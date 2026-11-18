@@ -2,6 +2,7 @@
  * Protocol approval documents (spec 6.3(9), Task 36, R117 I6): files the researcher drops onto the
  * protocol record are copied into `<Project>/protocol/`.
  *
+ * - Never a file inside the open library's own folder (by real path, links followed; R368 b).
  * - Only PDF, Word (DOCX), OpenDocument text, plain text and images (by content, not by name), each
  *   at most 100 MB, regular files only (no folder or symbolic link).
  * - Unencrypted projects keep the document's name; a name in use gets " (2)", " (3)", ….
@@ -15,10 +16,12 @@ import * as fsp from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { fileTypeFromFile } from "file-type";
 import { newId } from "@ao/core";
-import { InvalidInputError, PolicyDeniedError, ProjectLockedError } from "./repo/errors.js";
+import { InvalidInputError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError, RecoveryPendingError, isLockedRefusal } from "./repo/errors.js";
 import { decryptBytes, readMaybe } from "./repo/io.js";
 import type { Tx } from "./repo/mutate.js";
 import { noteIntegrityWarning, projectDataKey, projectEncrypted, repoLibrary, type Repo } from "./repo/repo.js";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
+import { insideLibrary } from "./fs/inside-library.js";
 
 /** Test seam (package-internal): a smaller cap for the check made on what was copied. */
 export const protocolSeams: { copyMaxBytes?: number } = {};
@@ -70,7 +73,9 @@ async function readManifest(repo: Repo, projectId: string, abs: string, key: { k
     const m = JSON.parse(plain.toString("utf8")) as Manifest;
     if (m?.formatVersion !== 1 || typeof m.documents !== "object" || m.documents === null) throw new Error("not a manifest");
     return m;
-  } catch {
+  } catch (err) {
+    // A key a lock wiped mid-read: the project is locked, the list is not damaged (R404); no warning is noted.
+    if (isLockedRefusal(err)) throw new ProjectLockedError(projectId);
     noteIntegrityWarning(repo, { projectId, kind: "protocol-manifest-unreadable", detail: "the sealed list of protocol document names cannot be read" });
     throw new InvalidInputError(MANIFEST_UNREADABLE);
   }
@@ -108,8 +113,10 @@ async function isPlainText(path: string): Promise<boolean> {
 }
 
 /** Why the file cannot be a protocol document, or undefined when it can. */
-async function refusal(path: string): Promise<string | undefined> {
+async function refusal(repo: Repo, path: string): Promise<string | undefined> {
   const name = basename(path);
+  // R368 b: nothing inside the library's own folder (before the file is looked at).
+  if (await insideLibrary(path, repoLibrary(repo))) return IN_LIBRARY_TEXT.file;
   const st = await fsp.lstat(path).catch(() => null);
   if (!st) return `${name} could not be found.`;
   if (st.isSymbolicLink()) return `${name} is a shortcut (symbolic link); drop the document itself.`;
@@ -194,7 +201,7 @@ export async function addProtocolDocuments(repo: Repo, projectId: string, paths:
   const out: ProtocolDocumentResult[] = [];
   for (const path of paths) {
     const file = basename(path);
-    const why = await refusal(path);
+    const why = await refusal(repo, path);
     if (why) {
       out.push({ file, outcome: "failed", reason: why });
       continue;
@@ -212,7 +219,11 @@ export async function addProtocolDocuments(repo: Repo, projectId: string, paths:
               ? "The project is locked. Unlock it, then try again."
               : err instanceof InvalidInputError
                 ? err.message
-                : `${file} could not be copied (a file or disk error); nothing of it was kept.`;
+                : err instanceof RecoveryPendingError
+                  ? "The project refuses changes until an interrupted change is resolved; nothing of this file was kept."
+                  : err instanceof ReadOnlyLibraryError
+                    ? "The library is open read-only, so nothing can be added."
+                    : `${file} could not be copied (a file or disk error); nothing of it was kept.`;
       out.push({ file, outcome: "failed", reason });
     }
   }

@@ -4,32 +4,52 @@
  * service's entry point.
  */
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   KeyRing,
   OcrQueue,
   WorkerJobError,
   createLibrary,
   deviceDeps,
+  destroyRaw,
+  indexSource,
+  setMeta,
   listBackups,
   openLibrary,
+  projectWarnings,
   openRepo,
+  readDestruction,
+  resumeDestruction,
   type Deps,
   type JobResult,
   type WorkerClient,
   type WorkerJob,
 } from "@ao/library";
+import { existsSync } from "node:fs";
 import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
+import { buildZoteroFixture } from "../../../packages/library/tests/fixtures/zotero/build-fixture.mjs";
+// Test seam of the library (same module instance as @ao/library's): makes overwriting a file fail.
+import { shredSeams } from "../../../packages/library/src/fs/shred.js";
+import { seams as repoSeams } from "../../../packages/library/src/repo/seams.js";
 import * as authModule from "./auth.js";
-import { readServiceToken } from "./auth.js";
-import { CREDENTIAL_QUERY_KEYS } from "@ao/shared";
+import { ApiError } from "./errors.js";
+import { CREDENTIAL_QUERY_KEYS, IN_LIBRARY_TEXT } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
+// The service has no undici of its own: the library's (the one its lookup client uses) sets the global dispatcher.
+import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "../../../packages/library/node_modules/undici/index.js";
+
+// The library as it is, with the destruction retry observable: a test can tell whether the service
+// started it for a project at all (R3-M3), not only what it changed.
+vi.mock("@ao/library", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@ao/library")>();
+  return { ...actual, resumeDestruction: vi.fn(actual.resumeDestruction) };
+});
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const PASS = "correct horse battery staple";
@@ -133,14 +153,6 @@ describe("authentication (R96)", () => {
     expect((await call({ url: "/libraries" })).status).toBe(200);
   });
 
-  it("reads AO_SERVICE_TOKEN once and removes it from the environment", () => {
-    const env: NodeJS.ProcessEnv = { AO_SERVICE_TOKEN: "x".repeat(40) };
-    expect(readServiceToken(env)).toBe("x".repeat(40));
-    expect(env.AO_SERVICE_TOKEN).toBeUndefined();
-    expect(() => readServiceToken({})).toThrow();
-    expect(() => readServiceToken({ AO_SERVICE_TOKEN: "short" })).toThrow();
-  });
-
   it("errors have exactly {error:{code,message,reason?}} and a body over 1 MB is 413", async () => {
     const big = await svc.app.inject({ method: "POST", url: "/libraries/open", headers: { ...auth, "content-type": "application/json" }, payload: JSON.stringify({ path: "x".repeat(1_100_000) }) });
     expect(big.statusCode).toBe(413);
@@ -193,6 +205,20 @@ describe("libraries, projects, sources", () => {
     expect(found.json.items.map((i: { id: string }) => i.id)).toContain(sid);
     const none = await call({ url: `/projects/${pid}/sources?text=zzzunfindable` });
     expect(none.json.total).toBe(0);
+    // Task 58: a match in an annotation, and an index awaiting a rebuild, reach the interface.
+    const idx = svc.state.session!.index!.db;
+    const sf = await svc.state.session!.repo.getSource(pid, sid);
+    indexSource(idx, { ...sf, annotations: [{ id: sid, sourceId: sid, kind: "note", anchors: [], body: "quokkaannotation", author: "t", createdAt: new Date().toISOString() }] });
+    const viaAnn = await call({ url: `/projects/${pid}/sources?text=quokkaannotation` });
+    expect(viaAnn.json.items).toEqual([expect.objectContaining({ id: sid, matchedIn: "annotation" })]);
+    expect(viaAnn.json).not.toHaveProperty("incomplete");
+    setMeta(idx, "needsRebuild", "annotations");
+    expect((await call({ url: `/projects/${pid}/sources` })).json.incomplete).toBe(true);
+    idx.prepare("DELETE FROM meta WHERE key = 'needsRebuild'").run();
+    // A query with too many words is refused in plain words (N1).
+    const many = await call({ url: `/projects/${pid}/sources?text=${encodeURIComponent(Array.from({ length: 17 }, (_, i) => `w${i}`).join(" "))}` });
+    expect(many.status).toBe(400);
+    expect(many.json.error).toMatchObject({ code: "VALIDATION", message: "Use at most 16 words in a search." });
     const one = await call({ url: `/projects/${pid}/sources/${sid}` });
     expect(one.json.source.id).toBe(sid);
     expect((await call({ url: `/projects/${pid}/sources/01ZZZZZZZZZZZZZZZZZZZZZZZZ` })).status).toBe(404);
@@ -218,6 +244,15 @@ describe("libraries, projects, sources", () => {
     const f = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/issued", value: "2001" } });
     expect(f.status, f.body).toBe(200);
     expect(f.json.verification["/issued"].status).toBe("user-confirmed");
+    // The audit entry names the field and says the value was changed, then kept; never the value (R191).
+    type Ev = { entity?: { id: string }; details?: Record<string, unknown> };
+    const confirmations = async () =>
+      ((await call({ url: `/projects/${pid}/audit?limit=1000` })).json.events as Ev[]).filter((e) => e.entity?.id === sid && e.details?.op === "source.update" && e.details.confirmed);
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/publisher", value: "Marmot Quokka Press" } })).status).toBe(200);
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/publisher", value: "Marmot Quokka Press" } })).status).toBe(200);
+    const named = (await confirmations()).reverse(); // the route lists the newest first
+    expect(named.map((e) => e.details!.confirmed)).toEqual([[{ field: "/issued", choice: "changed" }], [{ field: "/publisher", choice: "changed" }], [{ field: "/publisher", choice: "kept" }]]);
+    expect(JSON.stringify(named)).not.toContain("Marmot");
 
     const t1 = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcripts`, body: { text: "WEBVTT\n\n00:00.000 --> 00:01.000\nHi\n", format: "vtt" } });
     expect(t1.status, t1.body).toBe(200);
@@ -286,7 +321,13 @@ describe("governance, audit, citations", () => {
     expect(ok.json.loosened).toEqual([]); // the effective policy still requires encryption: only the violation is new
     expect((await call({ url: `/projects/${pid}/governance` })).json.yaml).toBe(looser);
     const audit = await call({ url: `/projects/${pid}/audit?limit=5` });
-    expect(audit.json.events.some((e: { details?: { reason?: string } }) => e.details?.reason === "IRB amendment 7")).toBe(true);
+    // An encrypted project (R362 b): the record holds the reason's keyed digest (R369 b), the screen's reading the text (unlocked).
+    const ev = audit.json.events.find((e: { details?: { op?: string } }) => e.details?.op === "project.governance");
+    expect(ev.details).toMatchObject({ reasonGiven: true, reasonMac: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(ev.details.reasonSha256).toBeUndefined();
+    expect(ev.details.reasonMac).not.toBe((await import("node:crypto")).createHash("sha256").update("IRB amendment 7", "utf8").digest("hex"));
+    expect(ev.details.reason).toBeUndefined();
+    expect(ev.reasonShown).toEqual({ state: "text", text: "IRB amendment 7" });
   });
 
   it("PUT governance: invalid YAML, custom tags, alias bombs and oversize text are refused", async () => {
@@ -324,6 +365,35 @@ describe("governance, audit, citations", () => {
     const rm = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "bibtex" } });
     expect(rm.status, rm.body).toBe(200);
     expect(rm.json.text).toContain("@");
+  });
+
+  it("R379 (FR-A14): POST /export/refman refuses an outputPath inside the library (400, the sentence); the rules file is unchanged", async () => {
+    const libPath = await openNewLibrary();
+    const pid = await newProject();
+    const sid = (await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } })).json.items[0].sourceId;
+    const gov = join(libPath, "Projects", "Study", "governance.yaml");
+    const before = await readFile(gov);
+    const r = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "ris", outputPath: gov } });
+    expect([r.status, r.json.error]).toEqual([400, { code: "VALIDATION", message: IN_LIBRARY_TEXT.exportFile }]);
+    expect(await readFile(gov)).toEqual(before);
+    const rel = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "ris", outputPath: "refs.ris" } });
+    expect(rel.status).toBe(400);
+    const ok = await call({ method: "POST", url: "/export/refman", body: { projectId: pid, sourceIds: [sid], format: "ris", outputPath: join(tmp, "refs.ris") } });
+    expect(ok.status, ok.body).toBe(200);
+    expect(await readFile(join(tmp, "refs.ris"), "utf8")).toContain("TY  - ");
+  });
+
+  it("R390 (c): POST /bibliography refuses a dest inside the library (400, the sentence) and makes no folder; one outside works", async () => {
+    const libPath = await openNewLibrary();
+    const pid = await newProject();
+    const sid = (await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } })).json.items[0].sourceId;
+    const dest = join(libPath, "Projects", "Study", "sources", "zz-new");
+    const r = await call({ method: "POST", url: "/bibliography", body: { projectId: pid, selection: { sourceIds: [sid] }, style: "apa", format: "text", dest } });
+    expect([r.status, r.json.error]).toEqual([400, { code: "VALIDATION", message: IN_LIBRARY_TEXT.exportFile }]);
+    await expect(stat(dest)).rejects.toThrow();
+    const ok = await call({ method: "POST", url: "/bibliography", body: { projectId: pid, selection: { sourceIds: [sid] }, style: "apa", format: "text", dest: join(tmp, "bibs") } });
+    expect(ok.status, ok.body).toBe(200);
+    expect(await readFile(ok.json.path, "utf8")).toContain("Coastal");
   });
 });
 
@@ -514,6 +584,69 @@ describe("appearance, fieldwork, import", () => {
     expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(0);
     expect((await call({ method: "POST", url: `/projects/${pid}/import/dry-run`, body: { adapter: { kind: "nonsense" } } })).status).toBe(400);
   });
+
+  it("FR-A21 (R392): a Zotero import's progress events carry its real total (the dry run's items), never done + 1", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const dataDir = join(tmp, "Zotero");
+    buildZoteroFixture(dataDir, { pdf: await buildPdf({ extra: "z one" }), linkedPdf: await buildPdf({ extra: "z two" }), linkedDir: join(tmp, "Elsewhere") });
+    const adapter = { kind: "zotero-local", dataDir };
+    const dry = await call({ method: "POST", url: `/projects/${pid}/import/dry-run`, body: { adapter } });
+    expect(dry.status, dry.body).toBe(200);
+    expect(dry.json.items).toBe(5);
+    const events: Array<{ type: string; data: any }> = [];
+    svc.state.events.subscribe((e) => events.push(e));
+    const started = await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter, options: {} } });
+    expect(started.status, started.body).toBe(200);
+    await svc.state.idle();
+    const running = events.filter((e) => e.type === "import.progress" && e.data.batchId === started.json.batchId && e.data.state === "running" && e.data.done > 0);
+    expect(running.length).toBeGreaterThan(0);
+    expect(running.every((e) => e.data.total === 5)).toBe(true);
+  });
+
+  it("R362 c: a file inside the library is not attached, a folder inside it (or holding it) is not imported — said in plain words", async () => {
+    const lib = await openNewLibrary();
+    const pid = await newProject();
+    const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } });
+    const sid = att.json.items[0].sourceId as string;
+    const stored = (await svc.state.session!.repo.getSource(pid, sid)).assets.find((a) => a.role === "original")!.path;
+    const inside = join(lib, stored);
+    const other = await fixturePdf("other.pdf", "Another Paper on Deltas");
+    const again = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [other, inside], toSourceId: sid } });
+    expect(again.status, again.body).toBe(200);
+    expect(again.json.items).toEqual([
+      { path: other, outcome: "attached", sourceId: sid },
+      { path: inside, outcome: "failed", reason: IN_LIBRARY_TEXT.file },
+    ]);
+    for (const path of [lib, join(lib, "Projects"), tmp]) {
+      for (const url of [`/projects/${pid}/import/dry-run`, `/projects/${pid}/import`]) {
+        const r = await call({ method: "POST", url, body: { adapter: { kind: "folder", path }, options: {} } });
+        expect([r.status, r.json.error]).toEqual([400, { code: "VALIDATION", message: IN_LIBRARY_TEXT.folder }]);
+      }
+    }
+    expect((await call({ url: `/projects/${pid}/imports` })).json).toEqual({ batches: [] });
+  });
+
+  it("R368 a: an import whose own file (a ZIP, an export) or Zotero folder lies inside the library is refused whole — said in plain words", async () => {
+    const lib = await openNewLibrary();
+    const pid = await newProject();
+    const zip = join(lib, "Backups", "copy.zip");
+    const bib = join(lib, "refs.bib");
+    await writeFile(zip, "not read");
+    await writeFile(bib, "@book{a, title = {Not read}}\n");
+    const cases: Array<[Record<string, string>, string]> = [
+      [{ kind: "zip", path: zip }, IN_LIBRARY_TEXT.importFile],
+      [{ kind: "bibtex", path: bib }, IN_LIBRARY_TEXT.importFile],
+      [{ kind: "zotero-local", dataDir: join(lib, "Projects") }, IN_LIBRARY_TEXT.folder],
+    ];
+    for (const [adapter, message] of cases) {
+      for (const url of [`/projects/${pid}/import/dry-run`, `/projects/${pid}/import`]) {
+        const r = await call({ method: "POST", url, body: { adapter, options: {} } });
+        expect([r.status, r.json.error]).toEqual([400, { code: "VALIDATION", message }]);
+      }
+    }
+    expect((await call({ url: `/projects/${pid}/imports` })).json).toEqual({ batches: [] });
+  });
 });
 
 describe("browser extension pairing (R96)", () => {
@@ -676,9 +809,12 @@ describe("entry point", () => {
     const entry = fileURLToPath(new URL("./main.ts", import.meta.url));
     const child = spawn(process.execPath, ["--import", "tsx", entry], {
       cwd: fileURLToPath(new URL("../", import.meta.url)),
-      env: { ...process.env, AO_SERVICE_TOKEN: TOKEN, AO_SERVICE_PORT: "0", AO_CONFIG_DIR: deps.appConfigDir, AO_LIBRARY: path, AO_NO_WORKER: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
+      // The token goes on standard input (R98), never in the environment.
+      env: { ...process.env, AO_SERVICE_PORT: "0", AO_CONFIG_DIR: deps.appConfigDir, AO_LIBRARY: path, AO_NO_WORKER: "1" },
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    child.stdin!.on("error", () => {});
+    child.stdin!.write(`${TOKEN}\n`);
     let out = "";
     let err = "";
     child.stderr!.on("data", (d: Buffer) => (err += d.toString()));
@@ -729,6 +865,22 @@ function nextEvent(pred: (e: { type: string; data: any }) => boolean): Promise<{
   });
 }
 
+/**
+ * Resolves with the first `running` import.progress event matching `pred`, having paused that
+ * batch inside the event's handler. Events are published synchronously from the batch's progress
+ * feed before the run takes its next item, so the run then waits between items until a resume, a
+ * suspend or a cancel lets it go: a gate the test holds, so the batch is still running when the
+ * test acts on it, however fast the machine and however few its items.
+ */
+function holdBatch(pred: (d: any) => boolean): Promise<{ type: string; data: any }> {
+  return nextEvent((e) => {
+    if (e.type !== "import.progress" || e.data.state !== "running" || !pred(e.data)) return false;
+    const h = svc.state.session?.batches.get(e.data.batchId)?.handle;
+    h?.pause();
+    return h !== undefined;
+  });
+}
+
 const batchState = async (pid: string, batchId: string) => ((await call({ url: `/projects/${pid}/imports` })).json.batches as Array<{ batchId: string; state: string }>).find((b) => b.batchId === batchId)?.state;
 
 describe("review round 1: governance PUT (R99 I1)", () => {
@@ -759,6 +911,311 @@ describe("review round 1: governance PUT (R99 I1)", () => {
     expect((await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: sha256 } })).status).toBe(400);
     const ok = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: sha256, reason: "repair" } });
     expect(ok.status, ok.body).toBe(200);
+  });
+});
+
+describe("FR-A18 (R379, R58): the rules' answer says whether the engine can read them", () => {
+  beforeEach(() => start());
+
+  const folderOf = async () => (await call({ url: "/projects" })).json.projects[0].folder as string;
+
+  it("an unknown key: readable false, an issue naming the key, no path; GET's yaml is still the text", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const text = "encryption: {atRest: optional}\nresidencey: {allowed: [local]}\n";
+    await writeFile(join(tmp, "Lib", await folderOf(), "governance.yaml"), text);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status).toBe(200);
+    expect(g.json.yaml).toBe(text);
+    expect(g.json.readable).toBe(false);
+    expect(g.json.issues.length).toBeGreaterThan(0);
+    expect(g.json.issues.some((i: string) => i.includes("residencey"))).toBe(true);
+    expect(g.json.warnings).toEqual([]);
+    expect(g.body).not.toContain(tmp);
+    expect(g.body).not.toContain(join(tmp, "Lib"));
+    for (const i of g.json.issues as string[]) expect(i).not.toMatch(/\n|at .*\.(js|ts):\d/);
+  });
+
+  it("text that is not YAML: readable false with one plain line", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await writeFile(join(tmp, "Lib", await folderOf(), "governance.yaml"), "encryption: [broken");
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json.readable).toBe(false);
+    expect(g.json.issues).toHaveLength(1);
+    expect(g.json.issues[0]).not.toContain("\n");
+    expect(g.body).not.toContain(tmp);
+  });
+
+  it("the old spelling of a legal-basis key: readable, with the note; an ordinary file: readable, no notes", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const g0 = await call({ url: `/projects/${pid}/governance` });
+    expect(g0.json).toMatchObject({ readable: true, issues: [], warnings: [] });
+    const old = `${OPEN_GOV.replace("consent:\n  requireLegalBasis: false\n", "consent:\n  requireLegalBasis: false\n  defaultLegalBasis:\n    manual_upload: consent\n    manual-upload: consent\n")}`;
+    await writeFile(join(tmp, "Lib", await folderOf(), "governance.yaml"), old);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json.readable).toBe(true);
+    expect(g.json.issues).toEqual([]);
+    expect(g.json.warnings).toHaveLength(1);
+    expect(g.json.warnings[0]).toContain("consent.defaultLegalBasis.manual_upload: ignored");
+  });
+
+  it("the save answer carries the same fields for the text just saved", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const { sha256 } = (await call({ url: `/projects/${pid}/governance` })).json;
+    const withNote = `${OPEN_GOV}exceptions:\n  - control: residencey.allowed\n    value: [local]\n    reason: x\n    by: y\n    at: 2026-01-01T09:30:00Z\n`;
+    const r = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: withNote, baseSha256: sha256, reason: "test" } });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.readable).toBe(true);
+    expect(r.json.issues).toEqual([]);
+    expect(r.json.warnings.some((w: string) => w.includes("residencey.allowed"))).toBe(true);
+    const r2 = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: r.json.sha256, reason: "back" } });
+    expect(r2.json).toMatchObject({ readable: true, issues: [], warnings: [] });
+    expect(r2.body).not.toContain(tmp);
+  });
+});
+
+describe("FR-A18 round 2 (R397 a): a missing or unreadable rules file is said, and a save of readable rules puts it back", () => {
+  beforeEach(() => start());
+
+  const MISSING = "The rules file (governance.yaml) is missing from this project's folder.";
+  const folderOf = async () => (await call({ url: "/projects" })).json.projects[0].folder as string;
+  const govFile = async () => join(tmp, "Lib", await folderOf(), "governance.yaml");
+  /** Three kinds of change: a collection, a tag, the project's time zone. */
+  const changes = (pid: string) => [
+    () => call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: `C${Math.random()}` } }),
+    () => call({ method: "POST", url: `/projects/${pid}/tags`, body: { name: `t${Math.random()}` } }),
+    () => call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: { timeZone: "Europe/Berlin" } }),
+  ];
+
+  async function repairs(pid: string, expectIssue: (issues: string[]) => void, mark: Record<string, unknown>) {
+    for (const c of changes(pid)) expect((await c()).status).toBe(403);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status).toBe(200);
+    expect(g.json.readable).toBe(false);
+    expectIssue(g.json.issues);
+    expect(g.body).not.toContain(tmp);
+    // An unreadable text is still refused.
+    const bad = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: "residencey: {allowed: [local]}\n", baseSha256: g.json.sha256, reason: "x (y)" } });
+    expect(bad.status).toBe(400);
+    // No reason: "a reason is needed" (the screen's "Record a reason" dialog opens on it).
+    const noReason = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256 } });
+    expect(noReason.status, noReason.body).toBe(400);
+    expect(noReason.json.error.code).toBe("VALIDATION");
+    expect(noReason.json.error.message).toMatch(/needs a reason/i);
+    for (const c of changes(pid)) expect((await c()).status).toBe(403);
+    const ok = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "putting the rules back (Ana)" } });
+    expect(ok.status, ok.body).toBe(200);
+    expect(await readFile(await govFile(), "utf8")).toBe(OPEN_GOV);
+    expect((await call({ url: `/projects/${pid}/governance` })).json).toMatchObject({ readable: true, issues: [] });
+    for (const c of changes(pid)) expect((await c()).status).toBe(200);
+    const events = (await call({ url: `/projects/${pid}/audit?limit=1000` })).json.events as Array<{ details?: Record<string, unknown> }>;
+    const edit = events.find((e) => e.details?.op === "project.governance");
+    expect(edit?.details).toMatchObject({ reason: "putting the rules back (Ana)", ...mark });
+    expect(JSON.stringify(edit)).not.toContain(tmp);
+    expect((await call({ url: `/projects/${pid}/audit/verify` })).json.ok).toBe(true);
+  }
+
+  it("a deleted rules file: refused, said missing, and a save with a reason puts it back", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await rm(await govFile());
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json).toMatchObject({ yaml: "", readable: false, issues: [MISSING], warnings: [] });
+    await repairs(pid, (i) => expect(i).toEqual([MISSING]), { rulesFile: "missing" });
+  });
+
+  it("R421 a: a repair whose reason holds only invisible characters is answered as one without a reason", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await rm(await govFile());
+    const g = await call({ url: `/projects/${pid}/governance` });
+    const r = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "\u200B\u2060 \uFEFF" } });
+    expect(r.status, r.body).toBe(400);
+    expect(r.json.error.message).toMatch(/needs a reason/i);
+    expect((await call({ url: `/projects/${pid}/governance` })).json.readable).toBe(false);
+  });
+
+  it("in an encrypted project even rules as strict as the defaults need a reason to put back", async () => {
+    await openNewLibrary();
+    const pid = await newProject(HIPAA_GOV, true);
+    await rm(await govFile());
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json).toMatchObject({ readable: false, issues: [MISSING] });
+    const strict = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: "# the default rules\n", baseSha256: g.json.sha256 } });
+    expect(strict.status, strict.body).toBe(400);
+    expect(strict.json.error.message).toMatch(/needs a reason/i);
+    const ok = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: "# the default rules\n", baseSha256: g.json.sha256, reason: "back (Ana)" } });
+    expect(ok.status, ok.body).toBe(200);
+    expect((await call({ method: "POST", url: `/projects/${pid}/tags`, body: { name: "kin" } })).status).toBe(200);
+  });
+
+  it("an empty file stays readable (the default rules)", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await writeFile(await govFile(), "");
+    expect((await call({ url: `/projects/${pid}/governance` })).json).toMatchObject({ yaml: "", readable: true, issues: [] });
+  });
+
+  it("a file the engine cannot read: refused, said, and a save with a reason puts it back", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await writeFile(await govFile(), "encryption: {atRest: optional}\nresidencey: {allowed: [local]}\n");
+    await repairs(pid, (i) => expect(i.some((x) => x.includes("residencey"))).toBe(true), { rulesFile: "unreadable" });
+  });
+});
+
+describe("FR-A18 round 2 (R397 e): a rules file that cannot be opened is said, never a 500", () => {
+  beforeEach(() => start());
+
+  const OPENED = "The rules file could not be opened.";
+  const folderOf = async () => (await call({ url: "/projects" })).json.projects[0].folder as string;
+  const govFile = async () => join(tmp, "Lib", await folderOf(), "governance.yaml");
+
+  it("a folder in the rules file's place: readable false with one issue; a save over it is refused in plain words", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const f = await govFile();
+    await rm(f);
+    await mkdir(f);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status, g.body).toBe(200);
+    expect(g.json).toMatchObject({ yaml: "", readable: false, issues: [OPENED], warnings: [] });
+    const put = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "back (Ana)" } });
+    expect(put.status, put.body).toBe(400);
+    expect(put.json.error.message).toMatch(/could not be opened/);
+    expect(put.body).not.toContain(tmp);
+    expect(put.body).not.toMatch(/EISDIR/);
+    expect((await call({ url: `/projects/${pid}/retention` })).status).toBe(200);
+  });
+
+  it("R421 b: a symbolic link whose target is missing cannot be opened; a save says to remove it, not that the path is refused", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const f = await govFile();
+    await rm(f);
+    await symlink(join(tmp, "nowhere.yaml"), f);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status, g.body).toBe(200);
+    expect(g.json).toMatchObject({ yaml: "", readable: false, issues: [OPENED], warnings: [] });
+    const put = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "back (Ana)" } });
+    expect(put.status, put.body).toBe(400);
+    expect(put.json.error.message).toMatch(/could not be opened.*Remove it from the project's folder/);
+    expect(put.body).not.toContain(tmp);
+  });
+
+  it("R421 b: a symbolic link to a readable file outside the library: read through the link; a save over it is refused", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const f = await govFile();
+    const outside = join(tmp, "elsewhere.yaml");
+    await writeFile(outside, OPEN_GOV);
+    await rm(f);
+    await symlink(outside, f);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json).toMatchObject({ yaml: OPEN_GOV, readable: true, issues: [] });
+    expect((await call({ method: "POST", url: `/projects/${pid}/tags`, body: { name: "kin" } })).status).toBe(200);
+    const put = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: `${OPEN_GOV}# note\n`, baseSha256: g.json.sha256, reason: "x (y)" } });
+    // Unchanged by R421: the transaction's path guard refuses to write through the link.
+    expect(put.status, put.body).toBe(400);
+    expect(put.json.error.message).toBe("That path is not allowed.");
+    expect(await readFile(outside, "utf8")).toBe(OPEN_GOV);
+  });
+
+  it.skipIf(process.getuid?.() === 0)("a rules file that cannot be opened (no permission): readable false with one issue", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const f = await govFile();
+    await chmod(f, 0o000);
+    try {
+      const g = await call({ url: `/projects/${pid}/governance` });
+      expect(g.status, g.body).toBe(200);
+      expect(g.json).toMatchObject({ readable: false, issues: [OPENED] });
+    } finally {
+      await chmod(f, 0o644);
+    }
+  });
+});
+
+describe("FR-A18 round 2 (R397 b–d): the issues are bounded, scrubbed, on one line, without hidden characters", () => {
+  beforeEach(() => start());
+
+  const folderOf = async () => (await call({ url: "/projects" })).json.projects[0].folder as string;
+  async function issuesOf(text: string): Promise<string[]> {
+    await openNewLibrary();
+    const pid = await newProject();
+    await writeFile(join(tmp, "Lib", await folderOf(), "governance.yaml"), text);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status).toBe(200);
+    expect(g.json.readable).toBe(false);
+    return g.json.issues as string[];
+  }
+
+  it("b: 60 unknown keys → twenty issues, then \"and 40 more.\"", async () => {
+    const text = Array.from({ length: 60 }, (_, i) => `unknown${i}: 1`).join("\n") + "\n";
+    const issues = await issuesOf(text);
+    expect(issues).toHaveLength(21);
+    expect(issues.slice(0, 20).every((i) => /^unknown\d+: unknown key/.test(i))).toBe(true);
+    expect(issues[20]).toBe("and 40 more.");
+  });
+
+  it("b: a 100,000-character key → an issue of at most 300 characters, cut with …", async () => {
+    const issues = await issuesOf(`? ${"k".repeat(100_000)}\n: 1\n`);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]!.length).toBeLessThanOrEqual(300);
+    expect(issues[0]!.endsWith("…")).toBe(true);
+  });
+
+  it("c: a value holding the library's folder path is scrubbed", async () => {
+    const inLib = await issuesOf(`encryption: {atRest: "${join(tmp, "Lib")}/secret-notes.txt"}\n`);
+    expect(inLib.join(" ")).not.toContain(tmp);
+    expect(inLib.join(" ")).toContain("secret-notes.txt");
+  });
+
+  it("c: an absolute path outside the library is scrubbed", async () => {
+    const outside = await issuesOf(`encryption: {atRest: "/Users/ana/private/consent.pdf"}\n`);
+    expect(outside.join(" ")).not.toContain("/Users/ana");
+    expect(outside.join(" ")).toContain("<path>");
+  });
+
+  it("c: a message with a newline in it is collapsed to one line", async () => {
+    const issues = await issuesOf(`encryption: {atRest: "first line\\nsecond line"}\n`);
+    expect(issues.some((i) => i.includes("first line second line"))).toBe(true);
+    for (const i of issues) expect(i).not.toMatch(/[\n\r]/);
+  });
+
+  it("R421 d: thirty exceptions that waive nothing → twenty warnings, then \"and 10 more.\"", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const ex = Array.from({ length: 30 }, (_, i) => `  - control: unknown${i}.allowed\n    value: [local]\n    reason: x\n    by: y\n    at: 2026-01-01T09:30:00Z\n`).join("");
+    await writeFile(join(tmp, "Lib", await folderOf(), "governance.yaml"), `${OPEN_GOV}exceptions:\n${ex}`);
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.json.readable).toBe(true);
+    expect(g.json.warnings).toHaveLength(21);
+    expect(g.json.warnings.slice(0, 20).every((w: string) => /unknown\d+\.allowed/.test(w))).toBe(true);
+    expect(g.json.warnings[20]).toBe("and 10 more.");
+  });
+
+  it("R421 c: the soft hyphen, a tag character, the Hangul filler and a variation selector are taken out too", async () => {
+    const issues = await issuesOf(`"ab\\u00ADc\\U000E0041d\\u3164e\\uFE0Ff\\u034Fg\\u115Fh\\u1160i": 1\n`);
+    expect(issues[0]).toMatch(/^abcdefghi: unknown key/);
+  });
+
+  it("R421 c: the cut at 300 is by whole characters, never half a pair", async () => {
+    const issues = await issuesOf(`? ${"k".repeat(298)}${"\u{1F600}".repeat(50)}\n: 1\n`);
+    const i = issues[0]!;
+    expect([...i]).toHaveLength(300);
+    expect(i.endsWith("\u{1F600}…")).toBe(true);
+    expect(i).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  });
+
+  it("d: control characters and the marks that reorder or hide text are taken out; angle brackets stay", async () => {
+    const issues = await issuesOf(`"<img src=x onerror=alert(1)>\\u202E\\a\\u200B\\u2066": 1\n`);
+    const i = issues.find((x) => x.includes("<img src=x onerror=alert(1)>"))!;
+    expect(i).toBeTruthy();
+    expect(i).not.toMatch(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/);
   });
 });
 
@@ -810,7 +1267,7 @@ describe("review round 1: batches (R99 I3, I4)", () => {
     await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(12);
-    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const progressed = holdBatch((d) => d.done >= 2);
     const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
     await progressed;
     expect((await call({ method: "POST", url: `/imports/${batchId}/cancel` })).status).toBe(200);
@@ -826,14 +1283,34 @@ describe("review round 1: batches (R99 I3, I4)", () => {
     expect((await call({ url: `/jobs?projectId=${pid}` })).json.imports).toEqual([]);
   });
 
+  it("R436 e: a Resume for a batch whose run has ended, its handle still kept, starts the resume (never 200 for nothing)", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await pdfFolder(12);
+    const progressed = holdBatch((d) => d.done >= 2);
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
+    await progressed;
+    const kept = svc.state.session!.batches.get(batchId)!;
+    expect((await call({ method: "POST", url: `/imports/${batchId}/cancel` })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("cancelled");
+    // The window the review found: the run has settled, but its handle is still kept (it leaves in followBatch's end).
+    svc.state.session!.batches.set(batchId, kept);
+    expect((await call({ method: "POST", url: `/imports/${batchId}/resume` })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("finished");
+    expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(12);
+  });
+
   it("lock mid-import, unlock, resume: every item imported once", async () => {
     await openNewLibrary();
     const pid = await newProject(OPEN_GOV.replace("atRest: optional", "atRest: required"), true);
     const dir = await pdfFolder(10);
-    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const progressed = holdBatch((d) => d.done >= 2);
     const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
     await progressed;
     await call({ method: "POST", url: `/projects/${pid}/lock` });
+    svc.state.session!.batches.get(batchId)!.handle.resume(); // the held batch meets the lock at its next write
     await svc.state.idle();
     await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } });
     expect(["failed", "paused", "interrupted"]).toContain(await batchState(pid, batchId));
@@ -847,7 +1324,7 @@ describe("review round 1: batches (R99 I3, I4)", () => {
     const path = await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(15);
-    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const progressed = holdBatch((d) => d.done >= 2);
     const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
     await progressed;
     await svc.close();
@@ -868,7 +1345,7 @@ describe("review round 1: library move during an import (R99 I5)", () => {
     const oldPath = await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(60);
-    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 5);
+    const progressed = holdBatch((d) => d.done >= 5);
     const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
     await progressed;
     const dest = join(tmp, "Moved");
@@ -911,6 +1388,477 @@ describe("review round 1: backups on open and unlock (R99 I7)", () => {
   });
 });
 
+describe("R125: backups are governed and audited", () => {
+  /** The library sits on this computer's disk, which these rules exclude. */
+  const REMOVABLE_ONLY = `${OPEN_GOV}residency:\n  allowed: [removable]\n`;
+  const NOT_ALLOWED = /this project's rules do not allow its data there/u;
+
+  it("POST /projects/:id/backups makes a backup now: file name, sha256 and size, never a path; audited", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject(OPEN_GOV, false, "Manual");
+    const r = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.backup).toEqual({ file: expect.stringMatching(/^Manual - backup - modified .+\.zip$/u), sha256: expect.stringMatching(/^[0-9a-f]{64}$/u), bytes: expect.any(Number), pruned: [], warnings: [] });
+    expect(r.body).not.toContain(path);
+    expect(r.body).not.toContain(tmp);
+    expect(await listBackups(svc.state.session!.repo, pid)).toHaveLength(1);
+    const { events } = await svc.state.session!.repo.readAudit(pid);
+    expect(events.map((e) => e.action)).toEqual(expect.arrayContaining(["backup", "backup.create"]));
+  });
+
+  it("R138: a double request, and the scheduler at the same moment, never leave a backup that is not the file it records", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject(OPEN_GOV, false, "Double");
+    await svc.state.idle();
+    const [a, b, sched] = await Promise.all([
+      call({ method: "POST", url: `/projects/${pid}/backups` }),
+      call({ method: "POST", url: `/projects/${pid}/backups` }),
+      svc.state.runScheduledBackups(),
+    ]);
+    expect(a.status, a.body).toBe(200);
+    expect(b.status, b.body).toBe(200);
+    expect(a.json.backup.file).not.toBe(b.json.backup.file);
+    expect(sched.every((r) => r.ok)).toBe(true);
+    const repo = svc.state.session!.repo;
+    const list = await listBackups(repo, pid);
+    expect(new Set(list.map((x) => x.file)).size).toBe(list.length);
+    const { createHash } = await import("node:crypto");
+    for (const x of list) {
+      const bytes = await readFile(join(svc.state.session!.lib.root, "Backups", x.file));
+      expect(createHash("sha256").update(bytes).digest("hex")).toBe(x.sha256);
+    }
+  });
+
+  it("a refused manual backup → 403 POLICY_DENIED with the engine's reason; nothing is made; the denial is audited", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject(REMOVABLE_ONLY, false, "Refused");
+    const r = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(r.status, r.body).toBe(403);
+    expect(r.json.error).toMatchObject({ code: "POLICY_DENIED", reason: expect.stringMatching(NOT_ALLOWED) });
+    expect(r.body).not.toContain(path);
+    expect(await listBackups(svc.state.session!.repo, pid)).toEqual([]);
+    const { events } = await svc.state.session!.repo.readAudit(pid);
+    expect(events.find((e) => e.action === "backup")?.decision).toMatchObject({ result: "deny", reason: expect.stringMatching(NOT_ALLOWED) });
+  });
+
+  it("a refused SCHEDULED backup raises `backup-failed` with the reason in the library state; a later backup clears it", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject(REMOVABLE_ONLY, false, "Scheduled");
+    await svc.state.idle();
+    const runs = await svc.state.runScheduledBackups();
+    expect(runs).toEqual([expect.objectContaining({ projectId: pid, ok: false, backedUp: false, error: expect.stringMatching(NOT_ALLOWED) })]);
+    await svc.state.projectWarnings(svc.state.session!);
+    const state = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; backupFailures: Record<string, { reason: string; refused?: boolean }> };
+    expect(state.projectWarnings[pid]).toContain("backup-failed");
+    expect(state.backupFailures[pid]).toMatchObject({ refused: true, reason: expect.stringMatching(NOT_ALLOWED) });
+    expect(JSON.stringify(state)).not.toContain(tmp);
+    // The rules are changed (a loosening, with a reason); a backup made by hand clears the warning.
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status, g.body).toBe(200);
+    const put = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "The library stays on this computer." } });
+    expect(put.status, put.body).toBe(200);
+    expect((await call({ method: "POST", url: `/projects/${pid}/backups` })).status).toBe(200);
+    await svc.state.projectWarnings(svc.state.session!);
+    const after = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; backupFailures: Record<string, unknown> };
+    expect(after.projectWarnings[pid]).not.toContain("backup-failed");
+    expect(after.backupFailures[pid]).toBeUndefined();
+  });
+});
+
+describe("Task 49 round 3: the destruction retry (when it runs, where it does not)", () => {
+  const RETAIN = `identifiability:
+  containsIdentifiable: true
+  pseudonymizeFileNames: false
+  deidentifiedExportsOnly: true
+encryption:
+  atRest: optional
+consent:
+  requireLegalBasis: false
+retention:
+  rawDataDestroyAfter: 2026-12-01
+captureMethods: [manual_upload]
+processing:
+  metadata_lookup: []
+`;
+  const clock = { now: new Date("2026-12-02T10:00:00.000Z") };
+  const later = (ms: number) => {
+    clock.now = new Date(clock.now.getTime() + ms);
+  };
+  const HOUR = 3_600_000;
+
+  /** A project whose destruction left its one backup NOT removed: returns the project id, the certificate and the backup's path. */
+  async function stuckDestruction(encrypted = false): Promise<{ pid: string; certificatePath: string; backup: string }> {
+    const pid = await newProject(encrypted ? RETAIN.replace("atRest: optional", "atRest: required") : RETAIN, encrypted, "Retain");
+    const repo = svc.state.session!.repo;
+    const file = join(tmp, "in", "interview.mp3");
+    await import("node:fs/promises").then((f) => f.mkdir(dirname(file), { recursive: true }));
+    await writeFile(file, "RAW interview audio bytes");
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "interview", title: { variants: [{ lang: "en", kind: "original", value: "Interview" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: file, role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "consented", basis: "test" }, identifiable: true } },
+    );
+    const b = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(b.status, b.body).toBe(200);
+    const backup = join(svc.state.session!.lib.root, "Backups", b.json.backup.file as string);
+    later(60_000);
+    shredSeams.failFor = (p) => p.endsWith(b.json.backup.file as string);
+    try {
+      const r = await destroyRaw(repo, pid, [sf.assets[0]!.id], "tester");
+      return { pid, certificatePath: r.certificatePath, backup };
+    } finally {
+      shredSeams.failFor = undefined;
+    }
+  }
+  // R147: the certificate file is never rewritten; the status is read with its amendments, from the audit log.
+  const statusOf = async (pid: string, path: string) => (await readDestruction(svc.state.session!.repo, pid, path)).status;
+  type Waiting = Record<string, Array<{ certificateFile: string; backups: string[]; reason?: string }>>;
+
+  beforeEach(async () => {
+    clock.now = new Date("2026-12-02T10:00:00.000Z");
+    await start({ now: () => clock.now });
+  });
+  afterEach(() => {
+    shredSeams.failFor = undefined;
+  });
+
+  it("runs when the library is opened", async () => {
+    const path = await openNewLibrary();
+    const { pid, certificatePath, backup } = await stuckDestruction();
+    expect(await statusOf(pid, certificatePath)).toBe("pending");
+    const written = await readFile(certificatePath);
+    await call({ method: "POST", url: "/libraries/close" });
+    later(HOUR);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await svc.state.idle();
+    expect(await statusOf(pid, certificatePath)).toBe("deleted");
+    expect((await readFile(certificatePath)).equals(written)).toBe(true);
+    expect(existsSync(backup)).toBe(false);
+    expect(await projectWarnings(svc.state.session!.repo, pid)).not.toContain("destruction-backups-pending");
+  });
+
+  it("runs when a project is unlocked, and never while it is locked", async () => {
+    await openNewLibrary();
+    const { pid, certificatePath, backup } = await stuckDestruction(true);
+    const repo = svc.state.session!.repo;
+    repo.lockProject(pid);
+    later(HOUR);
+    const retry = vi.mocked(resumeDestruction);
+    retry.mockClear();
+    await svc.state.runScheduledBackups();
+    // Locked: the retry is not even started for the project (R3-M3: without the service's own
+    // check it would be started, and only the library would decline).
+    expect(retry).not.toHaveBeenCalled();
+    expect(certificatePath.endsWith(".json.enc")).toBe(true);
+    expect(existsSync(backup)).toBe(true);
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    await svc.state.idle();
+    expect(retry).toHaveBeenCalledWith(repo, pid);
+    expect(existsSync(backup)).toBe(false);
+    expect(await statusOf(pid, certificatePath)).toBe("deleted");
+    expect(await projectWarnings(svc.state.session!.repo, pid)).not.toContain("destruction-backups-pending");
+  });
+
+  it("runs on the hourly pass, at most hourly", async () => {
+    await openNewLibrary();
+    const { pid, certificatePath, backup } = await stuckDestruction();
+    later(30 * 60_000);
+    // The first retry after the destruction is due at once; it still fails here.
+    shredSeams.failFor = (p) => p.endsWith(backup.slice(backup.lastIndexOf("/") + 1));
+    await svc.state.runScheduledBackups();
+    shredSeams.failFor = undefined;
+    expect(await statusOf(pid, certificatePath)).toBe("pending");
+    // Half an hour later: not due yet.
+    later(30 * 60_000);
+    await svc.state.runScheduledBackups();
+    expect(await statusOf(pid, certificatePath)).toBe("pending");
+    expect(existsSync(backup)).toBe(true);
+    // The library state names the backup that waits (no reason: nothing disagrees, the removal failed).
+    await svc.state.projectWarnings(svc.state.session!);
+    const waiting = (svc.state.libraryState() as { destructionBackupsPending: Waiting }).destructionBackupsPending;
+    expect(waiting[pid]).toEqual([{ certificateFile: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.json$/u), backups: [`Backups/${backup.slice(backup.lastIndexOf("/") + 1)}`] }]);
+    // An hour after the last attempt: retried, and done.
+    later(30 * 60_000);
+    await svc.state.runScheduledBackups();
+    expect(await statusOf(pid, certificatePath)).toBe("deleted");
+    expect(existsSync(backup)).toBe(false);
+    await svc.state.projectWarnings(svc.state.session!);
+    expect((svc.state.libraryState() as { destructionBackupsPending: Waiting }).destructionBackupsPending[pid]).toBeUndefined();
+  });
+
+  it("does not run while the library is being moved, nor in a read-only library", async () => {
+    await openNewLibrary();
+    const { pid, certificatePath, backup } = await stuckDestruction();
+    later(HOUR);
+    const st = svc.state as unknown as { moving: unknown };
+    const before = st.moving;
+    st.moving = true;
+    try {
+      expect(await svc.state.runScheduledBackups()).toEqual([]);
+    } finally {
+      st.moving = before;
+    }
+    expect(await statusOf(pid, certificatePath)).toBe("pending");
+    // As if the library had been opened read-only (an instance property shadows the getter).
+    const lib = svc.state.session!.lib;
+    const own = Object.getOwnPropertyDescriptor(lib, "mode");
+    Object.defineProperty(lib, "mode", { value: "read-only", configurable: true });
+    try {
+      expect(await svc.state.runScheduledBackups()).toEqual([]);
+    } finally {
+      if (own) Object.defineProperty(lib, "mode", own);
+      else delete (lib as unknown as { mode?: unknown }).mode;
+    }
+    expect(svc.state.session!.lib.mode).toBe("read-write");
+    expect(await statusOf(pid, certificatePath)).toBe("pending");
+    expect(existsSync(backup)).toBe(true);
+  });
+
+  it("R147: a certificate changed on disk: the retry removes nothing, the warning stands, and the library state says which backup waits and why, in plain words", async () => {
+    await openNewLibrary();
+    const { pid, certificatePath, backup } = await stuckDestruction();
+    const cert = JSON.parse(await readFile(certificatePath, "utf8")) as { assets: unknown[] };
+    cert.assets = [];
+    await writeFile(certificatePath, JSON.stringify(cert));
+    later(HOUR);
+    await svc.state.runScheduledBackups();
+    expect(existsSync(backup)).toBe(true);
+    await svc.state.projectWarnings(svc.state.session!);
+    const state = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; destructionBackupsPending: Waiting };
+    expect(state.projectWarnings[pid]).toContain("destruction-backups-pending");
+    expect(state.destructionBackupsPending[pid]).toEqual([
+      { certificateFile: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.json$/u), backups: [`Backups/${backup.slice(backup.lastIndexOf("/") + 1)}`], reason: expect.stringMatching(/audit log/u) },
+    ]);
+    expect(JSON.stringify(state)).not.toContain(tmp);
+    // The route that shows certificates says the same of it.
+    const shown = await call({ url: `/projects/${pid}/retention/certificates` });
+    expect(shown.status, shown.body).toBe(200);
+    expect(shown.json.certificates).toHaveLength(1);
+    expect(shown.json.certificates[0]).toMatchObject({ verified: false, status: "pending", outstanding: [`Backups/${backup.slice(backup.lastIndexOf("/") + 1)}`], problem: expect.stringMatching(/audit log/u) });
+    expect(shown.body).not.toContain(tmp);
+  });
+
+  it("R147: a pass that only observes still tells the interface what changed (automatic backups off)", async () => {
+    await openNewLibrary();
+    const { pid, certificatePath, backup } = await stuckDestruction();
+    const held = `Backups/${backup.slice(backup.lastIndexOf("/") + 1)}`;
+    // No scheduled backup for this project: nothing else in the pass publishes the library state.
+    expect((await call({ method: "PUT", url: `/projects/${pid}/backup-settings`, body: { automatic: false } })).status).toBe(200);
+    await svc.state.idle();
+    const published: Waiting[] = [];
+    const off = svc.state.events.subscribe((e) => {
+      if (e.type === "library.state") published.push((e.data as { destructionBackupsPending: Waiting }).destructionBackupsPending);
+    });
+    try {
+      // The certificate is changed on disk: the pass removes nothing, and the interface is told why.
+      const cert = JSON.parse(await readFile(certificatePath, "utf8")) as { assets: unknown[] };
+      cert.assets = [];
+      await writeFile(certificatePath, JSON.stringify(cert));
+      later(HOUR);
+      await svc.state.runScheduledBackups();
+      await svc.state.idle();
+      expect(existsSync(backup)).toBe(true);
+      expect(published.at(-1)?.[pid]).toEqual([{ certificateFile: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.json$/u), backups: [held], reason: expect.stringMatching(/audit log/u) }]);
+      // Nothing changes: nothing more is published.
+      const told = published.length;
+      later(HOUR);
+      await svc.state.runScheduledBackups();
+      await svc.state.idle();
+      expect(published).toHaveLength(told);
+      // The researcher removes the backup by hand: the pass records that it is gone, and the interface is told the warning has ended.
+      await rm(backup);
+      later(HOUR);
+      await svc.state.runScheduledBackups();
+      await svc.state.idle();
+      expect(await statusOf(pid, certificatePath)).toBe("no-longer-present");
+      expect(published.length).toBeGreaterThan(told);
+      expect(published.at(-1)?.[pid]).toBeUndefined();
+      expect((svc.state.libraryState() as { projectWarnings: Record<string, string[]> }).projectWarnings[pid]).not.toContain("destruction-backups-pending");
+    } finally {
+      off();
+    }
+  });
+
+  it("FR-A16 (R379): the library state carries destruction-old-copies-pending with its sentence and what stands behind it, without a path", async () => {
+    await openNewLibrary();
+    // This computer's list of old copies cannot be read: the destruction cannot check them.
+    await import("node:fs/promises").then((f) => f.mkdir(join(deps.appConfigDir, "pending-old-copies.json"), { recursive: true }));
+    const pid = await newProject(RETAIN, false, "Retain");
+    const file = join(tmp, "in", "interview.mp3");
+    await import("node:fs/promises").then((f) => f.mkdir(dirname(file), { recursive: true }));
+    await writeFile(file, "RAW interview audio bytes");
+    const sf = await svc.state.session!.repo.createSource(
+      pid,
+      { projectIds: [pid], type: "interview", title: { variants: [{ lang: "en", kind: "original", value: "Interview" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: file, role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "consented", basis: "test" }, identifiable: true } },
+    );
+    const d = await destroyRaw(svc.state.session!.repo, pid, [sf.assets[0]!.id], "tester");
+    expect(d.original.oldCopies).toMatchObject({ status: "unknown-pending" });
+    await svc.state.projectWarnings(svc.state.session!);
+    const state = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; destructionOldCopiesPending: Record<string, unknown> };
+    expect(state.projectWarnings[pid]).toContain("destruction-old-copies-pending");
+    expect(state.destructionOldCopiesPending[pid]).toEqual({
+      // R409 d: the list could not be checked — round 1's "could not be checked" sentence.
+      message:
+        "This computer's list of old copies of this library left by a move could not be read, so whether such a copy still holds the destroyed data could not be checked. Any that does was not destroyed.",
+      destructions: [{ certificateFile: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.json$/u), oldCopies: [], unchecked: true }],
+      oldCopies: [],
+      unchecked: true,
+    });
+    expect(JSON.stringify(state)).not.toContain(tmp);
+  });
+
+  it("R409 d: the warning tells the researcher's screen the old copy's place and what can be done — by hand, on the Move library screen, or that this computer has no record of it; the place is in no file of the library", async () => {
+    const libRoot = await openNewLibrary();
+    const pid = await newProject(RETAIN, false, "Retain");
+    const file = join(tmp, "in", "interview.mp3");
+    const fsp = await import("node:fs/promises");
+    await fsp.mkdir(dirname(file), { recursive: true });
+    await writeFile(file, "RAW interview audio bytes");
+    const repo = svc.state.session!.repo;
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "interview", title: { variants: [{ lang: "en", kind: "original", value: "Interview" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: file, role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "consented", basis: "test" }, identifiable: true } },
+    );
+    // An old copy of this library left by a move, still holding the file.
+    const oldRoot = join(tmp, "OldPlace");
+    const asset = sf.assets[0]!;
+    await fsp.mkdir(join(oldRoot, ...asset.path.split("/").slice(0, -1)), { recursive: true });
+    await writeFile(join(oldRoot, ...asset.path.split("/")), "RAW interview audio bytes");
+    // This computer's list of old copies (as a finished move writes it).
+    const record = { id: "rec1", oldRoot, newRoot: libRoot, libraryId: svc.state.session!.lib.id, verifiedHashesFile: join(deps.appConfigDir, "old-copies", "rec1.json"), createdAt: clock.now.toISOString(), split: false, movedFolders: [], movedProjectIds: [pid], moveId: "m1", complete: true };
+    await fsp.mkdir(deps.appConfigDir, { recursive: true });
+    await writeFile(join(deps.appConfigDir, "pending-old-copies.json"), JSON.stringify({ formatVersion: 1, records: [record] }));
+    const d = await destroyRaw(repo, pid, [asset.id], "tester");
+    expect(d.original.oldCopies).toMatchObject({ status: "pending" });
+    const entry = async () => {
+      await svc.state.projectWarnings(svc.state.session!);
+      return (svc.state.libraryState() as { destructionOldCopiesPending: Record<string, { message: string; oldCopies: unknown[] }> }).destructionOldCopiesPending[pid]!;
+    };
+    // The service holds no token for it: by hand, the folder named below.
+    expect(await entry()).toMatchObject({
+      message: "Old copies of this library, left by a move, still hold data that was destroyed here. Delete the folder named below by hand to complete the destruction; the app will notice when it is gone.",
+      oldCopies: [{ movedOn: "2026-12-02", place: oldRoot, canDelete: false }],
+    });
+    // Its offer is open and the service holds its token: on the Move library screen.
+    svc.state.recordMove({ oldRoot, newRoot: libRoot, confirmToken: "a-token", warnings: [] });
+    expect(await entry()).toMatchObject({
+      message: "Old copies of this library, left by a move, still hold data that was destroyed here. Delete them on the Move library screen to complete the destruction.",
+      oldCopies: [{ movedOn: "2026-12-02", place: oldRoot, canDelete: true }],
+    });
+    svc.state.forgetMove();
+    // This computer has no record of it.
+    await rm(join(deps.appConfigDir, "pending-old-copies.json"));
+    expect(await entry()).toEqual({
+      message:
+        "An old copy of this library, left by the move of 2026-12-02, may still hold data that was destroyed here. This computer has no record of where it is: open the library on the computer that moved it.",
+      destructions: [expect.objectContaining({ oldCopies: [{ movedAt: clock.now.toISOString() }] })],
+      oldCopies: [{ movedOn: "2026-12-02", canDelete: false }],
+    });
+    // The place is never written into the library.
+    const all = async (dir: string): Promise<string> => {
+      let out = "";
+      for (const e of await fsp.readdir(dir, { withFileTypes: true })) out += e.isDirectory() ? await all(join(dir, e.name)) : await readFile(join(dir, e.name), "latin1");
+      return out;
+    };
+    expect(await all(libRoot)).not.toContain(oldRoot);
+  });
+
+  describe("Task 46a: a reopen at start that the researcher's own choice supersedes starts nothing", () => {
+    /**
+     * The service stopped with a library open (so it is the one reopened at the next start) whose
+     * project has a destruction retry due: any pass on it would remove `backup`.
+     */
+    async function remembered(): Promise<{ path: string; pid: string; backup: string }> {
+      const path = await openNewLibrary("LibA");
+      const { pid, backup } = await stuckDestruction();
+      await svc.close();
+      later(HOUR);
+      vi.mocked(resumeDestruction).mockClear();
+      return { path, pid, backup };
+    }
+    /** Nothing was started on the abandoned library, it is not the open one, and its lock is free. */
+    async function expectNothingStarted(path: string, backup: string): Promise<void> {
+      await svc.state.idle();
+      expect(vi.mocked(resumeDestruction)).not.toHaveBeenCalled();
+      expect(existsSync(backup)).toBe(true);
+      expect(svc.state.session).toBeUndefined();
+      expect(svc.state.workKinds()).toEqual([]);
+      expect((svc.state as unknown as { backupTimer?: unknown }).backupTimer).toBeUndefined();
+      expect(await svc.state.runScheduledBackups()).toEqual([]);
+      const again = await openLibrary(path, deps);
+      try {
+        expect(again.mode).toBe("read-write");
+      } finally {
+        await again.close();
+      }
+    }
+    /** The same library reopened at a start nobody supersedes: the retry runs, as it should. */
+    async function expectAnOrdinaryReopenWorks(pid: string, backup: string): Promise<void> {
+      await svc.close();
+      await start({ now: () => clock.now });
+      await svc.state.reopenLast();
+      await svc.state.idle();
+      expect(vi.mocked(resumeDestruction)).toHaveBeenCalledWith(svc.state.session!.repo, pid);
+      expect(existsSync(backup)).toBe(false);
+      expect((svc.state as unknown as { backupTimer?: unknown }).backupTimer).toBeDefined();
+    }
+
+    it("superseded while the library's folder is still being opened: the late reopen is closed; no retry pass, no backup, no scheduler", async () => {
+      const { path, pid, backup } = await remembered();
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      await start({
+        now: () => clock.now,
+        openLibrary: async (root, d, o) => {
+          if (root === path) await gate;
+          return openLibrary(root, d, o);
+        },
+      });
+      const reopening = svc.state.reopenLast();
+      // The researcher's own choice (here: close) comes first.
+      await svc.state.closeLibrary();
+      release();
+      await reopening;
+      await expectNothingStarted(path, backup);
+      await expectAnOrdinaryReopenWorks(pid, backup);
+    });
+
+    it("superseded while the opened library is being adopted (its repository is being read): the same", async () => {
+      const { path, pid, backup } = await remembered();
+      let opened = false;
+      let superseded = false;
+      await start({
+        // The service's clock is read while the repository opens: the choice lands exactly there.
+        now: () => {
+          if (opened && !superseded) {
+            superseded = true;
+            void svc.state.closeLibrary();
+          }
+          return clock.now;
+        },
+        openLibrary: async (root, d, o) => {
+          const lib = await openLibrary(root, d, o);
+          if (root === path) opened = true;
+          return lib;
+        },
+      });
+      await svc.state.reopenLast();
+      expect(superseded).toBe(true);
+      await expectNothingStarted(path, backup);
+      await expectAnOrdinaryReopenWorks(pid, backup);
+    });
+  });
+});
+
 describe("review round 1: smaller route fixes (R99 minors)", () => {
   beforeEach(() => start());
 
@@ -950,23 +1898,8 @@ describe("review round 1: smaller route fixes (R99 minors)", () => {
     expect((await finished).data).toMatchObject({ jobId: r.json.jobId, done: 1, total: 1 });
   });
 
-  it("watches restarted after removing one keep reporting events", async () => {
-    await svc.close();
-    await start({ watchStabilityMs: 50 });
-    await openNewLibrary();
-    const pid = await newProject();
-    const { mkdir } = await import("node:fs/promises");
-    const keep = join(tmp, "watch-keep");
-    const drop = join(tmp, "watch-drop");
-    await mkdir(keep);
-    await mkdir(drop);
-    expect((await call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { dir: keep } })).status).toBe(200);
-    const w2 = (await call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { dir: drop } })).json;
-    expect((await call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${w2.id}` })).status).toBe(200);
-    const seen = nextEvent((e) => e.type === "job.progress" && e.data.kind === "watch" && e.data.event?.kind === "imported");
-    await writeFile(join(keep, "dropped.pdf"), await buildPdf({ title: "Dropped Later Into The Folder" }));
-    expect((await seen).data.projectId).toBe(pid);
-  }, 60_000);
+  // The watched-folder routes (adding by grant, what comes in is registered, a remove leaves the other watches
+  // running) are tested in watched-folders-routes.test.ts (Task W7).
 
   it("library errors map to their codes; a TypeError is 500 INTERNAL without its message", async () => {
     const { toApiError } = await import("./errors.js");
@@ -979,6 +1912,14 @@ describe("review round 1: smaller route fixes (R99 minors)", () => {
     expect(toApiError(new lib.PathEscapeError("x")).status).toBe(400);
     expect(toApiError(new lib.ExportDestinationError("x")).status).toBe(400);
     expect(toApiError(new lib.RestoreError("x")).status).toBe(400);
+  });
+
+  it("a file missing from the installation is 503 UNAVAILABLE with its plain message (not INTERNAL, not the user's fault)", async () => {
+    const { toApiError } = await import("./errors.js");
+    const lib = await import("@ao/library");
+    const t = toApiError(new lib.ResourceMissingError("the web page cleaner"));
+    expect([t.status, t.code]).toEqual([503, "UNAVAILABLE"]);
+    expect(t.message).toMatch(/web page cleaner is missing from the installation/);
   });
 });
 
@@ -1037,10 +1978,15 @@ describe("review round 2: library move (R102 N1–N3)", () => {
     const pid = await newProject();
     const dirA = await pdfFolder(20, "qa");
     const dirB = await pdfFolder(20, "qb");
-    const progA = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    // Both batches are held between items (holdBatch) so that each is still running when the move's
+    // quiesce reaches it: a is paused for the move by its own suspend, b's suspend never settles.
+    const progA = holdBatch((d) => d.done >= 2);
     const a = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dirA } } })).json.batchId;
     await progA;
+    const progB = holdBatch((d) => d.batchId !== a);
     const b = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dirB } } })).json.batchId;
+    await progB;
+    expect([a, b].map((id) => svc.state.session!.batches.has(id))).toEqual([true, true]); // both still running
     // Batch b cannot reach a safe point: its suspend never settles.
     const hb = svc.state.session!.batches.get(b)!.handle;
     hb.suspend = () => new Promise(() => {});
@@ -1058,9 +2004,11 @@ describe("review round 2: library move (R102 N1–N3)", () => {
     const path = await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(20);
-    const prog = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    // Held between items (holdBatch) so that it is still running when the close acts on it.
+    const prog = holdBatch((d) => d.done >= 2);
     const id = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json.batchId;
     await prog;
+    expect(svc.state.session!.batches.has(id)).toBe(true); // still running
     svc.state.session!.batches.get(id)!.handle.suspend = () => new Promise(() => {});
     await svc.close();
     await start();
@@ -1219,10 +2167,12 @@ describe("review round 3: move and background work (R106)", () => {
     const pid = await newProject();
     const dirA = await pdfFolder(20, "ma");
     const dirB = await pdfFolder(20, "mb");
-    const pa = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const pa = holdBatch((d) => d.done >= 2);
     const a = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dirA } } })).json.batchId;
     await pa;
+    const pb = holdBatch((d) => d.batchId !== a);
     const b = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dirB } } })).json.batchId;
+    await pb;
     const ha = svc.state.session!.batches.get(a)!.handle;
     const realA = ha.suspend.bind(ha);
     ha.suspend = () => new Promise((r) => setTimeout(r, 300)).then(realA); // lands late
@@ -1239,18 +2189,21 @@ describe("review round 3: move and background work (R106)", () => {
     await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(20, "undo");
-    const p = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 1);
+    const p = holdBatch((d) => d.done >= 1);
     const id = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json.batchId;
     await p;
     const r = await call({ method: "POST", url: `/imports/${id}/undo` });
     expect(r.status).toBe(409);
     expect(r.json.error.code).toBe("CONFLICT");
+    svc.state.session!.batches.get(id)!.handle.resume(); // let the held batch run to its end
     await svc.state.idle();
   });
 
   it("pending writes found by the move are 409 CONFLICT with a plain message, never POLICY_DENIED", async () => {
     const { toApiError } = await import("./errors.js");
-    const { MoveNotAllowedError } = await import("@ao/library");
+    const { MoveNotAllowedError, PendingWriteIncompleteError } = await import("@ao/library");
+    const inc = toApiError(new PendingWriteIncompleteError("019a7000-0000-7000-8000-0000000000c1", "The change could not be undone completely: a step failed."));
+    expect([inc.status, inc.code, inc.message]).toEqual([409, "CONFLICT", "The change could not be undone completely: a step failed."]);
     const e = toApiError(new MoveNotAllowedError("pending-writes" as never, "Some changes were interrupted"));
     expect([e.status, e.code]).toEqual([409, "CONFLICT"]);
   });
@@ -1271,7 +2224,7 @@ describe("review round 3: move and background work (R106)", () => {
     await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(20, "fo");
-    const p = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const p = holdBatch((d) => d.done >= 2);
     const id = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json.batchId;
     await p;
     const r = await call({ method: "POST", url: "/libraries/move", body: { dest } });
@@ -1406,7 +2359,7 @@ describe("review round 4: stopped work, in-flight changes, refusals, resumes (R1
     await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(20, "rs");
-    const p = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const p = holdBatch((d) => d.done >= 2);
     const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
     await p;
     expect((await call({ method: "POST", url: `/imports/${batchId}/cancel` })).status).toBe(200);
@@ -1602,7 +2555,8 @@ describe("integration: the extension's routes (R111)", () => {
     };
     return p;
   }
-  const yt = (k: string, i: number) => `https://www.youtube.com/watch?v=${(k + String(i).padStart(11, "0")).slice(-11)}`;
+  // Distinct links for distinct keys (Task 63: the same link still running in a project is not queued again).
+  const yt = (k: string, i: number) => `https://www.youtube.com/watch?v=${k}${String(i).padStart(10, "0")}`;
 
   it("R116: the project must allow browser capture as well as the downloader (403 POLICY_DENIED with the reason)", async () => {
     await start({ worker: fakeProvider({ fail: 99 }), pairing: { confirmPerMinute: 100 } });
@@ -1646,6 +2600,45 @@ describe("integration: the extension's routes (R111)", () => {
     // Once the queues have finished, the token may queue again.
     await svc.state.idle();
     expect((await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("d", 1)] })).status).toBe(200);
+    await svc.state.idle();
+  });
+
+  it("41a I3: closing the library while a links queue runs and another waits releases both slots (no 429 after reopening)", async () => {
+    const provider = slowProvider(40);
+    await start({ worker: provider, pairing: { confirmPerMinute: 100 } });
+    const path = await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const token = await pair();
+    const a = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [0, 1, 2].map((i) => yt("i", i)) });
+    const b = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("j", 1)] });
+    expect([a.status, b.status]).toEqual([200, 200]);
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await svc.state.idle();
+    // Both queues ended (one way or another) and say so.
+    expect(svc.state.captureQueue(b.json.queueId)?.finished).toBe(true);
+    const c = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("k", 1)] });
+    const d = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("l", 1)] });
+    expect([c.status, d.status], d.body).toEqual([200, 200]);
+    await svc.state.idle();
+  });
+
+  it("41a N4: a links queue carried across a library move keeps its slot (one running and one waiting, still)", async () => {
+    const provider = slowProvider(30);
+    await start({ worker: provider, pairing: { confirmPerMinute: 100 } });
+    await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const token = await pair();
+    const second = nextEvent((e) => e.type === "capture.progress" && e.data.done === 2);
+    const a = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: Array.from({ length: 12 }, (_, i) => yt("m", i)) });
+    expect(a.status, a.body).toBe(200);
+    await second;
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    expect(svc.state.captureQueue(a.json.queueId)?.finished).toBe(false);
+    const c = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("n", 1)] });
+    const d = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("o", 1)] });
+    expect([c.status, d.status]).toEqual([200, 429]);
     await svc.state.idle();
   });
 
@@ -1723,6 +2716,19 @@ describe("screens integration (R118): lock holder", () => {
       expect(body).not.toContain("4242");
       expect(body).not.toContain("ana");
     }
+  });
+
+  it("Task 58 M6: a read-only library's source list says its search is limited to titles", async () => {
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    expect((await call({ url: `/projects/${pid}/sources?text=anything` })).json).not.toHaveProperty("limited");
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    const now = new Date().toISOString();
+    await writeFile(join(path, ".lock"), JSON.stringify({ deviceId: "dev-other", hostname: "field-laptop", pid: 4242, openedAt: now, heartbeatAt: now, user: "ana" }));
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).json.mode).toBe("read-only");
+    const r = await call({ url: `/projects/${pid}/sources?text=anything` });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toMatchObject({ total: 0, items: [], limited: true });
   });
 
   it("(c) a writable library sends no lockedBy", async () => {
@@ -1827,20 +2833,521 @@ describe("screens integration (R118): resolve a pending write (R27)", () => {
     const list = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<{ txn: string; status: string; canKeep: boolean; canRollBack: boolean; project: string }>;
     expect(list.find((p) => p.txn === bad)).toMatchObject({ status: "invalid", canKeep: false, canRollBack: false, project: "library" });
     const g = list.find((p) => p.txn === good)!;
-    expect(g).toMatchObject({ status: "unverifiable", canKeep: false, canRollBack: true, project: "Study" });
+    // R131 a: an unverifiable marker offers no choice, and says why in plain words.
+    expect(g).toMatchObject({ status: "unverifiable", canKeep: false, canRollBack: false, project: "Study" });
+    expect((g as { detail?: string }).detail).toMatch(/backup/);
     expect(JSON.stringify(list)).not.toContain(path);
 
     const keep = await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "keep" } });
     expect(keep.status).toBe(409);
     expect(keep.json.error.code).toBe("CONFLICT");
+    const back = await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "roll-back" } });
+    expect(back.status).toBe(409);
+    expect(back.json.error.reason).toBe("allowed: none");
+    expect(await readFile(join(path, folder, "half-written.txt"), "utf8")).toBe("half");
     expect((await call({ method: "POST", url: `/libraries/pending-writes/${bad}/resolve`, body: { choice: "roll-back" } })).status).toBe(409);
     expect((await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "maybe" } })).status).toBe(400);
-    const r = await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "roll-back" } });
+    // A plainly uncommitted change (its marker matches the audit log) can be rolled back.
+    const fine = "019a7000-0000-7000-8000-0000000000c2";
+    const nowLines = (await readFile(join(path, folder, "audit", "0001.jsonl"), "utf8")).trim().split("\n").length;
+    await writeFile(
+      join(path, ".tmp", `txn-${fine}.json`),
+      JSON.stringify({ formatVersion: 1, txn: fine, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: nowLines, entries: [{ kind: "created", path: `${folder}/half-written-2.txt` }] }),
+    );
+    await writeFile(join(path, folder, "half-written-2.txt"), "half");
+    const listed = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<{ txn: string }>;
+    expect(listed.find((p) => p.txn === fine)).toMatchObject({ status: "uncommitted", canKeep: false, canRollBack: true });
+    const r = await call({ method: "POST", url: `/libraries/pending-writes/${fine}/resolve`, body: { choice: "roll-back" } });
     expect(r.status, r.body).toBe(200);
-    expect(r.json).toMatchObject({ txn: good, choice: "roll-back" });
-    expect((await call({ url: "/libraries/pending-writes" })).json.pendingWrites.map((p: { txn: string }) => p.txn)).toEqual([bad]);
+    expect(r.json).toMatchObject({ txn: fine, choice: "roll-back" });
+    await expect(readFile(join(path, folder, "half-written-2.txt"))).rejects.toThrow();
+    expect((await call({ url: "/libraries/pending-writes" })).json.pendingWrites.map((p: { txn: string }) => p.txn).sort()).toEqual([bad, good].sort());
     const audit = JSON.stringify((await call({ url: `/projects/${pid}/audit` })).json);
     expect(audit).toContain("txn.resolve");
     expect((await call({ method: "POST", url: `/libraries/pending-writes/${"019a7000-0000-7000-8000-0000000000ff"}/resolve`, body: { choice: "keep" } })).status).toBe(404);
+  });
+});
+
+describe("Task 46b D2 (R137): a library row's needsReview means an item waits in the import review queue", () => {
+  beforeEach(() => start());
+
+  it("is true while the source's review item is pending and false once it is decided, whatever the fields' verification", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = join(tmp, "in");
+    await fixturePdf("a.pdf", "First Paper on Rivers");
+    await fixturePdf("b.pdf", "Second Paper on Lakes");
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir }, options: {} } })).json;
+    await svc.state.idle();
+    const pending = (await call({ url: `/imports/${batchId}/review` })).json.items as Array<{ id: string; sourceId: string }>;
+    expect(pending.length, "the fixture's items wait for review (no lookups)").toBeGreaterThan(1);
+    const rows = async () => (await call({ url: `/projects/${pid}/sources?limit=100` })).json.items as Array<{ id: string; needsReview: boolean }>;
+    const waiting = new Set(pending.map((p) => p.sourceId));
+    for (const r of await rows()) expect(r.needsReview, r.id).toBe(waiting.has(r.id));
+
+    const [first, ...rest] = pending;
+    const statuses = async (sid: string) => ((await call({ url: `/projects/${pid}/sources/${sid}` })).json as { fields: Array<{ field: string; status: string }> }).fields.map((f) => `${f.field}:${f.status}`);
+    const before = await statuses(first!.sourceId);
+    const decided = await call({ method: "POST", url: `/review/${first!.id}/decide`, body: { projectId: pid, decision: { action: "accept" } } });
+    expect(decided.status, decided.body).toBe(200);
+    const after = await rows();
+    expect(after.find((r) => r.id === first!.sourceId)?.needsReview).toBe(false);
+    for (const p of rest) expect(after.find((r) => r.id === p.sourceId)?.needsReview).toBe(true);
+    // Accepting does not confirm the fields (R137): the source's verification is unchanged.
+    expect(await statuses(first!.sourceId)).toEqual(before);
+
+    // Every other decision clears it too (keep-both here), and a text search reports the same.
+    for (const p of rest) expect((await call({ method: "POST", url: `/review/${p.id}/decide`, body: { projectId: pid, decision: { action: "keep-both" } } })).status).toBe(200);
+    expect((await rows()).every((r) => !r.needsReview)).toBe(true);
+    const found = (await call({ url: `/projects/${pid}/sources?text=Rivers` })).json.items as Array<{ needsReview: boolean }>;
+    expect(found.length).toBeGreaterThan(0);
+    expect(found.every((r) => !r.needsReview)).toBe(true);
+  });
+});
+
+describe("Task 46b fix round 1 (R172): needsReview means the source has a pending entry of any kind in the project's review queue", () => {
+  beforeEach(() => start());
+
+  const rows = async (pid: string) => (await call({ url: `/projects/${pid}/sources?limit=500` })).json.items as Array<{ id: string; needsReview: boolean; locked: boolean }>;
+  const badge = async (pid: string, sid: string) => (await rows(pid)).find((r) => r.id === sid)?.needsReview;
+  /** The project's pending review entries, read from the index (no route lists entries outside a batch). */
+  const pendingEntries = (pid: string) =>
+    svc.state.session!.index!.db.prepare("SELECT id, kind, batch_id AS batchId, source_id AS sourceId FROM review_items WHERE project_id = ? AND status = 'pending'").all(pid) as Array<{
+      id: string;
+      kind: string;
+      batchId: string | null;
+      sourceId: string | null;
+    }>;
+  const decide = (pid: string, itemId: string, decision: Record<string, unknown>) => call({ method: "POST", url: `/review/${itemId}/decide`, body: { projectId: pid, decision } });
+  const importFolder = async (pid: string, titles: string[], folder: string) => {
+    for (const [i, t] of titles.entries()) await fixturePdf(join("..", folder, `p${i}.pdf`), t);
+    const r = await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: join(tmp, folder) }, options: {} } });
+    expect(r.status, r.body).toBe(200);
+    await svc.state.idle();
+    const items = (await call({ url: `/imports/${r.json.batchId}/review` })).json.items as Array<{ id: string; sourceId: string }>;
+    expect(items.length, "every fixture item waits for review (no lookups)").toBe(titles.length);
+    return { batchId: r.json.batchId as string, items };
+  };
+
+  it("a source attached by drag and drop whose outcome is needs-review carries the badge (an import entry with no batch), and deciding it clears it", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } });
+    expect(att.status, att.body).toBe(200);
+    const [o] = att.json.items as Array<{ outcome: string; sourceId: string }>;
+    expect(o!.outcome).toBe("needs-review");
+    const [entry] = pendingEntries(pid);
+    expect(entry).toMatchObject({ kind: "import", batchId: null, sourceId: o!.sourceId });
+    expect(await badge(pid, o!.sourceId)).toBe(true);
+    expect((await decide(pid, entry!.id, { action: "accept" })).status).toBe(200);
+    expect(await badge(pid, o!.sourceId)).toBe(false);
+  });
+
+  it("a captured source saved with conflicting fields carries the badge (a verification entry, as link and profile capture queue it)", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc.state.session!.repo;
+    // createSource's reviewItem is how link-capture.ts and profile-capture.ts queue a capture with conflicts.
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "webpage", title: { variants: [{ lang: "en", kind: "original", value: "A captured page" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: await fixturePdf("page.pdf"), role: "original", handling: "copy" }],
+      {
+        provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+        reviewItem: { fields: { "/title": "conflict" }, reasons: ["The page and its metadata disagree on the title."] },
+      },
+    );
+    expect(pendingEntries(pid)).toEqual([expect.objectContaining({ kind: "verification", sourceId: sf.source.id })]);
+    expect(await badge(pid, sf.source.id)).toBe(true);
+  });
+
+  it("an import batch item: on while pending, off after each kind of decision (accept, edit and accept, skip, merge, keep-both)", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const { items } = await importFolder(pid, ["Rivers of the North", "Lakes of the South", "Deltas of the East", "Estuaries of the West", "Marshes Everywhere"], "batch");
+    for (const it of items) expect(await badge(pid, it.sourceId), it.sourceId).toBe(true);
+    const [a, b, c, d, e] = items as [(typeof items)[0], (typeof items)[0], (typeof items)[0], (typeof items)[0], (typeof items)[0]];
+    const sf = await svc.state.session!.repo.getSource(pid, b.sourceId);
+    const draft = { ...sf.source, title: { variants: [{ lang: "en", kind: "original", value: "Lakes of the South, edited" }] } };
+    expect((await decide(pid, a.id, { action: "accept" })).status).toBe(200);
+    expect((await decide(pid, b.id, { action: "accept", draft })).status).toBe(200);
+    expect((await decide(pid, c.id, { action: "skip" })).status).toBe(200);
+    expect((await decide(pid, d.id, { action: "merge", sourceId: a.sourceId })).status).toBe(200);
+    const left = await rows(pid);
+    for (const s of [a, b]) expect(left.find((r) => r.id === s.sourceId)?.needsReview, s.sourceId).toBe(false);
+    for (const s of [c, d]) expect(left.find((r) => r.id === s.sourceId), "skipped or merged away: no row").toBeUndefined();
+    expect(left.find((r) => r.id === e.sourceId)?.needsReview).toBe(true);
+    expect((await decide(pid, e.id, { action: "keep-both" })).status).toBe(200);
+    expect((await rows(pid)).every((r) => !r.needsReview)).toBe(true);
+    expect(pendingEntries(pid)).toEqual([]);
+  });
+
+  it("off after the import is undone: no entry of the batch is left pending, and an older source merged into stays as it was", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const kept = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf("kept.pdf", "An Older Attached Paper")] } });
+    const keptId = kept.json.items[0].sourceId as string;
+    const [keptEntry] = pendingEntries(pid);
+    expect((await decide(pid, keptEntry!.id, { action: "accept" })).status).toBe(200);
+    const { batchId, items } = await importFolder(pid, ["Rivers of the North", "Lakes of the South"], "undo");
+    expect((await decide(pid, items[0]!.id, { action: "merge", sourceId: keptId })).status).toBe(200);
+    expect(await badge(pid, items[1]!.sourceId)).toBe(true);
+    const undo = await call({ method: "POST", url: `/imports/${batchId}/undo` });
+    expect(undo.status, undo.body).toBe(200);
+    expect(pendingEntries(pid)).toEqual([]);
+    expect((await rows(pid)).map((r) => [r.id, r.needsReview])).toEqual([[keptId, false]]);
+  });
+
+  it("a locked project's rows do not claim needsReview: its queue cannot be read while locked", async () => {
+    await openNewLibrary();
+    const pid = await newProject(OPEN_GOV, true);
+    const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } });
+    const sid = att.json.items[0].sourceId as string;
+    expect(await badge(pid, sid)).toBe(true);
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    const locked = (await rows(pid)).find((r) => r.id === sid);
+    expect(locked).toMatchObject({ locked: true, needsReview: false });
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    expect(await badge(pid, sid)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task 51 fix round 1 (R142 item 3): the worker client follows the live index after a rebuild
+
+describe("worker client and the index (Task 51)", () => {
+  it("a job's status change after rebuild-index reaches the rebuilt database's row", async () => {
+    const { createServer } = await import("node:http");
+    const { mkdir } = await import("node:fs/promises");
+    const { WorkerClient } = await import("@ao/library");
+    const { workerClientFor } = await import("./state.js");
+    let n = 0;
+    const outputs = new Map<string, string>();
+    const server = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      res.writeHead(req.method === "POST" ? 202 : 200, { "Content-Type": "application/json" });
+      if (req.method === "POST" && req.url === "/jobs") {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { output: string };
+        await mkdir(dirname(body.output), { recursive: true });
+        await writeFile(body.output, "jpeg");
+        const id = `w${++n}`;
+        outputs.set(id, body.output);
+        return res.end(JSON.stringify({ id }));
+      }
+      const id = /^\/jobs\/([^/]+)$/.exec(req.url ?? "")?.[1] ?? "";
+      res.end(JSON.stringify({ id, status: "done", progress: 1, result: { output: outputs.get(id), meta: {} } }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const endpoint = { baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: "t" };
+    try {
+      const provider: WorkerProvider = {
+        start: async () => ({
+          clientFor: (repo, index) => workerClientFor(WorkerClient, endpoint, repo, index),
+          versions: async () => ({}),
+          updateTools: async () => ({ ytDlp: { old: null, new: null, managed: false }, galleryDl: { version: null, pinned: true } }),
+          stop: async () => {},
+        }),
+      };
+      await start({ worker: provider, autoStartWorker: true });
+      const root = await openNewLibrary();
+      const pid = await newProject();
+      const client = await svc.state.workerClient();
+      // Job paths inside the library (R379).
+      const input = join(root, "test-files", "a.png");
+      await mkdir(dirname(input), { recursive: true });
+      await writeFile(input, "png");
+      expect((await call({ method: "POST", url: "/libraries/rebuild-index" })).status).toBe(200);
+      const r = await client.submit(pid, { type: "image.proxy", input, output: join(root, ".tmp", "test-files", "out", "a.jpg"), params: {} });
+      const db = svc.state.session!.index!.db;
+      expect(db.prepare("SELECT status FROM jobs WHERE id = ?").get(r.id)).toEqual({ status: "done" });
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task 51 fix round 2 (N-2, R106 C1 + R142): the rerun at an unlock is registered work
+
+describe("worker jobs rerun at an unlock (Task 51 N-2)", () => {
+  let stub: { close(): Promise<void>; runs: Array<{ n: number; cancelled: boolean }> } | undefined;
+  afterEach(async () => {
+    await stub?.close();
+    stub = undefined;
+  });
+
+  /**
+   * A service whose worker is a stand-in; an encrypted project whose first job is cancelled by a
+   * lock that lands while the worker accepts it (R142). The project is left locked. Reruns take `ms`.
+   */
+  async function lockCancelledJob(ms: number) {
+    const { createServer } = await import("node:http");
+    const { mkdir } = await import("node:fs/promises");
+    const { WorkerClient } = await import("@ao/library");
+    const { workerClientFor } = await import("./state.js");
+    const runs: Array<{ n: number; cancelled: boolean }> = [];
+    const outputs = new Map<string, string>();
+    let onFirst: (() => void) | undefined;
+    const server = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      res.setHeader("Content-Type", "application/json");
+      const m = /^\/jobs\/([^/]+)(\/cancel)?$/.exec(req.url ?? "");
+      if (req.method === "POST" && req.url === "/jobs") {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { output: string };
+        const run = { n: runs.length + 1, cancelled: false };
+        runs.push(run);
+        if (run.n === 1) onFirst?.();
+        else await new Promise((r) => setTimeout(r, ms));
+        await mkdir(dirname(body.output), { recursive: true });
+        await writeFile(body.output, "jpeg");
+        outputs.set(`w${run.n}`, body.output);
+        res.statusCode = 202;
+        return res.end(JSON.stringify({ id: `w${run.n}` }));
+      }
+      const run = runs[Number((m?.[1] ?? "w0").slice(1)) - 1];
+      if (m?.[2] && run) run.cancelled = true;
+      res.end(JSON.stringify({ id: m?.[1], status: run?.cancelled ? "cancelled" : "done", progress: 1, result: { output: outputs.get(m?.[1] ?? ""), meta: {} } }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    stub = { runs, close: () => new Promise<void>((r) => server.close(() => r())) };
+    const endpoint = { baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: "t" };
+    const provider: WorkerProvider = {
+      start: async () => ({
+        clientFor: (repo, index) => workerClientFor(WorkerClient, endpoint, repo, index),
+        versions: async () => ({}),
+        updateTools: async () => ({ ytDlp: { old: null, new: null, managed: false }, galleryDl: { version: null, pinned: true } }),
+        stop: async () => {},
+      }),
+    };
+    await start({ worker: provider, autoStartWorker: true });
+    const root = await openNewLibrary();
+    const pid = await newProject(OPEN_GOV, true);
+    const client = await svc.state.workerClient();
+    await svc.state.idle();
+    onFirst = () => svc.state.session!.repo.lockProject(pid);
+    // Job paths inside the library (R379).
+    const input = join(root, "test-files", "a.png");
+    await mkdir(dirname(input), { recursive: true });
+    await writeFile(input, "png");
+    const err = await client.submit(pid, { type: "image.proxy", input, output: join(root, ".tmp", "test-files", "out", "a.jpg"), params: {} }).catch((e: unknown) => e);
+    expect((err as Error).name).toBe("ProjectLockedError");
+    const folder = (await call({ url: "/projects" })).json.projects.find((p: { id: string }) => p.id === pid).folder as string;
+    const journalLines = async (libRoot: string) =>
+      (await readFile(join(libRoot, ...folder.split("/"), "jobs", "journal.jsonl"), "utf8")).split("\n").filter(Boolean).length;
+    expect(await journalLines(root)).toBe(2); // queued, cancelled (PROJECT_LOCKED)
+    return { pid, root, journalLines };
+  }
+
+  const unlock = async (pid: string) => expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+
+  it("the unlock resubmits the job once, as registered work", async () => {
+    const { pid, root, journalLines } = await lockCancelledJob(50);
+    await unlock(pid);
+    expect(svc.state.workKinds()).toContain("worker-resume");
+    await svc.state.idle();
+    expect(stub!.runs).toEqual([
+      { n: 1, cancelled: true },
+      { n: 2, cancelled: false },
+    ]);
+    expect(await journalLines(root)).toBe(5); // + claim (queued), running, done
+  });
+
+  it("a move started while the rerun is writing waits for it", async () => {
+    const { pid, journalLines } = await lockCancelledJob(400);
+    await unlock(pid);
+    while (stub!.runs.length < 2) await new Promise((r) => setTimeout(r, 5)); // the rerun is in the worker
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    await svc.state.idle();
+    expect(stub!.runs.filter((r) => !r.cancelled)).toHaveLength(1);
+    expect(await journalLines(join(tmp, "Moved"))).toBe(5); // the rerun finished in the library that was copied
+    // and the moved copy does not run it again once the project is unlocked there
+    await unlock(pid);
+    await svc.state.idle();
+    expect(stub!.runs.filter((r) => !r.cancelled)).toHaveLength(1);
+  });
+
+  it("a close started while the rerun is writing waits for it", async () => {
+    const { pid, root, journalLines } = await lockCancelledJob(400);
+    await unlock(pid);
+    while (stub!.runs.length < 2) await new Promise((r) => setTimeout(r, 5)); // the rerun is in the worker
+    await svc.state.closeLibrary();
+    expect(stub!.runs.filter((r) => !r.cancelled)).toHaveLength(1);
+    expect(await journalLines(root)).toBe(5);
+  });
+
+  it("nothing is resubmitted while a move holds the library", async () => {
+    const { pid } = await lockCancelledJob(0);
+    await svc.state.session!.repo.unlockProject(pid, PASS);
+    svc.state.moving = true;
+    try {
+      svc.state.resumeProject(svc.state.session!, pid, { workerJobs: true });
+      expect(svc.state.workKinds()).not.toContain("worker-resume");
+    } finally {
+      svc.state.moving = false;
+    }
+    await svc.state.idle();
+    expect(stub!.runs).toHaveLength(1);
+  });
+});
+
+describe("R379 (FR-A12): a dropped recording's name never leaves the device", () => {
+  beforeEach(() => start());
+
+  it("a recording dropped in a project under the default rules makes no title search request", async () => {
+    // The made-up services as the global dispatcher (nothing reaches the network); every request is kept.
+    const previous = getGlobalDispatcher();
+    const agent = new MockAgent();
+    agent.disableNetConnect();
+    const sent: string[] = [];
+    for (const origin of ["https://api.openalex.org", "https://api.crossref.org"]) {
+      agent
+        .get(origin)
+        .intercept({ path: () => true, method: "GET" })
+        .reply((o) => (sent.push(`${origin}${String(o.path)}`), { statusCode: 404, data: "{}", responseOptions: { headers: { "content-type": "application/json" } } }))
+        .persist();
+    }
+    setGlobalDispatcher(agent);
+    try {
+      await openNewLibrary();
+      // The default rules (identifiable data, encryption required), with a legal basis for dropped files.
+      const pid = await newProject('consent:\n  defaultLegalBasis:\n    manual-upload: "legitimate interest; ethics approval 2026-01"\n', true);
+      const m4a = Buffer.alloc(64);
+      m4a.writeUInt32BE(32, 0);
+      m4a.write("ftypM4A ", 4, "latin1");
+      const path = join(tmp, "in", "Gonzalez 2024 Interview about her eviction.m4a");
+      await import("node:fs/promises").then((f) => f.mkdir(dirname(path), { recursive: true }));
+      await writeFile(path, m4a);
+      const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [path] } });
+      expect(att.status, att.body).toBe(200);
+      expect(att.json.items[0], att.body).toMatchObject({ outcome: expect.stringMatching(/created|needs-review/u), sourceId: expect.any(String) });
+      expect(sent).toEqual([]);
+      const one = await call({ url: `/projects/${pid}/sources/${att.json.items[0].sourceId as string}` });
+      expect(one.json.source.title.variants[0].value).toBe("Interview about her eviction");
+    } finally {
+      setGlobalDispatcher(previous);
+      await agent.close();
+    }
+  });
+});
+
+describe("move/status says what is true after a lost connection (R379, FR-A19)", () => {
+  it("while a move runs, move/status says so; afterwards it does not", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inMove = new Promise<void>((r) => (entered = r));
+    await start({ beforeExecuteMove: async () => (entered(), gate) });
+    await openNewLibrary();
+    await newProject();
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ pending: null, running: false, failed: null });
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "a-1" } });
+    await inMove;
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ pending: null, running: true });
+    release();
+    expect((await moving).body).toContain('"done":true');
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ running: false, pending: { newRoot: join(tmp, "Moved") } });
+  });
+
+  it("a move that failed is kept with its attempt and destination, for 15 minutes or until the next move starts", async () => {
+    const clock = { now: new Date("2026-11-10T10:00:00Z") };
+    let fail = true;
+    await start({
+      now: () => clock.now,
+      beforeExecuteMove: async () => {
+        if (fail) throw new Error("the copy failed");
+      },
+    });
+    await openNewLibrary();
+    await newProject();
+    const dest = join(tmp, "Moved");
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-1" } })).body).toContain("error");
+    const st = (await call({ url: "/libraries/move/status" })).json;
+    expect(st).toMatchObject({ running: false, pending: null, failed: { newRoot: dest, attempt: "a-1", error: { code: expect.any(String), message: expect.any(String) } } });
+    expect(JSON.stringify(st.failed)).not.toContain(join(tmp, "Lib"));
+    clock.now = new Date(clock.now.getTime() + 16 * 60_000);
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toBeNull();
+    // A new failure, then a new move: the failure is forgotten as the new move starts.
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-2" } })).body).toContain("error");
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toMatchObject({ attempt: "a-2" });
+    fail = false;
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-3" } })).body).toContain('"done":true');
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toBeNull();
+  });
+
+  it("a status asked in the same tick as the move request already says running (R399 b)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    await start({ beforeExecuteMove: async () => gate });
+    await openNewLibrary();
+    await newProject();
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "a-1" } });
+    const st = call({ url: "/libraries/move/status" });
+    try {
+      expect((await st).json).toMatchObject({ pending: null, running: true });
+    } finally {
+      release();
+    }
+    expect((await moving).body).toContain('"done":true');
+    expect((await call({ url: "/libraries/move/status" })).json.running).toBe(false);
+  });
+
+  it("a move refused after it was asked for (background work that could not be paused) keeps its reason under its attempt (R399 c)", async () => {
+    let fail = true;
+    await start({
+      beforeExecuteMove: async () => {
+        if (fail) throw new Error("the copy failed");
+      },
+    });
+    await openNewLibrary();
+    await newProject();
+    const dest = join(tmp, "Moved");
+    // An earlier failure, kept.
+    await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-1" } });
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toMatchObject({ attempt: "a-1" });
+    // A request refused with no attempt of its own does not erase it.
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: 7 } })).status).toBe(400);
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ running: false, failed: { attempt: "a-1" } });
+    // Background work that could not be paused: the 409 before the stream, kept with its reason.
+    fail = false;
+    const quiesce = svc.state.quiesce.bind(svc.state);
+    svc.state.quiesce = async () => {
+      throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
+    };
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a-2" } });
+    expect(r.status).toBe(409);
+    const st = (await call({ url: "/libraries/move/status" })).json;
+    expect(st).toMatchObject({ running: false, pending: null, failed: { newRoot: dest, attempt: "a-2", error: { code: "CONFLICT", message: expect.stringMatching(/^Some background work could not be paused/) } } });
+    svc.state.quiesce = quiesce;
+  });
+
+  it("an attempt that is not a short plain string is refused before anything starts", async () => {
+    await start();
+    await openNewLibrary();
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "x".repeat(200) } });
+    expect(r.status).toBe(400);
+    expect((await call({ url: "/libraries/move/status" })).json.running).toBe(false);
+  });
+
+  it("a finished move's warnings are kept with its status, as long as its token (R379, I2)", async () => {
+    let pid = "";
+    await start({ beforeExecuteMove: async () => void (repoSeams.failAuditAppendFor = pid) });
+    await openNewLibrary();
+    pid = await newProject();
+    const dest = join(tmp, "Moved");
+    let moved;
+    try {
+      moved = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    } finally {
+      repoSeams.failAuditAppendFor = undefined;
+    }
+    const done = JSON.parse(moved.body.trim().split("\n").at(-1)!);
+    expect(done.done, moved.body).toBe(true);
+    expect(done.result.warnings.join(" ")).toMatch(/library\.move audit event could not be recorded/);
+    const st = (await call({ url: "/libraries/move/status" })).json;
+    expect(st.pending).toMatchObject({ newRoot: dest, confirmToken: done.result.confirmToken, warnings: done.result.warnings });
+    expect(JSON.stringify(st.pending.warnings)).not.toContain(tmp);
   });
 });

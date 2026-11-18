@@ -30,7 +30,7 @@
  */
 import type { Dirent } from "node:fs";
 import * as fsp from "node:fs/promises";
-import { createRequire } from "node:module";
+import { libraryVersion } from "../resources.js";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileTypeFromFile } from "file-type";
 import type { Asset, Creator, ImportOptionsInput, SourceType } from "@ao/core";
@@ -41,7 +41,7 @@ import { startBatch, type BatchHandle, type BulkImportDeps } from "./bulk/run.js
 import type { ImportSourceAdapter, ScanContext, ScanFile, ScanItem } from "./bulk/scan.js";
 import { sha256File } from "./common.js";
 
-const VERSION: string = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
+const VERSION: string = libraryVersion();
 
 const RAW_EXTS = new Set(["dng", "cr2", "cr3", "nef", "arw", "raf", "orf"]);
 /** Stills a Live Photo or a RAW+JPEG pair can have. */
@@ -321,7 +321,9 @@ export function deviceAdapter(dir: string, opts: DeviceAdapterOptions = {}): Imp
       const all = await collect(root, signal, note);
       const { kept, copies } = await splitDuplicates(all, signal);
       await readMetadata(all, signal);
-      for (const g of groupDeviceFiles(kept)) {
+      const groups = groupDeviceFiles(kept);
+      ctx?.total?.(groups.length + copies.length); // R392: every group and copy below is one item, known before the first
+      for (const g of groups) {
         signal.throwIfAborted();
         yield await toItem(g, researcher);
       }

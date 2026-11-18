@@ -1,0 +1,25 @@
+{
+  "status": "ok",
+  "message-type": "work-list",
+  "message": {
+    "total-results": 2,
+    "items": [
+      {
+        "DOI": "10.5555/ao.find.rivers.2021",
+        "type": "journal-article",
+        "title": ["Rivers and Memory in Upland Villages"],
+        "author": [{ "given": "Amara", "family": "Okafor" }, { "given": "Henrik", "family": "Lindqvist" }],
+        "issued": { "date-parts": [[2021, 3, 4]] },
+        "container-title": ["Journal of Upland Studies"]
+      },
+      {
+        "DOI": "10.5555/ao.find.rivers.preprint.2020",
+        "type": "posted-content",
+        "title": ["Rivers and memory in upland villages"],
+        "author": [{ "given": "Amara", "family": "Okafor" }, { "given": "Henrik", "family": "Lindqvist" }],
+        "issued": { "date-parts": [[2020, 11, 2]] },
+        "publisher": "Fixture Preprints"
+      }
+    ]
+  }
+}

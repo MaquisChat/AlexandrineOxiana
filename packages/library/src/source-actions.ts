@@ -6,19 +6,14 @@
  *    audited and thrown as PolicyDeniedError; an allow is not audited — each capture audits its own).
  *  - confirmField: the researcher sets a field's value; recorded as `user` field evidence and the
  *    verification recomputed in the same change, so an agreeing value becomes `user-confirmed`.
- *  - addTranscriptVersion: a human-edited transcript stored as a new derived version (never
- *    replacing the machine one).
  *  - readAssetText: the text of a derived text asset (transcript, OCR), decrypted when needed.
  */
-import { randomUUID } from "node:crypto";
-import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import { recheckSourceFile, type Asset, type Provenance, type Source, type SourceFile } from "@ao/core";
 import { classifyUrl } from "./capture/platforms.js";
 import { decryptBytes, readMaybe } from "./repo/io.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, updateSourceRechecked, type Repo } from "./repo/repo.js";
 import { InvalidInputError, NotFoundError } from "./repo/errors.js";
-import { activeTemp } from "./tmp-registry.js";
 
 /**
  * Evaluates (and on deny, audits and throws) the `capture` decision for each platform the links are on,
@@ -36,12 +31,14 @@ export async function checkCaptureAllowed(repo: Repo, projectId: string, urls: s
   }
 }
 
-/** Source fields a person may set through confirmField (top-level bibliographic fields). */
+/**
+ * Source fields a person may set through confirmField (top-level bibliographic fields). The
+ * identifiers are not here: they are confirmed one at a time as `/identifiers/<key>` (R149).
+ */
 export const CONFIRMABLE_FIELDS: ReadonlySet<string> = new Set([
   "title",
   "creators",
   "issued",
-  "identifiers",
   "container",
   "publisher",
   "type",
@@ -64,6 +61,8 @@ export const CONFIRMABLE_FIELDS: ReadonlySet<string> = new Set([
  * value agrees). Throws TypeError for a field that cannot be set this way or an invalid value.
  */
 export async function confirmField(repo: Repo, projectId: string, sourceId: string, field: string, value: unknown): Promise<SourceFile> {
+  const ident = /^\/?identifiers\/(.+)$/.exec(field);
+  if (ident) return confirmIdentifier(repo, projectId, sourceId, ident[1]!, value);
   const name = field.replace(/^\//, "");
   if (!CONFIRMABLE_FIELDS.has(name)) throw new InvalidInputError(`"${field}" is not a field that can be set here`);
   const at = new Date().toISOString();
@@ -71,6 +70,48 @@ export async function confirmField(repo: Repo, projectId: string, sourceId: stri
   return updateSourceRechecked(repo, projectId, sourceId, { [name]: value } as Partial<Omit<Source, "id">>, {
     fieldEvidence: (cur) => [...cur.fieldEvidence.filter((e) => !(e.field === pointer && e.source.kind === "user")), { field: pointer, value, source: { kind: "user" }, at }],
     verification: (next) => recheckSourceFile(next, {}).verification,
+    // The capture entries this confirm settles are resolved in this same change (R176 1).
+    resolveReview: "confirmation",
+    // The audit entry names the field and whether the value was kept or changed (R191).
+    confirmed: [pointer],
+  });
+}
+
+/**
+ * Identifiers a person may confirm one at a time (R149), named as the verification report names
+ * them: `/identifiers/<key>`. `platform` is a classification, not an identifier, and is not here.
+ */
+export const CONFIRMABLE_IDENTIFIERS: ReadonlySet<string> = new Set(["doi", "isbn", "issn", "url", "platformPostId", "arxiv"]);
+const IDENTIFIER_MAX = 2048;
+
+const identifierText = (v: unknown): v is string => typeof v === "string" && v.trim() !== "" && v.length <= IDENTIFIER_MAX;
+
+/**
+ * One identifier set by the researcher and recorded as their evidence at `/identifiers/<key>`, the
+ * pointer the verification report uses, so the badge can become user-confirmed (R149). The other
+ * identifiers are kept. ISBN is a list in the record: a single ISBN is recorded as a list of one.
+ */
+async function confirmIdentifier(repo: Repo, projectId: string, sourceId: string, key: string, raw: unknown): Promise<SourceFile> {
+  if (!CONFIRMABLE_IDENTIFIERS.has(key)) throw new InvalidInputError(`"/identifiers/${key}" is not a field that can be set here`);
+  let value: string | string[];
+  if (key === "isbn") {
+    const list = typeof raw === "string" ? [raw] : raw;
+    if (!Array.isArray(list) || list.length === 0 || list.length > 50 || !list.every(identifierText)) throw new InvalidInputError("an ISBN must be text (or a list of them)");
+    value = list.map((x) => x.trim());
+  } else {
+    if (!identifierText(raw)) throw new InvalidInputError(`the ${key} must be text of at most ${IDENTIFIER_MAX} characters`);
+    value = raw.trim();
+  }
+  const pointer = `/identifiers/${key}`;
+  const at = new Date().toISOString();
+  // The other identifiers are taken from the source as read inside the governed change, so two
+  // confirms at once both land (re-review N2: no lost update).
+  return updateSourceRechecked(repo, projectId, sourceId, (cur) => ({ identifiers: { ...cur.identifiers, [key]: value } }), {
+    fieldEvidence: (c) => [...c.fieldEvidence.filter((e) => !(e.field === pointer && e.source.kind === "user")), { field: pointer, value, source: { kind: "user" }, at }],
+    verification: (next) => recheckSourceFile(next, {}).verification,
+    // The capture entries this confirm settles are resolved in this same change (R176 1).
+    resolveReview: "confirmation",
+    confirmed: [pointer],
   });
 }
 
@@ -98,59 +139,4 @@ export function transcriptVersions(sf: SourceFile): Asset[] {
   return sf.assets
     .filter((a) => a.role === "derived" && a.kind === "transcript" && a.status !== "destroyed")
     .sort((a, b) => (a.derivation?.at ?? "").localeCompare(b.derivation?.at ?? ""));
-}
-
-/**
- * Stores a human-edited transcript as a new version (derived asset, tool `human-edit`) next to the
- * versions it was edited from; `basedOn` is the version edited (its parents are inherited, so the
- * new version derives from the same media).
- */
-export async function addTranscriptVersion(
-  repo: Repo,
-  projectId: string,
-  sourceId: string,
-  input: { text: string; format: "vtt" | "txt"; basedOn?: string; lang?: string },
-): Promise<Asset> {
-  if (typeof input.text !== "string" || input.text.length === 0) throw new InvalidInputError("the transcript text is empty");
-  if (Buffer.byteLength(input.text, "utf8") > ASSET_TEXT_MAX_BYTES) throw new InvalidInputError("the transcript is too long");
-  if (input.format !== "vtt" && input.format !== "txt") throw new InvalidInputError('format must be "vtt" or "txt"');
-  if (input.format === "vtt" && !/^﻿?WEBVTT/.test(input.text)) throw new InvalidInputError("a WebVTT transcript must start with WEBVTT");
-  const sf = await repo.getSource(projectId, sourceId);
-  let parents: string[];
-  if (input.basedOn) {
-    const base = transcriptVersions(sf).find((a) => a.id === input.basedOn);
-    if (!base) throw new NotFoundError("Transcript", input.basedOn);
-    parents = base.derivation?.parents?.length ? [...base.derivation.parents] : [base.id];
-  } else {
-    const media = sf.assets.find((a) => a.role === "original" && a.status !== "destroyed" && (a.mime.startsWith("audio/") || a.mime.startsWith("video/")));
-    parents = media ? [media.id] : [];
-  }
-  const root = repoLibrary(repo).root;
-  const name = `worker-edit-${randomUUID()}`;
-  const work = join(root, ".tmp", name);
-  activeTemp.add(name);
-  try {
-    await fsp.mkdir(work, { recursive: true, mode: 0o700 });
-    const file = join(work, `transcript.${input.format}`);
-    await fsp.writeFile(file, input.text, { mode: 0o600 });
-    return await repo.addDerivedAsset(projectId, sourceId, {
-      fromPath: file,
-      kind: "transcript",
-      ...(input.lang ? { lang: input.lang } : {}),
-      tool: "human-edit",
-      ext: input.format,
-      derivation: {
-        parents,
-        operation: "human-edit",
-        provider: "researcher",
-        ranAt: "local",
-        params: input.basedOn ? { basedOn: input.basedOn } : {},
-        at: new Date().toISOString(),
-        triggeredBy: "user",
-      },
-    });
-  } finally {
-    await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
-    activeTemp.delete(name);
-  }
 }

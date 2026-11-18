@@ -6,7 +6,9 @@
  * client is given.
  */
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { ApiClient } from "../api/client";
+import { isUsableFontFamily, isUserFontId } from "@ao/shared";
+import { ApiClientError, type ApiClient } from "../api/client";
+import { canLoadFaces, fontsApi, loadUserFace, type FontsApi, type FontsClient } from "../api/fonts";
 import { DEFAULT_APPEARANCE, FONT_SLOTS, applyPatch, checkAccent, type AppearancePatch, type AppearanceSettings, type FontSlot } from "./appearance";
 import { fontStack, type FontChoice } from "./fonts";
 import { THEMES, resolveTheme, type ThemeName } from "./themes";
@@ -26,8 +28,17 @@ export interface AppearanceContextValue {
    * screen, and the message stays, until retrySave() saves it (R109).
    */
   saveError?: string;
+  /**
+   * The service's `reason` for the last failure, when it gave one: "appearance" means the settings
+   * file cannot be read, and the screen offers its reset (Task 68).
+   */
+  saveErrorReason?: string;
   /** Sends the changes that failed to save again. */
   retrySave(): Promise<void>;
+  /** The researcher's own font files (R100), when the service is connected. */
+  fonts?: FontsApi;
+  /** Plain-language message when a chosen font file could not be loaded (its fallbacks are used). */
+  fontError?: string;
 }
 
 const AppearanceContext = createContext<AppearanceContextValue | null>(null);
@@ -56,8 +67,11 @@ function useMedia(query: string): boolean {
 const ACCENT_PROPS = ["--accent", "--accent-ink", "--on-accent"] as const;
 
 export interface AppearanceProviderProps {
-  /** The library service client; without one the settings live only in memory. */
-  client?: Pick<ApiClient, "appearance">;
+  /**
+   * The library service client; without one the settings live only in memory. With `request` and
+   * `bytes` too, fonts from the researcher's own files are loaded from the service (R100).
+   */
+  client?: Pick<ApiClient, "appearance"> & Partial<Pick<ApiClient, "request" | "bytes">>;
   /** Settings to start with (before the service answers). */
   initial?: AppearanceSettings;
   children?: ReactNode;
@@ -66,6 +80,7 @@ export interface AppearanceProviderProps {
 export function AppearanceProvider({ client, initial, children }: AppearanceProviderProps) {
   const [settings, setSettings] = useState<AppearanceSettings>(initial ?? DEFAULT_APPEARANCE);
   const [saveError, setSaveError] = useState<string | undefined>();
+  const [saveErrorReason, setSaveErrorReason] = useState<string | undefined>();
   const systemDark = useMedia("(prefers-color-scheme: dark)");
   const systemReduce = useMedia("(prefers-reduced-motion: reduce)");
   // Set once the user changes something, so a slow initial load never overwrites that change.
@@ -147,10 +162,14 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
           if (q.pending) next = applyPatch(next, q.pending);
           return next;
         });
-        if (!q.failed) setSaveError(undefined);
+        if (!q.failed) {
+          setSaveError(undefined);
+          setSaveErrorReason(undefined);
+        }
       } catch (err) {
         q.failed = mergePatch(q.failed, patchNow);
         setSaveError(`Couldn't save your appearance settings: ${messageOf(err)}`);
+        setSaveErrorReason(err instanceof ApiClientError ? err.reason : undefined);
       }
       for (const w of waiting) w();
     }
@@ -165,11 +184,78 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
     return update(f);
   }, [update]);
 
+  // ---- fonts from the researcher's own files (R100): loaded from the service's bytes ----
+  const fonts = useMemo(() => (client && typeof client.request === "function" && typeof client.bytes === "function" ? fontsApi(client as FontsClient) : undefined), [client]);
+  const wantedFaces = userFaceKeys(settings);
+  const faces = useRef(new Map<string, { ctl: AbortController; remove?: () => void }>());
+  const [faceErrors, setFaceErrors] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!fonts || !canLoadFaces()) return;
+    const wanted = new Map(wantedFaces.split("\n").filter(Boolean).map((k) => [k, splitFaceKey(k)] as const));
+    const reg = faces.current;
+    for (const [k, e] of reg) {
+      if (wanted.has(k)) continue;
+      e.ctl.abort();
+      e.remove?.();
+      reg.delete(k);
+      setFaceErrors((cur) => (k in cur ? withoutKey(cur, k) : cur));
+    }
+    for (const [k, { family, id }] of wanted) {
+      if (reg.has(k)) continue;
+      const entry: { ctl: AbortController; remove?: () => void } = { ctl: new AbortController() };
+      reg.set(k, entry);
+      loadUserFace(fonts, family, id, entry.ctl.signal).then(
+        (remove) => {
+          if (reg.get(k) === entry) entry.remove = remove;
+          else remove(); // no longer chosen while it loaded
+        },
+        (err: unknown) => {
+          if (reg.get(k) !== entry || entry.ctl.signal.aborted) return;
+          // Kept as failed (not retried in a loop); choosing it again tries again.
+          // The service's own words; the browser's (a refused face) are replaced by plain ones.
+          const why = err instanceof ApiClientError ? err.message : "This browser could not use the file as a font.";
+          setFaceErrors((cur) => ({ ...cur, [k]: `The font “${family}” could not be loaded, so the fallback typefaces are used. ${why}` }));
+        },
+      );
+    }
+  }, [fonts, wantedFaces]);
+  useEffect(
+    () => () => {
+      for (const e of faces.current.values()) {
+        e.ctl.abort();
+        e.remove?.();
+      }
+      faces.current.clear();
+    },
+    [],
+  );
+  const fontError = Object.values(faceErrors)[0];
+
   const value = useMemo<AppearanceContextValue>(
-    () => ({ settings, theme, reducedMotion, accentApplied, update, retrySave, ...(saveError ? { saveError } : {}) }),
-    [settings, theme, reducedMotion, accentApplied, update, retrySave, saveError],
+    () => ({ settings, theme, reducedMotion, accentApplied, update, retrySave, ...(saveError ? { saveError } : {}), ...(saveError && saveErrorReason ? { saveErrorReason } : {}), ...(fonts ? { fonts } : {}), ...(fontError ? { fontError } : {}) }),
+    [settings, theme, reducedMotion, accentApplied, update, retrySave, saveError, saveErrorReason, fonts, fontError],
   );
   return <AppearanceContext.Provider value={value}>{children}</AppearanceContext.Provider>;
+}
+
+/** The faces from the researcher's own files the settings choose, as one stable string ("id\0family" per line). */
+function userFaceKeys(s: AppearanceSettings): string {
+  const keys = new Set<string>();
+  for (const slot of FONT_SLOTS) {
+    const f = s.fonts[slot];
+    if (f.source === "user-file" && isUserFontId(f.file) && isUsableFontFamily(f.family) && !/[,'"]/.test(f.family)) keys.add(`${f.file}\u0000${f.family}`);
+  }
+  return [...keys].sort().join("\n");
+}
+
+function splitFaceKey(k: string): { id: string; family: string } {
+  const at = k.indexOf("\u0000");
+  return { id: k.slice(0, at), family: k.slice(at + 1) };
+}
+
+function withoutKey(o: Record<string, string>, k: string): Record<string, string> {
+  const { [k]: _gone, ...rest } = o;
+  return rest;
 }
 
 /** The stack for a stored choice; a family name that cannot be used falls back to the default. */

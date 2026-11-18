@@ -1,6 +1,6 @@
 /** Sources: create (capture + store), read, update, delete; source.json / source.json.enc and manifest.json. */
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, statSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
@@ -29,12 +29,13 @@ import { GovernanceViolationError, ImmutableProvenanceError, NotFoundError } fro
 import { decryptBytes, deepEqual, foldName, kindFor, mimeFor, namesIn, readMaybe } from "./io.js";
 import { runMutation, type RefuseHook, type MutateRequest, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
-import { workspaceTags } from "./collections.js";
-import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
+import { assignableWorkspaceTags, refuseUnknownTags } from "./collections.js";
+import { assignCodes, loadPseudonyms, participantNames, savePseudonyms } from "./pseudonyms.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
-import { appendReviewEntry, type ReviewInput } from "./review.js";
+import { appendReviewEntry, queueUnlistedConflicts, resolveCaptureEntriesAfterEdit, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type QueuedConflicts, type ReexaminedBy, type ReviewInput } from "./review.js";
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
+
 
 export interface SourceInputFile {
   path: string;
@@ -139,7 +140,21 @@ async function assertProvenanceUnchanged(core: RepoCore, tx: Tx, sf: SourceFile)
 /** The annotations file of a source folder (R74 I4). */
 const annotationsRel = (folder: string, encrypted: boolean) => `${folder}/${encrypted ? "annotations.json.enc" : "annotations.json"}`;
 
+/** An annotation-file problem a read found, to be recorded once confirmed (R77). */
+type AnnotationProblem = { file: string; kind: "annotations-unreadable" | "annotations-hash-mismatch"; detail: string };
+
 export async function readSourceFile(core: RepoCore, st: ProjectState, id: string): Promise<SourceFile> {
+  let read = await readSourcePair(core, st, id);
+  // A read outside the write queue can fall between the two files a write updates (the annotations
+  // file, then source.json): a problem is confirmed in the queue's turn, after any write in progress,
+  // and recorded only if it is still there (D21). Inside a turn no write is in progress.
+  if (read.problem && !core.holdsTurn()) read = await core.serial(() => readSourcePair(core, st, id));
+  if (read.problem) annotationWarning(core, st, read.problem.file, read.problem.kind, read.problem.detail);
+  return read.sf;
+}
+
+/** Reads source.json and its annotations file; a problem with the pair is returned, not recorded. */
+async function readSourcePair(core: RepoCore, st: ProjectState, id: string): Promise<{ sf: SourceFile; problem?: AnnotationProblem }> {
   const folder = sourceFolderOf(st, id);
   const encrypted = core.encrypted(st);
   const read = async (rel: string): Promise<string | null> => {
@@ -155,6 +170,7 @@ export async function readSourceFile(core: RepoCore, st: ProjectState, id: strin
   // Annotations in their own file; a source.json from before keeps them inline (moved on its next
   // write). A missing or damaged file never makes the source unreadable (R77): no annotations,
   // and an integrity warning; a file whose hash differs from the recorded one is read, with a warning.
+  let problem: AnnotationProblem | undefined;
   if (!sf.annotations.length && sf.annotationCount) {
     const rel = annotationsRel(folder, encrypted);
     let anns: string | null = null;
@@ -163,14 +179,14 @@ export async function readSourceFile(core: RepoCore, st: ProjectState, id: strin
       if (anns === null) throw new Error("missing");
       sf.annotations = Annotation.array().parse(JSON.parse(anns));
       if (sf.annotationsSha256 && createHash("sha256").update(anns).digest("hex") !== sf.annotationsSha256) {
-        annotationWarning(core, st, rel, "annotations-hash-mismatch", "The annotations file of a source was changed outside the app; it was read as it is.");
+        problem = { file: rel, kind: "annotations-hash-mismatch", detail: "The annotations file of a source was changed outside the app; it was read as it is." };
       }
     } catch {
       sf.annotations = [];
-      annotationWarning(core, st, rel, "annotations-unreadable", "The annotations file of a source is missing or damaged; the source is shown without annotations.");
+      problem = { file: rel, kind: "annotations-unreadable", detail: "The annotations file of a source is missing or damaged; the source is shown without annotations." };
     }
   }
-  return sf;
+  return problem ? { sf, problem } : { sf };
 }
 
 /** Records an annotation-file integrity warning once per file (R77). */
@@ -218,6 +234,18 @@ function manifestEntry(sf: SourceFile): ManifestEntry {
   return e;
 }
 
+/** Test seam (R47): runs between a source's annotations file and its source.json being written. */
+let betweenSourceFiles: ((folder: string) => Promise<void>) | undefined;
+
+/**
+ * Test seam (R47): `fn` runs in every source write after the annotations file is written (or
+ * removed) and before source.json is, only while NODE_ENV is "test"; `undefined` removes it.
+ */
+export function pauseBetweenSourceFilesForTests(fn: ((folder: string) => Promise<void>) | undefined): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("pauseBetweenSourceFilesForTests is only available in tests (NODE_ENV=test).");
+  betweenSourceFiles = fn;
+}
+
 /**
  * Writes source.json, or source.json.enc plus the manifest entry in encrypted projects. The
  * annotations go to annotations.json(.enc) — only when they changed since they were read (their
@@ -250,6 +278,7 @@ export async function writeSourceFile(core: RepoCore, tx: Tx, sf: SourceFile): P
   } else if (disk.status === "ok") {
     await tx.trash(annRel);
   }
+  if (betweenSourceFiles && process.env.NODE_ENV === "test") await betweenSourceFiles(folder);
   const parsed: SourceFile = { ...rest, annotations: [], ...meta };
   const json = JSON.stringify(parsed, null, 2);
   if (core.encrypted(tx.state)) {
@@ -429,6 +458,8 @@ async function writeNewSource(
   inTx: CreateInTx | undefined,
 ): Promise<SourceFile> {
   const st = tx.state;
+  // A new source may be given only tags that exist now: no workspace tag being deleted (41a N2).
+  await refuseUnknownTags(core, st, [], draft.tagIds);
   const id = newId();
   tx.entity("source", id);
   const short = shortId(id, takenShortIds(st));
@@ -447,17 +478,9 @@ async function writeNewSource(
       await writeProjectData(core, tx, data);
     }
     creator = codes.find((c) => c !== undefined) ?? (draft.creators.length ? "Unknown" : undefined);
-    // Every name form of each creator (handle with and without "@", literal, family, given,
-    // "given family") maps to its code; pseudonymize() matches the longest first.
-    const text = new Map(map);
-    draft.creators.forEach((c, i) => {
-      const code = codes[i];
-      if (!code) return;
-      const bare = c.handle?.replace(/^@+/, "");
-      for (const n of [c.handle, bare, c.literal, c.family, c.given, [c.given, c.family].filter(Boolean).join(" ")]) {
-        if (n?.trim() && !text.has(n.trim())) text.set(n.trim(), code);
-      }
-    });
+    // The project's participant names (the map, the participants' name details) and every name
+    // form of each creator, the list citations use too (R387 d); pseudonymize() matches the longest first.
+    const text = participantNames(map, data.participants, draft.creators.map((c, i) => ({ creator: c, code: codes[i] })));
     title = pseudonymize(title, text);
   }
   const folderBase = sourceFolderName({ dateOrYear: folderDate(draft, provenance), primaryCreator: creator, shortTitle: title, shortId: short });
@@ -575,6 +598,52 @@ export async function getSource(core: RepoCore, projectId: string, id: string): 
   return readSourceFile(core, st, id);
 }
 
+/**
+ * A source's own record from `source.json(.enc)` ALONE (R186): it does not open the annotations
+ * file, makes no cross-file check and records no integrity warning, so a list may read it for every
+ * row while annotations are being written. For anything that needs the annotations, use getSource.
+ */
+export async function getSourceRecord(core: RepoCore, projectId: string, id: string): Promise<Source> {
+  return (await getSourceRecordWithAssets(core, projectId, id)).source;
+}
+
+/**
+ * The same light read (R186), keeping the assets that `source.json` holds and that the read already
+ * parses: a list row can say what kind of files its source has without reading anything more (R222).
+ */
+export async function getSourceRecordWithAssets(core: RepoCore, projectId: string, id: string): Promise<{ source: Source; assets: Asset[] }> {
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  const folder = sourceFolderOf(st, id);
+  const encrypted = core.encrypted(st);
+  const raw = await readMaybe(core.abs(encrypted ? `${folder}/source.json.enc` : `${folder}/source.json`));
+  if (!raw) throw new NotFoundError("Source", id);
+  let text: string;
+  if (encrypted) {
+    const { key, keyId } = core.key(st);
+    text = (await decryptBytes((k) => (k === keyId ? key : undefined), raw)).toString("utf8");
+  } else text = raw.toString("utf8");
+  const sf = SourceFile.parse(JSON.parse(text));
+  return { source: sf.source, assets: sf.assets };
+}
+
+/**
+ * Task F15 (R328 e): a stamp of a source's record file — its inode, size, and modification and change times — or null
+ * when the record is not (or no longer) there. It reads nothing of the file (one `stat`), so a list may ask it for
+ * every row to know whether what it read before still stands: a write by the app (atomic, so a new file) and a change
+ * made outside the app both change it. Refused for a locked project, as a read is.
+ */
+export function sourceRecordStamp(core: RepoCore, projectId: string, id: string): string | null {
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  const folder = st.sources.get(id);
+  if (!folder) return null;
+  // Synchronous on purpose: one `stat` is a few microseconds, far less than a promise through the thread pool, and a
+  // list asks it for every row.
+  const s = statSync(core.abs(core.encrypted(st) ? `${folder}/source.json.enc` : `${folder}/source.json`), { bigint: true, throwIfNoEntry: false });
+  return s ? `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}` : null;
+}
+
 export function listSourceIds(core: RepoCore, projectId: string): string[] {
   return [...core.state(projectId).sources.keys()];
 }
@@ -585,33 +654,57 @@ export async function updateSource(
   core: RepoCore,
   projectId: string,
   id: string,
-  patch: SourcePatch,
+  /**
+   * The change, or (package-internal) a function that builds it from the source as read inside the
+   * governed change, so a merge with the current value never works on a stale read (lost update).
+   */
+  patchOrBuild: SourcePatch | ((cur: Source) => SourcePatch),
   /** Package-internal: also replace the source file's field evidence and verification (a recheck after a machine change). */
-  extra: { fieldEvidence?: (cur: SourceFile) => FieldEvidence[]; verification?: (next: SourceFile) => Record<string, FieldVerification> } = {},
+  extra: {
+    fieldEvidence?: (cur: SourceFile) => FieldEvidence[];
+    verification?: (next: SourceFile) => Record<string, FieldVerification>;
+    /**
+     * A confirm (R149) or a recheck: the source's capture-conflict review entries left with no listed
+     * field in conflict or unconfirmed are resolved in this same change, and the audit event says so (R176 1).
+     */
+    resolveReview?: "confirmation" | "recheck";
+    /**
+     * A confirmation (R191): the fields the researcher confirmed in this change, as the verification
+     * report names them (`/title`, `/identifiers/doi`). The audit entry names each and whether the
+     * recorded value was kept or another chosen; never the value.
+     */
+    confirmed?: readonly string[];
+  } = {},
 ): Promise<SourceFile> {
+  let resolved: string[] = [];
+  let confirmed: FieldConfirmation[] = [];
+  let by: ReexaminedBy | undefined;
+  let queued: QueuedConflicts[] = [];
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
-  const check = (cur: SourceFile) => {
+  const build = (cur: SourceFile): SourcePatch => (typeof patchOrBuild === "function" ? patchOrBuild(cur.source) : patchOrBuild);
+  const check = (cur: SourceFile, patch: SourcePatch) => {
     if ("provenance" in patch && !deepEqual(patch.provenance, cur.source.provenance)) throw new ImmutableProvenanceError();
     for (const f of FIXED_FIELDS) {
       if (f in patch && patch[f] !== cur.source[f]) throw new TypeError(`${f} cannot be changed`);
     }
   };
   const current = await readSourceFile(core, st, id);
-  check(current);
+  check(current, build(current));
   return runMutation(
     core,
     projectId,
     storeRequest(current.source.provenance),
     async (tx) => {
       const cur = await readSourceFile(core, st, id);
-      check(cur);
+      const patch = build(cur);
+      check(cur, patch);
       // Collections and tags set by the patch must exist (checked in this change, R99).
       if (patch.collectionIds || patch.tagIds) {
         const data = await readFullData(core, tx.state);
         for (const c of patch.collectionIds ?? []) if (!data.collections.some((x) => x.id === c)) throw new NotFoundError("Collection", c);
-        const ws = patch.tagIds?.length ? await workspaceTags(core) : [];
+        const ws = patch.tagIds?.length ? await assignableWorkspaceTags(core) : [];
         for (const t of patch.tagIds ?? []) if (!data.tags.some((x) => x.id === t) && !ws.some((x) => x.id === t)) throw new NotFoundError("Tag", t);
       }
       // Fieldwork links set by the patch must exist (R119).
@@ -629,16 +722,56 @@ export async function updateSource(
         modifiedBy: tx.actor,
       });
       let sf: SourceFile = { ...cur, source, ...(extra.fieldEvidence ? { fieldEvidence: extra.fieldEvidence(cur) } : {}) };
+      // The stored report is rewritten only by what recomputes it (a confirm, a recheck, a capture's new
+      // evidence: `extra.verification`); an ordinary edit never touches it (fix round 2, I3).
       if (extra.verification) sf = { ...sf, verification: extra.verification(sf) };
       await writeSourceFile(core, tx, sf);
       tx.record("source", id, cur.source, source);
+      confirmed = (extra.confirmed ?? []).map((field) => ({ field, choice: deepEqual(atPointer(cur.source, field), atPointer(source, field)) ? "kept" : "changed" }));
       // New links to a participant whose consent was withdrawn: queued for review (R117 I1, R119).
       if (linksChange) await flagIfWithdrawn(core, tx, tx.state.data, id, source, cur.source);
+      // Every field the recomputed report has in conflict is listed in a pending capture-conflict entry,
+      // in this change (R193 b: new or left without one by D19), before the entries are re-examined, so
+      // an entry it extends is not resolved under it.
+      if (extra.verification) queued = await queueUnlistedConflicts(core, tx, sf);
+      // The source's capture entries are re-examined in this change (R176 1): against the new report
+      // when one was computed; after an ordinary edit, against the stored report and the source as edited.
+      by = extra.resolveReview ?? (extra.verification ? "recheck" : "edit");
+      resolved =
+        by === "edit"
+          ? await resolveCaptureEntriesAfterEdit(core, tx, cur as unknown as Parameters<typeof resolveCaptureEntriesAfterEdit>[2], sf as unknown as Parameters<typeof resolveCaptureEntriesAfterEdit>[3])
+          : await resolveSettledCaptureEntries(core, tx, sf, by);
       tx.index((sink) => sink.indexSource(sf));
       return sf;
     },
-    { op: "source.update", entity: { type: "source", id } },
+    {
+      op: "source.update",
+      entity: { type: "source", id },
+      auditDetails: () => ({
+        ...(confirmed.length ? { confirmed } : {}),
+        ...(resolved.length ? { reviewResolved: { entries: resolved, by } } : {}),
+        // One shape in every audit event that carries it: an array of { entry, fields } (here one element).
+        ...(queued.length ? { reviewQueued: queued } : {}),
+      }),
+    },
   );
+}
+
+/**
+ * One field a confirmation settled, as its audit entry records it (R191): the field as the
+ * verification report names it, and whether the researcher kept the value recorded or chose
+ * another. Never the value, an alternative or anything the researcher typed.
+ */
+export interface FieldConfirmation {
+  field: string;
+  choice: "kept" | "changed";
+}
+
+/** The value at a `/a/b` pointer of a source (undefined when absent). */
+function atPointer(source: Source, pointer: string): unknown {
+  let v: unknown = source;
+  for (const part of pointer.split("/").slice(1)) v = v && typeof v === "object" ? (v as Record<string, unknown>)[part] : undefined;
+  return v;
 }
 
 /** Rewrites one source inside a running mutation (membership, fieldwork links). */
@@ -656,12 +789,19 @@ export async function editSource(core: RepoCore, tx: Tx, id: string, edit: (s: S
  * Deletes one source inside a running mutation (its folder is trashed; linked originals are not
  * touched). Every path that deletes a source comes through here; a source imported incrementally
  * (Zotero) leaves a deletion record so a later run does not bring it back (R73), except when the
- * deletion is a batch undo (`undo`), which is not the user's.
+ * deletion is a batch undo (`undo`), which is not the user's. The source's pending review entries
+ * are resolved in the same change (R176 4: "source-removed"; "undone" for an undo, coordinator's
+ * ruling 3), except `keepReview`, the entry a review decision resolves itself. `reviewEntries: false`
+ * says the caller knows the source has no pending entry (no caller uses it now: an undo reads the
+ * queue inside each removal, fix round 2 N3).
  */
-export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string, opts: { undo?: boolean } = {}): Promise<{ sf: SourceFile; tombstoned: string[] }> {
+export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string, opts: { undo?: boolean; keepReview?: string; reviewEntries?: boolean } = {}): Promise<{ sf: SourceFile; tombstoned: string[] }> {
   const st = tx.state;
   const cur = await readSourceFile(core, st, id);
   const tombstoned = opts.undo ? [] : await recordDeletion(core, tx, cur);
+  if (opts.reviewEntries !== false) {
+    await resolveEntriesOfRemovedSource(core, tx, id, { ...(opts.keepReview ? { keep: opts.keepReview } : {}), decision: opts.undo ? "undone" : "source-removed" });
+  }
   await tx.trash(cur.source.folder);
   if (tx.encrypted) await putManifest(tx, (m) => void (m.sources = m.sources.filter((x) => x.id !== id)));
   for (const a of cur.assets) tx.record("asset", a.id, a, null);

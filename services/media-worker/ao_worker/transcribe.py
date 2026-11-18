@@ -1,7 +1,8 @@
 """audio.transcribe: faster-whisper with VAD, per-segment language and hallucination flags.
 
-Output (in the `output` dir): `transcript.vtt` and `segments.json` (see README). Models are cached
-in `AO_MODELS_DIR` and downloaded on first use. A transcription uses every CPU core.
+Output (in the `output` dir): `transcript.vtt` and `segments.json` (see README). Models live in
+`AO_MODELS_DIR`, installed by the first-use tools dialogue (tools.py); a missing one fails the job with
+TOOL_NOT_INSTALLED. A transcription uses every CPU core.
 """
 from __future__ import annotations
 
@@ -16,10 +17,13 @@ from .jobs import Job, JobContext, JobError
 
 log = logging.getLogger("ao_worker.transcribe")
 
+# The speech models the app accepts: the same list as SPEECH_MODELS in packages/shared (R158;
+# tests/test_tools.py fails when they differ).
 MODELS = ("large-v3", "medium", "small", "tiny")
 COMPUTE_TYPES = ("int8", "float16")
 DEFAULTS = {
-    "model": "large-v3", "language": "auto", "multilingual": True, "vad": True, "computeType": "int8",
+    # model: DEFAULT_SPEECH_MODEL in packages/shared (R158; tests/test_tools.py checks).
+    "model": "medium", "language": "auto", "multilingual": True, "vad": True, "computeType": "int8",
     "wordTimestamps": True,
 }
 SAMPLE_RATE = 16000
@@ -45,6 +49,42 @@ def models_dir() -> Path:
     return base / "ao-worker" / "models"
 
 
+def model_path(name: str) -> str:
+    """The model's folder in `models_dir()`. A model already on disk is used with no network contact
+    at all (R144). An absent model is never downloaded here: the job fails with TOOL_NOT_INSTALLED
+    naming the tool (`speech-<name>`), which the first-use tools dialogue installs (tools.py)."""
+    from faster_whisper.utils import _MODELS, download_model
+
+    from .tools import not_installed
+
+    folder = models_dir()
+    cache = str(folder)
+    # Hugging Face cache layout: <models dir>/models--<owner>--<repo>/snapshots/<revision>/
+    repo = folder / ("models--" + _MODELS[name].replace("/", "--"))
+    absent = (not folder.exists() or folder.is_dir()) and not os.path.lexists(repo)
+    if absent:
+        log.info("the %s speech model is not installed", name)
+        raise not_installed(f"speech-{name}")
+    try:
+        path = download_model(name, cache_dir=cache, local_files_only=True)
+    except Exception as e:  # noqa: BLE001 - reported, never answered with a download
+        damaged = type(e).__name__ == "IncompleteSnapshotError"
+        log.warning("the %s speech model on disk is unusable (%s); not downloading", name, type(e).__name__)
+        raise JobError(
+            "MODEL_UNAVAILABLE",
+            f"the {name} model on disk is incomplete or damaged; install it again from the Optional tools screen"
+            if damaged else f"the {name} model on disk could not be read",
+            type(e).__name__,
+            tool=f"speech-{name}",
+        ) from e
+    if not (Path(path) / "model.bin").is_file():
+        log.warning("the %s speech model on disk has no model.bin; not downloading", name)
+        raise JobError("MODEL_UNAVAILABLE",
+                       f"the {name} model on disk is incomplete or damaged; install it again from the Optional tools screen",
+                       tool=f"speech-{name}")
+    return path
+
+
 def _load_model(name: str, compute_type: str):
     """One model kept in memory (the last one used); large models are too big to keep several."""
     from faster_whisper import WhisperModel
@@ -53,15 +93,14 @@ def _load_model(name: str, compute_type: str):
     with _model_lock:
         if key not in _model_cache:
             _model_cache.clear()
+            path = model_path(name)
             try:
-                _model_cache[key] = WhisperModel(
-                    name, device="auto", compute_type=compute_type, cpu_threads=os.cpu_count() or 4,
-                    download_root=str(models_dir()),
-                )
+                # A folder path: faster-whisper loads it as is and never calls the hub.
+                _model_cache[key] = WhisperModel(path, device="auto", compute_type=compute_type, cpu_threads=os.cpu_count() or 4)
             except ValueError as e:  # e.g. float16 on a CPU without support
                 raise JobError("INVALID_PARAMS", f"compute type {compute_type} is not supported on this device") from e
-            except OSError as e:
-                raise JobError("MODEL_UNAVAILABLE", f"the {name} model could not be loaded or downloaded", type(e).__name__) from e
+            except (OSError, RuntimeError) as e:  # damaged or incomplete model files
+                raise JobError("MODEL_UNAVAILABLE", f"the {name} model on disk could not be loaded", type(e).__name__) from e
         return _model_cache[key]
 
 

@@ -1,0 +1,25 @@
+/*
+ * The one-time display of a recovery code (Tasks 60 and 61). Tokens only (spec 8A.1, R105); focus
+ * rings come from base.css (:focus-visible).
+ */
+
+.ao-recovery-code__code {
+  font-family: var(--font-mono);
+  font-size: 1.2rem;
+  letter-spacing: 0.05em;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  padding: var(--space-2);
+  user-select: all;
+}
+
+.ao-recovery-code__choice {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.ao-recovery-code__actions {
+  margin-top: var(--space-3);
+}

@@ -617,6 +617,17 @@ describe("KeyRing", () => {
     expect(old.every((b) => b === 0)).toBe(true);
   });
 
+  it("adding the same key again keeps the buffer it holds, unzeroed (R379: a change may be sealing with it)", () => {
+    const ring = new KeyRing();
+    const id = newId();
+    const key = generateDataKey();
+    ring.add(id, key);
+    const held = ring.get(id)!;
+    ring.add(id, Buffer.from(key));
+    expect(ring.get(id)).toBe(held);
+    expect(Buffer.from(held).equals(Buffer.from(key))).toBe(true);
+  });
+
   it("works as decryptStream's getKey", async () => {
     const ring = new KeyRing();
     const { keyId, key } = generateProjectKey();

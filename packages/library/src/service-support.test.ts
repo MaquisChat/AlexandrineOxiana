@@ -4,11 +4,11 @@
  * (loosening needs a reason, audited), field confirmation, transcript versions, capture preflight,
  * app settings and path scrubbing.
  */
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { GovernanceParseError, newId, type PendingProxy, type Project } from "@ao/core";
-import { readAppSetting, scrubPaths, updateAppSetting } from "./app-settings.js";
+import { DEFAULT_GOVERNANCE, GovernanceParseError, loosenedControls, newId, parseGovernance, type PendingProxy, type Project } from "@ao/core";
+import { readAppSetting, scrubPaths, updateAppSettingStrict } from "./app-settings.js";
 import { OPEN_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
 import { OcrQueue, disposeOcrQueue, ocrQueueFor } from "./import/ocr.js";
 import { ProxyQueue, disposeProxyQueue, proxyQueueFor } from "./import/proxies.js";
@@ -16,7 +16,8 @@ import { GovernanceConflictError, GovernanceLooseningError } from "./repo/govern
 import { InvalidInputError, NotFoundError, PolicyDeniedError } from "./repo/errors.js";
 import { captureBrowserPage, stripHtmlSnapshot } from "./capture/browser-capture.js";
 import { tinyPng } from "../../../tests/fixtures/generate.mjs";
-import { addTranscriptVersion, checkCaptureAllowed, confirmField, readAssetText, transcriptVersions } from "./source-actions.js";
+import { checkCaptureAllowed, confirmField, readAssetText, transcriptVersions } from "./source-actions.js";
+import { addTranscriptVersion } from "./transcript-segments.js";
 import { WorkerJobError, type JobResult, type WorkerClient, type WorkerJob } from "./worker-client.js";
 
 let kit: Kit;
@@ -178,13 +179,85 @@ describe("source actions", () => {
     await expect(confirmField(kit.repo, p.id, sf.source.id, "/provenance", {})).rejects.toThrow(/not a field/);
   });
 
+  it("confirmField confirms an identifier under the verification report's own key (R149), as one governed, audited change", async () => {
+    const sf = await addSource(kit, p, { title: "A study", issued: "2001" });
+    const before = (await auditEvents(kit, p)).length;
+    const next = await confirmField(kit.repo, p.id, sf.source.id, "/identifiers/doi", "10.1000/xyz");
+    expect(next.source.identifiers.doi).toBe("10.1000/xyz");
+    expect(next.source.title.variants[0]?.value).toBe("A study");
+    expect(next.fieldEvidence.filter((e) => e.field === "/identifiers/doi" && e.source.kind === "user").map((e) => e.value)).toEqual(["10.1000/xyz"]);
+    expect(next.verification["/identifiers/doi"]?.status).toBe("user-confirmed");
+    const events = await auditEvents(kit, p);
+    expect(events.length).toBeGreaterThan(before);
+    expect(events.at(-1)?.details?.op).toBe("source.update");
+    // Another identifier keeps the first; a second confirm replaces the researcher's earlier evidence for that key only.
+    const again = await confirmField(kit.repo, p.id, sf.source.id, "/identifiers/url", "https://example.org/a");
+    expect(again.source.identifiers).toMatchObject({ doi: "10.1000/xyz", url: "https://example.org/a" });
+    expect(again.verification["/identifiers/doi"]?.status).toBe("user-confirmed");
+    // ISBN is a list in the record: a single typed ISBN is recorded as a list of one.
+    const isbn = await confirmField(kit.repo, p.id, sf.source.id, "/identifiers/isbn", "9780306406157");
+    expect(isbn.source.identifiers.isbn).toEqual(["9780306406157"]);
+    expect(isbn.fieldEvidence.find((e) => e.field === "/identifiers/isbn" && e.source.kind === "user")?.value).toEqual(["9780306406157"]);
+  });
+
+  it("two identifier confirms at once both land, each audited (re-review N2: no lost update)", async () => {
+    const sf = await addSource(kit, p, { title: "A study", issued: "2001" });
+    const before = (await auditEvents(kit, p)).filter((e) => e.details?.op === "source.update").length;
+    const [a, b] = await Promise.all([
+      confirmField(kit.repo, p.id, sf.source.id, "/identifiers/doi", "10.1/a"),
+      confirmField(kit.repo, p.id, sf.source.id, "/identifiers/url", "https://e.org/b"),
+    ]);
+    expect(a.source.identifiers.doi).toBe("10.1/a");
+    expect(b.source.identifiers.url).toBe("https://e.org/b");
+    const stored = await kit.repo.getSource(p.id, sf.source.id);
+    expect(stored.source.identifiers).toMatchObject({ doi: "10.1/a", url: "https://e.org/b" });
+    expect(stored.verification["/identifiers/doi"]?.status).toBe("user-confirmed");
+    expect(stored.verification["/identifiers/url"]?.status).toBe("user-confirmed");
+    const updates = (await auditEvents(kit, p)).filter((e) => e.details?.op === "source.update").length;
+    expect(updates - before).toBe(2);
+  });
+
+  it("an identifier confirm at once with an ordinary field confirm: both land (re-review N2)", async () => {
+    const sf = await addSource(kit, p, { title: "A study", issued: "2001" });
+    await Promise.all([
+      confirmField(kit.repo, p.id, sf.source.id, "/identifiers/doi", "10.1/a"),
+      confirmField(kit.repo, p.id, sf.source.id, "/publisher", "Polity"),
+    ]);
+    const stored = await kit.repo.getSource(p.id, sf.source.id);
+    expect(stored.source.identifiers.doi).toBe("10.1/a");
+    expect(stored.source.publisher).toBe("Polity");
+    expect(stored.verification["/identifiers/doi"]?.status).toBe("user-confirmed");
+    expect(stored.verification["/publisher"]?.status).toBe("user-confirmed");
+  });
+
+  it("the whole identifiers object cannot be confirmed at once; only one identifier at a time (re-review N3, R149)", async () => {
+    const sf = await addSource(kit, p, { title: "A study" });
+    await expect(confirmField(kit.repo, p.id, sf.source.id, "/identifiers", { doi: "10.1/a" })).rejects.toBeInstanceOf(InvalidInputError);
+  });
+
+  it("confirmField refuses an unknown identifier, a deeper path, and a value of the wrong kind (InvalidInputError, nothing written)", async () => {
+    const sf = await addSource(kit, p, { title: "A study" });
+    const before = (await kit.repo.getSource(p.id, sf.source.id)).source.modifiedAt;
+    for (const [field, value] of [
+      ["/identifiers/platform", "youtube"],
+      ["/identifiers/nonsense", "x"],
+      ["/identifiers/doi/x", "x"],
+      ["/identifiers/doi", 42],
+      ["/identifiers/doi", ""],
+      ["/identifiers/isbn", [1, 2]],
+    ] as const) {
+      await expect(confirmField(kit.repo, p.id, sf.source.id, field, value)).rejects.toBeInstanceOf(InvalidInputError);
+    }
+    expect((await kit.repo.getSource(p.id, sf.source.id)).source.modifiedAt).toBe(before);
+  });
+
   it("addTranscriptVersion stores a human-edited version next to the machine one", async () => {
     const sf = await addSource(kit, p, { title: "Interview" });
     const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: "WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n", format: "vtt" });
     const b = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: "WEBVTT\n\n00:00.000 --> 00:01.000\nHello there\n", format: "vtt", basedOn: a.id });
     const versions = transcriptVersions(await kit.repo.getSource(p.id, sf.source.id));
     expect(versions.map((v) => v.id)).toEqual([a.id, b.id]);
-    expect(b.derivation?.params).toEqual({ basedOn: a.id });
+    expect(b.derivation?.params).toEqual({ basedOn: a.id, segmentFlags: 1 }); // Task 62: the WebVTT carries each segment's marks
     expect(await readAssetText(kit.repo, p.id, sf.source.id, b.id)).toContain("Hello there");
     await expect(addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: "no header", format: "vtt" })).rejects.toThrow(/WEBVTT/);
   });
@@ -200,8 +273,8 @@ describe("source actions", () => {
 describe("app settings and scrubbing", () => {
   it("settings files are owner-only and read back", async () => {
     const dir = join(kit.tmp, "cfg");
-    await updateAppSetting<{ n: number }>(dir, "appearance.json", (cur) => ({ n: (cur?.n ?? 0) + 1 }));
-    await updateAppSetting<{ n: number }>(dir, "appearance.json", (cur) => ({ n: (cur?.n ?? 0) + 1 }));
+    await updateAppSettingStrict<{ n: number }>(dir, "appearance.json", (v): v is { n: number } => typeof (v as { n?: unknown }).n === "number", (cur) => ({ n: (cur?.n ?? 0) + 1 }));
+    await updateAppSettingStrict<{ n: number }>(dir, "appearance.json", (v): v is { n: number } => typeof (v as { n?: unknown }).n === "number", (cur) => ({ n: (cur?.n ?? 0) + 1 }));
     expect(await readAppSetting(dir, "appearance.json")).toEqual({ n: 2 });
     if (process.platform !== "win32") expect((await stat(join(dir, "appearance.json"))).mode & 0o777).toBe(0o600);
     expect(JSON.parse(await readFile(join(dir, "appearance.json"), "utf8"))).toEqual({ n: 2 });
@@ -236,18 +309,53 @@ describe("Task 30 review round 1 (R98, R99)", () => {
     await expect(kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: base })).rejects.toBeInstanceOf(GovernanceLooseningError);
   });
 
-  it("an unreadable governance.yaml can be replaced, but only with a reason (everything counts as loosened)", async () => {
+  it("an unreadable governance.yaml can be replaced, but only with a reason (compared with the default rules; R397 a)", async () => {
     const file = join(kit.lib.root, p.folder, "governance.yaml");
     await writeFile(file, "encryption: [this is: not valid");
     const { sha256, yaml } = await kit.repo.getGovernance(p.id);
     expect(yaml).toContain("not valid");
     const err = await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: sha256 }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(GovernanceLooseningError);
-    expect((err as GovernanceLooseningError).loosened).toEqual(["(unreadable governance.yaml)"]);
+    expect((err as GovernanceLooseningError).repair).toBe("unreadable");
+    expect((err as GovernanceLooseningError).loosened).toEqual(loosenedControls(DEFAULT_GOVERNANCE, parseGovernance(OPEN_GOV)));
     await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: sha256, reason: "repairing a damaged rules file" });
     expect(await readFile(file, "utf8")).toBe(OPEN_GOV);
     const ev = (await auditEvents(kit, p)).filter((e) => e.details?.op === "project.governance");
-    expect(ev.at(-1)!.details).toMatchObject({ reason: "repairing a damaged rules file", repairedUnreadable: true });
+    expect(ev.at(-1)!.details).toMatchObject({ reason: "repairing a damaged rules file", repairedUnreadable: true, rulesFile: "unreadable" });
+  });
+
+  it("R421 a: a reason of only white space and invisible characters is no reason (a repair and an ordinary loosening)", async () => {
+    const file = join(kit.lib.root, p.folder, "governance.yaml");
+    const invisible = " \u200B\u2060\uFEFF\u00AD\n";
+    // An ordinary loosening: the current file is OPEN_GOV, the new one turns the audit log off.
+    const looser = `${OPEN_GOV}audit:\n  enabled: false\n`;
+    const base0 = (await kit.repo.getGovernance(p.id)).sha256;
+    await expect(kit.repo.setGovernance(p.id, looser, { baseSha256: base0, reason: invisible })).rejects.toBeInstanceOf(GovernanceLooseningError);
+    await rm(file);
+    const g = await kit.repo.getGovernance(p.id);
+    const err = await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: g.sha256, reason: invisible }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GovernanceLooseningError);
+    expect((err as GovernanceLooseningError).repair).toBe("missing");
+  });
+
+  it("R397 a: a missing governance.yaml refuses every other change; readable rules put it back, only with a reason, audited as such", async () => {
+    const file = join(kit.lib.root, p.folder, "governance.yaml");
+    await rm(file);
+    const g = await kit.repo.getGovernance(p.id);
+    expect(g).toMatchObject({ yaml: "", file: "missing" });
+    await expect(kit.repo.createTag(p.id, "before")).rejects.toBeInstanceOf(PolicyDeniedError);
+    const err = await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: g.sha256 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GovernanceLooseningError);
+    expect((err as GovernanceLooseningError).repair).toBe("missing");
+    expect((err as Error).message).toMatch(/is missing, so putting rules back needs a reason/);
+    await expect(kit.repo.createTag(p.id, "still")).rejects.toBeInstanceOf(PolicyDeniedError);
+    await kit.repo.setGovernance(p.id, OPEN_GOV, { baseSha256: g.sha256, reason: "putting the rules back (Ana)" });
+    expect(await readFile(file, "utf8")).toBe(OPEN_GOV);
+    expect((await kit.repo.getGovernance(p.id)).file).toBe("present");
+    await kit.repo.createTag(p.id, "after");
+    const ev = (await auditEvents(kit, p)).filter((e) => e.details?.op === "project.governance");
+    expect(ev.at(-1)!.details).toMatchObject({ reason: "putting the rules back (Ana)", rulesFile: "missing" });
+    expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
   });
 
   it("tags can be renamed and deleted, collections renamed (governed); deleting a tag removes it from sources", async () => {
@@ -297,7 +405,7 @@ describe("Task 30 review round 1 (R98, R99)", () => {
     // A web page is platform "other": outside a protocol limited to YouTube.
     await expect(captureBrowserPage(kit.repo, scoped.id, input)).rejects.toBeInstanceOf(PolicyDeniedError);
     const open = await makeProject(kit, OPEN_GOV.replace("downloader]", "downloader, browser_capture]"));
-    const r = await captureBrowserPage(kit.repo, open.id, { ...input, extracted: { caption: "Hello", canonicalUrl: "https://example.org/a?token=SECRETTOKEN" } });
+    const r = await captureBrowserPage(kit.repo, open.id, { ...input, extracted: { caption: "Hello", canonicalUrl: "https://example.org/a?token=SECRETTOKENaB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY" } });
     const sf = await kit.repo.getSource(open.id, r.sourceId);
     expect(sf.source.identifiers.platform).toBe("other");
     const page = sf.assets.find((a) => a.kind === "html-snapshot")!;
@@ -305,6 +413,40 @@ describe("Task 30 review round 1 (R98, R99)", () => {
     expect(stored).not.toContain("SECRETJS");
     expect(JSON.stringify(sf)).not.toContain("SECRETTOKEN");
     await expect(captureBrowserPage(kit.repo, open.id, { url: "ftp://x" })).rejects.toBeInstanceOf(InvalidInputError);
+  });
+
+  it("browser capture stores the page's address without user name, password or secret parameters (R379, WB3 I1)", async () => {
+    const open = await makeProject(kit, OPEN_GOV.replace("downloader]", "downloader, browser_capture]"));
+    const url = "https://ana:hunter2@portal.example.org/case/7?id=7&access_token=SECRETTOKEN&page=2&sessionid=SESS&lang=en#frag";
+    const r = await captureBrowserPage(kit.repo, open.id, { url, screenshotPng: tinyPng().toString("base64") });
+    const sf = await kit.repo.getSource(open.id, r.sourceId);
+    expect(sf.source.identifiers.url).toBe("https://portal.example.org/case/7?id=7&page=2&lang=en");
+    expect(sf.source.provenance.originalUrl).toBe("https://portal.example.org/case/7?id=7&page=2&lang=en");
+    const all = JSON.stringify(sf) + JSON.stringify(await auditEvents(kit, open));
+    for (const bad of ["ana", "hunter2", "SECRETTOKEN", "SESS", "frag"]) expect(all, bad).not.toContain(bad);
+    // The token in `url` itself, the extension's own canonical address holding one too.
+    const r2 = await captureBrowserPage(kit.repo, open.id, { url: "https://example.org/a?token=SECRETTOKEN2aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY&x=1", screenshotPng: tinyPng().toString("base64"), extracted: { canonicalUrl: "https://example.org/a?token=SECRETTOKEN3aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY" } });
+    const sf2 = await kit.repo.getSource(open.id, r2.sourceId);
+    expect(sf2.source.identifiers.url).toBe("https://example.org/a?x=1");
+    expect(JSON.stringify(sf2)).not.toMatch(/SECRETTOKEN/);
+  });
+
+  it("a session id in a path parameter or a key-shaped sid reaches neither the stored address, the title nor the folder name (R391 a, review I1)", async () => {
+    const open = await makeProject(kit, OPEN_GOV.replace("downloader]", "downloader, browser_capture]"));
+    const HEX = "5f2b8c9e0a1d4e7f9b3c6a8d2e1f0b7c";
+    const url = `https://forum.example.org/app;jsessionid=JSESSPATH1/viewtopic.php;Sid=${HEX}?t=2&sid=${HEX}&session=12`;
+    const r = await captureBrowserPage(kit.repo, open.id, { url, screenshotPng: tinyPng().toString("base64") });
+    const sf = await kit.repo.getSource(open.id, r.sourceId);
+    expect(sf.source.identifiers.url).toBe("https://forum.example.org/app/viewtopic.php?t=2&session=12");
+    expect(sf.source.provenance.originalUrl).toBe("https://forum.example.org/app/viewtopic.php?t=2&session=12");
+    expect(sf.source.title.variants[0]!.value).toBe("forum.example.org/app/viewtopic.php");
+    const { readdir } = await import("node:fs/promises");
+    const names = (await readdir(kit.lib.root, { recursive: true })).map(String);
+    expect(names.length).toBeGreaterThan(0);
+    for (const bad of ["JSESSPATH1", "jsessionid", HEX]) {
+      expect(names.join("\n"), bad).not.toContain(bad);
+      expect(JSON.stringify(sf) + JSON.stringify(await auditEvents(kit, open)), bad).not.toContain(bad);
+    }
   });
 
   it("scrubPaths removes whole paths with spaces, non-ASCII letters and Windows forms", () => {

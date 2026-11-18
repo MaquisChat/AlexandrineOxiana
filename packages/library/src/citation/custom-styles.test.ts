@@ -25,6 +25,7 @@ import {
   renderCitationIn,
 } from "./custom-styles.js";
 import { SandboxError, configureSandbox, renderInSandbox, sandboxStats, shutdownSandbox } from "./sandbox.js";
+import { ResourceMissingError, sourceResolver, useResolverForTests } from "../resources.js";
 
 const HAVE_BUNDLE = bundleAvailable();
 if (!HAVE_BUNDLE && process.env.CI === "true") throw new Error("CSL bundle missing: run `pnpm fetch-csl` (scripts/fetch-csl.mjs)");
@@ -258,6 +259,25 @@ describe.skipIf(!HAVE_BUNDLE)("R88 I3: imported styles cannot block or exhaust t
     expect(n).toBeGreaterThan(2000);
     expect(over).toEqual([]);
   }, 180_000);
+
+  it("a damaged installation (no sandbox worker script) is reported as such, not as the researcher's style being unusable", async () => {
+    const p = await project();
+    useResolverForTests({
+      ...sourceResolver(),
+      sandboxWorkerUrl: () => {
+        throw new ResourceMissingError("the citation style sandbox");
+      },
+    });
+    try {
+      // A style no warm sandbox worker holds yet, so a worker must be started.
+      const fresh = style({ id: "http://www.zotero.org/styles/damaged-install", title: "Damaged Install" });
+      const err = await addCustomStyle(repo, p.id, fresh).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ResourceMissingError);
+      expect(await filesIn(stylesDir())).toEqual([]);
+    } finally {
+      useResolverForTests(undefined);
+    }
+  });
 
   it("an N=21 style passes the static cap but is refused by the render timeout", async () => {
     const p = await project();

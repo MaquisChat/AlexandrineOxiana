@@ -51,6 +51,7 @@ import { checkFiles, referenceMetadata, text } from "./refman.js";
 import { extraCitationKey, recordFields, zoteroAnnotation, zoteroCreator, zoteroTimestamp, type ZoteroAnnotationRow } from "./zotero-common.js";
 
 export { ITEM_TYPES, zoteroAnnotation, zoteroTimestamp, type ZoteroAnnotationRow } from "./zotero-common.js";
+import { isDiskFull, spaceMargin } from "./bulk/space.js";
 import { CopyNoSpace, CopyTooLarge, CopyUnstable, CopyUnusual, UNUSUAL_STATE_REASON, cappedRows, columnsOf, copyDatabases, openCopy, plainTables, t64, tN } from "./sqlite-copy.js";
 
 export const ZOTERO_REASONS = {
@@ -369,7 +370,7 @@ function itemQueries(db: Database.Database) {
   const note = db.prepare(`SELECT ${tN("note", "note", MAX_NOTE_CHARS + 1)} FROM itemNotes WHERE itemID = ?`);
   const annotation = db.prepare(
     `SELECT ${int("type", "type")}, ${t64("authorName", "authorName")}, ${t64("text", "text")}, ${t64("comment", "comment")}, ${t64("color", "color")},
-            ${t64("pageLabel", "pageLabel")}, ${t64("position", "position")} FROM itemAnnotations WHERE itemID = ?`,
+            ${t64("pageLabel", "pageLabel")}, ${t64("sortIndex", "sortIndex")}, ${t64("position", "position")} FROM itemAnnotations WHERE itemID = ?`,
   );
   return {
     fields: (id: number) => {
@@ -416,10 +417,15 @@ async function* scanZotero(dataDir: string, o: Required<Pick<ZoteroLocalOptions,
   try {
     copy = await copyDatabases(root, { required: ["zotero.sqlite"], optional: ["better-bibtex.sqlite"] }, await ctx.workDir(), "zotero", o.maxCopyBytes ?? MAX_ZOTERO_COPY_BYTES, {
       signal,
+      // R413 d: the copy leaves free what the import will copy and its margin, not 64 MB.
+      reserve: ctx.reserveBytes ?? spaceMargin(0),
       ...(o.freeSpace ? { freeSpace: o.freeSpace } : {}),
     });
   } catch (err) {
     if ((err as Error)?.name === "AbortError" || signal.aborted) throw signal.reason ?? err;
+    // R436 a: a full disk (or a quota) during the copy, after its own check of the room passed, ends the scan: the run
+    // stops the batch, resumable (copyDatabases has removed its folder). Never "missing or damaged".
+    if (isDiskFull(err)) throw err;
     yield fail(zoteroCopyReason(err));
     return;
   }
@@ -483,17 +489,27 @@ async function* scanZotero(dataDir: string, o: Required<Pick<ZoteroLocalOptions,
       return out;
     };
 
+    /** Whether the scan below yields this row as an item of its own (its own filters, in its own order). */
+    const ownItem = (it: ItemRow): boolean => {
+      if (snap.deleted.has(it.id) || snap.annotationIds.has(it.id) || snap.notes.has(it.id)) return false; // child notes come with their item
+      const att = snap.attachments.get(it.id);
+      if (att && att.parent !== null && att.parent !== undefined) return false; // child attachments come with their item
+      return it.type !== "note";
+    };
+    // R392: the total, counted over the same rows of the copy with the same filters, told before the first item;
+    // an empty standalone attachment (known only once its file is looked for) lowers it when it is passed by.
+    let told = 0;
+    for (const it of snap.items) if (ownItem(it)) told++;
+    ctx.total?.(told);
+
     let standaloneNotes = 0;
     for (const it of snap.items) {
       signal.throwIfAborted();
-      if (snap.deleted.has(it.id) || snap.annotationIds.has(it.id)) continue;
-      if (snap.notes.has(it.id)) {
-        if (!snap.childNoteIds.has(it.id)) standaloneNotes++;
-        continue; // child notes come with their item below
+      if (!ownItem(it)) {
+        if (!snap.deleted.has(it.id) && !snap.annotationIds.has(it.id) && snap.notes.has(it.id) && !snap.childNoteIds.has(it.id)) standaloneNotes++;
+        continue;
       }
       const att = snap.attachments.get(it.id);
-      if (att && att.parent !== null && att.parent !== undefined) continue; // child attachments come with their item
-      if (it.type === "note") continue;
 
       // Version token: Zotero's version (raised on sync only) plus modification times of the item and everything under it.
       const stamp: string[] = [`${it.id}:${it.clientModified ?? ""}`];
@@ -537,7 +553,10 @@ async function* scanZotero(dataDir: string, o: Required<Pick<ZoteroLocalOptions,
       // An annotation keeps its anchor only if its file is attached.
       const attached = new Set(files.map((f) => f.path));
       const annotations = anns.map((a) => (a.file && !attached.has(a.file) ? (({ file: _f, anchor: _a, ...rest }) => rest)(a) : a));
-      if (!fields.title && !files.length && !annotations.length) continue; // an empty standalone attachment
+      if (!fields.title && !files.length && !annotations.length) {
+        ctx.total?.(--told); // an empty standalone attachment: not an item after all
+        continue;
+      }
 
       const tagColors: Record<string, string> = {};
       for (const t of fields.tags ?? []) {

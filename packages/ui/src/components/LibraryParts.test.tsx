@@ -38,6 +38,17 @@ describe("CollectionTree", () => {
 });
 
 describe("CollectionTree expand, collapse, rename, delete", () => {
+  it("an open rename closes when another collection is selected, so it never renames the wrong one (41b1 M2)", async () => {
+    const onRename = vi.fn();
+    const user = userEvent.setup();
+    const { rerender } = render(<CollectionTree collections={COLLECTIONS.collections} selectedId="c1" onSelect={vi.fn()} onRename={onRename} />);
+    await user.click(screen.getByRole("button", { name: "Rename collection Chapter 1" }));
+    expect(screen.getByLabelText("New name for Chapter 1")).toBeTruthy();
+    rerender(<CollectionTree collections={COLLECTIONS.collections} selectedId="c4" onSelect={vi.fn()} onRename={onRename} />);
+    expect(screen.queryByLabelText(/New name for/)).toBeNull();
+    expect(onRename).not.toHaveBeenCalled();
+  });
+
   it("parents carry aria-expanded; Left collapses (hiding children) and Right expands", async () => {
     const user = userEvent.setup();
     render(<CollectionTree collections={COLLECTIONS.collections} selectedId={undefined} onSelect={vi.fn()} />);
@@ -144,6 +155,12 @@ describe("TagList", () => {
   });
 });
 
+// Task 69 (M2): the date is shown in the researcher's own time zone, so the expected day comes from
+// the machine's zone (getDate, not the formatter under test). Mid-November keeps month and year the
+// same in every zone, so the test checks the local day and the wording wherever it runs.
+const NOTICED_AT = "2026-11-15T12:00:00.000Z";
+const NOTICED_TEXT = `No longer available at its source, noticed on Nov ${new Date(NOTICED_AT).getDate()}, 2026`;
+
 describe("SourceTable", () => {
   it("shows title, creators and year; the title opens the source", async () => {
     const onOpen = vi.fn();
@@ -161,6 +178,78 @@ describe("SourceTable", () => {
   it("locked sources read as locked, with no title", () => {
     render(<SourceTable items={[{ id: "x", projectId: "p2", type: "book", title: "", creatorsText: "", folder: "f", needsReview: false, locked: true }]} total={1} onOpen={vi.fn()} />);
     expect(screen.getByText("Locked source")).toBeTruthy();
+  });
+
+  it("says in words when a source was found through its annotations (Task 58)", () => {
+    const base = { projectId: "p1", type: "book", creatorsText: "", folder: "f", needsReview: false, locked: false };
+    render(
+      <SourceTable
+        items={[
+          { ...base, id: "a", title: "Found by annotation", matchedIn: "annotation" },
+          { ...base, id: "b", title: "Found by title" },
+        ]}
+        total={2}
+        onOpen={vi.fn()}
+      />,
+    );
+    const rows = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row");
+    expect(rows[1]!.textContent).toContain("Found in an annotation");
+    expect(rows[2]!.textContent).not.toContain("annotation");
+  });
+
+  it("marks in words a source no longer available at its source, with the date it was noticed; nothing for an available, incomplete or unknown status (Task 69, D17)", () => {
+    const base = { projectId: "p1", type: "social-post", creatorsText: "", folder: "f", needsReview: false, locked: false };
+    render(
+      <SourceTable
+        items={[
+          { ...base, id: "a", title: "Gone post", availability: { status: "unavailable-on-platform", firstNoticedAt: NOTICED_AT } },
+          { ...base, id: "b", title: "Gone, date unknown", availability: { status: "unavailable-on-platform" } },
+          { ...base, id: "c", title: "Present post", availability: { status: "available" } },
+          { ...base, id: "d", title: "Part saved", availability: { status: "incomplete", firstNoticedAt: NOTICED_AT } },
+          { ...base, id: "e", title: "Future", availability: { status: "some-future-status" } },
+          { ...base, id: "f", title: "No field" },
+        ]}
+        total={6}
+        onOpen={vi.fn()}
+      />,
+    );
+    const rows = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row");
+    const marks = screen.getAllByRole("note");
+    expect(marks.map((m) => m.getAttribute("aria-label"))).toEqual([NOTICED_TEXT, "No longer available at its source"]);
+    expect(within(rows[1]!).getByRole("note", { name: NOTICED_TEXT }).textContent).toBe(NOTICED_TEXT);
+    expect(within(rows[2]!).getByRole("note").textContent).toBe("No longer available at its source");
+    for (const r of rows.slice(3)) expect(r.textContent).not.toMatch(/available|noticed/i);
+    // Words, not colour alone: a badge from the theme's classes.
+    expect(marks[0]!.className).toContain("ao-badge");
+  });
+
+  it("the mark's words are set apart from \"Needs review\" in the row's text (Task 69 M4)", () => {
+    const base = { projectId: "p1", type: "social-post", creatorsText: "", folder: "f", locked: false };
+    render(<SourceTable items={[{ ...base, id: "a", title: "Gone post", needsReview: true, availability: { status: "unavailable-on-platform" } }]} total={1} onOpen={vi.fn()} reviewHref={(id) => `#/review/${id}`} />);
+    const row = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row")[1]!;
+    expect(row.textContent).toContain("Needs review No longer available at its source");
+    expect(screen.getByRole("link", { name: "Needs review: Gone post" })).toBeTruthy();
+  });
+
+  it("says when only part of a source's annotations is searchable, when the index is incomplete, and when search covers titles only (R161)", () => {
+    const base = { projectId: "p1", type: "book", creatorsText: "", folder: "f", needsReview: false, locked: false };
+    const { rerender } = render(
+      <SourceTable items={[{ ...base, id: "a", title: "Long one", matchedIn: "annotation", annotationsPartial: true }, { ...base, id: "b", title: "Short one" }]} total={2} onOpen={vi.fn()} />,
+    );
+    const rows = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row");
+    expect(rows[1]!.textContent).toContain("Only part of its annotations is searchable");
+    expect(rows[2]!.textContent).not.toContain("part of its annotations");
+    expect(screen.queryByRole("note")).toBeNull();
+    rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} incomplete />);
+    // N3: a state and its remedy, not a rebuild that is not running.
+    const note = screen.getByRole("note").textContent;
+    expect(note).toMatch(/Annotations are not searchable yet: this library's search index needs rebuilding/);
+    expect(note).toMatch(/rebuild-index/);
+    expect(note).not.toMatch(/being/);
+    rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} incomplete rebuilding />);
+    expect(screen.getByRole("note").textContent).toMatch(/The search index is being rebuilt: annotations become searchable when it finishes/);
+    rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} limited />);
+    expect(screen.getByRole("note").textContent).toMatch(/only titles are searched/i);
   });
 });
 

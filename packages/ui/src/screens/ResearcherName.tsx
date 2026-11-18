@@ -23,7 +23,8 @@ export function ResearcherNameSetting({ client }: { client: ApiClient }) {
         setName(r.name ?? "");
         setLoaded(true);
       },
-      () => live && setLoaded(true),
+      // Not read: the form stays off, or saving would clear a name that was never shown (41b2 M9).
+      () => live && setError("Your name as researcher could not be read, so it cannot be changed here now. Nothing was changed."),
     );
     return () => {
       live = false;

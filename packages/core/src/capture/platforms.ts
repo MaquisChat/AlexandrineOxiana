@@ -1,0 +1,261 @@
+/**
+ * Recognizing YouTube, Instagram and TikTok links (spec 5.1). Pure: never touches the network. Short
+ * links (`vm.tiktok.com`) stay `unknown` and are resolved by the download tool.
+ *
+ * The one definition (R146, Task 63): the library captures by it, the service checks the extension's
+ * link lists by it, and the interface previews pasted links by it (a hint there; the service decides).
+ * No Node or DOM APIs beyond the WHATWG URL, which both have.
+ */
+
+import { secretName } from "./secret-names.js";
+
+/** Longest address the service accepts (routes/capture.ts). */
+export const MAX_ADDRESS_LENGTH = 2048;
+
+/** What may be sent for capture at all: http or https with a host, at most 2048 characters. */
+export function isWebAddress(u: string): boolean {
+  if (typeof u !== "string" || u.length > MAX_ADDRESS_LENGTH || !/^https?:\/\//i.test(u)) return false;
+  try {
+    const p = new URL(u);
+    return (p.protocol === "http:" || p.protocol === "https:") && p.hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+export type Platform = "youtube" | "instagram" | "tiktok" | "other";
+export type LinkKind = "video" | "short" | "post" | "reel" | "carousel" | "story-highlight" | "playlist" | "profile" | "unknown";
+
+export interface ClassifiedUrl {
+  platform: Platform;
+  kind: LinkKind;
+  /**
+   * The link as stored and printed: platform links in their canonical form; any other link without
+   * user name, password, fragment, tracking or secret-named parameters (R379).
+   */
+  canonicalUrl: string;
+  postId?: string;
+  handle?: string;
+}
+
+/** The kinds that name one post or video (R116: all a list of links may hold). */
+const POST_KINDS: ReadonlySet<LinkKind> = new Set<LinkKind>(["video", "short", "post", "reel", "carousel"]);
+
+/** A whole profile, channel or playlist: captured as a profile run (`captureProfile`), never as one link. */
+export function isCollectionLink(c: ClassifiedUrl): boolean {
+  return c.kind === "profile" || c.kind === "playlist";
+}
+
+/** One post or video on a known platform. */
+export function isPostLink(c: ClassifiedUrl): boolean {
+  return c.platform !== "other" && POST_KINDS.has(c.kind);
+}
+
+/** Query parameters that only track how a link was shared. */
+const TRACKING = /^(utm_.*|igsh|igshid|si|feature|fbclid|gclid|mc_cid|mc_eid|is_from_webapp|sender_device|sender_web_id|_r|_t)$/i;
+
+/** Instagram paths that are not profiles. */
+const IG_RESERVED = new Set(["p", "reel", "reels", "tv", "stories", "explore", "accounts", "direct", "about", "developer", "legal", "web", "api"]);
+const YT_ID = /^[\w-]{6,}$/;
+
+function hostOf(u: URL): string {
+  return u.hostname.toLowerCase().replace(/^(www|m|mobile|music)\./, "");
+}
+
+/** A piece of an address decoded for judging (`+` is a space in a query), or as written when its escapes are malformed. */
+function decodePart(s: string, query: boolean): string {
+  const t = query ? s.replace(/\+/g, " ") : s;
+  try {
+    return decodeURIComponent(t);
+  } catch {
+    return t;
+  }
+}
+
+/** True when the raw `name=value` (or bare `name`) part carries a secret (`secretName`, R391) or, in a query, tracks sharing. */
+function dropPart(part: string, query: boolean): boolean {
+  const eq = part.indexOf("=");
+  const name = decodePart(eq < 0 ? part : part.slice(0, eq), query);
+  const value = eq < 0 ? "" : decodePart(part.slice(eq + 1), query);
+  return (query && TRACKING.test(name)) || secretName(name, value);
+}
+
+/**
+ * The path without its secret path parameters (R391 a): in each segment, `;name=value` parts judged by
+ * the same rule as the query and removed when secret (`/app;jsessionid=…/x` → `/app/x`); the rest of
+ * the path is kept as written.
+ */
+function cleanPath(path: string): string {
+  if (!path.includes(";")) return path;
+  return path
+    .split("/")
+    .map((seg) => {
+      if (!seg.includes(";")) return seg;
+      const [head, ...params] = seg.split(";");
+      return [head, ...params.filter((p) => !dropPart(p, false))].join(";");
+    })
+    .join("/");
+}
+
+/**
+ * The query without tracking and secret parameters (R379, R391 b): one pass over the raw `&`-separated
+ * parts; every part kept is kept byte for byte and in its order (no re-serialising).
+ */
+function cleanQuery(search: string): string {
+  if (search.length <= 1) return "";
+  const kept = search.slice(1).split("&").filter((p) => !dropPart(p, true));
+  return kept.length === 0 || (kept.length === 1 && kept[0] === "") ? "" : `?${kept.join("&")}`;
+}
+
+/**
+ * The address as stored and printed (R379, R391; R41 C1, R99 I8: no secret in a stored address):
+ * without the user name and password, the fragment, tracking parameters and secret parameters, in the
+ * query and in the path (`secretName`). The rest of the path and every other parameter stay as
+ * written, so it still leads to the page.
+ */
+function stripTracking(u: URL): string {
+  return `${u.protocol}//${u.host.toLowerCase()}${cleanPath(u.pathname)}${cleanQuery(u.search)}`;
+}
+
+/** A handle segment decoded, or undefined when its percent escapes are malformed (R379: not a handle). */
+function decodeHandle(seg: string): string | undefined {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return undefined;
+  }
+}
+
+function youtube(u: URL, host: string): ClassifiedUrl {
+  const seg = u.pathname.split("/").filter(Boolean);
+  const unknown: ClassifiedUrl = { platform: "youtube", kind: "unknown", canonicalUrl: stripTracking(u) };
+  if (host === "youtu.be") {
+    const id = seg[0];
+    return id && YT_ID.test(id) ? { platform: "youtube", kind: "video", canonicalUrl: `https://www.youtube.com/watch?v=${id}`, postId: id } : unknown;
+  }
+  const list = u.searchParams.get("list") ?? undefined;
+  if (seg[0] === "watch") {
+    const id = u.searchParams.get("v") ?? "";
+    if (!YT_ID.test(id)) return unknown;
+    const q = new URLSearchParams({ v: id });
+    if (list) q.set("list", list);
+    return { platform: "youtube", kind: "video", canonicalUrl: `https://www.youtube.com/watch?${q}`, postId: id };
+  }
+  if ((seg[0] === "shorts" || seg[0] === "live" || seg[0] === "embed") && seg[1] && YT_ID.test(seg[1])) {
+    const id = seg[1];
+    return seg[0] === "shorts"
+      ? { platform: "youtube", kind: "short", canonicalUrl: `https://www.youtube.com/shorts/${id}`, postId: id }
+      : { platform: "youtube", kind: "video", canonicalUrl: `https://www.youtube.com/watch?v=${id}`, postId: id };
+  }
+  if (seg[0] === "playlist" && list) {
+    return { platform: "youtube", kind: "playlist", canonicalUrl: `https://www.youtube.com/playlist?list=${encodeURIComponent(list)}` };
+  }
+  const handle = seg[0]?.startsWith("@") && seg[0].length > 1 ? decodeHandle(seg[0]) : undefined;
+  if (handle !== undefined) {
+    return { platform: "youtube", kind: "profile", canonicalUrl: `https://www.youtube.com/${seg[0]}`, handle };
+  }
+  if ((seg[0] === "channel" || seg[0] === "c" || seg[0] === "user") && seg[1]) {
+    return { platform: "youtube", kind: "profile", canonicalUrl: `https://www.youtube.com/${seg[0]}/${seg[1]}` };
+  }
+  return unknown;
+}
+
+function instagram(u: URL): ClassifiedUrl {
+  const seg = u.pathname.split("/").filter(Boolean);
+  const unknown: ClassifiedUrl = { platform: "instagram", kind: "unknown", canonicalUrl: stripTracking(u) };
+  // `/<handle>/p/<code>/` and `/<handle>/reel/<code>/` are newer forms of the same links.
+  const i = seg[1] === "p" || seg[1] === "reel" || seg[1] === "reels" ? 1 : 0;
+  const [a, b] = [seg[i], seg[i + 1]];
+  if ((a === "p" || a === "tv") && b) return { platform: "instagram", kind: a === "tv" ? "video" : "post", canonicalUrl: `https://www.instagram.com/${a}/${b}/`, postId: b };
+  if ((a === "reel" || a === "reels") && b) return { platform: "instagram", kind: "reel", canonicalUrl: `https://www.instagram.com/reel/${b}/`, postId: b };
+  if (seg[0] === "stories" && seg[1] === "highlights" && seg[2]) {
+    return { platform: "instagram", kind: "story-highlight", canonicalUrl: `https://www.instagram.com/stories/highlights/${seg[2]}/`, postId: seg[2] };
+  }
+  if (seg.length === 1 && !IG_RESERVED.has(seg[0]!.toLowerCase()) && /^[\w.]+$/.test(seg[0]!)) {
+    return { platform: "instagram", kind: "profile", canonicalUrl: `https://www.instagram.com/${seg[0]}/`, handle: seg[0]! };
+  }
+  return unknown;
+}
+
+function tiktok(u: URL, host: string): ClassifiedUrl {
+  const seg = u.pathname.split("/").filter(Boolean);
+  if (host === "vm.tiktok.com" || host === "vt.tiktok.com") {
+    // A short link: the tool follows the redirect; its post id is known only after the download.
+    return { platform: "tiktok", kind: "unknown", canonicalUrl: seg[0] ? `https://${host}/${seg[0]}/` : stripTracking(u) };
+  }
+  const unknown: ClassifiedUrl = { platform: "tiktok", kind: "unknown", canonicalUrl: stripTracking(u) };
+  if (!seg[0]?.startsWith("@") || seg[0].length < 2) return unknown;
+  const handle = decodeHandle(seg[0]);
+  if (handle === undefined) return unknown;
+  if ((seg[1] === "video" || seg[1] === "photo") && seg[2] && /^\d+$/.test(seg[2])) {
+    return {
+      platform: "tiktok",
+      kind: seg[1] === "video" ? "video" : "carousel",
+      canonicalUrl: `https://www.tiktok.com/${seg[0]}/${seg[1]}/${seg[2]}`,
+      postId: seg[2],
+      handle,
+    };
+  }
+  if (seg.length === 1) return { platform: "tiktok", kind: "profile", canonicalUrl: `https://www.tiktok.com/${seg[0]}`, handle };
+  return unknown;
+}
+
+/**
+ * An address safe to store, for the catch-alls (R391 f): the cleaned form of an http(s) address
+ * (`stripTracking`) when it can be made; else the address with everything from the first `?`, `#`
+ * or `;` removed and any `user:pass@` removed. Never the address as given; never throws.
+ */
+export function cleanAddress(url: string): string {
+  const raw = typeof url === "string" ? url.trim() : "";
+  try {
+    const u = new URL(raw);
+    if (u.protocol === "https:" || u.protocol === "http:") return stripTracking(u);
+  } catch {
+    // fall through to the cut-short form
+  }
+  // The user information first (a password may hold a `;`), then the cut.
+  const bare = raw.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, "$1");
+  const cut = bare.search(/[?#;]/);
+  return cut >= 0 ? bare.slice(0, cut) : bare;
+}
+
+/**
+ * The platform and kind of `url`. Never throws, for any input (R379): an input that cannot be read
+ * as an address is the generic "other / unknown" with the input as given, and an address of another
+ * scheme is that too, without its user name and password (R415 e; no caller stores one that is not
+ * http or https); anything unexpected while reading one gives `cleanAddress` (R391 f).
+ */
+export function classifyUrl(url: string): ClassifiedUrl {
+  const raw = typeof url === "string" ? url.trim() : "";
+  try {
+    return classify(raw);
+  } catch {
+    return { platform: "other", kind: "unknown", canonicalUrl: cleanAddress(raw) };
+  }
+}
+
+/**
+ * An address of another scheme (`ftp:`, `sftp:` …) as given, but without its user name and password
+ * (R415 e: the command line prints it); `cleanAddress` if the URL will not drop them.
+ */
+function withoutUser(u: URL, raw: string): string {
+  if (!u.username && !u.password) return raw;
+  u.username = "";
+  u.password = "";
+  return u.username || u.password ? cleanAddress(raw) : u.href;
+}
+
+function classify(raw: string): ClassifiedUrl {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return { platform: "other", kind: "unknown", canonicalUrl: raw };
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return { platform: "other", kind: "unknown", canonicalUrl: withoutUser(u, raw) };
+  const host = hostOf(u);
+  if (host === "youtube.com" || host === "youtu.be" || host === "youtube-nocookie.com") return youtube(u, host);
+  if (host === "instagram.com") return instagram(u);
+  if (host === "tiktok.com" || host === "vm.tiktok.com" || host === "vt.tiktok.com") return tiktok(u, host);
+  return { platform: "other", kind: "unknown", canonicalUrl: stripTracking(u) };
+}

@@ -11,6 +11,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { devWorkerPython, openLibrary } from "@ao/library";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
@@ -141,7 +142,7 @@ describe("library and project", () => {
     });
     expect(r.code, r.stderr).toBe(0);
     const names = JSON.parse(await readFile(dump, "utf8")) as string[];
-    expect(names).toContain("AO_WORKER_TOKEN"); // its own token, set by the app for it
+    expect(names).not.toContain("AO_WORKER_TOKEN"); // its own token arrives on standard input (R155)
     expect(names).not.toContain("AO_PASSPHRASE");
   });
 
@@ -537,6 +538,34 @@ describe("import, export, secrets and maintenance", () => {
     expect(r.stderr).not.toContain(tmp);
   }, 60_000);
 
+  it("R362 c: the library's own folder, a project's folder and a folder holding the library are refused, nothing imported", async () => {
+    for (const dir of [lib, join(lib, "Projects", "Imp"), tmp]) {
+      for (const extra of [["--dry-run"], []]) {
+        const r = await run(["import", dir, "--project", "Imp", ...extra]);
+        expect([r.code, r.stderr.includes(IN_LIBRARY_TEXT.folder)], r.stderr).toEqual([1, true]);
+      }
+    }
+    expect(json(await run(["--json", "list", "--project", "Imp"])).sources).toEqual([]);
+    expect(await readdir(join(lib, "Projects", "Imp"))).not.toContain("imports");
+  }, 120_000);
+
+  it("R368 a: a ZIP inside the library (a backup) and an export file inside it are refused whole, nothing imported", async () => {
+    const zip = join(lib, "Backups", "Imp - backup.zip");
+    const bib = join(lib, "Exports", "refs.bib");
+    await writeFile(zip, "not read");
+    await writeFile(bib, "@book{a, title = {Not read}}\n");
+    for (const file of [zip, bib]) {
+      for (const extra of [["--dry-run"], []]) {
+        const r = await run(["import", file, "--project", "Imp", ...extra]);
+        expect([r.code, r.stderr.includes(IN_LIBRARY_TEXT.importFile)], r.stderr).toEqual([1, true]);
+      }
+    }
+    expect(json(await run(["--json", "list", "--project", "Imp"])).sources).toEqual([]);
+    expect(await readdir(join(lib, "Projects", "Imp"))).not.toContain("imports");
+    await rm(zip);
+    await rm(bib);
+  }, 120_000);
+
   it("imports a folder, then the same folder again finds the duplicates", async () => {
     const r = await run(["--json", "import", papers, "--project", "Imp", "--structure", "tags", "--duplicates", "skip"]);
     expect(r.code, r.stderr).toBe(0);
@@ -560,7 +589,7 @@ describe("import, export, secrets and maintenance", () => {
 
     const dry = await run(["--json", "import", join(bibDir, "a.bib"), "--project", "RefsA", "--dry-run"]);
     expect(dry.code, dry.stderr).toBe(0);
-    expect(json(dry).outsideFiles).toEqual([{ item: expect.any(String), folder: await realpath(elsewhere) }]);
+    expect(json(dry).outsideFiles).toEqual([{ item: expect.any(String), folder: await realpath(elsewhere), file: await realpath(join(elsewhere, "linked.pdf")) }]);
     const dryText = await run(["import", join(bibDir, "a.bib"), "--project", "RefsA", "--dry-run"]);
     expect(dryText.stdout).toContain("--approve-folder");
 
@@ -735,6 +764,15 @@ describe("import, export, secrets and maintenance", () => {
     expect(webDry.stderr).not.toMatch(/was not saved/u);
   }, 120_000);
 
+  it("R379 (FR-A14): export --output inside the library is refused (exit 1, the sentence); the rules file is unchanged", async () => {
+    const gov = join(lib, "Projects", "RefsB", "governance.yaml");
+    const before = await readFile(gov);
+    const r = await run(["export", "--project", "RefsB", "--format", "bibtex", "--output", gov]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain(IN_LIBRARY_TEXT.exportFile);
+    expect(await readFile(gov)).toEqual(before);
+  }, 60_000);
+
   it("review round 1: export --output to a folder or into a missing folder gives a plain message", async () => {
     const dir = await run(["export", "--project", "RefsB", "--format", "ris", "--output", tmp]);
     expect(dir.code).toBe(1);
@@ -812,3 +850,22 @@ async function wrapper(mode: string, env: Record<string, string> = {}): Promise<
   await mkdir(dir, { recursive: true });
   return dir;
 }
+
+describe("this computer's identity renewed by the command-line tool (Task 68 fix round 1, I2)", () => {
+  it("a damaged device.json: the tool says so on standard error and the notice is written before it exits", async () => {
+    const cfg = join(tmp, "config-renewed");
+    await mkdir(cfg, { recursive: true });
+    await writeFile(join(cfg, "device.json"), "garbage{");
+    // A quick command that fails: the notice must be written all the same.
+    const r = await ao(["library", "open", join(tmp, "no-such-library")], { AO_CONFIG_DIR: cfg });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toMatch(/This computer's identity for the app could not be read and had to be renewed/);
+    expect(r.stderr).not.toContain(cfg);
+    const notices = JSON.parse(await readFile(join(cfg, "notices.json"), "utf8")) as { notices: Array<{ kind: string }> };
+    expect(notices.notices.map((n) => n.kind)).toEqual(["device-identity-renewed"]);
+    expect((await readdir(cfg)).filter((n) => n.startsWith("device.json.corrupt-"))).toHaveLength(1);
+    // A second run reads the new identity: nothing said again.
+    const again = await ao(["library", "open", join(tmp, "no-such-library")], { AO_CONFIG_DIR: cfg });
+    expect(again.stderr).not.toMatch(/had to be renewed/);
+  }, 60_000);
+});

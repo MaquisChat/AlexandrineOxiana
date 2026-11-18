@@ -2,9 +2,9 @@
  * Task 36 routes: fieldwork update, consent withdrawal and guarded delete (R97), consent and
  * protocol documents, and the retention list / raw-data destruction.
  */
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { SourceDraft } from "@ao/core";
@@ -206,12 +206,60 @@ describe("retention (spec 6.3(5))", () => {
     expect(JSON.stringify(r.json)).not.toContain(tmp);
     expect((await call({ url: `/projects/${pid}/retention` })).json.due).toEqual([]);
   });
+
+  it("R147: the certificate is shown as written, with its amendments and the resulting status, at the destruction and afterwards", async () => {
+    const { assetId } = await newSource();
+    const b = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(b.status, b.body).toBe(200);
+    const held = `Backups/${b.json.backup.file as string}`;
+    const r = await call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [assetId], confirm: true } });
+    expect(r.status, r.body).toBe(200);
+    // As written at the destruction (and never rewritten): the backup that held the file, still to be removed.
+    expect(r.json.original.backups).toEqual({ status: "pending", containing: [held], deleted: [] });
+    // What happened then is an amendment beside it; the certificate is presented with the result.
+    expect(r.json.status).toBe("deleted");
+    expect(r.json.certificate.backups).toMatchObject({ status: "deleted", containing: [held], deleted: [held] });
+    expect(r.json.amendments).toEqual([
+      {
+        file: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.amendment-1\.json$/),
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+        verified: true,
+        content: expect.objectContaining({ kind: "destruction-certificate-amendment", number: 1 }),
+      },
+    ]);
+    expect(JSON.parse(await readFile(join(tmp, "Lib", r.json.certificateFile), "utf8"))).toEqual(r.json.original);
+    const list = await call({ url: `/projects/${pid}/retention/certificates` });
+    expect(list.status, list.body).toBe(200);
+    expect(list.json.certificates).toEqual([
+      { certificateFile: r.json.certificateFile, certificateSha256: expect.stringMatching(/^[0-9a-f]{64}$/), verified: true, original: r.json.original, certificate: r.json.certificate, amendments: r.json.amendments, status: "deleted", outstanding: [] },
+    ]);
+    expect(list.body).not.toContain(tmp);
+  });
+
+  it("the project's time zone (R93): GET retention shows it (null: UTC); PUT /time-zone sets a real zone or clears it", async () => {
+    expect((await call({ url: `/projects/${pid}/retention` })).json.timeZone).toBeNull();
+    const r = await call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: { timeZone: "asia/tokyo" } });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toEqual({ timeZone: "Asia/Tokyo" });
+    expect((await call({ url: `/projects/${pid}/retention` })).json.timeZone).toBe("Asia/Tokyo");
+    expect(svc.state.session!.repo.getProject(pid).timeZone).toBe("Asia/Tokyo");
+    for (const timeZone of ["Mars/Olympus", "+05:00", "", 7, ["UTC"], "x".repeat(300)]) {
+      const bad = await call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: { timeZone } });
+      expect(bad.status, JSON.stringify(timeZone)).toBe(400);
+      expect(bad.json.error.code).toBe("VALIDATION");
+    }
+    expect((await call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: {} })).status).toBe(400);
+    expect(svc.state.session!.repo.getProject(pid).timeZone).toBe("Asia/Tokyo");
+    const cleared = await call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: { timeZone: null } });
+    expect(cleared.json).toEqual({ timeZone: null });
+    expect((await call({ url: `/projects/${pid}/retention` })).json.timeZone).toBeNull();
+  });
 });
 
 describe("researcher name (device setting, R84/R117 carry-over)", () => {
   it("GET/PUT /settings/researcher keeps a display name on this device; invalid names are refused", async () => {
     expect((await call({ url: "/settings/researcher" })).json).toEqual({ name: null });
-    for (const name of ["", "   ", "a".repeat(201), "Ana‮Souza", "Ana\nSouza", 7]) {
+    for (const name of ["", "   ", "a".repeat(201), "Ana‮Souza", "Ana\nSouza", 7, "\ud800", "Ana\udc00"]) {
       expect((await call({ method: "PUT", url: "/settings/researcher", body: { name } })).status, JSON.stringify(name)).toBe(400);
     }
     const put = await call({ method: "PUT", url: "/settings/researcher", body: { name: "  Ana Souza " } });
@@ -248,5 +296,143 @@ describe("researcher name (device setting, R84/R117 carry-over)", () => {
     const batches = (await readdir(join(tmp, "Lib", folder, "imports"))).sort();
     const rec = JSON.parse(await readFile(join(tmp, "Lib", folder, "imports", batches.at(-1)!, "batch.json"), "utf8"));
     expect(rec.adapterOptions).toEqual({ researcherName: "Ana Souza" });
+  });
+
+  it("41a M6: a researcher name given for one device import is checked like the setting (400, nothing imported)", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const dir = join(tmp, "DCIM2");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "note.txt"), "x");
+    const dev = await call({ method: "POST", url: "/projects", body: { name: "Device2", governanceYaml: FIELD_GOV.replace("captureMethods: [manual_upload]", "captureMethods: [manual_upload, device_import]"), encryption: { enabled: false } } });
+    const devPid = dev.json.project.id as string;
+    for (const researcherName of ["Ana‮Souza", "Ana\nSouza", "\ud800", "a".repeat(201)]) {
+      const r = await call({ method: "POST", url: `/projects/${devPid}/device-import`, body: { dir, options: { researcherName } } });
+      expect(r.status, JSON.stringify(researcherName)).toBe(400);
+    }
+  });
+});
+
+describe("Task 46b fix round 1 (R172): consent withdrawal and the library row's needsReview", () => {
+  const badge = async (sid: string) => ((await call({ url: `/projects/${pid}/sources?limit=500` })).json.items as Array<{ id: string; needsReview: boolean }>).find((r) => r.id === sid)?.needsReview;
+  const pending = (sid: string) =>
+    svc.state.session!.index!.db.prepare("SELECT id, kind FROM review_items WHERE project_id = ? AND source_id = ? AND status = 'pending' ORDER BY kind").all(pid, sid) as Array<{ id: string; kind: string }>;
+  const withdrawFor = async (sourceId: string) => {
+    const p = (await call({ method: "POST", url: `/projects/${pid}/participants`, body: {} })).json;
+    const c = (await call({ method: "POST", url: `/projects/${pid}/consents`, body: { participantId: p.id, scope: "audio", date: "2026-03-14" } })).json;
+    await svc.state.session!.repo.linkSourceToFieldwork(pid, sourceId, { participantIds: [p.id] });
+    const w = await call({ method: "POST", url: `/projects/${pid}/consents/${c.id}/withdraw`, body: { reason: "phoned" } });
+    expect(w.status, w.body).toBe(200);
+    expect(w.json.flaggedSourceIds).toEqual([sourceId]);
+  };
+
+  it("a source flagged by a consent withdrawal carries the badge", async () => {
+    const { sourceId } = await newSource();
+    expect(await badge(sourceId)).toBe(false);
+    await withdrawFor(sourceId);
+    expect(pending(sourceId).map((e) => e.kind)).toEqual(["verification"]);
+    expect(await badge(sourceId)).toBe(true);
+  });
+
+  it("a source with two pending entries keeps the badge until both are decided: deciding its import entry leaves the withdrawal's", async () => {
+    const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [pdf] } });
+    expect(att.status, att.body).toBe(200);
+    expect(att.json.items[0].outcome).toBe("needs-review");
+    const sourceId = att.json.items[0].sourceId as string;
+    await withdrawFor(sourceId);
+    const two = pending(sourceId);
+    expect(two.map((e) => e.kind)).toEqual(["import", "verification"]);
+    expect(await badge(sourceId)).toBe(true);
+    const d = await call({ method: "POST", url: `/review/${two[0]!.id}/decide`, body: { projectId: pid, decision: { action: "accept" } } });
+    expect(d.status, d.body).toBe(200);
+    expect(pending(sourceId).map((e) => e.kind)).toEqual(["verification"]);
+    expect(await badge(sourceId)).toBe(true);
+  });
+});
+
+describe("attach takes only absolute paths (R379, WB5 M3)", () => {
+  it("a relative path or one holding a NUL is refused before anything is read; an absolute path works as before", async () => {
+    const sources = async () => JSON.stringify((await call({ url: `/projects/${pid}/sources` })).json);
+    const before = await sources();
+    // "package.json" exists in the folder the tests run from: read relative to it, it would be attached or sniffed.
+    for (const paths of [["package.json"], ["../../etc/hosts"], [`${pdf}\0.pdf`], [pdf, "form.pdf"]]) {
+      const r = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths } });
+      expect(r.status, JSON.stringify(paths)).toBe(400);
+      expect(r.json.error).toMatchObject({ code: expect.any(String), message: '"paths" must be absolute paths.' });
+      expect(r.json.items).toBeUndefined();
+    }
+    expect(await sources()).toBe(before);
+    const ok = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [pdf] } });
+    expect(ok.status, ok.body).toBe(200);
+    expect(ok.json.items).toHaveLength(1);
+  });
+});
+
+describe("every route that takes a path takes only an absolute path of this computer, without a NUL (R391 g, review M7)", () => {
+  // On macOS and Linux a Windows drive path or a network path is a relative name, read from the service's folder.
+  const FOREIGN = ["C:\\Windows\\win.ini", "c:/x.pdf", "\\\\server\\share\\package.json", "package.json", "/tmp/x\0.pdf"];
+  // R415 f (review 2 M5): these requests run from the test's temporary folder, never the repository's,
+  // so that a missing guard fails here without writing anything into the repository. Each foreign name
+  // exists there as a file, so that without the guard it would be read (and the test would fail).
+  let here: string;
+  beforeEach(async () => {
+    here = process.cwd();
+    process.chdir(tmp);
+    for (const p of FOREIGN.slice(0, 4)) {
+      await mkdir(dirname(join(tmp, p)), { recursive: true });
+      await writeFile(join(tmp, p), "{}");
+    }
+  });
+  afterEach(() => {
+    process.chdir(here);
+  });
+  const refused = async (method: "POST", url: string, body: (p: string) => unknown, message: string) => {
+    for (const p of FOREIGN) {
+      const r = await call({ method, url, body: body(p) });
+      expect(r.status, `${url} ${JSON.stringify(p)}: ${r.body}`).toBe(400);
+      expect(r.json.error.message, url).toBe(message);
+    }
+  };
+
+  it("the review's probe: attach refuses a Windows drive path and a network path", async () => {
+    const sources = async () => JSON.stringify((await call({ url: `/projects/${pid}/sources` })).json);
+    const before = await sources();
+    await refused("POST", `/projects/${pid}/attach`, (p) => ({ paths: [p] }), '"paths" must be absolute paths.');
+    expect(await sources()).toBe(before);
+  });
+  it("protocol documents", async () => {
+    await refused("POST", `/projects/${pid}/protocol/documents`, (p) => ({ paths: [p] }), '"paths" must be absolute paths.');
+  });
+  it("a consent form's document", async () => {
+    await refused("POST", `/projects/${pid}/consents/nope/document`, (p) => ({ path: p }), '"path" must be an absolute path.');
+  });
+  it("an import's dry run and import: the source's path, Zotero's data folder and the approved outside folders and files", async () => {
+    for (const url of [`/projects/${pid}/import/dry-run`, `/projects/${pid}/import`]) {
+      await refused("POST", url, (p) => ({ adapter: { kind: "folder", path: p } }), "The import path must be absolute.");
+      await refused("POST", url, (p) => ({ adapter: { kind: "zotero-local", dataDir: p } }), "The import path must be absolute.");
+    }
+    const dry = `/projects/${pid}/import/dry-run`;
+    await refused("POST", dry, (p) => ({ adapter: { kind: "folder", path: tmp }, approveOutside: { folders: [p] } }), '"approveOutside" must hold absolute paths.');
+    await refused("POST", dry, (p) => ({ adapter: { kind: "folder", path: tmp }, approveOutside: { files: [p] } }), '"approveOutside" must hold absolute paths.');
+    for (const k of ["folders", "files", "rememberFolders"]) {
+      await refused("POST", `/projects/${pid}/import`, (p) => ({ adapter: { kind: "folder", path: tmp }, options: { approveOutside: { [k]: [p] } } }), '"approveOutside" must hold absolute paths.');
+    }
+  });
+  it("a device import", async () => {
+    await refused("POST", `/projects/${pid}/device-import`, (p) => ({ dir: p }), '"dir" must be an absolute path.');
+  });
+  it("a bibliography and a reference-manager export written to a file", async () => {
+    await refused("POST", "/bibliography", (p) => ({ projectId: pid, selection: { sourceIds: [] }, style: "apa", format: "text", dest: p }), '"dest" must be an absolute path.');
+    await refused("POST", "/export/refman", (p) => ({ projectId: pid, format: "ris", outputPath: p }), '"outputPath" must be an absolute path.');
+  });
+  it("a font file", async () => {
+    await refused("POST", "/settings/fonts", (p) => ({ path: p }), "The font file's path must be absolute.");
+  });
+  it("the library's own routes: create, open, reconnect, locate, move", async () => {
+    await refused("POST", "/libraries/locate", (p) => ({ libraryId: "01a1e8a5-0d25-7e36-b73e-746115174e82", roots: [p] }), '"roots" must be absolute paths.');
+    await refused("POST", "/libraries/move/plan", (p) => ({ dest: p }), '"dest" must be an absolute path.');
+    await refused("POST", "/libraries/move", (p) => ({ dest: p }), '"dest" must be an absolute path.');
+    await refused("POST", "/libraries/reconnect", (p) => ({ path: p }), '"path" must be an absolute path.');
+    await refused("POST", "/libraries/open", (p) => ({ path: p }), '"path" must be an absolute path.');
+    await refused("POST", "/libraries", (p) => ({ path: p, name: "x" }), '"path" must be an absolute path.');
   });
 });

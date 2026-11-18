@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import * as realFs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Readable } from "node:stream";
 import { newId } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { decryptStream, encryptStream } from "../crypto/format.js";
@@ -18,6 +19,18 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     rename: vi.fn(actual.rename),
     unlink: vi.fn(actual.unlink),
   };
+});
+
+// Every file stream copyFileAtomic makes is recorded (the R454 tests hold the temp file's chmod until it has closed).
+const made = vi.hoisted(() => ({ raw: undefined as import("node:stream").Readable | undefined }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const createReadStream = ((...a: Parameters<typeof actual.createReadStream>) => {
+    const s = actual.createReadStream(...a);
+    made.raw = s;
+    return s;
+  }) as typeof actual.createReadStream;
+  return { ...actual, default: { ...actual, createReadStream }, createReadStream };
 });
 
 const { mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } = realFs;
@@ -256,5 +269,148 @@ describe("atomic file writes", () => {
       await expect(writeFileAtomic(join(dir, "b"), "x")).rejects.toThrow("ENOSPC");
       expect(realFs.rename).toHaveBeenCalledTimes(1);
     });
+  });
+});
+
+/**
+ * R454: copyFileAtomic makes its streams only after the temp file's mode is set, and attaches every listener with no
+ * `await` between making a stream and consuming it. Each test holds the temp file's chmod until the stream it names
+ * has closed (failed): the source's failure then always comes "during" the chmod — no reliance on the machine's speed.
+ */
+describe("copyFileAtomic: a source that fails at once (R454)", () => {
+  let dir: string;
+  let held: (() => Readable | undefined) | undefined;
+  let chmodFails: Error | undefined;
+  const handles: realFs.FileHandle[] = [];
+  const seen: unknown[] = [];
+  const onUncaught = (e: unknown) => seen.push(e);
+  const closed = (s: Readable) => new Promise<void>((r) => (s.closed ? r() : s.on("close", () => r()))); // never an 'error' listener
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "ao-atomic-r454-"));
+    held = undefined;
+    chmodFails = undefined;
+    handles.length = 0;
+    seen.length = 0;
+    made.raw = undefined;
+    process.on("uncaughtException", onUncaught);
+    process.on("unhandledRejection", onUncaught);
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(realFs.open).mockImplementation((async (...a: Parameters<typeof actual.open>) => {
+      const h = await actual.open(...a);
+      handles.push(h);
+      return h;
+    }) as typeof actual.open);
+    const probe = await actual.open(join(dir, ".probe"), "w");
+    const proto = Object.getPrototypeOf(probe) as { chmod: (mode: number) => Promise<void> };
+    await probe.close();
+    await rm(join(dir, ".probe"));
+    const real = proto.chmod;
+    vi.spyOn(proto, "chmod").mockImplementation(async function (this: unknown, mode: number) {
+      const s = held?.();
+      if (s && !s.closed) await closed(s);
+      if (chmodFails) throw chmodFails;
+      return real.call(this, mode);
+    });
+  });
+  afterEach(async () => {
+    process.off("uncaughtException", onUncaught);
+    process.off("unhandledRejection", onUncaught);
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(realFs.open).mockImplementation(actual.open);
+    vi.restoreAllMocks();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /** After a refused copy: no temp file, no destination, every handle closed, nothing uncaught. */
+  async function nothingLeft(keep: string[]) {
+    await new Promise((r) => setImmediate(r));
+    expect((await readdir(dir)).sort()).toEqual(keep.sort());
+    expect(handles.length).toBeGreaterThan(0);
+    for (const h of handles) expect(h.fd, "a file handle left open").toBe(-1);
+    expect(seen, "an uncaught exception or unhandled rejection").toEqual([]);
+  }
+
+  it("a decode that fails on its first bytes: rejects with its error", async () => {
+    const src = join(dir, "plain.bin");
+    await writeFile(src, "not the encrypted format, at all");
+    let dec: Readable | undefined;
+    held = () => dec;
+    const p = copyFileAtomic(src, join(dir, "dest"), {
+      mode: 0o600,
+      noFollow: true,
+      decode: (r) => (dec = r.pipe(decryptStream(() => undefined))),
+    });
+    const r = await Promise.race([p.then(() => "copied", (e: unknown) => e), new Promise((res) => setTimeout(() => res("hung"), 5000))]);
+    expect(r).toMatchObject({ name: "EncryptionFormatError" });
+    await nothingLeft(["plain.bin"]);
+  });
+
+  it("a missing source with a mode: rejects with ENOENT", async () => {
+    held = () => made.raw;
+    const p = copyFileAtomic(join(dir, "missing"), join(dir, "dest"), { mode: 0o600 });
+    const r = await Promise.race([p.then(() => "copied", (e: unknown) => e), new Promise((res) => setTimeout(() => res("hung"), 5000))]);
+    expect(r).toMatchObject({ code: "ENOENT" });
+    await nothingLeft([]);
+  });
+
+  it("a missing source with a decode that throws when called: rejects with decode's error, nothing uncaught (R455 M1)", async () => {
+    const p = copyFileAtomic(join(dir, "missing"), join(dir, "dest"), {
+      mode: 0o600,
+      decode: () => {
+        throw new Error("decode boom");
+      },
+    });
+    const r = await Promise.race([p.then(() => "copied", (e: unknown) => e), new Promise((res) => setTimeout(() => res("hung"), 5000))]);
+    expect(r).toMatchObject({ message: "decode boom" });
+    for (let i = 0; i < 5; i++) await new Promise((res) => setImmediate(res)); // the source's own failure comes later
+    await new Promise((res) => setTimeout(res, 50));
+    expect(await readdir(dir)).toEqual([]);
+    expect(seen, "an uncaught exception or unhandled rejection").toEqual([]);
+  });
+
+  it("a missing source with a decode: the raw stream's own failure ends the copy, with ENOENT (R455 M2)", async () => {
+    const { PassThrough } = await import("node:stream");
+    const p = copyFileAtomic(join(dir, "missing"), join(dir, "dest"), { mode: 0o600, decode: (r) => r.pipe(new PassThrough()) });
+    const r = await Promise.race([p.then(() => "copied", (e: unknown) => e), new Promise((res) => setTimeout(() => res("hung"), 5000))]);
+    expect(r).toMatchObject({ code: "ENOENT" });
+    await nothingLeft([]);
+  });
+
+  it("a transform that fails at once: rejects with its error", async () => {
+    const src = join(dir, "src");
+    await writeFile(src, "data");
+    let t: Readable | undefined;
+    held = () => t;
+    const { Transform } = await import("node:stream");
+    const p = copyFileAtomic(src, join(dir, "dest"), {
+      mode: 0o600,
+      noFollow: true,
+      transform: (r) =>
+        (t = r.pipe(
+          new Transform({
+            construct(cb) {
+              cb(new Error("transform boom"));
+            },
+            transform(c, _e, cb) {
+              cb(null, c);
+            },
+          }),
+        )),
+    });
+    const r = await Promise.race([p.then(() => "copied", (e: unknown) => e), new Promise((res) => setTimeout(() => res("hung"), 5000))]);
+    expect(r).toMatchObject({ message: "transform boom" });
+    await nothingLeft(["src"]);
+  });
+
+  it("a chmod that itself fails: rejects with its error, both handles closed", async () => {
+    const src = join(dir, "plain.bin");
+    await writeFile(src, randomBytes(4096));
+    chmodFails = Object.assign(new Error("EPERM"), { code: "EPERM" });
+    const p = copyFileAtomic(src, join(dir, "dest"), { mode: 0o600, noFollow: true, decode: (r) => r.pipe(decryptStream(() => undefined)) });
+    const r = await Promise.race([p.then(() => "copied", (e: unknown) => e), new Promise((res) => setTimeout(() => res("hung"), 5000))]);
+    expect(r).toMatchObject({ code: "EPERM" });
+    expect(handles.length).toBe(2);
+    await nothingLeft(["plain.bin"]);
   });
 });

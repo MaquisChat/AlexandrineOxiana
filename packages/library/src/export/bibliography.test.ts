@@ -1,8 +1,9 @@
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readFile, readdir, rm, stat, symlink } from "node:fs/promises";
+import { IN_LIBRARY_TEXT } from "@ao/shared";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { addCustomStyle, bundleAvailable } from "../citation/custom-styles.js";
-import { PolicyDeniedError } from "../repo/errors.js";
+import { InvalidInputError, PolicyDeniedError } from "../repo/errors.js";
 import { citeSources, exportBibliography, WITHHELD_NOTE } from "./bibliography.js";
 import { DEID_GOV, OPEN_GOV, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./test-kit.js";
 
@@ -154,6 +155,82 @@ describe.skipIf(!HAVE_BUNDLE)("citeSources (copy as citation)", () => {
     expect(bib.content.toLowerCase()).not.toContain("maria");
   });
 
+  it("FR-A10 (R378 a): a source's folder name and its bibliography entry agree for a participant written without spaces and one with accents", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const wang = await addSource(kit, p, { type: "book", title: "王小明访谈录", creators: [{ literal: "王小明", role: "interviewee" }], issued: "2025", identifiable: true });
+    const lucia = await addSource(kit, p, {
+      type: "book", // (a book: the styles give a recorded interview no reference-list entry)
+      title: "Entrevista a Lucia Fernandez",
+      creators: [{ given: "Lucía", family: "Fernández", role: "interviewee" }],
+      issued: "2025",
+      identifiable: true,
+    });
+    const codeOf = (folder: string) => /P-\d{3}/u.exec(folder)?.[0];
+    const wangCode = codeOf(wang.source.folder);
+    const luciaCode = codeOf(lucia.source.folder);
+    expect(wangCode).toBeDefined();
+    expect(luciaCode).toBeDefined();
+    // The folder: the name replaced inside the title too, accents or not.
+    expect(wang.source.folder).not.toContain("王小明");
+    expect(wang.source.folder).toContain(`${wangCode}访谈录`);
+    expect(lucia.source.folder.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()).not.toMatch(/lucia|fernandez/u);
+    expect(lucia.source.folder).toContain(`Entrevista a ${luciaCode}`);
+    // The bibliography: the same codes, the same titles.
+    const bib = await exportBibliography(kit.repo, p.id, { sourceIds: [wang.source.id, lucia.source.id] }, "apa", "text");
+    expect(bib.content).not.toContain("王小明");
+    expect(bib.content.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()).not.toMatch(/lucia|fernandez/u);
+    expect(bib.content).toContain(`${wangCode}访谈录`);
+    expect(bib.content).toContain(`Entrevista a ${luciaCode}`);
+  });
+
+  it("R387 (d): a participant named only in the fieldwork details is coded in the folder name and the bibliography alike", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const part = await kit.repo.createParticipant(p.id, { details: { fullName: "Lucía Fernández Ruiz" }, legalBasis: "consent" });
+    // A news story ABOUT her, by another author.
+    const story = await addSource(kit, p, {
+      type: "book",
+      title: "Lucía Fernández Ruiz habla; entrevista a Lucia Fernandez Ruiz",
+      creators: [person("Chen", "Wei")],
+      issued: "2025",
+      identifiable: true,
+    });
+    const plain = (s: string) => s.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+    expect(story.source.folder).toContain(`${part.code} habla`);
+    expect(plain(story.source.folder)).not.toMatch(/lucia|fernandez|ruiz/u);
+    const bib = await exportBibliography(kit.repo, p.id, { sourceIds: [story.source.id] }, "apa", "text");
+    expect(bib.content).toContain(`${part.code} habla`);
+    expect(plain(bib.content)).not.toMatch(/lucia|fernandez|ruiz/u);
+  });
+
+  it("R387 (e): a creator with a family name of two words: part of the name is never left beside the code, in the folder or the bibliography", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const sf = await addSource(kit, p, {
+      type: "book",
+      title: "Entrevista a Lucía Fernández y Ruiz habla",
+      creators: [{ given: "Lucía", family: "Fernández Ruiz", role: "interviewee" }],
+      issued: "2025",
+      identifiable: true,
+    });
+    const plain = (s: string) => s.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+    const code = /P-\d{3}/u.exec(sf.source.folder)![0];
+    expect(sf.source.folder).toContain(`Entrevista a ${code} y ${code} habla`);
+    expect(plain(sf.source.folder)).not.toMatch(/lucia|fernandez|ruiz/u);
+    const bib = await exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text");
+    expect(bib.content).toContain(`Entrevista a ${code} y ${code} habla`);
+    expect(plain(bib.content)).not.toMatch(/lucia|fernandez|ruiz/u);
+  });
+
+  it("R403 (b), changed from R387 (M6): a creator written without accents is a participant of her own (identity is strict)", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const a = await addSource(kit, p, { type: "book", title: "Primera", creators: [{ given: "Lucía", family: "Fernández", role: "interviewee" }], issued: "2025", identifiable: true });
+    const b = await addSource(kit, p, { type: "book", title: "Segunda", creators: [{ given: "LUCIA", family: "Fernandez", role: "interviewee" }], issued: "2025", identifiable: true });
+    const fw = await kit.repo.getFieldwork(p.id);
+    expect(fw.participants).toHaveLength(2);
+    expect(a.source.participantIds).toHaveLength(1);
+    expect(b.source.participantIds).toHaveLength(1);
+    expect(b.source.participantIds[0]).not.toBe(a.source.participantIds[0]);
+  });
+
   it("a custom style renders through the sandbox", async () => {
     const p = await makeProject(kit);
     const xml = `<?xml version="1.0" encoding="utf-8"?>
@@ -167,5 +244,158 @@ describe.skipIf(!HAVE_BUNDLE)("citeSources (copy as citation)", () => {
     expect(await citeSources(kit.repo, p.id, [{ sourceId: a.source.id }], id, "text")).toBe("[Diaz 2020]");
     const r = await exportBibliography(kit.repo, p.id, { sourceIds: [a.source.id] }, id, "text");
     expect(r.content.trim()).toBe("Rosa Diaz. Lab notes");
+  });
+});
+
+describe("R390 (c): the bibliography's destination folder is never inside the library", () => {
+  const exported = async (p: { id: string; folder: string } & Parameters<typeof auditEvents>[1]) =>
+    (await auditEvents(kit, p)).filter((e) => e.action === "export.bibliography").length;
+
+  it("the reviewer's probe: <project>/sources/zz-new in an encrypted project is refused before anything is made; nothing audited as an export", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const sf = await addSource(kit, p, { title: "A paper", creators: [person("Adams", "Ann")], issued: "2020" });
+    const dest = join(kit.lib.root, p.folder, "sources", "zz-new");
+    await expect(exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text", dest)).rejects.toThrow(new InvalidInputError(IN_LIBRARY_TEXT.exportFile));
+    await expect(stat(dest)).rejects.toThrow();
+    expect(await exported(p)).toBe(0);
+  });
+
+  it("a link outside the library that leads into it is refused; so are Backups, the root and a way out of Exports with '..'", async () => {
+    const p = await makeProject(kit, OPEN_GOV);
+    const sf = await addSource(kit, p, { title: "A paper", creators: [person("Adams", "Ann")], issued: "2020" });
+    const link = join(kit.tmp, "into-project");
+    await symlink(join(kit.lib.root, p.folder), link);
+    for (const dest of [join(link, "zz-new"), link, join(kit.lib.root, "Backups"), kit.lib.root, `${join(kit.lib.root, "Exports")}/../Projects`]) {
+      await expect(exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text", dest), dest).rejects.toThrow(new InvalidInputError(IN_LIBRARY_TEXT.exportFile));
+    }
+    await expect(stat(join(kit.lib.root, p.folder, "zz-new"))).rejects.toThrow();
+    expect(await exported(p)).toBe(0);
+  });
+
+  it.skipIf(!HAVE_BUNDLE)("R408 (c): the library's own Exports folder, named outright, a new folder in it, and one before Exports exists are written to", async () => {
+    const p = await makeProject(kit, OPEN_GOV);
+    const sf = await addSource(kit, p, { title: "A paper", creators: [person("Adams", "Ann")], issued: "2020" });
+    for (const dest of [join(kit.lib.root, "Exports"), join(kit.lib.root, "Exports", "sub")]) {
+      const r = await exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text", dest);
+      expect(r.path!.startsWith(dest + "/")).toBe(true);
+      expect(await readFile(r.path!, "utf8")).toContain("Adams");
+    }
+    // With no Exports folder yet, its nearest existing parent is the library's root: a new folder in it is made.
+    await rm(join(kit.lib.root, "Exports"), { recursive: true, force: true });
+    const fresh = join(kit.lib.root, "Exports", "new", "deeper");
+    const r = await exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text", fresh);
+    expect(r.path!.startsWith(fresh + "/")).toBe(true);
+    expect(await exported(p)).toBe(3);
+  });
+
+  it("R408 (c): a link named Exports that leads into a project's folder is refused; nothing is made there", async () => {
+    const p = await makeProject(kit, OPEN_GOV);
+    const sf = await addSource(kit, p, { title: "A paper", creators: [person("Adams", "Ann")], issued: "2020" });
+    await rm(join(kit.lib.root, "Exports"), { recursive: true, force: true });
+    await symlink(join(kit.lib.root, p.folder), join(kit.lib.root, "Exports"));
+    await expect(exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text", join(kit.lib.root, "Exports", "zz"))).rejects.toThrow(new InvalidInputError(IN_LIBRARY_TEXT.exportFile));
+    await expect(stat(join(kit.lib.root, p.folder, "zz"))).rejects.toThrow();
+    expect(await exported(p)).toBe(0);
+  });
+
+  it.skipIf(!HAVE_BUNDLE)("a destination outside the library still works", async () => {
+    const p = await makeProject(kit, OPEN_GOV);
+    const sf = await addSource(kit, p, { title: "A paper", creators: [person("Adams", "Ann")], issued: "2020" });
+    const dest = join(kit.tmp, "outside", "bibs");
+    const r = await exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text", dest);
+    expect(r.path!.startsWith(dest)).toBe(true);
+    expect(await readFile(r.path!, "utf8")).toContain("Adams");
+    expect(await exported(p)).toBe(1);
+  });
+});
+
+describe("R403 (b): who is the same participant is decided by a strict key (I1 of the FR-A10 second review)", () => {
+  type C = { given?: string; family?: string; literal?: string; handle?: string };
+  /** Adds one source per creator, in turn, to an encrypted project that pseudonymises; the participants and each source's link. */
+  const addInTurn = async (creators: C[]) => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const links: string[][] = [];
+    for (const [i, c] of creators.entries()) {
+      const sf = await addSource(kit, p, { type: "book", title: `Fuente ${i + 1}`, creators: [{ ...c, role: "interviewee" }], issued: "2025", identifiable: true });
+      links.push(sf.source.participantIds);
+    }
+    return { participants: (await kit.repo.getFieldwork(p.id)).participants, links };
+  };
+
+  it.each<[string, C, C]>([
+    ["Lê Thị Hương / Lê Thị Hường", { literal: "Lê Thị Hương" }, { literal: "Lê Thị Hường" }],
+    ["Ana Peña / Ana Pena", { given: "Ana", family: "Peña" }, { given: "Ana", family: "Pena" }],
+    ["@maria / María", { handle: "@maria" }, { literal: "María" }],
+    ["ハナコ / バナコ", { literal: "ハナコ" }, { literal: "バナコ" }],
+    ["@maria.cocina / Maria Cocina", { handle: "@maria.cocina" }, { given: "Maria", family: "Cocina" }],
+  ])("%s: two participants, each source linked to its own", async (_label, first, second) => {
+    const { participants, links } = await addInTurn([first, second]);
+    expect(participants).toHaveLength(2);
+    expect(links[0]).toHaveLength(1);
+    expect(links[1]).toHaveLength(1);
+    expect(links[0]![0]).toBe(participants[0]!.id);
+    expect(links[1]![0]).toBe(participants[1]!.id);
+    expect(participants[0]!.code).not.toBe(participants[1]!.code);
+  });
+
+  it.each<[string, C, C]>([
+    ["case only", { given: "LUCIA", family: "FERNANDEZ" }, { given: "Lucia", family: "Fernandez" }],
+    ["two spaces / one space", { literal: "Lucía  Fernández" }, { literal: "Lucía Fernández" }],
+    ["Hangul written apart / together", { literal: "김 민수" }, { literal: "김민수" }],
+    ["Han written apart / together", { literal: "山田 太郎" }, { literal: "山田太郎" }],
+  ])("%s: one participant", async (_label, first, second) => {
+    const { participants, links } = await addInTurn([first, second]);
+    expect(participants).toHaveLength(1);
+    expect(links[1]).toEqual(links[0]);
+  });
+});
+
+describe.skipIf(!HAVE_BUNDLE)("R403 (c): a single word of a compound family name stands for the name only when it could be a name by itself (I2 of the FR-A10 second review)", () => {
+  it.each([
+    [{ given: "Juan", family: "de la Cruz" }, "Historia de la ciudad y la Cruz Roja", "Historia de la ciudad y la CODE Roja"],
+    [{ given: "Jan", family: "van der Berg" }, "Der Berg ruft van Gogh", "Der CODE ruft van Gogh"],
+    [{ given: "Lucía", family: "Fernández Ruiz" }, "Fernández habla y Ruiz calla", "CODE habla y CODE calla"],
+  ])("%j with %j: the folder name and the bibliography agree, particles kept", async (c, title, expected) => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const sf = await addSource(kit, p, { type: "book", title, creators: [{ ...c, role: "interviewee" }], issued: "2025", identifiable: true });
+    const code = /P-\d{3}/u.exec(sf.source.folder)![0];
+    const want = expected.replaceAll("CODE", code);
+    expect(sf.source.folder).toContain(want);
+    const bib = await exportBibliography(kit.repo, p.id, { sourceIds: [sf.source.id] }, "apa", "text");
+    expect(bib.content).toContain(want);
+  });
+});
+
+describe.skipIf(!HAVE_BUNDLE)("R416: two participants whose names fold alike each carry their own code", () => {
+  it("Ana Peña and Ana Pena: each folder name and each bibliography entry carries its OWN code", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const a = await addSource(kit, p, { type: "book", title: "Entrevista a Ana Peña", creators: [{ given: "Ana", family: "Peña", role: "interviewee" }], issued: "2025", identifiable: true });
+    const b = await addSource(kit, p, { type: "book", title: "Entrevista a Ana Pena", creators: [{ given: "Ana", family: "Pena", role: "interviewee" }], issued: "2025", identifiable: true });
+    const fw = await kit.repo.getFieldwork(p.id);
+    const codeOf = (pid: string) => fw.participants.find((x) => x.id === pid)!.code;
+    const ca = codeOf(a.source.participantIds[0]!);
+    const cb = codeOf(b.source.participantIds[0]!);
+    expect(ca).not.toBe(cb);
+    expect(a.source.folder).toContain(`${ca} - Entrevista a ${ca}`);
+    expect(b.source.folder).toContain(`${cb} - Entrevista a ${cb}`);
+    const bibA = await exportBibliography(kit.repo, p.id, { sourceIds: [a.source.id] }, "apa", "text");
+    const bibB = await exportBibliography(kit.repo, p.id, { sourceIds: [b.source.id] }, "apa", "text");
+    expect(bibA.content).toContain(`Entrevista a ${ca}`);
+    expect(bibA.content).not.toContain(cb);
+    expect(bibB.content).toContain(`Entrevista a ${cb}`);
+    expect(bibB.content).not.toContain(ca);
+  });
+});
+
+describe.skipIf(!HAVE_BUNDLE)("R420 (a): a participant's whole name inside a creator who is not a participant", () => {
+  it("the printed entry shows 'Friends of P-001', never the name", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true);
+    const part = await kit.repo.createParticipant(p.id, { details: { fullName: "Maria Cocina", handle: "@maria.cocina" }, legalBasis: "consent" });
+    const page = await addSource(kit, p, { type: "webpage", title: "Recetas de la abuela", creators: [{ literal: "Friends of Maria Cocina", role: "author" }], issued: "2025" });
+    for (const style of ["apa", "chicago-author-date"]) {
+      const bib = await exportBibliography(kit.repo, p.id, { sourceIds: [page.source.id] }, style, "text");
+      expect(bib.content).toContain(`Friends of ${part.code}`);
+      expect(bib.content.toLowerCase()).not.toContain("cocina");
+    }
   });
 });

@@ -3,12 +3,14 @@
  * write and delete sources, copy files in as further originals, and update review entries, all in
  * one transaction (R26: txn marker, change log, audit). Nothing here is part of the public Repo API.
  */
+import { isDeepStrictEqual } from "node:util";
 import { Asset, SourceFile, encName, newId, originalFileName, withCollisionSuffix } from "@ao/core";
+import { refuseUnknownTags } from "./collections.js";
 import { NotFoundError } from "./errors.js";
 import { decryptBytes, foldName, mimeFor, namesIn, readMaybe } from "./io.js";
 import { runMutation, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
-import { appendReviewEntry, appendReviewUpdate, readReviewEntries, type ReviewEntry, type ReviewInput } from "./review.js";
+import { appendReviewEntry, appendReviewUpdate, queueUnlistedConflicts, readReviewEntries, resolveSettledCaptureEntries, type ReviewEntry, type ReviewInput } from "./review.js";
 import { deleteSourceInTx, fileMode, readSourceFile, writeSourceFile } from "./sources.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
 import { addDeletions, clearDeletions, releaseDeletions, resetDeletions } from "./tombstones.js";
@@ -21,7 +23,7 @@ export interface ImportOps {
   /** Writes the source file (recorded in the change log and indexed after commit). */
   writeSource(before: SourceFile | null, sf: SourceFile): Promise<void>;
   /** Deletes a source (a deletion record is kept for incrementally imported ones, R73; `undo`: none); returns the keys newly recorded. */
-  deleteSource(id: string, opts?: { undo?: boolean }): Promise<{ sf: SourceFile; tombstoned: string[] }>;
+  deleteSource(id: string, opts?: { undo?: boolean; keepReview?: string; reviewEntries?: boolean }): Promise<{ sf: SourceFile; tombstoned: string[] }>;
   /** Clears the deletion records of these Zotero item keys (R73); returns those that were recorded. */
   clearDeletions(zoteroKeys: string[]): Promise<string[]>;
   /** Records these Zotero item keys as deleted here (undo puts back what it cleared, R74 I3); returns those newly recorded. */
@@ -41,6 +43,11 @@ export interface ImportOps {
   deleteTags(tagIds: string[], sourceIds: Iterable<string>): Promise<string[]>;
   /** Reads a project file written by this repo (decrypted when the project is encrypted). */
   readText(rel: string): Promise<string | null>;
+  /**
+   * For a decision that leaves a source in place without writing it (a plain accept): every field of
+   * its stored report in conflict is listed in a pending capture entry, in this change (R194).
+   */
+  keepConflictsListed(sourceId: string): Promise<void>;
 }
 
 export function runImportChange<T>(
@@ -48,9 +55,14 @@ export function runImportChange<T>(
   projectId: string,
   reqs: MutateRequest | MutateRequest[],
   fn: (ops: ImportOps) => Promise<T>,
-  opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook },
+  /** `auditDetails`: more details for the allow audit event (counts, kinds and ids only, R177; e.g. Z5's `marked`). */
+  opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook; auditDetails?: Record<string, unknown> },
 ): Promise<T> {
   core.assertWritable();
+  /** Capture entries resolved by this change, because a write gave an existing source a new report (R176 1). */
+  const resolved: string[] = [];
+  /** Fields an existing source's new report put newly in conflict, queued by this change (R190 a). */
+  const queued: Array<{ entry: string; fields: string[] }> = [];
   return runMutation(
     core,
     projectId,
@@ -62,6 +74,8 @@ export function runImportChange<T>(
         readSource: (id) => readSourceFile(core, st, id),
         async writeSource(before, sf) {
           const parsed = SourceFile.parse(sf);
+          // No import write (bulk run, merge, review edit) may add a workspace tag being deleted (41a N2).
+          await refuseUnknownTags(core, st, before?.source.tagIds ?? [], parsed.source.tagIds);
           await writeSourceFile(core, tx, parsed);
           tx.record("source", parsed.source.id, before?.source ?? null, parsed.source);
           // New links to a participant whose consent was withdrawn: queued for review (R117 I1).
@@ -75,6 +89,14 @@ export function runImportChange<T>(
           const nowAnn = new Set(parsed.annotations.map((a) => a.id));
           for (const a of before?.annotations ?? []) if (!nowAnn.has(a.id)) tx.record("annotation", a.id, a, null);
           if (!st.sources.has(parsed.source.id)) tx.onCommit(() => st.sources.set(parsed.source.id, parsed.source.folder));
+          // An existing source written with its report: every field in conflict is listed in a pending
+          // capture entry, whether or not the report changed (R193 b, R194), and first, so an entry it
+          // extends is not resolved under it. A new source has none yet (its creation queued its own).
+          if (before) queued.push(...(await queueUnlistedConflicts(core, tx, parsed)));
+          // Given a new report (a review decision's fields): its capture entries are re-examined (R176 1).
+          if (before && !isDeepStrictEqual(before.verification, parsed.verification)) {
+            resolved.push(...(await resolveSettledCaptureEntries(core, tx, parsed, "recheck")));
+          }
           tx.index((sink) => sink.indexSource(parsed));
         },
         deleteSource: (id, o) => deleteSourceInTx(core, tx, id, o),
@@ -144,11 +166,19 @@ export function runImportChange<T>(
           const { key, keyId } = tx.key();
           return (await decryptBytes((k) => (k === keyId ? key : undefined), raw)).toString("utf8");
         },
+        async keepConflictsListed(sourceId) {
+          queued.push(...(await queueUnlistedConflicts(core, tx, await readSourceFile(core, st, sourceId))));
+        },
       };
       if (opts.entity) tx.entity(opts.entity.type, opts.entity.id);
       return fn(ops);
     },
-    { op: opts.op, ...(opts.entity ? { entity: opts.entity } : {}), ...(opts.refuse ? { refuse: opts.refuse } : {}) },
+    {
+      op: opts.op,
+      ...(opts.entity ? { entity: opts.entity } : {}),
+      ...(opts.refuse ? { refuse: opts.refuse } : {}),
+      auditDetails: () => ({ ...(opts.auditDetails ?? {}), ...(resolved.length ? { reviewResolved: { entries: [...resolved], by: "recheck" } } : {}), ...(queued.length ? { reviewQueued: [...queued] } : {}) }),
+    },
   );
 }
 

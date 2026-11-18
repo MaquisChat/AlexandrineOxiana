@@ -1,0 +1,815 @@
+/**
+ * Find and acquire, slice 1, end to end (Task F7; plan Amendments A2–A5; Rulings R130, R173, R249): the real
+ * service, the real runner and the real screen, in Chromium and in WebKit.
+ *
+ * The search services are answered by the harness's recorded lookup answers (AO_LOOKUP_FIXTURES, honoured only
+ * under NODE_ENV=test; R47, R130, R249): packages/library/tests/fixtures/lookup/answers.json names, for the exact
+ * address the search code asks for each line typed here, a Crossref answer recorded from the service and an
+ * OpenAlex answer built by hand from OpenAlex's own records of the work (`…-handbuilt.json`). An address without a
+ * recorded answer fails and nothing is fetched: the entry then waits to be tried again and never completes, so a
+ * missing answer shows here as a wrong state.
+ *
+ * The three typed lines and the clause of the rule "sure enough" (`decideMatch`, packages/library/src/find/search.ts)
+ * that decides each, against the recorded answers:
+ *  - SURE_A, Lamont and Molnár's article with its year: every condition holds on the whole title (all its words
+ *    typed; "Lamont" a creator's family name; no word unexplained — "Molnar" is a creator's name, "and" a small
+ *    word; the year 2002 matches; no other answer has a title close to it; the next best scores 0.7, more than
+ *    0.2 below 1): the record is completed without asking.
+ *  - CHOOSE_B, Geertz's essay without a year: the same essay is offered in five books and journals with different
+ *    DOIs and ISBNs (rule 5, other editions: titles alike, the records not provably one work), so the app asks.
+ *  - SURE_C, Vaisey's article with its year: sure as SURE_A (the next best scores 0.6).
+ *
+ * Every record the queue makes goes on to look for a free copy of its work (Task F11; R280 d). For each work the
+ * scenarios complete, the answers record what the copy part asks, each saying that the service has NO copy to offer.
+ * ALL of these answers are stand-ins built by hand, none is a recording (R313 j): the 404s given for OpenAlex and
+ * Semantic Scholar by DOI are the services' shape for "not found", but both services do know these works — the real
+ * answers would offer copies, which the harness cannot serve; arXiv (by first author and title) gets an empty Atom feed
+ * and Europe PMC (by DOI) an empty result, built in the services' shapes (`arxiv-query-empty-handbuilt.xml`,
+ * `europepmc-search-empty-handbuilt.json`). DOAB and the Internet Archive are asked for books only, and these works are
+ * articles and chapters. So every completed record ends "No open copy" with no reason and no "Try again": a missing
+ * answer would show as "Some services could not be reached…" (or, with none answered, as the engine's waits). The harness
+ * cannot serve a file: a file found, "Needs your check", "Use this file" and "In your library" are a later task's (F14).
+ *
+ * Such a row still says where the work can be got (Task F15; R324 a, R339 a): the service's answer for the queue gives
+ * each resting entry its `offers` ("Where to get it": any free-copy service's link — none here —, then for a work with a
+ * DOI the publisher's page at `https://doi.org/<doi>`, the library's catalogue when one is set — none here —, and for a
+ * book or a work with an ISBN, Open Library and WorldCat), and the row shows them as links "<label> (<host>)". The spec
+ * reads each entry's offers from the service's own answer and checks that the row shows exactly those, in order, each
+ * named by the host parsed here from its address and opening that address; the only thing written into the spec is the
+ * work's DOI, for the publisher's page that must be among them.
+ *
+ * Every wait is for something the screen shows (a state in words, a count, a row) with a generous limit (R173):
+ * lookups are paced by the product (Crossref one at a time) and the machine may be loaded.
+ */
+import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
+import { LIBRARY_DIR } from "./paths.js";
+
+// ---------- what is typed, and what the recorded answers say ----------
+
+const SURE_A = "Lamont and Molnar, The Study of Boundaries in the Social Sciences 2002";
+const CHOOSE_B = "Geertz, Deep Play: Notes on the Balinese Cockfight";
+const SURE_C = "Vaisey, Motivation and Justification: A Dual-Process Model of Culture in Action 2009";
+
+/** The works, as Crossref's recorded answers give them. */
+const WORK_A = { title: "The Study of Boundaries in the Social Sciences", doi: "10.1146/annurev.soc.28.110601.141107", families: ["Lamont", "Molnár"], given: ["Michèle", "Virág"], year: 2002, issued: "2002-08" };
+const WORK_C = { title: "Motivation and Justification: A Dual‐Process Model of Culture in Action", doi: "10.1086/597179", families: ["Vaisey"], given: ["Stephen"], year: 2009, issued: "2009-05" };
+/** The five works offered for CHOOSE_B, likeliest first (the one OpenAlex gave too is first among equals). */
+const B_DOIS = ["10.1007/978-1-349-62397-6_10", "10.2307/jj.36106134.16", "10.4324/9781003578123-32", "10.1162/001152605774431563", "10.1525/9780520340343-007"];
+/** The one chosen with the mouse: Daedalus's reprint of the essay (2005). */
+const B_CHOSEN = { doi: "10.1162/001152605774431563", title: "Deep play: notes on the Balinese cockfight" };
+
+/** Words typed here that also stand in the works' titles, looked for where they must never be. */
+const TYPED_WORDS = ["Cockfight", "Balinese", "Boundaries", "Molnar"];
+
+/** Rules of a project without identifiable data whose lookups are the defaults (Crossref and OpenAlex allowed). */
+const LOOKUP_RULES = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\n";
+/** Kept out of titles and logs; a test fixture, not a secret of anyone's. */
+const PASSPHRASE = "plain test passphrase for the second room";
+
+/** Generous: lookups, record creation and the queue's reads run in the service on a machine that may be loaded. */
+const STATE_TIMEOUT = 60_000;
+
+// ---------- the screen's words (packages/ui/src/components/FindEntryRow.tsx, screens/FindAcquire.tsx, ChooseWorkDialog.tsx) ----------
+
+const WORDS = {
+  noOpenCopy: "No open copy",
+  already: "Already in your library",
+  matches: (k: number) => (k === 1 ? "1 possible match" : `${k} possible matches`),
+  elsewhere: (name: string) => `Already in your project ${name}`,
+  elsewhereLocked: "Already in another project that is locked now.",
+  lockedCount: (k: number) => (k === 1 ? "1 locked project was not checked" : `${k} locked projects were not checked`),
+};
+
+/** A row control's accessible name: "<Act>: “<typed, cut at 80 characters + …>”" (FindEntryRow.tsx shortTyped). */
+function act(text: string, typed: string): string {
+  const chars = Array.from(typed);
+  return `${text}: “${chars.length > 80 ? `${chars.slice(0, 80).join("")}…` : typed}”`;
+}
+
+// ---------- shared ----------
+
+interface SourceList {
+  total: number;
+  items: Array<{ id: string; title: string; creatorsText: string; issuedYear?: string | number | null; type: string }>;
+}
+interface StoredSource {
+  source: {
+    id: string;
+    title: { variants: Array<{ value: string }> };
+    identifiers?: { doi?: string };
+    creators: Array<{ family?: string; given?: string }>;
+    issued?: string;
+    collectionIds: string[];
+    provenance?: { captureMethod: string; identification?: { method: string } };
+  };
+}
+interface QueueView {
+  entries: Array<{ id: string; typed: string; state: string; updatedAt: string; sourceId?: string; duplicateOf?: string; elsewhere?: true; chosen?: string; offers?: Array<{ label: string; url: string; host: string }> }>;
+}
+
+const queue = (page: Page) => page.getByRole("list", { name: "Queue" });
+/** The queue's rows (a row's own list, such as "Where to get it", is not a row). */
+const rows = (page: Page) => queue(page).locator(":scope > li");
+const stateOf = (page: Page, i: number) => rows(page).nth(i).locator(".ao-find__state");
+
+type Row = ReturnType<Page["locator"]>;
+
+/**
+ * A completed record whose copy part ended with every service answering that it has no copy (F11): "No open copy", no
+ * reason (none of the services failed, so no "Try again") — and "Where to get it" (F15; R339 a) with EXACTLY the links
+ * the service gives for that entry in its own answer for the queue: at least one, the publisher's page at
+ * `https://doi.org/<doi>` (the work's DOI, as the scenario knows it) among them, and the screen showing each in the
+ * service's order as "<label> (<host>)" — the host parsed here from the address, not taken from the service — with that
+ * address as its `href`, and no other link under "Where to get it".
+ */
+async function expectNoOpenCopy(app: AppHarness, projectId: string, row: Row, doi: string): Promise<void> {
+  await expect(row.locator(".ao-find__state")).toHaveText(WORDS.noOpenCopy, { timeout: STATE_TIMEOUT });
+  await expect(row.locator(".ao-find__reason")).toHaveCount(0);
+  await expect(row.getByRole("button", { name: /^Try again/ })).toHaveCount(0);
+  // What the service gives for this entry (the row carries the entry's id).
+  const entryId = await row.getAttribute("data-entry-id");
+  expect(entryId, "the row names its entry").toBeTruthy();
+  const entry = (await queueOf(app, projectId)).entries.find((e) => e.id === entryId);
+  expect(entry?.state, `the service's answer holds the entry ${entryId} with no open copy`).toBe("no-open-copy");
+  const offers = entry?.offers ?? [];
+  expect(offers.length, "the service gives at least one place to get the work").toBeGreaterThan(0);
+  expect(offers.filter((o) => o.label === "Publisher's page").map((o) => o.url)).toEqual([`https://doi.org/${doi}`]);
+  // What the screen shows: the heading, then exactly those links, in that order.
+  await expect(row.locator(".ao-find__where-title")).toHaveText("Where to get it");
+  const where = row.getByRole("list", { name: /^Where to get it/ });
+  await expect(where).toBeVisible();
+  const links = where.getByRole("link");
+  await expect(links).toHaveCount(offers.length);
+  await expect(row.locator(".ao-find__where a")).toHaveCount(offers.length);
+  for (const [i, o] of offers.entries()) {
+    await expect(links.nth(i)).toHaveText(`${o.label} (${new URL(o.url).host})`);
+    await expect(links.nth(i)).toHaveAttribute("href", o.url);
+  }
+  test.info().annotations.push({ type: "where-to-get-it", description: `${doi}: ${offers.map((o) => `${o.label} (${new URL(o.url).host})`).join("; ")}` });
+}
+
+/** The Find and acquire screen for a project (by its address, as the Library screen's link leads there). */
+async function openFind(page: Page, projectId: string): Promise<void> {
+  await page.goto(`${APP_ORIGIN}/find?project=${encodeURIComponent(projectId)}`);
+  await expect(page.getByRole("heading", { level: 1, name: "Find and acquire" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "References" })).toBeEnabled({ timeout: STATE_TIMEOUT });
+}
+
+/**
+ * Types the lines into the box and presses "Add"; waits for what the screen shows once the add is answered: the box
+ * emptied and one more row per line. (The polite status region says "Added N references." first, but a row's change
+ * of state may replace it at once, so it is not what is waited for.)
+ */
+async function addLines(page: Page, lines: string[]): Promise<void> {
+  const before = await rows(page).count();
+  const box = page.getByRole("textbox", { name: "References" });
+  await box.fill(lines.join("\n"));
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+  await expect(box).toHaveValue("", { timeout: STATE_TIMEOUT });
+  await expect(rows(page)).toHaveCount(before + lines.length, { timeout: STATE_TIMEOUT });
+}
+
+async function sources(app: AppHarness, projectId: string, query = ""): Promise<SourceList> {
+  const r = await app.api<SourceList>("GET", `/projects/${projectId}/sources?limit=500${query}`);
+  expect(r.status, JSON.stringify(r.body)).toBe(200);
+  return r.body;
+}
+
+async function stored(app: AppHarness, projectId: string, sourceId: string): Promise<StoredSource> {
+  const r = await app.api<StoredSource>("GET", `/projects/${projectId}/sources/${sourceId}`);
+  expect(r.status, JSON.stringify(r.body)).toBe(200);
+  return r.body;
+}
+
+/** The DOI of every source of the project (read from each stored record). */
+async function doisOf(app: AppHarness, projectId: string): Promise<string[]> {
+  const list = await sources(app, projectId);
+  const out: string[] = [];
+  for (const i of list.items) out.push((await stored(app, projectId, i.id)).source.identifiers?.doi ?? "");
+  return out.sort();
+}
+
+/** What the queue shows, row by row: the entry's id, what was typed and the state in words. */
+async function shownQueue(page: Page): Promise<Array<{ id: string; typed: string; state: string }>> {
+  return rows(page).evaluateAll((lis) =>
+    lis.map((li) => ({
+      id: (li as HTMLElement).dataset.entryId ?? "",
+      typed: li.querySelector("[data-entry-text]")?.textContent ?? "",
+      state: li.querySelector(".ao-find__state")?.textContent ?? "",
+    })),
+  );
+}
+
+async function queueOf(app: AppHarness, projectId: string): Promise<QueueView> {
+  const r = await app.api<QueueView>("GET", `/projects/${projectId}/find`);
+  expect(r.status, JSON.stringify(r.body)).toBe(200);
+  return r.body;
+}
+
+/** The project's queue file as it is on disk (an unencrypted project: plain JSON lines). */
+const queueFile = (libraryPath: string, projectFolder: string) => readFileSync(join(libraryPath, projectFolder, "find", "queue.jsonl"), "utf8");
+
+/** The record shown in place on the Find screen (region "Record"): its title and fields. */
+async function expectRecordShown(page: Page, w: { title: string; families: string[]; doi: string; issued: string }): Promise<void> {
+  const detail = page.getByRole("region", { name: "Record" }).getByRole("region", { name: "Source details" });
+  await expect(detail.getByRole("heading", { level: 2, name: w.title, exact: true })).toBeVisible({ timeout: STATE_TIMEOUT });
+  for (const f of w.families) await expect(detail.getByRole("listitem").filter({ hasText: f })).toHaveCount(1);
+  await expect(detail.getByText(w.issued, { exact: true })).toBeVisible();
+  await expect(detail.getByText(w.doi, { exact: true })).toBeVisible();
+}
+
+/**
+ * Plants works in a project of the library with the library's own code (as review-queue.spec.ts plants a source),
+ * while the service is stopped: each a journal article with its true title, creators, date and DOI. An encrypted
+ * project is unlocked with its passphrase in that process first. Returns the planted sources' ids.
+ */
+function plantWorks(app: AppHarness, o: { library: string; projectId: string; passphrase?: string; works: Array<typeof WORK_A> }): string[] {
+  const code = [
+    'import { KeyRing, createIndexSink, deviceDeps, openIndexChecked, openLibrary, openRepo } from "./src/index.ts";',
+    "const o = JSON.parse(process.env.AO_E2E_PLANT);",
+    "const lib = await openLibrary(o.library, deviceDeps(o.configDir));",
+    "const checked = await openIndexChecked(lib.root);",
+    "const ring = new KeyRing();",
+    "const repo = await openRepo(lib, ring, { index: createIndexSink(checked.handle, { root: lib.root, keyRing: ring }) });",
+    "if (process.env.AO_E2E_PLANT_SECRET) await repo.unlockProject(o.projectId, process.env.AO_E2E_PLANT_SECRET);",
+    "const at = new Date().toISOString();",
+    "const ids = [];",
+    "for (const w of o.works) {",
+    "  const made = await repo.createSource(o.projectId, {",
+    "    projectIds: [], type: 'article-journal', title: { variants: [{ lang: 'en', kind: 'original', value: w.title }] },",
+    "    creators: w.families.map((family, i) => ({ family, given: w.given[i], role: 'author' })), issued: w.issued, identifiers: { doi: w.doi },",
+    "    caseAttributes: {}, availability: { status: 'available' }, collectionIds: [], tagIds: [], participantIds: [],",
+    "  }, [], {",
+    "    provenance: { captureMethod: 'manual_upload', capturedAt: at, tool: { name: 'e2e-plant', version: '1' }, fileHashes: {}, legal: { status: 'public' }, identifiable: false },",
+    "    fieldEvidence: [],",
+    "  });",
+    "  ids.push(made.source.id);",
+    "}",
+    "checked.handle.close();",
+    "await lib.close();",
+    "process.stdout.write(JSON.stringify(ids));",
+  ].join("\n");
+  const env: NodeJS.ProcessEnv = { ...process.env, AO_E2E_PLANT: JSON.stringify({ library: o.library, projectId: o.projectId, configDir: app.configDir, works: o.works }) };
+  if (o.passphrase) env.AO_E2E_PLANT_SECRET = o.passphrase;
+  const r = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], { cwd: LIBRARY_DIR, env, encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0) throw new Error(`Planting the works failed (status ${r.status}): ${r.stderr}`);
+  return JSON.parse(r.stdout) as string[];
+}
+
+/**
+ * After `app.restart()` the new service reopens the last library by itself (main.ts `reopenLast`): wait until it says
+ * the library is open before the screen is opened (R281 e). `GET /libraries` itself waits once for that attempt.
+ */
+async function libraryOpenAgain(app: AppHarness): Promise<void> {
+  await expect
+    .poll(async () => {
+      const r = await app.api<{ current?: { libraryId?: string } }>("GET", "/libraries");
+      return r.status === 200 && typeof r.body.current?.libraryId === "string";
+    }, { timeout: STATE_TIMEOUT })
+    .toBe(true);
+}
+
+// ---------- kept for a failing run (R281 e): the page's requests with their answers, and the service's log ----------
+
+interface RequestNote {
+  at: number;
+  line: string;
+}
+const requestNotes = new WeakMap<Page, { notes: RequestNote[]; pending: Map<object, string>; t0: number }>();
+
+test.beforeEach(async ({ page }) => {
+  const rec = { notes: [] as RequestNote[], pending: new Map<object, string>(), t0: Date.now() };
+  requestNotes.set(page, rec);
+  const at = () => Date.now() - rec.t0;
+  page.on("request", (r) => {
+    const line = `${r.method()} ${r.url()}`;
+    rec.pending.set(r, line);
+    rec.notes.push({ at: at(), line: `→ ${line}` });
+  });
+  page.on("requestfinished", (r) => {
+    rec.pending.delete(r);
+    void r.response().then(
+      async (res) => {
+        const status = res?.status() ?? 0;
+        // The body of an answer that is not a success (a refusal's sentence, an error code); never a success's body.
+        const body = res && status >= 400 ? (await res.text().catch(() => "")).slice(0, 400) : "";
+        rec.notes.push({ at: at(), line: `← ${status} ${r.method()} ${r.url()}${body ? ` ${body}` : ""}` });
+      },
+      () => rec.notes.push({ at: at(), line: `← (no answer read) ${r.method()} ${r.url()}` }),
+    );
+  });
+  page.on("requestfailed", (r) => {
+    rec.pending.delete(r);
+    rec.notes.push({ at: at(), line: `✗ ${r.method()} ${r.url()} ${r.failure()?.errorText ?? ""}` });
+  });
+});
+
+test.afterEach(async ({ page, app }, testInfo) => {
+  if (testInfo.status === testInfo.expectedStatus) return;
+  const rec = requestNotes.get(page);
+  const lines = (rec?.notes ?? []).sort((a, b) => a.at - b.at).map((n) => `${String(n.at).padStart(7)} ms ${n.line}`);
+  for (const line of rec?.pending.values() ?? []) lines.push(`  (still waiting for an answer) ${line}`);
+  const requests = testInfo.outputPath("page-requests.txt");
+  writeFileSync(requests, lines.join("\n"));
+  await testInfo.attach("page-requests", { path: requests, contentType: "text/plain" });
+  const log = testInfo.outputPath("service-log.txt");
+  writeFileSync(log, app.log());
+  await testInfo.attach("service-log-file", { path: log, contentType: "text/plain" });
+});
+
+// ---------- the plan's first scenario ----------
+
+test("add, choose, complete, already, survives a restart", async ({ page, app }) => {
+  let projectId = "";
+  let libraryPath = "";
+  let projectFolder = "";
+  let collectionId = "";
+
+  await test.step("set-up: a library, a project with the default lookups and a collection (through the service)", async () => {
+    ({ projectId, libraryPath, projectFolder } = await libraryWithProject(app, page, { library: "Reading library", project: "Boundary work", governanceYaml: LOOKUP_RULES }));
+    const c = await app.api<{ id: string }>("POST", `/projects/${projectId}/collections`, { name: "To read" });
+    expect(c.status, JSON.stringify(c.body)).toBe(200);
+    collectionId = c.body.id;
+  });
+
+  await test.step("from the library, the link “Find and acquire”; the collection “To read” chosen", async () => {
+    await page.reload(); // the collection made through the service is listed on the next read
+    await page.getByRole("link", { name: "Find and acquire", exact: true }).click();
+    await expect(page.getByRole("heading", { level: 1, name: "Find and acquire" })).toBeVisible();
+    await expect(page.getByRole("combobox", { name: "Project" })).toHaveValue(projectId);
+    await page.getByRole("combobox", { name: "Collection" }).selectOption({ label: "To read" });
+    await expect(page.getByRole("combobox", { name: "Collection" })).toHaveValue(collectionId);
+  });
+
+  await test.step("two references typed: one becomes a complete record by itself (no open copy of it), the other asks to choose", async () => {
+    await addLines(page, [SURE_A, CHOOSE_B]);
+    await expect(rows(page)).toHaveCount(2);
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
+    await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
+    await expect(rows(page).nth(0).locator("[data-entry-text]")).toHaveText(SURE_A);
+    await expect(rows(page).nth(1).locator("[data-entry-text]")).toHaveText(CHOOSE_B);
+  });
+
+  await test.step("the library holds the record: in the project and the collection, with its title, authors and year", async () => {
+    const all = await sources(app, projectId);
+    expect(all.items.map((i) => i.title)).toEqual([WORK_A.title]);
+    const inCollection = await sources(app, projectId, `&collection=${collectionId}`);
+    expect(inCollection.items.map((i) => i.id)).toEqual([all.items[0]!.id]);
+    const s = await stored(app, projectId, all.items[0]!.id);
+    expect(s.source.identifiers?.doi).toBe(WORK_A.doi);
+    expect(s.source.creators.map((c) => c.family)).toEqual(WORK_A.families);
+    expect(s.source.issued).toBe(WORK_A.issued);
+    expect(s.source.collectionIds).toEqual([collectionId]);
+    expect(s.source.provenance).toMatchObject({ captureMethod: "reference_lookup", identification: { method: "find-match" } });
+  });
+
+  await test.step("the row's “Open” shows the record in place", async () => {
+    await page.getByRole("button", { name: act("Open", SURE_A) }).click();
+    await expectRecordShown(page, WORK_A);
+    await page.getByRole("region", { name: "Record" }).getByRole("button", { name: "Close", exact: true }).click();
+    await expect(page.getByRole("region", { name: "Record" })).toHaveCount(0);
+  });
+
+  await test.step("“Choose”: the five works offered, “None of these” last; one chosen with “Use this one”", async () => {
+    await page.getByRole("button", { name: act("Choose", CHOOSE_B) }).click();
+    const dialog = page.getByRole("dialog", { name: `Choose the work for “${CHOOSE_B}”` });
+    await expect(dialog).toBeVisible();
+    const radios = dialog.getByRole("radio");
+    await expect(radios).toHaveCount(6);
+    await expect(radios.nth(5)).toHaveAccessibleName("None of these");
+    for (const [i, doi] of B_DOIS.entries()) await expect(radios.nth(i)).toHaveAccessibleDescription(new RegExp(doi.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")));
+    await expect(dialog.getByRole("button", { name: "Use this one" })).toBeDisabled();
+    await radios.nth(B_DOIS.indexOf(B_CHOSEN.doi)).check();
+    await dialog.getByRole("button", { name: "Use this one" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expectNoOpenCopy(app, projectId, rows(page).nth(1), B_CHOSEN.doi);
+  });
+
+  await test.step("after the choice: exactly one source for the chosen work and none for the others", async () => {
+    const dois = await doisOf(app, projectId);
+    expect(dois).toEqual([WORK_A.doi, B_CHOSEN.doi].sort());
+    for (const other of B_DOIS.filter((d) => d !== B_CHOSEN.doi)) expect(dois).not.toContain(other);
+    const chosen = (await sources(app, projectId)).items.find((i) => i.title === B_CHOSEN.title);
+    expect(chosen, "the chosen work is listed with its own title").toBeTruthy();
+    expect((await stored(app, projectId, chosen!.id)).source.provenance).toMatchObject({ captureMethod: "reference_lookup", identification: { method: "find-chosen" } });
+  });
+
+  await test.step("the first reference typed again: “Already in your library”, and still one source of it", async () => {
+    await addLines(page, [SURE_A]);
+    await expect(rows(page)).toHaveCount(3);
+    await expect(stateOf(page, 2)).toHaveText(WORDS.already, { timeout: STATE_TIMEOUT });
+    const dois = await doisOf(app, projectId);
+    expect(dois.filter((d) => d === WORK_A.doi)).toHaveLength(1);
+    expect(dois).toHaveLength(2);
+  });
+
+  await test.step("in the library's list: the two records with title, authors and year; opened from the row", async () => {
+    await page.goto(`${APP_ORIGIN}/?project=${encodeURIComponent(projectId)}`);
+    const table = page.getByRole("table", { name: "Sources" });
+    await expect(table.getByRole("row")).toHaveCount(3, { timeout: STATE_TIMEOUT }); // the header and two sources
+    const rowA = table.getByRole("row").filter({ has: page.getByRole("button", { name: WORK_A.title, exact: true }) });
+    await expect(rowA).toContainText(WORK_A.families[0]!);
+    await expect(rowA).toContainText(WORK_A.families[1]!);
+    await expect(rowA.getByRole("cell").nth(2)).toHaveText(String(WORK_A.year));
+    await rowA.getByRole("button", { name: WORK_A.title, exact: true }).click();
+    const detail = page.getByRole("region", { name: "Source details" });
+    await expect(detail.getByRole("heading", { level: 2, name: WORK_A.title, exact: true })).toBeVisible();
+    await expect(detail.getByText(WORK_A.doi, { exact: true })).toBeVisible();
+  });
+
+  let before: Array<{ id: string; typed: string; state: string }> = [];
+  let fileBefore = "";
+  await test.step("quit and reopen the app: the queue shows the same entries, in the same order, in the same words", async () => {
+    await openFind(page, projectId);
+    await expect(stateOf(page, 2)).toHaveText(WORDS.already, { timeout: STATE_TIMEOUT });
+    before = await shownQueue(page);
+    expect(before.map((r) => r.state)).toEqual([WORDS.noOpenCopy, WORDS.noOpenCopy, WORDS.already]);
+    fileBefore = queueFile(libraryPath, projectFolder);
+    await app.restart();
+    await libraryOpenAgain(app);
+    await openFind(page, projectId);
+    await expect(rows(page)).toHaveCount(3, { timeout: STATE_TIMEOUT });
+    await expect(stateOf(page, 2)).toHaveText(WORDS.already, { timeout: STATE_TIMEOUT });
+    expect(await shownQueue(page)).toEqual(before);
+  });
+
+  await test.step("nothing was looked up again: the queue file is unchanged and the library holds the same two records", async () => {
+    // Read the queue through the service once more. A read of the queue does not wait for the runner, so this step shows only that, some time after the
+    // restart and the page's load, the queue file's bytes and the entries' stamps are unchanged; the later step in which a candidate is chosen after
+    // the restart shows that the runner has acted since.
+    expect((await queueOf(app, projectId)).entries.map((e) => e.state).sort()).toEqual(["already", "no-open-copy", "no-open-copy"]);
+    expect(queueFile(libraryPath, projectFolder)).toBe(fileBefore);
+    expect(await doisOf(app, projectId)).toEqual([WORK_A.doi, B_CHOSEN.doi].sort());
+  });
+});
+
+// ---------- the plan's second scenario ----------
+
+test("Check everything I have finds the other project", async ({ page, app }) => {
+  const SECOND = "Second reading room";
+  let projectId = "";
+  let libraryPath = "";
+  let projectFolder = "";
+  let secondId = "";
+  let planted: string[] = [];
+
+  await test.step("set-up: a library, a project, and an encrypted second project holding the two works (planted while the service is stopped)", async () => {
+    ({ projectId, libraryPath, projectFolder } = await libraryWithProject(app, page, { library: "Shared library", project: "First reading room", governanceYaml: LOOKUP_RULES }));
+    const second = await app.api<{ project: { id: string } }>("POST", "/projects", { name: SECOND, governanceYaml: LOOKUP_RULES, encryption: { enabled: true, passphrase: PASSPHRASE } });
+    expect(second.status, JSON.stringify(second.body)).toBe(200);
+    secondId = second.body.project.id;
+    await app.restart(async () => {
+      planted = plantWorks(app, { library: libraryPath, projectId: secondId, passphrase: PASSPHRASE, works: [WORK_A, WORK_C] });
+    });
+    expect(planted).toHaveLength(2);
+    // The relaunched app reopens the library when the page loads (as library.spec.ts's relaunch does).
+    await page.goto(`${APP_ORIGIN}/`);
+    await expect(page.getByRole("heading", { level: 1, name: "Shared library" })).toBeVisible({ timeout: STATE_TIMEOUT });
+    const unlocked = await app.api("POST", `/projects/${secondId}/unlock`, { secret: PASSPHRASE });
+    expect(unlocked.status, JSON.stringify(unlocked.body)).toBe(200);
+    expect((await doisOf(app, secondId))).toEqual([WORK_A.doi, WORK_C.doi].sort());
+  });
+
+  await test.step("with the switch off, the first reference becomes a record in this project: the other project is not looked at", async () => {
+    await openFind(page, projectId);
+    const sw = page.getByRole("switch", { name: "Check everything I have" });
+    await expect(sw).not.toBeChecked();
+    await addLines(page, [SURE_A]);
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
+    expect(await doisOf(app, projectId)).toEqual([WORK_A.doi]);
+  });
+
+  await test.step("with the switch on, the second reference is found in the other project, which the screen names", async () => {
+    const sw = page.getByRole("switch", { name: "Check everything I have" });
+    await sw.click();
+    await expect(sw).toBeChecked();
+    // The screen shows the switch checked at once; the service's runner judges duplicates with the stored value, so wait until the change is confirmed.
+    await expect(sw).not.toHaveAttribute("aria-busy", "true");
+    await addLines(page, [SURE_C]);
+    await expect(stateOf(page, 1)).toHaveText(WORDS.elsewhere(SECOND), { timeout: STATE_TIMEOUT });
+    await expect(page.getByRole("button", { name: act("Add it to this project as well", SURE_C) })).toBeVisible();
+    // Nothing was made here for it.
+    expect(await doisOf(app, projectId)).toEqual([WORK_A.doi]);
+    // "Open it there" shows that project's record.
+    await page.getByRole("button", { name: act("Open it there", SURE_C) }).click();
+    await expectRecordShown(page, WORK_C);
+  });
+
+  await test.step("the other project locked: read again, the entry says it is in a project that is locked now", async () => {
+    const locked = await app.api("POST", `/projects/${secondId}/lock`);
+    expect(locked.status, JSON.stringify(locked.body)).toBe(200);
+    await openFind(page, projectId);
+    await expect(stateOf(page, 1)).toHaveText(WORDS.elsewhereLocked, { timeout: STATE_TIMEOUT });
+    await expect(page.getByText(WORDS.lockedCount(1), { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: act("Open it there", SURE_C) })).toHaveCount(0);
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
+  });
+
+  await test.step("nothing of the second project is written into the first project's queue", async () => {
+    const file = queueFile(libraryPath, projectFolder);
+    expect(file.length).toBeGreaterThan(0);
+    expect(file.includes(secondId), "the second project's id is not in the first project's queue").toBe(false);
+    for (const id of planted) expect(file.includes(id), `the planted source ${id} is not in the first project's queue`).toBe(false);
+    expect(file.includes(SECOND)).toBe(false);
+    const entry = (await queueOf(app, projectId)).entries.find((e) => e.typed === SURE_C);
+    expect(entry).toMatchObject({ state: "already", elsewhere: true });
+    expect(entry?.duplicateOf).toBeUndefined();
+    expect(entry?.sourceId).toBeUndefined();
+  });
+});
+
+// ---------- by keyboard only ----------
+
+/** Tab (at most `max` times) until `target` holds focus. Fails if it never does. */
+async function tabTo(page: Page, target: ReturnType<Page["getByRole"]>, max = 60): Promise<void> {
+  for (let i = 0; i < max; i++) {
+    if (await target.evaluate((el) => el === document.activeElement).catch(() => false)) return;
+    await page.keyboard.press("Tab");
+  }
+  await expect(target).toBeFocused();
+}
+
+test("by keyboard only: add, choose, use this one", async ({ page, app }) => {
+  let projectId = "";
+  await test.step("set-up: a library and a project (through the service); the screen opened by its address", async () => {
+    ({ projectId } = await libraryWithProject(app, page, { library: "Keyboard library", project: "Keys only", governanceYaml: LOOKUP_RULES }));
+    await openFind(page, projectId);
+  });
+
+  await test.step("Tab to the box, type two lines, Ctrl+Enter adds them", async () => {
+    const box = page.getByRole("textbox", { name: "References" });
+    await tabTo(page, box);
+    await page.keyboard.type(SURE_A);
+    await page.keyboard.press("Enter");
+    await page.keyboard.type(CHOOSE_B);
+    await expect(box).toHaveValue(`${SURE_A}\n${CHOOSE_B}`);
+    await page.keyboard.press("Control+Enter");
+    await expect(box).toHaveValue("", { timeout: STATE_TIMEOUT });
+    await expect(rows(page)).toHaveCount(2, { timeout: STATE_TIMEOUT });
+    await expect(box).toBeFocused();
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
+    await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
+  });
+
+  await test.step("Tab to “Choose”, Enter opens the dialog with focus on the first work", async () => {
+    await tabTo(page, page.getByRole("button", { name: act("Choose", CHOOSE_B) }));
+    await page.keyboard.press("Enter");
+    const dialog = page.getByRole("dialog", { name: `Choose the work for “${CHOOSE_B}”` });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("radio").nth(0)).toBeFocused();
+  });
+
+  await test.step("the arrows move in the radio group; Tab reaches “Use this one”; Enter uses the first work", async () => {
+    const dialog = page.getByRole("dialog", { name: `Choose the work for “${CHOOSE_B}”` });
+    const radios = dialog.getByRole("radio");
+    await page.keyboard.press("ArrowDown");
+    await expect(radios.nth(1)).toBeFocused();
+    await expect(radios.nth(1)).toBeChecked();
+    await page.keyboard.press("ArrowUp");
+    await expect(radios.nth(0)).toBeFocused();
+    await expect(radios.nth(0)).toBeChecked();
+    await page.keyboard.press("Tab");
+    await expect(dialog.getByRole("button", { name: "Use this one" })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(dialog).toHaveCount(0);
+    await expectNoOpenCopy(app, projectId, rows(page).nth(1), B_DOIS[0]!);
+  });
+
+  await test.step("after the dialog closes, focus is on the row's next control (its “Open”), never the page", async () => {
+    await expect(page.getByRole("button", { name: act("Open", CHOOSE_B) })).toBeFocused();
+  });
+
+  await test.step("the library holds the first work offered, once, and none of the others", async () => {
+    const dois = await doisOf(app, projectId);
+    expect(dois).toEqual([WORK_A.doi, B_DOIS[0]!].sort());
+  });
+});
+
+// ---------- what was typed stays in request bodies ----------
+
+// The scan covers every request's address, headers and body, and the service's log at its real level (info). It does NOT cover the service's
+// debug-level lines (it logs at info, so they are never written) or the media worker's own output.
+test("what was typed is in no address, header or log line", async ({ page, app }) => {
+  const seen: Array<{ url: string; method: string; headers: Record<string, string>; body: string | null }> = [];
+  const pending: Array<Promise<void>> = [];
+  page.on("request", (r) => {
+    pending.push(
+      r.allHeaders().then(
+        (headers) => void seen.push({ url: r.url(), method: r.method(), headers, body: r.postData() }),
+        () => void seen.push({ url: r.url(), method: r.method(), headers: r.headers(), body: r.postData() }),
+      ),
+    );
+  });
+  let projectId = "";
+
+  await test.step("set-up, then both references added and the choice made on the screen", async () => {
+    ({ projectId } = await libraryWithProject(app, page, { library: "Quiet library", project: "Nothing said", governanceYaml: LOOKUP_RULES }));
+    await openFind(page, projectId);
+    await addLines(page, [SURE_A, CHOOSE_B]);
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
+    await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
+    await page.getByRole("button", { name: act("Choose", CHOOSE_B) }).click();
+    const dialog = page.getByRole("dialog", { name: `Choose the work for “${CHOOSE_B}”` });
+    await dialog.getByRole("radio").nth(0).check();
+    await dialog.getByRole("button", { name: "Use this one" }).click();
+    await expectNoOpenCopy(app, projectId, rows(page).nth(1), B_DOIS[0]!);
+    await page.getByRole("button", { name: act("Open", SURE_A) }).click();
+    await expectRecordShown(page, WORK_A);
+  });
+
+  await test.step("the typed words went in the add's request body", async () => {
+    await Promise.all(pending);
+    const adds = seen.filter((r) => r.method === "POST" && new URL(r.url).pathname === `/projects/${projectId}/find`);
+    expect(adds).toHaveLength(1);
+    expect(JSON.parse(adds[0]!.body ?? "{}")).toEqual({ lines: [SURE_A, CHOOSE_B] });
+  });
+
+  await test.step("no typed word in any address or header of any request the page made", async () => {
+    await Promise.all(pending);
+    expect(seen.length).toBeGreaterThan(5);
+    for (const r of seen) {
+      const url = decodeURIComponent(r.url).toLowerCase();
+      const headers = JSON.stringify(r.headers).toLowerCase();
+      for (const w of TYPED_WORDS) {
+        expect(url.includes(w.toLowerCase()), `“${w}” is not in ${r.method} ${r.url}`).toBe(false);
+        expect(headers.includes(w.toLowerCase()), `“${w}” is not in the headers of ${r.method} ${r.url}`).toBe(false);
+      }
+    }
+  });
+
+  await test.step("no typed word in the service's output (its standard output and error)", async () => {
+    const log = app.log().toLowerCase();
+    expect(log.length).toBeGreaterThan(0);
+    for (const w of TYPED_WORDS) expect(log.includes(w.toLowerCase()), `“${w}” is not in the service's output`).toBe(false);
+  });
+});
+
+// ---------- a restart in the middle ----------
+
+test("after a restart nothing is looked up twice", async ({ page, app }) => {
+  let projectId = "";
+  let libraryPath = "";
+  let projectFolder = "";
+  let before: QueueView | undefined;
+  let fileBefore = "";
+
+  await test.step("set-up; both references added: one complete (no open copy of it), one waiting for a choice", async () => {
+    ({ projectId, libraryPath, projectFolder } = await libraryWithProject(app, page, { library: "Restart library", project: "Twice told", governanceYaml: LOOKUP_RULES }));
+    await openFind(page, projectId);
+    await addLines(page, [SURE_A, CHOOSE_B]);
+    await expectNoOpenCopy(app, projectId, rows(page).nth(0), WORK_A.doi);
+    await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
+    before = await queueOf(app, projectId);
+    fileBefore = queueFile(libraryPath, projectFolder);
+    expect(await doisOf(app, projectId)).toEqual([WORK_A.doi]);
+  });
+
+  await test.step("quit and reopen: the same entries in the same states, the same words; the queue file untouched", async () => {
+    const shown = await shownQueue(page);
+    await app.restart();
+    await libraryOpenAgain(app);
+    await openFind(page, projectId);
+    await expect(rows(page)).toHaveCount(2, { timeout: STATE_TIMEOUT });
+    await expect(stateOf(page, 1)).toHaveText(WORDS.matches(5), { timeout: STATE_TIMEOUT });
+    expect(await shownQueue(page)).toEqual(shown);
+    const after = await queueOf(app, projectId);
+    const key = (q: QueueView) => q.entries.map((e) => [e.id, e.state, e.updatedAt].join(" ")).sort();
+    expect(key(after)).toEqual(key(before!));
+    expect(queueFile(libraryPath, projectFolder)).toBe(fileBefore);
+    expect(await doisOf(app, projectId)).toEqual([WORK_A.doi]);
+  });
+
+  await test.step("the entry left “Choose” can still be chosen after the restart", async () => {
+    await page.getByRole("button", { name: act("Choose", CHOOSE_B) }).click();
+    const dialog = page.getByRole("dialog", { name: `Choose the work for “${CHOOSE_B}”` });
+    await dialog.getByRole("radio").nth(B_DOIS.indexOf(B_CHOSEN.doi)).check();
+    await dialog.getByRole("button", { name: "Use this one" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expectNoOpenCopy(app, projectId, rows(page).nth(1), B_CHOSEN.doi);
+    expect(await doisOf(app, projectId)).toEqual([WORK_A.doi, B_CHOSEN.doi].sort());
+    // The first entry was not touched again.
+    const a = (await queueOf(app, projectId)).entries.find((e) => e.typed === SURE_A)!;
+    const a0 = before!.entries.find((e) => e.typed === SURE_A)!;
+    expect([a.id, a.state, a.updatedAt]).toEqual([a0.id, "no-open-copy", a0.updatedAt]);
+  });
+});
+
+// ---------- an author alone (Task F9; R267, R270, R271) ----------
+
+/**
+ * An author's name typed alone. The recorded answers (packages/library/tests/fixtures/lookup/answers.json) for the
+ * addresses this line makes the app ask:
+ *  - the works search: Crossref's answer cut by hand (`crossref-find-stark-handbuilt.json`: the envelope recorded from
+ *    the service, its five entries about people of that name — reference works with dates of birth and posts —
+ *    replaced by Crossref's own records of five of the sociologist's articles; R281 d) and OpenAlex's built by hand from
+ *    five of his works (`openalex-find-stark-handbuilt.json`) — no title covers 0.6 of the line, it holds no digit and
+ *    two words, so the people search is asked (`peopleSearchWanted`);
+ *  - the people search: built by hand from OpenAlex's own records of two real people of that name (the sociologist,
+ *    A5055013655, and a historian of colonial Brazil, A5108208998; `openalex-find-stark-people-handbuilt.json`) — both
+ *    names cover both typed words, so the app asks which person is meant (`decidePerson`: "several");
+ *  - the sociologist's works, newest first: built by hand from OpenAlex's records of eighteen of his works, each read
+ *    by its DOI (`openalex-find-stark-works-handbuilt.json`, one page, its count 18);
+ *  - each work ticked: OpenAlex's single-work answer recorded from the service (`openalex-work-W….json`), whose DOI
+ *    and title are those kept for choosing, so each record is made without asking (R271 M4).
+ */
+const AUTHOR = "David Stark";
+/** What tells the sociologist from the other David Stark in the dialog: the first subject he works on. */
+const PERSON_SUBJECT = "Post-Communist Economic and Political Transition";
+const OTHER_SUBJECT = "Colonialism, slavery, and trade";
+/** His works listed (all 18), and those from 2015 on (the filter "From year" used once). */
+const STARK_LISTED = 18;
+const STARK_FROM_2015 = 6;
+/** The three works ticked, with the DOIs their records must carry. */
+const STARK_TICKED = [
+  { title: "Put to the test: For a new sociology of testing", doi: "10.1111/1468-4446.12746" },
+  { title: "For What It’s Worth", doi: "10.1108/s0733-558x20170000052011" },
+  { title: "Game Changer: The Topology of Creativity", doi: "10.1086/681213" },
+];
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+
+test("an author alone, the person, three works", async ({ page, app }) => {
+  let projectId = "";
+  const authorRow = () => rows(page).filter({ has: page.locator("[data-entry-text]", { hasText: `Author: ${AUTHOR}` }) });
+  const addedRows = () => rows(page).filter({ has: page.locator(".ao-find__origin", { hasText: `Added from “${AUTHOR}”` }) });
+
+  await test.step("set-up: a library and a project with the default lookups; the screen opened", async () => {
+    ({ projectId } = await libraryWithProject(app, page, { library: "Author library", project: "One person's works", governanceYaml: LOOKUP_RULES }));
+    await openFind(page, projectId);
+  });
+
+  await test.step("the name typed alone: the row reads “Author: David Stark” and “2 people match”", async () => {
+    await addLines(page, [AUTHOR]);
+    await expect(authorRow()).toHaveCount(1);
+    await expect(authorRow().locator(".ao-find__state")).toHaveText("2 people match", { timeout: STATE_TIMEOUT });
+    // Nothing was made by itself.
+    expect((await sources(app, projectId)).total).toBe(0);
+  });
+
+  await test.step("“Choose the person”: the two people, told apart by what they work on; the sociologist chosen", async () => {
+    await page.getByRole("button", { name: act("Choose the person", AUTHOR) }).click();
+    const dialog = page.getByRole("dialog", { name: `Choose the person for “${AUTHOR}”` });
+    await expect(dialog).toBeVisible();
+    const people = dialog.getByRole("radio", { name: AUTHOR, exact: true });
+    await expect(people).toHaveCount(2, { timeout: STATE_TIMEOUT });
+    await expect(people.nth(0)).toBeFocused();
+    await expect(people.nth(0)).toHaveAccessibleDescription(new RegExp(escapeRe(`Works on: ${PERSON_SUBJECT}`)));
+    await expect(people.nth(1)).toHaveAccessibleDescription(new RegExp(escapeRe(`Works on: ${OTHER_SUBJECT}`)));
+    await expect(dialog.getByText("To choose another person later, remove this entry and type the name again.")).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "This is the person" })).toBeDisabled();
+    await people.nth(0).check();
+    await dialog.getByRole("button", { name: "This is the person" }).click();
+    await expect(dialog).toHaveCount(0);
+    // The works are fetched by the runner; the row says so when they have come.
+    await expect(authorRow().locator(".ao-find__state")).toHaveText("Choose works", { timeout: STATE_TIMEOUT });
+  });
+
+  await test.step("“Choose works”: his 18 works newest first; “From year” 2015 narrows them to 6; three ticked and added", async () => {
+    await page.getByRole("button", { name: act("Choose works", AUTHOR) }).click();
+    const dialog = page.getByRole("dialog", { name: `Choose works by ${AUTHOR}` });
+    await expect(dialog).toBeVisible();
+    const works = dialog.getByRole("checkbox");
+    await expect(works).toHaveCount(STARK_LISTED, { timeout: STATE_TIMEOUT });
+    await expect(dialog.getByRole("status")).toHaveText(`${STARK_LISTED} of ${STARK_LISTED} works shown`);
+    await expect(dialog.getByRole("textbox", { name: "From year" })).toBeFocused();
+    await dialog.getByRole("textbox", { name: "From year" }).fill("2015");
+    await expect(works).toHaveCount(STARK_FROM_2015);
+    await expect(dialog.getByRole("status")).toHaveText(`${STARK_FROM_2015} of ${STARK_LISTED} works shown`);
+    for (const w of STARK_TICKED) await dialog.getByRole("checkbox", { name: new RegExp(`^${escapeRe(w.title)}`) }).check();
+    await dialog.getByRole("button", { name: "Add the chosen works (3)" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByRole("button", { name: act("Choose works", AUTHOR) })).toBeFocused();
+  });
+
+  await test.step("three rows that say where they came from, each a complete record with no open copy", async () => {
+    await expect(addedRows()).toHaveCount(3, { timeout: STATE_TIMEOUT });
+    for (let i = 0; i < 3; i++) await expect(addedRows().nth(i).locator(".ao-find__state")).toHaveText(WORDS.noOpenCopy, { timeout: STATE_TIMEOUT });
+    const shown = (await addedRows().locator(".ao-find__match .ao-find__work").allTextContents()).sort();
+    expect(shown).toEqual(STARK_TICKED.map((w) => w.title).sort());
+    // Each row's work is known by the title it shows, and so its DOI.
+    for (let i = 0; i < 3; i++) {
+      const title = await addedRows().nth(i).locator(".ao-find__match .ao-find__work").textContent();
+      const work = STARK_TICKED.find((w) => w.title === title);
+      expect(work, `the row's work “${title}” is one of those ticked`).toBeTruthy();
+      await expectNoOpenCopy(app, projectId, addedRows().nth(i), work!.doi);
+    }
+    // Each is shown as a work the app added, not as a line typed (R281 a).
+    for (let i = 0; i < 3; i++) await expect(addedRows().nth(i).locator("[data-entry-text]")).toHaveText(/^Work: /);
+  });
+
+  await test.step("the three sources in the library, each with its work's DOI, made from the works chosen", async () => {
+    expect(await doisOf(app, projectId)).toEqual(STARK_TICKED.map((w) => w.doi).sort());
+    for (const item of (await sources(app, projectId)).items) {
+      expect((await stored(app, projectId, item.id)).source.provenance).toMatchObject({ captureMethod: "reference_lookup", identification: { method: "find-chosen" } });
+    }
+  });
+
+  await test.step("the author's row stays “Choose works”, with “3 added”, and can still be removed", async () => {
+    await expect(authorRow().locator(".ao-find__state")).toHaveText("Choose works · 3 added");
+    await expect(page.getByRole("button", { name: act("Remove from the queue", AUTHOR) })).toBeVisible();
+    const q = await queueOf(app, projectId);
+    expect(q.entries.find((e) => e.typed === AUTHOR)?.state).toBe("choose-works");
+  });
+});

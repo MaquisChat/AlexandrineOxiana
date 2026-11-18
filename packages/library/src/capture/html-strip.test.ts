@@ -5,7 +5,16 @@
  */
 import { parse } from "parse5";
 import { describe, expect, it } from "vitest";
+import {
+  KEY_PREFIXES as CORE_KEY_PREFIXES,
+  ORDINARY_WORDS as CORE_ORDINARY_WORDS,
+  SECRET_WORDS as CORE_SECRET_WORDS,
+  SIGNED_LINK_NAMES as CORE_SIGNED_LINK_NAMES,
+  TOKEN_PREFIXES as CORE_TOKEN_PREFIXES,
+  secretName as coreSecretName,
+} from "@ao/core";
 import { BROWSER_CAPTURE_LIMITS, stripHtmlSnapshot } from "./browser-capture.js";
+import { KEY_PREFIXES, ORDINARY_WORDS, SECRET_WORDS, SIGNED_LINK_NAMES, TOKEN_PREFIXES, cleanUrl, secretName } from "./html-strip.mjs";
 
 const S = "SECRETX";
 const BYPASSES: Array<[string, string]> = [
@@ -362,4 +371,104 @@ describe("pre-scan model (R107 I1): never below what parse5 builds", () => {
       expect(c.elements, page.slice(0, 200)).toBeGreaterThanOrEqual(real.elements);
     }
   }, 60_000);
+});
+
+describe("one word rule for secret names (R379)", () => {
+  it("the snapshot cleaner's word lists equal core's (it runs as plain JavaScript in a worker and keeps its own copy)", () => {
+    expect([...SECRET_WORDS].sort()).toEqual([...CORE_SECRET_WORDS].sort());
+    expect([...KEY_PREFIXES].sort()).toEqual([...CORE_KEY_PREFIXES].sort());
+    expect([...TOKEN_PREFIXES].sort()).toEqual([...CORE_TOKEN_PREFIXES].sort());
+    expect([...SIGNED_LINK_NAMES].sort()).toEqual([...CORE_SIGNED_LINK_NAMES].sort());
+    expect([...ORDINARY_WORDS].sort()).toEqual([...CORE_ORDINARY_WORDS].sort());
+  });
+});
+
+describe("the snapshot's address cleaner drops a user name and password too (R391 d, review M4)", () => {
+  it("the review's probe: a canonical link with credentials", async () => {
+    const out = await stripHtmlSnapshot(`<html><head><link rel="canonical" href="https://ana:hunter2@portal.example.org/case/7?access_token=T#f"></head><body><p>x</p></body></html>`);
+    expect(out).toContain('href="https://portal.example.org/case/7"');
+    expect(out).not.toMatch(/ana|hunter2/);
+  });
+  it("every form: with a scheme, protocol-relative, a user name alone, an `@` in the password; nothing else changes", () => {
+    expect(cleanUrl("https://ana:hunter2@host/p?x")).toBe("https://host/p");
+    expect(cleanUrl("//ana:hunter2@host/p")).toBe("//host/p");
+    expect(cleanUrl("http://ana@host:8080/p#f")).toBe("http://host:8080/p");
+    expect(cleanUrl("https://a:b@c@host/p")).toBe("https://host/p");
+    expect(cleanUrl("https://host/p@q")).toBe("https://host/p@q");
+    expect(cleanUrl("/a/b@c?x")).toBe("/a/b@c");
+    expect(cleanUrl("mailto:ana@example.org")).toBe("mailto:ana@example.org");
+  });
+});
+
+describe("the two copies of the secret-name rule decide alike, on one table of names and values (R391 e, review M5)", () => {
+  const HEX = "5f2b8c9e0a1d4e7f9b3c6a8d2e1f0b7c";
+  const MIXED = "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY";
+  const JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl";
+  // [name, value (undefined: judged by the name alone), secret?]
+  const TABLE: Array<[string, string | undefined, boolean]> = [
+    ["access_token", "1", true], ["accessToken", "1", true], ["accesstoken", "1", true], ["ACCESS-TOKEN", "1", true],
+    ["AuthToken", "x", true], ["id_token", "x", true], ["sessionToken", "x", true], ["refresh.token", "x", true],
+    ["X-Amz-Signature", "1", true], ["x-amz-credential", "1", true], ["X-Amz-Security-Token", "1", true], ["Key-Pair-Id", "1", true],
+    ["AWSAccessKeyId", "1", true], ["api_key", "1", true], ["apiKey", "1", true], ["authkey", "1", true], ["client_secret", "1", true],
+    ["clientSecret", "1", true], ["JSESSIONID", "1", true], ["phpsessid", "1", true], ["session_id", "1", true], ["password", "", true],
+    ["adminPassword", "x", true], ["passcode", "1", true], ["otp", "1", true], ["jwt", "1", true], ["csrf:token", "1", true],
+    ["token", "verb", false], ["token", MIXED, true], ["tOkEn", MIXED, true], ["tOkEn", "verb", false], ["session", "12", false],
+    ["session", HEX, true], ["form_session", "356", false], ["sid", HEX, true], ["sid", "7", false], ["pwd", MIXED, true],
+    ["signature", "MS-123", false], ["code", "CS101", false], ["code", "4/0AX4XfWhAbCdEfGhIjKlMnOpQrStUvWxYz0123456789", true],
+    ["key", "value", false], ["key", "AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY", true], ["usertoken", MIXED, true], ["usertoken", "a", false],
+    ["oauth_verifier", MIXED, true], ["subscription-key", HEX, true], ["state", JWT, true], ["state", "abc", false],
+    ["id", HEX, false], ["page", "2", false], ["tokenizer", MIXED, false], ["monkey", MIXED, false], ["keywords", MIXED, false],
+    // The splitting itself: at every character that is not a letter or digit, and at a digit before a capital.
+    ["access~token", "1", true], ["api[key]", "1", true], ["session/id", "1", true], ["api2Key", MIXED, true], ["page2Token", MIXED, true],
+    ["token", undefined, true], ["key", undefined, true], ["code", undefined, true], ["author", undefined, false], ["header_image", undefined, false],
+    // R415 b: a UUID and a run of 24 or more lower-case letters and digits holding both.
+    ["sid", "3f2504e0-4f89-11d3-9a0c-0305e82c3301", true], ["token", "3F2504E0-4F89-11D3-9A0C-0305E82C3301", true],
+    ["session", "mfrggzdfmztwq2lknnwg23tpobyxe43u", true], ["ticket", "t-abcdefghijkl0123456789ab", true],
+    ["code", "123456", false], ["session", "12", false], ["id", "3f2504e0-4f89-11d3-9a0c-0305e82c3301", false],
+    ["session", "abcdefghijklmnopqrstuvwxyzab", false], ["key", "abcdefghijk0123456789ab", false],
+  ];
+  it.each(TABLE)("%s = %s: %s in both copies", (name, value, secret) => {
+    expect(coreSecretName(name, value)).toBe(secret);
+    expect(secretName(name, value)).toBe(secret);
+  });
+  it("the table is large enough", () => expect(TABLE.length).toBeGreaterThanOrEqual(40));
+});
+
+describe("the snapshot's address cleaner drops every path parameter (R415 a, review 2 I1)", () => {
+  it("the review's probe: a jsessionid path parameter in a canonical link, og:url, a link and a form action", async () => {
+    const out = await stripHtmlSnapshot(
+      `<html><head><link rel="canonical" href="https://portal.example.org/app;jsessionid=JSESSHTML1/case">` +
+        `<meta property="og:url" content="https://portal.example.org/a;jsessionid=JSESSMETA"></head>` +
+        `<body><a href="/app;jsessionid=JSESSLINK1/next">n</a><form action="/login;jsessionid=JSESSFORM1"><button>go</button></form>` +
+        `<img src="/i.png" srcset="/app;jsessionid=JSESSSRCSET/i.png 2x"></body></html>`,
+    );
+    expect(out).not.toMatch(/jsessionid|JSESS/i);
+    expect(out).toContain('href="https://portal.example.org/app/case"');
+    expect(out).toContain('content="https://portal.example.org/a"');
+    expect(out).toContain('href="/app/next"');
+    expect(out).toContain('action="/login"');
+    expect(out).toContain('srcset="/app/i.png 2x"');
+  });
+  it("each segment loses everything from its first `;`, whatever the parameter's name", () => {
+    expect(cleanUrl("/app;jsessionid=ABC/viewtopic.php")).toBe("/app/viewtopic.php");
+    expect(cleanUrl("https://host/a;foo=bar;x=1/b;v=2/c?q#f")).toBe("https://host/a/b/c");
+    expect(cleanUrl("https://host/p;x=1")).toBe("https://host/p");
+    expect(cleanUrl("//host/a;sid=1/b")).toBe("//host/a/b");
+    expect(cleanUrl("page.html;s=1")).toBe("page.html");
+    expect(cleanUrl("https://host/plain/path")).toBe("https://host/plain/path");
+  });
+});
+
+describe("the snapshot's address cleaner reads an address as a browser does before it looks for user information (R415 c, review 2 M2)", () => {
+  it("the review's two strings: a tab inside the scheme, backslashes for slashes", () => {
+    expect(cleanUrl("h\tttps://ana:hunter2@host/p")).toBe("https://host/p");
+    expect(cleanUrl("https:\\\\ana:hunter2@host\\p")).toBe("https://host\\p");
+    expect(cleanUrl("ht\r\ntps://ana:hunter2@ho\nst/p")).toBe("https://host/p");
+    expect(cleanUrl("\\\\ana:hunter2@host/p")).toBe("//host/p");
+    expect(cleanUrl("https:\\\\host\\p@q")).toBe("https://host\\p@q");
+  });
+  it("in a saved page", async () => {
+    const out = await stripHtmlSnapshot(`<html><body><a href="h\tttps://ana:TABPW@x.org/">a</a><a href="https:\\\\ana:BSPW@x.org/">b</a></body></html>`);
+    expect(out).not.toMatch(/ana|TABPW|BSPW/);
+  });
 });

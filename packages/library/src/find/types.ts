@@ -1,0 +1,211 @@
+/**
+ * The types of Find and acquire that every part shares (Task F3). Types that other tasks build on are declared
+ * here once, exactly as those tasks' Interfaces give them, so that the later tasks import them from here:
+ * `PersonCandidate` (Task F8), `OfferLink` (Tasks F10 and F15) and `FindReasonCode` (Task F5).
+ * `WorkCandidate` is Task F2's, in `./candidates.ts`.
+ */
+import type { WorkCandidate } from "./candidates.js";
+import type { FreeCopySource } from "./free-copy.js";
+
+export type { WorkCandidate } from "./candidates.js";
+
+/** Where an entry of the queue stands, every state written out in words on the screen. */
+export type FindState =
+  | "looking-up"
+  | "choose"
+  | "choose-person"
+  | "choose-works"
+  | "maybe-duplicate"
+  | "record-complete"
+  | "looking-for-copy"
+  | "fetching"
+  | "in-library"
+  | "already"
+  | "no-open-copy"
+  | "waiting-sign-in"
+  | "needs-check"
+  | "not-found"
+  | "failed";
+
+export const FIND_STATES: readonly FindState[] = [
+  "looking-up",
+  "choose",
+  "choose-person",
+  "choose-works",
+  "maybe-duplicate",
+  "record-complete",
+  "looking-for-copy",
+  "fetching",
+  "in-library",
+  "already",
+  "no-open-copy",
+  "waiting-sign-in",
+  "needs-check",
+  "not-found",
+  "failed",
+];
+
+/**
+ * Task F8: a person the author's name might mean (OpenAlex's author `A<digits>`): name and affiliation at most 200
+ * characters each, and at most 3 subject names (each at most 100) from the same answer (R270 e: in place of the plan's
+ * sample titles, which would cost a request per person). For choosing only: shown through UserText, never audited.
+ */
+export type PersonCandidate = { id: string; name: string; affiliation?: string; worksCount: number; subjects: string[] };
+
+/** Tasks F10 and F15: a link under "Where to get it". */
+export type OfferLink = {
+  label: "Publisher's page" | "Your library's catalogue" | "Open Library" | "WorldCat" | "A free copy may be at";
+  url: string;
+  host: string;
+};
+
+/** Task F5: why an entry could not go on (the sentences are `FIND_REASON_TEXT` in the shared package). */
+export type FindReasonCode =
+  | "not-allowed"
+  | "no-legal-basis"
+  | "switched-off"
+  | "unreachable"
+  | "locked"
+  | "queue-full"
+  | "budget"
+  | "unexpected"
+  // F8b (R283 a): on a "choose" entry: people of this name could not be looked up ("Try again" looks again).
+  | "people-unavailable"
+  // F12 (R297 a): the only record source switched on and allowed needs a key that is not saved (`by: "settings"`).
+  | "needs-key"
+  // Task F11: the free copy. The rules refuse the acquiring method `free_copy` (the entry stays "record-complete"
+  // and is not tried again until the rules change); FIND_HELD_MAX files already wait (R296 d: "record-complete",
+  // woken by a decision on a waiting file, "Try again", opening and unlocking; an entry stored "failed" with it by an
+  // earlier build is still accepted by "Try again"); the researcher said the held file was not this work
+  // ("no-open-copy"); and what the file check said of the file that waits ("needs-check": one code per reason it did
+  // not match, or R296 b "file-looks-right" — advice only).
+  | "copy-not-allowed"
+  | "held-full"
+  | "not-this-file"
+  | "file-other-doi"
+  | "file-title-absent"
+  | "file-no-text"
+  | "file-other-version"
+  | "file-other-kind"
+  | "file-looks-right"
+  // R282 e: no offer, and some free-copy services could not be reached ("no-open-copy", with "Try again"). R282 g:
+  // the record was removed from the library ("no-open-copy", removal only); the rules' store part, or a missing
+  // legal basis, refused the file ("record-complete", like "copy-not-allowed").
+  | "copy-some-unreachable"
+  // R379 (FR-A17): offers found, none downloaded, at least one for a passing reason: retried like an unreachable
+  // lookup, then "no-open-copy" with "Try again".
+  | "copy-not-downloaded"
+  | "record-removed"
+  | "copy-store-not-allowed"
+  | "copy-no-legal-basis"
+  // Task F15 (R324 b): found "waiting-sign-in" at start-up with nothing kept to return to ("no-open-copy").
+  | "library-unfinished";
+
+export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
+
+/** How a work was matched (R237 M3): "find-match" with the rule's score when the app was sure; "find-chosen" when the researcher chose. */
+export type FindMatch = { method: "find-match" | "find-chosen"; confidence: number };
+
+/** The longest DOI a candidate, the queue and a record keep: one bound for F2, the runner and the store (R237 M2). */
+export const FIND_DOI_MAX = 300;
+
+export interface FindEntry {
+  id: string;
+  projectId: string;
+  collectionId?: string;
+  /** What the researcher typed (2–500 characters). */
+  typed: string;
+  state: FindState;
+  createdAt: string;
+  updatedAt: string;
+  candidates?: WorkCandidate[];
+  people?: PersonCandidate[];
+  works?: WorkCandidate[];
+  chosen?: string;
+  sourceId?: string;
+  duplicateOf?: string;
+  elsewhere?: true;
+  reason?: FindReason;
+  /** How the work was matched, once it was; the record made later (after a duplicate question, or "here as well") says the same. */
+  match?: FindMatch;
+  attempts: number;
+  nextTryAt?: string;
+  parentId?: string;
+  offers?: OfferLink[];
+  /** Task F8 (R267): OpenAlex reported more people of this name than the 20 kept ("More people have this name …"). */
+  morePeople?: true;
+  /** Task F8 (R267): the person has more works than those kept for choosing (at most 200, fewer if the line would not fit). */
+  moreWorks?: true;
+  /**
+   * Task F8 (R271 M5): on an entry made from an author's entry (`parentId`), the OpenAlex id (`W<digits>`) of the work
+   * it was made from; set once. What counts as "already added" from an author's entry is worked out from the live
+   * entries that carry it, never stored on the author's entry.
+   */
+  work?: string;
+  /**
+   * Task F15 (R324 b): on an entry "waiting-sign-in" only — the state and reason it rested in when the researcher
+   * started a fetch through the library, and returns to unless a file is handed over (cancel, the ticket running out,
+   * start-up, a lock or a close). Never sent to the screen. A build before F15 drops it on reading (an unknown field).
+   */
+  returnTo?: FindReturnTo;
+  /** Only ever on the line that takes an entry out of the queue (written by the "remove" operation). */
+  removed?: true;
+}
+
+/** Task F15: what a "waiting-sign-in" entry returns to (R324 a: only these two resting states start a library fetch). */
+export type FindReturnTo = { state: "no-open-copy" | "record-complete"; reason?: FindReason };
+
+/** Each project has at most this many entries that are not removed. */
+export const FIND_QUEUE_MAX = 500;
+/** A queue line (the entry as JSON, before it is sealed) is at most this many bytes. */
+export const FIND_LINE_MAX_BYTES = 65_536;
+/** The longest line a researcher can type. */
+export const FIND_TYPED_MAX = 500;
+
+/**
+ * Task F12's "Search sources" settings, as F4 needs them (F12 adds `copies`, `crossrefEmail` and `unpaywallEmail`
+ * with the free copies). `record` lists the services that find a work and its record, in the order asked; a source
+ * that is `on: false` is never asked. Settings can only narrow what a project's rules allow.
+ */
+export type RecordSearchSource = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit";
+/**
+ * F11 adds `copies` (the free-copy services, asked in the plan's order; absent: none is asked) and `unpaywallEmail`
+ * (Unpaywall is asked only with one); F12 stores them, with `crossrefEmail`.
+ */
+export type SearchSettings = {
+  record: Array<{ id: RecordSearchSource; on: boolean }>;
+  copies?: Array<{ id: FreeCopySource; on: boolean }>;
+  unpaywallEmail?: string;
+  /** F12 (R290 e): sent to Crossref only, in the User-Agent of its requests (`contactEmailFor`). */
+  crossrefEmail?: string;
+};
+
+/**
+ * The settings until the researcher changes them (F12 keeps them in `search-sources.json`): every source on but
+ * Elicit; every free-copy service on but Unpaywall (which needs an e-mail).
+ */
+export const DEFAULT_SEARCH_SETTINGS: Readonly<SearchSettings> = Object.freeze({
+  record: Object.freeze([
+    Object.freeze({ id: "crossref" as const, on: true }),
+    Object.freeze({ id: "openalex" as const, on: true }),
+    Object.freeze({ id: "openlibrary" as const, on: true }),
+    Object.freeze({ id: "loc" as const, on: true }),
+    Object.freeze({ id: "elicit" as const, on: false }),
+  ]) as SearchSettings["record"],
+  copies: Object.freeze(
+    (["openalex", "unpaywall", "arxiv", "europepmc", "semanticscholar", "doab", "internetarchive"] as const).map((id) => Object.freeze({ id, on: id !== "unpaywall" })),
+  ) as NonNullable<SearchSettings["copies"]>,
+});
+
+export const FIND_QUEUE_OPS = {
+  add: "project.find.add",
+  update: "project.find.update",
+  remove: "project.find.remove",
+  compact: "project.find.compact",
+  /**
+   * Task F15 (R324 c): the entry's line "waiting-sign-in" — a fetch through the library started on the researcher's
+   * press. Governed with the capture of `library_access` besides the queue's own store request; audited with the
+   * entry's id, the counts and `method: "library_access"`, and nothing of the address.
+   */
+  "library-start": "project.find.library-start",
+} as const;

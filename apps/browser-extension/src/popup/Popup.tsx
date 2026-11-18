@@ -3,14 +3,31 @@
  * (projects whose rules allow browser capture), "Capture this page", and "Capture profile as I
  * scroll" with its counter and Finish. Everything shown is React text — nothing from a page or the
  * service is ever rendered as HTML.
+ *
+ * When the desktop app does not answer on the saved port (R171, defect D13), the popup names the two
+ * possible causes (the app is closed; the app's port changed when it was reopened) and offers "Use a
+ * different port" beside "Unpair": the researcher types the port the app shows, the popup checks it
+ * with one authorised request and saves it only if the app accepts the token there. It never looks
+ * for a port itself (R110).
+ *
+ * Find and acquire, the browser's fallback (R348 i): at its opening the popup asks the background for the works
+ * waiting for a PDF from this browser. When one waits, the popup's FIRST section, "Find and acquire", says "Waiting for
+ * a PDF: <label>" (the label as text) with "Send this tab's PDF"; the background does the sending (find.ts), so a popup
+ * closed meanwhile does not stop it, and its sentence is shown at the next opening, once — only where it is true
+ * (R357 a): in its work's section if that work still waits, alone if nothing waits, and not at all (dropped) if a
+ * different work waits; it is removed only when shown or dropped (R357 b). After a press the focus goes to the result's
+ * sentence (R357 d). Nothing waiting, or the list not readable: the popup is exactly as before.
  */
-import { useCallback, useEffect, useState } from "react";
-import type { Api, Pairing } from "../api.js";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { ApiError, type Api, type LocalStorageArea, type Pairing } from "../api.js";
+import { FIND_TEXT, FIND_TICKET, parseFindReply, parseFindResult, parseWaitingRead, placeOfKept, sentenceAfterNoAnswer, ticketHash, type FindResult, type Waiting } from "../find.js";
 import type { PendingByProject } from "../pending.js";
 import type { BackgroundRequest, CaptureReply, ProfileStatus, ProjectChoice } from "../types.js";
 
 export interface PopupBridge {
   api: Api;
+  /** storage.local, for the researcher's own popup choices (R189); never storage.sync. */
+  prefs: Pick<LocalStorageArea, "get" | "set">;
   /** The tab the popup was opened on. */
   activeTabId(): Promise<number | undefined>;
   send<T>(msg: BackgroundRequest): Promise<T>;
@@ -24,6 +41,21 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 /** A reply that is not a profile status (no answer, or an error) means nothing is running. */
 const statusOf = (r: ProfileStatus | null | undefined): ProfileStatus => (r && typeof r.active === "boolean" && typeof r.count === "number" ? r : { active: false, count: 0 });
 
+/**
+ * The researcher's last choice for "Also download media with the downloader" (R189, defect D18),
+ * kept in storage.local under its own key. Anything but a stored boolean, or a read that fails,
+ * means ticked, as before. The project's rules still decide whether the box is offered at all.
+ */
+const ALSO_DOWNLOAD = "alsoDownload";
+async function readAlsoDownload(prefs: PopupBridge["prefs"]): Promise<boolean> {
+  try {
+    const v = (await prefs.get(ALSO_DOWNLOAD))?.[ALSO_DOWNLOAD];
+    return typeof v === "boolean" ? v : true;
+  } catch {
+    return true;
+  }
+}
+
 export function Popup({ bridge }: { bridge: PopupBridge }) {
   const [load, setLoad] = useState<Load>({ state: "loading" });
   const [port, setPort] = useState("");
@@ -31,11 +63,79 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   const [projects, setProjects] = useState<ProjectChoice[] | undefined>();
   const [projectId, setProjectId] = useState("");
   const [alsoDownload, setAlsoDownload] = useState(true);
+  /** The researcher changed the box in this opening: a stored value read late must not undo it. */
+  const alsoDownloadChanged = useRef(false);
   const [tabId, setTabId] = useState<number | undefined>();
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [profile, setProfile] = useState<ProfileStatus>({ active: false, count: 0 });
   const [pending, setPending] = useState<PendingByProject>({});
+  /** The app did not answer on the saved port (R171). */
+  const [unreachable, setUnreachable] = useState(false);
+  /** The app answered, but has no library open: said instead of "no project allows capture" (review M2). */
+  const [noLibrary, setNoLibrary] = useState(false);
+  /** "Use a different port": the field is open, what is typed, the check under way, why it failed. */
+  const [portOpen, setPortOpen] = useState(false);
+  const [newPort, setNewPort] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [portError, setPortError] = useState("");
+  const ids = useId();
+  const checkingNow = useRef(false);
+  const checkAbort = useRef<AbortController | undefined>(undefined);
+  const alive = useRef(true);
+  const changeButton = useRef<HTMLButtonElement>(null);
+  const portInput = useRef<HTMLInputElement>(null);
+  const pairedLine = useRef<HTMLSpanElement>(null);
+  /** Where focus goes once the field closes: back to its button, or to the line naming the new port. */
+  const [focusAfter, setFocusAfter] = useState<{ to: "button" | "paired" } | null>(null);
+  /** Find and acquire (R348 i): the works waiting for a PDF; the ticket being sent for; the last sentence said. */
+  const [findWaiting, setFindWaiting] = useState<Waiting[]>([]);
+  const [findSending, setFindSending] = useState<string | null>(null);
+  /** The sending under way is one this opening did not start (it is watched until it ends). */
+  const [findWatching, setFindWatching] = useState(false);
+  const [findSaid, setFindSaid] = useState("");
+  const findBusy = useRef(false);
+  /** The result's sentence: focused after a press in this popup (R357 d), never at a mere opening. */
+  const findSaidLine = useRef<HTMLParagraphElement>(null);
+  const [findFocus, setFindFocus] = useState(0);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      checkAbort.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    let current = true;
+    void readAlsoDownload(bridge.prefs).then((v) => {
+      if (current && !alsoDownloadChanged.current) setAlsoDownload(v);
+    });
+    return () => {
+      current = false;
+    };
+  }, [bridge]);
+
+  function chooseAlsoDownload(v: boolean) {
+    alsoDownloadChanged.current = true;
+    setAlsoDownload(v);
+    // Remembered for the next opening; if it cannot be stored, the box still holds for this one.
+    try {
+      void bridge.prefs.set({ [ALSO_DOWNLOAD]: v }).catch(() => undefined);
+    } catch {
+      /* no storage: nothing to remember */
+    }
+  }
+
+  useEffect(() => {
+    if (portOpen) portInput.current?.focus();
+  }, [portOpen]);
+
+  useEffect(() => {
+    if (!focusAfter) return;
+    (focusAfter.to === "button" ? changeButton.current : pairedLine.current)?.focus();
+  }, [focusAfter]);
 
   const refresh = useCallback(async () => {
     const pairing = await bridge.api.getPairing();
@@ -48,9 +148,15 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
       const list = (await bridge.api.listProjects()).filter((p) => p.captureMethods.includes("browser_capture"));
       setProjects(list);
       setProjectId((cur) => (list.some((p) => p.id === cur) ? cur : (list[0]?.id ?? "")));
+      setUnreachable(false);
+      setNoLibrary(false);
     } catch (e) {
       setProjects([]);
-      setStatus(message(e));
+      setNoLibrary(e instanceof ApiError && e.code === "LIBRARY_OFFLINE");
+      // Not answering: said once, with both causes and what to do, in its own notice (R171).
+      // No library open: said once, in the list area (re-review M9).
+      if (e instanceof ApiError && e.code === "UNREACHABLE") setUnreachable(true);
+      else if (!(e instanceof ApiError && e.code === "LIBRARY_OFFLINE")) setStatus(message(e));
       if (!(await bridge.api.getPairing())) setLoad({ state: "unpaired" });
     }
     if (tab !== undefined) setProfile(statusOf(await bridge.send<ProfileStatus>({ type: "profile-status", tabId: tab })));
@@ -59,6 +165,126 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  /** A find-* question to the background; no answer is undefined (never an error of its own). */
+  const ask = useCallback(
+    async (type: "find-waiting" | "find-status" | "find-result"): Promise<unknown> => {
+      try {
+        return await bridge.send<unknown>({ type });
+      } catch {
+        return undefined;
+      }
+    },
+    [bridge],
+  );
+  /** The kept result is removed once shown or dropped — that one only (its hash and its time), never a newer one. */
+  const forget = useCallback(
+    async (kept: FindResult): Promise<void> => {
+      try {
+        await bridge.send<unknown>({ type: "find-result-forget", work: kept.work, at: kept.at });
+      } catch {
+        /* the background went: the next opening decides again */
+      }
+    },
+    [bridge],
+  );
+  const sendingOf = (v: unknown): string | null => {
+    const s = (v as { sending?: unknown } | null | undefined)?.sending;
+    return typeof s === "string" && FIND_TICKET.test(s) ? s : null;
+  };
+
+  // At the opening: a sending under way (watched until it ends), else the last result kept while the popup was closed,
+  // and the list. The kept result is only looked at; it is removed when it is shown here or dropped (a different work
+  // waits) — an opening that ends before that leaves it for the next one (R357 a, b).
+  useEffect(() => {
+    let current = true;
+    void (async () => {
+      const sending = sendingOf(await ask("find-status"));
+      const kept = sending ? undefined : parseFindResult(await ask("find-result"));
+      const read = parseWaitingRead(await ask("find-waiting"));
+      const place = kept ? await placeOfKept(kept, read.waiting) : undefined;
+      if (!current) return;
+      setFindWaiting(read.waiting);
+      if (kept) {
+        if (place !== "drop") setFindSaid(kept.sentence);
+        void forget(kept);
+      }
+      if (sending && !findBusy.current) {
+        findBusy.current = true;
+        setFindSending(sending);
+        setFindWatching(true);
+      }
+    })();
+    return () => {
+      current = false;
+    };
+  }, [ask, forget]);
+
+  // A sending this opening did not start: asked once a second until it ends (it has its own limits), then its result.
+  useEffect(() => {
+    if (!findWatching) return;
+    let current = true;
+    let asking = false;
+    const t = setInterval(() => {
+      if (asking) return;
+      asking = true;
+      void (async () => {
+        try {
+          if (sendingOf(await ask("find-status"))) return;
+          clearInterval(t);
+          const kept = parseFindResult(await ask("find-result"));
+          const read = parseWaitingRead(await ask("find-waiting"));
+          const place = kept ? await placeOfKept(kept, read.waiting) : undefined;
+          if (!current) return;
+          setFindWaiting(read.waiting);
+          setFindSaid(kept && place !== "drop" ? kept.sentence : "");
+          if (kept) void forget(kept);
+          setFindSending(null);
+          setFindWatching(false);
+          findBusy.current = false;
+        } finally {
+          asking = false;
+        }
+      })();
+    }, 1000);
+    return () => {
+      current = false;
+      clearInterval(t);
+    };
+  }, [findWatching, ask, forget]);
+
+  // After a press in this popup, the result's sentence takes the focus (the pressed button is gone or was disabled).
+  useEffect(() => {
+    if (findFocus > 0) findSaidLine.current?.focus();
+  }, [findFocus]);
+
+  /** "Send this tab's PDF": one sending at a time; the background does it; the service's sentence is shown as it is. */
+  async function sendPdf(ticket: string) {
+    if (findBusy.current || tabId === undefined) return;
+    findBusy.current = true;
+    setFindSending(ticket);
+    setFindSaid("");
+    let reply: ReturnType<typeof parseFindReply>;
+    try {
+      reply = parseFindReply(await bridge.send<unknown>({ type: "find-send", tabId, ticket }));
+    } catch {
+      reply = undefined;
+    }
+    // Said here: the copy kept for a next opening (this work's) is removed, so it is not said twice.
+    if (reply) {
+      const kept = parseFindResult(await ask("find-result"));
+      if (kept && kept.work === (await ticketHash(ticket))) await forget(kept);
+    }
+    // The list again: whether the work still waits decides the button; with no answer, it decides what is said — a list
+    // not read or not understood is a failed read (R357 c).
+    const read = parseWaitingRead(await ask("find-waiting"));
+    if (!alive.current) return;
+    setFindWaiting(read.waiting);
+    setFindSaid(reply ? reply.sentence : sentenceAfterNoAnswer(ticket, read));
+    setFindSending(null);
+    setFindFocus((n) => n + 1);
+    findBusy.current = false;
+  }
 
   // While profile capture runs, keep the counter current.
   useEffect(() => {
@@ -88,7 +314,57 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
     }
   }
 
+  function closePortField(focusTo: "button" | "paired") {
+    checkAbort.current?.abort();
+    checkAbort.current = undefined;
+    checkingNow.current = false;
+    setChecking(false);
+    setPortOpen(false);
+    setNewPort("");
+    setPortError("");
+    setFocusAfter({ to: focusTo });
+  }
+
+  /** One authorised request to the typed port; saved only when the app accepts the token there (R171). */
+  async function checkPort(e: React.FormEvent) {
+    e.preventDefault();
+    if (checkingNow.current) return;
+    checkingNow.current = true;
+    const ac = new AbortController();
+    checkAbort.current = ac;
+    setChecking(true);
+    setPortError("");
+    try {
+      const r = await bridge.api.changePort(newPort, { signal: ac.signal });
+      if (!alive.current || ac.signal.aborted) return;
+      const list = (r.projects ?? []).filter((p) => p.captureMethods.includes("browser_capture"));
+      setLoad({ state: "paired", pairing: r.pairing });
+      setProjects(list);
+      setProjectId((cur) => (list.some((p) => p.id === cur) ? cur : (list[0]?.id ?? "")));
+      setUnreachable(false);
+      setNoLibrary(r.projects === null);
+      setStatus(
+        r.projects === null
+          ? `Connected again: this browser now uses port ${r.pairing.port}, and its pairing is unchanged.`
+          : `Connected again: this browser now uses port ${r.pairing.port}, and its pairing is unchanged. Choose a project below.`,
+      );
+      closePortField("paired");
+    } catch (err) {
+      if (!alive.current || ac.signal.aborted) return;
+      setPortError(message(err));
+      portInput.current?.focus();
+    } finally {
+      if (checkAbort.current === ac) {
+        checkAbort.current = undefined;
+        checkingNow.current = false;
+        if (alive.current) setChecking(false);
+      }
+    }
+  }
+
   async function unpair() {
+    if (portOpen) closePortField("button");
+    setUnreachable(false);
     await bridge.api.unpair();
     setProjects(undefined);
     setStatus("Unpaired. The desktop app's list of paired extensions can remove it there too.");
@@ -116,7 +392,7 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
     return (
       <main className="popup">
         <h1>Pair with the desktop app</h1>
-        <p className="hint">In Alexandrine Oxiana, open Settings → Browser extension. It shows a port number and a 6-digit code.</p>
+        <p className="hint">In Alexandrine Oxiana, with your library open, choose “Browser extension” at the top of the window, then “Show a pairing code”. It shows a port number and a 6-digit code.</p>
         <form onSubmit={(e) => void pair(e)}>
           <label>
             Port
@@ -138,17 +414,104 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   }
 
   const canCapture = !busy && !!project && tabId !== undefined;
+  const several = findWaiting.length > 1;
   return (
     <main className="popup">
+      {findWaiting.length > 0 || findSaid ? (
+        <section className="find" aria-labelledby={`${ids}-find`}>
+          <h2 id={`${ids}-find`}>{FIND_TEXT.heading}</h2>
+          {findWaiting.map((w) => (
+            <div className="find-work" key={w.ticket}>
+              <p>
+                Waiting for a PDF: <bdi>{w.label}</bdi>
+              </p>
+              <button
+                type="button"
+                disabled={findSending !== null || tabId === undefined}
+                aria-busy={findSending === w.ticket || undefined}
+                aria-label={several ? `${FIND_TEXT.button} for “${w.label}”` : undefined}
+                onClick={() => void sendPdf(w.ticket)}
+              >
+                {findSending === w.ticket ? FIND_TEXT.sending : FIND_TEXT.button}
+              </button>
+            </div>
+          ))}
+          <p className="find-said" aria-live="polite" aria-atomic="true" tabIndex={-1} ref={findSaidLine}>
+            {findSaid}
+          </p>
+        </section>
+      ) : null}
       <p className="paired">
-        <span>Paired with the desktop app (port {load.pairing.port}).</span>{" "}
+        <span ref={pairedLine} tabIndex={-1}>
+          Paired with the desktop app (port {load.pairing.port}).
+        </span>{" "}
+        {unreachable || portOpen ? (
+          <>
+            <button type="button" className="link" ref={changeButton} aria-expanded={portOpen} aria-controls={`${ids}-port`} onClick={() => (portOpen ? closePortField("button") : setPortOpen(true))}>
+              Use a different port
+            </button>{" "}
+          </>
+        ) : null}
         <button type="button" className="link" onClick={() => void unpair()}>
           Unpair
         </button>
       </p>
 
+      {unreachable ? (
+        <div role="alert" className="notice">
+          <p>The desktop app is not answering on port {load.pairing.port}.</p>
+          <p>
+            Either the app is closed: open it, then open this popup again. Or the app's port changed when it was reopened: its “Browser extension” page, at the top of its library window, then shows the new port. Enter that port with “Use a different port”. The pairing stays valid, so there is no need to pair again.
+          </p>
+        </div>
+      ) : null}
+
+      {portOpen ? (
+        <form
+          id={`${ids}-port`}
+          aria-label="Use a different port"
+          onSubmit={(e) => void checkPort(e)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              closePortField("button");
+            }
+          }}
+        >
+          <label>
+            New port (as shown in the desktop app)
+            <input
+              ref={portInput}
+              inputMode="numeric"
+              autoComplete="off"
+              value={newPort}
+              onChange={(e) => setNewPort(e.target.value.trim())}
+              maxLength={5}
+              required
+              aria-invalid={portError ? true : undefined}
+              aria-describedby={portError ? `${ids}-port-error` : undefined}
+            />
+          </label>
+          {portError ? (
+            <p id={`${ids}-port-error`} role="alert" className="error">
+              {portError}
+            </p>
+          ) : null}
+          <div className="actions">
+            <button type="submit" disabled={checking} aria-busy={checking || undefined}>
+              Check and save
+            </button>
+            <button type="button" onClick={() => closePortField("button")}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      ) : null}
+
       {projects === undefined ? (
         <p>Loading projects…</p>
+      ) : projects.length === 0 && noLibrary ? (
+        <p className="hint">No library is open in the desktop app. Open one, then open this popup again.</p>
       ) : projects.length === 0 ? (
         <p className="hint">No project allows browser capture. Allow it in a project's rules in the desktop app.</p>
       ) : (
@@ -164,7 +527,7 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
             </select>
           </label>
           <label className="check">
-            <input type="checkbox" checked={alsoDownload && downloaderAllowed} disabled={!downloaderAllowed || busy} onChange={(e) => setAlsoDownload(e.target.checked)} />
+            <input type="checkbox" checked={alsoDownload && downloaderAllowed} disabled={!downloaderAllowed || busy} onChange={(e) => chooseAlsoDownload(e.target.checked)} />
             Also download media with the downloader
           </label>
           {!downloaderAllowed && <p className="hint">This project's rules do not allow the downloader, so media downloads and profile capture are off.</p>}

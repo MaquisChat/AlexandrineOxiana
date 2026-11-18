@@ -1,0 +1,25 @@
+# Final review, Task FR-C2 — tests for guards of the screens and the end-to-end flows (implementer's dispatch)
+
+You are the implementer of **Task FR-C2** of the final review of the project "Alexandrine Oxiana" (a local-first research workbench; pnpm 10 monorepo, Node 22, TypeScript strict ESM, Vitest with Testing Library, React 19 in `packages/ui`, Playwright specs in `e2e/` run in Chromium and WebKit). You work in your own git worktree (your current directory).
+
+**Before anything else — your base:** `git reset --hard claude/pdf-reader-highlights`. Then `pnpm install --frozen-lockfile`, `pnpm fetch-csl`, `pnpm --filter @ao/ui run build`. Then read, IN FULL, `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/impl-common-reader.md` (how this project is built and tested) and Ruling R362 (`grep -n -E "Ruling R362\b" /home/user/AlexandrineOxiana/docs/handoff/LEDGER.md | cut -c1-9000`, clause i).
+
+## Your task: TESTS ONLY — no product code changes
+The project's reviews found guards and behaviours that matter to a researcher but that NO TEST would catch if they broke. You add those tests. For each item below: read its entry in `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/final-review-triage.md` (section "Group C") and in `final-review-list.md` (same folder; it gives the line of the decision log `/home/user/AlexandrineOxiana/docs/handoff/LEDGER.md` — read the context: `sed -n '<line>p' … | cut -c1-3000`); find the code; write the test; **prove it can fail: take the guard out (a scratch edit), see the test fail for that reason, put it back** — say in your report, per test, the mutation and the failure.
+
+1. **FR-195** (`packages/ui`, the new-project dialog; `NewProject.test.tsx`; log line 387): the refusal's text for the identifiable-data variant; completing a create AFTER the encryption refusal; a clipboard failure at the recovery-code step (the code must still be shown and the step not passed silently); the Tab trap at the recovery step; Escape while busy does not close or lose the recovery code.
+2. **FR-227, FR-228** (log line 428): a test in the UI's suite asserting the content-security policy's `media-src` — what keeps recordings and pictures from being loaded from any origin but the app's service (find where the policy is built: the UI's `serviceConnection` / the desktop's configuration; assert the directive's exact value and that a media address of another origin is not allowed by it).
+3. **FR-562** (`packages/ui/src/screens/FindAcquire.tsx`; log line 1577): the two checks inside the sign-in window's RETRY that the row is still the same (the entry and the library unchanged) — a project lock, or the row leaving its state, DURING the retry: the page must not open a window for a row that is no longer waiting. A test for each check that fails without it.
+4. **FR-214** (`e2e/import.spec.ts`; log line 418): an import's UNDO restoring MERGED sources is not exercised — the undo steps report "restored 0". Add a scenario of its own in which an import merges into existing sources (two imports of overlapping records, or as the product makes a merge happen — find it), then the undo restores them: assert the restored count and the sources' fields as they were before the import. Chromium and WebKit.
+**If a test you write shows the product is WRONG** (for FR-214 especially: the undo does NOT restore merged sources correctly): do not fix the product — keep the failing test OUT of the commit, and report it as a finding with the evidence (what was merged, what the undo left).
+
+## Files
+`packages/ui/src/**/*.test.tsx` beside the code, `e2e/import.spec.ts` (and its fixtures). No product code. No new dependency.
+
+## Verify (each at `nice -n 10`, in the foreground; give the final output line of each)
+Each test file you touched, by name · `pnpm --filter @ao/ui test` once at the end · `pnpm -r typecheck` · `pnpm e2e -- --app-only e2e/import.spec.ts --trace off` once (a timeout in a scenario you did not touch is re-run once alone and both runs reported).
+
+## Report
+Full report to `/tmp/claude-0/-home-user-AlexandrineOxiana/ac3b5cb4-f467-5f83-9948-4e7d2e34f036/scratchpad/task-FRC2-report.md`: per item — the code guarded (file:line), the test (file, name), the mutation and how the test failed under it; findings (a product defect a test showed); the runs. Commit on your worktree's branch. Final message to the coordinator (max 150 words): status (DONE / DONE_WITH_CONCERNS / BLOCKED), branch and head commit, how many items have a test proven by mutation, the runs in one line, any finding. Exactly one final message.
+
+Seven such tasks run at once on this machine: run tests at `nice -n 10`, in the foreground, only what is named; a timeout in a file you did not touch is re-run once alone and both runs reported; leave nothing running. Do not push. Commits end with the trailers YOUR OWN session's instructions give; no model identifiers anywhere else. If a point contradicts the code as built in a way you cannot resolve within the ruling, stop at that point and report it; finish the others.

@@ -8,6 +8,7 @@ import "./popup.css";
 
 const bridge: PopupBridge = {
   api: createApi({ fetch: (input, init) => fetch(input, init), storage: browser.storage.local }),
+  prefs: browser.storage.local,
   async activeTabId() {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
     return typeof tab?.id === "number" ? tab.id : undefined;

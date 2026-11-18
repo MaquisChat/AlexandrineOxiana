@@ -10,7 +10,8 @@ import { SimulatedCrash, seams } from "./repo/testing.js";
 import { findSourceBy, indexSource, openIndex } from "./index/db.js";
 import { shredSeams } from "./fs/shred.js";
 import { backupSeams } from "./export/backup.js";
-import { DESTRUCTION_NOTICE, destroyRaw, resumeDestruction, retentionDue } from "./retention.js";
+import { DESTRUCTION_NOTICE, destroyRaw, readDestruction, resumeDestruction, retentionDue } from "./retention.js";
+import { setProjectTimeZone } from "./repo/repo.js";
 
 let kit: Kit;
 beforeEach(async () => {
@@ -53,6 +54,59 @@ async function derived(p: Project, sf: SourceFile, kind: string, ext: string, bo
     derivation: { parents: [sf.assets[0]!.id], operation: kind, provider: "test", ranAt: "local", params: {}, at: kit.clock.now.toISOString(), triggeredBy: "tester" },
   });
 }
+
+describe("project time zone (Task 58, R93)", () => {
+  it("is set through a governed, audited change; the retention date is then read in it; cleared, it is UTC again", async () => {
+    const p = await makeProject(kit, GOV(false));
+    await rawSource(p);
+    const evening = new Date("2026-11-30T20:00:00Z"); // already 1 December at UTC+14
+    expect(kit.repo.getProject(p.id).timeZone).toBeUndefined();
+    expect(await retentionDue(kit.repo, p.id, evening)).toEqual([]);
+
+    const set = await setProjectTimeZone(kit.repo, p.id, "pacific/kiritimati");
+    expect(set.timeZone).toBe("Pacific/Kiritimati");
+    expect(kit.repo.getProject(p.id).timeZone).toBe("Pacific/Kiritimati");
+    expect(JSON.parse(await readFile(abs(`${p.folder}/project.json`), "utf8")).project.timeZone).toBe("Pacific/Kiritimati");
+    expect(await retentionDue(kit.repo, p.id, evening)).toHaveLength(1);
+    const ev = (await auditEvents(kit, p)).filter((e) => e.details?.op === "project.time-zone");
+    expect(ev).toHaveLength(1);
+    expect(ev[0]).toMatchObject({ action: "store", decision: { result: "allow" }, entity: { type: "project", id: p.id }, details: { from: null, to: "Pacific/Kiritimati" } });
+
+    // Setting the same zone again changes and records nothing (M2).
+    const events = (await auditEvents(kit, p)).length;
+    await setProjectTimeZone(kit.repo, p.id, "Pacific/Kiritimati");
+    expect((await auditEvents(kit, p)).length).toBe(events);
+
+    // It survives reopening the library.
+    await kit.reopen();
+    expect(kit.repo.getProject(p.id).timeZone).toBe("Pacific/Kiritimati");
+
+    await setProjectTimeZone(kit.repo, p.id, null);
+    expect((await auditEvents(kit, p)).filter((e) => e.details?.op === "project.time-zone").at(-1)?.details).toMatchObject({ from: "Pacific/Kiritimati", to: null });
+    expect(kit.repo.getProject(p.id).timeZone).toBeUndefined();
+    expect(JSON.parse(await readFile(abs(`${p.folder}/project.json`), "utf8")).project).not.toHaveProperty("timeZone");
+    expect(await retentionDue(kit.repo, p.id, evening)).toEqual([]);
+  });
+
+  it("refuses a name that is not a time zone and writes nothing", async () => {
+    const p = await makeProject(kit, GOV(false));
+    const before = await readFile(abs(`${p.folder}/project.json`), "utf8");
+    const events = (await auditEvents(kit, p)).length;
+    for (const bad of ["Mars/Olympus", "+05:00", "", " UTC", "x".repeat(65)]) {
+      await expect(setProjectTimeZone(kit.repo, p.id, bad), bad).rejects.toThrow(/not a time zone/);
+    }
+    await expect(setProjectTimeZone(kit.repo, p.id, 5 as unknown as string)).rejects.toThrow(/not a time zone/);
+    expect(await readFile(abs(`${p.folder}/project.json`), "utf8")).toBe(before);
+    expect((await auditEvents(kit, p)).length).toBe(events);
+  });
+
+  it("an encrypted project keeps its time zone readable while locked (project.json is plaintext)", async () => {
+    const p = await makeProject(kit, GOV(true), true);
+    await setProjectTimeZone(kit.repo, p.id, "Asia/Tokyo");
+    kit.repo.lockProject(p.id);
+    expect(kit.repo.getProject(p.id).timeZone).toBe("Asia/Tokyo");
+  });
+});
 
 describe("retentionDue", () => {
   it("lists the raw originals of identifiable sources once rawDataDestroyAfter has passed", async () => {
@@ -132,7 +186,12 @@ describe("destroyRaw", () => {
     // Sealed in an encrypted project (readable when unlocked).
     expect(r.certificatePath.endsWith(".json.enc")).toBe(true);
     expect((await readFile(r.certificatePath)).includes(Buffer.from(original.sha256))).toBe(false);
-    const cert = JSON.parse((await plainOf(kit, p, r.certificatePath.slice(kit.lib.root.length + 1).split("\\").join("/"))).toString("utf8"));
+    // R147: the file is the certificate as written at the destruction, never replaced; what became
+    // of the backups is read with its amendments (this test compared the replaced file before).
+    const written = JSON.parse((await plainOf(kit, p, r.certificatePath.slice(kit.lib.root.length + 1).split("\\").join("/"))).toString("utf8"));
+    expect(written).toEqual(r.original);
+    expect(written.backups).toEqual({ status: "pending", containing: [`Backups/${old.path.slice(old.path.lastIndexOf("/") + 1)}`], deleted: [] });
+    const cert = (await readDestruction(kit.repo, p.id, r.certificatePath)).certificate as typeof written;
     expect(cert).toEqual(r.certificate);
     expect(cert.assets.map((a: { assetId: string }) => a.assetId).sort()).toEqual([original.id, proxy.id].sort());
     expect(cert.trashedCopies).toEqual([`.tmp/trash-00000000-0000-4000-8000-000000000000-abcd/${base}`]);
@@ -210,13 +269,15 @@ describe("destroyRaw", () => {
     const done = await resumeDestruction(again, p.id);
     expect(done).toHaveLength(1);
     expect(existsSync(old.path)).toBe(false);
-    const cert = JSON.parse(await readFile(done[0]!, "utf8"));
+    // R147: the status is read with the amendments; the certificate file still says what it said at the destruction.
+    expect(JSON.parse(await readFile(done[0]!, "utf8")).backups.status).toBe("pending");
+    const cert = (await readDestruction(again, p.id, done[0]!)).certificate as { backups: { status: string } };
     expect(cert.backups.status).toBe("deleted");
   });
 });
 
 describe("R92", () => {
-  it("I3: a failed fresh backup keeps the step pending with lastError; resumeDestruction retries it", async () => {
+  it("I3, as R138 e changed it: a failed fresh backup no longer keeps the holding backups; they are removed and the certificate says no new backup could be made", async () => {
     const p = await makeProject(kit, GOV(false));
     const sf = await rawSource(p);
     const old = await backupProject(kit.repo, p.id);
@@ -228,15 +289,14 @@ describe("R92", () => {
     } finally {
       backupSeams.failBackup = false;
     }
-    expect(r.certificate.backups).toMatchObject({ status: "pending", deleted: [], lastError: expect.any(String) });
-    expect(existsSync(old.path)).toBe(true);
-    kit.clock.now = new Date("2026-12-02T10:20:00.000Z");
-    const done = await resumeDestruction(kit.repo, p.id);
-    expect(done).toHaveLength(1);
+    expect(r.certificate.backups).toMatchObject({
+      status: "deleted",
+      deleted: [`Backups/${old.path.slice(old.path.lastIndexOf("/") + 1)}`],
+      freshBackupFailed: "The backup could not be made (simulated backup failure).",
+    });
     expect(existsSync(old.path)).toBe(false);
-    const cert = JSON.parse(await readFile(done[0]!, "utf8"));
-    expect(cert.backups).toMatchObject({ status: "deleted", deleted: [`Backups/${old.path.slice(old.path.lastIndexOf("/") + 1)}`] });
-    expect(cert.backups.lastError).toBeUndefined();
+    expect((r.certificate.backups as { lastError?: string }).lastError).toBeUndefined();
+    expect(await resumeDestruction(kit.repo, p.id)).toEqual([]);
   });
 
   it("I3: a partly failed backup deletion reports exactly what was deleted, the manifest follows each deletion, and a retry finishes", async () => {
@@ -261,7 +321,8 @@ describe("R92", () => {
     expect((await listBackups(kit.repo, p.id)).map((x) => x.file)).not.toContain(nameOf(a));
     kit.clock.now = new Date("2026-12-02T10:20:00.000Z");
     const [path] = await resumeDestruction(kit.repo, p.id);
-    const cert = JSON.parse(await readFile(path!, "utf8"));
+    // R147: read with its amendments (the certificate file is not replaced any more).
+    const cert = (await readDestruction(kit.repo, p.id, path!)).certificate as { backups: { status: string; deleted: string[] } };
     expect(cert.backups.status).toBe("deleted");
     expect(cert.backups.deleted.sort()).toEqual([`Backups/${nameOf(a)}`, `Backups/${nameOf(b)}`].sort());
     expect(existsSync(b.path)).toBe(false);

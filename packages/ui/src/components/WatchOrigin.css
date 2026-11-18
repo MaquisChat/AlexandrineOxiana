@@ -1,0 +1,34 @@
+/* Where a source came from (Task W9). Colours from theme tokens only; focus rings come from base.css. */
+.ao-watch-origin {
+  margin: var(--space-3) 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+.ao-watch-origin h3 {
+  margin: 0 0 var(--space-2);
+  font-size: 1rem;
+}
+
+.ao-watch-origin__item + .ao-watch-origin__item {
+  margin-top: var(--space-3);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--line-strong);
+}
+
+.ao-watch-origin p {
+  margin: var(--space-1) 0;
+}
+
+/* Names come from other people and can be long: they wrap rather than push the page wide. */
+.ao-watch-origin__name {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.ao-watch-origin__quiet {
+  margin: var(--space-2) 0;
+}

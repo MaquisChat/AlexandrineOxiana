@@ -13,6 +13,7 @@
   "dependencies": {
     "@ao/core": "workspace:*",
     "@ao/library": "workspace:*",
+    "@ao/shared": "workspace:*",
     "commander": "^15.1.0"
   },
   "bin": {

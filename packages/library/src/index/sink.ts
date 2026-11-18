@@ -5,9 +5,11 @@ import type { KeyRing } from "../crypto/keys.js";
 import type { IndexSink, ProjectJson } from "../repo/state.js";
 import { computeStamps, listProjectEntries, newestChangeId, projectKey, stampFor, type Stamps } from "./changes.js";
 import {
-  getMeta, indexProject, indexProjectEntities, indexSource, purgeProject, removeSource, setMeta, upsertReviewItem, type IndexDb, type IndexHandle,
+  getMeta, indexLockedSource, indexProject, indexProjectEntities, indexSource, purgeProject, removeSource, setMeta, upsertReviewItem, type IndexDb, type IndexHandle,
 } from "./db.js";
-import { readExtractedText, readSource } from "./load.js";
+import { readExtractedText, readSource, withAnnotations } from "./load.js";
+import { JOBS_FILE, refreshJobRows, upgradeLegacyJobs } from "../job-journal.js";
+import { isLockedRefusal } from "../repo/errors.js";
 
 /**
  * (Re)loads an unlocked encrypted project's content into the in-memory TEMP schema: every source
@@ -50,10 +52,32 @@ export async function indexUnlockedProject(
       indexSource(db, sf, text, { protected: true });
       out.indexed++;
     } catch (err) {
+      if (isLockedRefusal(err)) break; // locked meanwhile (R404): see below
       out.errors.push({ folder, message: err instanceof Error ? err.message : String(err) });
     }
   }
-  if (!still()) purgeProject(db, projectId); // locked during the load: nothing may stay in memory
+  if (!still()) {
+    // Locked during the load: nothing may stay in memory, and the answer is the one a locked project gets (nothing
+    // loaded, no error): what was read before the lock is not reported as loaded, nor the lock as errors (R404).
+    purgeProject(db, projectId);
+    return { indexed: 0, errors: [] };
+  }
+  // Job rows (R31): legacy rows of this project are written into its journal now that its key is
+  // here, and the rows are made to match the journal (rows hold no payload: persistent is fine, R30).
+  try {
+    out.errors.push(...(await upgradeLegacyJobs(db, root, keyRing)).errors);
+    await refreshJobRows(() => db, root, entry.rel, projectId, k);
+  } catch (err) {
+    if (isLockedRefusal(err)) {
+      purgeProject(db, projectId); // locked meanwhile: as above (the job rows are not touched, R386 a)
+      return { indexed: 0, errors: [] };
+    }
+    out.errors.push({ folder: `${entry.rel}/${JOBS_FILE}`, message: err instanceof Error ? err.message : String(err) });
+  }
+  if (!still()) {
+    purgeProject(db, projectId); // locked just after the last read (R435 e): as above
+    return { indexed: 0, errors: [] };
+  }
   return out;
 }
 
@@ -92,7 +116,18 @@ async function readProjectJson(root: string, rel: string): Promise<ProjectJson |
  * incrementally (only the affected project), and index encrypted projects' content in memory only.
  * Without `ctx`, a source of an unknown project is treated as protected (kept in memory only).
  */
-export function createIndexSink(handle: IndexHandle, ctx?: { root: string; keyRing: KeyRing }): IndexSink {
+export function createIndexSink(
+  handle: IndexHandle,
+  ctx?: { root: string; keyRing: KeyRing },
+  opts: {
+    /**
+     * While true, writes do not record change stamps (M6): set from the open until the staleness
+     * check has run, so a write made before it cannot refresh a project's stamp and hide a change
+     * made outside the app. The written rows are indexed as usual.
+     */
+    holdStamps?: () => boolean;
+  } = {},
+): IndexSink {
   /** Looks up where a project lives and whether it is encrypted (project.json read once per call). */
   async function info(projectId: string) {
     const row = handle.db.prepare("SELECT folder, encrypted FROM projects WHERE id = ?").get(projectId) as
@@ -111,7 +146,7 @@ export function createIndexSink(handle: IndexHandle, ctx?: { root: string; keyRi
     return { prot: data.project.encryption.enabled, rel, data, k: projectKey(data, ctx.keyRing) };
   }
   async function stamp(i: { rel?: string | undefined; data?: ProjectJson | undefined }) {
-    if (!ctx) return;
+    if (!ctx || opts.holdStamps?.()) return;
     if (i.rel && i.data) await recordProjectStamp(handle.db, ctx.root, ctx.keyRing, i.rel, i.data);
     else await recordStamps(handle.db, ctx.root, ctx.keyRing);
   }
@@ -119,7 +154,10 @@ export function createIndexSink(handle: IndexHandle, ctx?: { root: string; keyRi
     async indexSource(sf, extractedText) {
       const i = await info(sf.source.projectIds[0] ?? "");
       const text = extractedText ?? (ctx ? await readExtractedText(ctx.root, sf, i.k) : undefined);
-      indexSource(handle.db, sf, text, { protected: i.prot });
+      // A source passed without its annotations loaded (source.json lists only their count): they
+      // are read from the folder, as written by the change that just committed.
+      const full = ctx ? await withAnnotations(join(ctx.root, sf.source.folder), sf, i.k) : sf;
+      indexSource(handle.db, full, text, { protected: i.prot });
       await stamp(i);
     },
     async removeSource(id) {
@@ -129,6 +167,13 @@ export function createIndexSink(handle: IndexHandle, ctx?: { root: string; keyRi
     },
     async indexProject(p) {
       indexProject(handle.db, p);
+      if (ctx) await stamp(await info(p.id));
+    },
+    async indexLockedProject(p, sources) {
+      indexProject(handle.db, p, true);
+      for (const m of sources) {
+        indexLockedSource(handle.db, { id: m.id, projectId: p.id, type: m.type, folder: m.folder, ...(m.issuedYear ? { issuedYear: m.issuedYear } : {}) });
+      }
       if (ctx) await stamp(await info(p.id));
     },
     purgeProject(projectId) {

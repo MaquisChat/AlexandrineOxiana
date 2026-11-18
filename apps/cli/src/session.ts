@@ -23,8 +23,20 @@ import { startCaptureWorker, type CaptureWorker } from "./worker.js";
 export const userCwd = (): string => process.env.INIT_CWD || process.cwd();
 export const resolveUserPath = (p: string): string => resolve(userCwd(), p);
 
+let renewalSaid = false;
+
+/**
+ * This device's Deps. When its identity file was damaged and had to be renewed (Task 68), the tool
+ * says so once on standard error, in plain words without a path; the device-level notice is written
+ * before the tool exits (index.ts awaits deviceNoticesIdle).
+ */
 export function makeDeps(): Deps {
-  return deviceDeps(appConfigDir());
+  const deps = deviceDeps(appConfigDir());
+  if (deps.deviceRenewed && !renewalSaid) {
+    renewalSaid = true;
+    process.stderr.write("This computer's identity for the app could not be read and had to be renewed. The damaged file is kept beside the app's settings, and the desktop app will show a notice about it.\n");
+  }
+  return deps;
 }
 
 const READ_ONLY_TEXT: Record<string, string> = {

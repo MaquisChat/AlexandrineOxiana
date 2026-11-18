@@ -101,18 +101,35 @@ function atomsOverlap(a: { src: string; group: boolean }, b: { src: string; grou
  *  - a repeated group that contains alternation ("(a|aa)+", "(?:\w|\d)+", "(.|\s)*") (R116);
  *  - two adjacent unbounded quantifiers whose atoms can match the same character ("\s*\s*") (R116).
  * Repeated = *, +, {n,}, {n,m} with m > 1, or {n} with n > 1; unbounded = *, + or {n,}.
+ *
+ * Those rules alone still let polynomial and exponential shapes through (41a I4: "a*b?a*b?a*$",
+ * "(?:a*)(?:a*)$", "a?a?…a?aa…a"), because an optional atom or a group hides the overlap. So the
+ * work a pattern can ever do is also bounded outright, whatever it is matched against:
+ *  - it must start with "^" and have no alternatives (|) outside a group, so it is tried at the
+ *    start of the value only (no new attempt at each of up to 20,000 positions);
+ *  - it has at most one unbounded quantifier, anywhere (lookarounds included);
+ *  - its bounded quantifiers and grouped alternatives allow at most MAX_COMBINATIONS combinations
+ *    (a {n,m} counts m − n + 1, a ? counts 2, a group with k alternatives counts k).
+ * Backtracking then tries at most input length × MAX_COMBINATIONS configurations from one start:
+ * a few milliseconds on the 20,000 characters a pattern sees (MAX_PATTERN_INPUT, R112).
  */
+export const MAX_COMBINATIONS = 256;
+
 export function unsafePatternReason(src: string): string | undefined {
-  type Frame = { start: number; quantified: boolean; alternation: boolean; prev?: { src: string; group: boolean } };
-  const groups: Frame[] = [{ start: -1, quantified: false, alternation: false }];
-  const quantifierAt = (i: number): { len: number; repeats: boolean; unbounded: boolean } | undefined => {
+  type Frame = { start: number; quantified: boolean; alternation: boolean; alternatives: number; prev?: { src: string; group: boolean } };
+  const groups: Frame[] = [{ start: -1, quantified: false, alternation: false, alternatives: 1 }];
+  let unboundedCount = 0;
+  let combinations = 1;
+  const quantifierAt = (i: number): { len: number; repeats: boolean; unbounded: boolean; choices: number } | undefined => {
     const c = src[i];
-    if (c === "*" || c === "+") return { len: src[i + 1] === "?" ? 2 : 1, repeats: true, unbounded: true };
-    if (c === "?") return { len: src[i + 1] === "?" ? 2 : 1, repeats: false, unbounded: false };
+    if (c === "*" || c === "+") return { len: src[i + 1] === "?" ? 2 : 1, repeats: true, unbounded: true, choices: 1 };
+    if (c === "?") return { len: src[i + 1] === "?" ? 2 : 1, repeats: false, unbounded: false, choices: 2 };
     const m = c === "{" ? /^\{(\d+)(,(\d*))?\}\??/.exec(src.slice(i)) : null;
     if (m) {
       const unbounded = m[2] !== undefined && m[3] === "";
-      return { len: m[0].length, repeats: unbounded || Number(m[3] || m[1]) > 1, unbounded };
+      const lo = Number(m[1]);
+      const hi = m[2] === undefined ? lo : Number(m[3]);
+      return { len: m[0].length, repeats: unbounded || Number(m[3] || m[1]) > 1, unbounded, choices: unbounded ? 1 : Math.max(1, hi - lo + 1) };
     }
     return undefined;
   };
@@ -128,11 +145,14 @@ export function unsafePatternReason(src: string): string | undefined {
     } else if (c === "[") {
       i++;
       if (src[i] === "^") i++;
-      if (src[i] === "]") i++;
+      // In JavaScript a "]" right after "[" or "[^" closes the class ("[]" matches nothing, "[^]"
+      // anything), unlike POSIX. Refused rather than guessed at (41a N3): a literal "]" is "\]".
+      if (src[i] === "]") return "an empty character class ([] or [^]) is not allowed; write a literal ] as \\]";
       while (i < src.length && src[i] !== "]") i += src[i] === "\\" ? 2 : 1;
+      if (i >= src.length) return "an unterminated character class is not allowed";
       i++;
     } else if (c === "(") {
-      groups.push({ start: i, quantified: false, alternation: false });
+      groups.push({ start: i, quantified: false, alternation: false, alternatives: 1 });
       i++;
       const head = /^\?(:|=|!|<=|<!|<[A-Za-z_][A-Za-z0-9_]*>)/.exec(src.slice(i));
       if (head) i += head[0].length;
@@ -140,12 +160,16 @@ export function unsafePatternReason(src: string): string | undefined {
     } else if (c === ")") {
       inner = groups.pop();
       if (!inner || groups.length === 0) return "unbalanced parentheses";
+      combinations *= inner.alternatives;
       i++;
     } else {
       i++;
       if (c === "|" || c === "^" || c === "$") {
         const top = groups[groups.length - 1]!;
-        if (c === "|") top.alternation = true;
+        if (c === "|") {
+          top.alternation = true;
+          top.alternatives++;
+        }
         top.prev = undefined; // nothing is adjacent across these
         continue;
       }
@@ -164,12 +188,19 @@ export function unsafePatternReason(src: string): string | undefined {
       if (q.repeats && inner?.alternation) return "a repeated group with alternatives (|) is not allowed";
       top.quantified = true;
       i += q.len;
+      if (q.unbounded) unboundedCount++;
+      combinations *= q.choices;
       if (q.unbounded && top.prev && atomsOverlap(top.prev, atom)) return "adjacent unbounded quantifiers over overlapping characters are not allowed";
       top.prev = q.unbounded ? atom : undefined;
     } else {
       top.prev = undefined;
     }
   }
+  if (groups.length !== 1) return "unbalanced parentheses";
+  if (!src.startsWith("^")) return "a pattern that does not start with ^ is not allowed (it would be tried at every position of the value)";
+  if (groups[0]!.alternation) return "alternatives (|) outside a group are not allowed (each would be tried at every position)";
+  if (unboundedCount > 1) return "more than one unbounded quantifier (*, + or {n,}) in a pattern is not allowed";
+  if (combinations > MAX_COMBINATIONS) return `bounded quantifiers and alternatives allowing more than ${MAX_COMBINATIONS} combinations are not allowed`;
   return undefined;
 }
 

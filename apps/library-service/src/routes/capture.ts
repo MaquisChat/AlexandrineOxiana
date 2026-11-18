@@ -7,36 +7,92 @@
  *
  * The `capture` decision is evaluated before anything is queued, so a capture the project's rules
  * deny answers 403 POLICY_DENIED with the reason at once (the deny is audited).
+ *
+ * A capture's state can be read again (Task 63, R146; shapes in @ao/shared api/capture.ts):
+ * `GET /projects/:id/captures` lists the project's running and recent queues, and
+ * `GET /projects/:id/captures/:queueId` returns one with its items. The desktop app only (UI token,
+ * shell origin): a paired extension's token does not reach them (R116 keeps its scope to its own
+ * capture routes and the project list). A locked project is refused (423). An address still waiting
+ * or being captured in a running queue of the same project is not queued again: 409 CONFLICT with
+ * reason CAPTURE_RUNNING. Refused rather than joined: the new request's options (browser session,
+ * legal basis, refresh, transcription) could differ from the running queue's, and joining would
+ * silently drop them; the screen shows the running queue, so nothing is lost by saying so.
  */
 import { randomUUID } from "node:crypto";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
+// The address classifier and the acknowledgement: one definition, shared with the interface (R146).
+import { COOKIES_ACKNOWLEDGEMENT, MAX_ADDRESS_LENGTH, classifyUrl, isCollectionLink, isPostLink, isWebAddress } from "@ao/core";
 import {
-  COOKIES_ACKNOWLEDGEMENT,
   captureBrowserPage,
   checkCaptureAllowed,
-  classifyUrl,
   createLinkCapture,
-  isCollectionLink,
-  isPostLink,
   type BrowserName,
+  type CaptureOutcome,
+  type CaptureStatus,
+  type ProfileCaptureReport,
   type CaptureOptions,
   type ProfileCaptureOptions,
   type ProfileContentType,
 } from "@ao/library";
+// Request and answer shapes: one declaration with the interface (@ao/shared, Task 47).
+import {
+  CAPTURE_BROWSERS,
+  CAPTURE_CONTENT_TYPES,
+  CAPTURE_LINKS_MAX,
+  CAPTURE_RUNNING,
+  CAPTURE_STOPPING,
+  PAIRING_CODE_ID,
+  SPEECH_MODELS,
+  type BrowserCaptureProgressEvent,
+  type CaptureBrowser,
+  type CaptureContentType,
+  type CaptureItemOutcome,
+  type CaptureItemStatus,
+  type CaptureProfileReport,
+  type CaptureLinksRequest,
+  type CaptureProfileRequest,
+  type CaptureQueueDetail,
+  type CaptureQueueListResponse,
+  type CaptureQueueProgressEvent,
+  type CaptureRequestOptions,
+  type CaptureStartedBy,
+  type CaptureStartedResponse,
+  type CaptureToolsUpdateResponse,
+  type CaptureToolVersionsResponse,
+  type PairedBrowsers,
+  type PairingCodeIssued,
+  type PairingCodeStatus,
+  type PairingConfirmRequest,
+  type PairingConfirmResponse,
+  type PairingRemovedResponse,
+  type ProfileCaptureRequestOptions,
+} from "@ao/shared";
+import { SHELL_ORIGINS } from "../auth.js";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { Session } from "../state.js";
-import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
+import { registerTranscription } from "./transcription.js";
+import { bodyAs, bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type BodyOf, type Ctx, type Same } from "./util.js";
 
 /** Browser capture carries a full-page screenshot and the page's HTML (R96: raised only here). */
 export const BROWSER_CAPTURE_BODY_LIMIT = 32 * 1024 * 1024;
 
-const BROWSERS: BrowserName[] = ["chrome", "firefox", "safari", "edge", "brave"];
-const MODELS = ["large-v3", "medium", "small"];
-const TYPES: ProfileContentType[] = ["posts", "reels", "videos", "shorts", "highlights"];
+// The library's browsers and profile parts are exactly the shared lists (a change to either fails here).
+true satisfies Same<BrowserName, CaptureBrowser>;
+true satisfies Same<ProfileContentType, CaptureContentType>;
+// A link's outcome and a profile run's report go out as the library makes them: its statuses are the
+// shared list, and they carry exactly the fields the shared types declare (no undeclared field on the wire).
+true satisfies Same<CaptureStatus, CaptureItemStatus>;
+true satisfies Same<keyof CaptureOutcome, keyof CaptureItemOutcome>;
+true satisfies Same<keyof ProfileCaptureReport, keyof CaptureProfileReport>;
+const BROWSERS: readonly BrowserName[] = CAPTURE_BROWSERS;
+// The speech models the app accepts (R158, one definition in @ao/shared).
+const MODELS: readonly string[] = SPEECH_MODELS;
+const TYPES: readonly ProfileContentType[] = CAPTURE_CONTENT_TYPES;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
-function captureOptions(o: Obj | undefined): CaptureOptions {
-  const opts = o ?? {};
+/** The options of a capture, read through their shared request type (an absent `options` is `{}`). */
+function captureOptions(o: BodyOf<CaptureRequestOptions> | undefined): CaptureOptions {
+  const opts = o ?? ({} as BodyOf<CaptureRequestOptions>);
   const browser = optStr(opts, "cookiesFromBrowser", 16);
   if (browser !== undefined && !BROWSERS.includes(browser as BrowserName)) throw badRequest(`"${browser}" is not a supported browser.`);
   const model = optStr(opts, "transcribeModel", 16);
@@ -60,24 +116,14 @@ function requireAcknowledged(s: Session, projectId: string, opts: CaptureOptions
   }
 }
 
-/** Links queued at once (R111: also the extension's link lists). */
-export const MAX_QUEUED_LINKS = 500;
+/** Links queued at once (R111: also the extension's link lists; @ao/shared CAPTURE_LINKS_MAX). */
+export const MAX_QUEUED_LINKS = CAPTURE_LINKS_MAX;
 
 /** A list of web addresses (http or https only, at most 2048 characters each). */
-function urlList(b: Obj, key: string, max: number): string[] {
-  const urls = strArray(b, key, { max, itemMax: 2048 });
+function urlList<O extends object>(b: O, key: keyof O & string, max: number): string[] {
+  const urls = strArray(b, key, { max, itemMax: MAX_ADDRESS_LENGTH });
   for (const u of urls) if (!isWebAddress(u)) throw badRequest(`"${key}" must be web addresses.`);
   return urls;
-}
-
-function isWebAddress(u: string): boolean {
-  if (!/^https?:\/\//i.test(u)) return false;
-  try {
-    const p = new URL(u);
-    return (p.protocol === "http:" || p.protocol === "https:") && p.hostname.length > 0;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -95,6 +141,18 @@ function postLinksOnly(urls: string[]): void {
 /** Links queues one extension may have at once (R116): one running and one waiting. */
 export const LINK_QUEUES_PER_EXTENSION = 2;
 
+const LINKS_RUNNING =
+  "At least one of these links is already waiting or being captured in this project, in a capture that is still running, so nothing new was queued. Wait until that capture has finished, or leave the link out.";
+/** While an ended capture still finishes: what ended it, in plain words (N6). */
+const stopping = (why: "lock" | "close"): string =>
+  `A capture of this project that was stopped when ${why === "lock" ? "the project was locked" : "the library was closed or moved"} is still finishing its current download, so nothing new was queued. Try again in a moment.`;
+const PROFILE_RUNNING = "This profile, channel or playlist is already being captured in this project, so nothing new was started. Wait until that capture has finished.";
+
+/** A locked project's queues are not shown (423), as its sources are not. */
+function requireUnlocked(s: Session, projectId: string): void {
+  if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
+}
+
 export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   const { state, pairing } = ctx;
 
@@ -104,46 +162,62 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     projectId: string,
     urls: string[],
     opts: CaptureOptions,
-    extra: { methods?: Parameters<typeof checkCaptureAllowed>[3]; after?: Promise<unknown>; onQueued?: (queueId: string, done: Promise<void>) => void } = {},
-  ): Promise<{ queueId: string }> {
+    extra: { methods?: Parameters<typeof checkCaptureAllowed>[3]; after?: Promise<unknown>; onQueued?: (queueId: string, done: Promise<void>) => void; startedBy?: CaptureStartedBy } = {},
+  ): Promise<CaptureStartedResponse> {
+    // Nothing about the project's captures is said before the lock and the rules have been checked (I1).
+    requireUnlocked(s, projectId);
     await checkCaptureAllowed(s.repo, projectId, urls, extra.methods); // 403 with the reason when denied
     requireAcknowledged(s, projectId, opts);
     await state.workerClient(); // 503 when the media helper cannot run
+    // Checked and recorded with nothing awaited in between, so parallel requests cannot both pass.
+    requireUnlocked(s, projectId);
+    // An ended capture's download still occupies the worker: its addresses are forgotten, so the
+    // whole project waits until it has returned (I3).
+    const ending = state.captureStopping(projectId);
+    if (ending) throw new ApiError(409, "CONFLICT", stopping(ending), CAPTURE_STOPPING);
+    if (state.captureQueues.runningConflict(projectId, urls)) throw new ApiError(409, "CONFLICT", LINKS_RUNNING, CAPTURE_RUNNING);
     const queueId = randomUUID();
     // In the work registry: a library move stops it between links and it continues afterwards (R106).
     // The legal basis is checked per link as it is stored, as for every capture.
-    const done = state.startCaptureQueue(queueId, projectId, urls, opts, extra.after ? { after: extra.after } : {});
+    const done = state.startCaptureQueue(queueId, projectId, urls, opts, { ...(extra.after ? { after: extra.after } : {}), startedBy: extra.startedBy ?? "desktop" });
     extra.onQueued?.(queueId, done);
     return { queueId };
   }
 
   /**
    * Each paired extension's links queues (R116): a slot is taken synchronously before anything async,
-   * so parallel requests cannot all pass the limit; it stays taken while its queue is unfinished.
+   * so parallel requests cannot all pass the limit; it stays taken while its queue is unfinished,
+   * and only while the library it was taken in stays open (41a I3: closing the library, or shutting
+   * the service down, releases it even when the queue never got to finish).
    */
-  type Slot = { root: string; queueId?: string; done?: Promise<void> };
+  type Slot = { lib: object; queueId?: string; done?: Promise<void> };
   const linkSlots = new Map<string, Slot[]>();
-  function activeSlots(callerId: string, root: string): Slot[] {
-    const live = (linkSlots.get(callerId) ?? []).filter((x) => x.root === root && (x.queueId === undefined || state.captureQueue(x.queueId)?.finished === false));
+  function activeSlots(callerId: string, lib: object): Slot[] {
+    const live = (linkSlots.get(callerId) ?? []).filter((x) => {
+      if (x.queueId === undefined) return x.lib === lib;
+      // A queue carried on by a move runs on the moved library: its slot follows it (41a N4).
+      const q = state.captureQueue(x.queueId);
+      return q?.finished === false && (q.lib ?? x.lib) === lib;
+    });
     linkSlots.set(callerId, live);
     return live;
   }
 
-  app.post("/projects/:id/capture", async (req) => {
+  app.post("/projects/:id/capture", async (req): Promise<CaptureStartedResponse> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
-    const b = bodyOf(req);
+    const b = bodyAs<CaptureLinksRequest>(req);
     const urls = urlList(b, "urls", MAX_QUEUED_LINKS);
-    const opts = captureOptions(optObj(b, "options"));
+    const opts = captureOptions(optObj(b, "options") as BodyOf<CaptureRequestOptions> | undefined);
     return queueLinks(s, projectId, urls, opts);
   });
 
-  app.post("/projects/:id/capture-profile", async (req) => {
+  app.post("/projects/:id/capture-profile", async (req): Promise<CaptureStartedResponse> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
-    const b = bodyOf(req);
-    const url = urlList({ u: [str(b, "url", 2048)] }, "u", 1)[0]!;
-    const o = optObj(b, "options") ?? {};
+    const b = bodyAs<CaptureProfileRequest>(req);
+    const url = urlList({ u: [str(b, "url", MAX_ADDRESS_LENGTH)] }, "u", 1)[0]!;
+    const o = (optObj(b, "options") ?? {}) as BodyOf<ProfileCaptureRequestOptions>;
     const base = captureOptions(o);
     const since = optStr(o, "since", 10);
     const until = optStr(o, "until", 10);
@@ -162,72 +236,130 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
       ...(optBool(o, "metadataOnly") ? { metadataOnly: true } : {}),
       ...(optBool(o, "includeComments") ? { includeComments: true } : {}),
     };
+    requireUnlocked(s, projectId); // nothing about its captures before the lock and the rules (I1)
     await checkCaptureAllowed(s.repo, projectId, [url]);
     requireAcknowledged(s, projectId, opts);
     const worker = await state.workerClient();
+    // Checked and recorded with nothing awaited in between (as for links).
+    requireUnlocked(s, projectId);
+    const ending = state.captureStopping(projectId);
+    if (ending) throw new ApiError(409, "CONFLICT", stopping(ending), CAPTURE_STOPPING);
+    if (state.captureQueues.runningConflict(projectId, [url])) throw new ApiError(409, "CONFLICT", PROFILE_RUNNING, CAPTURE_RUNNING);
     const queueId = randomUUID();
+    const queues = state.captureQueues;
+    queues.startProfile(queueId, projectId, url, "desktop");
+    state.profileRunStarted(queueId, projectId);
     const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
     // A profile run cannot stop part-way here: a move waits for it to finish (drained, R106).
     state.startWork("profile-capture", async () => {
       try {
-        const report = await capture.captureProfile(projectId, url, opts, (done, total, outcome) => state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false }));
-        state.events.publish("capture.progress", { queueId, projectId, finished: true, report });
+        const report = await capture.captureProfile(
+          projectId,
+          url,
+          opts,
+          (done, total, outcome) => {
+            // Ended meanwhile (a lock, a close): nothing more of it is recorded or published (I3).
+            if (state.captureEnded(queueId)) return;
+            queues.progress(queueId, done, total, outcome);
+            state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false } satisfies CaptureQueueProgressEvent);
+          },
+          { cancelled: () => state.captureEnded(queueId), signal: state.captureSignal(queueId) },
+        );
+        if (state.profileRunEnded(queueId)) return; // its end was published when it was ended
+        queues.finish(queueId, { report });
+        state.events.publish("capture.progress", { queueId, projectId, finished: true, report } satisfies CaptureQueueProgressEvent);
       } catch (err) {
-        state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) });
+        if (state.profileRunEnded(queueId)) return;
+        queues.finish(queueId, { error: err });
+        state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) } satisfies CaptureQueueProgressEvent);
       }
     });
     return { queueId };
   });
 
-  app.post("/projects/:id/sources/:sid/transcribe", async (req) => {
-    const s = state.requireWritable();
+  // ---- a capture's state, read again (Task 63) ----
+  app.get("/projects/:id/captures", async (req): Promise<CaptureQueueListResponse> => {
+    const s = state.requireSession();
     const projectId = projectParam(ctx, req);
-    const sid = paramsOf(req).sid ?? "";
-    if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
-    const b = bodyOf(req);
-    const model = optStr(b, "model", 16);
-    if (model !== undefined && !MODELS.includes(model)) throw badRequest(`"${model}" is not a transcription model.`);
-    const language = optStr(b, "language", 16);
-    if (language !== undefined && language !== "auto" && !/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/.test(language)) throw badRequest(`"${language}" is not a language code.`);
-    const worker = await state.workerClient();
-    const r = await createLinkCapture({ repo: s.repo, worker, index: s.index }).transcribeSource(projectId, sid, { ...(model ? { model } : {}), ...(language ? { language } : {}) });
-    return r;
+    requireUnlocked(s, projectId);
+    return { queues: state.captureQueues.list(projectId) };
   });
 
-  app.get("/tools/versions", async () => {
+  app.get("/projects/:id/captures/:qid", async (req): Promise<CaptureQueueDetail> => {
+    const s = state.requireSession();
+    const projectId = projectParam(ctx, req);
+    requireUnlocked(s, projectId);
+    const q = state.captureQueues.detail(projectId, paramsOf(req).qid ?? "");
+    if (!q) throw notFound("That capture");
+    return q;
+  });
+
+  // Transcription of a source runs as a job (Task 62): its routes are in transcription.ts.
+  registerTranscription(app, ctx);
+
+  app.get("/tools/versions", async (): Promise<CaptureToolVersionsResponse> => {
     const w = await state.ensureWorker();
     return { versions: await w.versions() };
   });
 
-  app.post("/tools/update", async () => {
+  app.post("/tools/update", async (): Promise<CaptureToolsUpdateResponse> => {
     const w = await state.ensureWorker();
     return w.updateTools();
   });
 
   // ---- the browser extension ----
-  app.post("/extension/pair", async (req) => {
+  app.post("/extension/pair", async (req): Promise<PairingCodeIssued> => {
     if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Pairing is started from the desktop app.");
     return pairing.newCode();
   });
 
-  app.post("/extension/pair/confirm", async (req) => {
+  app.post("/extension/pair/confirm", async (req): Promise<PairingConfirmResponse> => {
     if (pairing.rateLimited(req.headers.origin ?? "")) throw new ApiError(429, "RATE_LIMITED", "Too many attempts. Wait a minute, then try again.");
-    const code = bodyOf(req).code;
+    const code = bodyAs<PairingConfirmRequest>(req).code;
     const token = await pairing.confirm(typeof code === "string" ? code : "", req.headers.origin ?? "");
     if (!token) throw new ApiError(401, "UNAUTHORIZED", "That code is not valid. Ask the desktop app for a new one.");
     return { token };
   });
 
-  app.get("/extension/pairings", async () => ({ extensions: pairing.list() }));
-  app.delete("/extension/pairings/:pid", async (req) => {
+  // What became of a code (Task 46c): never the code itself; the UI token from the desktop app's own
+  // page only. The extension token never reaches here (not one of its routes, server.ts), and a paired
+  // extension's origin, which the service otherwise lets through, is refused too.
+  const codeStatus = (req: FastifyRequest): PairingCodeStatus => {
+    const origin = req.headers.origin;
+    if (req.caller !== "ui" || origin === undefined || !SHELL_ORIGINS.has(origin)) throw new ApiError(403, "FORBIDDEN", "A pairing code's status is shown in the desktop app only.");
+    const codeId = paramsOf(req).codeId;
+    if (codeId !== undefined && !PAIRING_CODE_ID.test(codeId)) throw badRequest("That is not a pairing code's id.");
+    return pairing.status(codeId);
+  };
+  app.get("/extension/pair/status", async (req) => codeStatus(req));
+  app.get("/extension/pair/status/:codeId", async (req) => codeStatus(req));
+
+  // With the service's port now, so the app can tell which browsers still hold an older one (R171).
+  app.get("/extension/pairings", async (): Promise<PairedBrowsers> => {
+    // Whether the pairings file can be read now (Task 68): when it cannot, the desktop app says so and
+    // offers its reset; the list is what the service holds.
+    const unreadable = await pairing.checkFile();
+    const port = pairing.port;
+    return { extensions: pairing.list(), ...(port !== undefined ? { port } : {}), ...(unreadable ? { unreadable: true as const } : {}) };
+  });
+  app.delete("/extension/pairings/:pid", async (req): Promise<PairingRemovedResponse> => {
     if (!(await pairing.unpair(paramsOf(req).pid ?? ""))) throw notFound("That pairing");
+    // R353 d: the LAST extension unpaired — a work waiting in the browser returns as by "Cancel" (its ticket ends at
+    // once, inside the call; the entry's write follows, not awaited). A window's wait is never touched. If the entry
+    // cannot be written now (its project locked, the library closing) it comes back by the existing ways; the removal
+    // answers as before, and the failure is a warning that names nothing of the work.
+    if (pairing.list().length === 0) {
+      state.session?.find?.endBrowserWait().catch(() => {
+        req.log.warn("A work waiting in the browser could not be put back now; it comes back when its project is next unlocked or the library next opened.");
+      });
+    }
     return { removed: true };
   });
 
   // The extension's "profile as I scroll" list (R111): the same decision, queue and capture.progress
   // events as /projects/:id/capture, reached with the extension token only (the desktop app uses that
   // route). No browser-session (cookies) option from here; a legal basis may be given.
-  app.post("/capture/browser/links", async (req) => {
+  app.post("/capture/browser/links", async (req): Promise<CaptureStartedResponse> => {
     if (req.caller !== "extension") throw new ApiError(403, "FORBIDDEN", "This is the browser extension's route; the desktop app queues links with /projects/:id/capture.");
     const s = state.requireWritable();
     const b = bodyOf(req);
@@ -240,10 +372,9 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const legalBasis = optStr(b, "legalBasis", 2000);
     // One running and one waiting links queue per paired extension; more is 429 (R116).
     const callerId = req.extensionId ?? "";
-    const root = s.lib.root;
-    const live = activeSlots(callerId, root);
+    const live = activeSlots(callerId, s.lib);
     if (live.length >= LINK_QUEUES_PER_EXTENSION) throw new ApiError(429, "RATE_LIMITED", "Links from this browser are already being captured. Wait until they have finished, then send more.");
-    const slot: Slot = { root };
+    const slot: Slot = { lib: s.lib };
     live.push(slot);
     // A second list waits for the first; downloads from any queue share one lane per platform.
     const after = live.find((x) => x !== slot)?.done;
@@ -251,6 +382,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
       return await queueLinks(s, projectId, urls, { transcribe: "project-default", ...(legalBasis ? { legalBasis } : {}) }, {
         // A link list is both browser capture and the downloader: the project must allow both (R116).
         methods: ["browser_capture", "downloader"],
+        startedBy: "extension",
         ...(after ? { after } : {}),
         onQueued: (queueId, done) => {
           slot.queueId = queueId;
@@ -285,7 +417,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
       },
       linkCapture ? { linkCapture } : {},
     );
-    state.events.publish("capture.progress", { kind: "browser", projectId, sourceId: r.sourceId, status: r.status, finished: true });
+    state.events.publish("capture.progress", { kind: "browser", projectId, sourceId: r.sourceId, status: r.status, finished: true } satisfies BrowserCaptureProgressEvent);
     return r;
   });
 }

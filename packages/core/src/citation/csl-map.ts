@@ -21,7 +21,10 @@
  * name forms (handle, literal, "given family", "family given", family, given) becomes
  * `{ literal: <code> }`. Every map entry and every coded creator's name forms are replaced by the
  * code in the title, container, publisher and the other text fields (see scrubText for the rule on
- * short bare names). A URL carrying any of them in a slug form (joined, -, ., _) is left out, and
+ * short bare names; a name of two or more words also in reversed order and as "Family, Given"; a
+ * name in a script written without spaces also inside the run it is joined to — the rule shared
+ * with folder names, participant-names.ts, R378 a). A URL carrying any of them with any separator
+ * (space, %20, +, -, ., _, none) in either order is left out, and
  * no citation key is copied when participants are involved. The participant's `details` are never
  * an input here. A source linked to participants with no pseudonym map is an error outright. A
  * source linked to participants (`participantIds`), or any source when
@@ -31,6 +34,7 @@
 import type { Anchor } from "../model/anchor.js";
 import type { BiblioField, Creator, SourceFile, SourceType } from "../model/source.js";
 import type { MultiText } from "../model/text.js";
+import { mapCode, mapKeys, nameForms, normName, scrubNames, urlNamesAny, type NameForm, type NameSet } from "../participant-names.js";
 
 export interface CslName {
   family?: string;
@@ -147,30 +151,14 @@ const lang1 = (tag: string) => tag.trim().toLowerCase().split(/[-_]/)[0] ?? "";
 // ------------------------------------------------------------------------------------------
 // Participant names (R88 I1)
 
-/** Letters NFKD leaves whole, spelled the way names are commonly written without them (R89). */
-const TRANSLIT: Readonly<Record<string, string>> = {
-  ł: "l", Ł: "L", ø: "o", Ø: "O", đ: "d", Đ: "D", ß: "ss", ẞ: "SS", æ: "ae", Æ: "AE", œ: "oe", Œ: "OE", þ: "th", Þ: "TH", ı: "i",
-};
-/** Name comparison key: those letters transliterated, then NFKD, combining marks removed, lowercase. */
-const fold = (s: string) =>
-  s
-    .replace(/[łŁøØđĐßẞæÆœŒþÞı]/gu, (c) => TRANSLIT[c] ?? c)
-    .normalize("NFKD")
-    .replace(/\p{M}+/gu, "")
-    .toLowerCase();
-/** The words of a name or text, folded ("@Lucía.Cocina" → ["lucia", "cocina"]). */
-const words = (s: string) => fold(s).match(/[\p{L}\p{N}]+/gu) ?? [];
-/** A name's comparison form: its folded words joined by single spaces (no "@", no punctuation). */
-export const normName = (s: string) => words(s).join(" ");
+// The shared rule for recognising a participant's name (folding, words, no-space scripts): see
+// participant-names.ts (R378 a). Folder names use the same rule (naming.ts pseudonymize).
+export { normName };
 
-/** A name form to look for, as folded words; `bare`: a lone given or family name. */
-interface NameForm {
-  words: string[];
-  code: string;
-  bare: boolean;
-}
-
-/** The forms under which a creator's name may appear (the lone given and family names marked bare). */
+/**
+ * The names a creator is looked up by in the pseudonym map (handle, literal, "given family",
+ * "family given", family, given). The forms replaced in text are `nameForms` (participant-names.ts).
+ */
 function creatorForms(c: Creator): Array<{ text: string; bare: boolean }> {
   const out: Array<{ text: string; bare: boolean }> = [];
   const add = (t: string | undefined, bare = false) => {
@@ -187,62 +175,74 @@ function creatorForms(c: Creator): Array<{ text: string; bare: boolean }> {
   return out;
 }
 
-function codeFor(c: Creator, keys: ReadonlyMap<string, string>): string | undefined {
+/**
+ * A creator's code: for each of its forms in turn, the map entry whose name is exactly that form by
+ * the strict key, else the first whose folded name is (R416: "Ana Pena" is not "Ana Peña"'s code
+ * when both are participants).
+ */
+function codeFor(c: Creator, map: ReadonlyMap<string, string>): string | undefined {
   for (const f of creatorForms(c)) {
-    const hit = keys.get(normName(f.text));
+    const hit = mapCode(map, f.text);
     if (hit) return hit;
   }
   return undefined;
 }
 
 /**
- * Replaces every participant name form in `text` by its code, matching whole words after folding
- * (case, accents, full-width forms, an "@" in front). Longer forms win. A bare given or family name
- * of fewer than 4 letters is replaced only together with the other part of the name ("Li" alone is
- * kept, "Rose Li" and "Li, Rose" are not): replacing every short name everywhere would blank common
- * words. Longer bare names are always replaced, even where the word means something else ("Rose
- * gardens"): over-scrubbing a title is the fail-safe side (R88).
+ * Replaces every participant name form in `text` by its code, by the shared rule
+ * (participant-names.ts: folded case, accents and width; whole words, or inside a run of a script
+ * written without spaces; longer forms first). A bare given or family name of fewer than 4 letters
+ * is replaced only together with the other part of the name ("Li" alone is kept, "Rose Li" and
+ * "Li, Rose" are not): replacing every short name everywhere would blank common words. In a script
+ * written without spaces the floor is 2 characters, in Hangul 2 syllables (R387 c). Longer bare
+ * names are always replaced, even where the word means something else ("Rose gardens"):
+ * over-scrubbing a title is the fail-safe side (R88).
  */
-function scrubText(text: string, forms: readonly NameForm[]): string {
-  const usable = forms.filter((f) => f.words.length > 0 && !(f.bare && f.words.length === 1 && f.words[0]!.length < 4));
-  // A name written as one word ("marialopez", "MariaLopez") is the same name (R89).
-  for (const f of [...usable]) if (f.words.length > 1) usable.push({ words: [f.words.join("")], code: f.code, bare: false });
-  if (usable.length === 0) return text;
-  usable.sort((a, b) => b.words.length - a.words.length);
-  const tokens = [...text.matchAll(/[\p{L}\p{N}\p{M}]+/gu)].map((m) => ({ start: m.index!, end: m.index! + m[0].length, w: words(m[0]).join("") }));
-  let out = "";
-  let pos = 0;
-  for (let i = 0; i < tokens.length; ) {
-    const hit = usable.find((f) => f.words.every((w, k) => tokens[i + k]?.w === w));
-    if (!hit) {
-      i++;
-      continue;
-    }
-    let start = tokens[i]!.start;
-    while (start > pos && text[start - 1] === "@") start--;
-    out += text.slice(pos, start) + hit.code;
-    pos = tokens[i + hit.words.length - 1]!.end;
-    i += hit.words.length;
-  }
-  return out + text.slice(pos);
+function scrubText(text: string, names: NameSet): string {
+  return scrubNames(text, names, { bareMinLength: 4 });
 }
 
-/** Whether a URL carries any participant name form, in any slug form (joined, -, ., _), as whole words. */
-function urlNamesParticipant(url: string, forms: readonly NameForm[]): boolean {
-  let u = url;
-  try {
-    u = decodeURIComponent(url);
-  } catch {
-    // keep as is
+/**
+ * Whether a URL carries any participant name form, by the shared rule (participant-names.ts): decoded
+ * safely, any separator (space, %20, +, -, ., _, none), either word order, no length floor.
+ */
+function urlNamesParticipant(url: string, names: NameSet): boolean {
+  return urlNamesAny(url, names);
+}
+
+/**
+ * R420 a, corrected by R427 b: a creator who is not a participant, whose name holds a participant's
+ * WHOLE name (a map entry, a name or a handle; a coded creator's handle, literal, "given family",
+ * "family given") or a RUN of two or more words of one that is a form by R403 c ("Lucía Fernández"
+ * of "Lucía Fernández Ruiz"; in a creator written as given and family names only a run that takes
+ * words from both fields, R437 a): the text that cslName would print (the literal, else the handle; for a
+ * given/family creator the joined "given family", else "family given"), with each such name replaced
+ * by its code (by the shared rule, R416's choice included). Single names (a lone given or family
+ * name, one word of a compound name) are not looked for: an author who shares a first name with a
+ * participant is not rewritten (the stated limit FR-699). Undefined when nothing was replaced.
+ */
+function creatorWithWholeNames(c: Creator, whole: NameSet): string | undefined {
+  const tryText = (t: string | undefined, runSpan?: (start: number, end: number) => boolean): string | undefined => {
+    const v = t?.trim();
+    if (!v) return undefined;
+    const out = scrubNames(v, whole, runSpan ? { runSpan } : {});
+    return out !== v ? out : undefined;
+  };
+  const given = c.given?.trim();
+  const family = c.family?.trim();
+  if (given || family) {
+    // R437 a: in a creator written as given and family names, a run of a participant's name counts
+    // only when its span takes words from BOTH fields ("Lucía Fernández"); one lying wholly inside
+    // the given name ("Juan Carlos" of Juan Carlos Onetti) or the family name ("Fernández Ruiz" of
+    // Pedro Fernández Ruiz) is another person's name. A creator of one field is one text, like a literal: runs count in it (R440 a). A whole
+    // name counts anywhere (R420 a).
+    // In the second, family-given reading no run counts (R440 b): runs carry their own rotations, so
+    // swapped fields are coded by the first reading; whole names still count there.
+    const across = (first: string) => (start: number, end: number) => start < first.length && end > first.length + 1;
+    if (!given || !family) return tryText(given ?? family);
+    return tryText(`${given} ${family}`, across(given)) ?? tryText(`${family} ${given}`, () => false);
   }
-  const hay = fold(u);
-  const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  return forms.some((f) =>
-    ["", "-", ".", "_"].some((sep) => {
-      const slug = f.words.join(sep);
-      return slug !== "" && new RegExp(`(?<![\\p{L}\\p{N}])${esc(slug)}(?![\\p{L}])`, "u").test(hay);
-    }),
-  );
+  return tryText(c.literal) ?? (c.literal?.trim() ? undefined : tryText(c.handle));
 }
 
 function cslName(c: Creator): CslName | undefined {
@@ -308,35 +308,45 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   if (mapped.medium) item.medium = mapped.medium;
 
   // Creators, coded where the pseudonym map knows them (names compared folded, R88 I1).
-  const keys = new Map<string, string>();
+  // The map's comparison keys and forms are built once per map (participant-names.ts, R387 M2).
+  const map = opts.pseudonyms ?? new Map<string, string>();
+  const keys = mapKeys(map);
   const forms: NameForm[] = [];
-  for (const [k, code] of opts.pseudonyms ?? []) {
-    const n = normName(k);
-    if (!n) continue;
-    if (!keys.has(n)) keys.set(n, code);
-    forms.push({ words: n.split(" "), code, bare: false });
-  }
   // Sources linked to participants fail closed: every creator but the interviewer needs a code (R88 I2).
   const requireCodes = opts.requireParticipantCodes === true || s.participantIds.length > 0;
   // Participants but no pseudonym map to code them with: nothing about them can be cited safely (R89).
   if (s.participantIds.length > 0 && keys.size === 0) throw new ParticipantCodeMissingError();
   let anyCoded = false;
-  for (const c of s.creators) {
-    const code = codeFor(c, keys);
+  // Every creator's code first, so that a creator who is not a participant can be read against the
+  // whole names of every coded creator, wherever it stands in the list (R420 a).
+  const codes = s.creators.map((c) => codeFor(c, map));
+  for (const [i, c] of s.creators.entries()) {
+    const code = codes[i];
+    if (code) forms.push(...nameForms(c, code));
+    else if (requireCodes && c.role !== "interviewer" && creatorForms(c).length > 0) throw new ParticipantCodeMissingError();
+  }
+  const whole: NameSet = { map, forms, noSingleNames: true };
+  const lookForWhole = keys.size > 0 || forms.length > 0;
+  for (const [i, c] of s.creators.entries()) {
+    const code = codes[i];
     let name: CslName | undefined;
     if (code) {
       anyCoded = true;
       name = { literal: code };
-      for (const f of creatorForms(c)) forms.push({ words: normName(f.text).split(" ").filter(Boolean), code, bare: f.bare });
     } else {
-      if (requireCodes && c.role !== "interviewer" && creatorForms(c).length > 0) throw new ParticipantCodeMissingError();
       name = cslName(c);
+      const scrubbed = lookForWhole ? creatorWithWholeNames(c, whole) : undefined;
+      if (scrubbed !== undefined) {
+        anyCoded = true;
+        name = { literal: scrubbed };
+      }
     }
     if (!name) continue;
     const role = ROLE_MAP[c.role];
     (item[role] ??= []).push(name);
   }
-  const scrub = (text: string) => (forms.length ? scrubText(text, forms) : text);
+  const names: NameSet = { map, forms };
+  const scrub = (text: string) => (keys.size || forms.length ? scrubText(text, names) : text);
 
   const title = pickTitle(s.title, opts, true);
   if (title.value) item.title = scrub(title.value);
@@ -368,7 +378,7 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   if (accessed) item.accessed = accessed;
 
   const url = s.identifiers.url;
-  if (url && !urlNamesParticipant(url, forms)) item.URL = url;
+  if (url && !urlNamesParticipant(url, names)) item.URL = url;
   if (s.identifiers.doi) item.DOI = s.identifiers.doi;
   const isbn = s.identifiers.isbn?.[0];
   if (isbn) item.ISBN = isbn;

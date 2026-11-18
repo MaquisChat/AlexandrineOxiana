@@ -1,0 +1,25 @@
+{
+  "status": "ok",
+  "message-type": "work-list",
+  "message": {
+    "total-results": 2,
+    "items": [
+      {
+        "DOI": "10.5555/ao.find.weakties.1973",
+        "type": "journal-article",
+        "title": ["The Strength of Weak Ties"],
+        "author": [{ "given": "Mark S.", "family": "Granovetter" }],
+        "issued": { "date-parts": [[1973, 5]] },
+        "container-title": ["Fixture Journal of Sociology"]
+      },
+      {
+        "DOI": "10.5555/ao.find.ties.2008",
+        "type": "journal-article",
+        "title": ["Ties That Bind in Upland Villages"],
+        "author": [{ "given": "Amara", "family": "Okafor" }],
+        "issued": { "date-parts": [[2008]] },
+        "container-title": ["Journal of Upland Studies"]
+      }
+    ]
+  }
+}

@@ -6,8 +6,10 @@
  * nothing is fetched), no font-face loading, no XFA.
  */
 import * as fsp from "node:fs/promises";
+import { basename } from "node:path";
 import type { Creator } from "@ao/core";
 import { clean, cleanText, normalizeDate, parseName, parseNameList } from "./names.js";
+import { embeddedTitle, keepCreators } from "./title-like.js";
 import { OCR_THRESHOLD_CHARS, type RawExtract } from "./types.js";
 
 type PdfJs = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
@@ -17,7 +19,6 @@ const loadPdfJs = () => (pdfjs ??= import("pdfjs-dist/legacy/build/pdf.mjs"));
 const TEXT_PAGES = 3;
 /** Larger PDFs are not read into memory for metadata. */
 const MAX_PDF_BYTES = 512 * 1024 * 1024;
-const JUNK_TITLE = /^(?:untitled|microsoft word - .*|.*\.(?:docx?|pdf|tex|indd|rtf|odt))$/iu;
 
 const str = (v: unknown): string | undefined => (typeof v === "string" && clean(v) ? clean(v) : undefined);
 
@@ -48,16 +49,21 @@ export async function extractPdf(path: string): Promise<RawExtract> {
     const { info, metadata } = await doc.getMetadata().catch(() => ({ info: {} as Record<string, unknown>, metadata: null }));
     const inf = (info ?? {}) as Record<string, unknown>;
 
+    // R394 a: the XMP title, else the Info Title, whichever first looks like a title.
+    const name = basename(path);
     const xmpTitle = str(metadata?.get("dc:title"));
     const infoTitle = str(inf.Title);
-    const title = [xmpTitle, infoTitle].find((t) => t && !JUNK_TITLE.test(t));
+    const title = embeddedTitle(xmpTitle, name) ?? embeddedTitle(infoTitle, name);
     if (title) out.title = title;
+    const rawTitles = [xmpTitle, infoTitle].filter((t): t is string => !!t);
+    if (rawTitles.length) out.rawTitles = rawTitles;
 
     const xmpCreators = metadata?.get("dc:creator");
     let creators: Creator[] = [];
-    if (Array.isArray(xmpCreators)) creators = xmpCreators.map((c) => (typeof c === "string" ? parseName(c) : undefined)).filter((c): c is Creator => !!c);
-    else if (str(xmpCreators)) creators = parseNameList(str(xmpCreators)!);
-    if (!creators.length && str(inf.Author)) creators = parseNameList(str(inf.Author)!);
+    // R394 b: stock names ("Administrator", "LaTeX with hyperref") are no authors; the Info Author is read when XMP names none.
+    if (Array.isArray(xmpCreators)) creators = keepCreators(xmpCreators.map((c) => (typeof c === "string" ? parseName(c) : undefined)).filter((c): c is Creator => !!c));
+    else if (str(xmpCreators)) creators = keepCreators(parseNameList(str(xmpCreators)!));
+    if (!creators.length && str(inf.Author)) creators = keepCreators(parseNameList(str(inf.Author)!));
     if (creators.length) out.creators = creators;
 
     // Publication dates only (R54b): the Info CreationDate/ModDate and xmp:CreateDate are the

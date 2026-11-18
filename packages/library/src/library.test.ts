@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,8 +9,11 @@ import {
   LibraryNotWritableError,
   NotALibraryError,
   createLibrary,
+  forgetLastOpenLibrary,
   forgetLibrary,
+  lastOpenLibrary,
   listLibraries,
+  rememberLastOpenLibrary,
   openLibrary,
   recordLocation,
   registerLibrary,
@@ -114,6 +117,40 @@ describe("createLibrary / openLibrary", () => {
     const root2 = join(tmp, "Lib2");
     await (await createLibrary(root2, "X", mkDeps())).close();
     await expect(createLibrary(root2, "Y", mkDeps())).rejects.toBeInstanceOf(AlreadyALibraryError);
+  });
+
+  it("FR-047: a folder holding only the Finder's .DS_Store and/or .localized counts as empty; those files are left", async () => {
+    for (const names of [[".DS_Store"], [".localized"], [".DS_Store", ".localized"]]) {
+      const dir = join(tmp, `Finder-${names.join("+")}`);
+      await mkdir(dir, { recursive: true });
+      for (const n of names) await writeFile(join(dir, n), `finder ${n}`);
+      const lib = await createLibrary(dir, "X", mkDeps());
+      await lib.close();
+      for (const n of names) expect(await readFile(join(dir, n), "utf8")).toBe(`finder ${n}`);
+      await (await openLibrary(dir, mkDeps())).close();
+    }
+  });
+
+  it("FR-047: anything else still refuses — another hidden file, a folder or a link of that name, or one more entry", async () => {
+    const cases: Array<[string, (dir: string) => Promise<void>]> = [
+      ["other hidden file", (d) => writeFile(join(d, ".hidden"), "x")],
+      ["folder named .DS_Store", (d) => mkdir(join(d, ".DS_Store"))],
+      ["folder named .localized", (d) => mkdir(join(d, ".localized"))],
+      ["link named .DS_Store", (d) => symlink(join(tmp, "elsewhere.txt"), join(d, ".DS_Store"))],
+      ["DS_Store and a file", async (d) => {
+        await writeFile(join(d, ".DS_Store"), "x");
+        await writeFile(join(d, "notes.txt"), "x");
+      }],
+      ["case variant", (d) => writeFile(join(d, ".ds_store"), "x")],
+    ];
+    await writeFile(join(tmp, "elsewhere.txt"), "x");
+    for (const [what, make] of cases) {
+      const dir = join(tmp, `NotEmpty-${what.replaceAll(" ", "-")}`);
+      await mkdir(dir, { recursive: true });
+      await make(dir);
+      await expect(createLibrary(dir, "X", mkDeps()), what).rejects.toBeInstanceOf(FolderNotEmptyError);
+      expect(await readdir(dir), what).not.toContain("library.json");
+    }
   });
 
   it("NotALibraryError without library.json", async () => {
@@ -290,6 +327,26 @@ describe("registry", () => {
     expect((await listLibraries(deps)).map((l) => l.libraryId)).toEqual(["L2"]);
   });
 
+  it("D5: remembers the last open library by id only, in the app settings folder; forgets it on request", async () => {
+    const deps = mkDeps();
+    expect(await lastOpenLibrary(deps)).toBeUndefined();
+    await rememberLastOpenLibrary("L1", deps);
+    expect(await lastOpenLibrary(deps)).toBe("L1");
+    await rememberLastOpenLibrary("L2", deps);
+    expect(await lastOpenLibrary(deps)).toBe("L2");
+    // Only the id: where the library is comes from the registry, nothing about it from the library.
+    const raw = await readFile(join(deps.appConfigDir, "last-library.json"), "utf8");
+    expect(JSON.parse(raw)).toEqual({ libraryId: "L2" });
+    await forgetLastOpenLibrary(deps);
+    expect(await lastOpenLibrary(deps)).toBeUndefined();
+    await forgetLastOpenLibrary(deps); // nothing to forget: no error
+    // A damaged file means nothing to reopen, never an error.
+    await writeFile(join(deps.appConfigDir, "last-library.json"), "{ torn");
+    expect(await lastOpenLibrary(deps)).toBeUndefined();
+    await writeFile(join(deps.appConfigDir, "last-library.json"), JSON.stringify({ libraryId: 7 }));
+    expect(await lastOpenLibrary(deps)).toBeUndefined();
+  });
+
   it("create/open record the library in the registry", async () => {
     const deps = mkDeps();
     const lib = await createLibrary(root, "Mine", deps);
@@ -454,5 +511,9 @@ describe("lock holder's device name (R118 c)", () => {
     const z = await createLibrary(join(root, "..", `long-${now}`), "Long", mkDeps({ hostname: "h".repeat(300) }));
     expect((await openLibrary(z.root, depsB())).lockedBy).toBeUndefined();
     await z.close();
+    // 41a M6: a lone surrogate is not a usable name either.
+    const s = await createLibrary(join(root, "..", `surrogate-${now}`), "Surrogate", mkDeps({ hostname: "host\ud800" }));
+    expect((await openLibrary(s.root, depsB())).lockedBy).toBeUndefined();
+    await s.close();
   });
 });

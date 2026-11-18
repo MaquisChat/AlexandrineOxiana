@@ -1,4 +1,5 @@
 import type { PolicyAction } from "@ao/core";
+import { KeyWipedError } from "../crypto/format.js";
 
 /** The library is open read-only; nothing was evaluated or written. */
 export class ReadOnlyLibraryError extends Error {
@@ -25,6 +26,16 @@ export class ProjectLockedError extends Error {
   constructor(readonly projectId: string) {
     super(`Project ${projectId} is locked; unlock it with its passphrase or recovery code`);
   }
+}
+
+/**
+ * A refusal because the project is locked: `ProjectLockedError`, or `KeyWipedError` from an opening whose key a lock
+ * wiped mid-read (R386 a). A reader that tolerates what it cannot read lets these through: a lock is "locked", never
+ * "damaged", "not found" or a shorter result (R404). A file sealed under a key id that is not the project's (a
+ * KeyNotAvailableError that is not a wiped key) stays damage.
+ */
+export function isLockedRefusal(err: unknown): boolean {
+  return err instanceof ProjectLockedError || err instanceof KeyWipedError;
 }
 
 /** Provenance is immutable once captured (spec 3.2). */
@@ -71,6 +82,21 @@ export class PendingWriteChoiceError extends Error {
   }
 }
 
+/**
+ * The researcher's choice for an interrupted change was recorded but a step of it could not be
+ * carried out yet (a file could not be overwritten or put back). The marker keeps the choice; it is
+ * tried again by resolving again or on the next open (R131 c). The message is plain language.
+ */
+export class PendingWriteIncompleteError extends Error {
+  override name = "PendingWriteIncompleteError";
+  constructor(
+    readonly txn: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 /** A path resolves (through a symbolic link) outside the folder it must stay in. */
 export class PathEscapeError extends Error {
   override name = "PathEscapeError";
@@ -91,6 +117,17 @@ export class TornFileError extends Error {
         "Incomplete lines are trimmed when the library is opened read-write, unless an interrupted change to the project is still unresolved; " +
         "see the library's integrity warnings",
     );
+  }
+}
+
+/**
+ * The project's key file changed between reading it and writing (another new recovery code was issued
+ * at the same time): nothing was written by this request (services answer 409 CONFLICT).
+ */
+export class KeyFileChangedError extends Error {
+  override name = "KeyFileChangedError";
+  constructor() {
+    super("Another new recovery code was issued for this project at the same time, so this request changed nothing. Use the code that was shown, or ask for a new one again");
   }
 }
 
@@ -127,6 +164,14 @@ export class DestroyedParentError extends Error {
   override name = "DestroyedParentError";
   constructor(readonly assetId: string) {
     super(`the parent asset ${assetId} was destroyed under the project's retention rule`);
+  }
+}
+
+/** A review entry was already decided (two decisions at once: the first one stands, R176). */
+export class ReviewEntryDecidedError extends Error {
+  override name = "ReviewEntryDecidedError";
+  constructor() {
+    super("This entry has already been reviewed.");
   }
 }
 

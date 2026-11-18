@@ -1,0 +1,360 @@
+/**
+ * "Your library" (Find and acquire Task F15; Ruling R324): the settings, the address worked out from one pasted link,
+ * and the start (and cancel) of a fetch through the library. The shapes and every sentence are @ao/shared's
+ * (api/find.ts, the section "Task F15"). Every route is for the desktop app's token only: none is in server.ts's
+ * EXTENSION_ROUTES (the extension's token is refused before any runs), and each checks the caller again.
+ *
+ *   GET  /settings/your-library                  → YourLibraryResponse (the file read anew; a problem said)
+ *   PUT  /settings/your-library                  YourLibrary → YourLibraryResponse
+ *   POST /settings/your-library/derive           { link } → { access, sentence } (200 whether or not an address is found)
+ *   POST /settings/your-library/test             no body → { url } (Task F18a, R334 b: the address of one fixed work)
+ *   POST /projects/:id/find/:eid/library/start   no body → { url, ticket }
+ *   POST /projects/:id/find/:eid/library/cancel  no body → FindEntryView
+ *   POST /projects/:id/find/:eid/link/start      { url } → { url, ticket } (Task F18c, R345: one of the entry's links)
+ *   POST /projects/:id/find/:eid/browser/start   no body → { url } (Task F20a, R348 d: the library's start, in the
+ *                                                researcher's own browser; no ticket to the page)
+ *
+ * The pasted link is read and dropped: it is never stored, logged, put in an error, or repeated in an answer (only the
+ * worked-out address's host — and a link resolver's path — and kind are said). The PUT never trusts the page: an address is accepted only in the form
+ * `deriveLibraryAccess` gives (`isLibraryAccess`), the catalogue address only as `catalogueTemplateOk` allows; a
+ * refusal names the field, never what was sent.
+ *
+ * The start is the researcher's press, one entry at a time (the runner's `libraryStart`: one ticket for the whole
+ * service, the pause after a hand-over, the limit of waiting files, the entry's view). The service never fetches
+ * anything from the library: the answer is the address and the ticket, for the sign-in window (Task F16). Neither is in
+ * any log line, audit entry, event, error or file; the answer is `Cache-Control: no-store`. The hand-over (Task F17)
+ * ends the ticket through the runner's `libraryHandedOver`.
+ *
+ * Task F18c (R345): "Open it here and fetch the PDF" — the same start at one of the entry's own links (the runner's
+ * `linkStart`, its second entry point: the same ticket, pause, limit, waiting state, cancel, ways back and hand-over).
+ * It is here, beside the library's start, because it IS that start — the same caller checks, bounds, refusals' form
+ * and `said` — with a body of exactly `{ url }`. The link is never logged, audited, put in an event or an error, or
+ * repeated in a refusal; the answer gives it back as the service holds it, with the ticket (`no-store`).
+ *
+ * Task F20a (R348 d): "Get through my library in my own browser" — the library's start once more (the runner's
+ * `browserStart`, its third entry point), here for the same reason. It differs in two things: it is refused when no
+ * browser extension is paired (409 "browser-not-paired"; the route context's `pairing`, `list()` at the press), and
+ * its answer is the address ONLY: the ticket stays in the service, for the paired extension's list
+ * (routes/find-browser.ts). Its file is handed over by the extension's route, never by the shell's line.
+ */
+import type { FastifyInstance, FastifyRequest } from "fastify";
+import { isId } from "@ao/core";
+import {
+  FindEntryStateError,
+  FindLibraryRefusedError,
+  FindProjectStoppedError,
+  FindRunnerClosedError,
+  KeyNotAvailableError,
+  LIBRARY_LINK_MAX as LIBRARY_LINK_MAX_HERE,
+  NotFoundError,
+  ProjectLockedError,
+  ReadOnlyLibraryError,
+  YOUR_LIBRARY_NAME_MAX as LIBRARY_NAME_MAX,
+  YourLibraryNewerError,
+  catalogueTemplateOk,
+  deriveLibraryAccessWhy,
+  isLibraryAccess,
+  libraryAccessPlace,
+  libraryAddressFor,
+  readFindQueueOf,
+  readYourLibrary,
+  writeYourLibrary,
+  yourLibraryNameOk,
+  type DeriveRefusal,
+  type FindRunner,
+  type HandedFile,
+  type LibraryAccess as LibraryAccessHere,
+  type YourLibrary as YourLibraryHere,
+} from "@ao/library";
+import {
+  FIND_BROWSER_TEXT,
+  FIND_LIBRARY_TEXT,
+  FIND_LINK_TEXT,
+  FIND_ROUTE_TEXT,
+  WHERE_TO_GET_IT_URL_MAX,
+  YOUR_LIBRARY_BODY_MAX_BYTES,
+  YOUR_LIBRARY_DERIVE_TEXT,
+  YOUR_LIBRARY_LINK_MAX,
+  YOUR_LIBRARY_NAME_MAX,
+  YOUR_LIBRARY_TEST_DOI,
+  YOUR_LIBRARY_TEXT,
+  yourLibraryAddressSentence,
+  type FindBrowserStartResponse,
+  type FindEntryView,
+  type FindLibraryStartResponse,
+  type LibraryAccess,
+  type YourLibrary,
+  type YourLibraryDeriveRefusal,
+  type YourLibraryDeriveResponse,
+  type YourLibraryResponse,
+  type YourLibraryTestResponse,
+} from "@ao/shared";
+import { ApiError, badRequest } from "../errors.js";
+import type { ServiceState, Session } from "../state.js";
+import { discardInboxFile, inboxOf, takeInboxFile, type FileGrant } from "../file-grants.js";
+import { entryView, libraryPartsOf } from "./find.js";
+import { paramsOf, type Ctx, type Obj, type Same } from "./util.js";
+
+// The library's names and bounds and @ao/shared's are one and the same (Task 47).
+true satisfies Same<LibraryAccessHere, LibraryAccess>;
+true satisfies Same<YourLibraryHere, YourLibrary>;
+true satisfies Same<DeriveRefusal, YourLibraryDeriveRefusal>;
+true satisfies Same<typeof LIBRARY_LINK_MAX_HERE, typeof YOUR_LIBRARY_LINK_MAX>;
+true satisfies Same<typeof LIBRARY_NAME_MAX, typeof YOUR_LIBRARY_NAME_MAX>;
+
+const FIELDS: readonly string[] = ["name", "access", "catalogueSearch", "staySignedIn"];
+
+/** The body as a JSON object (absent: `{}`); anything else is refused with `sentence`. Never repeats what was sent. */
+function objectBody(req: FastifyRequest, sentence: string): Obj {
+  const b: unknown = req.body;
+  if (b === undefined || b === null) return {};
+  if (typeof b !== "object" || Array.isArray(b)) throw badRequest(sentence);
+  return b as Obj;
+}
+
+const responseOf = (s: YourLibraryHere, problem?: "unreadable" | "newer"): YourLibraryResponse => ({
+  ...s,
+  // R336 i: the stored address named in the derive's own words (none when no library is set).
+  ...(s.access ? { addressSentence: yourLibraryAddressSentence(libraryAccessPlace(s.access), s.access.kind) } : {}),
+  ...(problem ? { problem: { code: problem, text: problem === "newer" ? YOUR_LIBRARY_TEXT.newer : YOUR_LIBRARY_TEXT.unreadable } } : {}),
+});
+
+/** A start through the library refused, in words, with the `reason` the screen may act on. */
+const LIBRARY_REFUSAL: Record<FindLibraryRefusedError["code"], { reason: string; message?: string }> = {
+  "not-offered": { reason: "library-not-offered", message: FIND_LIBRARY_TEXT.notOffered },
+  "no-library": { reason: "no-library", message: FIND_LIBRARY_TEXT.noLibrary },
+  busy: { reason: "library-busy", message: FIND_LIBRARY_TEXT.busy },
+  pause: { reason: "library-pause" },
+  "held-full": { reason: "library-held-full", message: FIND_LIBRARY_TEXT.heldFull },
+  // F18c (R345): a link start's own refusals (the library's sentence would name the library untruly).
+  "link-not-offered": { reason: "link-not-offered", message: FIND_LINK_TEXT.notOffered },
+  "not-a-place": { reason: "link-not-a-place", message: FIND_LINK_TEXT.notAPlace },
+};
+
+/**
+ * F18c (R345 b): the link of a link start's body, or null when it cannot be one of an entry's links at all (not https,
+ * a user name or password, over the links' bound, not an address). Whether it IS one of the entry's is the runner's.
+ */
+function linkShapeOk(url: string): boolean {
+  if (url.length > WHERE_TO_GET_IT_URL_MAX) return false;
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" && u.username === "" && u.password === "";
+  } catch {
+    return false;
+  }
+}
+
+export function registerYourLibrary(app: FastifyInstance, ctx: Ctx): void {
+  const { state, pairing } = ctx;
+  /** F20a (R348 d, e): at least one browser extension is paired, now. */
+  const paired = () => pairing.list().length > 0;
+  const limit = { bodyLimit: YOUR_LIBRARY_BODY_MAX_BYTES };
+  const uiOnly = (req: FastifyRequest) => {
+    if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", YOUR_LIBRARY_TEXT.uiOnly);
+  };
+
+  app.get("/settings/your-library", async (req, reply): Promise<YourLibraryResponse> => {
+    uiOnly(req);
+    reply.header("Cache-Control", "no-store");
+    const r = await readYourLibrary(state.deps.appConfigDir);
+    return responseOf(r.settings, r.problem);
+  });
+
+  app.put("/settings/your-library", limit, async (req, reply): Promise<YourLibraryResponse> => {
+    uiOnly(req);
+    reply.header("Cache-Control", "no-store");
+    const b = objectBody(req, YOUR_LIBRARY_TEXT.fields);
+    if (Object.keys(b).some((k) => !FIELDS.includes(k))) throw badRequest(YOUR_LIBRARY_TEXT.fields);
+    const name = b.name === undefined || b.name === null ? "" : b.name;
+    if (typeof name !== "string" || !yourLibraryNameOk(name.trim())) throw badRequest(YOUR_LIBRARY_TEXT.name);
+    const access = b.access === undefined ? null : b.access;
+    // Never trusted: only an address of the form "derive" itself gives.
+    if (access !== null && !isLibraryAccess(access)) throw badRequest(YOUR_LIBRARY_TEXT.access);
+    const cat = b.catalogueSearch === undefined || b.catalogueSearch === null || b.catalogueSearch === "" ? undefined : b.catalogueSearch;
+    if (cat !== undefined && !catalogueTemplateOk(cat)) throw badRequest(YOUR_LIBRARY_TEXT.catalogueSearch);
+    if (b.staySignedIn !== undefined && typeof b.staySignedIn !== "boolean") throw badRequest(YOUR_LIBRARY_TEXT.staySignedIn);
+    const cur = await readYourLibrary(state.deps.appConfigDir);
+    if (cur.problem === "newer") throw new ApiError(409, "CONFLICT", YOUR_LIBRARY_TEXT.newer);
+    try {
+      const saved = await writeYourLibrary(state.deps.appConfigDir, { name: name.trim(), access, ...(cat !== undefined ? { catalogueSearch: cat } : {}), staySignedIn: b.staySignedIn === true }, state.opts.now());
+      return responseOf(saved);
+    } catch (err) {
+      if (err instanceof YourLibraryNewerError) throw new ApiError(409, "CONFLICT", YOUR_LIBRARY_TEXT.newer);
+      throw err;
+    }
+  });
+
+  app.post("/settings/your-library/derive", limit, async (req, reply): Promise<YourLibraryDeriveResponse> => {
+    uiOnly(req);
+    reply.header("Cache-Control", "no-store");
+    const b = objectBody(req, YOUR_LIBRARY_TEXT.link);
+    if (Object.keys(b).some((k) => k !== "link") || typeof b.link !== "string") throw badRequest(YOUR_LIBRARY_TEXT.link);
+    // The link is read here and dropped: only the address worked out from it (or a refusal's code) goes on.
+    const r = deriveLibraryAccessWhy(b.link);
+    if ("refused" in r) return { access: null, sentence: YOUR_LIBRARY_DERIVE_TEXT[r.refused] };
+    return { access: r.access, sentence: yourLibraryAddressSentence(libraryAccessPlace(r.access), r.access.kind) };
+  });
+
+  /**
+   * Task F18a (R334 b): "Test" — the library's address for ONE fixed, well-known work, by the stored access. It takes
+   * nothing (no link, no DOI, no project) and gives no ticket: the page opens the sign-in window with a ticket of its
+   * own, which no hand-over can match, so nothing the window might fetch is ever kept. The address is in the answer
+   * only (`no-store`): no log line (bodies are never logged), audit entry, event or error carries it.
+   */
+  app.post("/settings/your-library/test", limit, async (req, reply): Promise<YourLibraryTestResponse> => {
+    uiOnly(req);
+    // R336 f: every answer of this route, its refusals included, is no-store.
+    reply.header("Cache-Control", "no-store");
+    if (Object.keys(objectBody(req, YOUR_LIBRARY_TEXT.noBody)).length) throw badRequest(YOUR_LIBRARY_TEXT.noBody);
+    const r = await readYourLibrary(state.deps.appConfigDir);
+    if (r.problem === "newer") throw new ApiError(409, "CONFLICT", YOUR_LIBRARY_TEXT.newer);
+    if (r.problem === "unreadable") throw new ApiError(409, "CONFLICT", YOUR_LIBRARY_TEXT.unreadable);
+    if (!r.settings.access) throw new ApiError(409, "CONFLICT", FIND_LIBRARY_TEXT.noLibrary, "no-library");
+    const url = libraryAddressFor(r.settings.access, { id: "your-library-test", title: "", creators: [], type: "article-journal", identifiers: { doi: YOUR_LIBRARY_TEST_DOI }, providers: [] });
+    if (!url) throw new ApiError(409, "CONFLICT", YOUR_LIBRARY_TEXT.testNoAddress);
+    return { url };
+  });
+
+  // ------------------------------------------------------------------------------------------------------------
+  // Starting and cancelling a fetch through the library (R324 a–c).
+
+  /**
+   * The caller, ids, body, library and project of a start or cancel. `takes` "nothing": no body (the library's routes);
+   * "url" (F18c's link start): a body of exactly `{ url }` with text — its link returned.
+   */
+  const addressed = (req: FastifyRequest, takes: "nothing" | "url" = "nothing"): { s: Session; runner: FindRunner; projectId: string; entryId: string; url: string } => {
+    uiOnly(req);
+    const p = paramsOf(req);
+    const projectId = p.id ?? "";
+    const entryId = p.eid ?? "";
+    if (!isId(projectId)) throw badRequest("That is not a project's id.");
+    if (!isId(entryId)) throw badRequest("That is not a queue entry's id.");
+    let url = "";
+    if (takes === "nothing") {
+      if (Object.keys(objectBody(req, YOUR_LIBRARY_TEXT.noBody)).length) throw badRequest(YOUR_LIBRARY_TEXT.noBody);
+    } else {
+      const b = objectBody(req, FIND_LINK_TEXT.body);
+      if (Object.keys(b).length !== 1 || typeof b.url !== "string") throw badRequest(FIND_LINK_TEXT.body);
+      url = b.url;
+      // Never repeated: a refusal is the fixed sentence.
+      if (!linkShapeOk(url)) throw new ApiError(400, "VALIDATION", FIND_LINK_TEXT.notAPlace, "link-not-a-place");
+    }
+    const s = state.requireSession();
+    if (!s.repo.listProjects().some((x) => x.id === projectId)) throw new ApiError(404, "NOT_FOUND", "That project was not found.");
+    state.assertNotMoving();
+    if (s.lib.mode === "read-only" || !s.index) throw new ApiError(409, "READ_ONLY", FIND_ROUTE_TEXT.readOnly, "read-only");
+    if (!s.find || state.session !== s) throw new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed");
+    if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
+    return { s, runner: s.find, projectId, entryId, url };
+  };
+
+  /** A refusal of the runner in words (each its own status, as the find routes give them). Nothing else is passed on. */
+  const said = (s: Session, projectId: string, err: unknown): unknown => {
+    if (err instanceof ApiError) return err;
+    if (err instanceof FindLibraryRefusedError) {
+      const r = LIBRARY_REFUSAL[err.code];
+      return new ApiError(409, "CONFLICT", r.message ?? err.message, r.reason);
+    }
+    if (state.session !== s || !s.find || err instanceof FindRunnerClosedError) return new ApiError(503, "UNAVAILABLE", FIND_ROUTE_TEXT.closed, "closed");
+    if (err instanceof ProjectLockedError || err instanceof KeyNotAvailableError || !s.repo.isUnlocked(projectId)) return new ApiError(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
+    if (err instanceof FindProjectStoppedError) return new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.projectStopped, "stopped");
+    if (err instanceof ReadOnlyLibraryError) return new ApiError(409, "READ_ONLY", FIND_ROUTE_TEXT.readOnly, "read-only");
+    if (err instanceof NotFoundError) return new ApiError(404, "NOT_FOUND", FIND_ROUTE_TEXT.entryNotFound);
+    if (err instanceof FindEntryStateError) return new ApiError(409, "CONFLICT", FIND_ROUTE_TEXT.entryState, "entry-state");
+    return err;
+  };
+
+  app.post("/projects/:id/find/:eid/library/start", limit, async (req, reply): Promise<FindLibraryStartResponse> => {
+    const { s, runner, projectId, entryId } = addressed(req);
+    const { settings } = await readYourLibrary(state.deps.appConfigDir);
+    let got: { url: string; ticket: string };
+    try {
+      got = await runner.libraryStart(projectId, entryId, settings.access);
+    } catch (err) {
+      throw said(s, projectId, err);
+    }
+    reply.header("Cache-Control", "no-store");
+    return { url: got.url, ticket: got.ticket };
+  });
+
+  /**
+   * F18c (R345): "Open it here and fetch the PDF" — the start at one of the entry's own links. "Your library" is read
+   * anew only for its catalogue's link (no library need be set); the runner compares the link with the entry's links as
+   * "Where to get it" gives them now. Every answer, its refusals included, is no-store.
+   */
+  app.post("/projects/:id/find/:eid/link/start", limit, async (req, reply): Promise<FindLibraryStartResponse> => {
+    reply.header("Cache-Control", "no-store");
+    const { s, runner, projectId, entryId, url } = addressed(req, "url");
+    const { settings } = await readYourLibrary(state.deps.appConfigDir);
+    let got: { url: string; ticket: string };
+    try {
+      got = await runner.linkStart(projectId, entryId, url, settings);
+    } catch (err) {
+      throw said(s, projectId, err);
+    }
+    return { url: got.url, ticket: got.ticket };
+  });
+
+  /**
+   * F20a (R348 d): "Get through my library in my own browser" — the library's start (every refusal of it), refused also
+   * when no extension is paired; the answer is the library's address for the work and nothing else (the ticket stays
+   * in the service). Every answer, its refusals included, is no-store.
+   */
+  app.post("/projects/:id/find/:eid/browser/start", limit, async (req, reply): Promise<FindBrowserStartResponse> => {
+    reply.header("Cache-Control", "no-store");
+    const { s, runner, projectId, entryId } = addressed(req);
+    if (!paired()) throw new ApiError(409, "CONFLICT", FIND_BROWSER_TEXT.notPaired, "browser-not-paired");
+    const { settings } = await readYourLibrary(state.deps.appConfigDir);
+    let got: { url: string };
+    try {
+      got = await runner.browserStart(projectId, entryId, settings.access);
+    } catch (err) {
+      throw said(s, projectId, err);
+    }
+    return { url: got.url };
+  });
+
+  app.post("/projects/:id/find/:eid/library/cancel", limit, async (req, reply): Promise<FindEntryView> => {
+    const { s, runner, projectId, entryId } = addressed(req);
+    let back;
+    try {
+      back = await runner.libraryCancel(projectId, entryId);
+    } catch (err) {
+      throw said(s, projectId, err);
+    }
+    reply.header("Cache-Control", "no-store");
+    const q = await readFindQueueOf(s.repo, projectId).catch(() => null);
+    const parts = await libraryPartsOf(state.deps.appConfigDir, s, projectId, q ? q.entries.values() : [back], { paired: paired() });
+    return entryView(back, undefined, parts.get(back.id));
+  });
+}
+
+/**
+ * Task F17 (R329): what the service does with a file grant from the shell (main.ts hands every one to this, at once).
+ * The ticket ends FIRST (the runner's seam, before anything of the file is looked at): the pause starts whatever
+ * becomes of the file. No open ticket — a wrong, used or expired one, a closed library, a locked project (its lock
+ * ended the ticket) — and the file is deleted if it is inside the inbox, and nothing else happens. Otherwise the runner
+ * takes it through the inbox's checks (file-grants.ts) and holds it for the researcher's check, with the starting
+ * address it kept with the ticket. Nothing of the line, the path or the address is logged, answered or thrown.
+ */
+export function libraryFileHandler(state: ServiceState): (g: FileGrant) => Promise<void> {
+  return async (g) => {
+    const inbox = inboxOf(state.deps.appConfigDir);
+    const runner = state.session?.find;
+    // F20a (R348 c): the shell's line hands over only a window's ticket; a browser's is answered as a wrong one (and stays open).
+    const t = runner ? runner.libraryHandedOver(g.ticket, "window") : null;
+    if (!runner || !t) {
+      await discardInboxFile(inbox, g.path);
+      return;
+    }
+    const file: HandedFile = {
+      take: async (path, to, maxBytes) => {
+        const r = await takeInboxFile(inbox, { id: g.id, path }, to, { maxBytes });
+        return r.ok ? r : { ok: false, why: r.why === "too-large" ? "too-large" : "unreadable" };
+      },
+      discard: (path) => discardInboxFile(inbox, path),
+    };
+    await runner.acceptLibraryFile(t.projectId, t.entryId, g.path, "sign-in-window", runner.libraryAddressOf(t.projectId, t.entryId) ?? "", file);
+  };
+}

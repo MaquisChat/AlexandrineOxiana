@@ -1,6 +1,6 @@
 /** Fieldwork entities (spec 3.6): participants, sessions, consent records, source links. */
 import { ConsentRecord, Participant, Session, newId, type SourceFile } from "@ao/core";
-import { FieldworkInUseError, InvalidInputError, NotFoundError } from "./errors.js";
+import { FieldworkInUseError, InvalidInputError, NotFoundError, ProjectLockedError } from "./errors.js";
 import { runMutation, type MutateRequest } from "./mutate.js";
 import { appendReviewEntry } from "./review.js";
 import { isUnlocked, readFullData, writeProjectData } from "./projects.js";
@@ -12,6 +12,7 @@ import { encName } from "@ao/core";
 import type { ProjectJson } from "./state.js";
 import { editSource, readSourceFile, storeRequest } from "./sources.js";
 import type { ProjectState, RepoCore } from "./state.js";
+import { auditedReasonIn } from "./audit-reasons.js";
 
 export interface ParticipantInput {
   /** Defaults to the next `P-NNN` code. */
@@ -160,8 +161,13 @@ export async function getFieldwork(
   projectId: string,
 ): Promise<{ participants: Participant[]; sessions: Session[]; consents: ConsentRecord[]; complete: boolean }> {
   const st = core.state(projectId);
+  const was = isUnlocked(core, projectId);
   const data = await readFullData(core, st, true);
-  return { participants: data.participants, sessions: data.sessions, consents: data.consents, complete: isUnlocked(core, projectId) };
+  const complete = isUnlocked(core, projectId);
+  // Locked (or being locked) while the identifying fields were read: refused as locked, never those fields handed
+  // out after the lock under "incomplete" (R435 e).
+  if (was && !complete) throw new ProjectLockedError(projectId);
+  return { participants: data.participants, sessions: data.sessions, consents: data.consents, complete };
 }
 
 /** Every code given in this project: participants', retired ones, and the pseudonym map's (R117 C1). */
@@ -340,7 +346,13 @@ export async function updateConsent(core: RepoCore, projectId: string, id: strin
     {
       op: detaching ? "consent.document-detach" : "consent.update",
       entity: { type: "consent", id },
-      ...(detaching ? { auditDetails: { reason: patch.detachReason!.trim() } } : {}),
+      // R362 b: in an encrypted project the audit entry holds the reason's keyed digest (R369 b), its text is sealed in this change.
+      ...(detaching
+        ? {
+            auditDetails: () => auditedReasonIn(core, core.state(projectId), patch.detachReason!.trim()),
+            sealedReason: patch.detachReason!.trim(),
+          }
+        : {}),
     },
   );
 }
@@ -433,6 +445,7 @@ export async function withdrawConsent(
         await appendReviewEntry(core, tx, {
           sourceId,
           kind: "verification",
+          cause: { kind: "consent-withdrawal", consentIds: [c.id] },
           fields: {},
           reasons: [
             `Consent from participant ${p?.code ?? "(unknown)"} (scope: ${c.scope}) was withdrawn on ${tx.at.slice(0, 10)}${why}. ` +

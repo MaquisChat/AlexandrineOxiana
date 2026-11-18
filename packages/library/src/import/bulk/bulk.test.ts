@@ -4,7 +4,7 @@ import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MockAgent } from "undici";
+import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { ExifTool } from "exiftool-vendored";
 import { primary, type AuditEvent, type Project, type SourceDraft } from "@ao/core";
@@ -25,7 +25,12 @@ import { decryptBytes } from "../../repo/io.js";
 import type { Repo } from "../../repo/repo.js";
 import { importChange, projectCollectionsAndTags, projectDataKey } from "../../repo/repo.js";
 import { openTestRepo } from "../../repo/testing.js";
-import { BatchRefusedError, createBulkImport, folderAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
+import { BatchRefusedError, createBulkImport, folderAdapter, zipAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
+import { useMemorySecrets } from "../../secrets-testing.js";
+import { setSecret } from "../../secrets.js";
+import { ZOTERO_WEB_FILE_NOTES, resumeZoteroWebImport, startZoteroWebImport, zoteroWebAdapter, zoteroWebSince, type ZoteroWebOptions } from "../zotero-web.js";
+import { FakeZotero, guardNetwork } from "../../../tests/zotero/fake-zotero.js";
+import { referenceMetadata } from "../refman.js";
 
 const FAST = 2 ** 10;
 const LOOKUP_FIX = join(dirname(fileURLToPath(import.meta.url)), "../../../tests/fixtures/lookup");
@@ -436,6 +441,49 @@ describe("pause, cancel and resume", () => {
   });
 });
 
+describe("review queue: workspace tags being deleted (41a N2)", () => {
+  it("a bulk review edit cannot put a workspace tag being deleted on a source, whether it is marked already or the delete races it", async () => {
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const items = await bulk.listReview(p.id, h.batchId);
+    expect(items.length).toBeGreaterThanOrEqual(2);
+    // Already marked: the delete stopped part-way (another project could not take it).
+    const marked = await repo.createTag("workspace", "marked");
+    const tagsFile = join(lib.root, "tags.json");
+    const tj = JSON.parse(await readFile(tagsFile, "utf8")) as Record<string, unknown>;
+    await writeFile(tagsFile, JSON.stringify({ ...tj, deleting: [marked.id] }));
+    await expect(bulk.bulkEditReview(p.id, [items[0]!.id], { tagIds: [marked.id] })).rejects.toThrow(/not found/i);
+    expect((await repo.getSource(p.id, items[0]!.sourceId!)).source.tagIds).not.toContain(marked.id);
+    // Racing: the edit checks its tags, the whole delete runs, then the edit writes.
+    for (let round = 0; round < 3; round++) {
+      const tag = await repo.createTag("workspace", `racing ${round}`);
+      let done = false;
+      const del = repo.deleteWorkspaceTag(tag.id).finally(() => {
+        done = true;
+      });
+      while (!done) await bulk.bulkEditReview(p.id, [items[1]!.id], { tagIds: [tag.id] }).catch(() => {});
+      await del;
+      expect((await repo.listWorkspaceTags()).some((t) => t.id === tag.id)).toBe(false);
+      expect((await repo.getSource(p.id, items[1]!.sourceId!)).source.tagIds).not.toContain(tag.id);
+    }
+  });
+
+  it("createSource refuses a workspace tag whose deletion has started", async () => {
+    const p = await project();
+    const tag = await repo.createTag("workspace", "going");
+    const tagsFile = join(lib.root, "tags.json");
+    const tj = JSON.parse(await readFile(tagsFile, "utf8")) as Record<string, unknown>;
+    await writeFile(tagsFile, JSON.stringify({ ...tj, deleting: [tag.id] }));
+    const before = repo.listSourceIds(p.id).length;
+    await expect(
+      repo.createSource(p.id, { projectIds: [], type: "article-journal", title: { variants: [{ lang: "en", kind: "original", value: "T" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [tag.id], participantIds: [] }, [], {
+        provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "ao", version: "0" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+      }),
+    ).rejects.toThrow(/not found/i);
+    expect(repo.listSourceIds(p.id).length).toBe(before);
+  });
+});
+
 describe("review queue", () => {
   it("decideReview and bulkEditReview are governed, audited changes", async () => {
     const p = await project();
@@ -463,6 +511,52 @@ describe("review queue", () => {
     expect(left.map((e) => e.id)).not.toEqual(expect.arrayContaining([a!.id, b!.id, c!.id]));
     const ops = (await auditEvents(p)).map((e) => e.details?.op);
     expect(ops).toEqual(expect.arrayContaining(["review.decide", "review.bulk-edit"]));
+  });
+
+  it("listProjectReview (Task 67, R172): every pending entry of the project, of every kind, oldest first, paged, with titles; decided entries and entries of removed sources are left out", async () => {
+    const p = await project();
+    const other = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const batchItems = await bulk.listReview(p.id, h.batchId);
+    expect(batchItems.length).toBeGreaterThanOrEqual(3);
+    // Entries with no batch, as a drag-and-drop attach (import) and a capture or a consent withdrawal (verification) queue them.
+    const attached = await repo.createSource(p.id, plainDraft("Attached by hand"), [], { provenance: plainProvenance(), reviewItem: { kind: "import", fields: {}, reasons: ["Check it."] } });
+    const captured = await repo.createSource(p.id, plainDraft("A captured page"), [], { provenance: plainProvenance(), reviewItem: { fields: { "/title": "conflict" }, reasons: ["The title disagrees."] } });
+    const flagged = await repo.createSource(p.id, plainDraft("An interview"), [], { provenance: plainProvenance(), reviewItem: { kind: "verification", fields: {}, reasons: ["Consent was withdrawn."] } });
+    await repo.createSource(other.id, plainDraft("Another project's"), [], { provenance: plainProvenance(), reviewItem: { kind: "import", fields: {}, reasons: ["x"] } });
+    // One batch item decided, one whose source is gone.
+    await bulk.decideReview(p.id, batchItems[0]!.id, { action: "keep-both" });
+    await repo.deleteSource(p.id, batchItems[1]!.sourceId!);
+
+    const all = await bulk.listProjectReview(p.id);
+    const expected = batchItems.length - 2 + 3;
+    expect(all.total).toBe(expected);
+    expect(all.items).toHaveLength(expected);
+    expect(all.items.every((e) => e.status === "pending" && e.projectId === p.id)).toBe(true);
+    const ids = all.items.map((e) => e.id);
+    expect(ids).not.toContain(batchItems[0]!.id);
+    expect(ids).not.toContain(batchItems[1]!.id);
+    const bySource = new Map(all.items.map((e) => [e.sourceId, e]));
+    expect(bySource.get(attached.source.id)).toMatchObject({ kind: "import", title: "Attached by hand" });
+    expect(bySource.get(attached.source.id)!.batchId).toBeUndefined();
+    expect(bySource.get(captured.source.id)).toMatchObject({ kind: "verification", fields: { "/title": "conflict" }, title: "A captured page" });
+    expect(bySource.get(flagged.source.id)).toMatchObject({ kind: "verification", fields: {}, title: "An interview" });
+    const times = all.items.map((e) => e.createdAt);
+    expect([...times].sort()).toEqual(times);
+
+    const page = await bulk.listProjectReview(p.id, { offset: 1, limit: 2 });
+    expect(page.total).toBe(expected);
+    expect(page.items.map((e) => e.id)).toEqual(ids.slice(1, 3));
+    const one = await bulk.listProjectReview(p.id, { sourceId: captured.source.id });
+    expect(one).toMatchObject({ total: 1, items: [{ sourceId: captured.source.id }] });
+    expect((await bulk.listProjectReview(p.id, { limit: 0 })).items).toEqual([]);
+  });
+
+  it("listProjectReview refuses a locked project", async () => {
+    const p = await project(ENC_GOV, true);
+    await repo.createSource(p.id, plainDraft("Sealed"), [], { provenance: plainProvenance(), reviewItem: { kind: "import", fields: {}, reasons: ["x"] } });
+    repo.lockProject(p.id);
+    await expect(bulk.listProjectReview(p.id)).rejects.toThrow(/locked/i);
   });
 });
 
@@ -772,6 +866,38 @@ processing:
     expect(result.counts.failed).toBe(1);
     const report = await bulk.batchReport(p.id, h.batchId);
     expect(report.failures).toEqual([{ item: "IMG_0001.tif", reason: "Location data requires encryption or locationMetadata: keep" }]);
+  });
+});
+
+describe("undo and the review queue (Task 67 fix round 1, M1; coordinator's ruling 3)", () => {
+  it("each source's removal resolves its pending entries in the same change: a crash between two removals leaves no pending entry of a source that is gone", async () => {
+    const { SimulatedCrash, seams } = await import("../../repo/testing.js");
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const items = await bulk.listReview(p.id, h.batchId);
+    expect(items.length).toBeGreaterThanOrEqual(2);
+    // One batch-created source is also flagged by a consent withdrawal (an entry outside the batch).
+    const part = await repo.createParticipant(p.id, {});
+    const c = await repo.createConsent(p.id, { participantId: part.id, scope: "audio", date: "2026-03-14" });
+    for (const it of items) await repo.linkSourceToFieldwork(p.id, it.sourceId!, { participantIds: [part.id] });
+    await repo.withdrawConsent(p.id, c.id, {});
+    // Crash right after the first removal commits (before its marker is deleted).
+    seams.crashAt = "before-marker-delete";
+    await expect(bulk.undoBatch(p.id, h.batchId)).rejects.toBeInstanceOf(SimulatedCrash);
+    seams.crashAt = undefined;
+    handle.close();
+    await lib.close();
+    lib = await openLibrary(join(tmp, "Lib"), deps());
+    handle = new IndexHandle(lib.root);
+    repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
+    const present = new Set(repo.listSourceIds(p.id));
+    const gone = items.map((i) => i.sourceId!).filter((sid) => !present.has(sid));
+    expect(gone.length).toBe(1);
+    const entries = await projectReviewEntries(repo, p.id);
+    const ofGone = entries.filter((e) => gone.includes(e.sourceId!));
+    expect(ofGone.length).toBeGreaterThanOrEqual(2); // its batch item and its withdrawal flag
+    expect(ofGone.map((e) => [e.status, e.decision])).toEqual(ofGone.map(() => ["resolved", "undone"]));
   });
 });
 
@@ -1241,4 +1367,892 @@ describe("review round 2 (R82): stores from attach and Bulk Import share the pro
     expect(r.counts).toMatchObject({ duplicates: 1, created: 0, needsReview: 0 });
     expect(repo.listSourceIds(p.id)).toHaveLength(1);
   }, 30_000);
+});
+
+describe("Task 72 (R190): an import decision that puts a field newly in conflict queues it; the batch's undo takes it back", () => {
+  const STORE = { action: "store" as const, store: { identifiable: false, hasLocation: false } };
+
+  /**
+   * A batch with one item; its source carries a page's date (2014); the item's import entry offers a
+   * candidate dated 2018. Accepting the candidate puts the date newly in conflict.
+   */
+  async function decidedIntoConflict(fields: Record<string, string> = {}) {
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(await folderWith("r190", { "a.pdf": await workPdf("r190") })));
+    const [sid] = repo.listSourceIds(p.id);
+    const at = new Date().toISOString();
+    await importChange(repo, p.id, STORE, async (ops) => {
+      const cur = await ops.readSource(sid!);
+      await ops.writeSource(cur, { ...cur, fieldEvidence: [...cur.fieldEvidence, { field: "/issued", value: "2014", source: { kind: "page-dom" }, at }] });
+    }, { op: "test" });
+    const entry = await importChange(repo, p.id, STORE, (ops) =>
+      ops.appendReview({
+        sourceId: sid!,
+        kind: "import",
+        batchId: h.batchId,
+        fields,
+        reasons: ["low confidence"],
+        candidates: [{ provider: "openalex", title: WORK_TITLE, creators: [], issued: "2018", type: "article-journal", identifiers: {} }],
+      }),
+      { op: "test" },
+    );
+    await bulk.decideReview(p.id, entry.id, { action: "accept-candidate", index: 0 });
+    expect((await repo.getSource(p.id, sid!)).verification["/issued"]?.status).toBe("conflict");
+    const queued = (await projectReviewEntries(repo, p.id)).filter((e) => e.sourceId === sid && e.status === "pending" && e.kind === "verification");
+    return { p, sid: sid!, batchId: h.batchId, queued, entries: async () => (await projectReviewEntries(repo, p.id)).filter((e) => e.sourceId === sid) };
+  }
+
+  it("the decision's own change queues the date, its cause a later check, and its audit event says so", async () => {
+    const { p, queued } = await decidedIntoConflict();
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ fields: { "/issued": "conflict" }, cause: { kind: "capture-conflict", foundBy: "later-check" } });
+    const decide = (await auditEvents(p)).filter((e) => (e.details as { op?: string } | undefined)?.op === "review.decide");
+    expect(decide).toHaveLength(1);
+    expect(decide[0]!.details).toMatchObject({ reviewQueued: [{ entry: queued[0]!.id, fields: ["/issued"] }] });
+  });
+
+  it("R193 a (I1): the item's own import entry lists the field, as reviewFor writes it: the decision still queues the conflict", async () => {
+    const { queued } = await decidedIntoConflict({ "/issued": "unverified" });
+    expect(queued).toEqual([expect.objectContaining({ fields: { "/issued": "conflict" }, cause: { kind: "capture-conflict", foundBy: "later-check" } })]);
+  });
+
+  it("undoing the batch takes the entry back in the change that removes the source", async () => {
+    const { p, batchId, queued, entries } = await decidedIntoConflict();
+    expect(queued).toHaveLength(1);
+    await bulk.undoBatch(p.id, batchId);
+    expect(await entries()).toEqual(expect.arrayContaining([expect.objectContaining({ id: queued[0]!.id, status: "resolved", decision: "undone" })]));
+    expect((await entries()).filter((e) => e.status === "pending")).toEqual([]);
+  });
+
+  it("an entry the researcher already settled is neither resurrected nor rewritten by the undo", async () => {
+    const { confirmField } = await import("../../source-actions.js");
+    const { p, sid, batchId, queued, entries } = await decidedIntoConflict();
+    expect(queued).toHaveLength(1);
+    await confirmField(repo, p.id, sid, "/issued", "2018");
+    expect((await entries()).find((e) => e.id === queued[0]!.id)).toMatchObject({ status: "resolved", decision: "confirmed" });
+    const linesBefore = (await readProjectFile(p, "review/pending.jsonl")).split("\n").filter((l) => l.includes(queued[0]!.id)).length;
+    await bulk.undoBatch(p.id, batchId);
+    expect((await entries()).find((e) => e.id === queued[0]!.id)).toMatchObject({ status: "resolved", decision: "confirmed" });
+    expect((await readProjectFile(p, "review/pending.jsonl")).split("\n").filter((l) => l.includes(queued[0]!.id))).toHaveLength(linesBefore);
+  });
+});
+
+describe("Task 72 fix round 2 (R194): every import decision that leaves the source in place keeps its conflicts listed", () => {
+  /**
+   * A batch, and an item of it as a run leaves one: its stored report has /issued in conflict (the
+   * file says 2014, the platform 2018), listed only by its pending import entry (reviewFor's shape).
+   * `conflict: false`: the same item with no conflict.
+   */
+  async function importedItem(o: { conflict?: boolean } = {}) {
+    const { recheckSourceFile } = await import("@ao/core");
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(await folderWith("r194", { "a.pdf": await workPdf("r194") })));
+    const at = new Date().toISOString();
+    const evidence = [
+      { field: "/issued", value: "2014", source: { kind: "page-dom" as const }, at },
+      ...(o.conflict === false ? [] : [{ field: "/issued", value: "2018", source: { kind: "platform-json" as const }, at }]),
+    ];
+    const draft = plainDraft("An imported item", { issued: "2014" });
+    const sf0 = { source: { ...draft, id: "x", provenance: plainProvenance() }, fieldEvidence: evidence, verification: {}, assets: [], annotations: [] };
+    const verification = recheckSourceFile(sf0 as unknown as Parameters<typeof recheckSourceFile>[0], {}).verification;
+    expect(verification["/issued"]?.status === "conflict").toBe(o.conflict !== false);
+    const fields = Object.fromEntries(Object.entries(verification).filter(([, v]) => v.status === "conflict" || v.status === "unverified").map(([k, v]) => [k, v.status]));
+    const sf = await repo.createSource(p.id, draft, [], {
+      provenance: { ...plainProvenance(), importBatchId: h.batchId },
+      fieldEvidence: evidence,
+      verification,
+      reviewItem: { kind: "import", batchId: h.batchId, fields, reasons: ["The file and the platform disagree."] },
+    });
+    const sid = sf.source.id;
+    const entries = async () => (await projectReviewEntries(repo, p.id)).filter((e) => e.sourceId === sid);
+    const importEntry = (await entries()).find((e) => e.kind === "import")!;
+    return { p, sid, batchId: h.batchId, importEntry, entries, pending: async () => (await entries()).filter((e) => e.status === "pending") };
+  }
+
+  /** The source's pending entries are exactly one capture-conflict entry listing /issued as in conflict (the row needs review). */
+  const expectListed = (pending: Array<{ kind: string; fields: Record<string, string>; cause?: unknown }>) =>
+    expect(pending).toEqual([expect.objectContaining({ kind: "verification", fields: expect.objectContaining({ "/issued": "conflict" }), cause: { kind: "capture-conflict", foundBy: "later-check" } })]);
+
+  it("a plain accept (no draft): the conflict gets its capture entry in the decision's change", async () => {
+    const { p, sid, importEntry, pending } = await importedItem();
+    await bulk.decideReview(p.id, importEntry.id, { action: "accept" });
+    expect((await repo.getSource(p.id, sid)).verification["/issued"]?.status).toBe("conflict");
+    expectListed(await pending());
+    const decide = (await auditEvents(p)).filter((e) => (e.details as { op?: string } | undefined)?.op === "review.decide");
+    expect(decide.at(-1)!.details).toMatchObject({ reviewQueued: [{ fields: ["/issued"] }] });
+  });
+
+  it("an accept whose draft leaves the report as it was: the same", async () => {
+    const { p, sid, importEntry, pending } = await importedItem();
+    // A draft that sets nothing (the reviewer's probe; the service passes the draft it is given).
+    await bulk.decideReview(p.id, importEntry.id, { action: "accept", draft: {} as SourceDraft });
+    expect((await repo.getSource(p.id, sid)).verification["/issued"]?.status).toBe("conflict");
+    expectListed(await pending());
+  });
+
+  it("a merge whose target keeps a conflict with no entry: the target's conflict is listed", async () => {
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    const { recheckSourceFile } = await import("@ao/core");
+    const { p, importEntry } = await importedItem({ conflict: false });
+    const at = new Date().toISOString();
+    const evidence = [
+      { field: "/issued", value: "2010", source: { kind: "page-dom" as const }, at },
+      { field: "/issued", value: "2016", source: { kind: "platform-json" as const }, at },
+    ];
+    const tdraft = plainDraft("The target", { issued: "2010" });
+    const verification = recheckSourceFile({ source: { ...tdraft, id: "t", provenance: plainProvenance() }, fieldEvidence: evidence, verification: {}, assets: [], annotations: [] } as unknown as Parameters<typeof recheckSourceFile>[0], {}).verification;
+    expect(verification["/issued"]?.status).toBe("conflict");
+    // A target as D19 left it: the conflict stored, no entry.
+    const target = await repo.createSource(p.id, tdraft, [], { provenance: plainProvenance(), fieldEvidence: evidence, verification });
+    await bulk.decideReview(p.id, importEntry.id, { action: "merge", sourceId: target.source.id });
+    expect((await repo.getSource(p.id, target.source.id)).verification["/issued"]?.status).toBe("conflict");
+    expectListed((await projectReviewEntries(repo, p.id)).filter((e) => e.sourceId === target.source.id && e.status === "pending"));
+  });
+
+  it("a plain accept of an item with no conflict writes no entry and audits no reviewQueued", async () => {
+    const { p, importEntry, pending } = await importedItem({ conflict: false });
+    await bulk.decideReview(p.id, importEntry.id, { action: "accept" });
+    expect(await pending()).toEqual([]);
+    const decide = (await auditEvents(p)).filter((e) => (e.details as { op?: string } | undefined)?.op === "review.decide");
+    expect(decide.at(-1)!.details).not.toHaveProperty("reviewQueued");
+  });
+
+  it("the batch's undo takes back the entry a plain accept wrote, crash-safe", async () => {
+    const { SimulatedCrash, seams } = await import("../../repo/testing.js");
+    const { p, sid, batchId, importEntry, entries, pending } = await importedItem();
+    await bulk.decideReview(p.id, importEntry.id, { action: "accept" });
+    const [capture] = await pending();
+    expect(capture).toBeDefined();
+    // A crash before the removal's commit point: the source and its entry are both still there.
+    seams.crashAt = "before-audit";
+    await expect(bulk.undoBatch(p.id, batchId)).rejects.toBeInstanceOf(SimulatedCrash);
+    seams.crashAt = undefined;
+    handle.close();
+    await lib.close();
+    lib = await openLibrary(join(tmp, "Lib"), deps());
+    handle = new IndexHandle(lib.root);
+    repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
+    bulk = createBulkImport({ repo, http, index: handle });
+    expect(repo.listSourceIds(p.id)).toContain(sid);
+    expect((await pending()).map((e) => e.id)).toEqual([capture!.id]);
+    await bulk.undoBatch(p.id, batchId);
+    expect(repo.listSourceIds(p.id)).not.toContain(sid);
+    expect((await entries()).find((e) => e.id === capture!.id)).toMatchObject({ status: "resolved", decision: "undone" });
+  });
+});
+
+describe("context hooks and gone items (Z2)", () => {
+  /** An incremental adapter that knows nothing of `skip`, `knownIds` or `gone`; it records the context it was given. */
+  const plain = (items: ScanItem[], seen: Array<Record<string, unknown>> = []): ImportSourceAdapter => ({
+    kind: "bibtex",
+    location: "plain.bib",
+    incremental: true,
+    scan: async function* (_signal, ctx) {
+      seen.push({ skip: typeof ctx?.skip, knownIds: ctx?.knownIds ? [...ctx.knownIds()] : undefined });
+      yield* items;
+    },
+  });
+  const ref = (key: string, title: string, version = "v1"): ScanItem => ({
+    key,
+    files: [],
+    referenceMetadata: referenceMetadata({ type: "book", title }),
+    version: { id: `lib/${key}`, version },
+  });
+
+  it("another adapter is unchanged by Z6: a field changed on both sides is kept and reported, nothing is queued, and an update adds no collection", async () => {
+    const p = await project();
+    const withFolder = (title: string, version: string, folder: string[]): ScanItem => ({ ...ref("A", title, version), referenceSource: { kind: "refman", ref: "reference" }, folderPath: folder });
+    await run(p, plain([withFolder("Alpha", "v1", ["Shelf"])]));
+    const id = repo.listSourceIds(p.id)[0]!;
+    await repo.updateSource(p.id, id, { title: { variants: [{ lang: "en", kind: "original", value: "Alpha, as I call it" }] } });
+    const { result, handle: h2 } = await run(p, plain([withFolder("Alpha revised", "v2", ["Another shelf"])]));
+    const batchId = h2.batchId;
+    expect(result.counts).toMatchObject({ conflicts: 0, failed: 0 });
+    const sf = await repo.getSource(p.id, id);
+    expect(primary(sf.source.title)).toBe("Alpha, as I call it");
+    expect(sf.verification["/title"]?.status).not.toBe("conflict");
+    expect(sf.source.collectionIds).toHaveLength(1);
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    expect((await projectReviewEntries(repo, p.id)).filter((e) => e.kind === "verification")).toEqual([]);
+    expect((await bulk.batchReport(p.id, batchId)).keptFields).toEqual([{ item: "A", fields: ["/title"] }]);
+    const lines = (await readFile(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines.every((l) => l.conflictsQueued === undefined && (l.ext as { cols?: unknown } | undefined)?.cols === undefined)).toBe(true);
+  });
+
+  it("an adapter that knows nothing of skip and knownIds runs unchanged", async () => {
+    const p = await project();
+    const seen: Array<Record<string, unknown>> = [];
+    const first = await run(p, plain([ref("A", "Alpha"), ref("B", "Beta")], seen));
+    expect(first.result.state).toBe("finished");
+    expect(first.result.counts.created + first.result.counts.needsReview).toBe(2);
+    const again = await run(p, plain([ref("A", "Alpha"), ref("B", "Beta")], seen));
+    expect(again.result.counts).toMatchObject({ unchanged: 2, created: 0, failed: 0 });
+    // The engine offers the hooks; ignoring them changes nothing.
+    expect(seen[0]).toEqual({ skip: "function", knownIds: [] });
+    expect(seen[1]).toEqual({ skip: "function", knownIds: ["lib/A", "lib/B"] });
+    // A non-incremental adapter is offered no knownIds.
+    const nonInc: Array<Record<string, unknown>> = [];
+    await run(p, { ...plain([], nonInc), incremental: false });
+    expect(nonInc[0]).toEqual({ skip: "function", knownIds: undefined });
+  });
+
+  it("a gone item whose source is not its own Zotero item's changes nothing here and is only counted apart (Z5); a dry run does not count it", async () => {
+    const p = await project();
+    await run(p, plain([ref("A", "Alpha")]));
+    const [id] = repo.listSourceIds(p.id);
+    const folderOf = async () => join(lib.root, (await repo.getSource(p.id, id!)).source.folder);
+    const before = await tree(await folderOf());
+    expect(before.size).toBeGreaterThan(0);
+    const { result, handle: h } = await run(p, plain([{ key: "A", files: [], gone: "deleted", version: { id: "lib/A", version: "deleted" } }]));
+    expect(result.state).toBe("finished");
+    expect(result.counts).toMatchObject({ items: 0, goneInZotero: 0, goneNotMarked: 1 });
+    expect(await tree(await folderOf())).toEqual(before);
+    // Z5: the source's provenance does not name this Zotero item of this library: not marked, one line counting it.
+    const lines = readFileSync(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines).toEqual([{ key: "A", outcome: "zotero-gone-unmarked", gone: "deleted" }]);
+    expect(h.batchId).toBeTruthy();
+    const dry = await bulk.dryRun(p.id, plain([{ key: "B", files: [], gone: "bin", version: { id: "lib/B", version: "bin:3" } }]));
+    expect(dry.items).toBe(0);
+  });
+
+  it("a gone item from an adapter that is not incremental is passed by: no line, no count (Z5, R224 g)", async () => {
+    const p = await project();
+    await run(p, plain([ref("A", "Alpha")]));
+    const { result } = await run(p, { ...plain([{ key: "A", files: [], gone: "deleted", version: { id: "lib/A", version: "deleted" } }]), incremental: false });
+    expect(result.state).toBe("finished");
+    expect(result.counts).toMatchObject({ items: 0, goneInZotero: 0, goneAlready: 0, goneNotMarked: 0 });
+    expect(existsSync(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"))).toBe(false);
+  });
+
+  it("skip: an item already in a resumed batch's journal is passed by before the adapter fetches it", async () => {
+    const p = await project();
+    const asked: string[] = [];
+    const items = [ref("A", "Alpha"), ref("B", "Beta"), ref("C", "Gamma")];
+    const adapter: ImportSourceAdapter = {
+      kind: "bibtex",
+      location: "skip.bib",
+      incremental: true,
+      scan: async function* (_signal, ctx) {
+        for (const i of items) {
+          if (ctx?.skip?.(i.key)) continue;
+          asked.push(i.key);
+          yield i;
+        }
+      },
+    };
+    const h = await bulk.startBatch(p.id, adapter);
+    for await (const e of h.progress) {
+      if (e.done >= 1) {
+        h.cancel();
+        break;
+      }
+    }
+    const stopped = await h.done;
+    const done = stopped.counts.items;
+    expect(done).toBeGreaterThanOrEqual(1);
+    asked.length = 0;
+    const r = await (await bulk.resumeBatch(p.id, h.batchId, adapter)).done;
+    expect(r.state).toBe("finished");
+    expect(asked).toHaveLength(3 - done);
+    expect(repo.listSourceIds(p.id)).toHaveLength(3);
+  });
+});
+
+describe("Zotero Web batches resumed (Z2)", () => {
+  const ZGOV = `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: optional
+captureMethods: [zotero_import]
+processing:
+  metadata_lookup: []
+`;
+  const U = "user:42";
+  let z: FakeZotero;
+  let secrets: ReturnType<typeof useMemorySecrets>;
+  let restoreDispatcher: () => void;
+  // Guard (this part only: other tests here talk to a loopback media worker through the global dispatcher).
+  let unguard: () => void;
+  beforeAll(() => {
+    unguard = guardNetwork();
+  });
+  afterAll(() => unguard());
+  beforeEach(async () => {
+    z = new FakeZotero();
+    secrets = useMemorySecrets();
+    await setSecret("zotero-api-key", z.key);
+    // resumeZoteroWebImport takes no dispatcher (as in the service): the stand-in is the global one here.
+    const previous = getGlobalDispatcher();
+    setGlobalDispatcher(z.agent);
+    restoreDispatcher = () => setGlobalDispatcher(previous);
+  });
+  afterEach(async () => {
+    // One way only: nothing but GET reached the stand-in.
+    expect(z.requests.filter((r) => r.method !== "GET")).toEqual([]);
+    restoreDispatcher();
+    secrets.restore();
+    await z.agent.close();
+  });
+
+  const deps = () => ({ repo, http, index: handle });
+  const web = (): ZoteroWebOptions => ({ libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {} });
+  const addWithFile = async (title: string) => {
+    const p = z.addItem(U, { itemType: "journalArticle", title });
+    const att = z.addItem(U, { itemType: "attachment", contentType: "application/pdf", filename: "f.pdf" }, { parent: p, file: { bytes: await buildPdf({ extra: title }) } });
+    return { p, att };
+  };
+  const listings = () => z.requests.filter((r) => r.path.startsWith("/users/42/items?")).map((r) => new URL(r.path, "https://x.invalid").searchParams);
+  const fileRequests = () => z.requests.filter((r) => r.path.endsWith("/file")).map((r) => r.path);
+
+  /** A first full run, then an incremental batch cancelled after its first item. */
+  async function cancelledIncremental(after = 1): Promise<{ p: Project; batchId: string; v1: number; journaled: number }> {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three"]) await addWithFile(t);
+    await (await startZoteroWebImport(deps(), p.id, web())).done;
+    const v1 = z.libraryVersion(U);
+    expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+    for (const t of ["Four", "Five", "Six", "Seven"]) await addWithFile(t);
+    const h = await startZoteroWebImport(deps(), p.id, web());
+    for await (const e of h.progress) {
+      if (e.done >= after) {
+        h.cancel();
+        break;
+      }
+    }
+    const stopped = await h.done;
+    expect(stopped.state).toBe("cancelled");
+    expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+    return { p, batchId: h.batchId, v1, journaled: stopped.counts.items };
+  }
+
+  const batchJson = (p: Project, n: number) => join(lib.root, p.folder, "imports", `batch-${String(n).padStart(4, "0")}`, "batch.json");
+
+  it("FR-A21 (R392): a Web import's progress carries the stand-in's real total, the dry run's items, and a sync the changed items'", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three"]) await addWithFile(t);
+    z.addItem(U, { itemType: "note", note: "<p>standalone, not an item here</p>" });
+    const dry = await createBulkImport(deps()).dryRun(p.id, zoteroWebAdapter(web()));
+    expect(dry.items).toBe(3);
+    const totals = async (h: Awaited<ReturnType<typeof startZoteroWebImport>>) => {
+      const seen: Array<number | undefined> = [];
+      for await (const e of h.progress) if (e.done > 0) seen.push(e.total);
+      await h.done;
+      return seen;
+    };
+    const first = await totals(await startZoteroWebImport(deps(), p.id, web()));
+    expect(first.length).toBeGreaterThan(0);
+    expect(first.every((t) => t === 3)).toBe(true);
+    for (const t of ["Four", "Five"]) await addWithFile(t);
+    const sync = await totals(await startZoteroWebImport(deps(), p.id, web()));
+    expect(sync.length).toBeGreaterThan(0);
+    expect(sync.every((t) => t === 2)).toBe(true);
+  });
+
+  /** Every event of a run as [done, total]. */
+  const pairs = async (h: Awaited<ReturnType<typeof startZoteroWebImport>>) => {
+    const seen: Array<[number, number | undefined]> = [];
+    for await (const e of h.progress) seen.push([e.done, e.total]);
+    const r = await h.done;
+    return { seen, r };
+  };
+  const expectWholeBatch = (seen: Array<[number, number | undefined]>, n: number) => {
+    expect(seen.length).toBeGreaterThan(0);
+    for (const [, t] of seen) expect(t).toBe(n);
+    for (let i = 1; i < seen.length; i++) expect(seen[i]![0]).toBeGreaterThanOrEqual(seen[i - 1]![0]);
+    expect(seen.at(-1)![0]).toBe(n);
+  };
+
+  it("R426 a: a resumed full Web batch counts the whole batch: total 6 throughout, done never goes down and ends at 6", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three", "Four", "Five", "Six"]) await addWithFile(t);
+    const h = await startZoteroWebImport(deps(), p.id, web());
+    for await (const e of h.progress) {
+      if (e.done >= 3) {
+        h.cancel();
+        break;
+      }
+    }
+    expect((await h.done).state).toBe("cancelled");
+    const { seen, r } = await pairs(await resumeZoteroWebImport(deps(), p.id, h.batchId));
+    expect(r.state).toBe("finished");
+    expectWholeBatch(seen, 6);
+    expect(repo.listSourceIds(p.id)).toHaveLength(6);
+    expect(JSON.parse(await readFile(batchJson(p, 1), "utf8")).total).toBe(6);
+  });
+
+  it("R433 (1): a resumed Web batch sends no opening event: no event of the resumed run is below what the first part finished", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two", "Three", "Four", "Five", "Six"]) await addWithFile(t);
+    const h = await startZoteroWebImport(deps(), p.id, web());
+    for await (const e of h.progress) {
+      if (e.done >= 3) {
+        h.cancel();
+        break;
+      }
+    }
+    const first = await h.done;
+    expect(first.counts.items).toBeGreaterThanOrEqual(3);
+    const { seen, r } = await pairs(await resumeZoteroWebImport(deps(), p.id, h.batchId));
+    expect(r.state).toBe("finished");
+    expect(seen.length).toBeGreaterThan(0);
+    for (const [d] of seen) expect(d).toBeGreaterThanOrEqual(first.counts.items);
+    expectWholeBatch(seen, 6);
+  });
+
+  it("R426 a: a resumed incremental Web batch counts the whole batch (the changed items passed by included)", async () => {
+    const { p, batchId } = await cancelledIncremental();
+    expect(JSON.parse(await readFile(batchJson(p, 2), "utf8")).total).toBe(4);
+    const { seen, r } = await pairs(await resumeZoteroWebImport(deps(), p.id, batchId));
+    expect(r.state).toBe("finished");
+    expectWholeBatch(seen, 4);
+    expect(JSON.parse(await readFile(batchJson(p, 2), "utf8")).total).toBe(4);
+  });
+
+  it("a resumed Web batch asks since its recorded version and records the new one", async () => {
+    const { p, batchId, v1, journaled } = await cancelledIncremental();
+    const rec = JSON.parse(await readFile(batchJson(p, 2), "utf8"));
+    // The first part's read version is in the record as soon as that part's lines are (A5).
+    expect(rec.adapterOptions).toEqual({ zoteroSince: v1, zoteroFiles: true, zoteroReadVersions: [z.libraryVersion(U)] });
+    z.requests.length = 0;
+    const r = await (await resumeZoteroWebImport(deps(), p.id, batchId)).done;
+    expect(r.state).toBe("finished");
+    expect(listings().length).toBeGreaterThan(0);
+    expect(listings().every((q) => q.get("since") === String(v1))).toBe(true);
+    // Items already journaled are passed by: their files are not fetched again.
+    expect(fileRequests()).toHaveLength(4 - journaled);
+    expect(repo.listSourceIds(p.id)).toHaveLength(7);
+    const now = z.libraryVersion(U);
+    expect(zoteroWebSince(repo, p.id, U)).toBe(now);
+    expect(JSON.parse(await readFile(batchJson(p, 2), "utf8")).recordedLibraryVersion).toBe(now);
+    const events = (await auditEvents(p)).map((e) => e.details?.op);
+    expect(events).toContain("project.import-settings.zotero-web");
+  });
+
+  it("a batch record without the new fields resumes as before (a full scan) and records no version", async () => {
+    const { p, batchId, v1 } = await cancelledIncremental();
+    const path = batchJson(p, 2);
+    const { adapterOptions: _gone, ...old } = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify(old, null, 2));
+    z.requests.length = 0;
+    const r = await (await resumeZoteroWebImport(deps(), p.id, batchId)).done;
+    expect(r.state).toBe("finished");
+    expect(listings().length).toBeGreaterThan(0);
+    expect(listings().every((q) => !q.has("since"))).toBe(true);
+    expect(repo.listSourceIds(p.id)).toHaveLength(7);
+    const titles = await Promise.all(repo.listSourceIds(p.id).map(async (id) => (await repo.getSource(p.id, id)).source.title.variants[0]!.value));
+    expect(new Set(titles).size).toBe(7);
+    // The version the first part read at is not known: nothing is recorded, the next run repeats (A5).
+    expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+  });
+
+  it("a resumed batch records the LOWEST version any part read at; what changed in between comes in next run (C1)", async () => {
+    const { p, batchId, journaled } = await cancelledIncremental(2);
+    expect(journaled).toBeGreaterThanOrEqual(2);
+    const read1 = JSON.parse(await readFile(batchJson(p, 2), "utf8")).adapterOptions.zoteroReadVersions;
+    expect(read1).toEqual([z.libraryVersion(U)]);
+    // Between the stop and the resume, in Zotero: one item the first part brought in is edited, another is binned.
+    const journal = (await readFile(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l) as { key: string; sourceId?: string });
+    const [edited, binned] = journal.filter((e) => e.sourceId).map((e) => e.key.replace(/^zotero:/u, ""));
+    z.editItem(U, edited!, { title: "Edited in Zotero between the parts" });
+    z.trash(U, binned!);
+    const r = await (await resumeZoteroWebImport(deps(), p.id, batchId)).done;
+    expect(r.state).toBe("finished");
+    const rec = JSON.parse(await readFile(batchJson(p, 2), "utf8"));
+    expect(rec.adapterOptions.zoteroReadVersions).toEqual([read1[0], z.libraryVersion(U)]);
+    // Recorded: the first part's version, not the resumed part's.
+    expect(zoteroWebSince(repo, p.id, U)).toBe(read1[0]);
+    expect(rec.recordedLibraryVersion).toBe(read1[0]);
+    expect(repo.listSourceIds(p.id)).toHaveLength(7);
+    // The next incremental run asks since that version: the edit comes in, the binned item is yielded as gone.
+    z.requests.length = 0;
+    const next = await (await startZoteroWebImport(deps(), p.id, web())).done;
+    expect(listings().every((q) => q.get("since") === String(read1[0]))).toBe(true);
+    expect(next.counts).toMatchObject({ updated: 1, created: 0, failed: 0 });
+    const titles = await Promise.all(repo.listSourceIds(p.id).map(async (id) => (await repo.getSource(p.id, id)).source.title.variants[0]!.value));
+    expect(titles).toContain("Edited in Zotero between the parts");
+    expect(new Set(titles).size).toBe(7);
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {}, since: read1[0] });
+    const work = join(tmp, "w-gone");
+    await mkdir(work, { recursive: true });
+    const gone: ScanItem[] = [];
+    for await (const i of a.scan(new AbortController().signal, { workDir: async () => work, knownIds: () => new Set(journal.map((e) => `${U}/${e.key.replace(/^zotero:/u, "")}`)) })) if (i.gone) gone.push(i);
+    expect(gone.map((i) => [i.key, i.gone])).toEqual([[`zotero:${binned}`, "bin"]]);
+  });
+
+  it("a batch record without the read versions records nothing", async () => {
+    const { p, batchId, v1 } = await cancelledIncremental();
+    const path = batchJson(p, 2);
+    const rec = JSON.parse(await readFile(path, "utf8"));
+    delete rec.adapterOptions.zoteroReadVersions;
+    await writeFile(path, JSON.stringify(rec, null, 2));
+    const r = await (await resumeZoteroWebImport(deps(), p.id, batchId)).done;
+    expect(r.state).toBe("finished");
+    expect(repo.listSourceIds(p.id)).toHaveLength(7);
+    expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+    const after = JSON.parse(await readFile(path, "utf8"));
+    expect(after.adapterOptions.zoteroReadVersions).toBeUndefined();
+    expect(after.recordedLibraryVersion).toBeUndefined();
+  });
+
+  it("a download that failed before the resume holds since back at the end of the resumed run", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two"]) await addWithFile(t);
+    await (await startZoteroWebImport(deps(), p.id, web())).done;
+    const v1 = z.libraryVersion(U);
+    const { att } = await addWithFile("Fails first");
+    z.failFile(U, att, { api: 500 });
+    for (const t of ["Four", "Five"]) await addWithFile(t);
+    const h = await startZoteroWebImport(deps(), p.id, { ...web(), maxRetries: 0 });
+    // Hold the batch until the failing file's item is journaled, then stop it.
+    for await (const e of h.progress) {
+      if (e.done >= 3) {
+        h.cancel();
+        break;
+      }
+    }
+    await h.done;
+    z.failFile(U, att, null);
+    const r = await (await resumeZoteroWebImport(deps(), p.id, h.batchId)).done;
+    expect(r.state).toBe("finished");
+    const journal = (await readFile(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l));
+    // The failing item (third, newest first) was journaled before the stop; the resumed part had no failure of its own.
+    expect(journal.some((e: { notes?: string[] }) => e.notes?.includes(ZOTERO_WEB_FILE_NOTES.failed))).toBe(true);
+    expect(fileRequests().filter((f) => f.includes(att))).toHaveLength(1);
+    expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+  });
+
+  it("an update adds a new Zotero collection membership and removes none (Z6)", async () => {
+    const p = await project(ZGOV);
+    const a = z.addCollection(U, "Fieldwork");
+    const b = z.addCollection(U, "Theory");
+    const key = z.addItem(U, { itemType: "journalArticle", title: "In two collections", collections: [a, b] });
+    await (await startZoteroWebImport(deps(), p.id, web())).done;
+    const id = repo.listSourceIds(p.id)[0]!;
+    const nameOf = async (ids: string[]) => {
+      const { collections } = await projectCollectionsAndTags(repo, p.id);
+      return ids.map((c) => collections.find((x) => x.id === c)!.name).sort();
+    };
+    expect(await nameOf((await repo.getSource(p.id, id)).source.collectionIds)).toEqual(["Fieldwork", "Theory"]);
+    // In Zotero: out of "Theory", into a new "Methods".
+    const c = z.addCollection(U, "Methods");
+    z.editItem(U, key, { collections: [a, c] });
+    const r = await (await startZoteroWebImport(deps(), p.id, web())).done;
+    expect(r.counts).toMatchObject({ updated: 1, failed: 0 });
+    expect(await nameOf((await repo.getSource(p.id, id)).source.collectionIds)).toEqual(["Fieldwork", "Methods", "Theory"]);
+    // The batch made "Methods" and the membership; its undo takes both away again and keeps the others.
+    const rec = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "batch.json"), "utf8")) as { id: string };
+    const u = await bulk.undoBatch(p.id, rec.id);
+    expect(u.reverted).toMatchObject({ updated: 1 });
+    expect(await nameOf((await repo.getSource(p.id, id)).source.collectionIds)).toEqual(["Fieldwork", "Theory"]);
+    expect((await projectCollectionsAndTags(repo, p.id)).collections.map((x) => x.name).sort()).toEqual(["Fieldwork", "Theory"]);
+  });
+
+  it("the service-free resume of another kind is resumeBatch's", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, folderAdapter(folder));
+    for await (const e of h.progress) {
+      if (e.done >= 2) {
+        h.cancel();
+        break;
+      }
+    }
+    await h.done;
+    const r = await (await resumeZoteroWebImport(deps(), p.id, h.batchId)).done;
+    expect(r.state).toBe("finished");
+    expect(sum(r.counts)).toBe(fx.items);
+  });
+});
+
+describe("R379 (FR-A12): a title search never carries what may be a participant's data", () => {
+  const RECORDING = "Gonzalez 2024 Interview about her eviction";
+  const NOTE = "Titles were not looked up online, because this project holds identifiable data. Look-ups by identifier (DOI, ISBN) are not affected.";
+  /** Every request to OpenAlex's search endpoint (answered with no results). */
+  const recordSearches = (): string[] => {
+    const seen: string[] = [];
+    agent
+      .get("https://api.openalex.org")
+      .intercept({ path: (p: string) => p.startsWith("/works?"), method: "GET" })
+      .reply(200, (o) => (seen.push(String(o.path)), JSON.stringify({ results: [] })), JSON_HEADERS)
+      .persist();
+    return seen;
+  };
+  const m4a = () => {
+    const b = Buffer.alloc(64);
+    b.writeUInt32BE(32, 0);
+    b.write("ftypM4A ", 4, "latin1");
+    return b;
+  };
+  const interviews = async () => {
+    const src = join(tmp, "Interviews");
+    await mkdir(src);
+    await writeFile(join(src, `${RECORDING}.m4a`), m4a());
+    await writeFile(join(src, `${RECORDING}.pdf`), await buildPdf({ lines: ["Transcript pages."] }));
+    return src;
+  };
+
+  it("the bulk engine in a default project: the names never leave, the records keep them, and the report says why", async () => {
+    // The default rules (identifiable data, encryption required), with a legal basis for the files brought in.
+    const p = await project('consent:\n  defaultLegalBasis:\n    manual-upload: "legitimate interest; ethics approval 2026-01"\n', true);
+    const seen = recordSearches();
+    const { handle: h, result } = await run(p, folderAdapter(await interviews()));
+    expect(result.counts.failed).toBe(0);
+    expect(seen).toEqual([]);
+    const titles = await Promise.all(repo.listSourceIds(p.id).map(async (id) => primary((await repo.getSource(p.id, id)).source.title)));
+    expect(titles).toEqual(["Interview about her eviction", "Interview about her eviction"]);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes).toContain(NOTE);
+  });
+
+  it("where the project holds no identifiable data, the PDF's title is searched for as before, and no such note", async () => {
+    const p = await project(GOV.replace("metadata_lookup: []", "metadata_lookup: [openalex]"));
+    const seen = recordSearches();
+    const { handle: h } = await run(p, folderAdapter(await interviews()));
+    expect(seen).toEqual(["/works?search=Interview+about+her+eviction+Gonzalez&per-page=5"]);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes.filter((n) => n.startsWith("Titles were not looked up"))).toEqual([]);
+  });
+
+  it("no note where the project allows no look-up service at all (nothing was withheld for this reason)", async () => {
+    // The default rules (identifiable data), with every look-up service turned off.
+    const p = await project('consent:\n  defaultLegalBasis:\n    manual-upload: "legitimate interest; ethics approval 2026-01"\nprocessing:\n  metadata_lookup: []\n', true);
+    const seen = recordSearches();
+    const { handle: h, result } = await run(p, folderAdapter(await interviews()));
+    expect(result.counts.failed).toBe(0);
+    expect(seen).toEqual([]);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes.filter((n) => n.startsWith("Titles were not looked up"))).toEqual([]);
+  });
+});
+
+describe("FR-A21 (R392): the progress tells the truth about the total", () => {
+  const meta = (key: string): ScanItem => ({ key, files: [], referenceMetadata: { type: "book", title: { variants: [{ lang: "en", kind: "original", value: `Book ${key}` }] } } });
+  const synthetic = (n: number, tell?: { at: number; total: number }): ImportSourceAdapter => ({
+    kind: "csl-json",
+    location: "synthetic",
+    async *scan(_signal, ctx): AsyncGenerator<ScanItem> {
+      for (let i = 0; i < n; i++) {
+        if (tell && i === tell.at) ctx?.total?.(tell.total);
+        yield meta(`k${i}`);
+      }
+    },
+  });
+  async function events(h: Awaited<ReturnType<BulkImport["startBatch"]>>) {
+    const seen: Array<{ done: number; total?: number }> = [];
+    for await (const e of h.progress) seen.push({ done: e.done, ...("total" in e ? { total: e.total } : {}) });
+    await h.done;
+    return seen;
+  }
+  const recPath = (p: Project) => join(lib.root, p.folder, "imports", "batch-0001", "batch.json");
+
+  it("a source with neither count nor total: no progress event carries a total (never done + 1)", async () => {
+    const p = await project();
+    const seen = await events(await bulk.startBatch(p.id, synthetic(4)));
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.at(-1)!.done).toBe(4);
+    for (const e of seen) {
+      expect(e.total).toBeUndefined();
+      expect(e.total).not.toBe(e.done + 1);
+    }
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBeUndefined();
+  });
+
+  it("a source that tells total(5000) after its first item: every later event carries 5,000", async () => {
+    const p = await project();
+    const seen = await events(await bulk.startBatch(p.id, synthetic(3, { at: 1, total: 5000 })));
+    const first = seen.findIndex((e) => e.total !== undefined);
+    expect(first).toBeGreaterThanOrEqual(0); // the feed keeps the latest value: the first events may be read together
+    expect(seen.slice(0, first).every((e) => e.total === undefined)).toBe(true);
+    expect(seen.slice(first).every((e) => e.total === 5000)).toBe(true);
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(5000);
+  });
+
+  it("more items than told: the total grows with the count (never x above y)", async () => {
+    const p = await project();
+    const seen = await events(await bulk.startBatch(p.id, synthetic(4, { at: 0, total: 2 })));
+    for (const e of seen) if (e.total !== undefined) expect(e.total).toBeGreaterThanOrEqual(e.done);
+    expect(seen.at(-1)).toEqual({ done: 4, total: 4 });
+  });
+
+  it("items yielded twice count as done: the total stays the scan's", async () => {
+    const p = await project();
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(_s, ctx): AsyncGenerator<ScanItem> {
+        ctx?.total?.(3);
+        yield meta("a");
+        yield meta("a");
+        yield meta("b");
+      },
+    };
+    const seen = await events(await bulk.startBatch(p.id, adapter));
+    expect(seen.at(-1)).toEqual({ done: 3, total: 3 });
+  });
+
+  it("a resumed batch starts from the total it recorded, and is corrected when the source tells a new one", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(3, { at: 0, total: 3 }));
+    await h.done;
+    const reopen = async () => writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    await reopen();
+    const kept = await events(await bulk.resumeBatch(p.id, h.batchId, synthetic(3)));
+    // R433: a resume sends no opening event, and this one tells no total and has no new item: it may send none.
+    expect(kept.every((e) => e.total === 3)).toBe(true);
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(3);
+    await reopen();
+    const told = await events(await bulk.resumeBatch(p.id, h.batchId, synthetic(4, { at: 0, total: 4 })));
+    expect(told.at(-1)).toEqual({ done: 4, total: 4 });
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(4);
+  });
+
+  /** A resumed part that tells the whole batch's total and asks `skip` (twice) for each key; skipped keys are yielded only when `yieldSkipped`. */
+  const skipping = (n: number, yieldSkipped: boolean): ImportSourceAdapter => ({
+    kind: "csl-json",
+    location: "synthetic",
+    async *scan(_signal, ctx): AsyncGenerator<ScanItem> {
+      ctx?.total?.(n);
+      for (let i = 0; i < n; i++) {
+        const passed = ctx?.skip?.(`k${i}`) === true;
+        ctx?.skip?.(`k${i}`);
+        if (passed && !yieldSkipped) continue;
+        yield meta(`k${i}`);
+      }
+    },
+  });
+
+  it("R426 a: keys an adapter passes by through skip and never yields count as done, once each", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(3));
+    await h.done;
+    await writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    const seen = await events(await bulk.resumeBatch(p.id, h.batchId, skipping(5, false)));
+    for (let i = 1; i < seen.length; i++) expect(seen[i]!.done).toBeGreaterThanOrEqual(seen[i - 1]!.done);
+    expect(seen.at(-1)).toEqual({ done: 5, total: 5 });
+    expect((JSON.parse(await readFile(recPath(p), "utf8")) as { total?: number }).total).toBe(5);
+  });
+
+  it("R426 a: keys passed by through skip and yielded all the same are not counted twice", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(3));
+    await h.done;
+    await writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    const seen = await events(await bulk.resumeBatch(p.id, h.batchId, skipping(5, true)));
+    for (const e of seen) expect(e.done).toBeLessThanOrEqual(5);
+    expect(seen.at(-1)).toEqual({ done: 5, total: 5 });
+  });
+
+  const signal = () => new AbortController().signal;
+  const archives: Array<[string, Buffer]> = [
+    ["an empty ZIP", buildZip([])],
+    ["a ZIP of folders only", buildZip([{ name: "a/", data: "" }, { name: "a/b/", data: "" }])],
+  ];
+  for (const [what, zip] of archives) {
+    it(`R426 e: ${what} counts 0, as many as it yields; the dry run and the run agree`, async () => {
+      const p = await project();
+      const src = await folderWith(`r426e-${what.replace(/\W+/gu, "-")}`, { "x.zip": zip });
+      const za = zipAdapter(join(src, "x.zip"));
+      expect(await za.count!(signal())).toBe(0);
+      expect((await bulk.dryRun(p.id, za)).items).toBe(0);
+      const seen = await events(await bulk.startBatch(p.id, za));
+      expect(seen.at(-1)!.done).toBe(0);
+      for (const e of seen) if (e.total !== undefined) expect(e.total).toBe(0);
+    });
+  }
+
+  it("R426 e: a folder holding an empty ZIP ends with done equal to its total, and its dry run agrees", async () => {
+    const p = await project();
+    const src = await folderWith("r426e-folder", {
+      "one.pdf": await buildPdf({ title: "One", lines: ["One"], extra: "r426e-1" }),
+      "two.pdf": await buildPdf({ title: "Two", lines: ["Two"], extra: "r426e-2" }),
+      "empty.zip": buildZip([]),
+    });
+    expect(await folderAdapter(src).count!(signal())).toBe(2);
+    expect((await bulk.dryRun(p.id, folderAdapter(src))).items).toBe(2);
+    const seen = await events(await bulk.startBatch(p.id, folderAdapter(src)));
+    expect(seen.at(-1)).toEqual({ done: 2, total: 2 });
+  });
+
+  it("R426 e: an archive that cannot be read counts 1 and yields its one unreadable item", async () => {
+    const p = await project();
+    const src = await folderWith("r426e-unreadable", { "broken.zip": Buffer.from("not an archive at all") });
+    const za = zipAdapter(join(src, "broken.zip"));
+    expect(await za.count!(signal())).toBe(1);
+    const dry = await bulk.dryRun(p.id, za);
+    expect(dry.items).toBe(1);
+    expect(dry.unreadable).toHaveLength(1);
+    const seen = await events(await bulk.startBatch(p.id, za));
+    expect(seen.at(-1)).toEqual({ done: 1, total: 1 });
+  });
+
+  /** An adapter that says when its scan starts and yields its items only once `open` is called. */
+  const gated = (n: number) => {
+    let started!: () => void;
+    let open!: () => void;
+    const scanStarted = new Promise<void>((r) => (started = r));
+    const gate = new Promise<void>((r) => (open = r));
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(): AsyncGenerator<ScanItem> {
+        started();
+        await gate;
+        for (let i = 0; i < n; i++) yield meta(`k${i}`);
+      },
+    };
+    return { adapter, scanStarted, open };
+  };
+  /** The event already sent when the scan starts, or "none". */
+  const opening = async (h: Awaited<ReturnType<BulkImport["startBatch"]>>, scanStarted: Promise<void>) => {
+    await scanStarted;
+    const it = h.progress[Symbol.asyncIterator]();
+    return Promise.race([it.next().then((x) => (x.done ? "none" : x.value)), new Promise<"none">((r) => setTimeout(() => r("none"), 100))]);
+  };
+
+  it("R433 (1): a first run opens with its event before the scan yields anything", async () => {
+    const p = await project();
+    const g = gated(2);
+    const h = await bulk.startBatch(p.id, g.adapter);
+    expect(await opening(h, g.scanStarted)).toEqual({ done: 0 });
+    g.open();
+    expect((await h.done).state).toBe("finished");
+  });
+
+  it("R433 (1): a resumed batch sends no opening event; its first event carries what the journal holds", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, synthetic(2));
+    await h.done;
+    await writeFile(recPath(p), JSON.stringify({ ...(JSON.parse(await readFile(recPath(p), "utf8")) as object), state: "running" }));
+    const g = gated(4);
+    const r = await bulk.resumeBatch(p.id, h.batchId, g.adapter);
+    expect(await opening(r, g.scanStarted)).toBe("none");
+    g.open();
+    const seen = await events(r);
+    for (const e of seen) expect(e.done).toBeGreaterThanOrEqual(2);
+    expect(seen.at(-1)!.done).toBe(4);
+  });
+
+  it("R433 (2): a key yielded and then asked through skip is not counted again", async () => {
+    const p = await project();
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(_s, ctx): AsyncGenerator<ScanItem> {
+        ctx?.total?.(2);
+        yield { key: "k0", files: [], unreadable: "not readable" }; // journaled at once (a failed item)
+        if (ctx?.skip?.("k0") !== true) throw new Error("k0 should be in the journal");
+        yield meta("k1");
+      },
+    };
+    const seen = await events(await bulk.startBatch(p.id, adapter));
+    for (const e of seen) expect(e.done).toBeLessThanOrEqual(2);
+    expect(seen.at(-1)).toEqual({ done: 2, total: 2 });
+  });
+
+  for (const bad of [2.5, Number.NaN, -1]) {
+    it(`R426 c: a total of ${bad} is not a total: no event carries one`, async () => {
+      const p = await project();
+      const seen = await events(await bulk.startBatch(p.id, synthetic(3, { at: 0, total: bad })));
+      expect(seen.at(-1)!.done).toBe(3);
+      for (const e of seen) expect(e.total).toBeUndefined();
+    });
+  }
 });

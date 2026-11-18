@@ -10,12 +10,13 @@ import type { Deps } from "../deps.js";
 import { IndexHandle } from "../index/db.js";
 import { rebuildIndex } from "../index/rebuild.js";
 import { createIndexSink } from "../index/sink.js";
+import { appendJobRecords } from "../job-journal.js";
 import { createLibrary, type Library } from "../library.js";
 import { PolicyDeniedError, type Repo } from "../repo/index.js";
 import { decryptBytes } from "../repo/io.js";
 import { openTestRepo } from "../repo/testing.js";
 import { WorkerClient, devWorkerPython, startWorker } from "../worker-client.js";
-import { AcknowledgementRequiredError, COOKIES_ACKNOWLEDGEMENT, plainReason } from "./errors.js";
+import { AcknowledgementRequiredError, COOKIES_ACKNOWLEDGEMENT, plainReason, toolMissingReason } from "./errors.js";
 import { createLinkCapture, type LinkCapture } from "./link-capture.js";
 import { classifyUrl } from "./platforms.js";
 import { stripSnapshot } from "./snapshot.js";
@@ -148,6 +149,11 @@ describe("stripSnapshot", () => {
       _filename: "/home/a/b", filepath: "/home/a/b", nested: { csrf_token: "t", Authorization: "a", ok: 1, list: [{ set_cookie: "x", keep: 2 }] },
     });
     expect(s).toEqual({ id: "x", title: "t", nested: { ok: 1, list: [{ keep: 2 }] } });
+  });
+
+  it("an address in the metadata that cannot be decoded is kept without its query; the rest is stripped as usual (R379, WB1 I4)", () => {
+    const s = stripSnapshot({ uploader_url: "https://www.tiktok.com/@%ZZ?x=1", channel_url: "https://www.youtube.com/@%E0%A4%A", webpage_url: "https://www.tiktok.com/@%ZZ/video/123", title: "t" });
+    expect(s).toEqual({ uploader_url: "https://www.tiktok.com/@%ZZ", channel_url: "https://www.youtube.com/@%E0%A4%A", webpage_url: "https://www.tiktok.com/@%ZZ/video/123", title: "t" });
   });
 });
 
@@ -446,6 +452,22 @@ describe("captureUrls", () => {
   });
 });
 
+describe("a queue ended while its download runs (Task 63 fix round 2, I3)", () => {
+  it("the late result is discarded, nothing is stored, and the next links are not tried", async () => {
+    const p = await project();
+    let ended = false;
+    const submit = client.submit.bind(client);
+    vi.spyOn(client, "submit").mockImplementation(async (...args) => {
+      const r = await submit(...args);
+      ended = true; // the queue is ended (a lock) while this download was running
+      return r;
+    });
+    const outs = await capture.captureUrls(p.id, [YT, IG], { transcribe: false }, () => {}, { cancelled: () => ended });
+    expect(outs).toEqual([{ url: YT, status: "failed", errorCode: "CANCELLED", reason: expect.any(String) }]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+});
+
 describe("with the real Python media worker", () => {
   const venv = devWorkerPython();
   it.skipIf(!existsSync(venv))("captures through the worker's own yt-dlp handling (fake yt-dlp on PATH)", async () => {
@@ -550,6 +572,16 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
     expect((sf.source.provenance.platformSnapshot as { author?: unknown }).author).toMatchObject({ uniqueId: "fake.dancer", nickname: "Fake Dancer" });
   });
 
+  it("a legal basis of invisible characters is no legal basis: LEGAL_BASIS_REQUIRED, not POLICY_DENIED (R391 c)", async () => {
+    const p = await project(GDPR_GOV(), true);
+    for (const legalBasis of ["\u200b", "\u2800", "\u0301"]) {
+      const out = await capture.captureUrl(p.id, YT, { transcribe: false, legalBasis });
+      expect(out, JSON.stringify(legalBasis)).toMatchObject({ status: "failed", errorCode: "LEGAL_BASIS_REQUIRED" });
+    }
+    expect(worker.submitted).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
   it("I1: an identifiable GDPR project without a legal basis fails plainly before downloading; with the project default or an override it captures", async () => {
     const p = await project(GDPR_GOV(), true);
     const out = await capture.captureUrl(p.id, YT, { transcribe: false });
@@ -594,11 +626,53 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
     await once(YT, { transcribe: false }, "failed");
   });
 
+  it("I2 per path (FR-101): needs review, incomplete (partial and no media) and a missing legal basis each leave exactly one audited capture decision", async () => {
+    const p = await project();
+    let before = 0;
+    const once = async (projectId: string, folder: string, url: string, status: string, errorCode?: string) => {
+      const out = await capture.captureUrl(projectId, url, { transcribe: false });
+      expect([url, out.status, out.errorCode]).toEqual([url, status, errorCode]);
+      const evs = await captureEvents(folder);
+      expect([status, errorCode, evs.length - before]).toEqual([status, errorCode, 1]);
+      before = evs.length;
+      const last = evs.at(-1)!;
+      expect(last.decision?.result).toBe("allow");
+      expect(last.details).toMatchObject({ op: "capture.link", platform: "youtube", cookies: false });
+      return out;
+    };
+    // Needs review: the source is stored with its review entry; still one capture decision.
+    const review = await once(p.id, p.folder, YT_CONFLICT, "needs-review");
+    expect((await repo.getSource(p.id, review.sourceId!)).verification["/issued"]!.status).toBe("conflict");
+    // Incomplete: media saved, then an error.
+    process.env.FAKE_TOOL_MODE = "partial";
+    const partial = await once(p.id, p.folder, YT, "incomplete", "RATE_LIMITED");
+    expect((await repo.getSource(p.id, partial.sourceId!)).source.availability.status).toBe("incomplete");
+    // Incomplete: the post's data without any media file.
+    await repo.deleteSource(p.id, partial.sourceId!);
+    process.env.FAKE_TOOL_MODE = "infoonly";
+    const noMedia = await once(p.id, p.folder, YT, "incomplete", "NO_MEDIA");
+    expect((await repo.getSource(p.id, noMedia.sourceId!)).source.availability.status).toBe("incomplete");
+    delete process.env.FAKE_TOOL_MODE;
+    // A missing legal basis: the capture decision (allowed) is audited once, the store's refusal once, and nothing is
+    // downloaded or stored.
+    const q = await project(GDPR_GOV(), true);
+    before = 0;
+    const submitted = worker.submitted.length;
+    await once(q.id, q.folder, YT, "failed", "LEGAL_BASIS_REQUIRED");
+    const denies = (await auditEvents(q.folder)).filter((e) => e.decision?.result === "deny");
+    expect(denies.map((e) => [e.action, e.details?.op])).toEqual([["store", "capture.link"]]);
+    expect(worker.submitted.length).toBe(submitted);
+    expect(repo.listSourceIds(q.id)).toEqual([]);
+  });
+
   it("I3: capture jobs are never resumed, leftovers are swept, and the work folder is private", async () => {
     const p = await project();
-    // a capture.download job left running by a crash
-    handle.db.prepare("INSERT INTO jobs (id, project_id, kind, status, payload_json, created_at) VALUES ('j-old', ?, 'capture.download', 'running', ?, ?)")
-      .run(p.id, JSON.stringify({ type: "capture.download", input: YT, output: join(lib.root, ".tmp", "capture-old"), params: {} }), new Date().toISOString());
+    // a capture.download job left running by a crash (its journal record, R31; the row was never written)
+    const at = new Date().toISOString();
+    await appendJobRecords(lib.root, p.folder, null, [
+      { v: 1, id: "j-old", projectId: p.id, kind: "capture.download", status: "running", createdAt: at, updatedAt: at,
+        job: { type: "capture.download", input: YT, output: join(lib.root, ".tmp", "capture-old"), params: {} } },
+    ]);
     const stale = join(lib.root, ".tmp", "capture-old");
     await mkdir(stale, { recursive: true });
     await writeFile(join(stale, "aoTest00001.info.json"), '{"http_headers":{"Cookie":"SID=x"}}');
@@ -758,5 +832,74 @@ describe("R116: one per-platform lane per library", () => {
     await Promise.all([a.captureUrls(p.id, urls("A"), { transcribe: false }), b.captureUrls(p.id, urls("B"), { transcribe: false })]);
     expect(downloads).toBe(8);
     expect(overlaps).toEqual([]);
+  });
+});
+
+describe("a missing tool (Task 48a, R126)", () => {
+  async function withMissing(...missing: string[]): Promise<LinkCapture> {
+    const w = await startToolWorker({ missing });
+    closers.push(() => w.close());
+    return createLinkCapture({ repo, worker: new WorkerClient({ repo, worker: w, index: { db: handle.db }, pollMs: 5 }), index: handle });
+  }
+
+  it("a video link without the video downloader names it and says how to get it; nothing is saved", async () => {
+    const p = await project();
+    const out = await (await withMissing("video-downloader")).captureUrl(p.id, YT, { transcribe: false });
+    expect(out).toEqual({ url: YT, status: "failed", errorCode: "TOOL_NOT_INSTALLED", tool: "video-downloader", reason: toolMissingReason("video-downloader") });
+    expect(out.reason).toMatch(/video downloader is not installed/i);
+    expect(out.reason).toMatch(/the Optional tools screen/);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("a photo post without the image downloader names it", async () => {
+    const p = await project();
+    const out = await (await withMissing("image-downloader")).captureUrl(p.id, IG, { transcribe: false });
+    expect(out).toMatchObject({ status: "failed", errorCode: "TOOL_NOT_INSTALLED", tool: "image-downloader" });
+    expect(out.reason).toMatch(/image downloader is not installed/i);
+  });
+
+  it("a capture whose speech model is missing saves the source and names the model in its note", async () => {
+    const p = await project();
+    const out = await (await withMissing("speech-small")).captureUrl(p.id, YT, { transcribe: true, transcribeModel: "small" });
+    expect(out.status).toBe("created");
+    expect(out.tool).toBe("speech-small");
+    expect(out.reason).toMatch(/small speech model is not installed/i);
+    expect(out.reason).toMatch(/the Optional tools screen/);
+  });
+
+  it("the plain reason for the code is no longer the generic one, and names no path or address", () => {
+    expect(plainReason("TOOL_NOT_INSTALLED")).not.toBe(plainReason("SOMETHING_ELSE"));
+    expect(plainReason("TOOL_NOT_INSTALLED")).toMatch(/the Optional tools screen/);
+    for (const t of ["video-downloader", "image-downloader", "speech-tiny", "speech-large-v3", "ffmpeg", "ocr", "unknown-thing"]) {
+      expect(toolMissingReason(t)).toMatch(/not installed/);
+      expect(toolMissingReason(t)).not.toMatch(/:\/\/|[\\/]home/);
+    }
+    expect(toolMissingReason("speech-large-v3")).toMatch(/large-v3 speech model/);
+  });
+});
+
+describe("the default speech model (R158)", () => {
+  it("a capture that transcribes without naming a model asks for the shared default", async () => {
+    const { DEFAULT_SPEECH_MODEL } = await import("@ao/shared");
+    const p = await project();
+    const out = await capture.captureUrl(p.id, YT, { transcribe: true });
+    expect(out.status).toBe("created");
+    const job = worker.submitted.find((j) => j.type === "audio.transcribe");
+    expect(job?.params.model).toBe(DEFAULT_SPEECH_MODEL);
+    expect(DEFAULT_SPEECH_MODEL).toBe("medium");
+  });
+});
+
+describe("the speech model names in sentences (R158)", () => {
+  it("every shared speech model is named, and nothing else is taken for one", async () => {
+    const { SPEECH_MODELS } = await import("@ao/shared");
+    for (const m of SPEECH_MODELS) expect(toolMissingReason(`speech-${m}`)).toMatch(new RegExp(`^The ${m} speech model is not installed`));
+    expect(toolMissingReason("speech-huge")).toMatch(/^A tool this needs/);
+  });
+
+  it("the sentences carry no list of model names of their own", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const src = await readFile(new URL("./errors.ts", import.meta.url), "utf8");
+    expect(src).not.toMatch(/large-v3|\btiny\b/);
   });
 });

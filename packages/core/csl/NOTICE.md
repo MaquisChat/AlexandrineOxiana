@@ -22,7 +22,19 @@ The citation processor is citeproc-js (Frank Bennett), npm `citeproc` 2.4.63, li
 Common Public Attribution License 1.0 (or later) or the GNU Affero General Public License 3.0 (or later), at the user's option (dual-licensed;
 see its `LICENSE`).
 
-**Open decision before distribution:** citeproc-js may be used under either the CPAL-1.0 or the
-AGPL-3.0, and which of the two this application takes (with its attribution or source-offer
-duties) is a decision for the project owner that has not been made yet (R87). It must be made
-before the application is distributed.
+**Licence decision:** on 2026-11-11 the project owner chose to use citeproc-js under the CPAL-1.0 (R124).
+The full CPAL-1.0 text is in `LICENSE-CPAL-1.0.txt` next to this file, saved unchanged from
+<https://raw.githubusercontent.com/spdx/license-list-data/main/text/CPAL-1.0.txt>
+(sha256 `54cef60295bdffd5d41904338632538db1f3cdcd4c5f7ea5bb021d04eef14d92`).
+
+citeproc-js, its `LICENSE` and its upstream repository (<https://github.com/Juris-M/citeproc-js>) carry no
+filled-in Exhibit B, so the licence (Section 14(c)) requires no attribution display. We show this notice
+regardless, on the About screen:
+
+> Copyright (c) 2009-2019 Frank Bennett. citeproc-js, <https://github.com/juris-m/citeproc-js>, used under the Common Public Attribution License 1.0.
+
+The source of citeproc-js is available under the CPAL at the repository above (version 2.4.63 of the npm
+package `citeproc`). This application makes no Modifications to it. What the licence requires, with quotes
+and section numbers, is in `docs/adr/0012-citations.md`.
+
+The project's own licence is not yet chosen; that is an owner decision before any publication.

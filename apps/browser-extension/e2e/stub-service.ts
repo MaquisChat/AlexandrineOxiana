@@ -7,7 +7,12 @@
  *  - Origin: every request carries the paired chrome-extension:// origin (pairing: any extension
  *    origin), except GET /projects, where Chrome sends none for a host-permitted request — there a
  *    missing Origin is accepted, a present but different one is not;
- *  - POST bodies are JSON (content-type application/json) of at most 32 MB (bytes).
+ *  - POST bodies are JSON (content-type application/json) of at most 32 MB (bytes);
+ *  - Find and acquire (R348 f, as F20a built it): POST /find/browser/waiting takes exactly `{}` and answers
+ *    `{ waiting }` (settable); POST /find/browser/file/<ticket> takes ONLY `application/pdf` (any other type gets the
+ *    real service's framework answer, 400 "The request body is not valid JSON."), a ticket of the list (else 404
+ *    browser-not-waiting), and records exactly the bytes and headers it received; it answers `fileAnswer` (settable),
+ *    and a "held" ends the wait (the list is then empty).
  */
 import { randomBytes } from "node:crypto";
 import http from "node:http";
@@ -20,8 +25,21 @@ export interface Received {
   body?: unknown;
 }
 
+export interface ReceivedFile {
+  ticket: string;
+  headers: http.IncomingHttpHeaders;
+  bytes: Buffer;
+}
+
 export interface StubService {
   port: number;
+  /** The works waiting for a PDF from the browser, as the list answers them. */
+  waiting: Array<{ ticket: string; label: string }>;
+  /** The file route's 200 answer. */
+  fileAnswer: { outcome: string; sentence: string };
+  /** The bodies the list was asked with. */
+  waitingAsks: unknown[];
+  files: ReceivedFile[];
   code: string;
   requests: Received[];
   captures: Received[];
@@ -46,7 +64,11 @@ export async function startStubService(): Promise<StubService> {
   const linkLists: Received[] = [];
   const refusals: string[] = [];
   const noOriginGets: string[] = [];
+  const files: ReceivedFile[] = [];
+  const waitingAsks: unknown[] = [];
   let port = 0;
+  // Read and set through the returned object (stub.waiting = [...]).
+  const self = { waiting: [] as Array<{ ticket: string; label: string }>, fileAnswer: { outcome: "held", sentence: "Sent. The file waits for your check in the app's review queue." } };
 
   const send = (res: http.ServerResponse, status: number, body: unknown, origin?: string) => {
     res.statusCode = status;
@@ -85,6 +107,18 @@ export async function startStubService(): Promise<StubService> {
         res.setHeader("access-control-allow-headers", "authorization, content-type");
         return res.end();
       }
+      // The file route: the PDF's bytes, never parsed as JSON (R348 f 2).
+      const fileRoute = /^\/find\/browser\/file\/([^/]*)$/.exec(path);
+      if (req.method === "POST" && fileRoute) {
+        if (origin !== pairedOrigin) return refuse(res, 403, "FORBIDDEN", "not the paired extension");
+        if (!token || req.headers.authorization !== `Bearer ${token}`) return refuse(res, 401, "UNAUTHORIZED", "A valid token is needed.");
+        if (!/^application\/pdf(\s*;|$)/i.test(req.headers["content-type"] ?? "")) return refuse(res, 400, "BAD_REQUEST", "The request body is not valid JSON.");
+        const ticket = fileRoute[1] ?? "";
+        if (!self.waiting.some((w) => w.ticket === ticket)) return refuse(res, 404, "NOT_FOUND", "That work is no longer waiting for a PDF from your browser. Nothing was kept.");
+        files.push({ ticket, headers: req.headers, bytes: Buffer.concat(chunks) });
+        if (self.fileAnswer.outcome === "held") self.waiting = self.waiting.filter((w) => w.ticket !== ticket);
+        return send(res, 200, self.fileAnswer, origin);
+      }
       let body: unknown;
       if (req.method === "POST") {
         if (!/^application\/json(\s*;|$)/i.test(req.headers["content-type"] ?? "")) return refuse(res, 415, "UNSUPPORTED_MEDIA_TYPE", `content-type ${req.headers["content-type"]}`);
@@ -122,6 +156,11 @@ export async function startStubService(): Promise<StubService> {
           origin,
         );
       }
+      if (route === "POST /find/browser/waiting") {
+        waitingAsks.push(body);
+        if (typeof body !== "object" || body === null || Array.isArray(body) || Object.keys(body).length) return refuse(res, 400, "VALIDATION", "This request takes an empty object ({}) and nothing else.");
+        return send(res, 200, { waiting: self.waiting }, origin);
+      }
       if (route === "POST /capture/browser") {
         captures.push(r);
         return send(res, 200, { sourceId: "src-0001", status: "created" }, origin);
@@ -139,7 +178,7 @@ export async function startStubService(): Promise<StubService> {
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   port = (server.address() as AddressInfo).port;
-  return {
+  return Object.assign(self, {
     port,
     code,
     requests,
@@ -147,6 +186,8 @@ export async function startStubService(): Promise<StubService> {
     linkLists,
     refusals,
     noOriginGets,
+    waitingAsks,
+    files,
     token: () => token,
     origin: () => pairedOrigin,
     close: () =>
@@ -154,5 +195,5 @@ export async function startStubService(): Promise<StubService> {
         server.close(() => resolve());
         server.closeAllConnections();
       }),
-  };
+  });
 }

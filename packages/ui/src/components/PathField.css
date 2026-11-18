@@ -1,0 +1,22 @@
+/* A path field with the native picker's button beside it (D12). Tokens only. */
+.ao-pathfield {
+  display: inline-flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.ao-pathfield__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  align-items: center;
+}
+
+.ao-pathfield__row input {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
+.ao-pathfield__problem {
+  color: var(--deny);
+}

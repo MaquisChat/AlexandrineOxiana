@@ -53,4 +53,12 @@ export interface Extracted {
  * dispatcher canonicalises them and adds those found in `text`. */
 export interface RawExtract extends Omit<Extracted, "identifiers"> {
   ids?: { dois?: string[]; isbns?: string[]; arxiv?: string[] };
+  /**
+   * Every embedded title the file carries, as found, in the order the extractor reads them (PDF: XMP, Info; MOBI: EXTH
+   * 503, the record-0 full name, the PalmDB name; HTML: the meta title, `<title>`), before the R394 filter that gives
+   * `title`; only when one was found. Read by Find and acquire's file check alone, for its signs of another kind or
+   * version of document ("Front Matter" behind an XMP "untitled", R410 b, R425 a); the dispatcher drops it, so the
+   * import never sees it.
+   */
+  rawTitles?: string[];
 }

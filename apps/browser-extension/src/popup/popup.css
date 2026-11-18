@@ -112,12 +112,59 @@ button.link {
   display: none;
 }
 
+/* The app is not answering on the saved port (R171): both causes and what to do. */
+.notice {
+  border: 1px solid var(--border);
+  border-inline-start: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Why a typed port was not saved (beside its field, named by aria-describedby). */
+.error {
+  font-weight: 600;
+}
+
 .pending {
   border-top: 1px solid var(--border);
   padding-top: 8px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* Find and acquire (R348 i): the work waiting for a PDF from this browser, first in the popup. */
+.find {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+h2 {
+  font-size: 15px;
+  margin: 0;
+}
+
+.find-work {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+/* A long title, or one without spaces, wraps inside the popup's width. */
+.find-work p,
+.find-said {
+  overflow-wrap: anywhere;
+}
+
+.find-said:empty {
+  display: none;
 }
 
 :focus-visible {

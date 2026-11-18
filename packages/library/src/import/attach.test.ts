@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import fs, { readFileSync, writeFileSync } from "node:fs";
+import fsp from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -7,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { AuditEvent, SourceFile } from "@ao/core";
 import { MockAgent } from "undici";
 import { DEFAULT_GOVERNANCE, LOCATION_NEEDS_ENCRYPTION, findDuplicate, parseGovernanceWithWarnings } from "@ao/core";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ExifTool } from "exiftool-vendored";
 import { FIXTURE_DOI, buildCameraTiff, buildDoiPdf, buildPdf, tinyPng } from "../../../../tests/fixtures/generate.mjs";
 import { KeyRing } from "../crypto/keys.js";
@@ -24,7 +26,8 @@ import { openTestRepo } from "../repo/testing.js";
 import { WorkerClient } from "../worker-client.js";
 import { stubWorker } from "../worker-testing.js";
 import { decryptBytes } from "../repo/io.js";
-import { ACCEPTED_EXTENSIONS, LOCATION_REASON, acceptedType, createAttach, type Attach } from "./attach.js";
+import { ACCEPTED_EXTENSIONS, LOCATION_REASON, NOT_DOWNLOADED_REASON, acceptedType, createAttach, type Attach } from "./attach.js";
+import { findSidecars } from "./sidecar.js";
 import { ProxyQueue } from "./proxies.js";
 import { gpsOf, locationTags, proxyStub } from "./proxy-testing.js";
 import { AUTO_ACCEPT_THRESHOLD, mayHaveLocation, resolveItem } from "./resolve.js";
@@ -1086,5 +1089,283 @@ processing:
     expect(acceptedType({ ext: "oga", mime: "audio/ogg" })).toEqual({ ext: "oga", mime: "audio/ogg", kind: "audio" });
     expect(acceptedType({ ext: "png", mime: "image/png" })).toEqual({ ext: "png", mime: "image/png", kind: "image" });
     expect(acceptedType({ ext: "xml", mime: "application/xml" })).toBeUndefined();
+  });
+});
+
+describe("cloud-drive folders: attach reads only what `readable` allows (Task W2)", () => {
+  /** Every call that opens or reads a file's bytes, through each module's own binding (syncBuiltinESMExports). */
+  function readSpies(): (path: string) => unknown[][] {
+    const spies = [
+      vi.spyOn(fsp, "open"),
+      vi.spyOn(fsp, "readFile"),
+      vi.spyOn(fsp, "copyFile"),
+      vi.spyOn(fsp, "cp"),
+      vi.spyOn(fs, "createReadStream"),
+      vi.spyOn(fs, "open"),
+      vi.spyOn(fs, "readFile"),
+      vi.spyOn(fs, "openSync"),
+      vi.spyOn(fs, "readFileSync"),
+      vi.spyOn(fs, "copyFile"),
+      vi.spyOn(fs, "copyFileSync"),
+    ];
+    syncBuiltinESMExports();
+    return (path) => spies.flatMap((s) => s.mock.calls as unknown[][]).filter((args) => String(args[0]) === path);
+  }
+  afterEach(() => {
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+  });
+
+  it("attach refuses a non-local file before reading it", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const path = await put("online.pdf", await buildPdf({ title: "Online only", extra: "online" }));
+    const asked: string[] = [];
+    const opened = readSpies();
+    const guarded = createAttach({ repo, http, readable: async (q) => (asked.push(q), false) });
+    const [r] = await guarded.attachFiles(p.id, [path]);
+    expect(r).toEqual({ path, outcome: "failed", reason: NOT_DOWNLOADED_REASON });
+    expect(NOT_DOWNLOADED_REASON).toBe("Not downloaded to this Mac. It comes in once it is downloaded.");
+    expect(asked).toEqual([path]);
+    expect(opened(path)).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("a non-local sidecar is not read; the item comes in without it", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const path = await put("scan0002.pdf", await buildPdf({ lines: ["Some page text without a title that we could use."], extra: "w2" }));
+    const ris = await put("scan0002.ris", "TY  - JOUR\nTI  - Weaving and Kinship in Highland Markets\nER  - \n");
+    const opened = readSpies();
+    const guarded = createAttach({ repo, http, readable: async (q) => q !== ris });
+    const [r] = await guarded.attachFiles(p.id, [path]);
+    expect(r!.sourceId).toEqual(expect.any(String));
+    expect(opened(path).length).toBeGreaterThan(0); // the spies see this module's reads
+    expect(opened(ris)).toEqual([]);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.title.variants[0]?.value ?? "").not.toBe("Weaving and Kinship in Highland Markets");
+  });
+
+  it("readable is asked again immediately before each open: the sniff, the hash, the metadata, the copy (A6)", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const path = await put("each.pdf", await buildPdf({ title: "Each open", extra: "each" }));
+    const asked: string[] = [];
+    const opened = readSpies();
+    const [ok] = await createAttach({ repo, http, readable: async (q) => (asked.push(q), true) }).attachFiles(p.id, [path]);
+    const fullReads = opened(path).length;
+    expect(ok!.sourceId).toEqual(expect.any(String));
+    expect(asked.filter((q) => q === path).length).toBeGreaterThanOrEqual(4);
+    // Evicted after the sniff and the hash: refused at the next open, nothing stored.
+    const p2 = await project(NO_LOOKUP_GOV);
+    const path2 = await put("evicted.pdf", await buildPdf({ title: "Evicted later", extra: "evicted2" }));
+    let n = 0;
+    const [r] = await createAttach({ repo, http, readable: async (q) => q !== path2 || ++n <= 2 }).attachFiles(p2.id, [path2]);
+    expect(r).toEqual({ path: path2, outcome: "failed", reason: NOT_DOWNLOADED_REASON });
+    expect(repo.listSourceIds(p2.id)).toEqual([]);
+    const reads = opened(path2).length;
+    expect(reads).toBeGreaterThan(0);
+    expect(reads).toBeLessThan(fullReads); // the sniff and the hash happened; the copy never opened the file
+  });
+
+  it("attach and findSidecars without `readable` behave as before", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const path = await put("scan0003.pdf", await buildPdf({ lines: ["Some page text without a title that we could use."], extra: "w2b" }));
+    const ris = await put("scan0003.ris", "TY  - JOUR\nTI  - Weaving and Kinship in Highland Markets\nER  - \n");
+    expect(await findSidecars(path)).toEqual([ris]);
+    expect(await findSidecars(path, async () => true)).toEqual([ris]);
+    expect(await findSidecars(path, async () => false)).toEqual([]);
+    const [r] = await createAttach({ repo, http }).attachFiles(p.id, [path]);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.title.variants[0]!.value).toBe("Weaving and Kinship in Highland Markets");
+    expect(sf.source.provenance.identification!.method).toBe("sidecar");
+  });
+});
+
+describe("cloud-drive folders: attach's collection and origin (Task W3)", () => {
+  it("attach without the new options behaves as before: drag-and-drop provenance, no external key, no collection", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const path = await put("plain.pdf", await buildPdf({ title: "Dropped as before", extra: "w3-plain" }));
+    const [r] = await attach.attachFiles(p.id, [path]);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.provenance.tool.name).toBe("drag-and-drop");
+    expect(sf.source.provenance.externalKeys).toBeUndefined();
+    expect(sf.source.collectionIds).toEqual([]);
+    expect(r).not.toHaveProperty("noCollection");
+  });
+
+  it("origin names the watch in the provenance, set when the source is created; the collection comes in the same change", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const c = await repo.createCollection(p.id, "From the drive");
+    const watchId = "01900000-0000-7000-8000-000000000001";
+    const path = await put("watched.pdf", await buildPdf({ title: "From a watched folder", extra: "w3-origin" }));
+    const before = (await auditEvents(p.folder)).length;
+    const [r] = await attach.attachFiles(p.id, [path], { collectionId: c.id, origin: { watchId } });
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.provenance.tool).toEqual({ name: "watched-folder", version: expect.any(String) });
+    expect(sf.source.provenance.externalKeys).toEqual({ "watched-folder": watchId });
+    expect(sf.source.provenance.captureMethod).toBe("manual_upload");
+    expect(sf.source.collectionIds).toEqual([c.id]);
+    // One change: the source's creation (no separate membership change).
+    const after = (await auditEvents(p.folder)).slice(before);
+    expect(after.map((e) => e.details?.op).filter((o) => o !== "source.create")).toEqual([]);
+    expect(new Set(after.map((e) => e.details?.txn)).size).toBe(1);
+  });
+
+  it("a collection that no longer exists: the source comes in without one and the outcome says so", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const c = await repo.createCollection(p.id, "Soon gone");
+    await repo.deleteCollection(p.id, c.id);
+    const path = await put("nocoll.pdf", await buildPdf({ title: "No collection", extra: "w3-nocoll" }));
+    const [r] = await attach.attachFiles(p.id, [path], { collectionId: c.id });
+    expect(r).toMatchObject({ outcome: expect.stringMatching(/created|needs-review/u), noCollection: true });
+    expect((await repo.getSource(p.id, r!.sourceId!)).source.collectionIds).toEqual([]);
+  });
+
+  it("onto a source (a further file), origin and collection change nothing about the source's record", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const watchId = "01900000-0000-7000-8000-000000000002";
+    const first = await put("v1.pdf", await buildPdf({ title: "Version one", extra: "w3-v1" }));
+    const [r] = await attach.attachFiles(p.id, [first], { origin: { watchId } });
+    const before = await repo.getSource(p.id, r!.sourceId!);
+    const second = await put("v2.pdf", await buildPdf({ title: "Version two", extra: "w3-v2" }));
+    const [r2] = await attach.attachFiles(p.id, [second], { toSourceId: r!.sourceId!, origin: { watchId } });
+    expect(r2).toMatchObject({ outcome: "attached", sourceId: r!.sourceId });
+    const after = await repo.getSource(p.id, r!.sourceId!);
+    expect(after.assets.filter((a) => a.role === "original")).toHaveLength(2);
+    expect(after.source.provenance).toEqual(before.source.provenance);
+    expect(after.source.collectionIds).toEqual(before.source.collectionIds);
+  });
+});
+
+describe("R379 (FR-A12): a title search never carries what may be a participant's data", () => {
+  const RECORDING = "Gonzalez 2024 Interview about her eviction";
+  /**
+   * A project under the default rules (it says it holds identifiable data; encryption required), with a
+   * default legal basis for dropped files so that attach can store them.
+   */
+  const defaultProject = async () =>
+    (
+      await repo.createProject({
+        name: `D${Math.random().toString(36).slice(2, 7)}`,
+        governanceYaml: 'consent:\n  defaultLegalBasis:\n    manual-upload: "legitimate interest; ethics approval 2026-01"\n',
+        encryption: { enabled: true, passphrase: "pw" },
+      })
+    ).project;
+  /** Every request to OpenAlex's search endpoint (answered with no results). */
+  const recordSearches = (): string[] => {
+    const seen: string[] = [];
+    openalex()
+      .intercept({ path: searchPath, method: "GET" })
+      .reply(200, (o) => (seen.push(String(o.path)), JSON.stringify({ results: [] })), JSON_HEADERS)
+      .persist();
+    return seen;
+  };
+  const m4a = () => {
+    const b = Buffer.alloc(64);
+    b.writeUInt32BE(32, 0);
+    b.write("ftypM4A ", 4, "latin1");
+    return b;
+  };
+  const resolveIn = async (p: { id: string }, input: Parameters<typeof resolveItem>[0]) =>
+    resolveItem(input, { projectId: p.id, patterns: [], lookup: await lookupContextFor(repo, p.id, http) });
+  const expectNameOnDevice = (r: Awaited<ReturnType<typeof resolveItem>>) => {
+    expect(r.draft.title.variants[0]!.value).toBe("Interview about her eviction");
+    expect(r.draft.creators[0]).toMatchObject({ literal: "Gonzalez" });
+    expect(r.draft.issued).toBe("2024");
+    expect(r.evidence.method).toBe("filename");
+    for (const f of ["/title", "/creators", "/issued"]) expect(r.fieldEvidence).toContainEqual(expect.objectContaining({ field: f, source: { kind: "filename" } }));
+  };
+
+  it("the reviewer's probe: a recording under the default rules is never searched for; its name still fills the record", async () => {
+    const p = await defaultProject();
+    const seen = recordSearches();
+    const r = await resolveIn(p, { path: await put(`${RECORDING}.m4a`, m4a()), mime: "audio/mp4" });
+    expect(seen).toEqual([]);
+    expectNameOnDevice(r);
+  });
+
+  it("audio, video and image files are never searched for, even where the project holds no identifiable data", async () => {
+    const p = await project();
+    const seen = recordSearches();
+    for (const [name, mime, bytes] of [
+      [`${RECORDING}.m4a`, "audio/mp4", m4a()],
+      [`${RECORDING}.mp4`, "video/mp4", m4a()],
+      [`${RECORDING}.png`, "image/png", tinyPng()],
+    ] as const) {
+      const r = await resolveIn(p, { path: await put(name, bytes), mime });
+      expect(seen, mime).toEqual([]);
+      expectNameOnDevice(r);
+    }
+  });
+
+  it("a PDF named after the interview: no search in a default project; searched as before where the project holds no identifiable data", async () => {
+    const pdf = await buildPdf({ lines: ["Scanned pages without a usable text layer title."] });
+    const d = await defaultProject();
+    const seen = recordSearches();
+    expectNameOnDevice(await resolveIn(d, { path: await put(`${RECORDING}.pdf`, pdf), mime: "application/pdf" }));
+    expect(seen).toEqual([]);
+
+    const open = await project();
+    await resolveIn(open, { path: await put(`open/${RECORDING}.pdf`, pdf), mime: "application/pdf" });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("search=Interview+about+her+eviction+Gonzalez");
+  });
+
+  it("a PDF with a DOI in a default project: the DOI is still looked up", async () => {
+    const p = await defaultProject();
+    const seen = recordSearches();
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    const r = await resolveIn(p, { path: await put("doi-article.pdf", await buildDoiPdf()), mime: "application/pdf" });
+    expect(r.draft.identifiers.doi).toBe(FIXTURE_DOI);
+    expect(r.evidence.method).toBe("identifier+lookup");
+    expect(r.fieldEvidence).toContainEqual(expect.objectContaining({ field: "/title", source: { kind: "lookup", provider: "crossref" } }));
+    expect(seen).toEqual([]);
+  });
+
+  it("an embedded title (step 6) and a reference manager's title in a default project are not searched for", async () => {
+    const p = await defaultProject();
+    const seen = recordSearches();
+    const slides = await resolveIn(p, { path: await put("conference_slides.pdf", await slidesPdf()), mime: "application/pdf" });
+    expect(slides.draft.title.variants[0]!.value).toBe("Field Notes on Market Days");
+    const pdf = await put("scan0001.pdf", await buildPdf({ lines: ["Some page text without a title that we could use."] }));
+    const ris = await put("scan0001.ris", "TY  - JOUR\nTI  - Weaving and Kinship in Highland Markets\nAU  - Adebayo, Ngozi\nPY  - 2009\nER  - \n");
+    const side = await resolveIn(p, { path: pdf, mime: "application/pdf", sidecarPaths: [ris] });
+    expect(side.draft.title.variants[0]!.value).toBe("Weaving and Kinship in Highland Markets");
+    expect(side.evidence.method).toBe("sidecar");
+    // A record with no file (a reference manager's sidecar alone).
+    await resolveIn(p, { sidecarPaths: [ris] });
+    expect(seen).toEqual([]);
+  });
+
+  it("R385 c: a look-up context built by hand without titleSearchAllowed makes no title search (fail-closed)", async () => {
+    const p = await project();
+    const seen = recordSearches();
+    // The context of a project with no identifiable data, but without the flag.
+    const { titleSearchAllowed: _flag, ...byHand } = await lookupContextFor(repo, p.id, http);
+    expect(byHand.policy?.identifiability.containsIdentifiable).toBe(false);
+    const r = await resolveItem(
+      { path: await put(`${RECORDING}.pdf`, await buildPdf({ lines: ["Scanned pages without a usable text layer title."] })), mime: "application/pdf" },
+      { projectId: p.id, patterns: [], lookup: byHand },
+    );
+    expect(seen).toEqual([]);
+    expectNameOnDevice(r);
+  });
+
+  it("an item with no file is not a media file: where the project holds no identifiable data, its title is searched for", async () => {
+    const p = await project();
+    const seen = recordSearches();
+    const ris = await put("record.ris", "TY  - JOUR\nTI  - Weaving and Kinship in Highland Markets\nAU  - Adebayo, Ngozi\nPY  - 2009\nER  - \n");
+    await resolveIn(p, { sidecarPaths: [ris] });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("search=Weaving+and+Kinship+in+Highland+Markets");
+  });
+
+  it("through attach (drop on the library) in a default project: the recording's and the PDF's names never leave", async () => {
+    const p = await defaultProject();
+    const seen = recordSearches();
+    const rs = await attach.attachFiles(p.id, [await put(`${RECORDING}.m4a`, m4a()), await put(`${RECORDING}.pdf`, await buildPdf({ lines: ["Transcript pages."] }))]);
+    for (const r of rs) {
+      expect(r.sourceId, r.reason).toBeDefined();
+      expect((await repo.getSource(p.id, r.sourceId!)).source.title.variants[0]!.value).toBe("Interview about her eviction");
+    }
+    expect(seen).toEqual([]);
   });
 });

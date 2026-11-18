@@ -6,6 +6,7 @@
 import { useId, useState, type FormEvent } from "react";
 import type { Tag } from "../api/library";
 import { CodeSwatch } from "./CodeSwatch";
+import { useReadableNote } from "./ReadableNameNote";
 import { UserText } from "./UserText";
 import "./library.css";
 
@@ -22,6 +23,8 @@ export interface TagListProps {
   /** Deletes a workspace tag from every project. */
   onDeleteWorkspace: (id: string) => void;
   onCreate: (name: string, scope: "project" | "workspace") => void;
+  /** R362 h: the project is encrypted: every tag name field says its names can be read without the passphrase. */
+  encrypted?: boolean;
 }
 
 const HEX = /^#[0-9a-fA-F]{6}$/;
@@ -35,9 +38,11 @@ interface TagRowProps {
   onRename?: (name: string) => void;
   onDelete?: () => void;
   workspace?: boolean;
+  encrypted?: boolean;
 }
 
-function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelete, workspace = false }: TagRowProps) {
+function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelete, workspace = false, encrypted }: TagRowProps) {
+  const readable = useReadableNote(encrypted);
   const what = workspace ? "workspace tag" : "tag";
   const [mode, setMode] = useState<"view" | "rename" | "delete">("view");
   const [name, setName] = useState(tag.name);
@@ -81,6 +86,7 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
             dir="auto"
             value={name}
             autoFocus
+            aria-describedby={readable.describedBy}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Escape") setMode("view");
@@ -90,6 +96,7 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
           <button type="button" onClick={() => setMode("view")}>
             Cancel
           </button>
+          {readable.note}
         </form>
       )}
       {mode === "delete" && !readOnly && (
@@ -123,7 +130,8 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
   );
 }
 
-export function TagList({ tags, workspaceTags, selectedId, onSelect, readOnly = false, onRename, onDelete, onRenameWorkspace, onDeleteWorkspace, onCreate }: TagListProps) {
+export function TagList({ tags, workspaceTags, selectedId, onSelect, readOnly = false, onRename, onDelete, onRenameWorkspace, onDeleteWorkspace, onCreate, encrypted }: TagListProps) {
+  const readable = useReadableNote(encrypted);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
   const [scope, setScope] = useState<"project" | "workspace">("project");
@@ -145,7 +153,7 @@ export function TagList({ tags, workspaceTags, selectedId, onSelect, readOnly = 
       {tags.length === 0 && workspaceTags.length === 0 && <p className="ao-muted">No tags yet.</p>}
       <ul className="ao-plain-list">
         {tags.map((t, i) => (
-          <TagRow key={t.id} tag={t} position={i + 1} selected={selectedId === t.id} onSelect={() => toggle(t.id)} readOnly={readOnly} onRename={(n) => onRename(t.id, n)} onDelete={() => onDelete(t.id)} />
+          <TagRow key={t.id} tag={t} position={i + 1} selected={selectedId === t.id} onSelect={() => toggle(t.id)} readOnly={readOnly} onRename={(n) => onRename(t.id, n)} onDelete={() => onDelete(t.id)} encrypted={encrypted} />
         ))}
       </ul>
       {workspaceTags.length > 0 && (
@@ -163,6 +171,7 @@ export function TagList({ tags, workspaceTags, selectedId, onSelect, readOnly = 
                 readOnly={readOnly}
                 onRename={(n) => onRenameWorkspace(t.id, n)}
                 onDelete={() => onDeleteWorkspace(t.id)}
+                encrypted={encrypted}
               />
             ))}
           </ul>
@@ -175,13 +184,14 @@ export function TagList({ tags, workspaceTags, selectedId, onSelect, readOnly = 
       {creating && !readOnly && (
         <form onSubmit={create} className="ao-inline-form">
           <label htmlFor={fieldId}>Tag name</label>
-          <input id={fieldId} dir="auto" value={name} onChange={(e) => setName(e.target.value)} />
+          <input id={fieldId} dir="auto" value={name} aria-describedby={readable.describedBy} onChange={(e) => setName(e.target.value)} />
           <label htmlFor={scopeId}>For</label>
           <select id={scopeId} value={scope} onChange={(e) => setScope(e.target.value as "project" | "workspace")}>
             <option value="project">This project</option>
             <option value="workspace">Every project (workspace tag)</option>
           </select>
           <button type="submit">Create</button>
+          {readable.note}
         </form>
       )}
     </section>

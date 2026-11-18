@@ -18,7 +18,8 @@ import { startStubService, type StubService } from "./stub-service.js";
 
 test.describe.configure({ mode: "serial" });
 
-const DIST = fileURLToPath(new URL("../dist", import.meta.url));
+// dist/, or the folder playwright.config.ts checked from AO_EXTENSION_DIR (the unzipped download, Task 65).
+const DIST = process.env.AO_E2E_EXTENSION_DIR || fileURLToPath(new URL("../dist", import.meta.url));
 const HOST = "www.instagram.com";
 const POST_URL = `https://${HOST}/p/C0FAKEPOST1/`;
 const PROFILE_URL = `https://${HOST}/fieldnotes.example/`;

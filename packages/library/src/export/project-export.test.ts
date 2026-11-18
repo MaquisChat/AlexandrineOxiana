@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, stat, symlink, utimes, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, readdir, realpath, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { ExifTool } from "exiftool-vendored";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { newId, type Annotation, type Project, type SourceDraft, type SourceFile } from "@ao/core";
@@ -151,6 +151,36 @@ describe("exportProjectOpenFormats", () => {
     expect(text).toContain("page 3");
     expect(text).toContain("my \\*comment\\*");
     expect(text).toContain("A standalone note with \\`code\\`");
+  });
+
+  it("an annotation with no author (an imported one Zotero gave none for, D22) is signed with its time alone", async () => {
+    const p = await makeProject(kit);
+    const pdf = await scratchFile(kit, "y.pdf", "%PDF-1.4");
+    const draft: SourceDraft = {
+      projectIds: [p.id],
+      type: "article-journal",
+      title: { variants: [{ lang: "en", kind: "original", value: "Authorless" }] },
+      creators: [],
+      identifiers: {},
+      caseAttributes: {},
+      availability: { status: "available" },
+      collectionIds: [],
+      tagIds: [],
+      participantIds: [],
+    };
+    const at = "2027-03-12T10:00:00.000Z";
+    await kit.repo.createSource(p.id, draft, [{ path: pdf, role: "original", handling: "copy" }], {
+      provenance: { captureMethod: "manual_upload", capturedAt: at, tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+      annotations: (sourceId, assets): Annotation[] => [
+        { id: newId(), sourceId, kind: "highlight", quote: "nobody's line", anchors: [{ kind: "pdf", id: newId(), assetId: assets[0]!.id, page: 1, rects: [{ x: 0, y: 0, w: 1, h: 1 }] }], createdAt: at },
+        { id: newId(), sourceId, kind: "note", body: "nobody's note", anchors: [], createdAt: at },
+      ],
+    });
+    const r = await exportProjectOpenFormats(kit.repo, p.id, await outDir());
+    const md = (await walk(r.path)).find((n) => n.endsWith(".md"))!;
+    const text = await readFile(join(r.path, md), "utf8");
+    expect(text.match(/^\*2027-03-12T10:00:00\.000Z\*$/gmu)).toHaveLength(2);
+    expect(text).not.toContain("undefined");
   });
 
   it("pseudonymised file names: no participant's handle in any exported file or folder name", async () => {
@@ -409,5 +439,54 @@ captureMethods: [manual_upload]
     expect(md).not.toContain("<i>");
     expect(md).not.toContain("<b>");
     expect(md).toContain("\\*region\\*&lt;i&gt;");
+  });
+});
+
+describe("R379 (FR-A14, I4): no absolute path leaves the computer in an open-format export", () => {
+  /** Every string value in a JSON document. */
+  const stringsOf = (v: unknown): string[] =>
+    typeof v === "string" ? [v] : Array.isArray(v) ? v.flatMap(stringsOf) : v && typeof v === "object" ? Object.values(v).flatMap(stringsOf) : [];
+
+  it("the reviewer's probe: a file linked from outside — source.json holds no absolutePath, no path from / or .., nothing of the folder's name", async () => {
+    const p = await makeProject(kit, OPEN_GOV);
+    const pdf = await scratchFile(kit, "interview-notes.pdf", "%PDF-1.4 linked in place");
+    const sf = await addSource(kit, p, { title: "Linked notes", files: [{ path: pdf, role: "original", handling: "link" }] });
+    expect(sf.assets.find((a) => a.role === "original")?.linked?.absolutePath).toBe(pdf);
+    const r = await exportProjectOpenFormats(kit.repo, p.id, await outDir());
+    const jsonPath = (await walk(r.path)).find((n) => n.endsWith("/source.json"))!;
+    const text = await readFile(join(r.path, jsonPath), "utf8");
+    const tmpName = kit.tmp.slice(kit.tmp.lastIndexOf("/") + 1);
+    expect(text).not.toContain("absolutePath");
+    expect(text).not.toContain("libraryRelativePath");
+    expect(text).not.toContain(tmpName);
+    for (const s of stringsOf(JSON.parse(text))) {
+      expect(s.startsWith("/"), s).toBe(false);
+      expect(s.startsWith(".."), s).toBe(false);
+    }
+    // The file itself is in the export, and the record says the asset was linked in place.
+    const exported = (JSON.parse(text) as SourceFile).assets.find((a) => a.role === "original")!;
+    expect(exported.linked).toBeUndefined();
+    expect(exported).toMatchObject({ path: "files/interview-notes.pdf", linkedInPlace: true });
+    expect(await readFile(join(r.path, dirname(jsonPath), "files", "interview-notes.pdf"), "utf8")).toBe("%PDF-1.4 linked in place");
+    // The library's own record is untouched.
+    expect((await kit.repo.getSource(p.id, sf.source.id)).assets.find((a) => a.role === "original")?.linked?.absolutePath).toBe(pdf);
+  });
+
+  it("a whole export of a project with a linked file: no exported text file holds the temporary folder's absolute path", async () => {
+    const p = await makeProject(kit, OPEN_GOV);
+    const pdf = await scratchFile(kit, "linked.pdf", "%PDF-1.4 linked");
+    await addSource(kit, p, { title: "Linked", citationKey: "linked2026", files: [{ path: pdf, role: "original", handling: "link" }] });
+    await addSource(kit, p, { title: "Copied", files: [{ path: await scratchFile(kit, "copied.pdf", "%PDF-1.4 copied"), role: "original", handling: "copy" }] });
+    const r = await exportProjectOpenFormats(kit.repo, p.id, await outDir());
+    const real = await realpath(kit.tmp);
+    let checked = 0;
+    for (const n of await walk(r.path)) {
+      if (!/\.(?:json|md|bib|txt)$/u.test(n)) continue;
+      const text = await readFile(join(r.path, n), "utf8");
+      expect(text, n).not.toContain(kit.tmp);
+      expect(text, n).not.toContain(real);
+      checked++;
+    }
+    expect(checked).toBeGreaterThanOrEqual(5);
   });
 });

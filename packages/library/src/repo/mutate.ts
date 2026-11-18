@@ -40,6 +40,7 @@ import type { Readable } from "node:stream";
 import { decryptStream, encryptStream } from "../crypto/format.js";
 import { copyFileAtomic, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
+import { scrubPaths } from "../app-settings.js";
 
 const SMALL_FILE_BYTES = 256 * 1024;
 import type { AuditInput } from "./audit-store.js";
@@ -48,6 +49,7 @@ import { AuditStore } from "./audit-store.js";
 import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo, type ContainmentCache } from "./io.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
+import { AUDIT_REASONS_FILE, reasonMac, sealedReasonLine } from "./audit-reasons.js";
 import { TxnLog } from "./txn.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
 
@@ -86,6 +88,14 @@ export interface InternalMutateOptions extends MutateOptions {
   unauditedDeny?: boolean;
   /** More details recorded on the allow audit event(s), e.g. the reason given for loosening governance; a function is called once `fn` has run. */
   auditDetails?: Record<string, unknown> | (() => Record<string, unknown>);
+  /**
+   * R362 b: the reason the researcher typed, whose audit details (`auditedReason`) record only that it was given and
+   * its keyed digest (`reasonMac`, R369 b) in an encrypted project. There its text is sealed into `<Project>/audit-reasons/reasons.jsonl`, keyed by the
+   * entry's seq and hash, in this change, under the write-ahead marker and before the entry (the commit point): a
+   * crash before the entry undoes the line with the change, a crash after it keeps both. Ignored in a project that is
+   * not encrypted (the details carry the reason as typed) and when empty.
+   */
+  sealedReason?: string;
   /**
    * Only for repairing an unreadable governance.yaml (governance edit, R98): the policy evaluated
    * when the file cannot be read or parsed, instead of denying everything.
@@ -356,8 +366,10 @@ async function governanceOf(core: RepoCore, st: ProjectState) {
  * Step 1 of a mutation: evaluates each request with the researcher's tz and `now` (R17). A
  * governance file that cannot be read or parsed denies (fail closed); conditions the project cannot
  * honour deny. A deny is audited and thrown as PolicyDeniedError. Caller holds `core.serial`.
+ * Exported (package-internal) only so a backup can be decided again at its commit point (R138), in
+ * the same write-queue turn as its commit; nothing else here changes.
  */
-async function decide(
+export async function decide(
   core: RepoCore,
   st: ProjectState,
   reqs: MutateRequest | MutateRequest[],
@@ -373,12 +385,14 @@ async function decide(
   try {
     cfg = await governanceOf(core, st);
   } catch (e) {
-    cfgError = `Policy could not be evaluated: ${e instanceof Error ? e.message : String(e)}`;
+    // Error text from the file system can name absolute paths: scrubbed here, where it is captured,
+    // before it becomes a recorded reason (Task 50 N5; the researcher's own text is never touched).
+    cfgError = `Policy could not be evaluated: ${scrubPaths(e instanceof Error ? e.message : String(e), [core.root])}`;
     if (fallback) cfg = fallback;
   }
   const allowed: Array<{ req: PolicyRequest; d: PolicyDecision }> = [];
   for (const r of Array.isArray(reqs) ? reqs : [reqs]) {
-    const req: PolicyRequest = { ...r, projectId: st.project.id, actor: r.actor ?? core.actor, now: r.now ?? at, tz: r.tz ?? core.tz };
+    const req: PolicyRequest = { ...r, projectId: st.project.id, actor: r.actor ?? core.actor, now: r.now ?? at, tz: r.tz ?? core.zoneOf(st.project) };
     let d = enforceConditions(core, st, cfg ? evaluate(cfg, req) : denyOf(cfgError!));
     const refused = runRefuse(refuse, d, req);
     if (refused) d = denyOf(refused, d.warnings);
@@ -482,15 +496,27 @@ export async function runMutation<T>(
       await tx.guard(join(st.audit.dir, "x"));
       await appendChanges(core.abs(`${st.rel}/changes`), tx.changes, seal, seal ? undefined : CHANGE_LOG_MODE, onPlan);
       maybeCrash("before-audit");
+      const sealedReason = seal && opts.sealedReason ? opts.sealedReason : undefined;
       for (const [i, { req, d }] of allowed.entries()) {
         if (i > 0) maybeCrash("between-audit");
-        await st.audit.append({
+        const input: AuditInput = {
           ...core.auditBase(st, at),
           action: req.action,
           entity: opts.entityFor?.(i) ?? tx.auditEntity,
           decision: auditDecision(d),
           details: { op, ...(typeof opts.auditDetails === "function" ? opts.auditDetails() : opts.auditDetails), txn: log.id, changes: tx.changes.length, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
-        }, onPlan);
+        };
+        if (sealedReason !== undefined) {
+          // Only for an entry that records the reason by its keyed digest (R369 b); never beside the text or an unkeyed digest.
+          const { key, keyId } = core.key(st);
+          const d = input.details as Record<string, unknown>;
+          const mac = d.reasonMac;
+          if (mac !== reasonMac(key, sealedReason) || d.reason !== undefined || d.reasonSha256 !== undefined) throw new Error("a sealed reason needs an audit entry that records only its keyed digest");
+          const next = st.audit.peek(input);
+          await tx.appendLine(`${st.rel}/${AUDIT_REASONS_FILE}`, sealedReasonLine(key, keyId, projectId, { seq: next.seq, hash: next.hash, reasonMac: mac, text: sealedReason }));
+          maybeCrash("after-sealed-reason");
+        }
+        await st.audit.append(input, onPlan);
       }
       maybeCrash("before-marker-delete");
     } catch (err) {

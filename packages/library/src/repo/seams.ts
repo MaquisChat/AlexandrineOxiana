@@ -4,7 +4,26 @@
  */
 
 /** Points in a mutation where a simulated crash can be injected. */
-export type CrashPoint = "before-changes" | "before-audit" | "between-audit" | "before-marker-delete" | "torn-audit";
+export type CrashPoint =
+  | "before-changes"
+  | "before-audit"
+  | "between-audit"
+  | "before-marker-delete"
+  | "torn-audit"
+  /** Issuing a new recovery code (R141): before the staged key file is written. */
+  | "recovery-before-stage"
+  /** After the commit point, before the staged key file is made active. */
+  | "recovery-before-activate"
+  /** The active key file replaced, the staged one not yet removed. */
+  | "recovery-mid-activate"
+  /** Activation finished, before the code is returned. */
+  | "recovery-after-activate"
+  /** Task 50: an audit append failed after the action, before the project is marked as needing attention. */
+  | "before-attention-mark"
+  /** R362 b: a reason's sealed text is written (under the marker), its audit entry not yet. */
+  | "after-sealed-reason"
+  /** R362 b: the library's log: a reason's sealed text is written, the library's entry not yet. */
+  | "library-reason-before-entry";
 
 export const seams: {
   crashAt?: CrashPoint;
@@ -14,6 +33,10 @@ export const seams: {
   beforeMkdir?: (abs: string) => Promise<void>;
   /** Makes every audit append for this project id fail (until cleared). */
   failAuditAppendFor?: string;
+  /** Receives a newly issued recovery code before the change is written (crash tests, Task 61). */
+  onRecoveryCode?: (code: string) => void;
+  /** Makes removing the staged key file fail after the new one is active (M-b, Task 61). */
+  failRecoveryCleanup?: boolean;
 } = {};
 
 /** Thrown at a crash point; the mutation does NOT roll back (as if the process died). */

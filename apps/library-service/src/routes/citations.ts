@@ -8,9 +8,9 @@ import { Anchor, type CitationFormat } from "@ao/core";
 import { CUSTOM_STYLE_MAX_BYTES, REFMAN_FORMATS, addCustomStyle, citeSources, exportBibliography, exportRefman, listStyles, writeRefmanExport, type BibliographySelection, type CiteRef, type RefmanFormat } from "@ao/library";
 import { badRequest } from "../errors.js";
 import { bodyOf, optBool, optObj, optStr, queryOf, str, strArray, type Ctx, type Obj } from "./util.js";
+import { isLocalAbsolutePath } from "./local-path.js";
 
 const FORMATS: CitationFormat[] = ["text", "html", "rtf"];
-const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 
 function format(b: Obj): CitationFormat {
   const f = optStr(b, "format", 8) ?? "text";
@@ -68,7 +68,7 @@ export function registerCitations(app: FastifyInstance, ctx: Ctx): void {
     else if (sel && typeof sel.tagId === "string") selection = { tagId: str(sel, "tagId", 64) };
     else throw badRequest('"selection" must give sourceIds, a collectionId or a tagId.');
     const dest = optStr(b, "dest", 4096);
-    if (dest !== undefined && !isAbsolute(dest)) throw badRequest('"dest" must be an absolute path.');
+    if (dest !== undefined && !isLocalAbsolutePath(dest)) throw badRequest('"dest" must be an absolute path.');
     const lang = optStr(b, "lang", 35);
     const r = await exportBibliography(s.repo, projectId, selection, str(b, "style", 200), format(b), dest, lang ? { lang } : {});
     // `path` is either the folder the researcher chose or the library's Exports/ folder: shown library-relative there.
@@ -86,7 +86,7 @@ export function registerCitations(app: FastifyInstance, ctx: Ctx): void {
     const includeTags = optBool(b, "includeTags") === true;
     const outputPath = optStr(b, "outputPath", 4096);
     if (outputPath !== undefined) {
-      if (!isAbsolute(outputPath)) throw badRequest('"outputPath" must be an absolute path.');
+      if (!isLocalAbsolutePath(outputPath)) throw badRequest('"outputPath" must be an absolute path.');
       const r = await writeRefmanExport(s.repo, projectId, sourceIds, fmt as RefmanFormat, outputPath, { includeTags });
       return { exported: r.exported, excluded: r.excluded, notes: r.notes, path: outputPath };
     }

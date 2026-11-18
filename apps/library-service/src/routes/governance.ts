@@ -8,17 +8,31 @@
  * Also the two governance controls that keep files (Task 36): protocol approval documents dropped
  * onto the protocol record (stored under `<Project>/protocol/`, sealed in encrypted projects), and
  * retention — the raw originals due under `retention.rawDataDestroyAfter`, and their destruction
- * (only those due, only with `confirm: true`), answered with the destruction certificate.
+ * (only those due, only with `confirm: true`), answered with the destruction certificate. A
+ * certificate is always shown as written at the destruction together with its amendments and the
+ * resulting status of its backups step (R147): in the answer to a destruction, and in the list of
+ * the project's certificates.
  */
 import { userInfo } from "node:os";
 import type { FastifyInstance } from "fastify";
 import { isAlias, isNode, parseDocument, visit } from "yaml";
-import { effectivePolicy, parseGovernance } from "@ao/core";
-import { GOVERNANCE_MAX_BYTES, addProtocolDocuments, destroyRaw, listProtocolDocuments, researcherName, retentionDue, scrubPaths } from "@ao/library";
+import { GovernanceParseError, effectivePolicy, parseGovernance, parseGovernanceWithWarnings } from "@ao/core";
+import type { GovernanceReadability } from "@ao/shared";
+import {
+  GOVERNANCE_MAX_BYTES,
+  addProtocolDocuments,
+  destroyRaw,
+  listDestructions,
+  listProtocolDocuments,
+  researcherName,
+  retentionDue,
+  scrubPaths,
+  setProjectTimeZone,
+} from "@ao/library";
 import { badRequest } from "../errors.js";
 import { bodyOf, optBool, optStr, projectParam, str, strArray, type Ctx } from "./util.js";
+import { isLocalAbsolutePath } from "./local-path.js";
 
-const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 
 const whoAmI = (): string => {
   try {
@@ -52,13 +66,60 @@ export function safeYamlCheck(text: string): void {
   }
 }
 
+/**
+ * Whether the policy engine can read these rules (R379 FR-A18, R58): when it cannot, every request
+ * in the project is refused, so the answer says so with the engine's own messages, one line per
+ * problem (the key and what is wrong; no path, no stack); readable rules carry their non-fatal
+ * warnings (a key in an old spelling, an exception that waives nothing).
+ */
+export function governanceReadability(yaml: string, roots: Iterable<string>): GovernanceReadability {
+  // R397 c, d: one line; no control characters or marks that reorder or hide text (taken out before
+  // the paths are scrubbed, so they cannot split a path); no path; at most MAX_LINE_CHARS (R397 b).
+  const clean = (t: string) => {
+    const line = scrubPaths(t.replace(/\s+/g, " ").replace(HIDDEN_CHARS, ""), roots).trim();
+    // Cut by whole characters (code points), never half a surrogate pair (R421 c).
+    const chars = [...line];
+    return chars.length > MAX_LINE_CHARS ? `${chars.slice(0, MAX_LINE_CHARS - 1).join("")}…` : line;
+  };
+  try {
+    const { config, warnings } = parseGovernanceWithWarnings(yaml);
+    effectivePolicy(config);
+    return { readable: true, issues: [], warnings: capped(warnings.map(clean).filter(Boolean)) };
+  } catch (err) {
+    let issues: string[] = [];
+    if (err instanceof GovernanceParseError && err.issues.length) issues = err.issues;
+    else if (err instanceof Error) issues = [err.message.split("\n")[0]!.replace(/^governance\.yaml:\s*/, "").replace(/:\s*$/, "")];
+    issues = issues.map(clean).filter(Boolean);
+    return { readable: false, issues: issues.length ? capped(issues) : ["the rules file could not be read"], warnings: [] };
+  }
+}
+
+/** At most this many issues (or warnings) are sent, then "and N more." (R397 b). */
+const MAX_LINES = 20;
+/** Each issue or warning is at most this many characters (code points), cut with "…" (R397 b). */
+const MAX_LINE_CHARS = 300;
+/**
+ * Taken out of issues and warnings (R397 d, R421 c): every control and format character (\p{Cc},
+ * \p{Cf}: C0 and C1 controls, the soft hyphen, the bidi marks, embeddings, overrides and isolates,
+ * the zero-width characters, the tag characters U+E0000–E007F), the invisible fillers U+034F,
+ * U+115F, U+1160 and U+3164, and the variation selectors U+FE00–FE0F.
+ */
+const HIDDEN_CHARS = /[\p{Cc}\p{Cf}\u034F\u115F\u1160\u3164\uFE00-\uFE0F]/gu;
+
+const capped = (lines: string[]): string[] => (lines.length > MAX_LINES ? [...lines.slice(0, MAX_LINES), `and ${lines.length - MAX_LINES} more.`] : lines);
+
+/** The single issue when the project's rules file is missing (a link to nothing cannot be opened: R421 b) (R397 a). */
+export const GOVERNANCE_MISSING_ISSUE = "The rules file (governance.yaml) is missing from this project's folder.";
+/** The single issue when something that cannot be opened is in the rules file's place: a folder, a file without permission (R397 e), a link to a file that is not there (R421 b). */
+export const GOVERNANCE_UNOPENABLE_ISSUE = "The rules file could not be opened.";
+
 export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
   app.get("/projects/:id/governance", async (req, reply) => {
     const s = state.requireSession();
     const projectId = projectParam(ctx, req);
-    const { yaml, sha256 } = await s.repo.getGovernance(projectId);
+    const { yaml, sha256, file } = await s.repo.getGovernance(projectId);
     // The version an edit is made from: send it back as If-Match (or `baseSha256`).
     void reply.header("ETag", `"${sha256}"`);
     let violations: unknown[] = [];
@@ -67,7 +128,14 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     } catch {
       // unreadable rules: every request is denied; the text is still shown for fixing
     }
-    return { yaml, sha256, violations };
+    // R397 a, e: no file (or one that cannot be opened) is not an empty file: the engine refuses everything until rules are put back.
+    const readability: GovernanceReadability =
+      file === "missing"
+        ? { readable: false, issues: [GOVERNANCE_MISSING_ISSUE], warnings: [] }
+        : file === "unopenable"
+          ? { readable: false, issues: [GOVERNANCE_UNOPENABLE_ISSUE], warnings: [] }
+          : governanceReadability(yaml, state.roots);
+    return { yaml, sha256, violations, ...readability };
   });
 
   app.put("/projects/:id/governance", async (req) => {
@@ -90,7 +158,9 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     safeYamlCheck(yaml);
     const r = await s.repo.setGovernance(projectId, yaml, { baseSha256, ...(reason ? { reason } : {}) });
     state.publishState();
-    return { violations: r.violations, loosened: r.loosened, sha256: r.sha256 };
+    // R282 f: the project's Find and acquire entries the rules had stopped are looked at again under the new rules.
+    state.resumeFind(s, projectId);
+    return { violations: r.violations, loosened: r.loosened, sha256: r.sha256, ...governanceReadability(yaml, state.roots) };
   });
 
   app.get("/projects/:id/protocol/documents", async (req) => {
@@ -104,7 +174,7 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     const paths = strArray(bodyOf(req), "paths", { max: 50 });
-    if (paths.some((p) => !isAbsolute(p) || p.includes("\0"))) throw badRequest('"paths" must be absolute paths.');
+    if (paths.some((p) => !isLocalAbsolutePath(p))) throw badRequest('"paths" must be absolute paths.');
     // One result per file (R117 I6): a refused file does not stop the others.
     const results = (await addProtocolDocuments(s.repo, projectId, paths)).map((r) => (r.reason ? { ...r, reason: scrubPaths(r.reason, state.roots) } : r));
     return { results, documents: await listProtocolDocuments(s.repo, projectId) };
@@ -126,7 +196,20 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
       const sf = await s.repo.getSource(projectId, d.sourceId);
       out.push({ sourceId: d.sourceId, title: sf.source.title.variants[0]?.value ?? "", assetIds: d.assetIds });
     }
-    return { destroyAfter, due: out };
+    // The time zone the retention date is read in (R92, R93); null: UTC.
+    return { destroyAfter, timeZone: s.repo.getProject(projectId).timeZone ?? null, due: out };
+  });
+
+  // The project's time zone (R93): a real IANA zone name, or null to read its dates in UTC again.
+  app.put("/projects/:id/time-zone", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const b = bodyOf(req);
+    if (!("timeZone" in b)) throw badRequest('"timeZone" is required (a time zone name such as Europe/Berlin, or null for UTC).');
+    const tz = b.timeZone;
+    if (tz !== null && (typeof tz !== "string" || tz.length > 64)) throw badRequest('"timeZone" must be a time zone name such as Europe/Berlin, or null for UTC.');
+    const p = await setProjectTimeZone(s.repo, projectId, tz);
+    return { timeZone: p.timeZone ?? null };
   });
 
   app.post("/projects/:id/retention/destroy", async (req) => {
@@ -147,6 +230,18 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     state.publishState();
     const root = s.lib.root.replace(/[\\/]+$/, "");
     const rel = r.certificatePath.startsWith(root) ? r.certificatePath.slice(root.length + 1).split(/[\\/]/).join("/") : "";
-    return { certificate: r.certificate, certificateFile: rel };
+    // `certificate`: as presented (its backups as they stand now). `original`: the file as written,
+    // never rewritten. `amendments`: what was recorded beside it since (library-relative files).
+    return { certificate: r.certificate, certificateFile: rel, original: r.original, amendments: r.amendments, status: r.status };
+  });
+
+  // The project's destruction certificates, oldest first: each as written, with its amendments, the
+  // resulting status, the backups still to be removed, and why the app does not remove them by
+  // itself when its files and the audit log disagree (R147). Library-relative paths only.
+  app.get("/projects/:id/retention/certificates", async (req) => {
+    const s = state.requireSession();
+    const projectId = projectParam(ctx, req);
+    const certificates = (await listDestructions(s.repo, projectId)).map((d) => (d.problem ? { ...d, problem: scrubPaths(d.problem, state.roots) } : d));
+    return { certificates };
   });
 }

@@ -1,8 +1,8 @@
 /**
  * Server-sent events (`GET /events`): `library.state`, `job.progress`, `import.progress`,
- * `capture.progress`. Subscribers are removed when their client disconnects.
+ * `capture.progress`, `watch.status` (Task W7), `find.progress` (Task F5), `zotero.sync` (Task Z8). Subscribers are removed when their client disconnects.
  */
-export type EventType = "library.state" | "job.progress" | "import.progress" | "capture.progress";
+export type EventType = "library.state" | "job.progress" | "import.progress" | "capture.progress" | "watch.status" | "find.progress" | "zotero.sync";
 
 export interface ServiceEvent {
   type: EventType;

@@ -7,7 +7,21 @@
  * Citations are always rendered by the service (participant codes and withheld sources are applied
  * there, R88/R90); the UI only shows and copies the string it returns.
  */
+import type {
+  DestructionOldCopiesState,
+  DeviceNotice,
+  DeviceNoticeDismissRequest,
+  DeviceNoticeKind,
+  LibraryFolderRoomRequest,
+  LibraryFolderRoomResponse,
+  LibrarySuggestedFolderResponse,
+  ProjectReviewPage,
+} from "@ao/shared";
+
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
+import { verificationApi } from "./verification";
+import { watchedFoldersApi } from "./watchedFolders";
+import { zoteroSyncApi } from "./zoteroSync";
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -20,6 +34,17 @@ export interface LibraryEntry {
 
 export type ReadOnlyReason = "locked-by-other-device" | "newer-format" | "offline" | "not-writable" | "moved" | "move-incomplete";
 
+/**
+ * The open library's search index when it is not ready (IndexStatus in the service's state.ts, D8):
+ * being rebuilt from the files, failed to rebuild, or not writable (a read-only library). Absent when
+ * the index is ready.
+ */
+export type IndexStatus =
+  /** `partial`: the index holds only part of the library until the rebuild completes (C1): no list is shown. */
+  | { state: "rebuilding"; done: number; total: number; partial?: true }
+  | { state: "failed"; message: string; partial?: true }
+  | { state: "unavailable"; reason: string };
+
 /** The library the service has open (libraryView in routes/libraries.ts). */
 export interface CurrentLibrary {
   libraryId: string;
@@ -28,6 +53,20 @@ export interface CurrentLibrary {
   readOnlyReason?: ReadOnlyReason | (string & {});
   /** With "locked-by-other-device": the name of the device holding the library (R118; never a user name). */
   lockedBy?: string;
+  /** The index when it is not ready (D8). */
+  index?: IndexStatus;
+}
+
+/** GET /libraries. */
+export interface LibraryList {
+  libraries: LibraryEntry[];
+  current?: CurrentLibrary;
+  /** The library open when the app last ran, which could not be reopened at start (D5). */
+  notFound?: { libraryId: string; name: string };
+  /** The library open when the app last ran, still being opened by the service (I1). */
+  reopening?: { libraryId: string; name: string };
+  /** This computer's own notices (Task 68): kind and time only. */
+  notices?: DeviceNotice[];
 }
 
 export interface ReconnectResult extends CurrentLibrary {
@@ -74,8 +113,13 @@ export interface LibraryState {
   mode?: CurrentLibrary["mode"];
   readOnlyReason?: CurrentLibrary["readOnlyReason"];
   lockedBy?: CurrentLibrary["lockedBy"];
+  index?: IndexStatus;
   integrityWarnings?: IntegrityWarning[];
   projectWarnings?: Record<string, string[]>;
+  /** What stands behind `destruction-old-copies-pending`, per project (R409 d). */
+  destructionOldCopiesPending?: Record<string, DestructionOldCopiesState>;
+  /** This computer's own notices (Task 68): kind and time only. */
+  notices?: DeviceNotice[];
 }
 
 export interface ProjectSummary {
@@ -88,6 +132,44 @@ export interface ProjectSummary {
   acknowledgements?: string[];
   /** Compliance profiles named by the project's rules (sent by the service, R118). */
   profiles?: string[];
+}
+
+/**
+ * The body of POST /projects (routes/projects.ts). `governanceYaml` is the rules file verbatim ("" is
+ * the default rules, which require encryption). An encrypted project needs a non-empty passphrase.
+ * `name` is at most 200 characters and must not be blank.
+ */
+export interface NewProjectRequest {
+  name: string;
+  governanceYaml: string;
+  encryption: { enabled: false } | { enabled: true; passphrase: string };
+  /** At most 20 language tags of at most 35 characters. */
+  targetLanguages?: string[];
+}
+
+/**
+ * The answer of POST /projects: the project as GET /projects lists it, and, for an encrypted project
+ * only, its recovery code. The service returns the code this once and never stores or logs it.
+ */
+export interface NewProjectResult {
+  project: ProjectSummary;
+  recoveryCode?: string;
+}
+
+/**
+ * The body of POST /projects/:id/recovery-code (routes/projects.ts, Task 61): the project's
+ * passphrase again (at most 1024 characters). UI token only; never logged.
+ */
+export interface NewRecoveryCodeRequest {
+  passphrase: string;
+}
+
+/**
+ * Its answer: the project's new recovery code, returned this once and never stored or logged. The old
+ * code stopped working; backups made before still open with the old code (ADR 0006).
+ */
+export interface NewRecoveryCodeResult {
+  recoveryCode: string;
 }
 
 export interface Collection {
@@ -117,8 +199,41 @@ export interface SourceRow {
   creatorsText: string;
   issuedYear?: string;
   folder: string;
+  /** R137, R172: this source has a pending entry of any kind in the project's review queue (nothing else; not field verification). False for a locked row. */
   needsReview: boolean;
   locked: boolean;
+  /** A text search found it through the text of its annotations (Task 58). */
+  matchedIn?: "annotation";
+  /** Only part of its annotations' text is searchable (R161 b). */
+  annotationsPartial?: true;
+  /** The record's availability (Task 69); absent for a locked row or a record that could not be read. */
+  availability?: SourceAvailability;
+  /** R222: the source has a PDF the reader can open (the service's rule); absent in an older answer: cannot tell. */
+  hasReadablePdf?: boolean;
+}
+
+/**
+ * A source's availability as the library records it (@ao/core Availability): "available",
+ * "incomplete" (only part of it was saved), "unavailable-on-platform" (a later capture found it
+ * gone from its platform); `firstNoticedAt` (ISO time) when recorded. Other values may come later.
+ */
+export interface SourceAvailability {
+  status: string;
+  firstNoticedAt?: string;
+  /** Task Z5: with "unavailable-on-platform", the item was deleted in the researcher's Zotero library, or is in its bin. */
+  zotero?: "deleted" | "bin";
+}
+
+/** A page of sources (GET /projects/:id/sources). */
+export interface SourcePage {
+  total: number;
+  items: SourceRow[];
+  /** The index awaits a rebuild: annotation text is not searchable yet (R161 a). */
+  incomplete?: true;
+  /** A read-only library: only titles were searched. */
+  limited?: true;
+  /** The index is being rebuilt, could not be rebuilt, or cannot be written (D8). */
+  index?: IndexStatus;
 }
 
 export interface SourceQuery {
@@ -174,6 +289,7 @@ export interface SourceFile {
     collectionIds: string[];
     tagIds: string[];
     folder: string;
+    availability?: SourceAvailability;
     [k: string]: unknown;
   };
   assets: Asset[];
@@ -225,9 +341,15 @@ export function libraryApi(client: ApiClient) {
       resolve: (txn: string, choice: PendingWriteChoice) => r<{ txn: string; choice: PendingWriteChoice; projectId: string }>("POST", `/libraries/pending-writes/${seg(txn)}/resolve`, { body: { choice } }),
     },
     libraries: {
-      list: () => r<{ libraries: LibraryEntry[]; current?: CurrentLibrary }>("GET", "/libraries"),
+      list: () => r<LibraryList>("GET", "/libraries"),
+      /** The researcher's "Got it" for a device-level notice (Task 68): POST /settings/notices/dismiss. */
+      dismissNotice: (kind: DeviceNoticeKind) => r<{ notices: DeviceNotice[] }>("POST", "/settings/notices/dismiss", { body: { kind } satisfies DeviceNoticeDismissRequest }),
       open: (path: string) => r<CurrentLibrary>("POST", "/libraries/open", { body: { path } }),
       create: (path: string, name: string) => r<CurrentLibrary>("POST", "/libraries", { body: { path, name } }),
+      /** A folder to offer for a new library, if the service has one (R447 a); nothing is created. */
+      suggestedFolder: () => r<LibrarySuggestedFolderResponse>("GET", "/libraries/suggested-folder"),
+      /** The free room on the disk under a full path, sent in the body (R447 b, c); absent when it cannot be told. */
+      folderRoom: (path: string) => r<LibraryFolderRoomResponse>("POST", "/libraries/folder-room", { body: { path } satisfies LibraryFolderRoomRequest }),
       close: () => r<{ closed: true }>("POST", "/libraries/close"),
       reconnect: (path: string, libraryId: string, opts: { signal?: AbortSignal } = {}) =>
         r<ReconnectResult>("POST", "/libraries/reconnect", { body: { path, libraryId }, ...(opts.signal ? { signal: opts.signal } : {}) }),
@@ -247,8 +369,12 @@ export function libraryApi(client: ApiClient) {
     },
     projects: {
       list: () => r<{ projects: ProjectSummary[] }>("GET", "/projects"),
+      /** Creates a project; the recovery code in the answer is a secret shown once (never kept). */
+      create: (body: NewProjectRequest) => r<NewProjectResult>("POST", "/projects", { body }),
       unlock: (id: string, secret: string) => r<{ unlocked: true }>("POST", `${proj(id)}/unlock`, { body: { secret } }),
       lock: (id: string) => r<{ unlocked: false }>("POST", `${proj(id)}/lock`),
+      /** Issues a new recovery code (the old one stops working); the code in the answer is a secret shown once. */
+      newRecoveryCode: (id: string, body: NewRecoveryCodeRequest) => r<NewRecoveryCodeResult>("POST", `${proj(id)}/recovery-code`, { body }),
       governance: (id: string) => r<{ yaml: string; sha256: string; violations: unknown[] }>("GET", `${proj(id)}/governance`),
     },
     collections: {
@@ -270,7 +396,7 @@ export function libraryApi(client: ApiClient) {
     },
     sources: {
       search: (pid: string, q: SourceQuery = {}, opts: { signal?: AbortSignal } = {}) =>
-        r<{ total: number; items: SourceRow[] }>("GET", `${proj(pid)}/sources`, {
+        r<SourcePage>("GET", `${proj(pid)}/sources`, {
           query: { text: q.text || undefined, type: q.type, collection: q.collection, tag: q.tag, limit: q.limit, offset: q.offset },
           ...(opts.signal ? { signal: opts.signal } : {}),
         }),
@@ -279,6 +405,17 @@ export function libraryApi(client: ApiClient) {
       attach: async (pid: string, paths: string[], toSourceId?: string) =>
         (await r<{ items: AttachOutcome[] }>("POST", `${proj(pid)}/attach`, { body: { paths, ...(toSourceId ? { toSourceId } : {}) } })).items,
     },
+    /** The project's whole review queue (Task 67): how many entries wait (only the total is asked for). */
+    reviewQueue: {
+      count: async (pid: string, opts: { signal?: AbortSignal } = {}) =>
+        (await r<Pick<ProjectReviewPage, "total">>("GET", `${proj(pid)}/review`, { query: { limit: 0 }, ...(opts.signal ? { signal: opts.signal } : {}) })).total,
+    },
+    /** Field verification, recheck, pictures and retries (Task 34d, api/verification.ts). */
+    verification: verificationApi(client),
+    /** Where a source came from, and the two acts on it (Task W9, api/watchedFolders.ts). */
+    watchedFolders: watchedFoldersApi(client),
+    /** The Zotero sync's state, read for the lines under a project's header (Task Z12; only `state` is used here). */
+    zotero: zoteroSyncApi(client),
     citations: {
       styles: async (q?: string, opts: { signal?: AbortSignal } = {}) =>
         (await r<{ styles: StyleEntry[] }>("GET", "/styles", { query: { q: q || undefined }, ...(opts.signal ? { signal: opts.signal } : {}) })).styles,
@@ -312,7 +449,8 @@ const CODE_LEAD: Partial<Record<string, string>> = {
 export function errorText(err: unknown, fallback: string): string {
   if (!(err instanceof ApiClientError)) return fallback;
   const parts: string[] = [];
-  const lead = CODE_LEAD[err.code];
+  // A rate limit the service explains itself is said once, in its words.
+  const lead = err.code === "RATE_LIMITED" && err.message ? undefined : CODE_LEAD[err.code];
   if (lead) parts.push(lead);
   if (err.message && !parts.includes(err.message) && !(err.code === "PROJECT_LOCKED" || err.code === "READ_ONLY")) parts.push(err.message);
   if (err.reason && !parts.some((p) => p.includes(err.reason!))) parts.push(err.reason);

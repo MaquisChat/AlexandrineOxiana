@@ -2,7 +2,10 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { primary } from "@ao/core";
 import { parseName } from "../extract/names.js";
+import { BIB_DOUBTS } from "./bib-blocks.js";
+import { resolveItem } from "./resolve.js";
 import { parseBibtex, parseCslJson, parseRis, readSidecar } from "./sidecar.js";
 
 let tmp: string;
@@ -68,6 +71,93 @@ describe("parseBibtex", () => {
     const t0 = performance.now();
     expect(parseBibtex(`@comment{${"\n \t".repeat(300_000)}x\n @article{k,title={Late}}`).title).toBe("Late");
     expect(performance.now() - t0).toBeLessThan(1000);
+  });
+
+  describe("R374 b: free text after an entry", () => {
+    it("notes and section headers between entries give no doubt; the remains of an entry closed early do", () => {
+      const m = parseBibtex("@article{a, title={One}, year={2020}}\n\n==== Chapter 2 ====\nSome notes the exporter wrote here.\n\n@book{b, title={Two}, year={2021}}\n");
+      expect(m).toMatchObject({ title: "One", issued: "2020" });
+      expect(m.doubt).toBeUndefined();
+      expect(parseBibtex("@article{a, title={One}}\nSorted by year, descending. ==== 2020 ====\n").doubt).toBeUndefined();
+      expect(parseBibtex('@article{a, title="a } c", year=2020}\n').doubt).toBe(BIB_DOUBTS.textAfter);
+      expect(parseBibtex('@article{a, title="a } c",\ndoi = {10.1/x}}\n').doubt).toBe(BIB_DOUBTS.textAfter);
+    });
+  });
+
+  describe("R362 g: a line beginning with @ inside a field's value (the same rule as the export reader)", () => {
+    const later = "  doi = {10.5555/ao.thread.2021},\n  year = {2021}\n}\n";
+    it("belongs to the value when the entry closes properly after it, in braces and in quotes: later fields kept, no doubt", () => {
+      const braces = parseBibtex(`@article{k,\n  title = {Replies},\n  abstract = {We read.\n@someuser replied to the thread\nEnd.},\n${later}@book{n, title={Next}}`);
+      expect(braces).toMatchObject({ title: "Replies", doi: "10.5555/ao.thread.2021", issued: "2021" });
+      expect(braces.doubt).toBeUndefined();
+      const quotes = parseBibtex(`@article{k,\n  title = {Replies},\n  abstract = "We read.\n  @someuser replied to the thread\nEnd.",\n${later}`);
+      expect(quotes).toMatchObject({ title: "Replies", doi: "10.5555/ao.thread.2021", issued: "2021" });
+      expect(quotes.doubt).toBeUndefined();
+    });
+
+    it("a citation pasted inside a balanced value is part of it (said as a doubt)", () => {
+      const m = parseBibtex(`@article{k,\n  title = {Citing},\n  abstract = {As in\n@article{smith2020, title={Pasted}}\nmore.},\n${later}`);
+      expect(m).toMatchObject({ title: "Citing", doi: "10.5555/ao.thread.2021", issued: "2021" });
+      expect(m.doubt).toBe(BIB_DOUBTS.innerEntry);
+    });
+
+    it("an entry truly not closed is cut at the next entry and carries the doubt; one unclosed at the end of the file too", () => {
+      const cut = parseBibtex("@article{a,\n  title = {First},\n  abstract = {opens\n@someuser replied\n},\n  year = {2020},\n\n@article{b, title={Second}, doi={10.5555/b}}\n");
+      expect(cut).toMatchObject({ title: "First", issued: "2020" });
+      expect(cut.doi).toBeUndefined();
+      expect(cut.doubt).toBe(BIB_DOUBTS.cut);
+      const eof = parseBibtex("@article{last,\n  title = {Last One},\n  year = {2019},\n  abstract = {cut off\n@someuser said");
+      expect(eof).toMatchObject({ title: "Last One", issued: "2019" });
+      expect(eof.doubt).toBe(BIB_DOUBTS.eof);
+    });
+
+    it("R366 c: '@jdoe (2021) wrote back' and '@jdoe {at} the meeting' begin no entry: in braces, quotes and a ( entry, every field, no doubt", () => {
+      for (const line of ["@jdoe (2021) wrote back", "@jdoe {at} the meeting"]) {
+        for (const [open, close] of [["{", "}"], ["(", ")"]]) {
+          for (const value of [`{We read.\n${line}\nEnd.}`, `"We read.\n${line}\nEnd."`]) {
+            const m = parseBibtex(`@article${open}k,\n  title = {Replies},\n  abstract = ${value},\n  doi = {10.5555/k},\n  year = {2021}\n${close}\n@book{n, title={Next}}\n`);
+            expect([line, open, value[0], m]).toMatchObject([line, open, value[0], { title: "Replies", doi: "10.5555/k", issued: "2021" }]);
+            expect(m.doubt).toBeUndefined();
+          }
+        }
+      }
+    });
+
+    it("R366 a: an entry line between the fields ends the entry, whatever brace closes later; inside a value it is kept, with the third doubt", () => {
+      const m = parseBibtex("@article{a, title={A}, year={2001}\n@article{b, title={B}, doi={10.5555/b}, year={2002}}}\n");
+      expect(m).toMatchObject({ title: "A", issued: "2001" });
+      expect(m.doi).toBeUndefined();
+      expect(m.doubt).toBe(BIB_DOUBTS.cut);
+      const q = parseBibtex('@article{k,\n  title = {Citing},\n  abstract = "As in\n@article{smith2020, title={Pasted}}\nmore.",\n  doi = {10.5555/k},\n  year = {2021}\n}\n');
+      expect(q).toMatchObject({ title: "Citing", doi: "10.5555/k", issued: "2021" });
+      expect(q.doubt).toBe(BIB_DOUBTS.innerEntry);
+    });
+
+    it("R366 d: in a ( entry, a ')' inside a braced or quoted value does not close it", () => {
+      for (const abstract of ["{We ask 1) why and 2) how.}", '"We ask 1) why and 2) how."']) {
+        const m = parseBibtex(`@article(a, title={T}, abstract=${abstract}, doi={10.5555/a}, year={2001})`);
+        expect(m).toMatchObject({ title: "T", doi: "10.5555/a", issued: "2001" });
+        expect(m.doubt).toBeUndefined();
+      }
+    });
+
+    it("R366 e: an unmatched '}' inside a quoted value closes the entry with text after it: the doubt; % lines and blank lines give none", () => {
+      const m = parseBibtex('@article{a, title="a } c", doi={10.5555/a}, year={2020}}');
+      expect(m.doubt).toBe("There is text after this BibTeX entry's closing brace that belongs to no entry; some of the entry's fields may be incomplete.");
+      const ok = parseBibtex("% exported\n@article{a, title={A}, year={2020}}\n\n% next one\n@article{b, title={B}}\n");
+      expect(ok).toMatchObject({ title: "A", issued: "2020" });
+      expect(ok.doubt).toBeUndefined();
+    });
+
+    it("a sidecar's doubt reaches the resolution: the item goes to review with it", async () => {
+      const dir = await mkdtemp(join(tmp, "res-"));
+      const bib = join(dir, "paper.bib");
+      await writeFile(bib, "@article{a,\n  title = {First},\n  abstract = {never closed\n@article{b, title={Second}}\n");
+      const r = await resolveItem({ sidecarPaths: [bib] }, { projectId: "p", patterns: [], lookup: null });
+      expect(primary(r.draft.title)).toBe("First");
+      expect(r.verification.overall).toBe("needs-review");
+      expect(r.verification.reasons).toContain(BIB_DOUBTS.cut);
+    });
   });
 
   it("skips @string, @comment and @preamble blocks and reads the first real entry", () => {

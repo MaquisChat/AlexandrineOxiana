@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import type { AuditEvent, SourceFile } from "@ao/core";
+import { toCslItem, type AuditEvent, type SourceDraft, type SourceFile } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -17,7 +17,7 @@ import { PolicyDeniedError, type Repo } from "../repo/index.js";
 import { decryptBytes } from "../repo/io.js";
 import { openTestRepo } from "../repo/testing.js";
 import { WorkerClient } from "../worker-client.js";
-import { AcknowledgementRequiredError } from "./errors.js";
+import { AcknowledgementRequiredError, toolMissingReason } from "./errors.js";
 import { createLinkCapture, type LinkCapture } from "./link-capture.js";
 import { FAKE_TOOLS_DIR, startToolWorker, type ToolWorker } from "./testing.js";
 
@@ -357,6 +357,48 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).edited).toBe(0);
   });
 
+  // Task 63 item 3: the run's title edit is read, merged and written in one governed change, so an
+  // edit made at the same time is kept (R26).
+  it("a title edit made while a profile run records an edit is not lost: both land, each audited", async () => {
+    const p = await project();
+    await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    const target = ttId(6);
+    const sid = (await byPost(p.id, target)).source.id;
+    const prof = synthetic();
+    await setProfile({ ...prof, items: prof.items.map((it) => (it.id === target ? { ...it, caption: "Evening dance at the old market (edited)\n#dance" } : it)) });
+    const updatesOf = async () => (await auditEvents(p.folder)).filter((e) => e.entity?.type === "source" && e.entity.id === sid && e.action === "store");
+    const before = (await updatesOf()).length;
+    // The researcher adds a translated title while the run is between its read and its write.
+    const add = repo.addOriginalAsset.bind(repo);
+    vi.spyOn(repo, "addOriginalAsset").mockImplementation(async (...args) => {
+      const cur = await repo.getSource(p.id, sid);
+      await repo.updateSource(p.id, sid, { title: { variants: [...cur.source.title.variants, { lang: "de", kind: "translated", value: "Tanz Nummer 6" }] } });
+      return add(...args);
+    });
+    expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).edited).toBe(1);
+    const values = (await byPost(p.id, target)).source.title.variants.map((v) => v.value);
+    expect(values).toContain("Evening dance at the old market (edited)");
+    expect(values).toContain("Tanz Nummer 6");
+    // Two source updates (the researcher's and the run's), each its own governed change with its own audit entry.
+    const updates = (await updatesOf()).slice(before).filter((e) => e.details?.["op"] === "source.update");
+    expect(updates).toHaveLength(2);
+    expect(new Set(updates.map((e) => e.details?.["txn"])).size).toBe(2);
+  });
+
+  it("a run ended while a post downloads (Task 63 fix round 2, I3): the post is not stored and the run stops there", async () => {
+    const p = await project();
+    let ended = false;
+    const submit = client.submit.bind(client);
+    vi.spyOn(client, "submit").mockImplementation(async (...args) => {
+      const r = await submit(...args);
+      if (String(args[1].input).includes("/video/")) ended = true;
+      return r;
+    });
+    const err = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { cancelled: () => ended }).catch((e: unknown) => e);
+    expect((err as Error).name).toBe("CaptureCancelledError");
+    expect(await posts(p.id)).toHaveLength(0);
+  });
+
   it("maxItems: 5 stops at 5 and never marks the rest unavailable; a later full run adds the rest", async () => {
     const p = await project();
     const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 5 });
@@ -391,6 +433,27 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect(since).toMatchObject({ listComplete: false, newlyUnavailable: 0 });
     expect(worker.submitted.at(-1)!.params).toMatchObject({ dateAfter: "20260110" });
     for (const sf of await posts(p.id)) expect(sf.source.availability.status).toBe("available");
+  });
+
+  it("N7: a run ended during a rate-limit wait starts no more downloads", async () => {
+    const p = await project();
+    process.env.FAKE_TOOL_MODE = "ratelimit";
+    let ended = false;
+    let submits = 0;
+    let atEnd = -1;
+    const submit = client.submit.bind(client);
+    vi.spyOn(client, "submit").mockImplementation(async (...args) => {
+      submits++;
+      return submit(...args);
+    });
+    const c = createLinkCapture({ repo, worker: client, index: handle, sleep: async () => {
+      ended = true; // the run is ended (a lock) while it waits
+      atEnd = submits;
+    } });
+    const err = await c.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { cancelled: () => ended }).catch((e: unknown) => e);
+    expect((err as Error).name).toBe("CaptureCancelledError");
+    expect(atEnd).toBeGreaterThan(0);
+    expect(submits).toBe(atEnd);
   });
 
   it("rate limited: waits 60, 120 and 240 s, then pauses; a re-run resumes without duplicates", async () => {
@@ -487,6 +550,83 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     const again = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
     expect(again).toMatchObject({ created: 0, profileSourceId: r.profileSourceId });
     expect(await readdir(profilesDir)).toEqual(["tiktok-P-001"]);
+  });
+
+  describe("R437 (b): the profile is filed under the code of exactly the creator its source carries (C1 of the FR-A10 fourth review)", () => {
+    /** A source by one creator, as a downloader capture with a legal basis (what PSEUDO_GOV allows). */
+    const sourceBy = (projectId: string, creator: SourceDraft["creators"][number]) =>
+      repo.createSource(
+        projectId,
+        {
+          projectIds: [],
+          type: "interview",
+          title: { variants: [{ lang: "es", kind: "original", value: "Entrevista" }] },
+          creators: [creator],
+          identifiers: {},
+          caseAttributes: {},
+          availability: { status: "available" },
+          collectionIds: [],
+          tagIds: [],
+          participantIds: [],
+        },
+        [],
+        {
+          provenance: {
+            captureMethod: "downloader",
+            capturedAt: new Date().toISOString(),
+            tool: { name: "test", version: "1" },
+            fileHashes: {},
+            legal: { status: "consented", basis: "consent" },
+            identifiable: true,
+          },
+        },
+      );
+    const codeOfProfileSource = async (projectId: string, sourceId: string) => {
+      const prof = await repo.getSource(projectId, sourceId);
+      const fw = await repo.getFieldwork(projectId);
+      return prof.source.participantIds.map((id) => fw.participants.find((x) => x.id === id)!.code);
+    };
+
+    it("a participant named like the handle without its '@' is another person: the profile gets its own source's new code", async () => {
+      const p = await project(PSEUDO_GOV, true);
+      const first = await sourceBy(p.id, { role: "interviewee", literal: "fake.dancer" });
+      const fw0 = await repo.getFieldwork(p.id);
+      expect(first.source.participantIds.map((id) => fw0.participants.find((x) => x.id === id)!.code)).toEqual(["P-001"]);
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+      expect(r.status).toBe("completed");
+      expect(await codeOfProfileSource(p.id, r.profileSourceId!)).toEqual(["P-002"]);
+      expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-P-002"]);
+    });
+
+    it("a profile whose handle is already a participant's recorded handle finds that participant", async () => {
+      const p = await project(PSEUDO_GOV, true);
+      await sourceBy(p.id, { role: "uploader", handle: "@fake.dancer" });
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+      expect(r.status).toBe("completed");
+      expect(await codeOfProfileSource(p.id, r.profileSourceId!)).toEqual(["P-001"]);
+      expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-P-001"]);
+      expect((await repo.getFieldwork(p.id)).participants).toHaveLength(1);
+    });
+
+    it("R438: the posts (handle without '@') and the profile's own source (with '@') are ONE participant; folder, collection, citation agree", async () => {
+      const p = await project(PSEUDO_GOV, true);
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+      expect(r.status).toBe("completed");
+      const fw = await repo.getFieldwork(p.id);
+      expect(fw.participants.map((x) => x.code)).toEqual(["P-001"]);
+      expect(await codeOfProfileSource(p.id, r.profileSourceId!)).toEqual(["P-001"]);
+      expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-P-001"]);
+      const post = await byPost(p.id, ttId(1));
+      expect(post.source.creators[0]!.handle).toBe("fake.dancer");
+      expect(post.source.participantIds).toEqual([fw.participants[0]!.id]);
+      expect(post.source.folder).toContain("P-001");
+      expect(post.source.folder.toLowerCase()).not.toContain("fake");
+      // The citation, with the project's pseudonym map as stored (this project withholds identifiable exports).
+      const stored = JSON.parse(await readMaybeEncrypted(join(lib.root, p.folder, "keys", "pseudonyms.json.enc"))) as { map: Record<string, string> };
+      expect(stored.map).toEqual({ "@fake.dancer": "P-001" });
+      const item = toCslItem(post, { citationLanguage: "en", translatedTitles: "off", script: "original", pseudonyms: new Map(Object.entries(stored.map)) });
+      expect(item.author).toEqual([{ literal: "P-001" }]);
+    });
   });
 
   it("R42b: governance changed during the run → POLICY_CHANGED, nothing more stored, one deny audited", async () => {
@@ -647,6 +787,29 @@ describe("captureProfile fix round 1 (R43)", { timeout: 120_000 }, () => {
     expect(nested).toMatchObject({ entries: [], nested: true });
   });
 
+  it("a listing entry whose address cannot be decoded does not fail the others (R379, WB1 I4)", async () => {
+    const { readEnumeration } = await import("./profile-snapshot.js");
+    const c = { platform: "tiktok" as const, kind: "profile" as const, canonicalUrl: "https://www.tiktok.com/@fake.dancer", handle: "@fake.dancer" };
+    const e = readEnumeration(
+      [
+        {
+          _type: "playlist",
+          uploader: "fake.dancer",
+          webpage_url: "https://www.tiktok.com/@%ZZ",
+          entries: [
+            { id: "7000000000000000001", url: "https://www.tiktok.com/@fake.dancer/video/7000000000000000001" },
+            { id: "7000000000000000002", url: "https://www.tiktok.com/@%ZZ/video/7000000000000000002" },
+            { id: "7000000000000000003", url: "https://www.tiktok.com/@%E0%A4%A" },
+          ],
+        },
+      ],
+      c,
+      "yt-dlp",
+    );
+    expect(e.entries.map((x) => x.id)).toEqual(["7000000000000000001", "7000000000000000002", "7000000000000000003"]);
+    expect(e.entries[1]!.url).toBe("https://www.tiktok.com/@fake.dancer/video/7000000000000000002");
+  });
+
   it("I1: an old profile.json with only knownPostIds is migrated", async () => {
     const p = await project();
     await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
@@ -737,6 +900,11 @@ consent:
 `);
     expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, includeComments: true })).toMatchObject({ status: "failed", errorCode: "LEGAL_BASIS_REQUIRED" });
     expect(worker.submitted).toEqual([]);
+    // R391 c: a legal basis of invisible characters is no legal basis for the comments either.
+    for (const legalBasis of ["\u200b", "\u2800", "\u0301"]) {
+      expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, includeComments: true, legalBasis }), JSON.stringify(legalBasis)).toMatchObject({ status: "failed", errorCode: "LEGAL_BASIS_REQUIRED" });
+    }
+    expect(worker.submitted).toEqual([]);
     expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, includeComments: true, maxItems: 1, legalBasis: "consent" })).created).toBe(1);
   });
 
@@ -750,5 +918,16 @@ consent:
     expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-fake.dancer"]);
     const prof = await repo.getSource(p.id, r.profileSourceId!);
     expect(prof.fieldEvidence.find((e) => e.field === "/identifiers/url")).toMatchObject({ source: { kind: "platform-json" } });
+  });
+});
+
+describe("a missing tool (Task 48a, R126)", () => {
+  it("a profile run without the video downloader fails naming it, with a sentence that says how to get it", async () => {
+    const w = await startToolWorker({ missing: ["video-downloader"] });
+    closers.push(() => w.close());
+    const c = createLinkCapture({ repo, worker: new WorkerClient({ repo, worker: w, index: { db: handle.db }, pollMs: 5 }), index: handle });
+    const p = await project();
+    const r = await c.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(r).toMatchObject({ status: "failed", errorCode: "TOOL_NOT_INSTALLED", tool: "video-downloader", reason: toolMissingReason("video-downloader") });
   });
 });

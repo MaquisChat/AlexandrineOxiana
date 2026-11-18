@@ -1,13 +1,16 @@
 /** `openRepo` and the `Repo` facade: one per open library. */
+import { DESTRUCTION_OLD_COPIES_PENDING_WARNING as DESTRUCTION_OLD_COPIES_PENDING_WARNING_KIND } from "@ao/shared";
 import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent } from "@ao/core";
-import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
+import type { Annotation, Asset, Collection, DateRule, ConsentRecord, EntityType, GovernanceConfig, PolicyDecision, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, Source, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import { KeyNotAvailableError } from "../crypto/format.js";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
-import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
+import { createAnnotation, deleteAnnotation, listAnnotations, updateAnnotation, type AnnotationDraft, type AnnotationPatch } from "./annotations.js";
+import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord, resetZoteroWebVersion, updateWatchedFolderOptions, type WatchedFolderOptionsPatch } from "./import-settings.js";
 import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingOcrMany, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
 import {
@@ -46,15 +49,32 @@ import {
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
-import { authorizeOnly, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
-import { createProject, isUnlocked, lockProject, readFullData, unlockProject, type CreateProjectInput } from "./projects.js";
+import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, auditedReason, auditedReasonIn, hasSealedReason, openLibraryReason, readLibraryReasonLines, readProjectReasons, reasonKey, reasonMatches, reasonView } from "./audit-reasons.js";
+import type { AuditReasonView } from "@ao/shared";
+import { authorizeOnly, decide, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
+import {
+  RECOVERY_CODE_UNSHOWN_WARNING,
+  completeRecoveryActivation,
+  createProject,
+  isUnlocked,
+  issueRecoveryCode,
+  lockAsksOf,
+  lockProject,
+  readFullData,
+  recoveryCodeUnshown,
+  unlockProject,
+  type CreateProjectInput,
+} from "./projects.js";
 import {
   createSource,
   createSources,
   deleteSource,
   getSource,
+  getSourceRecord,
+  getSourceRecordWithAssets,
   listSourceIds,
   relinkLinkedAsset as relinkLinkedAssetIn,
+  sourceRecordStamp,
   updateSource,
   type CreateInTx,
   type CreateSourceOptions,
@@ -64,19 +84,51 @@ import {
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
-import { readReviewEntries, type ReviewEntry } from "./review.js";
+import { hasSettledCaptureEntries, hasUnlistedConflicts, heldWaitingCount, holdMismatchedFile, readReviewEntries, removeFindEntryWithHeld, resolveHeldFile, reviewedAfterWithdrawal, type HoldInput, type ReviewEntry } from "./review.js";
+import { readWatchOrigins, readWatchRegister, recordWatchedFiles, type WatchRegisterEntry } from "./watch-register.js";
+import { appendFindEntries, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
+import type { FindEntry } from "../find/types.js";
 import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
-import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
-import { loadPseudonyms } from "./pseudonyms.js";
+import { RepoCore, loadProjects, type ProjectState, type RepoOptions } from "./state.js";
+import { loadPseudonyms, participantCodeOf } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
-import { RecoveryPendingError } from "./errors.js";
-import { pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
+import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "./errors.js";
+import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
-import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
-import { destroyAssets, type DestroyInput } from "./destroy.js";
+import {
+  adoptRestoredProject as adoptRestoredIn,
+  authorizeRestoreIn,
+  recordUnreadableBackup,
+  refuseRestoreIn,
+  type DestructionRecordError,
+  type RestoreRequest,
+  type StagedRestore,
+} from "./restore.js";
+import { amendDestruction, destroyAssets, type AmendInput, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
-import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
+import { setTimeZone as setTimeZoneIn } from "./time-zone.js";
+import { readGovernance, readGovernanceFile, setGovernance as setGovernanceIn, type GovernanceEditResult, type GovernanceFileState } from "./governance-edit.js";
+import {
+  AUDIT_WAITING_WARNING,
+  attentionWarnings,
+  holdsLock,
+  listMarks,
+  markForSetAside,
+  moveOutboxIntoProject,
+  newAttentionId,
+  readOutbox,
+  reasonOf,
+  removeAttention,
+  settleAttention,
+  settleOrphanOutbox,
+  writeAttention,
+  writeOutbox,
+  type AttentionMark,
+  type AttentionRecord,
+} from "./attention.js";
+import { SimulatedCrash, maybeCrash } from "./seams.js";
+import { LIBRARY_AUDIT_DIR, appendLibraryAudit, appendLibraryAuditWithReason, checkLibraryAudit, libraryAnchorKey, readLibraryAudit } from "./library-audit.js";
 
 /** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
 const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
@@ -108,6 +160,60 @@ export class Repo {
     return this.core.indexErrors;
   }
 
+  /** The library's own audit log (refused project creations, Task 50) and whether its chain verifies. */
+  /** What the project needs attention for (Task 50): marks, as the audit screen lists them. */
+  attentionMarks(projectId: string): Promise<AttentionMark[]> {
+    return listMarks(this.core, this.core.state(projectId));
+  }
+
+  /**
+   * Sets a mark aside with a reason (R154 d): decided by the policy engine (`delete`, op
+   * `attention.set-aside`) and audited with the reason, who, when and the mark itself, in the
+   * project's log when it is intact, else in the library's log; only then is the mark removed.
+   */
+  setAsideMark(projectId: string, markId: string, reason: string): Promise<{ recordedIn: "project" | "library" }> {
+    return setAsideMarkIn(this.core, projectId, markId, reason);
+  }
+
+  /** A page of the library's own audit log, newest first (like `readAudit`). */
+  async readLibraryAuditPage(opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: ShownAuditEvent[]; total: number }> {
+    const { events: all } = await readLibraryAudit(this.core.root);
+    const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
+    const older = opts.beforeSeq === undefined ? all : all.filter((e) => e.seq < opts.beforeSeq!);
+    return { events: await withLibraryReasons(this.core, older.slice(-limit).reverse()), total: all.length };
+  }
+
+  /** Checks the library's own audit log against its anchor, like `verifyAudit` for a project (R154 a). Reads only. */
+  verifyLibraryAudit(): Promise<AuditCheck> {
+    const core = this.core;
+    return core.serial(async () => {
+      const raw = await AuditStore.read(join(core.root, LIBRARY_AUDIT_DIR));
+      const verify = verifyChain(raw as AuditEvent[]);
+      let anchors: Awaited<ReturnType<RepoCore["anchors"]["readAll"]>> | undefined;
+      try {
+        anchors = await core.anchors.readAll();
+      } catch (err) {
+        if (!(err instanceof AnchorsUnreadableError)) throw err;
+      }
+      const anchor = anchors?.[libraryAnchorKey(core)];
+      const problem = raw.length === 0 && !anchor ? null : checkAnchor(raw, verify, anchor, core.device);
+      const alteredAt = raw
+        .filter((e): e is AuditEvent => !!e && (e.action === "audit.anchor-mismatch" || e.action === "audit.anchor-missing"))
+        .map((e) => e.at);
+      return {
+        ok: !problem && anchors !== undefined && alteredAt.length === 0,
+        events: raw.length,
+        anchored: !!anchor,
+        alteredAt,
+        ...(problem ? { problem } : anchors === undefined ? { problem: { kind: "anchors-unreadable" as const, detail: "the record of audit heads kept outside the library could not be read" } } : {}),
+      };
+    });
+  }
+
+  libraryAudit(): Promise<{ events: AuditEvent[]; verify: AuditVerifyResult }> {
+    return readLibraryAudit(this.core.root);
+  }
+
   listProjects(): Project[] {
     return [...this.core.projects.values()].map((s) => structuredClone(s.project));
   }
@@ -117,16 +223,29 @@ export class Repo {
   createProject(input: CreateProjectInput): Promise<{ project: Project; recoveryCode?: string }> {
     return createProject(this.core, input);
   }
-  async unlockProject(projectId: string, passphraseOrRecovery: string): Promise<void> {
-    await unlockProject(this.core, projectId, passphraseOrRecovery);
+  /** `lockAsksAtRequest` (R443 a): the count `lockAsksOf` gave when the request arrived; every later lock overtakes this unlock. */
+  async unlockProject(projectId: string, passphraseOrRecovery: string, lockAsksAtRequest?: number): Promise<void> {
+    await unlockProject(this.core, projectId, passphraseOrRecovery, lockAsksAtRequest);
     // Work that waited for the key (e.g. sealed backups the backups manifest could not read, R94).
     for (const h of unlockHooks) await h(this, projectId).catch(() => {});
   }
-  lockProject(projectId: string): void {
-    lockProject(this.core, projectId);
+  /**
+   * Issues a new recovery code for an unlocked encrypted project, given its passphrase again
+   * (governed and audited; the project key is unchanged and the old code stops working). The code is
+   * returned once and never stored.
+   */
+  issueRecoveryCode(projectId: string, passphrase: string): Promise<{ recoveryCode: string }> {
+    return issueRecoveryCode(this.core, projectId, passphrase);
+  }
+  lockProject(projectId: string): Promise<void> {
+    return lockProject(this.core, projectId);
   }
   isUnlocked(projectId: string): boolean {
     return isUnlocked(this.core, projectId);
+  }
+  /** The project's count of locks asked so far (read-only): noted by an unlock when its request arrives (R443 a). */
+  lockAsksOf(projectId: string): number {
+    return lockAsksOf(this.core, projectId);
   }
 
   /** The governed write path; see mutate.ts for the ordering guarantees. */
@@ -142,6 +261,14 @@ export class Repo {
   getSource(projectId: string, id: string): Promise<SourceFile> {
     return getSource(this.core, projectId, id);
   }
+  /** The source's own record (source.json alone; no annotations, no integrity check: R186). */
+  getSourceRecord(projectId: string, id: string): Promise<Source> {
+    return getSourceRecord(this.core, projectId, id);
+  }
+  /** The light read with the assets `source.json` holds (no annotations, no integrity check: R186, R222). */
+  getSourceRecordWithAssets(projectId: string, id: string): Promise<{ source: Source; assets: Asset[] }> {
+    return getSourceRecordWithAssets(this.core, projectId, id);
+  }
   listSourceIds(projectId: string): string[] {
     return listSourceIds(this.core, projectId);
   }
@@ -151,15 +278,36 @@ export class Repo {
   /**
    * The "Recheck" action: recomputes the source's field verification from its stored evidence and,
    * when it changed, saves it as a governed, audited and change-logged update of the source.
-   * Returns the source file as stored afterwards. A source whose verification is unchanged is not written.
+   * Returns the source file as stored afterwards. A source whose verification is unchanged is not
+   * written, unless one of its capture review entries is settled by it (R176 1), or a field of it in
+   * conflict is listed in no pending capture-conflict entry (R193 b: a source D19 left behind): the
+   * recheck's own governed change resolves or queues them.
    */
   async recheckSource(projectId: string, id: string, ctx: VerifyContext = {}): Promise<SourceFile> {
     const cur = await this.getSource(projectId, id);
-    if (isDeepStrictEqual(recheckSourceFile(cur, ctx).verification, cur.verification)) return cur;
-    return updateSource(this.core, projectId, id, {}, { verification: (next) => recheckSourceFile(next, ctx).verification });
+    const next = recheckSourceFile(cur, ctx);
+    const st = this.core.state(projectId);
+    if (isDeepStrictEqual(next.verification, cur.verification) && !(await hasSettledCaptureEntries(this.core, st, next)) && !(await hasUnlistedConflicts(this.core, st, next))) return cur;
+    return updateSource(this.core, projectId, id, {}, { verification: (n) => recheckSourceFile(n, ctx).verification, resolveReview: "recheck" });
   }
   deleteSource(projectId: string, id: string): Promise<void> {
     return deleteSource(this.core, projectId, id);
+  }
+  /** One source's annotations, as stored (the full read: source.json and its annotations file). */
+  listAnnotations(projectId: string, sourceId: string): Promise<Annotation[]> {
+    return listAnnotations(this.core, projectId, sourceId);
+  }
+  /** Adds a highlight or a page note on a PDF of the source: one governed, audited change (Task R3). */
+  createAnnotation(projectId: string, sourceId: string, draft: AnnotationDraft): Promise<Annotation> {
+    return createAnnotation(this.core, projectId, sourceId, draft);
+  }
+  /** Recolours an annotation, or sets or removes its note: one governed, audited change. */
+  updateAnnotation(projectId: string, sourceId: string, annotationId: string, patch: AnnotationPatch): Promise<Annotation> {
+    return updateAnnotation(this.core, projectId, sourceId, annotationId, patch);
+  }
+  /** Deletes an annotation (an imported one's key is remembered, so a re-import does not bring it back). */
+  deleteAnnotation(projectId: string, sourceId: string, annotationId: string): Promise<{ id: string; external: boolean }> {
+    return deleteAnnotation(this.core, projectId, sourceId, annotationId);
   }
   addDerivedAsset(projectId: string, sourceId: string, input: DerivedAssetInput): Promise<Asset> {
     return addDerivedAsset(this.core, projectId, sourceId, input);
@@ -205,13 +353,13 @@ export class Repo {
    * A page of the project's audit events, newest first: at most `limit` events with a sequence
    * number below `beforeSeq` (default: from the newest). Reads only.
    */
-  async readAudit(projectId: string, opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: AuditEvent[]; total: number }> {
+  async readAudit(projectId: string, opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: ShownAuditEvent[]; total: number }> {
     const st = this.core.state(projectId);
     const all = (await AuditStore.read(st.audit.dir)).filter((e): e is AuditEvent => !!e);
     const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
     const before = opts.beforeSeq;
     const older = before === undefined ? all : all.filter((e) => e.seq < before);
-    return { events: older.slice(-limit).reverse(), total: all.length };
+    return { events: await withProjectReasons(this.core, st, older.slice(-limit).reverse()), total: all.length };
   }
 
   /** Records (and audits) that the researcher acknowledged a one-time capture explanation (spec 5.1). */
@@ -278,6 +426,18 @@ export class Repo {
   setMembership(projectId: string, sourceId: string, m: { collectionIds?: string[]; tagIds?: string[] }): Promise<void> {
     return setMembership(this.core, projectId, sourceId, m);
   }
+  /** A watched folder's register, folded by key (Task W3; sealed in encrypted projects: refused while locked). */
+  watchRegister(projectId: string, watchId: string): Promise<Map<string, WatchRegisterEntry>> {
+    return readWatchRegister(this.core, projectId, watchId);
+  }
+  /** Appends entries to a watched folder's register: one governed, audited change (counts only in the audit). */
+  recordWatchedFiles(projectId: string, watchId: string, entries: WatchRegisterEntry[]): Promise<void> {
+    return recordWatchedFiles(this.core, projectId, watchId, entries);
+  }
+  /** Which watched folders, and which file in each, a source came from. */
+  watchOrigins(projectId: string, sourceId: string): Promise<Array<{ watchId: string; entry: WatchRegisterEntry }>> {
+    return readWatchOrigins(this.core, projectId, sourceId);
+  }
 
   createParticipant(projectId: string, input: ParticipantInput): Promise<Participant> {
     return createParticipant(this.core, projectId, input);
@@ -304,6 +464,13 @@ export class Repo {
   withdrawConsent(projectId: string, id: string, opts?: { reason?: string }): Promise<{ consent: ConsentRecord; flaggedSourceIds: string[] }> {
     return withdrawConsent(this.core, projectId, id, opts);
   }
+  /**
+   * "Reviewed after the withdrawal" (R176 2): resolves a review entry a consent withdrawal queued,
+   * with the researcher's reason (required, stored as typed). Changes nothing else about the source.
+   */
+  reviewedAfterWithdrawal(projectId: string, entryId: string, reason: string): Promise<ReviewEntry> {
+    return reviewedAfterWithdrawal(this.core, projectId, entryId, reason);
+  }
   /** Only when no consent record, session or source links to it (FieldworkInUseError otherwise). */
   deleteParticipant(projectId: string, id: string): Promise<void> {
     return deleteParticipant(this.core, projectId, id);
@@ -325,9 +492,12 @@ export class Repo {
   async getGovernanceText(projectId: string): Promise<string> {
     return (await readGovernance(this.core, projectId)).yaml;
   }
-  /** The governance.yaml text and its SHA-256 (the `baseSha256` of an edit). */
-  getGovernance(projectId: string): Promise<{ yaml: string; sha256: string }> {
-    return readGovernance(this.core, projectId);
+  /**
+   * The governance.yaml text, its SHA-256 (the `baseSha256` of an edit), and whether the file is there
+   * at all (R397 a) or something that cannot be opened is in its place (R397 e: the empty text).
+   */
+  getGovernance(projectId: string): Promise<{ yaml: string; sha256: string; file: GovernanceFileState }> {
+    return readGovernanceFile(this.core, projectId);
   }
   /**
    * Replaces the project's governance.yaml (governed and audited). A change that loosens a control
@@ -379,6 +549,10 @@ const RECOVERY_WARNINGS: Partial<Record<RecoveryOutcome, { kind: IntegrityWarnin
   "skipped-audit-unverifiable": {
     kind: "txn-recovery-skipped-audit-unverifiable",
     text: "an interrupted change was not rolled back because the audit log cannot be trusted to show it was uncommitted; the marker is kept",
+  },
+  "resolve-incomplete": {
+    kind: "incomplete-write-pending",
+    text: "the choice made for an interrupted change could not be completed when the library opened; the marker keeps the choice, and it is completed by resolving it again or on the next open",
   },
 };
 
@@ -442,6 +616,9 @@ export async function openRepoInternal(
   /** A marker is unresolved and cannot be tied to a project: no file of any project is trimmed. */
   let unattributed = false;
   if (writable) {
+    // Choices the researcher recorded but a crash or failed audit append left unfinished are
+    // completed and audited first (R131 c); recovery never acts on a recorded choice itself.
+    await completeRecordedResolves(core, (pid) => anchors[core.anchorKey(pid)]);
     const recovered = await recoverTransactions(core.root, (pid) => anchors[core.anchorKey(pid)]);
     for (const r of recovered) {
       // A committed change whose destroyed files still wait to be overwritten does not block writes.
@@ -476,7 +653,15 @@ export async function openRepoInternal(
   // Incomplete last lines (R28). Recovery ran first, so what a transaction appended is already
   // truncated; what is left was cut off outside a transaction and is not a committed record.
   // The workspace change log has no transactions and no audit chain: it is trimmed and reported.
-  reportIncompleteLines(core, "*", await scanIncompleteLines(core.root, "", writable), writable);
+  const rootLines = await scanIncompleteLines(core.root, "", writable);
+  reportIncompleteLines(core, "*", rootLines, writable);
+  // The library's own audit log (Task 50, R154 a): compared with its anchor like a project's log.
+  await checkLibraryAudit(
+    core,
+    anchors[libraryAnchorKey(core)],
+    writable,
+    rootLines.filter((l) => l.trimmed && l.file.startsWith(`${LIBRARY_AUDIT_DIR}/`)),
+  );
   const incomplete = new Map<string, IncompleteLine[]>();
   const loaded = await loadProjects(core, async (p) => {
     const lines = await scanIncompleteLines(core.root, p.rel, writable && !unattributed && !isPending(p));
@@ -496,6 +681,13 @@ export async function openRepoInternal(
     const problem = checkAnchor(events, verify, anchor, core.device);
     const at = core.clock().toISOString();
     if (problem) core.integrityWarnings.push({ projectId: st.project.id, ...problem });
+    if (!verify.ok) st.auditUnverified = true;
+    // Marks this device kept for this library (R154 e): a project that cannot be settled now takes them into its folder.
+    if (writable && (blocked || !verify.ok)) {
+      await moveOutboxIntoProject(core, st).catch((err: unknown) => {
+        if (err instanceof SimulatedCrash) throw err;
+      });
+    }
     if (!writable || blocked) continue;
     // A failed append here must never keep the whole library from opening: it blocks this project only.
     try {
@@ -522,10 +714,29 @@ export async function openRepoInternal(
           appended = true;
         }
       }
+      // A new recovery code committed but not yet put in place when the app stopped (R141 b).
+      if (core.encrypted(st)) {
+        const headBefore = st.audit.head?.seq;
+        await completeRecoveryActivation(core, st, events, verify.ok, at);
+        if (st.audit.head?.seq !== headBefore) appended = true;
+      }
+      // Audit events an action could not write, and permissions a restore could not set (Task 50).
+      if (verify.ok) {
+        const settled = await settleAttention(core, st, events, at);
+        if (settled > 0) {
+          appended = true;
+          core.integrityWarnings.push({
+            projectId: st.project.id,
+            kind: "audit-recorded-late",
+            detail: `${settled} action(s) whose audit entry or file permissions could not be written at the time were recorded now`,
+          });
+        }
+      }
       if (!problem && !appended && st.audit.head && (anchor?.seq !== st.audit.head.seq || anchor.hash !== st.audit.head.hash)) {
         await core.updateAnchor(st, at);
       }
     } catch (err) {
+      if (err instanceof SimulatedCrash) throw err; // test seam: the process died here
       st.recoveryPending = true;
       core.integrityWarnings.push({
         projectId: st.project.id,
@@ -533,6 +744,12 @@ export async function openRepoInternal(
         detail: `an audit event could not be appended while opening (${err instanceof Error ? err.message : String(err)}); this project refuses changes until the library is reopened`,
       });
     }
+  }
+  // This device's outbox entries for projects the library no longer has (N9).
+  if (writable) {
+    await settleOrphanOutbox(core).catch((err: unknown) => {
+      if (err instanceof SimulatedCrash) throw err;
+    });
   }
   const repo = new Repo(core);
   // Package-internal reconcilers (e.g. consent forms whose link to the consent was interrupted, R117 I5).
@@ -610,6 +827,112 @@ export async function appendLibraryEvent(
       details,
     });
   });
+}
+
+/**
+ * Package-internal (library move, Task 50): audits a refusal of a library-level action for one
+ * project (a deny event: who, what, the rule's reason), with the same guards as any append.
+ */
+export async function appendRefusalEvent(repo: Repo, projectId: string, action: string, reason: string, details: Record<string, unknown>): Promise<void> {
+  const core = cores.get(repo)!;
+  core.assertWritable();
+  return core.serial(async () => {
+    core.assertWritable();
+    const st = core.state(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    const at = core.clock().toISOString();
+    await core.auditNow(st, {
+      ...core.auditBase(st, at),
+      action,
+      entity: { type: "project", id: projectId },
+      decision: { result: "deny", reason },
+      details,
+    });
+  });
+}
+
+/** Package-internal: the project's library-relative folder, actor and device in this repo. */
+export function repoProjectInfo(repo: Repo, projectId: string): { rel: string; actor: string; device: string; at: string } {
+  const core = cores.get(repo)!;
+  return { rel: core.state(projectId).rel, actor: core.actor, device: core.device, at: core.clock().toISOString() };
+}
+
+/**
+ * Package-internal (Task 50, R28, R82): appends a library-level event; when that fails, the action is
+ * not undone but the project is marked (`<Project>/attention/`, warning `audit-unrecorded`) and the
+ * next writable open records the event late. Returns a plain warning when the event was not
+ * recorded now (and says whether the mark could be written), else undefined.
+ */
+export async function recordOrMark(
+  repo: Repo,
+  projectId: string,
+  action: string,
+  details: Record<string, unknown>,
+  refusal?: { reason: string },
+): Promise<string | undefined> {
+  try {
+    if (refusal) await appendRefusalEvent(repo, projectId, action, refusal.reason, details);
+    else await appendLibraryEvent(repo, projectId, action, details);
+    return undefined;
+  } catch (err) {
+    const core = cores.get(repo)!;
+    const st = core.projects.get(projectId);
+    const what = `The ${action} audit event could not be recorded for project ${projectId} (${err instanceof Error ? err.message : String(err)})`;
+    if (!st) return `${what}; the project could not be marked as needing attention`;
+    try {
+      maybeCrash("before-attention-mark");
+      // Never into a library another device holds (N1): checked now, not by the repo handed in.
+      if (!(await holdsLock(core.library))) throw new Error("this computer does not hold the library's lock");
+      await writeAttention(core.root, st.rel, {
+        formatVersion: 1,
+        id: newAttentionId(),
+        kind: "audit-unrecorded",
+        occurredAt: core.clock().toISOString(),
+        actor: core.actor,
+        device: core.device,
+        action,
+        ...(refusal ? { decision: { result: "deny" as const, reason: refusal.reason } } : {}),
+        details,
+        state: "ready",
+        reason: reasonOf(err),
+      });
+    } catch (e) {
+      if (e instanceof SimulatedCrash) throw e;
+      // The project folder cannot take it: kept on this device instead (R154 e, M1).
+      try {
+        await writeOutbox(core.library.appConfigDir, core.library.id, projectId, {
+          formatVersion: 1,
+          id: newAttentionId(),
+          kind: "audit-unrecorded",
+          occurredAt: core.clock().toISOString(),
+          actor: core.actor,
+          device: core.device,
+          action,
+          ...(refusal ? { decision: { result: "deny" as const, reason: refusal.reason } } : {}),
+          details,
+          state: "ready",
+          reason: reasonOf(err),
+        });
+      } catch (e2) {
+        return `${what}; it could not be kept for later either (${e2 instanceof Error ? e2.message : String(e2)})`;
+      }
+      return `${what}; it is kept on this computer and recorded when the library is next opened here with write access`;
+    }
+    return `${what}; the project is marked as needing attention and the event is recorded when the library is next opened`;
+  }
+}
+
+/** Package-internal: the project's standing attention warnings, read through this repo. */
+export async function writeProjectAttention(repo: Repo, projectId: string, rec: AttentionRecord): Promise<void> {
+  const core = cores.get(repo)!;
+  if (!(await holdsLock(core.library))) throw new Error("this computer does not hold the library's lock");
+  await writeAttention(core.root, core.state(projectId).rel, rec);
+}
+
+/** Package-internal: removes a record written before an action, once its event is recorded. */
+export async function removeProjectAttention(repo: Repo, projectId: string, id: string): Promise<void> {
+  const core = cores.get(repo)!;
+  await removeAttention(core.root, core.state(projectId).rel, id);
 }
 
 /** Package-internal (reconnect): points a linked asset at its new library-relative path, governed and audited. */
@@ -784,7 +1107,7 @@ export function importChange<T>(
   projectId: string,
   reqs: MutateRequest | MutateRequest[],
   fn: (ops: ImportOps) => Promise<T>,
-  opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook },
+  opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook; auditDetails?: Record<string, unknown> },
 ): Promise<T> {
   return runImportChange(cores.get(repo)!, projectId, reqs, fn, opts);
 }
@@ -845,16 +1168,58 @@ export async function deletedRecordsTrouble(repo: Repo, projectId: string): Prom
 export const BACKUP_FAILED_WARNING = "backup-failed";
 
 /**
+ * Persisted in `Backups/backups-state.json` (`pending`) when old backups were removed but their
+ * `backup.prune` audit event could not be written yet (R125, R82); cleared once it is recorded.
+ */
+export const BACKUP_AUDIT_PENDING_WARNING = "backup-audit-pending";
+
+/**
+ * Noted in `Backups/backups-state.json` (`undestroyed`) while a backup listed at a destruction under
+ * the retention rule is not yet verifiably gone (R138 e, N1, R147). The note is rewritten from the
+ * audit log at every retry pass, and cleared once every listed backup is recorded as removed or as
+ * no longer present.
+ */
+export const DESTRUCTION_BACKUPS_PENDING_WARNING = "destruction-backups-pending";
+
+/**
+ * Noted in `Backups/backups-state.json` (`oldCopiesUndestroyed`) while an old copy of the library
+ * left by a move, which this computer lists, still holds files a destruction under the retention
+ * rule destroyed, or while that list could not be checked (R379). Rewritten from the audit log at
+ * every retry pass, as the backups' note is; its sentences are in @ao/shared (oldCopiesPendingText).
+ */
+export { DESTRUCTION_OLD_COPIES_PENDING_WARNING } from "@ao/shared";
+
+/**
  * The project's standing warnings (persisted ones: 'deleted-records-unreadable', R74 I2;
- * 'backup-failed', R92).
+ * 'backup-failed', R92; 'backup-audit-pending', R125; 'destruction-backups-pending', R147; 'destruction-old-copies-pending', R379;
+ * 'recovery-code-unshown', R141 b; 'audit-unrecorded' and 'permissions-not-set', Task 50).
  */
 export async function projectWarnings(repo: Repo, projectId: string): Promise<string[]> {
   const core = cores.get(repo)!;
-  const out = (await deletedRecordsWarning(core, core.state(projectId))) ? [DELETED_RECORDS_WARNING] : [];
+  const st = core.state(projectId);
+  const out = (await deletedRecordsWarning(core, st)) ? [DELETED_RECORDS_WARNING] : [];
+  if (await recoveryCodeUnshown(core, st)) out.push(RECOVERY_CODE_UNSHOWN_WARNING);
+  // Actions not undone whose audit event, or permissions, could not be written (Task 50).
+  out.push(...(await attentionWarnings(core.root, st.rel, st.recoveryPending === true || st.auditUnverified === true)));
+  // Marks waiting on this device for this library's lock (R154 e).
+  if ((await readOutbox(core.library.appConfigDir, core.library.id)).some((e) => e.projectId === projectId)) out.push(AUDIT_WAITING_WARNING);
   try {
     const raw = await readMaybe(join(core.root, "Backups", "backups-state.json"));
-    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown> }) : undefined;
+    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown>; pending?: Record<string, unknown>; undestroyed?: Record<string, unknown> }) : undefined;
     if (m?.failures && Object.hasOwn(m.failures, projectId)) out.push(BACKUP_FAILED_WARNING);
+    const stuck = m?.undestroyed && typeof m.undestroyed === "object" && Object.hasOwn(m.undestroyed, projectId) ? m.undestroyed[projectId] : undefined;
+    // Per destruction certificate (R2-I2): the warning stands while any of them has a backup left.
+    const lists = Array.isArray(stuck) ? [stuck] : stuck && typeof stuck === "object" ? Object.values(stuck as Record<string, unknown>) : [];
+    if (lists.some((l) => Array.isArray(l) && l.length > 0)) out.push(DESTRUCTION_BACKUPS_PENDING_WARNING);
+    // Old copies of the library left by a move (R379), per certificate: a copy listed, or a list not checked.
+    const copies = (m as { oldCopiesUndestroyed?: Record<string, unknown> } | undefined)?.oldCopiesUndestroyed;
+    const mine = copies && typeof copies === "object" && Object.hasOwn(copies, projectId) ? copies[projectId] : undefined;
+    const noted = mine && typeof mine === "object" ? Object.values(mine as Record<string, { copies?: unknown; unchecked?: unknown } | null>) : [];
+    if (noted.some((n) => (Array.isArray(n?.copies) && n.copies.length > 0) || n?.unchecked === true)) out.push(DESTRUCTION_OLD_COPIES_PENDING_WARNING_KIND);
+    const pending = m?.pending && typeof m.pending === "object" ? Object.values(m.pending) : [];
+    if (pending.some((op) => (op as { kind?: unknown; projectId?: unknown; auditFailed?: unknown } | null)?.kind === "prune" && (op as { projectId?: unknown }).projectId === projectId && (op as { auditFailed?: unknown }).auditFailed === true)) {
+      out.push(BACKUP_AUDIT_PENDING_WARNING);
+    }
   } catch {
     // an unreadable manifest is handled (and rebuilt) by the backups module
   }
@@ -875,7 +1240,7 @@ export async function pseudonymizesIdentifiable(repo: Repo, projectId: string): 
     projectId,
     actor: core.actor,
     now: core.clock().toISOString(),
-    tz: core.tz,
+    tz: core.zoneOf(core.state(projectId).project),
     store: { identifiable: true, hasLocation: false, legalBasis: "(evaluated for naming only)" },
   });
   if (d.result === "deny") return true;
@@ -907,23 +1272,28 @@ export function updateSourceRechecked(
   repo: Repo,
   projectId: string,
   id: string,
-  patch: SourcePatch,
+  patch: Parameters<typeof updateSource>[3],
   extra: Parameters<typeof updateSource>[4],
 ): Promise<SourceFile> {
   return updateSource(cores.get(repo)!, projectId, id, patch, extra);
 }
 
 /**
- * Package-internal (profile capture): the participant code the project's pseudonym map gives one
- * of `names` (compared case-insensitively), if any. Needs the unlocked project key.
+ * Package-internal (profile capture): the participant code the project's pseudonym map gives the
+ * first of `names` that names one, each looked up by `participantCodeOf` (as written, then the strict
+ * key; R427 a), if any. It decides nothing about which spellings to try: the profile capture passes
+ * exactly one, the `creatorKey` of the creator its source will carry, so the answer is the record
+ * `assignCodes` links that source to (R437 b). Needs the unlocked project key.
  */
 export async function pseudonymCodeFor(repo: Repo, projectId: string, names: string[]): Promise<string | undefined> {
   const core = cores.get(repo)!;
   const st = core.state(projectId);
   if (!core.encrypted(st)) return undefined;
   const map = await loadPseudonyms(core, st);
-  const wanted = new Set(names.filter(Boolean).map((n) => n.normalize("NFC").toLowerCase()));
-  for (const [k, code] of map) if (wanted.has(k.normalize("NFC").toLowerCase())) return code;
+  for (const n of names) {
+    const code = n?.trim() ? participantCodeOf(map, n) : undefined;
+    if (code) return code;
+  }
   return undefined;
 }
 
@@ -939,7 +1309,12 @@ export async function lookupPolicyInfo(
   const core = cores.get(repo)!;
   const st = core.state(projectId);
   const policy = await projectPolicy(repo, projectId);
-  return { policy, actor: core.actor, ...(core.tz ? { tz: core.tz } : {}), clock: core.clock, sensitive: core.encrypted(st) };
+  return { policy, actor: core.actor, tz: core.zoneOf(st.project), clock: core.clock, sensitive: core.encrypted(st) };
+}
+
+/** Package-internal (Task F15, R328 e): a stamp of a source's record file (one `stat`, nothing read), or null when it is gone. */
+export function sourceRecordStampIn(repo: Repo, projectId: string, id: string): string | null {
+  return sourceRecordStamp(cores.get(repo)!, projectId, id);
 }
 
 /** Package-internal (Zotero Web import): records the library version a finished import saw (governed, audited). */
@@ -947,14 +1322,74 @@ export function recordZoteroWebLibraryVersion(repo: Repo, projectId: string, ref
   return recordZoteroWebVersion(cores.get(repo)!, projectId, ref, version);
 }
 
+/**
+ * Task Z5 (R206 4): forgets the Zotero library version recorded for `ref` (op
+ * `project.import-settings.zotero-web.reset`), so the next Web import of that library is a full one.
+ */
+export function clearZoteroWebVersion(repo: Repo, projectId: string, ref: string): Promise<void> {
+  return resetZoteroWebVersion(cores.get(repo)!, projectId, ref);
+}
+
 /** Package-internal (watched folders): adds a watch's id + options to project.json (governed, audited). */
 export function addWatchedFolderEntry(repo: Repo, projectId: string, options: unknown): Promise<WatchedFolder> {
   return addWatchedFolderRecord(cores.get(repo)!, projectId, options);
 }
 
+/** Package-internal (watched folders, W7 round 2): changes a watch's label and/or collection in project.json (governed, audited by field names only). */
+export function updateWatchedFolderEntry(repo: Repo, projectId: string, id: string, patch: WatchedFolderOptionsPatch): Promise<WatchedFolder> {
+  return updateWatchedFolderOptions(cores.get(repo)!, projectId, id, patch);
+}
+
 /** Package-internal (watched folders): removes a watch's record from project.json (governed, audited). */
 export function removeWatchedFolderEntry(repo: Repo, projectId: string, id: string): Promise<void> {
   return removeWatchedFolderRecord(cores.get(repo)!, projectId, id);
+}
+
+/** Package-internal (Find and acquire, R237 e): the project's queue, its live entries (see find/queue-store.ts). */
+export function readFindQueueIn(repo: Repo, projectId: string): Promise<Map<string, FindEntry>> {
+  return readFindQueue(cores.get(repo)!, projectId);
+}
+
+/** Package-internal (Find and acquire): the live entries and how many lines could not be read. */
+export function readFindQueueDetailedIn(repo: Repo, projectId: string): Promise<{ entries: Map<string, FindEntry>; unreadableLines: number }> {
+  return readFindQueueDetailed(cores.get(repo)!, projectId);
+}
+
+/**
+ * Package-internal (Find and acquire): one governed change of the queue (`project.find.add|update|remove`); with an
+ * add, `alongside` are new lines of live entries written in the same change (F8: the author's entry whose works are added).
+ */
+export function appendFindEntriesIn(repo: Repo, projectId: string, entries: FindEntry[], op: "add" | "update" | "remove" | "library-start", alongside: FindEntry[] = [], method: "library_access" | "free_copy" = "library_access"): Promise<void> {
+  return appendFindEntries(cores.get(repo)!, projectId, entries, op, alongside, method);
+}
+
+/** Package-internal (Find and acquire F11): the held file, its review entry and the entry's line, in one change (review.ts). */
+export function holdMismatchedFileIn(repo: Repo, projectId: string, input: HoldInput): Promise<{ reviewId: string; held: string }> {
+  return holdMismatchedFile(cores.get(repo)!, projectId, input);
+}
+
+/** Package-internal (F11, R296 d): how many files wait for the researcher's check in the project (one read; review.ts). */
+export function heldWaitingCountIn(repo: Repo, projectId: string): Promise<number> {
+  return heldWaitingCount(cores.get(repo)!, projectId);
+}
+
+/** Package-internal (F11): "Use this file" / "Not this file" on a held file, one change each (review.ts). */
+export function resolveHeldFileIn(repo: Repo, projectId: string, reviewId: string, decision: "attach" | "discard"): Promise<{ entry: FindEntry | null; asset?: Asset }> {
+  return resolveHeldFile(cores.get(repo)!, projectId, reviewId, decision);
+}
+
+/** Package-internal (F11, R277 c): removes a queue entry, its held file and its review entry in one change (review.ts). */
+export function removeFindEntryIn(repo: Repo, projectId: string, entry: FindEntry): Promise<void> {
+  return removeFindEntryWithHeld(cores.get(repo)!, projectId, entry);
+}
+
+/**
+ * Package-internal: the zone a project's date rule is read in (R160 as amended): its time zone
+ * when set, else the computer's for protocol dates and UTC for retention (`dateRuleZone`).
+ */
+export function projectDateZone(repo: Repo, projectId: string, rule: DateRule): string {
+  const core = cores.get(repo)!;
+  return core.zoneOf(core.state(projectId).project, rule);
 }
 
 /** Package-internal: the researcher's time zone the repo names dated files in. */
@@ -993,6 +1428,13 @@ export interface ProjectQueueContext {
   at(): string;
   /** Appends one audit event about the project (decision allow), anchored. */
   audit(action: string, details: Record<string, unknown>): Promise<void>;
+  /**
+   * Evaluates a request in this turn, against the governance in force now (a backup's commit
+   * point, R138 c): a deny is audited and thrown as PolicyDeniedError, as in any governed write.
+   */
+  decide(req: MutateRequest, opts: { op: string; entity?: { type: EntityType; id: string }; unaudited?: boolean }): Promise<PolicyDecision>;
+  /** Appends one audit event about the project with the given decision (e.g. a deny with what it refused), anchored. */
+  record(action: string, decision: { result: "allow" } | { result: "deny"; reason: string }, details: Record<string, unknown>): Promise<void>;
 }
 
 /**
@@ -1019,6 +1461,14 @@ export function withProjectQueue<T>(repo: Repo, projectId: string, fn: (ctx: Pro
         const at = core.clock().toISOString();
         await core.auditNow(st, { ...core.auditBase(st, at), action, entity: { type: "project", id: projectId }, decision: { result: "allow" }, details });
       },
+      decide: async (req, o) => {
+        const [first] = await decide(core, st, req, core.clock().toISOString(), o.op, o.entity, undefined, o.unaudited === true);
+        return first!.d;
+      },
+      record: async (action, decision, details) => {
+        const at = core.clock().toISOString();
+        await core.auditNow(st, { ...core.auditBase(st, at), action, entity: { type: "project", id: projectId }, decision, details });
+      },
     });
   });
 }
@@ -1028,14 +1478,33 @@ export function keyFromRing(repo: Repo, keyId: string): Uint8Array | undefined {
   return cores.get(repo)!.keyRing.get(keyId);
 }
 
-/** Package-internal (restore with a passphrase): puts a project key in the repo's key ring. */
-export function addKeyToRing(repo: Repo, keyId: string, key: Uint8Array): void {
-  cores.get(repo)!.keyRing.add(keyId, key);
-}
-
 /** Package-internal (restore, R90 b): makes an unpacked backup a new project of the library. */
 export function adoptRestoredProject(repo: Repo, s: StagedRestore): ReturnType<typeof adoptRestoredIn> {
   return adoptRestoredIn(cores.get(repo)!, s);
+}
+
+/**
+ * Package-internal (restore, Task 50b): the policy decision for a restore, made before anything of
+ * the backup is unpacked. A deny is audited and thrown as PolicyDeniedError.
+ */
+export function authorizeRestore(repo: Repo, r: RestoreRequest): ReturnType<typeof authorizeRestoreIn> {
+  return authorizeRestoreIn(cores.get(repo)!, r);
+}
+
+/** Package-internal (restore): audits a restore refused because the record of destructions cannot be read. */
+export function refuseRestore(repo: Repo, r: RestoreRequest, err: DestructionRecordError): Promise<void> {
+  return refuseRestoreIn(cores.get(repo)!, r, err);
+}
+
+/** Package-internal (restore, R179): audits, in the library's own log, the refusal of a file that is not a readable backup. */
+export function refuseUnreadableBackup(repo: Repo, f: { file: string; sha256?: string; reason: string }): Promise<void> {
+  return recordUnreadableBackup(cores.get(repo)!, f);
+}
+
+/** Package-internal (restore): the head of the project's audit log as this process holds it. */
+export function auditHeadOf(repo: Repo, projectId: string): { seq: number; hash: string } | null {
+  const head = cores.get(repo)!.state(projectId).audit.head;
+  return head ? { seq: head.seq, hash: head.hash } : null;
 }
 
 /** Package-internal (retention, R90 d): the governed destruction change. */
@@ -1043,9 +1512,78 @@ export function destroyProjectAssets(repo: Repo, projectId: string, input: Destr
   return destroyAssets(cores.get(repo)!, projectId, input);
 }
 
+/** Package-internal (retention, R147): the governed change that writes an amendment beside a destruction certificate. */
+export function amendProjectDestruction(repo: Repo, projectId: string, input: AmendInput): ReturnType<typeof amendDestruction> {
+  return amendDestruction(cores.get(repo)!, projectId, input);
+}
+
+/**
+ * Package-internal (retention, R147): the project's audit events whose line contains one of
+ * `needles`. `headMatches`: the log on disk ends at the head this process holds (the one checked
+ * against the anchor at open, moved on only by this process's own appends); false means the log
+ * changed outside the app since. The log is read outside the write queue (it can be long, and this
+ * runs hourly for every project); only the comparison with the head runs in the queue. If the two do
+ * not match, an entry may have been appended while the log was read: it is read once more, in the
+ * queue, where nothing is appended meanwhile.
+ */
+export async function auditEventsMentioning(repo: Repo, projectId: string, needles: readonly string[]): Promise<{ events: AuditEvent[]; headMatches: boolean }> {
+  const core = cores.get(repo)!;
+  const first = await AuditStore.readMatching(core.state(projectId).audit.dir, needles);
+  return core.serial(async () => {
+    const st = core.state(projectId);
+    if (endsAt(first.last, st.audit.head)) return { events: first.events, headMatches: true };
+    const { events, last } = await AuditStore.readMatching(st.audit.dir, needles);
+    return { events, headMatches: endsAt(last, st.audit.head) };
+  });
+}
+
+/**
+ * Package-internal (retention, R147): every audit event of the project, only when its chain of
+ * hashes verifies and it ends at the head this process holds; otherwise `ok: false` (the log is not
+ * what the app wrote, so nothing may be removed on its word). Read and verified outside the write
+ * queue, the head compared in it; a reading that does not pass is made once more in the queue, so an
+ * entry appended meanwhile is never taken for a change made outside the app.
+ */
+export async function verifiedAuditEvents(repo: Repo, projectId: string): Promise<{ ok: true; events: AuditEvent[] } | { ok: false }> {
+  const core = cores.get(repo)!;
+  const read = async () => {
+    const events = (await AuditStore.read(core.state(projectId).audit.dir)) as AuditEvent[];
+    return { events, verify: verifyChain(events) };
+  };
+  let r = await read();
+  return core.serial(async () => {
+    const head = core.state(projectId).audit.head;
+    if (!r.verify.ok || !endsAt(r.verify.head, head)) r = await read();
+    if (!r.verify.ok || !endsAt(r.verify.head, head)) return { ok: false as const };
+    return { ok: true as const, events: r.events };
+  });
+}
+
+/**
+ * Package-internal (restore, in its commit turn): `verifiedAuditEvents` for a caller that already
+ * holds the write queue, where nothing is appended meanwhile. Never call it outside the queue.
+ */
+export async function verifiedAuditEventsInQueue(repo: Repo, projectId: string): Promise<{ ok: true; events: AuditEvent[] } | { ok: false }> {
+  const st = cores.get(repo)!.state(projectId);
+  const events = (await AuditStore.read(st.audit.dir)) as AuditEvent[];
+  const verify = verifyChain(events);
+  return verify.ok && endsAt(verify.head, st.audit.head) ? { ok: true, events } : { ok: false };
+}
+
+const endsAt = (last: { seq: number; hash: string } | null, head: { seq: number; hash: string } | null): boolean =>
+  (last?.seq ?? 0) === (head?.seq ?? 0) && (last?.hash ?? "") === (head?.hash ?? "");
+
 /** Sets a project's backup settings (daily automatic backup, how many to keep); governed and audited. */
 export function setProjectBackupSettings(repo: Repo, projectId: string, settings: BackupSettings): Promise<Project> {
   return setBackupSettingsIn(cores.get(repo)!, projectId, settings);
+}
+
+/**
+ * Sets (a real IANA zone name) or clears (null) the project's time zone, in which its calendar
+ * rules such as the retention date are read (R92, R93); governed and audited. Absent: UTC.
+ */
+export function setProjectTimeZone(repo: Repo, projectId: string, tz: string | null): Promise<Project> {
+  return setTimeZoneIn(cores.get(repo)!, projectId, tz);
 }
 
 /** Package-internal (citations, exports): the project's pseudonym map (handle or name → code); empty unless encrypted. */
@@ -1079,4 +1617,152 @@ export function setConsentDocumentAsset(repo: Repo, projectId: string, consentId
 export function noteIntegrityWarning(repo: Repo, w: IntegrityWarning): void {
   const list = cores.get(repo)!.integrityWarnings;
   if (!list.some((x) => x.projectId === w.projectId && x.kind === w.kind && x.detail === w.detail)) list.push(w);
+}
+
+const SET_ASIDE_OP = "attention.set-aside";
+
+/** An audit event as the audit screen reads it: with the reason the researcher typed, when it carries one (R362 b). */
+export type ShownAuditEvent = AuditEvent & { reasonShown?: AuditReasonView };
+
+/** The project's key, or "locked". */
+function keyOrLocked(core: RepoCore, st: ProjectState): { key: Uint8Array; keyId: string } | "locked" {
+  try {
+    return core.key(st);
+  } catch {
+    return "locked";
+  }
+}
+
+/**
+ * R362 b: each event of a project's log with the reason it carries: as typed; or, sealed, read with the project key
+ * (from the review entry for "Reviewed after the withdrawal", R177 b; else from the store of reasons, by the entry's
+ * seq and hash), shown only when it matches the entry's digest (keyed, R369 b; or SHA-256 in earlier entries). Locked:
+ * the sentence; nothing is read without the key.
+ */
+async function withProjectReasons(core: RepoCore, st: ProjectState, events: AuditEvent[]): Promise<ShownAuditEvent[]> {
+  const sealed = events.filter(hasSealedReason);
+  let k: { key: Uint8Array; keyId: string } | "locked" = "locked";
+  // A read that fails is said as such (R369 d), never as a text that is no longer there.
+  let store: Map<string, { text: string }> | "unreadable" = new Map();
+  let review: ReviewEntry[] | "unreadable" = [];
+  if (sealed.length && core.encrypted(st)) {
+    k = keyOrLocked(core, st);
+    if (k !== "locked") {
+      const key = k.key;
+      // A read a lock cut short (a wiped key) is "locked", never "unreadable" (R386 a).
+      const failed = (e: unknown): "unreadable" => {
+        if (e instanceof KeyNotAvailableError || e instanceof ProjectLockedError) throw new ProjectLockedError(st.project.id);
+        return "unreadable";
+      };
+      if (sealed.some((e) => typeof e.details?.reviewEntry !== "string")) store = await readProjectReasons(core.abs(`${st.rel}/${AUDIT_REASONS_FILE}`), key, st.project.id).catch(failed);
+      if (sealed.some((e) => typeof e.details?.reviewEntry === "string")) review = await readReviewEntries(core, st).catch(failed);
+      // The digests below are checked with this key: wiped meanwhile, the read is refused as locked.
+      if (key.every((b) => b === 0)) throw new ProjectLockedError(st.project.id);
+    }
+  }
+  return events.map((e) => {
+    const shown = reasonView(e, () => {
+      if (k === "locked") return "locked";
+      const key = k.key;
+      const entry = e.details?.reviewEntry;
+      if (typeof entry === "string") {
+        if (review === "unreadable") return "unreadable";
+        // A restored copy gives its review entries new ids (R92) while its audit log keeps the old: then the entry
+        // resolved by this decision at this entry's time, with the text whose digest the entry records.
+        const byId = review.find((r) => r.id === entry);
+        if (byId) return { key, text: byId.reason };
+        return { key, text: review.find((r) => r.decision === "reviewed-after-withdrawal" && r.resolvedAt === e.at && typeof r.reason === "string" && reasonMatches(e.details, r.reason, key))?.reason };
+      }
+      if (store === "unreadable") return "unreadable";
+      return { key, text: store.get(reasonKey(e.seq, e.hash))?.text };
+    });
+    return shown ? { ...e, reasonShown: shown } : e;
+  });
+}
+
+/** R362 b: the library's log: a sealed reason is read with the key of the project the entry names. */
+async function withLibraryReasons(core: RepoCore, events: AuditEvent[]): Promise<ShownAuditEvent[]> {
+  // A read that fails is said as such (R369 d), never as a text that is no longer there.
+  const lines = events.some(hasSealedReason) ? await readLibraryReasonLines(join(core.root, LIBRARY_AUDIT_REASONS_FILE)).catch(() => "unreadable" as const) : [];
+  return events.map((e) => {
+    const shown = reasonView(e, () => {
+      const st = e.projectId ? core.projects.get(e.projectId) : undefined;
+      if (!st) return { key: new Uint8Array(0), text: undefined };
+      const k = keyOrLocked(core, st);
+      if (k === "locked") return "locked";
+      if (lines === "unreadable") return "unreadable";
+      const line = lines.find((l) => l.seq === e.seq && l.hash === e.hash && l.projectId === e.projectId);
+      return { key: k.key, text: line ? openLibraryReason(line.sealed, k.key, st.project.id)?.text : undefined };
+    });
+    return shown ? { ...e, reasonShown: shown } : e;
+  });
+}
+
+async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string, reason: string): Promise<{ recordedIn: "project" | "library" }> {
+  core.assertWritable();
+  // The policy engine decides on the reason itself (N7): a blank one is refused there, and audited.
+  const why = typeof reason === "string" ? reason.trim() : "";
+  if (why.length > 1000) throw new InvalidInputError("Give a reason of up to 1000 characters for setting this aside");
+  const st = core.state(projectId);
+  if (typeof markId !== "string") throw new NotFoundError("Mark", String(markId));
+  const intact = st.recoveryPending !== true && st.auditUnverified !== true;
+  if (intact) {
+    const m = await markForSetAside(core, st, markId);
+    if (!m) throw new NotFoundError("Mark", markId);
+    // Decided and audited in the project's log (a deny is audited there and thrown).
+    if (core.encrypted(st)) {
+      // R362 b: the entry records the reason's SHA-256; its text is sealed in the same change, under the marker (R26).
+      await runMutation(core, projectId, { action: "set-aside", setAside: { reason: why } }, async () => undefined, {
+        op: SET_ASIDE_OP,
+        entity: { type: "project", id: projectId },
+        // Keyed with the project's key, known once the change runs (a locked project is refused there).
+        auditDetails: () => ({ ...auditedReasonIn(core, st, why), mark: m.summary }),
+        sealedReason: why,
+      });
+    } else {
+      await authorizeOnly(
+        core,
+        projectId,
+        { action: "set-aside", setAside: { reason: why } },
+        { op: SET_ASIDE_OP, entity: { type: "project", id: projectId }, auditAllow: { details: { reason: why, mark: m.summary } } },
+      );
+    }
+    await core.serial(() => m.remove());
+    return { recordedIn: "project" };
+  }
+  // The project's log cannot take it: decided against the project's governance, recorded in the library's log.
+  return core.serial(async () => {
+    core.assertWritable();
+    // R362 b: an encrypted project's reason is sealed with its key; locked, nothing is written.
+    const encrypted = core.encrypted(st);
+    if (encrypted) core.assertUnlocked(st);
+    const m = await markForSetAside(core, st, markId);
+    if (!m) throw new NotFoundError("Mark", markId);
+    const at = core.clock().toISOString();
+    let decision: { result: "allow" } | { result: "deny"; reason: string };
+    try {
+      const raw = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
+      if (!raw) throw new Error("governance.yaml is missing");
+      const d = evaluate(parseGovernance(raw.toString("utf8")), { action: "set-aside", projectId, actor: core.actor, now: at, tz: core.zoneOf(st.project), setAside: { reason: why } });
+      decision = d.result === "deny" ? { result: "deny", reason: d.reason } : { result: "allow" };
+    } catch (e) {
+      // Never an error message here: it can name an absolute path (N5).
+      decision = { result: "deny", reason: `Policy could not be evaluated (${reasonOf(e)})` };
+    }
+    const input = {
+      at,
+      actor: core.actor,
+      device: core.device,
+      projectId,
+      action: "set-aside",
+      entity: { type: "project" as const, id: projectId },
+      decision,
+      details: { op: SET_ASIDE_OP, ...(encrypted && why === "" ? {} : auditedReason(encrypted ? core.key(st).key : undefined, why)), mark: m.summary, projectLogNotIntact: true },
+    };
+    if (encrypted && why !== "") await appendLibraryAuditWithReason(core, input, core.key(st), why);
+    else await appendLibraryAudit(core, input);
+    if (decision.result === "deny") throw new PolicyDeniedError(decision.reason, "set-aside");
+    await m.remove();
+    return { recordedIn: "library" as const };
+  });
 }

@@ -1,0 +1,91 @@
+/*
+ * The new-project dialog (Task 60). Tokens only (spec 8A.1, R105); focus rings come from base.css
+ * (:focus-visible).
+ */
+
+/* The library screen's "New project" button. */
+.ao-new-project {
+  margin: var(--space-2) 0;
+}
+
+/* A create whose answer was lost, on the library screen until it is settled. */
+.ao-newproject-notice {
+  border-inline-start: 4px solid var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+  padding: var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+/* "A project named … already exists" in the dialog. */
+.ao-newproject__confirm {
+  border-inline-start: 4px solid var(--warn-line);
+  padding-inline-start: var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+.ao-newproject-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-3);
+  background: color-mix(in srgb, var(--backdrop) 80%, var(--bg) 20%);
+}
+
+.ao-newproject {
+  max-width: 40rem;
+  width: 100%;
+  max-height: calc(100vh - 2 * var(--space-3));
+  overflow: auto;
+  border: 2px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: var(--space-3);
+}
+
+.ao-newproject h2 {
+  margin-top: 0;
+  font-size: 1.2rem;
+}
+
+.ao-newproject__field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-2) 0;
+}
+
+.ao-newproject__group {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin: var(--space-2) 0;
+  padding: var(--space-2) var(--space-3);
+}
+
+.ao-newproject__choice {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.ao-newproject__profile {
+  margin: var(--space-1) 0;
+}
+
+.ao-newproject__needs {
+  margin: 0 0 var(--space-2);
+  font-size: 0.9rem;
+}
+
+.ao-newproject__warning {
+  border-inline-start: 4px solid var(--warn-line);
+  padding-inline-start: var(--space-2);
+}
+
+.ao-newproject__actions {
+  margin-top: var(--space-3);
+}

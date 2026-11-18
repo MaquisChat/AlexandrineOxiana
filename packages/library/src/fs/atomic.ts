@@ -191,8 +191,10 @@ export async function copyFileAtomic(
   dest: string,
   opts: CopyOptions = {},
 ): Promise<{ sha256: string; bytes: number }> {
-  // Open the temp file first so that every stream below gets its error
-  // listeners attached synchronously, before any error can be emitted.
+  // R454: every stream below is made, given its error listeners and consumed with NO `await` in between. The source
+  // starts reading (and failing: a missing file, a lock, a damaged or foreign file) as soon as it is made; an `await`
+  // there lets that error arrive with no listener — an uncaught exception, which stops the service — and leaves the
+  // copy waiting for ever on a stream that is already dead. So both files are opened and the mode applied first.
   const tmp = tempPathFor(dest);
   // With noFollow, the source is opened first, without following a link at its path (ELOOP).
   const nf = opts.noFollow ? fs.constants.O_NOFOLLOW : undefined;
@@ -200,15 +202,15 @@ export async function copyFileAtomic(
   let fh: fsp.FileHandle | undefined;
   try {
     fh = await fsp.open(tmp, "wx", opts.mode);
+    await applyMode(fh, opts.mode);
   } catch (err) {
+    await fh?.close().catch(() => {});
     await srcFh?.close().catch(() => {});
+    if (fh) await removeQuietly(tmp); // a failed exclusive open made no temp file (it may be another's)
     throw err;
   }
   const hash = createHash("sha256");
   let bytes = 0;
-  const raw = srcFh ? srcFh.createReadStream() : createReadStream(src);
-  const source: Readable = opts.decode ? opts.decode(raw) : raw;
-  if (source !== raw) raw.on("error", (err) => source.destroy(err));
   const hasher = new Transform({
     transform(chunk: Buffer, _enc, cb) {
       hash.update(chunk);
@@ -216,12 +218,20 @@ export async function copyFileAtomic(
       cb(null, chunk);
     },
   });
+  let raw: Readable | undefined;
+  let source: Readable | undefined;
   let out: Readable = hasher;
   try {
-    await applyMode(fh, opts.mode);
-    // `pipe` does not forward errors; do it by hand so the output fails too.
-    source.on("error", (err) => hasher.destroy(err));
-    const hashed = source.pipe(hasher);
+    // From here to the `for await`, nothing awaits (R454).
+    const r = srcFh ? srcFh.createReadStream() : createReadStream(src);
+    raw = r;
+    // `raw` has its listener before `decode` is called (R455), so even a `decode` that throws leaves nothing
+    // uncaught. `pipe` does not forward errors; this does: to the decoded stream once there is one, else the hasher.
+    r.on("error", (err: Error) => (source !== undefined && source !== r ? source : hasher).destroy(err));
+    const s = opts.decode ? opts.decode(r) : r;
+    source = s;
+    if (s !== r) s.on("error", (err: Error) => hasher.destroy(err));
+    const hashed = s.pipe(hasher);
     out = opts.transform ? opts.transform(hashed) : hashed;
     if (out !== hashed) hashed.on("error", (err) => out.destroy(err));
     for await (const chunk of out as AsyncIterable<Uint8Array>) {
@@ -238,11 +248,12 @@ export async function copyFileAtomic(
     await commit(tmp, dest);
     return { sha256: hash.digest("hex"), bytes };
   } catch (err) {
-    raw.destroy();
-    source.destroy();
+    raw?.destroy();
+    source?.destroy();
     hasher.destroy();
     out.destroy();
     await fh?.close().catch(() => {});
+    await srcFh?.close().catch(() => {});
     await removeQuietly(tmp);
     throw err;
   }

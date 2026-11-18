@@ -6,6 +6,14 @@ export declare function tinyTiff(): Buffer;
 export declare function buildMobi(opts?: { exth?: [number, string][]; fullName?: string; corruptExth?: boolean }): Buffer;
 export declare function buildPdf(opts?: { title?: string; author?: string; lines?: string[]; extra?: string }): Promise<Buffer>;
 export declare function buildDoiPdf(): Promise<Buffer>;
+/** Reader fixtures (Task R6): see generate.mjs for what each page holds. */
+export declare function buildTwoColumnPdf(): Promise<Buffer>;
+export declare function buildScanPdf(pages: number): Promise<Buffer>;
+export declare function buildRotatedCropPdf(): Promise<Buffer>;
+export declare function buildMultiPagePdf(pages: number): Promise<Buffer>;
+export declare function buildDamagedPdf(): Buffer;
+export declare function buildRangeReadPdf(pages: number): Promise<Buffer>;
+export declare function buildCjkPdf(): Promise<Buffer>;
 export declare function buildCameraTiff(path: string): Promise<void>;
 export interface GeneratedFixtures {
   doiPdf: string;

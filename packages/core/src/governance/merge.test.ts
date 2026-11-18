@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { effectivePolicy } from "./merge.js";
-import { parseGovernance, parseGovernanceWithWarnings, GovernanceParseError } from "./schema.js";
+import { parseGovernance, parseGovernanceWithWarnings, GovernanceParseError, ACQUIRE_METHODS, DEFAULT_GOVERNANCE, PUBLIC_METADATA_SERVICES } from "./schema.js";
 
 const cfg = (yaml: string) => parseGovernance(yaml);
 const H = "profiles: [hipaa]\nsharing: { locationMetadata: strip }\n";
@@ -58,6 +58,16 @@ describe("effectivePolicy: spec scenarios", () => {
       cfg(H + "encryption: { atRest: optional }\n" + exc("encryption.atRest", "optional", "  ")),
     );
     expect(violations).toHaveLength(1);
+  });
+  it("an exception whose reason or approver is blank (invisible characters) waives nothing, and the file is still read (R391 c)", () => {
+    for (const reason of ["\\u200b", "\\u2800", "\\u0301"]) {
+      const { violations } = effectivePolicy(cfg(H + "encryption: { atRest: optional }\n" + exc("encryption.atRest", "optional", reason)));
+      expect(violations, reason).toHaveLength(1);
+    }
+    const byBlank = `exceptions:\n  - { control: "encryption.atRest", value: optional, reason: "IRB amendment 3", by: "\\u200b\\u3164", at: "2026-01-01T09:30:00Z" }\n`;
+    const { policy, violations } = effectivePolicy(cfg(H + "encryption: { atRest: optional }\n" + byBlank));
+    expect(violations).toHaveLength(1);
+    expect(policy.encryption.atRest).toBe("required");
   });
   it("irb + gdpr sets both requirements", () => {
     const { policy, violations } = effectivePolicy(
@@ -293,9 +303,14 @@ describe("exception shape", () => {
     expect(() => cfg(e('reason: r, by: pi, at: "2026-01-01T00:00:00Z"'))).toThrow(/exceptions\.0\.value/);
     expect(() => cfg(e('value: null, reason: r, by: pi, at: "2026-01-01T00:00:00Z"'))).not.toThrow();
   });
-  it("by must be non-blank", () => {
-    expect(() => cfg(e('value: false, reason: r, by: "  ", at: "2026-01-01T00:00:00Z"'))).toThrow(/exceptions\.0\.by/);
+  it("by is required; a blank one is read and waives nothing, as a blank reason (R415 d, review 2 M3)", () => {
     expect(() => cfg(e('value: false, reason: r, at: "2026-01-01T00:00:00Z"'))).toThrow(/exceptions\.0\.by/);
+    for (const by of ["", "  ", "\\u00a0", "\\u3000", "\\ufeff", "\\u200b", "\\u3164"]) {
+      const y = `exceptions:\n  - { control: "encryption.atRest", value: optional, reason: "IRB amendment 3", by: "${by}", at: "2026-01-01T09:30:00Z" }\n`;
+      const { policy, violations } = effectivePolicy(cfg(H + "encryption: { atRest: optional }\n" + y));
+      expect(violations, JSON.stringify(by)).toHaveLength(1);
+      expect(policy.encryption.atRest, JSON.stringify(by)).toBe("required");
+    }
   });
   it("at must be ISO 8601 UTC", () => {
     expect(() => cfg(e("value: false, reason: r, by: pi, at: \"2026-01-01\""))).toThrow(/exceptions\.0\.at/);
@@ -327,5 +342,62 @@ describe("consent.defaultLegalBasis", () => {
   });
   it("rejects a blank basis", () => {
     expect(() => parseGovernance("consent:\n  defaultLegalBasis:\n    social-media: '  '\n")).toThrow(GovernanceParseError);
+  });
+});
+
+describe("acquireMethods (Find and acquire)", () => {
+  const msg = (yaml: string): string => {
+    try {
+      cfg(yaml);
+    } catch (e) {
+      return (e as Error).message;
+    }
+    return "no error";
+  };
+  it("defaults to all three, and an explicit captureMethods list does not change that", () => {
+    expect(cfg("").acquireMethods).toEqual([...ACQUIRE_METHODS]);
+    expect(cfg("captureMethods: [manual_upload]").acquireMethods).toEqual([...ACQUIRE_METHODS]);
+    expect(DEFAULT_GOVERNANCE.acquireMethods).toEqual(["reference_lookup", "free_copy", "library_access"]);
+    expect(cfg("acquireMethods: []").acquireMethods).toEqual([]);
+    expect(cfg("acquireMethods: [free_copy]").acquireMethods).toEqual(["free_copy"]);
+  });
+  it("one of the three written into captureMethods is an error with a plain sentence", () => {
+    expect(msg("captureMethods: [manual_upload, free_copy]")).toContain(
+      "captureMethods.1: free_copy is a way of acquiring, not a capture method; list it under acquireMethods",
+    );
+  });
+  it("an old capture method written into acquireMethods is an error with a plain sentence", () => {
+    expect(msg("acquireMethods: [downloader]")).toContain(
+      "acquireMethods.0: downloader is a capture method, not a way of acquiring; list it under captureMethods",
+    );
+  });
+  it("an unknown name, a non-list and a null are errors, never 'allow'", () => {
+    expect(msg("acquireMethods: [carrier_pigeon]")).toContain("acquireMethods.0");
+    expect(msg("acquireMethods: free_copy")).toContain("acquireMethods");
+    expect(msg("acquireMethods: { free_copy: true }")).toContain("acquireMethods");
+    expect(msg("acquireMethods: true")).toContain("acquireMethods");
+    expect(msg("acquireMethods:")).toContain("acquireMethods");
+    expect(msg("acquireMethods: [free_copy, 3]")).toContain("acquireMethods.1");
+  });
+  it("profiles never change it", () => {
+    for (const p of ["irb", "gdpr", "hipaa", "dmp"]) {
+      const { policy, violations } = effectivePolicy(cfg(`profiles: [${p}]`));
+      expect(policy.acquireMethods).toEqual([...ACQUIRE_METHODS]);
+      expect(violations.map((v) => v.control)).not.toContain("acquireMethods");
+    }
+    expect(effectivePolicy(cfg("profiles: [irb, gdpr, hipaa, dmp]\nacquireMethods: [free_copy]")).policy.acquireMethods).toEqual(["free_copy"]);
+  });
+  it("GDPR drops elicit without a DPA", () => {
+    const base = "vendors: [{ id: elicit, baa: true, dpa: false }]\nprocessing: { metadata_lookup: [crossref, elicit] }\n";
+    const { policy, violations } = effectivePolicy(cfg("profiles: [gdpr]\n" + base));
+    expect(policy.processing.metadata_lookup).toEqual(["crossref"]);
+    expect(violations.map((v) => v.control)).toContain("processing.metadata_lookup");
+    const ok = effectivePolicy(cfg("profiles: [gdpr]\nvendors: [{ id: elicit, dpa: true }]\nprocessing: { metadata_lookup: [crossref, elicit] }"));
+    expect(ok.policy.processing.metadata_lookup).toEqual(["crossref", "elicit"]);
+  });
+  it("HIPAA drops elicit without a BAA, and elicit is not a public metadata service", () => {
+    const base = "vendors: [{ id: elicit, dpa: true }]\nprocessing: { metadata_lookup: [crossref, elicit] }\n";
+    expect(effectivePolicy(cfg("profiles: [hipaa]\nsharing: { locationMetadata: strip }\n" + base)).policy.processing.metadata_lookup).toEqual(["crossref"]);
+    expect((PUBLIC_METADATA_SERVICES as readonly string[]).includes("elicit")).toBe(false);
   });
 });

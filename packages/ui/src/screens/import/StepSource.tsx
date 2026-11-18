@@ -3,9 +3,14 @@
  * from here on; the wizard reads it to set safe defaults (R24 link refusal, R64 structure).
  */
 import { useEffect, useId, useState, type ReactElement } from "react";
-import type { FieldSession, ImportAdapter, ImportApi, Participant, ProjectInfo } from "../../api/import";
+import type { FieldSession, ImportAdapter, ImportApi, Participant, ProjectInfo, ZoteroDataFolder } from "../../api/import";
+import { PathField } from "../../components/PathField";
 import { UserText } from "../../components/UserText";
+import { ZoteroKeyField } from "../../components/ZoteroKeyField";
 import { ErrorNote, errorText, isAbsolutePath, PATH_HINT, Section } from "./shared";
+
+/** Makes a path field (label, value, setter, placeholder, what the picker chooses, the picker's title). */
+type PathFieldMaker = (label: string, value: string, set: (v: string) => void, placeholder: string, pick: "folder" | "file", pickerTitle: string) => ReactElement;
 
 export type RefFormat = "bibtex" | "ris" | "csl-json" | "zotero-rdf";
 
@@ -75,11 +80,9 @@ export interface StepSourceProps {
 
 export function StepSource({ api, projects, projectId, onProject, choice, onChoice, busy, error, onScan, onNext }: StepSourceProps) {
   const [invalid, setInvalid] = useState<string | null>(null);
-  const pathProps = (label: string, value: string, set: (v: string) => void, placeholder: string) => (
-    <label className="ao-import__field">
-      <span>{label}</span>
-      <input type="text" value={value} placeholder={placeholder} spellCheck={false} onChange={(e) => set(e.target.value)} />
-    </label>
+  // A path field with the native picker beside it inside the desktop shell (D12).
+  const pathProps: PathFieldMaker = (label, value, set, placeholder, pick, pickerTitle) => (
+    <PathField className="ao-import__field" label={label} value={value} onChange={set} placeholder={placeholder} pick={pick} pickerTitle={pickerTitle} />
   );
 
   const pick = (kind: Kind) => {
@@ -130,6 +133,8 @@ export function StepSource({ api, projects, projectId, onProject, choice, onChoi
             choice.path,
             (path) => onChoice({ ...choice, path }),
             choice.kind === "zip" ? "/Users/me/Downloads/papers.zip" : "/Users/me/Documents/Papers",
+            choice.kind === "zip" ? "file" : "folder",
+            choice.kind === "folder" ? "Choose the folder to import" : choice.kind === "zip" ? "Choose the ZIP file to import" : "Choose the Calibre library folder",
           )}
         {choice.kind === "reference" && (
           <>
@@ -143,15 +148,16 @@ export function StepSource({ api, projects, projectId, onProject, choice, onChoi
                 ))}
               </select>
             </label>
-            {pathProps("File path", choice.path, (path) => onChoice({ ...choice, path }), "/Users/me/Documents/library.bib")}
+            {pathProps("File path", choice.path, (path) => onChoice({ ...choice, path }), "/Users/me/Documents/library.bib", "file", "Choose the reference file")}
           </>
         )}
         {choice.kind === "zotero-local" && (
           <>
-            {pathProps("Zotero data folder", choice.dataDir, (dataDir) => onChoice({ ...choice, dataDir }), "/Users/me/Zotero")}
+            {pathProps("Zotero data folder", choice.dataDir, (dataDir) => onChoice({ ...choice, dataDir }), "/Users/me/Zotero", "folder", "Choose the Zotero data folder")}
             <p className="ao-import__hint">
               Zotero keeps it in <code>~/Zotero</code> on macOS and Linux and in <code>%USERPROFILE%\Zotero</code> on Windows, unless you moved it (Zotero: Settings, Advanced, Files and Folders).
             </p>
+            <ZoteroFolders api={api} onUse={(dataDir) => onChoice({ ...choice, dataDir })} />
           </>
         )}
         {choice.kind === "zotero-web" && (
@@ -173,10 +179,7 @@ export function StepSource({ api, projects, projectId, onProject, choice, onChoi
               <input type="checkbox" checked={choice.full} onChange={(e) => onChoice({ ...choice, full: e.target.checked })} />
               <span>Import everything again, not only what changed since the last import</span>
             </label>
-            <p className="ao-import__note">
-              The Zotero API key is not entered here: the library service has no way yet to store it from this window. Store it once on this computer with <code>ao secrets set zotero-api-key</code>; the
-              service reads it from the system keyring. Public group libraries need no key.
-            </p>
+            <ZoteroKeyField api={api} />
           </>
         )}
         {choice.kind === "device" && <DeviceFields api={api} projectId={projectId} choice={choice} onChoice={onChoice} field={pathProps} />}
@@ -210,7 +213,7 @@ function DeviceFields({
   projectId: string;
   choice: Extract<SourceChoice, { kind: "device" }>;
   onChoice(c: SourceChoice): void;
-  field: (label: string, value: string, set: (v: string) => void, placeholder: string) => ReactElement;
+  field: PathFieldMaker;
 }) {
   const hintId = useId();
   const [sessions, setSessions] = useState<FieldSession[]>([]);
@@ -243,7 +246,7 @@ function DeviceFields({
 
   return (
     <>
-      {field("Camera or phone folder", choice.dir, (dir) => onChoice({ ...choice, dir }), "/Volumes/PHONE/DCIM")}
+      {field("Camera or phone folder", choice.dir, (dir) => onChoice({ ...choice, dir }), "/Volumes/PHONE/DCIM", "folder", "Choose the camera or phone folder")}
       <label className="ao-import__field">
         <span>Fieldwork session</span>
         <select value={choice.sessionId} onChange={(e) => pickSession(e.target.value)}>
@@ -275,6 +278,45 @@ function DeviceFields({
       </p>
       <ErrorNote error={error} />
     </>
+  );
+}
+
+/**
+ * Folders on this computer that look like a Zotero data folder (found by the service). Choosing one
+ * only fills the field: nothing is read or imported until Scan.
+ */
+function ZoteroFolders({ api, onUse }: { api: ImportApi; onUse(path: string): void }) {
+  const [folders, setFolders] = useState<ZoteroDataFolder[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    api.zoteroDataFolders().then(
+      (f) => live && setFolders(f),
+      (e: unknown) => live && setError(errorText(e)),
+    );
+    return () => {
+      live = false;
+    };
+  }, [api]);
+
+  if (error) return <ErrorNote error={`The Zotero data folder could not be looked for. ${error}`} />;
+  if (!folders) return <p className="ao-import__hint">Looking for Zotero data folders on this computer…</p>;
+  if (!folders.length) return <p className="ao-import__hint">No Zotero data folder was found in the usual places. Enter its path above.</p>;
+  return (
+    <fieldset className="ao-import__choices ao-import__found">
+      <legend>Zotero data folders found on this computer</legend>
+      <ul className="ao-import__found-list">
+        {folders.map((f) => (
+          <li key={f.path}>
+            <UserText className="ao-import__found-path">{f.path}</UserText>{" "}
+            <span className="ao-import__hint">{f.from === "zotero-setting" ? "(the folder Zotero's own setting names)" : "(Zotero's usual place)"}</span>{" "}
+            <button type="button" aria-label={`Use ${f.path}`} onClick={() => onUse(f.path)}>
+              Use
+            </button>
+          </li>
+        ))}
+      </ul>
+    </fieldset>
   );
 }
 

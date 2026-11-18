@@ -21,9 +21,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
-import { recheckSourceFile, type FieldEvidence, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
+import { cleanAddress, nonBlank, recheckSourceFile, type FieldEvidence, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
 import { InvalidInputError } from "../repo/errors.js";
 import { addCapturedOriginal, projectPolicy, repoLibrary, updateSourceRechecked, type Repo } from "../repo/repo.js";
+import { htmlStripWorkerUrl } from "../resources.js";
 import { activeTemp } from "../tmp-registry.js";
 import { classifyUrl } from "./platforms.js";
 import { stripSnapshot } from "./snapshot.js";
@@ -180,9 +181,12 @@ export async function captureBrowserPage(
     const c = classifyUrl(url.href);
     const policy = await projectPolicy(repo, projectId);
     const identifiable = policy?.identifiability.containsIdentifiable ?? true;
-    const legalBasis = text(input.legalBasis, 2000) ?? policy?.consent.defaultLegalBasis?.["social-media"]?.trim() ?? undefined;
+    // A blank basis (invisible characters only) is none: core's one `blank()` (R391 c, R415 d).
+    const legalBasis = nonBlank(input.legalBasis)?.slice(0, 2000) ?? nonBlank(policy?.consent.defaultLegalBasis?.["social-media"]);
     const social = c.platform !== "other";
-    const title = ex.caption?.split("\n")[0]?.slice(0, 500) || (c.postId ? `${c.platform} post ${c.postId}` : url.hostname + url.pathname);
+    // The title (and so the folder name) from the CLEANED address: a `;jsessionid=…` in the path never reaches it (R391 a).
+    const shown = URL.canParse(c.canonicalUrl) ? new URL(c.canonicalUrl) : undefined;
+    const title = ex.caption?.split("\n")[0]?.slice(0, 500) || (c.postId ? `${c.platform} post ${c.postId}` : shown ? shown.hostname + shown.pathname : url.hostname);
     const day = ex.postedAt ? DAY.exec(ex.postedAt)?.[1] : undefined;
     const draft: SourceDraft = {
       projectIds: [projectId],
@@ -191,7 +195,7 @@ export async function captureBrowserPage(
       creators: ex.handle ? [{ handle: ex.handle, ...(ex.displayName ? { literal: ex.displayName } : {}), role: "author" }] : [],
       ...(day ? { issued: day } : {}),
       // The platform from the URL ("other" for a web page), so a protocol's platform list applies (R99 I8).
-      identifiers: { url: c.canonicalUrl || url.href, platform: c.platform, ...(c.postId ? { platformPostId: c.postId } : {}) },
+      identifiers: { url: c.canonicalUrl || cleanAddress(url.href), platform: c.platform, ...(c.postId ? { platformPostId: c.postId } : {}) },
       caseAttributes: {},
       availability: { status: "available" },
       collectionIds: [],
@@ -201,7 +205,8 @@ export async function captureBrowserPage(
     const provenance: Provenance = {
       captureMethod: "browser_capture",
       capturedAt: at,
-      originalUrl: c.canonicalUrl || url.href,
+      // Never the address as given (R391 f).
+      originalUrl: c.canonicalUrl || cleanAddress(url.href),
       tool: { name: "ao-browser-extension", version: "1" },
       fileHashes: {},
       legal: { status: "unknown", ...(legalBasis ? { basis: legalBasis } : {}) },
@@ -236,7 +241,6 @@ export const HTML_STRIP_MAX_WAITING = 8;
 export const HTML_STRIP_RETRY_AFTER_TIMEOUT_MS = 10 * 60_000;
 /** Test seam: the time budget in force (HTML_STRIP_TIMEOUT_MS). */
 export const htmlStripTuning = { timeoutMs: HTML_STRIP_TIMEOUT_MS };
-const STRIP_WORKER = new URL("./html-strip-worker.mjs", import.meta.url);
 
 /** The page's HTML was not stored (too large or deep, or markup that does not settle); the screenshot still is. */
 export class HtmlSnapshotRefusedError extends InvalidInputError {
@@ -274,7 +278,7 @@ async function slot(): Promise<() => void> {
 function runWorker(html: string, hash: string): Promise<string> {
   return new Promise((resolve, reject) => {
     started++;
-    const worker = new Worker(STRIP_WORKER, { workerData: { html }, resourceLimits: { maxOldGenerationSizeMb: HTML_STRIP_HEAP_MB } });
+    const worker = new Worker(htmlStripWorkerUrl(), { workerData: { html }, resourceLimits: { maxOldGenerationSizeMb: HTML_STRIP_HEAP_MB } });
     let settled = false;
     const finish = (fn: () => void) => {
       if (settled) return;

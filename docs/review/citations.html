@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Citation outputs review</title>
+<style>
+:root{color-scheme:light dark;--pg-bg:#faf8f3;--pg-ink:#22201c;--pg-muted:#5d584e;--pg-line:#d9d4c7;--pg-card:#ffffff;--pg-soft:#f0ece2;--pg-accent:#1f5e63;--pg-flag-bg:#fdf0dc;--pg-flag-ink:#6b3a05;--pg-flag-line:#e0b87c}
+@media (prefers-color-scheme:dark){:root{--pg-bg:#171714;--pg-ink:#ebe8df;--pg-muted:#aaa598;--pg-line:#3a3832;--pg-card:#201f1c;--pg-soft:#2a2925;--pg-accent:#8ccbc6;--pg-flag-bg:#3a2a14;--pg-flag-ink:#f2c994;--pg-flag-line:#6b4a22}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--pg-bg);color:var(--pg-ink);font-family:Georgia,'Times New Roman',serif;font-size:18px;line-height:1.65}
+main{max-width:56rem;margin:0 auto;padding:2rem 16px 5rem}
+h1{font-size:2rem;line-height:1.2;margin:0 0 .5rem}
+h2{font-size:1.5rem;line-height:1.25;margin:3.2rem 0 .75rem;padding-top:1rem;border-top:1px solid var(--pg-line)}
+h3{font-size:1.15rem;margin:0 0 .4rem}
+p,li{overflow-wrap:anywhere}
+a{color:var(--pg-accent)}
+.lead{color:var(--pg-muted);margin:0 0 1.5rem}
+.box{background:var(--pg-soft);border:1px solid var(--pg-line);border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0}
+.box h2,.box h3{border:0;margin:0 0 .4rem;padding:0}
+.box ul,.box ol{margin:.4rem 0 0;padding-left:1.3rem}
+.box li{margin:.3rem 0}
+code,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.85em}
+nav.toc ul{margin:.4rem 0 0;padding-left:1.3rem}
+small,.muted{color:var(--pg-muted)}
+
+.tag{background:var(--pg-flag-bg);color:var(--pg-flag-ink);border:1px solid var(--pg-flag-line);border-radius:4px;padding:0 .4em;font-size:.85em}
+.src{margin:1rem 0}
+.src dl,.entry .in{margin:0}
+.src dl{display:grid;grid-template-columns:minmax(8rem,14rem) 1fr;gap:.15rem 1rem;font-size:.92rem}
+.src dt{color:var(--pg-muted)}
+.src dd{margin:0;overflow-wrap:anywhere}
+.entry{background:var(--pg-card);border:1px solid var(--pg-line);border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;scroll-margin-top:1rem}
+.entry.flagged{border-left:5px solid var(--pg-flag-line)}
+.entry header{display:flex;gap:.75rem;align-items:baseline;flex-wrap:wrap}
+.entry header h3{margin:0}
+.eid{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:bold;background:var(--pg-soft);border:1px solid var(--pg-line);border-radius:4px;padding:0 .5em;font-size:.95rem}
+.entry .in{font-size:.85rem;color:var(--pg-muted);margin:.5rem 0 .75rem}
+.fld{display:inline-block;margin:0 1rem .1rem 0}
+.fld b{font-weight:normal;font-style:italic}
+.lab{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--pg-muted);margin:.7rem 0 .1rem}
+.bib{margin:0;padding-left:2em;text-indent:-2em;font-size:1.05rem}
+.cite{margin:0;font-size:1.05rem}
+.issue{margin:.9rem 0 0;padding:.6rem .8rem;background:var(--pg-flag-bg);color:var(--pg-flag-ink);border:1px solid var(--pg-flag-line);border-radius:6px;font-size:.95rem}
+.cmp{overflow-x:auto;margin:1rem 0}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th,td{border:1px solid var(--pg-line);padding:.4rem .6rem;text-align:left;vertical-align:top;overflow-wrap:anywhere}
+th{background:var(--pg-soft)}
+td:first-child{white-space:nowrap}
+@media (max-width:600px){body{font-size:17px}.src dl{grid-template-columns:1fr}.src dt{margin-top:.4rem}.entry{padding:.8rem 1rem}table{font-size:.8rem}}
+</style>
+</head>
+<body>
+<main>
+<h1>Citation outputs: please review</h1>
+<p class="lead">The citations the app produces for six test sources, in five styles.</p>
+
+<div class="box"><h2>What this page is</h2>
+<p>The app formats a source as a bibliography entry and as an in-text citation. Its tests keep a saved copy of that output for APA, Chicago author-date, MLA, ASA and Harvard (Cite Them Right). Each saved copy is marked <b>PENDING HUMAN REVIEW</b>: nobody has yet checked it against the style guides. This page lays those saved copies out so you can check them by eye, next to the facts that went in. Nothing here was edited by hand; the entries are the saved files, word for word.</p>
+<p><b>How to respond.</b> Reply in the chat with an entry id and what is wrong, for example <i>&ldquo;APA-3: the year should be in parentheses&rdquo;</i>. If an entry is fine, you do not need to say anything; if you checked a whole style and it is fine, say so (&ldquo;ASA: all correct&rdquo;).</p>
+<p><b>Generated from</b> commit <code>b5b9762</code>. The saved snapshot files were last changed in commit <code>388ab1a</code> (2026-11-10). To regenerate after the snapshots change: <code>pnpm review-pages</code>.</p>
+<p><b>Formatting.</b> The snapshots keep both a plain-text line and the engine&rsquo;s HTML for every bibliography entry, so italics are shown exactly as the app produces them (28 of 30 entries contain italics; none of the others carry any formatting). The in-text citations are plain text only: the snapshots hold no formatting for them, and none is expected.</p>
+<p><b>Possible issues.</b> 8 entries are marked <span class="tag">Possible issue &mdash; please check</span>. Each has one concrete reason, phrased as a question. They are guesses from reading the output, not rulings; the style guides decide.</p>
+<p><b>Privacy.</b> The Instagram reel&rsquo;s creator is a research participant. The app shows the participant code (P-014) instead of the name, and so does this page.</p>
+</div>
+
+<nav class="toc box"><h2>Contents</h2><ul>
+<li><a href="#sources">The six test sources</a></li>
+<li><a href="#apa">APA 7</a> (APA-1 to APA-6)</li>
+<li><a href="#chi">Chicago author-date</a> (CHI-1 to CHI-6)</li>
+<li><a href="#mla">MLA 9</a> (MLA-1 to MLA-6)</li>
+<li><a href="#asa">ASA</a> (ASA-1 to ASA-6)</li>
+<li><a href="#har">Harvard (Cite Them Right)</a> (HAR-1 to HAR-6)</li>
+<li><a href="#compare">Side by side, source by source</a></li>
+</ul>
+<p class="muted">Possible issues: <a href="#APA-5">APA-5</a>, <a href="#CHI-3">CHI-3</a>, <a href="#MLA-4">MLA-4</a>, <a href="#ASA-3">ASA-3</a>, <a href="#ASA-4">ASA-4</a>, <a href="#ASA-5">ASA-5</a>, <a href="#HAR-4">HAR-4</a>, <a href="#HAR-5">HAR-5</a>.</p></nav>
+
+<section id="sources"><h2>The six test sources</h2>
+<p class="muted">These are the inputs used by every style. Entry number <i>n</i> in each style comes from source <i>n</i>, so APA-3, CHI-3, MLA-3, ASA-3 and HAR-3 are the same source.</p>
+<div class="src"><h3>1. Journal article <small class="mono">article-journal</small></h3><dl><dt>Title (en)</dt><dd dir="auto">Fermentation and food sovereignty in the Andes</dd><dt>Author 1</dt><dd dir="auto">given “María José”, family “Quispe”</dd><dt>Author 2</dt><dd dir="auto">given “Daniel K.”, family “Ortega”</dd><dt>Journal</dt><dd dir="auto">Journal of Ethnobiology</dd><dt>Volume / issue / pages</dt><dd dir="auto">41 / 2 / 115–134</dd><dt>Issued</dt><dd dir="auto">2021-06</dd><dt>DOI</dt><dd dir="auto">10.5555/joe.2021.0042</dd><dt>ISSN</dt><dd dir="auto">0278-0771</dd><dt>Locator in the “with locator” line</dt><dd dir="auto">page 12</dd></dl></div>
+<div class="src"><h3>2. Book <small class="mono">book</small></h3><dl><dt>Title (en)</dt><dd dir="auto">The art of fermentation</dd><dt>Author</dt><dd dir="auto">given “Sandor Ellix”, family “Katz”</dd><dt>Publisher</dt><dd dir="auto">Chelsea Green Publishing</dd><dt>Place</dt><dd dir="auto">White River Junction, VT</dd><dt>Issued</dt><dd dir="auto">2012</dd><dt>ISBN</dt><dd dir="auto">9781603582865</dd><dt>Locator</dt><dd dir="auto">page 12</dd></dl></div>
+<div class="src"><h3>3. Book chapter <small class="mono">chapter</small></h3><dl><dt>Title (en)</dt><dd dir="auto">Kitchen ferments as household knowledge</dd><dt>Author</dt><dd dir="auto">given “Aiko”, family “Tanaka”</dd><dt>Editor 1</dt><dd dir="auto">given “Ruth”, family “Mendel”</dd><dt>Editor 2</dt><dd dir="auto">given “Omar”, family “Haddad”</dd><dt>Book (container)</dt><dd dir="auto">Ferment and society</dd><dt>Publisher / place</dt><dd dir="auto">Routledge / London</dd><dt>Pages</dt><dd dir="auto">45–67</dd><dt>Issued</dt><dd dir="auto">2019</dd><dt>Locator</dt><dd dir="auto">page 12</dd></dl></div>
+<div class="src"><h3>4. YouTube video <small class="mono">video</small></h3><dl><dt>Title (en)</dt><dd dir="auto">How to start a sourdough culture</dd><dt>Channel (creator)</dt><dd dir="auto">Fermentology Lab (handle @fermentologylab)</dd><dt>Issued</dt><dd dir="auto">2023-05-01</dd><dt>Accessed</dt><dd dir="auto">2026-11-01</dd><dt>URL</dt><dd dir="auto">https://www.youtube.com/watch?v=dQw4w9WgXcQ</dd><dt>Platform / post id</dt><dd dir="auto">youtube / dQw4w9WgXcQ</dd><dt>Locator</dt><dd dir="auto">time range 0:38–0:46</dd></dl></div>
+<div class="src"><h3>5. Instagram reel <small class="mono">social-post</small></h3><dl><dt>Title (es, original)</dt><dd dir="auto">Receta de la abuela, sin filtros</dd><dt>Title (en, translated)</dt><dd dir="auto">Grandma&#39;s recipe, no filters</dd><dt>Creator (uploader)</dt><dd dir="auto">a research participant: the app shows the code P-014 instead of the name and handle, so they are not shown here</dd><dt>Issued</dt><dd dir="auto">2024-03-02</dd><dt>Accessed</dt><dd dir="auto">2026-10-30</dd><dt>URL</dt><dd dir="auto">https://www.instagram.com/reel/C4abc123XyZ/</dd><dt>Platform / post id</dt><dd dir="auto">instagram / C4abc123XyZ</dd><dt>Locator</dt><dd dir="auto">time range 0:38–0:46</dd></dl></div>
+<div class="src"><h3>6. Field photograph <small class="mono">field-photo</small></h3><dl><dt>Title (en)</dt><dd dir="auto">Clay fermentation jars at a market stall</dd><dt>Photographer</dt><dd dir="auto">given “Ana”, family “Castillo”</dd><dt>Issued</dt><dd dir="auto">2025-08-14</dd><dt>Locator</dt><dd dir="auto">none (the snapshot has no “with locator” line for this source)</dd></dl></div>
+</section>
+<section id="apa">
+<h2>APA 7 <small class="mono">APA-1 to APA-6</small></h2>
+<div class="box"><h3>What to check</h3><ul><li>Author order, surnames first, and the initials: are they in the form APA uses (for example “Quispe, M. J., &amp; Ortega, D. K.”)?</li><li>Where the year sits: in parentheses right after the authors.</li><li>Title capitalisation: only the first word and proper nouns capitalised (sentence case). Italics on the book, journal and video titles, and on the journal volume.</li><li>Volume, issue and page form: 41(2), 115–134. Pages for the book chapter after the container title.</li><li>DOI as a full https://doi.org/ link; URL for the video and the reel.</li><li>Two authors joined by “&amp;”; two editors in “In R. Mendel &amp; O. Haddad (Eds.), …”. Nothing here reaches “et al.” (the test has at most two authors), so that rule is not tested by this page.</li><li>The Spanish title with its English translation in square brackets (APA-5): is the bracketed part right, and should it be italic?</li><li>The “[Video]” and “[Field photograph]” descriptions, and the platform name after them.</li><li>The in-text form with a locator: “p. 12” for pages, a time range for the videos.</li></ul></div>
+<article class="entry" id="APA-1">
+<header><span class="eid">APA-1</span><h3>Journal article</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Fermentation and food sovereignty in the Andes</span></span><span class="fld"><b>Author 1</b> <span dir="auto">given “María José”, family “Quispe”</span></span><span class="fld"><b>Author 2</b> <span dir="auto">given “Daniel K.”, family “Ortega”</span></span><span class="fld"><b>Journal</b> <span dir="auto">Journal of Ethnobiology</span></span><span class="fld"><b>Volume / issue / pages</b> <span dir="auto">41 / 2 / 115–134</span></span><span class="fld"><b>Issued</b> <span dir="auto">2021-06</span></span><span class="fld"><b>DOI</b> <span dir="auto">10.5555/joe.2021.0042</span></span><span class="fld"><b>ISSN</b> <span dir="auto">0278-0771</span></span><span class="fld"><b>Locator in the “with locator” line</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Quispe, M. J., &#38; Ortega, D. K. (2021). Fermentation and food sovereignty in the Andes. <i>Journal of Ethnobiology</i>, <i>41</i>(2), 115–134. https://doi.org/10.5555/joe.2021.0042</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Quispe &amp; Ortega, 2021)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Quispe &amp; Ortega, 2021, p. 12)</p>
+</div>
+
+</article>
+<article class="entry" id="APA-2">
+<header><span class="eid">APA-2</span><h3>Book</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">The art of fermentation</span></span><span class="fld"><b>Author</b> <span dir="auto">given “Sandor Ellix”, family “Katz”</span></span><span class="fld"><b>Publisher</b> <span dir="auto">Chelsea Green Publishing</span></span><span class="fld"><b>Place</b> <span dir="auto">White River Junction, VT</span></span><span class="fld"><b>Issued</b> <span dir="auto">2012</span></span><span class="fld"><b>ISBN</b> <span dir="auto">9781603582865</span></span><span class="fld"><b>Locator</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Katz, S. E. (2012). <i>The art of fermentation</i>. Chelsea Green Publishing.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Katz, 2012)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Katz, 2012, p. 12)</p>
+</div>
+
+</article>
+<article class="entry" id="APA-3">
+<header><span class="eid">APA-3</span><h3>Book chapter</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Kitchen ferments as household knowledge</span></span><span class="fld"><b>Author</b> <span dir="auto">given “Aiko”, family “Tanaka”</span></span><span class="fld"><b>Editor 1</b> <span dir="auto">given “Ruth”, family “Mendel”</span></span><span class="fld"><b>Editor 2</b> <span dir="auto">given “Omar”, family “Haddad”</span></span><span class="fld"><b>Book (container)</b> <span dir="auto">Ferment and society</span></span><span class="fld"><b>Publisher / place</b> <span dir="auto">Routledge / London</span></span><span class="fld"><b>Pages</b> <span dir="auto">45–67</span></span><span class="fld"><b>Issued</b> <span dir="auto">2019</span></span><span class="fld"><b>Locator</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Tanaka, A. (2019). Kitchen ferments as household knowledge. In R. Mendel &#38; O. Haddad (Eds.), <i>Ferment and society</i> (pp. 45–67). Routledge.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Tanaka, 2019)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Tanaka, 2019, p. 12)</p>
+</div>
+
+</article>
+<article class="entry" id="APA-4">
+<header><span class="eid">APA-4</span><h3>YouTube video</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">How to start a sourdough culture</span></span><span class="fld"><b>Channel (creator)</b> <span dir="auto">Fermentology Lab (handle @fermentologylab)</span></span><span class="fld"><b>Issued</b> <span dir="auto">2023-05-01</span></span><span class="fld"><b>Accessed</b> <span dir="auto">2026-11-01</span></span><span class="fld"><b>URL</b> <span dir="auto">https://www.youtube.com/watch?v=dQw4w9WgXcQ</span></span><span class="fld"><b>Platform / post id</b> <span dir="auto">youtube / dQw4w9WgXcQ</span></span><span class="fld"><b>Locator</b> <span dir="auto">time range 0:38–0:46</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Fermentology Lab. (2023, May 1). <i>How to start a sourdough culture</i> [Video]. YouTube. https://www.youtube.com/watch?v=dQw4w9WgXcQ</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Fermentology Lab, 2023)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Fermentology Lab, 2023, 0:38–0:46)</p>
+</div>
+
+</article>
+<article class="entry flagged" id="APA-5">
+<header><span class="eid">APA-5</span><h3>Instagram reel</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (es, original)</b> <span dir="auto">Receta de la abuela, sin filtros</span></span><span class="fld"><b>Title (en, translated)</b> <span dir="auto">Grandma&#39;s recipe, no filters</span></span><span class="fld"><b>Creator (uploader)</b> <span dir="auto">a research participant: the app shows the code P-014 instead of the name and handle, so they are not shown here</span></span><span class="fld"><b>Issued</b> <span dir="auto">2024-03-02</span></span><span class="fld"><b>Accessed</b> <span dir="auto">2026-10-30</span></span><span class="fld"><b>URL</b> <span dir="auto">https://www.instagram.com/reel/C4abc123XyZ/</span></span><span class="fld"><b>Platform / post id</b> <span dir="auto">instagram / C4abc123XyZ</span></span><span class="fld"><b>Locator</b> <span dir="auto">time range 0:38–0:46</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">P-014. (2024, March 2). <i>Receta de la abuela, sin filtros [Grandma’s recipe, no filters]</i> [Video]. Instagram. https://www.instagram.com/reel/C4abc123XyZ/</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(P-014, 2024)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(P-014, 2024, 0:38–0:46)</p>
+</div>
+<p class="issue"><b>Possible issue &mdash; please check.</b> The bracketed English translation sits inside the italic title in the HTML (the italics end after the closing bracket); is the translation meant to be italic?</p>
+</article>
+<article class="entry" id="APA-6">
+<header><span class="eid">APA-6</span><h3>Field photograph</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Clay fermentation jars at a market stall</span></span><span class="fld"><b>Photographer</b> <span dir="auto">given “Ana”, family “Castillo”</span></span><span class="fld"><b>Issued</b> <span dir="auto">2025-08-14</span></span><span class="fld"><b>Locator</b> <span dir="auto">none (the snapshot has no “with locator” line for this source)</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Castillo, A. (2025). <i>Clay fermentation jars at a market stall</i> [Field photograph].</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Castillo, 2025)</p>
+
+</div>
+
+</article>
+</section>
+<section id="chi">
+<h2>Chicago author-date <small class="mono">CHI-1 to CHI-6</small></h2>
+<div class="box"><h3>What to check</h3><ul><li>Author order: first author surname-first, second author given-name first (“Quispe, María José, and Daniel K. Ortega”). Full given names rather than initials.</li><li>The year directly after the author, followed by a full stop.</li><li>Title capitalisation: headline style (major words capitalised). Quotation marks for article and chapter titles, italics for books and journals.</li><li>Volume, issue and pages: “41 (2): 115–34”, with the page range shortened.</li><li>DOI as a link, with a final full stop.</li><li>Chapter: “In …, edited by …”, and whether the page range of the chapter should appear.</li><li>In-text: no comma between author and year; a page locator after a comma; “at” before the time range for videos.</li><li>The Spanish title with its English translation in square brackets, and the platform and date after it for the reel (CHI-5).</li><li>Whether the city of publication is left out of the book entry.</li></ul></div>
+<article class="entry" id="CHI-1">
+<header><span class="eid">CHI-1</span><h3>Journal article</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Fermentation and food sovereignty in the Andes</span></span><span class="fld"><b>Author 1</b> <span dir="auto">given “María José”, family “Quispe”</span></span><span class="fld"><b>Author 2</b> <span dir="auto">given “Daniel K.”, family “Ortega”</span></span><span class="fld"><b>Journal</b> <span dir="auto">Journal of Ethnobiology</span></span><span class="fld"><b>Volume / issue / pages</b> <span dir="auto">41 / 2 / 115–134</span></span><span class="fld"><b>Issued</b> <span dir="auto">2021-06</span></span><span class="fld"><b>DOI</b> <span dir="auto">10.5555/joe.2021.0042</span></span><span class="fld"><b>ISSN</b> <span dir="auto">0278-0771</span></span><span class="fld"><b>Locator in the “with locator” line</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Quispe, María José, and Daniel K. Ortega. 2021. “Fermentation and Food Sovereignty in the Andes.” <i>Journal of Ethnobiology</i> 41 (2): 115–34. https://doi.org/10.5555/joe.2021.0042.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Quispe and Ortega 2021)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Quispe and Ortega 2021, 12)</p>
+</div>
+
+</article>
+<article class="entry" id="CHI-2">
+<header><span class="eid">CHI-2</span><h3>Book</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">The art of fermentation</span></span><span class="fld"><b>Author</b> <span dir="auto">given “Sandor Ellix”, family “Katz”</span></span><span class="fld"><b>Publisher</b> <span dir="auto">Chelsea Green Publishing</span></span><span class="fld"><b>Place</b> <span dir="auto">White River Junction, VT</span></span><span class="fld"><b>Issued</b> <span dir="auto">2012</span></span><span class="fld"><b>ISBN</b> <span dir="auto">9781603582865</span></span><span class="fld"><b>Locator</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Katz, Sandor Ellix. 2012. <i>The Art of Fermentation</i>. Chelsea Green Publishing.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Katz 2012)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Katz 2012, 12)</p>
+</div>
+
+</article>
+<article class="entry flagged" id="CHI-3">
+<header><span class="eid">CHI-3</span><h3>Book chapter</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Kitchen ferments as household knowledge</span></span><span class="fld"><b>Author</b> <span dir="auto">given “Aiko”, family “Tanaka”</span></span><span class="fld"><b>Editor 1</b> <span dir="auto">given “Ruth”, family “Mendel”</span></span><span class="fld"><b>Editor 2</b> <span dir="auto">given “Omar”, family “Haddad”</span></span><span class="fld"><b>Book (container)</b> <span dir="auto">Ferment and society</span></span><span class="fld"><b>Publisher / place</b> <span dir="auto">Routledge / London</span></span><span class="fld"><b>Pages</b> <span dir="auto">45–67</span></span><span class="fld"><b>Issued</b> <span dir="auto">2019</span></span><span class="fld"><b>Locator</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Tanaka, Aiko. 2019. “Kitchen Ferments as Household Knowledge.” In <i>Ferment and Society</i>, edited by Ruth Mendel and Omar Haddad. Routledge.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Tanaka 2019)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Tanaka 2019, 12)</p>
+</div>
+<p class="issue"><b>Possible issue &mdash; please check.</b> The chapter entry has no page range (45–67) although the input has one and the other four styles print it; should Chicago show it?</p>
+</article>
+<article class="entry" id="CHI-4">
+<header><span class="eid">CHI-4</span><h3>YouTube video</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">How to start a sourdough culture</span></span><span class="fld"><b>Channel (creator)</b> <span dir="auto">Fermentology Lab (handle @fermentologylab)</span></span><span class="fld"><b>Issued</b> <span dir="auto">2023-05-01</span></span><span class="fld"><b>Accessed</b> <span dir="auto">2026-11-01</span></span><span class="fld"><b>URL</b> <span dir="auto">https://www.youtube.com/watch?v=dQw4w9WgXcQ</span></span><span class="fld"><b>Platform / post id</b> <span dir="auto">youtube / dQw4w9WgXcQ</span></span><span class="fld"><b>Locator</b> <span dir="auto">time range 0:38–0:46</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Fermentology Lab. 2023. <i>How to Start a Sourdough Culture</i>. YouTube. Video. https://www.youtube.com/watch?v=dQw4w9WgXcQ.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Fermentology Lab 2023)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Fermentology Lab 2023, at 0:38–0:46)</p>
+</div>
+
+</article>
+<article class="entry" id="CHI-5">
+<header><span class="eid">CHI-5</span><h3>Instagram reel</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (es, original)</b> <span dir="auto">Receta de la abuela, sin filtros</span></span><span class="fld"><b>Title (en, translated)</b> <span dir="auto">Grandma&#39;s recipe, no filters</span></span><span class="fld"><b>Creator (uploader)</b> <span dir="auto">a research participant: the app shows the code P-014 instead of the name and handle, so they are not shown here</span></span><span class="fld"><b>Issued</b> <span dir="auto">2024-03-02</span></span><span class="fld"><b>Accessed</b> <span dir="auto">2026-10-30</span></span><span class="fld"><b>URL</b> <span dir="auto">https://www.instagram.com/reel/C4abc123XyZ/</span></span><span class="fld"><b>Platform / post id</b> <span dir="auto">instagram / C4abc123XyZ</span></span><span class="fld"><b>Locator</b> <span dir="auto">time range 0:38–0:46</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">P-014. 2024. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” Video. Instagram, March 2. https://www.instagram.com/reel/C4abc123XyZ/.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(P-014 2024)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(P-014 2024, at 0:38–0:46)</p>
+</div>
+
+</article>
+<article class="entry" id="CHI-6">
+<header><span class="eid">CHI-6</span><h3>Field photograph</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Clay fermentation jars at a market stall</span></span><span class="fld"><b>Photographer</b> <span dir="auto">given “Ana”, family “Castillo”</span></span><span class="fld"><b>Issued</b> <span dir="auto">2025-08-14</span></span><span class="fld"><b>Locator</b> <span dir="auto">none (the snapshot has no “with locator” line for this source)</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Castillo, Ana. 2025. <i>Clay Fermentation Jars at a Market Stall</i>. Field photograph. August 14.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Castillo 2025)</p>
+
+</div>
+
+</article>
+</section>
+<section id="mla">
+<h2>MLA 9 <small class="mono">MLA-1 to MLA-6</small></h2>
+<div class="box"><h3>What to check</h3><ul><li>Author order and names: full given names, second author given-name first.</li><li>The year is not in the in-text citation; it sits near the end of the entry, after the publisher or container.</li><li>Title capitalisation: headline style. Quotation marks for the article and chapter, italics for the journal and book.</li><li>Volume, issue and pages: “vol. 41, no. 2, June 2021, pp. 115–34”.</li><li>DOI or URL form at the end of the entry.</li><li>In-text citations: author only, with the page number and no comma (“(Quispe and Ortega 12)”); a time range for videos.</li><li>Dates written as “2 Mar. 2024”.</li><li>The video entries: the position of the title (italic or in quotation marks), the platform, and the word “Video.” (MLA-4, MLA-5).</li><li>The Spanish title with its English translation in square brackets.</li></ul></div>
+<article class="entry" id="MLA-1">
+<header><span class="eid">MLA-1</span><h3>Journal article</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Fermentation and food sovereignty in the Andes</span></span><span class="fld"><b>Author 1</b> <span dir="auto">given “María José”, family “Quispe”</span></span><span class="fld"><b>Author 2</b> <span dir="auto">given “Daniel K.”, family “Ortega”</span></span><span class="fld"><b>Journal</b> <span dir="auto">Journal of Ethnobiology</span></span><span class="fld"><b>Volume / issue / pages</b> <span dir="auto">41 / 2 / 115–134</span></span><span class="fld"><b>Issued</b> <span dir="auto">2021-06</span></span><span class="fld"><b>DOI</b> <span dir="auto">10.5555/joe.2021.0042</span></span><span class="fld"><b>ISSN</b> <span dir="auto">0278-0771</span></span><span class="fld"><b>Locator in the “with locator” line</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Quispe, María José, and Daniel K. Ortega. “Fermentation and Food Sovereignty in the Andes.” <i>Journal of Ethnobiology</i>, vol. 41, no. 2, June 2021, pp. 115–34, https://doi.org/10.5555/joe.2021.0042.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Quispe and Ortega)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Quispe and Ortega 12)</p>
+</div>
+
+</article>
+<article class="entry" id="MLA-2">
+<header><span class="eid">MLA-2</span><h3>Book</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">The art of fermentation</span></span><span class="fld"><b>Author</b> <span dir="auto">given “Sandor Ellix”, family “Katz”</span></span><span class="fld"><b>Publisher</b> <span dir="auto">Chelsea Green Publishing</span></span><span class="fld"><b>Place</b> <span dir="auto">White River Junction, VT</span></span><span class="fld"><b>Issued</b> <span dir="auto">2012</span></span><span class="fld"><b>ISBN</b> <span dir="auto">9781603582865</span></span><span class="fld"><b>Locator</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Katz, Sandor Ellix. <i>The Art of Fermentation</i>. Chelsea Green Publishing, 2012.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Katz)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Katz 12)</p>
+</div>
+
+</article>
+<article class="entry" id="MLA-3">
+<header><span class="eid">MLA-3</span><h3>Book chapter</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Kitchen ferments as household knowledge</span></span><span class="fld"><b>Author</b> <span dir="auto">given “Aiko”, family “Tanaka”</span></span><span class="fld"><b>Editor 1</b> <span dir="auto">given “Ruth”, family “Mendel”</span></span><span class="fld"><b>Editor 2</b> <span dir="auto">given “Omar”, family “Haddad”</span></span><span class="fld"><b>Book (container)</b> <span dir="auto">Ferment and society</span></span><span class="fld"><b>Publisher / place</b> <span dir="auto">Routledge / London</span></span><span class="fld"><b>Pages</b> <span dir="auto">45–67</span></span><span class="fld"><b>Issued</b> <span dir="auto">2019</span></span><span class="fld"><b>Locator</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Tanaka, Aiko. “Kitchen Ferments as Household Knowledge.” <i>Ferment and Society</i>, edited by Ruth Mendel and Omar Haddad, Routledge, 2019, pp. 45–67.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Tanaka)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Tanaka 12)</p>
+</div>
+
+</article>
+<article class="entry flagged" id="MLA-4">
+<header><span class="eid">MLA-4</span><h3>YouTube video</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">How to start a sourdough culture</span></span><span class="fld"><b>Channel (creator)</b> <span dir="auto">Fermentology Lab (handle @fermentologylab)</span></span><span class="fld"><b>Issued</b> <span dir="auto">2023-05-01</span></span><span class="fld"><b>Accessed</b> <span dir="auto">2026-11-01</span></span><span class="fld"><b>URL</b> <span dir="auto">https://www.youtube.com/watch?v=dQw4w9WgXcQ</span></span><span class="fld"><b>Platform / post id</b> <span dir="auto">youtube / dQw4w9WgXcQ</span></span><span class="fld"><b>Locator</b> <span dir="auto">time range 0:38–0:46</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Fermentology Lab. <i>How to Start a Sourdough Culture</i>. YouTube, 2023, https://www.youtube.com/watch?v=dQw4w9WgXcQ. Video.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Fermentology Lab)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Fermentology Lab, 0:38–0:46)</p>
+</div>
+<p class="issue"><b>Possible issue &mdash; please check.</b> The YouTube title is in italics while the reel title (MLA-5) is in quotation marks, and a bare “Video.” trails the URL; is that the intended MLA form?</p>
+</article>
+<article class="entry" id="MLA-5">
+<header><span class="eid">MLA-5</span><h3>Instagram reel</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (es, original)</b> <span dir="auto">Receta de la abuela, sin filtros</span></span><span class="fld"><b>Title (en, translated)</b> <span dir="auto">Grandma&#39;s recipe, no filters</span></span><span class="fld"><b>Creator (uploader)</b> <span dir="auto">a research participant: the app shows the code P-014 instead of the name and handle, so they are not shown here</span></span><span class="fld"><b>Issued</b> <span dir="auto">2024-03-02</span></span><span class="fld"><b>Accessed</b> <span dir="auto">2026-10-30</span></span><span class="fld"><b>URL</b> <span dir="auto">https://www.instagram.com/reel/C4abc123XyZ/</span></span><span class="fld"><b>Platform / post id</b> <span dir="auto">instagram / C4abc123XyZ</span></span><span class="fld"><b>Locator</b> <span dir="auto">time range 0:38–0:46</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">P-014. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” Video. <i>Instagram</i>, 2 Mar. 2024, https://www.instagram.com/reel/C4abc123XyZ/.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(P-014)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(P-014, 0:38–0:46)</p>
+</div>
+
+</article>
+<article class="entry" id="MLA-6">
+<header><span class="eid">MLA-6</span><h3>Field photograph</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Clay fermentation jars at a market stall</span></span><span class="fld"><b>Photographer</b> <span dir="auto">given “Ana”, family “Castillo”</span></span><span class="fld"><b>Issued</b> <span dir="auto">2025-08-14</span></span><span class="fld"><b>Locator</b> <span dir="auto">none (the snapshot has no “with locator” line for this source)</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Castillo, Ana. <i>Clay Fermentation Jars at a Market Stall</i>. Field photograph. 14 Aug. 2025.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Castillo)</p>
+
+</div>
+
+</article>
+</section>
+<section id="asa">
+<h2>ASA <small class="mono">ASA-1 to ASA-6</small></h2>
+<div class="box"><h3>What to check</h3><ul><li>Author order: first author surname-first, second author given-name first; full given names.</li><li>The year directly after the author, followed by a full stop.</li><li>Title capitalisation and italics, for the book, the chapter’s container and the journal. Are they consistent between entries (ASA-3)?</li><li>Volume, issue and pages written as “41(2):115–34”, with no spaces.</li><li>DOI form: “doi:10.5555/…”.</li><li>Chapter: “Pp. 45–67 in …, edited by R. Mendel and O. Haddad”, with place and publisher.</li><li>In-text: year, then a colon and the page (“2021:12”). With a time range the result has two colons (“2023:0:38–0:46”): readable?</li><li>Whether the video and reel entries should name the platform, give a URL or give an access date (ASA-4, ASA-5).</li><li>The Spanish title with its English translation in square brackets.</li></ul></div>
+<article class="entry" id="ASA-1">
+<header><span class="eid">ASA-1</span><h3>Journal article</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Fermentation and food sovereignty in the Andes</span></span><span class="fld"><b>Author 1</b> <span dir="auto">given “María José”, family “Quispe”</span></span><span class="fld"><b>Author 2</b> <span dir="auto">given “Daniel K.”, family “Ortega”</span></span><span class="fld"><b>Journal</b> <span dir="auto">Journal of Ethnobiology</span></span><span class="fld"><b>Volume / issue / pages</b> <span dir="auto">41 / 2 / 115–134</span></span><span class="fld"><b>Issued</b> <span dir="auto">2021-06</span></span><span class="fld"><b>DOI</b> <span dir="auto">10.5555/joe.2021.0042</span></span><span class="fld"><b>ISSN</b> <span dir="auto">0278-0771</span></span><span class="fld"><b>Locator in the “with locator” line</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Quispe, María José, and Daniel K. Ortega. 2021. “Fermentation and Food Sovereignty in the Andes.” <i>Journal of Ethnobiology</i> 41(2):115–34. doi:10.5555/joe.2021.0042.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Quispe and Ortega 2021)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Quispe and Ortega 2021:12)</p>
+</div>
+
+</article>
+<article class="entry" id="ASA-2">
+<header><span class="eid">ASA-2</span><h3>Book</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">The art of fermentation</span></span><span class="fld"><b>Author</b> <span dir="auto">given “Sandor Ellix”, family “Katz”</span></span><span class="fld"><b>Publisher</b> <span dir="auto">Chelsea Green Publishing</span></span><span class="fld"><b>Place</b> <span dir="auto">White River Junction, VT</span></span><span class="fld"><b>Issued</b> <span dir="auto">2012</span></span><span class="fld"><b>ISBN</b> <span dir="auto">9781603582865</span></span><span class="fld"><b>Locator</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Katz, Sandor Ellix. 2012. <i>The Art of Fermentation</i>. White River Junction, VT: Chelsea Green Publishing.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Katz 2012)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Katz 2012:12)</p>
+</div>
+
+</article>
+<article class="entry flagged" id="ASA-3">
+<header><span class="eid">ASA-3</span><h3>Book chapter</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Kitchen ferments as household knowledge</span></span><span class="fld"><b>Author</b> <span dir="auto">given “Aiko”, family “Tanaka”</span></span><span class="fld"><b>Editor 1</b> <span dir="auto">given “Ruth”, family “Mendel”</span></span><span class="fld"><b>Editor 2</b> <span dir="auto">given “Omar”, family “Haddad”</span></span><span class="fld"><b>Book (container)</b> <span dir="auto">Ferment and society</span></span><span class="fld"><b>Publisher / place</b> <span dir="auto">Routledge / London</span></span><span class="fld"><b>Pages</b> <span dir="auto">45–67</span></span><span class="fld"><b>Issued</b> <span dir="auto">2019</span></span><span class="fld"><b>Locator</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Tanaka, Aiko. 2019. “Kitchen Ferments as Household Knowledge.” Pp. 45–67 in <i>Ferment and society</i>, edited by R. Mendel and O. Haddad. London: Routledge.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Tanaka 2019)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Tanaka 2019:12)</p>
+</div>
+<p class="issue"><b>Possible issue &mdash; please check.</b> The book title in ASA-2 is in title case, but the chapter’s container title here is in sentence case; does ASA treat them differently?</p>
+</article>
+<article class="entry flagged" id="ASA-4">
+<header><span class="eid">ASA-4</span><h3>YouTube video</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">How to start a sourdough culture</span></span><span class="fld"><b>Channel (creator)</b> <span dir="auto">Fermentology Lab (handle @fermentologylab)</span></span><span class="fld"><b>Issued</b> <span dir="auto">2023-05-01</span></span><span class="fld"><b>Accessed</b> <span dir="auto">2026-11-01</span></span><span class="fld"><b>URL</b> <span dir="auto">https://www.youtube.com/watch?v=dQw4w9WgXcQ</span></span><span class="fld"><b>Platform / post id</b> <span dir="auto">youtube / dQw4w9WgXcQ</span></span><span class="fld"><b>Locator</b> <span dir="auto">time range 0:38–0:46</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Fermentology Lab. 2023. <i>How to Start a Sourdough Culture</i>. YouTube.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Fermentology Lab 2023)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Fermentology Lab 2023:0:38–0:46)</p>
+</div>
+<p class="issue"><b>Possible issue &mdash; please check.</b> The entry has no URL, while the reel entry (ASA-5) has a URL and no platform name; should both carry the same elements?</p>
+</article>
+<article class="entry flagged" id="ASA-5">
+<header><span class="eid">ASA-5</span><h3>Instagram reel</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (es, original)</b> <span dir="auto">Receta de la abuela, sin filtros</span></span><span class="fld"><b>Title (en, translated)</b> <span dir="auto">Grandma&#39;s recipe, no filters</span></span><span class="fld"><b>Creator (uploader)</b> <span dir="auto">a research participant: the app shows the code P-014 instead of the name and handle, so they are not shown here</span></span><span class="fld"><b>Issued</b> <span dir="auto">2024-03-02</span></span><span class="fld"><b>Accessed</b> <span dir="auto">2026-10-30</span></span><span class="fld"><b>URL</b> <span dir="auto">https://www.instagram.com/reel/C4abc123XyZ/</span></span><span class="fld"><b>Platform / post id</b> <span dir="auto">instagram / C4abc123XyZ</span></span><span class="fld"><b>Locator</b> <span dir="auto">time range 0:38–0:46</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">P-014. 2024. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” https://www.instagram.com/reel/C4abc123XyZ/.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(P-014 2024)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(P-014 2024:0:38–0:46)</p>
+</div>
+<p class="issue"><b>Possible issue &mdash; please check.</b> The reel entry prints the URL but not “Instagram” and not the word “Video”, unlike the YouTube entry; is that complete?</p>
+</article>
+<article class="entry" id="ASA-6">
+<header><span class="eid">ASA-6</span><h3>Field photograph</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Clay fermentation jars at a market stall</span></span><span class="fld"><b>Photographer</b> <span dir="auto">given “Ana”, family “Castillo”</span></span><span class="fld"><b>Issued</b> <span dir="auto">2025-08-14</span></span><span class="fld"><b>Locator</b> <span dir="auto">none (the snapshot has no “with locator” line for this source)</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Castillo, Ana. 2025. <i>Clay Fermentation Jars at a Market Stall</i>.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Castillo 2025)</p>
+
+</div>
+
+</article>
+</section>
+<section id="har">
+<h2>Harvard (Cite Them Right) <small class="mono">HAR-1 to HAR-6</small></h2>
+<div class="box"><h3>What to check</h3><ul><li>Author order and initials: “Quispe, M.J. and Ortega, D.K.”, with initials unspaced.</li><li>The year in parentheses directly after the author, with no full stop before it.</li><li>Title capitalisation: sentence case. Italics on books and journals; quotation marks for articles and chapters, with the comma inside the closing mark.</li><li>Volume, issue and pages: “41(2), pp. 115–134”.</li><li>DOI or URL written as “Available at: …”, with “(Accessed: …)” for the web items.</li><li>The format of the access date (HAR-4, HAR-5).</li><li>Chapter: “in R. Mendel and O. Haddad (eds.) …”, then place, publisher and pages.</li><li>In-text: a comma between author and year, then “p. 12”.</li><li>The Spanish title with its English translation in square brackets.</li></ul></div>
+<article class="entry" id="HAR-1">
+<header><span class="eid">HAR-1</span><h3>Journal article</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Fermentation and food sovereignty in the Andes</span></span><span class="fld"><b>Author 1</b> <span dir="auto">given “María José”, family “Quispe”</span></span><span class="fld"><b>Author 2</b> <span dir="auto">given “Daniel K.”, family “Ortega”</span></span><span class="fld"><b>Journal</b> <span dir="auto">Journal of Ethnobiology</span></span><span class="fld"><b>Volume / issue / pages</b> <span dir="auto">41 / 2 / 115–134</span></span><span class="fld"><b>Issued</b> <span dir="auto">2021-06</span></span><span class="fld"><b>DOI</b> <span dir="auto">10.5555/joe.2021.0042</span></span><span class="fld"><b>ISSN</b> <span dir="auto">0278-0771</span></span><span class="fld"><b>Locator in the “with locator” line</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Quispe, M.J. and Ortega, D.K. (2021) “Fermentation and food sovereignty in the Andes,” <i>Journal of Ethnobiology</i>, 41(2), pp. 115–134. Available at: https://doi.org/10.5555/joe.2021.0042.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Quispe and Ortega, 2021)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Quispe and Ortega, 2021, p. 12)</p>
+</div>
+
+</article>
+<article class="entry" id="HAR-2">
+<header><span class="eid">HAR-2</span><h3>Book</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">The art of fermentation</span></span><span class="fld"><b>Author</b> <span dir="auto">given “Sandor Ellix”, family “Katz”</span></span><span class="fld"><b>Publisher</b> <span dir="auto">Chelsea Green Publishing</span></span><span class="fld"><b>Place</b> <span dir="auto">White River Junction, VT</span></span><span class="fld"><b>Issued</b> <span dir="auto">2012</span></span><span class="fld"><b>ISBN</b> <span dir="auto">9781603582865</span></span><span class="fld"><b>Locator</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Katz, S.E. (2012) <i>The art of fermentation</i>. White River Junction, VT: Chelsea Green Publishing.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Katz, 2012)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Katz, 2012, p. 12)</p>
+</div>
+
+</article>
+<article class="entry" id="HAR-3">
+<header><span class="eid">HAR-3</span><h3>Book chapter</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Kitchen ferments as household knowledge</span></span><span class="fld"><b>Author</b> <span dir="auto">given “Aiko”, family “Tanaka”</span></span><span class="fld"><b>Editor 1</b> <span dir="auto">given “Ruth”, family “Mendel”</span></span><span class="fld"><b>Editor 2</b> <span dir="auto">given “Omar”, family “Haddad”</span></span><span class="fld"><b>Book (container)</b> <span dir="auto">Ferment and society</span></span><span class="fld"><b>Publisher / place</b> <span dir="auto">Routledge / London</span></span><span class="fld"><b>Pages</b> <span dir="auto">45–67</span></span><span class="fld"><b>Issued</b> <span dir="auto">2019</span></span><span class="fld"><b>Locator</b> <span dir="auto">page 12</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Tanaka, A. (2019) “Kitchen ferments as household knowledge,” in R. Mendel and O. Haddad (eds.) <i>Ferment and society</i>. London: Routledge, pp. 45–67.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Tanaka, 2019)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Tanaka, 2019, p. 12)</p>
+</div>
+
+</article>
+<article class="entry flagged" id="HAR-4">
+<header><span class="eid">HAR-4</span><h3>YouTube video</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">How to start a sourdough culture</span></span><span class="fld"><b>Channel (creator)</b> <span dir="auto">Fermentology Lab (handle @fermentologylab)</span></span><span class="fld"><b>Issued</b> <span dir="auto">2023-05-01</span></span><span class="fld"><b>Accessed</b> <span dir="auto">2026-11-01</span></span><span class="fld"><b>URL</b> <span dir="auto">https://www.youtube.com/watch?v=dQw4w9WgXcQ</span></span><span class="fld"><b>Platform / post id</b> <span dir="auto">youtube / dQw4w9WgXcQ</span></span><span class="fld"><b>Locator</b> <span dir="auto">time range 0:38–0:46</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Fermentology Lab (2023) <i>How to start a sourdough culture</i> [Video]. YouTube. Available at: https://www.youtube.com/watch?v=dQw4w9WgXcQ (Accessed: November 1, 2026).</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Fermentology Lab, 2023)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(Fermentology Lab, 2023, 0:38–0:46)</p>
+</div>
+<p class="issue"><b>Possible issue &mdash; please check.</b> The access date reads “November 1, 2026” (month first); is that the form Cite Them Right uses?</p>
+</article>
+<article class="entry flagged" id="HAR-5">
+<header><span class="eid">HAR-5</span><h3>Instagram reel</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (es, original)</b> <span dir="auto">Receta de la abuela, sin filtros</span></span><span class="fld"><b>Title (en, translated)</b> <span dir="auto">Grandma&#39;s recipe, no filters</span></span><span class="fld"><b>Creator (uploader)</b> <span dir="auto">a research participant: the app shows the code P-014 instead of the name and handle, so they are not shown here</span></span><span class="fld"><b>Issued</b> <span dir="auto">2024-03-02</span></span><span class="fld"><b>Accessed</b> <span dir="auto">2026-10-30</span></span><span class="fld"><b>URL</b> <span dir="auto">https://www.instagram.com/reel/C4abc123XyZ/</span></span><span class="fld"><b>Platform / post id</b> <span dir="auto">instagram / C4abc123XyZ</span></span><span class="fld"><b>Locator</b> <span dir="auto">time range 0:38–0:46</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">P-014 (2024) “Receta de la abuela, sin filtros [Grandma’s recipe, no filters],” <i>Instagram</i>. Available at: https://www.instagram.com/reel/C4abc123XyZ/ (Accessed: October 30, 2026).</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(P-014, 2024)</p>
+<p class="lab">In-text citation with locator (plain text)</p><p class="cite" dir="auto">(P-014, 2024, 0:38–0:46)</p>
+</div>
+<p class="issue"><b>Possible issue &mdash; please check.</b> The access date reads “October 30, 2026” (month first); same question as HAR-4.</p>
+</article>
+<article class="entry" id="HAR-6">
+<header><span class="eid">HAR-6</span><h3>Field photograph</h3></header>
+<p class="in"><span class="lab">Went in:</span> <span class="fld"><b>Title (en)</b> <span dir="auto">Clay fermentation jars at a market stall</span></span><span class="fld"><b>Photographer</b> <span dir="auto">given “Ana”, family “Castillo”</span></span><span class="fld"><b>Issued</b> <span dir="auto">2025-08-14</span></span><span class="fld"><b>Locator</b> <span dir="auto">none (the snapshot has no “with locator” line for this source)</span></span></p>
+<div class="out">
+<p class="lab">Bibliography entry (formatting as in the snapshot)</p>
+<p class="bib" dir="auto">Castillo, A. (2025) <i>Clay fermentation jars at a market stall</i>.</p>
+<p class="lab">In-text citation (plain text)</p>
+<p class="cite" dir="auto">(Castillo, 2025)</p>
+
+</div>
+
+</article>
+</section>
+<section id="compare"><h2>Side by side, source by source</h2>
+<p class="muted">The same bibliography entries as above, grouped by source so the five styles sit together. Plain text, as in the snapshots; italics are shown in the style sections above.</p>
+<div class="cmp"><h3>1. Journal article</h3><table><thead><tr><th>Id</th><th>Bibliography</th><th>In text</th></tr></thead><tbody><tr><td class="mono"><a href="#APA-1">APA-1</a></td><td dir="auto">Quispe, M. J., &amp; Ortega, D. K. (2021). Fermentation and food sovereignty in the Andes. Journal of Ethnobiology, 41(2), 115–134. https://doi.org/10.5555/joe.2021.0042</td><td dir="auto">(Quispe &amp; Ortega, 2021)</td></tr><tr><td class="mono"><a href="#CHI-1">CHI-1</a></td><td dir="auto">Quispe, María José, and Daniel K. Ortega. 2021. “Fermentation and Food Sovereignty in the Andes.” Journal of Ethnobiology 41 (2): 115–34. https://doi.org/10.5555/joe.2021.0042.</td><td dir="auto">(Quispe and Ortega 2021)</td></tr><tr><td class="mono"><a href="#MLA-1">MLA-1</a></td><td dir="auto">Quispe, María José, and Daniel K. Ortega. “Fermentation and Food Sovereignty in the Andes.” Journal of Ethnobiology, vol. 41, no. 2, June 2021, pp. 115–34, https://doi.org/10.5555/joe.2021.0042.</td><td dir="auto">(Quispe and Ortega)</td></tr><tr><td class="mono"><a href="#ASA-1">ASA-1</a></td><td dir="auto">Quispe, María José, and Daniel K. Ortega. 2021. “Fermentation and Food Sovereignty in the Andes.” Journal of Ethnobiology 41(2):115–34. doi:10.5555/joe.2021.0042.</td><td dir="auto">(Quispe and Ortega 2021)</td></tr><tr><td class="mono"><a href="#HAR-1">HAR-1</a></td><td dir="auto">Quispe, M.J. and Ortega, D.K. (2021) “Fermentation and food sovereignty in the Andes,” Journal of Ethnobiology, 41(2), pp. 115–134. Available at: https://doi.org/10.5555/joe.2021.0042.</td><td dir="auto">(Quispe and Ortega, 2021)</td></tr></tbody></table></div>
+<div class="cmp"><h3>2. Book</h3><table><thead><tr><th>Id</th><th>Bibliography</th><th>In text</th></tr></thead><tbody><tr><td class="mono"><a href="#APA-2">APA-2</a></td><td dir="auto">Katz, S. E. (2012). The art of fermentation. Chelsea Green Publishing.</td><td dir="auto">(Katz, 2012)</td></tr><tr><td class="mono"><a href="#CHI-2">CHI-2</a></td><td dir="auto">Katz, Sandor Ellix. 2012. The Art of Fermentation. Chelsea Green Publishing.</td><td dir="auto">(Katz 2012)</td></tr><tr><td class="mono"><a href="#MLA-2">MLA-2</a></td><td dir="auto">Katz, Sandor Ellix. The Art of Fermentation. Chelsea Green Publishing, 2012.</td><td dir="auto">(Katz)</td></tr><tr><td class="mono"><a href="#ASA-2">ASA-2</a></td><td dir="auto">Katz, Sandor Ellix. 2012. The Art of Fermentation. White River Junction, VT: Chelsea Green Publishing.</td><td dir="auto">(Katz 2012)</td></tr><tr><td class="mono"><a href="#HAR-2">HAR-2</a></td><td dir="auto">Katz, S.E. (2012) The art of fermentation. White River Junction, VT: Chelsea Green Publishing.</td><td dir="auto">(Katz, 2012)</td></tr></tbody></table></div>
+<div class="cmp"><h3>3. Book chapter</h3><table><thead><tr><th>Id</th><th>Bibliography</th><th>In text</th></tr></thead><tbody><tr><td class="mono"><a href="#APA-3">APA-3</a></td><td dir="auto">Tanaka, A. (2019). Kitchen ferments as household knowledge. In R. Mendel &amp; O. Haddad (Eds.), Ferment and society (pp. 45–67). Routledge.</td><td dir="auto">(Tanaka, 2019)</td></tr><tr><td class="mono"><a href="#CHI-3">CHI-3</a></td><td dir="auto">Tanaka, Aiko. 2019. “Kitchen Ferments as Household Knowledge.” In Ferment and Society, edited by Ruth Mendel and Omar Haddad. Routledge.</td><td dir="auto">(Tanaka 2019)</td></tr><tr><td class="mono"><a href="#MLA-3">MLA-3</a></td><td dir="auto">Tanaka, Aiko. “Kitchen Ferments as Household Knowledge.” Ferment and Society, edited by Ruth Mendel and Omar Haddad, Routledge, 2019, pp. 45–67.</td><td dir="auto">(Tanaka)</td></tr><tr><td class="mono"><a href="#ASA-3">ASA-3</a></td><td dir="auto">Tanaka, Aiko. 2019. “Kitchen Ferments as Household Knowledge.” Pp. 45–67 in Ferment and society, edited by R. Mendel and O. Haddad. London: Routledge.</td><td dir="auto">(Tanaka 2019)</td></tr><tr><td class="mono"><a href="#HAR-3">HAR-3</a></td><td dir="auto">Tanaka, A. (2019) “Kitchen ferments as household knowledge,” in R. Mendel and O. Haddad (eds.) Ferment and society. London: Routledge, pp. 45–67.</td><td dir="auto">(Tanaka, 2019)</td></tr></tbody></table></div>
+<div class="cmp"><h3>4. YouTube video</h3><table><thead><tr><th>Id</th><th>Bibliography</th><th>In text</th></tr></thead><tbody><tr><td class="mono"><a href="#APA-4">APA-4</a></td><td dir="auto">Fermentology Lab. (2023, May 1). How to start a sourdough culture [Video]. YouTube. https://www.youtube.com/watch?v=dQw4w9WgXcQ</td><td dir="auto">(Fermentology Lab, 2023)</td></tr><tr><td class="mono"><a href="#CHI-4">CHI-4</a></td><td dir="auto">Fermentology Lab. 2023. How to Start a Sourdough Culture. YouTube. Video. https://www.youtube.com/watch?v=dQw4w9WgXcQ.</td><td dir="auto">(Fermentology Lab 2023)</td></tr><tr><td class="mono"><a href="#MLA-4">MLA-4</a></td><td dir="auto">Fermentology Lab. How to Start a Sourdough Culture. YouTube, 2023, https://www.youtube.com/watch?v=dQw4w9WgXcQ. Video.</td><td dir="auto">(Fermentology Lab)</td></tr><tr><td class="mono"><a href="#ASA-4">ASA-4</a></td><td dir="auto">Fermentology Lab. 2023. How to Start a Sourdough Culture. YouTube.</td><td dir="auto">(Fermentology Lab 2023)</td></tr><tr><td class="mono"><a href="#HAR-4">HAR-4</a></td><td dir="auto">Fermentology Lab (2023) How to start a sourdough culture [Video]. YouTube. Available at: https://www.youtube.com/watch?v=dQw4w9WgXcQ (Accessed: November 1, 2026).</td><td dir="auto">(Fermentology Lab, 2023)</td></tr></tbody></table></div>
+<div class="cmp"><h3>5. Instagram reel</h3><table><thead><tr><th>Id</th><th>Bibliography</th><th>In text</th></tr></thead><tbody><tr><td class="mono"><a href="#APA-5">APA-5</a></td><td dir="auto">P-014. (2024, March 2). Receta de la abuela, sin filtros [Grandma’s recipe, no filters] [Video]. Instagram. https://www.instagram.com/reel/C4abc123XyZ/</td><td dir="auto">(P-014, 2024)</td></tr><tr><td class="mono"><a href="#CHI-5">CHI-5</a></td><td dir="auto">P-014. 2024. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” Video. Instagram, March 2. https://www.instagram.com/reel/C4abc123XyZ/.</td><td dir="auto">(P-014 2024)</td></tr><tr><td class="mono"><a href="#MLA-5">MLA-5</a></td><td dir="auto">P-014. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” Video. Instagram, 2 Mar. 2024, https://www.instagram.com/reel/C4abc123XyZ/.</td><td dir="auto">(P-014)</td></tr><tr><td class="mono"><a href="#ASA-5">ASA-5</a></td><td dir="auto">P-014. 2024. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” https://www.instagram.com/reel/C4abc123XyZ/.</td><td dir="auto">(P-014 2024)</td></tr><tr><td class="mono"><a href="#HAR-5">HAR-5</a></td><td dir="auto">P-014 (2024) “Receta de la abuela, sin filtros [Grandma’s recipe, no filters],” Instagram. Available at: https://www.instagram.com/reel/C4abc123XyZ/ (Accessed: October 30, 2026).</td><td dir="auto">(P-014, 2024)</td></tr></tbody></table></div>
+<div class="cmp"><h3>6. Field photograph</h3><table><thead><tr><th>Id</th><th>Bibliography</th><th>In text</th></tr></thead><tbody><tr><td class="mono"><a href="#APA-6">APA-6</a></td><td dir="auto">Castillo, A. (2025). Clay fermentation jars at a market stall [Field photograph].</td><td dir="auto">(Castillo, 2025)</td></tr><tr><td class="mono"><a href="#CHI-6">CHI-6</a></td><td dir="auto">Castillo, Ana. 2025. Clay Fermentation Jars at a Market Stall. Field photograph. August 14.</td><td dir="auto">(Castillo 2025)</td></tr><tr><td class="mono"><a href="#MLA-6">MLA-6</a></td><td dir="auto">Castillo, Ana. Clay Fermentation Jars at a Market Stall. Field photograph. 14 Aug. 2025.</td><td dir="auto">(Castillo)</td></tr><tr><td class="mono"><a href="#ASA-6">ASA-6</a></td><td dir="auto">Castillo, Ana. 2025. Clay Fermentation Jars at a Market Stall.</td><td dir="auto">(Castillo 2025)</td></tr><tr><td class="mono"><a href="#HAR-6">HAR-6</a></td><td dir="auto">Castillo, A. (2025) Clay fermentation jars at a market stall.</td><td dir="auto">(Castillo, 2025)</td></tr></tbody></table></div>
+</section>
+</main>
+</body>
+</html>

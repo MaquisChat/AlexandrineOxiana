@@ -9,6 +9,7 @@ import { basename, dirname, extname, join } from "node:path";
 import { biblioOf, toIsbn13, type Biblio, type Creator, type SourceType } from "@ao/core";
 import { dcValues } from "../extract/epub.js";
 import { clean, decodeEntities, normalizeDate, parseName } from "../extract/names.js";
+import { BibBlocks, bibDoubt } from "./bib-blocks.js";
 
 export const SIDECAR_EXTS = [".bib", ".ris", ".json", ".opf"] as const;
 const MAX_SIDECAR_BYTES = 1024 * 1024;
@@ -34,17 +35,26 @@ export interface SidecarMetadata extends Biblio {
   publisher?: string;
   doi?: string;
   isbn?: string[];
+  /** The entry could not be taken whole (a BibTeX entry not closed, …; BIB_DOUBTS, R362 g). */
+  doubt?: string;
 }
 
-/** Existing sidecar files for `path` (same folder, same base name), in SIDECAR_EXTS order. */
-export async function findSidecars(path: string): Promise<string[]> {
+/**
+ * Existing sidecar files for `path` (same folder, same base name), in SIDECAR_EXTS order.
+ * `readable` (a watched folder, Task W2): a sidecar is kept only when it answers true — the watch answers
+ * true only for a file whose content is on this computer, so a sidecar that is not downloaded is never
+ * read. Without it, every existing file is kept, as before (drag-and-drop, Bulk Import).
+ */
+export async function findSidecars(path: string, readable?: (p: string) => Promise<boolean>): Promise<string[]> {
   const stem = basename(path, extname(path));
   const out: string[] = [];
   for (const ext of SIDECAR_EXTS) {
     const p = join(dirname(path), stem + ext);
     if (p === path) continue;
     const st = await fsp.stat(p).catch(() => null);
-    if (st?.isFile()) out.push(p);
+    if (!st?.isFile()) continue;
+    if (readable && !(await readable(p).catch(() => false))) continue;
+    out.push(p);
   }
   return out;
 }
@@ -156,33 +166,18 @@ const BIB_TYPES: Record<string, SourceType> = {
   report: "report", misc: "other", online: "webpage", dataset: "dataset", unpublished: "manuscript",
 };
 
-/** The first `@type{key, field = {value} | "value" | number, ...}` entry, braces balanced by counting. */
-/**
- * Index just past the brace (or parenthesis) block opening at `open`, counting nesting. A block
- * that does not balance before a line starting with "@" (after optional spaces or tabs) ends there,
- * at the "@" (an unbalanced @comment or a quoted brace in @string must not swallow the entries
- * after it); text.length if unclosed.
- */
-function blockEnd(text: string, open: number): number {
-  const o = text[open]!;
-  const c = o === "(" ? ")" : "}";
-  let depth = 0;
-  for (let i = open; i < text.length; i++) {
-    if (text[i] === "\n") {
-      // Spaces and tabs only, so each character is looked at a bounded number of times (linear).
-      let j = i + 1;
-      while (text[j] === " " || text[j] === "\t") j++;
-      if (text[j] === "@") return j;
-    }
-    if (text[i] === o) depth++;
-    else if (text[i] === c && --depth === 0) return i + 1;
-  }
-  return text.length;
-}
-
 const NON_ENTRIES = new Set(["string", "comment", "preamble"]);
 
+/**
+ * The first `@type{key, field = {value} | "value" | number, ...}` entry, braces balanced by counting.
+ * Where each block ends is the export reader's rule (bib-blocks.ts, R362 g, R366): at its own closing
+ * delimiter, so a line beginning with "@" inside a value belongs to it; a line that begins an entry
+ * between an entry's fields, or after a block that never closes (an unbalanced @comment, a quoted
+ * brace in @string, an entry missing its closing brace), cuts it. The entry read carries the doubt
+ * the rule gives it (`doubt`).
+ */
 export function parseBibtex(text: string): SidecarMetadata {
+  const blocks = new BibBlocks(text);
   // The first real entry: @string, @comment and @preamble blocks are skipped whole.
   let at = text.indexOf("@");
   let open = -1;
@@ -197,22 +192,24 @@ export function parseBibtex(text: string): SidecarMetadata {
         open = j;
         break;
       }
-      at = text.indexOf("@", blockEnd(text, j));
+      at = text.indexOf("@", blocks.block(j).end);
     } else {
       at = text.indexOf("@", j);
     }
   }
   if (open < 0) return {};
+  const block = blocks.block(open);
+  /** The entry's text ends here: just past its own closing delimiter, or where it was cut. */
+  const n = block.end;
   const fields = new Map<string, string>();
   let i = text.indexOf(",", open);
-  if (i < 0) return {};
+  if (i < 0 || i >= n) return {};
   i++;
-  const n = text.length;
   while (i < n) {
     while (i < n && /[\s,]/u.test(text[i]!)) i++;
     if (i >= n || text[i] === "}") break;
     const eq = text.indexOf("=", i);
-    if (eq < 0) break;
+    if (eq < 0 || eq >= n) break;
     const name = text.slice(i, eq).trim().toLowerCase();
     i = eq + 1;
     while (i < n && /\s/u.test(text[i]!)) i++;
@@ -239,7 +236,8 @@ export function parseBibtex(text: string): SidecarMetadata {
     }
     if (name && !fields.has(name)) fields.set(name, clean(cap(value).replace(/[{}]/gu, "")));
   }
-  const m: SidecarMetadata = { type: own(BIB_TYPES, kind) ?? "other" };
+  const doubt = bibDoubt(block);
+  const m: SidecarMetadata = { type: own(BIB_TYPES, kind) ?? "other", ...(doubt ? { doubt } : {}) };
   const get = (k: string) => fields.get(k) || undefined;
   if (get("title")) m.title = get("title");
   const people = (k: string, role: Creator["role"]) =>

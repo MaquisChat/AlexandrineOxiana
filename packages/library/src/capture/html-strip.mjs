@@ -9,7 +9,8 @@
 // key; meta tags and form fields that carry a token or a password; javascript:, vbscript: and
 // data: URLs in every URL attribute; CSS expression().
 // Removed too: meta refresh and set-cookie (R107).
-// Cleaned: every URL (absolute, protocol-relative or relative) loses its query and fragment — in
+// Cleaned: every URL (absolute, protocol-relative or relative) loses its query, fragment, user
+// information and path parameters (R391 d, R415 a) — in
 // URL attributes, srcset, meta content (og:image …), URL-like data-* values, and CSS url()/@import,
 // image-set candidates (quoted or not) and URL-like strings and custom properties in <style> and style=.
 //
@@ -27,32 +28,106 @@ const URL_ATTRS = new Set([
 ]);
 const SRCSET_ATTRS = new Set(["srcset", "imagesrcset"]);
 const DROP_ATTRS = new Set(["srcdoc", "nonce", "integrity", "formtarget"]);
-const SECRET_WORDS = new Set([
-  "csrf", "xsrf", "token", "tokens", "auth", "authorization", "authenticity", "session", "sessionid", "password", "passwd", "secret",
-  "signature", "sig", "nonce", "jwt", "credential", "credentials", "apikey", "cookie", "cookies", "otp",
+// The rule for secret names is defined in @ao/core (capture/secret-names.ts and key-shape.ts, R379,
+// R391). This file runs as plain JavaScript in a worker thread (html-strip-worker.mjs), where @ao/core's
+// TypeScript source cannot be loaded, so it keeps a copy of the lists and the functions;
+// html-strip.test.ts runs both copies over one table of names and values (R391 e). Here names are judged
+// without a value (an attribute, a form field, a JSON key), so an ordinary word counts as secret.
+export const SECRET_WORDS = new Set([
+  "csrf", "xsrf", "authorization", "authentication", "authenticity", "bearer", "sessionid", "phpsessid", "jsessionid",
+  "password", "passwd", "secret", "nonce", "otp", "jwt", "credential", "credentials", "passcode",
+  "apikey", "accesskey", "privatekey", "secretkey", "authkey", "clientsecret", "cookie", "cookies",
 ]);
-const KEY_PREFIXES = new Set(["api", "access", "private", "secret"]);
+export const KEY_PREFIXES = new Set(["api", "auth", "access", "private", "secret"]);
+export const TOKEN_PREFIXES = new Set(["access", "auth", "id", "refresh", "session", "csrf", "xsrf", "bearer"]);
+export const SIGNED_LINK_NAMES = new Set(["xamzsignature", "xamzcredential", "xamzsecuritytoken", "keypairid"]);
+export const ORDINARY_WORDS = new Set([
+  "token", "tokens", "auth", "session", "sid", "signature", "sig", "pwd", "pass", "key", "code", "hash", "ticket",
+  "sess", "sessid", "cfid", "verifier",
+]);
+const ALWAYS_SUFFIXES = [
+  "secret", "password", "passwd", "sessionid", "passcode", "credential", "credentials",
+  ...[...TOKEN_PREFIXES].flatMap((p) => [`${p}token`, `${p}tokens`]),
+  ...[...KEY_PREFIXES].map((p) => `${p}key`),
+];
+const ALWAYS_END = new RegExp(`(?:${ALWAYS_SUFFIXES.join("|")})$`, "u");
+const RUN = 4;
+const HEX_KEY = /^[0-9A-Fa-f]{16,}$/u;
+const MIXED_KEY = /^[A-Za-z0-9_-]{20,}$/u;
+const ASPNET_KEY = /^\((?:[A-Z]\([^()/]+\))+\)$/u;
+const sessionLike = (seg) =>
+  HEX_KEY.test(seg) || (MIXED_KEY.test(seg) && /[a-z]/u.test(seg) && /[A-Z]/u.test(seg) && /\d/u.test(seg)) || ASPNET_KEY.test(seg);
+const UUID_KEY = /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/u;
+const lowerIdRun = (v) => {
+  for (const m of v.matchAll(/[a-z0-9]{24,}/gu)) if (/[a-z]/u.test(m[0]) && /\d/u.test(m[0])) return true;
+  return false;
+};
+const keyLikeValue = (value) => {
+  const v = String(value);
+  return sessionLike(v) || v.split(/[^A-Za-z0-9_-]+/u).some(sessionLike) || UUID_KEY.test(v) || lowerIdRun(v);
+};
+const signedTokenValue = (value) => /^eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(String(value).trim());
 
 function words(k) {
-  return String(k)
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-    .split(/[\s_.:-]+/)
+  const s = String(k);
+  // The camel-case splits only when there is a capital (most names have none: cheaper, same words).
+  return (/[A-Z]/.test(s) ? s.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2") : s)
+    .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
     .map((w) => w.toLowerCase());
 }
-function secretName(k) {
+function classOfRun(run) {
+  if (SECRET_WORDS.has(run) || SIGNED_LINK_NAMES.has(run) || ALWAYS_END.test(run)) return "always";
+  if (ORDINARY_WORDS.has(run) || /tokens?$/u.test(run)) return "ordinary";
+  return "none";
+}
+function nameClass(k) {
   const ws = words(k);
-  return ws.some((w, i) => SECRET_WORDS.has(w) || (w === "key" && i > 0 && KEY_PREFIXES.has(ws[i - 1])));
+  let out = "none";
+  const runs = [];
+  for (let i = 0; i < ws.length; i++) for (let j = i + 1; j <= Math.min(ws.length, i + RUN); j++) runs.push(ws.slice(i, j).join(""));
+  if (ws.length > RUN) runs.push(ws.join(""));
+  for (const r of runs) {
+    const c = classOfRun(r);
+    if (c === "always") return "always";
+    if (c === "ordinary") out = "ordinary";
+  }
+  return out;
+}
+/** True when the name `k` (with its decoded value, when there is one) carries a secret: core's secretName. */
+export function secretName(k, value) {
+  if (value !== undefined && signedTokenValue(value)) return true;
+  const c = nameClass(k);
+  if (c === "always") return true;
+  if (c === "ordinary") return value === undefined || keyLikeValue(value);
+  return false;
 }
 
-/** null: an unsafe scheme (the attribute is dropped); else the URL without query and fragment. */
+/**
+ * null: an unsafe scheme (the attribute is dropped); else the URL without query and fragment, without
+ * a user name and password in its authority (`https://ana:pw@host/p` → `https://host/p`, R391 d), and
+ * without any path parameter (`/app;jsessionid=…/next` → `/app/next`, R415 a).
+ */
 export function cleanUrl(value) {
   const compact = String(value).replace(/[\u0000- \u007f-\u009f]/g, "").toLowerCase();
   if (/^(javascript|vbscript|data|livescript|mocha|jar):/.test(compact)) return null;
-  const v = String(value);
+  // Read as a browser reads it (R415 c): tabs and line ends inside an address are dropped, and in an
+  // http or https address (or one with no scheme, read against the page's) a backslash before the
+  // host is a slash — `h<TAB>ttps://ana:pw@host/` and `https:\\ana:pw@host\p` carry user information too.
+  const v = String(value).replace(/[\t\n\r]/g, "");
   const q = v.search(/[?#]/);
-  return q >= 0 ? v.slice(0, q) : v;
+  const head = q >= 0 ? v.slice(0, q) : v;
+  const slashed = head.replace(/^(\s*(?:https?:)?)[\\/]{2}[^\\/]*/i, (m) => m.replace(/\\/g, "/"));
+  // The authority runs from `//` to the next `/` (or `\`, which a browser reads as one); everything up
+  // to its last `@` is user information.
+  const noUser = slashed.replace(/^(\s*(?:[a-z][a-z0-9+.-]*:)?\/\/)([^/\\]*@)/i, "$1");
+  // Path parameters (R415 a): in every segment of the path, everything from its first `;` goes, whatever
+  // its name — a site that rewrites its addresses writes the session id there in every link. The
+  // authority is left as it is, and so is an address of a scheme with no `//` (`mailto:` …).
+  const auth = /^\s*(?:[a-z][a-z0-9+.-]*:)?\/\/[^/\\]*/i.exec(noUser);
+  if (!auth && /^\s*[a-z][a-z0-9+.-]*:/i.test(noUser)) return noUser;
+  const start = auth ? auth[0].length : 0;
+  return noUser.slice(0, start) + noUser.slice(start).replace(/;[^/\\]*/g, "");
 }
 
 function cleanSrcset(value) {

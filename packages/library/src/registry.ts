@@ -1,7 +1,8 @@
-import { mkdir, readFile, rename } from "node:fs/promises";
+import { mkdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { writeFileAtomic } from "./fs/atomic.js";
 import type { Deps } from "./deps.js";
+import { raiseDeviceNotice } from "./device-notices.js";
 
 export interface RegistryEntry {
   libraryId: string;
@@ -60,10 +61,16 @@ function stamp(d: Date): string {
   return d.toISOString().replace(/\.\d+Z$/, "").replace(/[-:]/g, "").replace("T", "-");
 }
 
-/** Keeps a damaged registry as libraries.json.corrupt-<stamp> before it is overwritten. */
+/**
+ * Keeps a damaged registry as libraries.json.corrupt-<stamp> before it is overwritten, and then,
+ * only once that rename has succeeded, raises a device-level notice (Task 68 fix round 2, R181 a):
+ * nothing in the settings folder is set aside in silence.
+ */
 async function backupIfDamaged(deps: RegDeps, damaged: boolean): Promise<void> {
   if (!damaged) return;
-  await rename(file(deps), `${file(deps)}.corrupt-${stamp(deps.clock())}`);
+  const now = deps.clock();
+  await rename(file(deps), `${file(deps)}.corrupt-${stamp(now)}`);
+  await raiseDeviceNotice(deps.appConfigDir, "libraries-list-set-aside", now);
 }
 
 async function save(deps: RegDeps, entries: RegistryEntry[]): Promise<void> {
@@ -123,8 +130,49 @@ export async function addKnownPath(libraryId: string, path: string, deps: RegDep
   await save(deps, entries);
 }
 
+/**
+ * When the list is damaged, sets it aside now (with its notice) and writes back what was usable, so
+ * the chooser never just looks empty (Task 68 fix round 2, R181 a). Does nothing otherwise; a read
+ * error other than "missing" throws, as every other registry read does.
+ */
+export async function settleDamagedRegistry(deps: RegDeps): Promise<void> {
+  const { entries, damaged } = await load(deps);
+  if (!damaged) return;
+  await backupIfDamaged(deps, true);
+  await save(deps, entries);
+}
+
 export async function forgetLibrary(libraryId: string, deps: RegDeps): Promise<void> {
   const entries = await loadForUpdate(deps);
   const rest = entries.filter((e) => e.libraryId !== libraryId);
   if (rest.length !== entries.length) await save(deps, rest);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The library open when the app last ran (spec 4.5: reopened at start, D5)
+
+const lastFile = (d: Pick<Deps, "appConfigDir">) => join(d.appConfigDir, "last-library.json");
+
+/**
+ * Remembers which library is open, so the app reopens it at its next start. Only the library's id
+ * is kept, in the app settings folder (never in the library); where it is comes from the registry.
+ */
+export async function rememberLastOpenLibrary(libraryId: string, deps: Pick<Deps, "appConfigDir">): Promise<void> {
+  await mkdir(deps.appConfigDir, { recursive: true });
+  await writeFileAtomic(lastFile(deps), JSON.stringify({ libraryId }));
+}
+
+/** The id of the library open when the app last ran, or undefined (none, or the file is unusable). */
+export async function lastOpenLibrary(deps: Pick<Deps, "appConfigDir">): Promise<string | undefined> {
+  try {
+    const v = JSON.parse(await readFile(lastFile(deps), "utf8")) as { libraryId?: unknown };
+    return typeof v.libraryId === "string" && v.libraryId ? v.libraryId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The researcher closed the library: the next start shows the chooser. */
+export async function forgetLastOpenLibrary(deps: Pick<Deps, "appConfigDir">): Promise<void> {
+  await rm(lastFile(deps), { force: true });
 }

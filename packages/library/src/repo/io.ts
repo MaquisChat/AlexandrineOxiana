@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
 import { LibraryRelativePath } from "@ao/core";
-import { decryptStream, encryptStream } from "../crypto/format.js";
+import { assertLiveKey, decryptStream, encryptStream, noteOpening } from "../crypto/format.js";
 import { PathEscapeError, TornFileError } from "./errors.js";
 
 /** Absolute path of a library-relative path; validates it first. */
@@ -141,7 +141,15 @@ export async function appendDurable(
   const fd = fs.openSync(path, "a", mode);
   try {
     if (mode !== undefined && process.platform !== "win32") fs.fchmodSync(fd, mode);
-    fs.writeSync(fd, text);
+    // A write can be cut short (a full disk writes part of it and says how much): the rest is written, and the
+    // next write's error (ENOSPC) undoes the whole append below, so no torn line is left (R393 c).
+    const bytes = Buffer.from(text, "utf8");
+    for (let off = 0; off < bytes.length; ) {
+      const n = fs.writeSync(fd, bytes, off, bytes.length - off);
+      // R436 f: a write that takes nothing of a non-empty buffer would never end: it fails, and the append is undone.
+      if (n <= 0) throw new Error("a write to the file wrote nothing");
+      off += n;
+    }
     fs.fsyncSync(fd);
   } catch (err) {
     try {
@@ -215,6 +223,7 @@ export async function undoAppend(u: AppendUndo): Promise<void> {
  */
 /** Seals one JSON line with the project key; `purpose` binds it to its file kind (AAD `<purpose>|<projectId>`). */
 export function sealLine(key: Uint8Array, keyId: string, projectId: string, json: string, purpose = "ao-changes"): string {
+  assertLiveKey(key, keyId); // never under a wiped (all-zero) key (R379)
   const nonce = randomBytes(12);
   const c = createCipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
   c.setAAD(Buffer.from(`${purpose}|${projectId}`, "utf8"));
@@ -223,7 +232,10 @@ export function sealLine(key: Uint8Array, keyId: string, projectId: string, json
 }
 
 export function openLine(key: Uint8Array, projectId: string, line: string, purpose = "ao-changes"): string {
-  const o = JSON.parse(line) as { nonce: string; ct: string };
+  const o = JSON.parse(line) as { keyId?: unknown; nonce: string; ct: string };
+  const keyId = typeof o.keyId === "string" ? o.keyId : "";
+  noteOpening(keyId);
+  assertLiveKey(key, keyId); // a wiped key is "locked", not a line that does not open (R386 a)
   const ct = Buffer.from(o.ct, "base64");
   const d = createDecipheriv("aes-256-gcm", key, Buffer.from(o.nonce, "base64"), { authTagLength: 16 });
   d.setAAD(Buffer.from(`${purpose}|${projectId}`, "utf8"));

@@ -23,10 +23,10 @@ import {
   planMove,
 } from "./move.js";
 import { acquireLock, releaseLock } from "./lock.js";
-import { addPendingOldCopy, markPendingComplete } from "./old-copies.js";
+import { OldCopiesUnreadableError, addPendingOldCopy, markPendingComplete } from "./old-copies.js";
 import { listLibraries } from "./registry.js";
-import type { Repo } from "./repo/index.js";
-import { openTestRepo, seams } from "./repo/testing.js";
+import { projectWarnings, type Repo } from "./repo/index.js";
+import { SimulatedCrash, openTestRepo, seams } from "./repo/testing.js";
 
 const FAST = 2 ** 10;
 const NOW = "2026-11-09T14:30:00.000Z";
@@ -161,6 +161,8 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   seams.failUndo = undefined;
+  seams.failAuditAppendFor = undefined;
+  seams.crashAt = undefined;
   moveSeams.crashAfter = undefined;
   moveSeams.unreadableDir = undefined;
   for (const l of open) await l.close();
@@ -364,6 +366,22 @@ describe("planMove", () => {
     await expect(planMove(lib, dest, env)).resolves.toBeDefined();
   });
 
+  it("FR-047: a destination holding only the Finder's .DS_Store / .localized counts as empty; a link of that name does not", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await mkdir(dest);
+    await writeFile(join(dest, ".DS_Store"), "finder");
+    await writeFile(join(dest, ".localized"), "");
+    await expect(planMove(lib, dest, env)).resolves.toBeDefined();
+    await rm(join(dest, ".DS_Store"));
+    await symlink(join(dest, ".localized"), join(dest, ".DS_Store"));
+    await expect(planMove(lib, dest, env)).rejects.toMatchObject({ code: "destination-not-empty" });
+    await rm(join(dest, ".DS_Store"));
+    await writeFile(join(dest, ".DS_Store"), "finder");
+    await writeFile(join(dest, ".hidden"), "mine");
+    await expect(planMove(lib, dest, env)).rejects.toMatchObject({ code: "destination-not-empty" });
+  });
+
   it("aborts on a symbolic link inside the library, naming it", async () => {
     const { lib, a } = await fixture();
     await symlink(pdf, join(lib.root, a.folder, "link.pdf"));
@@ -376,6 +394,19 @@ describe("planMove", () => {
 });
 
 describe("executeMove", () => {
+  it("FR-047: moves into a folder that holds only the Finder's .DS_Store, and leaves that file", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Finder", "Lib");
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, ".DS_Store"), "finder");
+    const res = await executeMove(lib, dest, { deps: mkDeps(), env });
+    expect(res.verified).toBe(true);
+    expect(await readFile(join(dest, ".DS_Store"), "utf8")).toBe("finder");
+    const moved = await openLibrary(dest, mkDeps());
+    expect(moved.mode).toBe("read-write");
+    await moved.close();
+  });
+
   it("copies, verifies and switches a library with two projects", async () => {
     const { lib, a, b } = await fixture();
     const before = await hashes(lib.root, notLock);
@@ -992,5 +1023,181 @@ describe("review fixes round 3", () => {
     expect(out.movedAwayKept).toEqual([f.a.folder]);
     expect(await hashes(join(f.lib.root, f.a.folder))).toEqual(keepA);
     expect(await walkFiles(f.lib.root)).not.toContain("library.json");
+  });
+});
+
+describe("Task 50: no refusal or audit failure is silent", () => {
+  const macEnv = (): LocationEnv => ({ ...env, platform: "darwin" });
+  const oneDrive = () => join(env.homeDir, "Library/CloudStorage/OneDrive-Contoso/Lib");
+  const attentionOf = async (root: string, folder: string) => readdir(join(root, folder, "attention")).catch(() => [] as string[]);
+
+  it("a refused move is audited as a deny in each refused project: who, what, the rule", async () => {
+    const { lib, repo, a, b } = await fixture(HIPAA_GOV, true);
+    const beforeA = (await auditOf(lib.root, a.folder)).length;
+    await expect(executeMove(lib, oneDrive(), { deps: mkDeps(), env: macEnv(), sourceRepo: repo })).rejects.toMatchObject({ code: "policy-denied" });
+    const ev = (await auditOf(lib.root, b.folder)).at(-1)!;
+    expect(ev.action).toBe("move");
+    expect(ev.actor).toBe("tester");
+    expect(ev.decision).toMatchObject({ result: "deny" });
+    expect(ev.decision!.reason).toMatch(/\S/);
+    expect(ev.details).toMatchObject({ op: "library.move", destinationKind: "cloud_folder", cloudFolderId: "onedrive:Contoso" });
+    expect(JSON.stringify(ev)).not.toContain(tmp);
+    expect((await auditOf(lib.root, a.folder)).length).toBe(beforeA);
+    expect(await attentionOf(lib.root, b.folder)).toEqual([]);
+  });
+
+  it("a refusal that cannot be audited now marks the project; the next open records it late", async () => {
+    const { lib, repo, b } = await fixture(HIPAA_GOV, true);
+    // No open repo was passed: nothing can append to the log now.
+    await expect(executeMove(lib, oneDrive(), { deps: mkDeps(), env: macEnv() })).rejects.toMatchObject({ code: "policy-denied" });
+    expect(await attentionOf(lib.root, b.folder)).toHaveLength(1);
+    expect(await projectWarnings(repo, b.id)).toContain("audit-unrecorded");
+    const raw = await readFile(join(lib.root, b.folder, "attention", (await attentionOf(lib.root, b.folder))[0]!), "utf8");
+    expect(raw).not.toContain(tmp);
+    await lib.close();
+    const again = await openLibrary(lib.root, mkDeps());
+    open.push(again);
+    const r = await openTestRepo(again, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    const ev = (await auditOf(lib.root, b.folder)).at(-1)!;
+    expect(ev).toMatchObject({ action: "move", decision: { result: "deny" }, details: { op: "library.move", recordedLate: { occurredAt: NOW } } });
+    expect(r.integrityWarnings).toContainEqual(expect.objectContaining({ projectId: b.id, kind: "audit-recorded-late" }));
+    expect(await projectWarnings(r, b.id)).not.toContain("audit-unrecorded");
+    expect(await attentionOf(lib.root, b.folder)).toEqual([]);
+  });
+
+  it("a library.move event that cannot be written leaves the move in place, marks the project, and is recorded on the next open", async () => {
+    const { lib, a, b } = await fixture();
+    const dest = join(tmp, "Dest");
+    seams.failAuditAppendFor = a.id;
+    const res = await executeMove(lib, dest, { deps: mkDeps(), env });
+    expect(res.verified).toBe(true);
+    expect(res.warnings.join(" ")).toMatch(/needing attention/);
+    expect(await attentionOf(dest, a.folder)).toHaveLength(1);
+    expect((await auditOf(dest, a.folder)).filter((e) => e.action === "library.move")).toHaveLength(0);
+    expect((await auditOf(dest, b.folder)).filter((e) => e.action === "library.move")).toHaveLength(1);
+    seams.failAuditAppendFor = undefined;
+    const d = await openLibrary(dest, mkDeps());
+    open.push(d);
+    expect(d.mode).toBe("read-write");
+    const before = await openTestRepo(d, ring, { clock: () => now, tz: "UTC", scryptN: FAST, noHeal: true });
+    expect(await projectWarnings(before, a.id)).toContain("audit-unrecorded");
+    const r = await openTestRepo(d, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    const moves = (await auditOf(dest, a.folder)).filter((e) => e.action === "library.move");
+    expect(moves).toHaveLength(1);
+    expect(moves[0]!.details).toMatchObject({ moveId: expect.any(String), recordedLate: { occurredAt: NOW, reason: "Error" } });
+    expect(r.integrityWarnings).toContainEqual(expect.objectContaining({ projectId: a.id, kind: "audit-recorded-late" }));
+    expect(await projectWarnings(r, a.id)).toEqual([]);
+  });
+
+  it("P2 / R154 e: nothing is written under another device's lock; the mark waits on this device and is delivered once", async () => {
+    const { lib, a, b } = await fixture();
+    const dest = join(tmp, "Dest");
+    const res = await executeMove(lib, dest, { deps: mkDeps(), env });
+    const depsB: Deps = { ...mkDeps(), deviceId: "dev-B", hostname: "host-B", pid: process.pid + 1 };
+    await acquireLock(dest, depsB);
+    const out = await deleteOldCopy(lib.root, res.confirmToken);
+    expect(out.rootRemoved).toBe(true);
+    expect(out.warnings.join(" ")).toMatch(/kept on this computer/);
+    // Nothing appeared in the library B holds.
+    expect(await attentionOf(dest, a.folder)).toEqual([]);
+    expect(await attentionOf(dest, b.folder)).toEqual([]);
+    const outbox = await readdir(join(tmp, "config", "attention-outbox")).catch(() => [] as string[]);
+    expect(outbox).toHaveLength(1);
+    // Shown on this device while B holds the lock.
+    const ro = await openLibrary(dest, mkDeps());
+    expect(ro.readOnlyReason).toBe("locked-by-other-device");
+    const roRepo = await openTestRepo(ro, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    expect(await projectWarnings(roRepo, a.id)).toEqual(["audit-waiting"]);
+    await ro.close();
+    // Delivered on this device's next writable open, once.
+    await releaseLock(dest, depsB);
+    for (let i = 0; i < 2; i++) {
+      const d = await openLibrary(dest, mkDeps());
+      const r = await openTestRepo(d, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+      for (const f of [a.folder, b.folder]) {
+        const ev = (await auditOf(dest, f)).filter((e) => e.action === "library.old-copy-deleted");
+        expect(ev).toHaveLength(1);
+        expect(ev[0]!.details).toMatchObject({ recordedLate: { by: "dev-A" } });
+      }
+      expect(await projectWarnings(r, a.id)).toEqual([]);
+      await d.close();
+    }
+    const left = await readdir(join(tmp, "config", "attention-outbox", (await readdir(join(tmp, "config", "attention-outbox")))[0]!));
+    expect(left).toEqual([]);
+  });
+
+  it("P2b / N1: handed a read-only repo of a library another device holds, nothing is written there; the marks wait on this device", async () => {
+    const { lib, a, b } = await fixture();
+    const dest = join(tmp, "Dest");
+    const res = await executeMove(lib, dest, { deps: mkDeps(), env });
+    const depsB: Deps = { ...mkDeps(), deviceId: "dev-B", hostname: "host-B", pid: process.pid + 1 };
+    await acquireLock(dest, depsB);
+    const ro = await openLibrary(dest, mkDeps());
+    open.push(ro);
+    expect(ro.readOnlyReason).toBe("locked-by-other-device");
+    const roRepo = await openTestRepo(ro, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    const out = await deleteOldCopy(lib.root, res.confirmToken, { destRepo: roRepo });
+    expect(out.warnings.join(" ")).toMatch(/kept on this computer/);
+    expect(out.warnings.join(" ")).not.toMatch(/marked as needing attention/);
+    expect(await attentionOf(dest, a.folder)).toEqual([]);
+    expect(await attentionOf(dest, b.folder)).toEqual([]);
+    expect(await projectWarnings(roRepo, a.id)).toEqual(["audit-waiting"]);
+  });
+
+  it("a library.old-copy-deleted event that cannot be written marks the project in the new copy", async () => {
+    const { lib, a, b } = await fixture();
+    const dest = join(tmp, "Dest");
+    const res = await executeMove(lib, dest, { deps: mkDeps(), env });
+    seams.failAuditAppendFor = b.id;
+    const out = await deleteOldCopy(lib.root, res.confirmToken);
+    expect(out.rootRemoved).toBe(true);
+    expect(out.warnings.join(" ")).toMatch(/needing attention/);
+    expect(await attentionOf(dest, b.folder)).toHaveLength(1);
+    expect(await attentionOf(dest, a.folder)).toEqual([]);
+    seams.failAuditAppendFor = undefined;
+    const d = await openLibrary(dest, mkDeps());
+    open.push(d);
+    await openTestRepo(d, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    expect((await auditOf(dest, b.folder)).filter((e) => e.action === "library.old-copy-deleted")).toHaveLength(1);
+    expect(await attentionOf(dest, b.folder)).toEqual([]);
+  });
+
+  it("a crash after the failed append and before the mark leaves the move unfinished, which the next open reports and completeMove records", async () => {
+    const { lib, a, b } = await fixture();
+    const dest = join(tmp, "Dest");
+    seams.failAuditAppendFor = a.id;
+    seams.crashAt = "before-attention-mark";
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedCrash);
+    await lib.close();
+    seams.failAuditAppendFor = undefined;
+    const half = await openLibrary(dest, mkDeps());
+    expect([half.mode, half.readOnlyReason]).toEqual(["read-only", "move-incomplete"]);
+    await half.close();
+    await completeMove(dest, mkDeps(), env);
+    for (const f of [a.folder, b.folder]) expect((await auditOf(dest, f)).filter((e) => e.action === "library.move")).toHaveLength(1);
+    expect(await attentionOf(dest, a.folder)).toEqual([]);
+  });
+});
+
+describe("the list of old library copies cannot be read (Task 68, ruling 1)", () => {
+  it("the move is stopped before anything is switched, says so in plain words, and writes nothing to the list", async () => {
+    const { lib } = await fixture();
+    const before = await hashes(lib.root, notLock);
+    const cfgDir = join(tmp, "config");
+    await mkdir(cfgDir, { recursive: true });
+    // A folder where the list should be: it cannot be read (and could not be replaced).
+    await mkdir(join(cfgDir, "pending-old-copies.json"));
+    const regBefore = await listLibraries(mkDeps());
+    const err = (await executeMove(lib, join(tmp, "Moved", "Lib"), { deps: mkDeps(), env }).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(OldCopiesUnreadableError);
+    expect(err.message).toMatch(/stopped before anything was switched/);
+    expect(err.message).toMatch(/still where it was/);
+    expect(err.message).toMatch(/no old copy is listed for deletion/);
+    expect(err.message).not.toContain(tmp);
+    // Nothing switched: the library is where it was, unchanged; the registry and the list are as before.
+    expect(await hashes(lib.root, notLock)).toEqual(before);
+    expect(await listLibraries(mkDeps())).toEqual(regBefore);
+    expect((await stat(join(cfgDir, "pending-old-copies.json"))).isDirectory()).toBe(true);
+    expect(await readdir(join(cfgDir, "old-copies")).catch(() => [])).toEqual([]);
   });
 });

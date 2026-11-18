@@ -1,0 +1,81 @@
+/* Optional tools screen and first-use dialogue (Task 48b). Colours from theme tokens only; focus rings come from base.css. */
+.ao-tools .ao-visually-hidden,
+.ao-first-use .ao-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.ao-tools__group {
+  margin: var(--space-4) 0;
+}
+
+.ao-tool h3 {
+  margin-top: 0;
+}
+
+.ao-tool h3[tabindex="-1"]:focus {
+  outline: none;
+}
+
+.ao-tool__parts {
+  margin: var(--space-1) 0;
+  padding-inline-start: var(--space-4);
+}
+
+.ao-tool__status {
+  margin: var(--space-2) 0;
+}
+
+.ao-tool__job {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.ao-tool__progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 12rem;
+}
+
+.ao-tool__progress progress {
+  width: 100%;
+}
+
+.ao-first-use {
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+}
+
+.ao-first-use fieldset {
+  border: 1px solid var(--line-control);
+  border-radius: 6px;
+  margin: var(--space-2) 0;
+  padding: var(--space-2) var(--space-3);
+}
+
+.ao-first-use legend {
+  font-weight: 700;
+  padding: 0 var(--space-1);
+}
+
+.ao-first-use__option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: var(--space-1) 0;
+}
+
+.ao-first-use__option input {
+  margin-top: 0.3em;
+}

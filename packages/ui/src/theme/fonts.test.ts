@@ -66,6 +66,13 @@ describe("font stacks", () => {
     expect(fontStack({ family: "My Thesis Font", source: "user-file", file: "fonts/thesis.otf", generic: "serif" })).toBe(`'My Thesis Font', serif, ${FALLBACKS}`);
   });
 
+  it("a researcher's file family is always quoted, so a name like a keyword or a generic family stays the file's face (M5)", () => {
+    for (const family of ["Brill", "serif", "inherit", "monospace", "system-ui", "Junicode-Regular"]) {
+      const s = fontStack({ family, source: "user-file", file: "0123456789abcdef0123456789abcdef", generic: "serif" });
+      expect(s, family).toBe(`'${family}', serif, ${FALLBACKS}`);
+    }
+  });
+
   it("refuses family names that could escape the font-family value, including control characters", () => {
     for (const bad of ["x; color: red", "a{b}", "<script>", "", "a\\b", "Times\nNew", "x\u0000y", "x\u007fy"]) expect(() => fontStack({ family: bad, source: "system" }), JSON.stringify(bad)).toThrow(/font name/);
     for (const bad of ["Times\nNew", "x\u0000y"]) expect(isUsableFamily(bad)).toBe(false);
@@ -91,8 +98,15 @@ describe("bundled fonts", () => {
     for (const fam of ["Sorts Mill Goudy", "Atkinson Hyperlegible", "OpenDyslexic"]) expect(fontsCss).toContain(`font-family: "${fam}"`);
     expect(fontsCss).toMatch(/font-family: "Sorts Mill Goudy";[^}]*font-style: italic/);
     expect(fontsCss).not.toMatch(/font-family: "Goudy Old Style"/);
-    // An installed copy of each bundled font is preferred over the bundled file.
-    expect(fontsCss).toContain('local("Sorts Mill Goudy")');
+  });
+
+  it("no bundled face names a local() source (D6): in WebKit a face with local() sources that the page matches but does not need is left in error, and document.fonts never finishes loading", () => {
+    const faces = [...fontsCss.matchAll(/@font-face\s*\{([^}]*)\}/g)].map((m) => m[1]!);
+    expect(faces.length).toBeGreaterThan(0);
+    for (const f of faces) {
+      expect(f).not.toMatch(/local\(/);
+      expect(f).toMatch(/src:\s*url\("\/fonts\/[^"]+\.woff2"\) format\("woff2"\);/);
+    }
   });
 
   it("every font file fonts.css loads is pinned in scripts/fonts.lock.json", () => {

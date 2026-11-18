@@ -21,15 +21,19 @@
  * folders (trashed through the repository) and the copies a merge added. Linked originals and the
  * user's files outside the library are never touched.
  */
-import { appendLibraryEvent, hasSource, importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
+import { appendLibraryEvent, clearZoteroWebVersion, hasSource, importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
 import { encName } from "@ao/core";
 import { decryptBytes, readMaybe } from "../../repo/io.js";
 import { projectDataKey } from "../../repo/repo.js";
 import { join } from "node:path";
 import { zoteroKeysOf } from "../../repo/tombstones.js";
-import { BOOKKEEPING, PRIVATE_MODE, activeBatches, findBatch, readJournal, writeBatchRecord } from "./batch.js";
-import { revertMerge } from "./merge.js";
+import type { ImportOps } from "../../repo/import-ops.js";
+import { reviewCauseOf } from "../../repo/review.js";
+import { BOOKKEEPING, PRIVATE_MODE, activeBatches, batchDirs, findBatch, readBatchAt, readJournal, writeBatchRecord } from "./batch.js";
+import { getAt, revertMerge } from "./merge.js";
+import { asEvidence } from "./update.js";
+import { isDeepStrictEqual } from "node:util";
 import { BatchRefusedError } from "./run.js";
 
 const CREATED = new Set(["created", "needs-review", "incomplete"]);
@@ -43,7 +47,8 @@ async function readProjectRel(repo: Repo, projectId: string, rel: string): Promi
 }
 
 export interface UndoKept {
-  kind: "tag" | "collection" | "field" | "annotation";
+  /** `availability` (Z5): a source's availability changed after the batch marked it (or took its mark away); kept. */
+  kind: "tag" | "collection" | "field" | "annotation" | "availability";
   /** The tag or collection id, or the field's JSON pointer. */
   id: string;
   /** For fields: the source. */
@@ -54,8 +59,64 @@ export interface UndoKept {
 export interface UndoResult {
   removedSources: number;
   revertedMerges: number;
+  /**
+   * Of `revertedMerges`, by what the batch had done (Z5, R224): merges restored, updates reverted (a back that also
+   * updated the item among them), "gone from Zotero" marks taken off, and marks put back (a bare back undone).
+   * Other changes taken back (a sort index filled in) are in `revertedMerges` only.
+   */
+  reverted: {
+    merged: number;
+    updated: number;
+    unmarked: number;
+    remarked: number;
+    /**
+     * Task Z6 (present only when not 0): sources whose conflict (a field changed in Zotero and here) this undo took off,
+     * its review entry resolved "undone"; the researcher's value was never changed. An updated source that also had one
+     * is counted in `updated` too.
+     */
+    conflicts?: number;
+  };
   /** What undo left in place because it is in use or was changed since (R61). */
   kept: UndoKept[];
+  /** Z5: the Zotero library version this batch recorded was forgotten, so the next Web import is a full one. */
+  libraryVersionReset?: true;
+}
+
+const UNSETTLED = new Set(["conflict", "unverified"]);
+
+/**
+ * Task Z6 (R177 c, R194): inside the undo's change of a source, the pending capture-conflict entries that list a field
+ * whose conflict the undo took off, and none of whose listed fields is still in conflict or unverified in `verification`
+ * (the report as the undo leaves it), are resolved "undone". No entry is left for a conflict that no longer exists.
+ */
+async function resolveUndoneConflicts(ops: ImportOps, sourceId: string, paths: string[], verification: Record<string, { status: string }>): Promise<void> {
+  for (const en of await ops.reviewEntries()) {
+    if (en.status !== "pending" || en.sourceId !== sourceId || reviewCauseOf(en)?.kind !== "capture-conflict") continue;
+    const listed = Object.keys(en.fields ?? {});
+    if (!listed.some((f) => paths.includes(f))) continue;
+    if (listed.some((f) => UNSETTLED.has(verification[f]?.status ?? ""))) {
+      // M2: an entry that still waits for another field no longer lists the one this undo took off (its reasons, which
+      // name no field, are left as they are).
+      const off = listed.filter((f) => paths.includes(f) && !UNSETTLED.has(verification[f]?.status ?? ""));
+      if (off.length) await ops.updateReview({ ...en, fields: Object.fromEntries(Object.entries(en.fields).filter(([f]) => !off.includes(f))) });
+      continue;
+    }
+    await ops.updateReview({ ...en, status: "resolved", resolvedAt: ops.tx.at, decision: "undone" });
+  }
+}
+
+/** The ids of the project's batches whose record says undone (an unreadable record is taken as standing). */
+async function undoneBatchIds(repo: Repo, projectId: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const d of await batchDirs(repo, projectId)) {
+    try {
+      const r = await readBatchAt(repo, projectId, d.name);
+      if (r?.state === "undone") out.add(r.id);
+    } catch {
+      // unreadable: not known to be undone
+    }
+  }
+  return out;
 }
 
 export async function undoBatch(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
@@ -77,28 +138,61 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
   const journal = await readJournal(repo, projectId, rec.dir);
   const kept: UndoKept[] = [];
 
-  // 1. Merges, newest first, exactly what each one added.
+  // 1. Merges, newest first, exactly what each one added. Z5 (R224 b): a "gone from Zotero" mark whose own batch is
+  //    undone is never put back; which batches are undone is read from their records (never their journals).
+  const undone = journal.some((e) => e.merge?.availability?.marks?.length) ? await undoneBatchIds(repo, projectId) : new Set<string>();
   let revertedMerges = 0;
+  const reverted: UndoResult["reverted"] = { merged: 0, updated: 0, unmarked: 0, remarked: 0 };
   for (const e of [...journal].reverse()) {
     if (!e.mergedInto || !e.merge || !hasSource(repo, projectId, e.mergedInto)) continue;
     const cur = await repo.getSource(projectId, e.mergedInto);
     const p = cur.source.provenance;
+    let conflictsOff = false;
     const changed = await importChange(
       repo,
       projectId,
       { action: "store", store: { identifiable: p.identifiable, hasLocation: false, ...(p.legal.basis ? { legalBasis: p.legal.basis } : {}) } },
       async (ops) => {
         const now = await ops.readSource(e.mergedInto!);
-        const r = revertMerge(now, e.merge!, ops.tx.at, ops.tx.actor);
+        const r = revertMerge(now, e.merge!, ops.tx.at, ops.tx.actor, (id) => undone.has(id));
         for (const a of r.removed) await ops.trashAssetFile(a);
         for (const path of r.kept) kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason: "changed after the import; kept" });
+        // Z6 (R177 c): a conflict this batch raised and the undo took off: its pending capture entry is resolved
+        // "undone" in this same change, once none of the fields it lists is left in conflict or unverified (an entry
+        // that also lists another open field stays pending for that one). Resolved BEFORE the source is written, so
+        // the write's own re-examination finds it decided and does not call it "rechecked".
+        if (r.conflictsReverted.length) await resolveUndoneConflicts(ops, e.mergedInto!, r.conflictsReverted, r.next.verification);
+        // One the researcher decided after the import is theirs: kept, with its evidence, and said.
+        // I1 (R236 b): what they decided is said as it is — their own value kept, or Zotero's taken — by comparing the
+        // field's value now with the Zotero value this batch asked about.
+        for (const path of r.keptConflicts) {
+          const decided = r.next.verification[path]?.status === "user-confirmed";
+          const asked = e.merge!.conflicts?.find((c) => c.path === path)?.after.values?.[0]?.value;
+          const tookZotero = asked !== undefined && isDeepStrictEqual(asEvidence(path, getAt(r.next.source, path)), asked);
+          const reason = !decided
+            ? "changed after the import; kept"
+            : tookZotero
+              ? "you chose Zotero's value after this import; your decision was kept"
+              : "you kept your own value after this import; your decision was kept";
+          kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason });
+        }
+        conflictsOff = r.conflictsReverted.length > 0;
         for (const id of r.keptAnnotations) kept.push({ kind: "annotation", id, sourceId: e.mergedInto!, reason: "edited after the import; kept" });
+        // Z5: an availability changed since this batch wrote it (a later batch, or the researcher) is left as it is.
+        if (r.keptAvailability) kept.push({ kind: "availability", id: "/availability", sourceId: e.mergedInto!, reason: "its availability was changed after this import, so it was left as it is" });
         if (r.changed) await ops.writeSource(now, r.next);
         return r.changed;
       },
       { op: "import.undo.merge", entity: { type: "source", id: e.mergedInto } },
     );
-    if (changed) revertedMerges++;
+    if (changed) {
+      revertedMerges++;
+      if (e.outcome === "merged") reverted.merged++;
+      else if (e.outcome === "updated" || (e.outcome === "zotero-back" && e.contentUpdated)) reverted.updated++;
+      else if (e.outcome === "zotero-gone") reverted.unmarked++;
+      else if (e.outcome === "zotero-back") reverted.remarked++;
+      if (conflictsOff) reverted.conflicts = (reverted.conflicts ?? 0) + 1;
+    }
   }
 
   // 2. Sources the batch created: by provenance, the record and the journal (R45).
@@ -115,7 +209,9 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
   const removed = new Set<string>();
   for (const id of ids) {
     if (!hasSource(repo, projectId, id)) continue;
-    // Not the user's deletion: no deletion record, so a later run imports the item again (R73).
+    // Not the user's deletion: no deletion record, so a later run imports the item again (R73). Its
+    // pending review entries are read and resolved ("undone") inside this same change (coordinator's
+    // ruling 3; fix round 2, N3: an entry queued while the undo runs is not missed).
     await importChange(repo, projectId, { action: "delete" }, (ops) => ops.deleteSource(id, { undo: true }), { op: "source.delete", entity: { type: "source", id } });
     removed.add(id);
   }
@@ -221,6 +317,15 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
     }
   }
 
+  // 4b. Zotero Web (Z5, R206 4): a batch that recorded the library's version had it forgotten, so the next run is a
+  //     full one and brings back what this undo took away. Before the record says undone: an undo that stops in
+  //     between is done again, and forgetting twice changes nothing.
+  let libraryVersionReset = false;
+  if (rec.source.kind === "zotero-web" && rec.recordedLibraryVersion !== undefined && /^(user|group):\d{1,12}$/u.test(rec.source.location)) {
+    await clearZoteroWebVersion(repo, projectId, rec.source.location);
+    libraryVersionReset = true;
+  }
+
   // 5. Review entries, the record, the audit log.
   const pending = (await projectReviewEntries(repo, projectId)).filter((e) => e.status === "pending" && (e.batchId === batchId || (e.sourceId && removed.has(e.sourceId))));
   rec.state = "undone";
@@ -241,6 +346,7 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
     removedSources,
     revertedMerges,
     kept: kept.length,
+    ...(libraryVersionReset ? { libraryVersionReset } : {}),
   });
-  return { removedSources, revertedMerges, kept };
+  return { removedSources, revertedMerges, reverted, kept, ...(libraryVersionReset ? { libraryVersionReset: true as const } : {}) };
 }

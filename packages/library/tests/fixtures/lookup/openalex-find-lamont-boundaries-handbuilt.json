@@ -1,0 +1,108 @@
+{
+ "meta": {
+  "count": 1,
+  "db_response_time_ms": 0,
+  "page": 1,
+  "per_page": 5,
+  "groups_count": null
+ },
+ "results": [
+  {
+   "id": "https://openalex.org/W2098486530",
+   "doi": "https://doi.org/10.1146/annurev.soc.28.110601.141107",
+   "title": "The Study of Boundaries in the Social Sciences",
+   "display_name": "The Study of Boundaries in the Social Sciences",
+   "publication_year": 2002,
+   "publication_date": "2002-07-28",
+   "ids": {
+    "openalex": "https://openalex.org/W2098486530",
+    "doi": "https://doi.org/10.1146/annurev.soc.28.110601.141107",
+    "mag": "2098486530"
+   },
+   "language": "en",
+   "primary_location": {
+    "id": "doi:10.1146/annurev.soc.28.110601.141107",
+    "doi": "https://doi.org/10.1146/annurev.soc.28.110601.141107",
+    "is_oa": false,
+    "landing_page_url": "https://doi.org/10.1146/annurev.soc.28.110601.141107",
+    "pdf_url": null,
+    "source": {
+     "id": "https://openalex.org/S61274580",
+     "display_name": "Annual Review of Sociology",
+     "issn_l": "0360-0572",
+     "issn": [
+      "0360-0572",
+      "1545-2115"
+     ],
+     "is_oa": false,
+     "is_in_doaj": false,
+     "is_core": true,
+     "listed_in": [
+      "abdc-a-star",
+      "anvur-class-a",
+      "anvur-scientific",
+      "cwts-core",
+      "fnege-2",
+      "jufo-3",
+      "norway-2",
+      "poland-200",
+      "russia-white-list-1",
+      "vabb-shw"
+     ],
+     "host_organization": "https://openalex.org/P4310320373",
+     "host_organization_name": "Annual Reviews",
+     "host_organization_lineage": [
+      "https://openalex.org/P4310320373"
+     ],
+     "host_organization_lineage_names": [
+      "Annual Reviews"
+     ],
+     "type": "journal"
+    },
+    "license": null,
+    "license_id": null,
+    "version": "publishedVersion",
+    "is_accepted": true,
+    "is_published": true,
+    "raw_source_name": "Annual Review of Sociology",
+    "raw_type": "journal-article"
+   },
+   "type": "review",
+   "authorships": [
+    {
+     "author_position": "first",
+     "author": {
+      "id": "https://openalex.org/A5014334361",
+      "display_name": "Michèle Lamont",
+      "orcid": "https://orcid.org/0000-0002-0221-0402",
+      "observed_orcids": [
+       "https://orcid.org/0000-0002-0221-0402"
+      ]
+     },
+     "raw_author_name": "Michèle Lamont"
+    },
+    {
+     "author_position": "last",
+     "author": {
+      "id": "https://openalex.org/A5013038493",
+      "display_name": "Virág Molnár",
+      "orcid": "https://orcid.org/0000-0003-1156-9238",
+      "observed_orcids": [
+       "https://orcid.org/0000-0003-1156-9238"
+      ]
+     },
+     "raw_author_name": "Virág Molnár"
+    }
+   ],
+   "biblio": {
+    "volume": "28",
+    "issue": "1",
+    "first_page": "167",
+    "last_page": "195"
+   },
+   "is_retracted": false,
+   "is_paratext": false
+  }
+ ],
+ "group_by": []
+}

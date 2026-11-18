@@ -18,6 +18,8 @@ import {
   KEY_LEN,
   KeyNotAvailableError,
   TAG_LEN,
+  assertLiveKey,
+  noteOpening,
   chunkAad,
   chunkNonce,
   parseHeader,
@@ -38,14 +40,24 @@ export interface DecryptedFile {
 
 /** Opens `path` for random-access decryption; throws KeyNotAvailableError when `getKey` has no key. */
 export async function openDecrypted(path: string, getKey: (keyId: string) => Uint8Array | undefined): Promise<DecryptedFile> {
-  const fh = await fsp.open(path, "r");
+  return openDecryptedHandle(await fsp.open(path, "r"), getKey);
+}
+
+/**
+ * The same over a file already open (e.g. opened without following symbolic links). The returned
+ * file owns `fh`: its close() closes it, and so does a failure here.
+ */
+export async function openDecryptedHandle(fh: fsp.FileHandle, getKey: (keyId: string) => Uint8Array | undefined, opts: { cacheChunks?: number } = {}): Promise<DecryptedFile> {
+  const cacheChunks = Math.max(1, opts.cacheChunks ?? CACHE_CHUNKS);
   try {
     const { size: fileSize } = await fh.stat();
     const header = Buffer.alloc(HEADER_LEN);
     const { bytesRead } = await fh.read(header, 0, HEADER_LEN, 0);
     const parsed = parseHeader(header.subarray(0, bytesRead));
+    noteOpening(parsed.keyId);
     const k = getKey(parsed.keyId);
     if (!(k instanceof Uint8Array) || k.length !== KEY_LEN) throw new KeyNotAvailableError(parsed.keyId);
+    assertLiveKey(k, parsed.keyId);
     const key = Buffer.from(k);
     const body = fileSize - HEADER_LEN;
     if (body < TAG_LEN) throw new DecryptionError("encrypted file is truncated: missing final chunk");
@@ -82,7 +94,7 @@ export async function openDecrypted(path: string, getKey: (keyId: string) => Uin
         throw new DecryptionError(`authentication failed at chunk ${i}`);
       }
       cache.set(i, pt);
-      if (cache.size > CACHE_CHUNKS) {
+      if (cache.size > cacheChunks) {
         const oldest = cache.keys().next().value!;
         cache.get(oldest)?.fill(0);
         cache.delete(oldest);

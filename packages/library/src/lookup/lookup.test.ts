@@ -13,7 +13,7 @@ import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary } from "../library.js";
 import { openTestRepo } from "../repo/testing.js";
-import { datePartsToEdtf } from "./crossref.js";
+import { datePartsToEdtf, mapCrossref } from "./crossref.js";
 import { mapLocMods } from "./loc.js";
 import { DEFAULT_ATTEMPT_TIMEOUT_MS, HttpClient, LookupHttpError, USER_AGENT } from "./http.js";
 import { lookupContextFor, lookupDoi, lookupIsbn, searchTitle, type LookupContext } from "./index.js";
@@ -107,7 +107,7 @@ describe("lookupDoi", () => {
 
   it("serves the second call from the on-disk cache (one request), file named sha256(cacheKey), 0600 in a 0700 dir", async () => {
     crossref().intercept({ path: CR_PATH, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
-    const http = client({ contactEmail: EMAIL });
+    const http = client({ contactEmailFor: () => EMAIL });
     const first = await lookupDoi(DOI, ctx(http));
     const second = await lookupDoi(DOI, ctx(http));
     expect(second).toEqual(first);
@@ -233,12 +233,12 @@ describe("lookupDoi", () => {
     crossref()
       .intercept({ path: "/works/10.5555/other", method: "GET", headers: { "user-agent": `AlexandrineOxiana/0.0.0 (+https://github.com/maquiscatta-sys/AlexandrineOxiana; mailto:${EMAIL})` } })
       .reply(200, fixture("crossref-work.json"), JSON_HEADERS);
-    await lookupDoi("10.5555/other", ctx(client({ contactEmail: EMAIL })));
+    await lookupDoi("10.5555/other", ctx(client({ contactEmailFor: () => EMAIL })));
     agent.assertNoPendingInterceptors();
   });
 
   it("ignores a contact email that could inject header text", () => {
-    expect(client({ contactEmail: "a@b.example\r\nX-Evil: 1" }).userAgent).toBe(UA);
+    expect(client({ contactEmailFor: () => "a@b.example\r\nX-Evil: 1" }).userAgent).toBe(UA);
   });
 });
 
@@ -305,6 +305,27 @@ describe("cache and transport hardening", () => {
     expect(rs).toEqual([{}, {}, {}, {}]);
   });
 
+  it("R247 (c): once told to stop writing to disk, a late answer writes nothing; told again, it writes", async () => {
+    await mkdir(join(tmp, "Lib"));
+    const http = client();
+    crossref().intercept({ path: CR_PATH, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(2);
+    http.setDiskCache(false);
+    expect((await lookupDoi(DOI, ctx(http)))?.provider).toBe("crossref");
+    expect(existsSync(join(tmp, "Lib", ".cache"))).toBe(false);
+    http.setDiskCache(true);
+    expect((await lookupDoi(DOI, ctx(client())))?.provider).toBe("crossref");
+    expect(existsSync(join(tmp, "Lib", ".cache", "lookups"))).toBe(true);
+  });
+
+  it("R247 (c): a library folder removed after the client was made is never created again by a cache write", async () => {
+    await mkdir(join(tmp, "Lib"));
+    const http = client();
+    await rm(join(tmp, "Lib"), { recursive: true });
+    crossref().intercept({ path: CR_PATH, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS);
+    expect((await lookupDoi(DOI, ctx(http)))?.provider).toBe("crossref");
+    expect(existsSync(join(tmp, "Lib"))).toBe(false);
+  });
+
   it("refuses to write through a symlinked cache directory", async () => {
     if (process.platform === "win32") return;
     const elsewhere = join(tmp, "elsewhere");
@@ -353,6 +374,14 @@ describe("cache and transport hardening", () => {
     expect(datePartsToEdtf([[2020, null, 5]])).toBe("2020");
     expect(datePartsToEdtf([[2020, 7, null]])).toBe("2020-07");
     expect(datePartsToEdtf([[null]])).toBeUndefined();
+  });
+
+  it("Crossref title and subtitle: a title ending in a colon, a question mark or an exclamation mark is joined with a space (R272)", () => {
+    const titleOf = (title: string, subtitle: string) => mapCrossref({ title: [title], subtitle: [subtitle] }, "10.1/x")?.title;
+    expect(titleOf("Deep Play:", "Notes on the Balinese Cockfight")).toBe("Deep Play: Notes on the Balinese Cockfight");
+    expect(titleOf("What Is History?", "A Reply")).toBe("What Is History? A Reply");
+    expect(titleOf("Stop!", "A Warning")).toBe("Stop! A Warning");
+    expect(titleOf("Deep Play", "Notes on the Balinese Cockfight")).toBe("Deep Play: Notes on the Balinese Cockfight");
   });
 });
 
@@ -512,5 +541,34 @@ describe("lookupContextFor", () => {
     expect(a).toMatchObject({ projectId: plain.project.id, actor: "tester", sensitive: false });
     expect(a.policy?.processing.metadata_lookup).toEqual(["openalex"]);
     expect(b.sensitive).toBe(true);
+    // R379: title searches only where the project's rules say it holds no identifiable data.
+    expect(a.titleSearchAllowed).toBe(true);
+    const def = await repo.createProject({ name: "Default", governanceYaml: "", encryption: { enabled: true, passphrase: "pw" } });
+    const ident = await repo.createProject({
+      name: "Identifiable",
+      governanceYaml: "identifiability:\n  containsIdentifiable: true\n  pseudonymizeFileNames: false\nencryption:\n  atRest: optional\n",
+      encryption: { enabled: false },
+    });
+    expect((await lookupContextFor(repo, def.project.id, http)).titleSearchAllowed).toBe(false);
+    expect((await lookupContextFor(repo, ident.project.id, http)).titleSearchAllowed).toBe(false);
+
+    // R385 c: fail-closed. Rules that cannot be read (corrupted, or gone) give a null policy and no title search.
+    const broken = await repo.createProject({ name: "Broken", governanceYaml: gov, encryption: { enabled: false } });
+    const govFile = join(lib.root, broken.project.folder, "governance.yaml");
+    await writeFile(govFile, "identifiability: [unclosed\n  ::: not rules");
+    const c = await lookupContextFor(repo, broken.project.id, http);
+    expect(c.policy).toBeNull();
+    expect(c.titleSearchAllowed).toBe(false);
+    await rm(govFile);
+    const gone = await lookupContextFor(repo, broken.project.id, http);
+    expect(gone.policy).toBeNull();
+    expect(gone.titleSearchAllowed).toBe(false);
+    // A locked encrypted project allows no title search, whatever its rules say (nothing can be stored in it).
+    repo.lockProject(enc.project.id);
+    const locked = await lookupContextFor(repo, enc.project.id, http);
+    expect(locked.sensitive).toBe(true);
+    expect(locked.titleSearchAllowed).toBe(false);
+    repo.lockProject(def.project.id);
+    expect((await lookupContextFor(repo, def.project.id, http)).titleSearchAllowed).toBe(false);
   });
 });

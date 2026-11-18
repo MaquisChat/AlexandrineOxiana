@@ -1,8 +1,9 @@
+import { blank } from "../blank.js";
 import type { Provenance } from "../model/source.js";
 import { effectivePolicy } from "./merge.js";
-import { ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
+import { ACQUIRE_METHODS, ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
 
-export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move";
+export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move" | "backup" | "restore" | "set-aside" | "review-withdrawal";
 
 export interface PolicyRequest {
   action: PolicyAction;
@@ -18,7 +19,26 @@ export interface PolicyRequest {
   store?: { identifiable: boolean; hasLocation: boolean; legalBasis?: string };
   move?: { destination: ResidencyKind; cloudFolderId?: string };
   export?: { identifiable: boolean; hasLocation: boolean };
+  /**
+   * A full copy of the project written to `<Library>/Backups/`, i.e. where the library itself lives
+   * (R125). `destinations` lists every kind of storage that folder may be on: its path and its real
+   * path (symbolic links resolved), and, when a kind could not be determined (`uncertain`), every
+   * plausible kind. Each must be allowed.
+   */
+  backup?: { destinations: Array<{ destination: ResidencyKind; cloudFolderId?: string; uncertain?: boolean }> };
+  /**
+   * A backup restored as a new project of a library (Task 50b). `destinations` lists every kind of
+   * storage the library's folder may be on, as for a backup. Each must be allowed. The caller asks
+   * this of the rules the backup carries (they become the new project's; `rules: 'backup'`, the
+   * default) and, when the project the backup was made from is in the library, of the rules that
+   * project has now (`rules: 'original'`). `rules` only chooses the words of a refusal.
+   */
+  restore?: { destinations: Array<{ destination: ResidencyKind; cloudFolderId?: string; uncertain?: boolean }>; rules?: "backup" | "original" };
   sync?: Record<string, never>;
+  /** Setting aside a mark that cannot be repaired (Task 50, R154 d): the researcher's reason. */
+  setAside?: { reason: string };
+  /** Recording that a source flagged by a consent withdrawal was reviewed (Task 67, R176 2): the researcher's reason. */
+  reviewWithdrawal?: { reason: string };
 }
 
 export type Condition =
@@ -74,6 +94,7 @@ function assertShape(p: GovernanceConfig): void {
   obj(p.processing, "processing");
   for (const op of PROCESSING_OPS) arr(p.processing[op], `processing.${op}`);
   arr(p.captureMethods, "captureMethods");
+  arr(p.acquireMethods, "acquireMethods");
   obj(p.protocol, "protocol");
   arr(p.protocol.platforms, "protocol.platforms");
   obj(p.identifiability, "identifiability");
@@ -144,8 +165,10 @@ function capture(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): P
   const c = need(req.capture, "capture");
   const method = str(c.method, "capture.method");
   if (c.platform !== undefined) str(c.platform, "capture.platform");
-  if (!(p.captureMethods as string[]).includes(method)) return deny(`Capture method ${method} is not enabled for this project`, warnings);
-  if (p.protocol.requireBeforeCapture && !p.protocol.number) {
+  // Each family has its own list: the three ways of acquiring answer to acquireMethods only, every other name to captureMethods only.
+  const list = (ACQUIRE_METHODS as readonly string[]).includes(method) ? p.acquireMethods : p.captureMethods;
+  if (!(list as string[]).includes(method)) return deny(`Capture method ${method} is not enabled for this project`, warnings);
+  if (p.protocol.requireBeforeCapture && blank(p.protocol.number)) {
     return deny("An approved protocol number is required before capture", warnings);
   }
   const today = localDate(req.now, req.tz ?? "UTC");
@@ -193,7 +216,7 @@ function store(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): Pol
     if (!conditions.some((c) => c.type === "encrypt")) conditions.push({ type: "encrypt" });
     conditions.push({ type: "location", mode: p.sharing.locationMetadata });
   }
-  if (s.identifiable && p.consent.requireLegalBasis && !s.legalBasis) {
+  if (s.identifiable && p.consent.requireLegalBasis && blank(s.legalBasis)) {
     return deny("Record a legal basis for identifiable data before storing it", warnings);
   }
   return withConditions(conditions, warnings);
@@ -209,22 +232,157 @@ function exportData(p: GovernanceConfig, req: PolicyRequest, warnings: string[])
   return withConditions(conditions, warnings);
 }
 
+/**
+ * Setting aside a mark that cannot be repaired (R154 d): allowed in every profile, but only with a
+ * reason that is not empty once trimmed, so the decision and its audit record have substance.
+ */
+function setAside(req: PolicyRequest, warnings: string[]): PolicyDecision {
+  const s = need(req.setAside, "setAside");
+  str(s.reason, "setAside.reason");
+  if (blank(s.reason)) return deny("A reason is required to set this aside", warnings);
+  return allow(warnings);
+}
+
+/**
+ * Recording that a source flagged by a consent withdrawal was reviewed (R176 2, following R157):
+ * allowed in every profile, but only with a reason that is not blank (`blank`, R391 c).
+ */
+function reviewWithdrawal(req: PolicyRequest, warnings: string[]): PolicyDecision {
+  const s = need(req.reviewWithdrawal, "reviewWithdrawal");
+  str(s.reason, "reviewWithdrawal.reason");
+  if (blank(s.reason)) return deny("A reason is required to record that this source was reviewed after the withdrawal", warnings);
+  return allow(warnings);
+}
+
+/**
+ * Whether the project's data may be kept on this kind of storage (residency): "kind" when the kind
+ * is not in the effective `residency.allowed`; "folder" when it is a cloud folder that must be, and
+ * is not, on the approved list (HIPAA, or whenever that list is non-empty); else null.
+ */
+function residencyProblem(p: GovernanceConfig, destination: string, cloudFolderId: string | undefined): "kind" | "folder" | null {
+  if (!(RESIDENCY_KINDS as readonly string[]).includes(destination) || !p.residency.allowed.includes(destination as ResidencyKind)) return "kind";
+  if (destination === "cloud_folder") {
+    const approved = p.residency.approvedCloudFolders;
+    const needsList = p.profiles.includes("hipaa") || approved.length > 0;
+    if (needsList && (cloudFolderId === undefined || !approved.includes(cloudFolderId))) return "folder";
+  }
+  return null;
+}
+
 function move(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
   const { destination, cloudFolderId } = need(req.move, "move");
   str(destination, "move.destination");
   if (cloudFolderId !== undefined) str(cloudFolderId, "move.cloudFolderId");
-  if (!(RESIDENCY_KINDS as readonly string[]).includes(destination) || !p.residency.allowed.includes(destination)) {
-    return deny(`Destination ${destination} is not permitted for project ${req.projectId}`, warnings);
-  }
-  if (destination === "cloud_folder") {
-    const approved = p.residency.approvedCloudFolders;
-    const hipaa = p.profiles.includes("hipaa");
-    const needsList = hipaa || approved.length > 0;
-    if (needsList && (cloudFolderId === undefined || !approved.includes(cloudFolderId))) {
-      return deny(`Cloud folder ${cloudFolderId ?? "(unspecified)"} is not on this project's approved list`, warnings);
-    }
-  }
+  const problem = residencyProblem(p, destination, cloudFolderId);
+  if (problem === "kind") return deny(`Destination ${destination} is not permitted for project ${req.projectId}`, warnings);
+  if (problem === "folder") return deny(`Cloud folder ${cloudFolderId ?? "(unspecified)"} is not on this project's approved list`, warnings);
   return allow(warnings);
+}
+
+/** Plain words for a kind of storage, in refusal reasons. */
+const STORAGE_WORDS: Record<ResidencyKind, string> = {
+  device: "this computer's disk",
+  removable: "a removable drive",
+  network: "a network drive",
+  cloud_folder: "a cloud-synced folder",
+  own_server: "your own server",
+  cloud: "a cloud service",
+};
+const storageWords = (kind: string): string => (Object.hasOwn(STORAGE_WORDS, kind) ? STORAGE_WORDS[kind as ResidencyKind] : `storage of kind "${kind}"`);
+const onOrIn = (kind: string): string => `${kind === "cloud_folder" ? "in" : "on"} ${storageWords(kind)}`;
+
+/** The words of a refusal for a full copy of a project kept where the library lives (a backup, a restore). */
+interface FullCopyWords {
+  /** Where the library is could not be determined; `kind` is one it may be, in plain words. */
+  uncertain: (kind: string) => string;
+  /** The library is in a cloud folder that is not on the approved list. */
+  folder: (cloudFolderId: string) => string;
+  /** The library is on (or in) a kind of storage the rules do not allow, in plain words. */
+  kind: (where: string) => string;
+}
+
+/**
+ * A full copy of the project's data kept where the library lives: the same questions as storing the
+ * data there. Every kind of storage the library's folder may be on must be allowed by the residency
+ * rules (as for a move); when the rules require encryption at rest, the copy must be encrypted (an
+ * `encrypt` condition, which an unencrypted project cannot honour, so the caller refuses it).
+ */
+function fullCopy(p: GovernanceConfig, payload: unknown, what: "backup" | "restore", words: FullCopyWords, warnings: string[]): PolicyDecision {
+  const b = payload as { destinations?: unknown };
+  if (typeof b !== "object" || b === null || !Array.isArray(b.destinations) || b.destinations.length === 0) {
+    throw new Error(`${what}.destinations must be a non-empty list`);
+  }
+  for (const d of b.destinations as Array<{ destination?: unknown; cloudFolderId?: unknown; uncertain?: unknown } | null>) {
+    if (typeof d !== "object" || d === null) throw new Error(`${what}.destinations entries must be mappings`);
+    const destination = str(d.destination, `${what}.destinations.destination`);
+    const cloudFolderId = d.cloudFolderId === undefined ? undefined : str(d.cloudFolderId, `${what}.destinations.cloudFolderId`);
+    const uncertain = d.uncertain === undefined ? false : bool(d.uncertain, `${what}.destinations.uncertain`);
+    const problem = residencyProblem(p, destination, cloudFolderId);
+    if (problem === null) continue;
+    if (uncertain) return deny(words.uncertain(storageWords(destination)), warnings);
+    if (problem === "folder") return deny(words.folder(cloudFolderId ?? "(unknown)"), warnings);
+    return deny(words.kind(onOrIn(destination)), warnings);
+  }
+  return withConditions(p.encryption.atRest === "required" ? [{ type: "encrypt" }] : [], warnings);
+}
+
+/**
+ * A backup (R125): the same questions as storing the project's data where the library lives. Every
+ * kind of storage the Backups folder may be on must be allowed by the project's residency rules (as
+ * for a move); when the rules require encryption at rest, the backup must be sealed (an `encrypt`
+ * condition, which an unencrypted project cannot honour, so the caller refuses it).
+ */
+function backup(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
+  return fullCopy(
+    p,
+    need(req.backup, "backup"),
+    "backup",
+    {
+      uncertain: (kind) =>
+        `Where the library's folder is stored could not be determined (it may be ${kind}), and this project's rules do not allow its data there. To make backups, move the library to storage the rules allow, or allow that kind of storage in the project's rules.`,
+      folder: (id) => `Backups are kept in the library's folder, which is in cloud folder ${id}; it is not on this project's approved list`,
+      kind: (where) => `Backups are kept in the library's folder, which is ${where}; this project's rules do not allow its data there`,
+    },
+    warnings,
+  );
+}
+
+/**
+ * A restore (Task 50b): a backup becomes a new project of this library. The questions are a
+ * backup's, the other way round: every kind of storage the library's folder may be on must be
+ * allowed by the residency rules, and rules that require encryption at rest give an `encrypt`
+ * condition, which a project that is not encrypted cannot honour (the caller refuses it: nothing
+ * comes back unencrypted under such rules). The caller asks this of the rules the backup brings
+ * with it, which become the new project's, and of the rules the project it was made from has now
+ * when that project is in the library; `restore.rules` says which, for the words of a refusal.
+ */
+function restore(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
+  const r = need(req.restore, "restore") as { rules?: unknown };
+  const which = r === null || typeof r !== "object" || r.rules === undefined ? "backup" : str(r.rules, "restore.rules");
+  if (which !== "backup" && which !== "original") throw new Error('restore.rules must be "backup" or "original"');
+  // A refusal says which rule refuses and what the researcher can do about it (R179). A backup's
+  // own rules cannot be changed, so the way out is another library; the original's can be.
+  const own = which === "backup";
+  const rule = own ? "the rule on where data may live in this backup's own rules" : "the rule on where data may live that the original project has now";
+  const elsewhere = own ? "Restore the backup into another library, on storage that rule allows." : "Restore the backup into another library on storage that rule allows";
+  return fullCopy(
+    p,
+    r,
+    "restore",
+    {
+      uncertain: (kind) =>
+        `Where the library's folder is stored could not be determined (it may be ${kind}), and ${rule} does not allow its data there. ${own ? elsewhere : `${elsewhere}, or allow that kind of storage in the original project's rules.`}`,
+      folder: (id) =>
+        `The project would be restored into the library's folder, which is in cloud folder ${id}. That folder is not on ${
+          own
+            ? "the approved list in this backup's own rules. Restore the backup into another library, on storage those rules allow."
+            : "the approved list the original project has now. Restore the backup into another library, or add the folder to the original project's approved list."
+        }`,
+      kind: (where) =>
+        `The project would be restored into the library's folder, which is ${where}. ${rule.charAt(0).toUpperCase()}${rule.slice(1)} does not allow its data there. ${own ? elsewhere : `${elsewhere}, or allow this kind of storage in the original project's rules.`}`,
+    },
+    warnings,
+  );
 }
 
 function run(cfg: GovernanceConfig, req: PolicyRequest): PolicyDecision {
@@ -248,8 +406,16 @@ function run(cfg: GovernanceConfig, req: PolicyRequest): PolicyDecision {
       return exportData(policy, req, warnings);
     case "move":
       return move(policy, req, warnings);
+    case "backup":
+      return backup(policy, req, warnings);
+    case "restore":
+      return restore(policy, req, warnings);
     case "sync":
       return deny("Sync is not enabled in this version", warnings);
+    case "set-aside":
+      return setAside(req, warnings);
+    case "review-withdrawal":
+      return reviewWithdrawal(req, warnings);
     case "delete":
     case "view":
     case "share":

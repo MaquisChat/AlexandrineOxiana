@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies } from "./index.js";
+import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES, reviewGroup, HELD_FILE_WHY_TEXT, HELD_FILE_REVIEW_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, heldFileReviewText, FIND_REASON_TEXT, HELD_FILE_DECISIONS, DEVICE_NOTICE_KINDS, isDeviceNoticeKind } from "./index.js";
 
 describe("@ao/shared", () => {
   it("credential query keys (R96/R98), any case", () => {
@@ -31,5 +31,101 @@ describe("@ao/shared", () => {
     expect(inferGenericFamily("Consolas")).toBe("monospace");
     expect(inferGenericFamily("Some Unknown Face")).toBeUndefined();
     expect(splitFontFamilies("'A, B', \"C\", D")).toEqual(["'A, B'", '"C"', "D"]);
+  });
+
+  it("media ticket addresses (R135): /media/ and 43 base64url characters, nothing else", () => {
+    const t = "A".repeat(42) + "_";
+    expect(isMediaTicketPath(`/media/${t}`)).toBe(true);
+    expect(MEDIA_TICKET_PATH.test(`/media/${t}`)).toBe(true);
+    for (const bad of [`/media/${t}?x=1`, `/media/${t}#f`, `/media/${t}/`, `/media/${t}A`, `/media/${"A".repeat(42)}`, `/media/${"A".repeat(42)}=`, `//media/${t}`, `http://127.0.0.1:1/media/${t}`, `/media/../${t}`]) {
+      expect(isMediaTicketPath(bad), bad).toBe(false);
+    }
+  });
+});
+
+describe("Task 57: Zotero key, user fonts", () => {
+  it("a Zotero API key: letters and digits only, 16 to 64 of them", () => {
+    expect(isZoteroApiKeyShape("abcdEFGH12345678abcdEFGH")).toBe(true);
+    for (const bad of ["", "short", "a".repeat(65), "abcd efgh 1234 5678", "abcdEFGH12345678abcdEFG\n", "ключключключключключ"]) expect(isZoteroApiKeyShape(bad), JSON.stringify(bad)).toBe(false);
+  });
+
+  it("a font file is recognised by its first four bytes only", () => {
+    const head = (...b: number[]) => new Uint8Array([...b, 0, 0, 0, 0]);
+    expect(sniffFontFormat(head(0x00, 0x01, 0x00, 0x00))).toBe("ttf");
+    expect(sniffFontFormat(head(0x74, 0x72, 0x75, 0x65))).toBe("ttf"); // 'true'
+    expect(sniffFontFormat(head(0x4f, 0x54, 0x54, 0x4f))).toBe("otf"); // 'OTTO'
+    expect(sniffFontFormat(head(0x77, 0x4f, 0x46, 0x46))).toBe("woff"); // 'wOFF'
+    expect(sniffFontFormat(head(0x77, 0x4f, 0x46, 0x32))).toBe("woff2"); // 'wOF2'
+    expect(sniffFontFormat(head(0x74, 0x74, 0x63, 0x66))).toBeNull(); // 'ttcf': collections are not taken
+    expect(sniffFontFormat(head(0x25, 0x50, 0x44, 0x46))).toBeNull(); // %PDF
+    expect(sniffFontFormat(new Uint8Array([0x00, 0x01]))).toBeNull();
+    expect(USER_FONT_MIME).toEqual({ ttf: "font/ttf", otf: "font/otf", woff: "font/woff", woff2: "font/woff2" });
+  });
+
+  it("font ids are 32 lowercase hex characters", () => {
+    expect(isUserFontId("0123456789abcdef0123456789abcdef")).toBe(true);
+    for (const bad of ["", "../x", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef0123456789abcde"]) expect(isUserFontId(bad)).toBe(false);
+  });
+});
+
+describe("speech models (R158): one definition", () => {
+  it("the accepted models, the default among them, and one speech tool per model", async () => {
+    const { SPEECH_MODELS, DEFAULT_SPEECH_MODEL, TOOL_IDS, speechToolId, isSpeechModel } = await import("./index.js");
+    expect([...SPEECH_MODELS]).toEqual(["tiny", "small", "medium", "large-v3"]);
+    expect(DEFAULT_SPEECH_MODEL).toBe("medium");
+    expect(isSpeechModel("medium")).toBe(true);
+    expect(isSpeechModel("huge")).toBe(false);
+    const speechTools = TOOL_IDS.filter((t) => t.startsWith("speech-"));
+    expect(speechTools.sort()).toEqual(SPEECH_MODELS.map((m) => speechToolId(m)).sort());
+  });
+});
+
+describe("font names a researcher's own file cannot take (Task 57 M5): one list", () => {
+  it("CSS-wide keywords, generic families and bundled faces, in any case", () => {
+    expect([...CSS_WIDE_KEYWORDS]).toEqual(["inherit", "initial", "unset", "revert", "revert-layer", "default"]);
+    expect([...GENERIC_FONT_KEYWORDS].sort()).toEqual(
+      ["serif", "sans-serif", "monospace", "cursive", "fantasy", "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace", "ui-rounded", "emoji", "math", "fangsong"].sort(),
+    );
+    expect([...BUNDLED_FONT_FAMILIES].sort()).toEqual(["Atkinson Hyperlegible", "OpenDyslexic", "Sorts Mill Goudy"]);
+    for (const n of ["inherit", "Initial", "UNSET", "revert-layer", "Default"]) expect(reservedFontName(n), n).toBe("css-keyword");
+    for (const n of ["serif", "Sans-Serif", "MONOSPACE", "system-ui", "ui-rounded", "Emoji", "math", "fangsong"]) expect(reservedFontName(n), n).toBe("generic-family");
+    for (const n of ["Sorts Mill Goudy", "sorts mill goudy", "ATKINSON HYPERLEGIBLE", "opendyslexic", " OpenDyslexic "]) expect(reservedFontName(n), n).toBe("bundled-face");
+    for (const n of ["Junicode", "Brill", "Serif Pro", "Goudy", "revert2"]) expect(reservedFontName(n), n).toBeNull();
+  });
+
+  it("review queue groups (Task 67, R176): import with a batch, import without one, verification by its cause", () => {
+    expect(reviewGroup({ kind: "import", batchId: "b1" })).toBe("import");
+    expect(reviewGroup({ kind: "import" })).toBe("attach");
+    // Verification entries by their cause (R176 3: recorded, or read by the library's reviewCauseOf), never by their fields.
+    expect(reviewGroup({ kind: "verification", cause: { kind: "capture-conflict" } })).toBe("capture");
+    expect(reviewGroup({ kind: "verification", cause: { kind: "consent-withdrawal", consentIds: ["c1"] } })).toBe("withdrawal");
+    // F11 (R277): a file found for a record that did not clearly match it.
+    expect(reviewGroup({ kind: "verification", cause: { kind: "acquired-file-mismatch", findEntryId: "e1" } })).toBe("found-file");
+  });
+
+  it("a held file's reasons each have one plain sentence (F11, R277 d)", () => {
+    expect(Object.keys(HELD_FILE_WHY_TEXT).sort()).toEqual(["looks-right", "no-text", "other-doi", "other-kind", "other-version", "title-absent"]);
+    for (const t of Object.values(HELD_FILE_WHY_TEXT)) expect(t).toMatch(/^[A-Z].*\.$/);
+    expect(HELD_FILE_REVIEW_TEXT).toBe("A file was found for this record, but it did not clearly match.");
+    // R296 b: a file the check found to look right waits all the same; its review entry and its reason say so.
+    expect(HELD_FILE_LOOKS_RIGHT_TEXT).toBe("A file was found for this record. It looks like the right file: its first page shows the record's title with the author directly below.");
+    expect(HELD_FILE_WHY_TEXT["looks-right"]).toBe("This looks like the right file. Check it, then use it.");
+    // Each held file's reason is the find queue's sentence for the same code, declared once.
+    for (const [why, t] of Object.entries(HELD_FILE_WHY_TEXT)) expect(t).toBe(FIND_REASON_TEXT[`file-${why}` as keyof typeof FIND_REASON_TEXT]);
+    expect(heldFileReviewText("looks-right")).toBe(HELD_FILE_LOOKS_RIGHT_TEXT);
+    for (const why of ["other-doi", "title-absent", "no-text", "other-version", "other-kind"] as const) expect(heldFileReviewText(why)).toBe(HELD_FILE_REVIEW_TEXT);
+    expect(HELD_FILE_DECISIONS).toEqual(["attach", "discard"]);
+  });
+});
+
+describe("device notices (R242): the Zotero sync settings notice is one of the closed list", () => {
+  it("isDeviceNoticeKind knows zotero-sync-settings-set-aside, and still refuses an unknown kind", () => {
+    expect(DEVICE_NOTICE_KINDS).toContain("zotero-sync-settings-set-aside");
+    expect(isDeviceNoticeKind("zotero-sync-settings-set-aside")).toBe(true);
+    expect(isDeviceNoticeKind("zotero-sync-history-set-aside")).toBe(false);
+  });
+
+  it("R244 M7: and the notice for sync settings written by a newer version", () => {
+    expect(isDeviceNoticeKind("zotero-sync-settings-newer")).toBe(true);
   });
 });

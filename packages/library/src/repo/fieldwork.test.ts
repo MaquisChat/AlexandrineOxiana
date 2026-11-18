@@ -238,6 +238,14 @@ describe("protocol approval documents (spec 6.3(9), R117 I6)", () => {
     expect(JSON.stringify(ev)).not.toContain("input");
   });
 
+  it("41a M5: a project waiting on an interrupted change gives that reason, not a file or disk error", async () => {
+    (repo as unknown as { core: { projects: Map<string, { recoveryPending: boolean }> } }).core.projects.get(pid)!.recoveryPending = true;
+    const [r] = await addProtocolDocuments(repo, pid, [pdf]);
+    expect(r).toMatchObject({ outcome: "failed" });
+    expect(r!.reason).toMatch(/interrupted change/);
+    expect(r!.reason).not.toMatch(/disk/);
+  });
+
   it("two drops of the same name at the same time both succeed, under different names", async () => {
     const [a, b] = await Promise.all([addProtocolDocuments(repo, pid, [pdf]), addProtocolDocuments(repo, pid, [pdf])]);
     expect([...added(a), ...added(b)].sort()).toEqual(["input (2).pdf", "input.pdf"]);

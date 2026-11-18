@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
+    "package": "node scripts/package.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "e2e": "node scripts/build.mjs && playwright test"

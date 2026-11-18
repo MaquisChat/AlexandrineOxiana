@@ -1,5 +1,6 @@
-export { Repo, openRepo, projectWarnings, BACKUP_FAILED_WARNING } from "./repo.js";
-export { GOVERNANCE_MAX_BYTES, GovernanceConflictError, GovernanceLooseningError, UNREADABLE_GOVERNANCE } from "./governance-edit.js";
+export { Repo, openRepo, projectWarnings, setProjectTimeZone, BACKUP_FAILED_WARNING, BACKUP_AUDIT_PENDING_WARNING, DESTRUCTION_BACKUPS_PENDING_WARNING, DESTRUCTION_OLD_COPIES_PENDING_WARNING } from "./repo.js";
+export { RECOVERY_CODE_UNSHOWN_WARNING } from "./projects.js";
+export { GOVERNANCE_MAX_BYTES, GovernanceConflictError, GovernanceLooseningError, GOVERNANCE_UNOPENABLE_SAVE, type GovernanceFileState, type GovernanceRepair } from "./governance-edit.js";
 export type { GovernanceEditResult } from "./governance-edit.js";
 export type { AuditCheck, RepoOptions } from "./repo.js";
 export type { IndexSink, Manifest, ManifestEntry, ProjectJson } from "./state.js";
@@ -11,14 +12,17 @@ export type { CreateProjectInput, ProjectKeyFile } from "./projects.js";
 export type { CreateSourceOptions, SourceInputFile, SourcePatch } from "./sources.js";
 export type { DerivedAssetInput, OriginalAssetInput } from "./assets.js";
 export type { AcknowledgementKind } from "./acknowledge.js";
-export type { ReviewEntry, ReviewInput, ReviewItemRow } from "./review.js";
+export type { ReviewCause, ReviewEntry, ReviewInput, ReviewItemRow } from "./review.js";
+export { reviewCauseOf } from "./review.js";
 export { REVIEW_FILE } from "./review.js";
 export type { ConsentInput, ConsentPatch, ParticipantInput, ParticipantPatch, SessionInput, SessionPatch } from "./fieldwork.js";
 export {
   GovernanceViolationError,
   InvalidInputError,
+  KeyFileChangedError,
   DestroyedParentError,
   FieldworkInUseError,
+  ReviewEntryDecidedError,
   MissingParentError,
   ProxyRecordRefusedError,
   ImmutableProvenanceError,
@@ -28,7 +32,9 @@ export {
   ReadOnlyLibraryError,
   PathEscapeError,
   PendingWriteChoiceError,
+  PendingWriteIncompleteError,
   RecoveryPendingError,
   TornFileError,
 } from "./errors.js";
 export type { PendingWrite, PendingWriteChoice } from "./pending-writes.js";
+export type { AttentionMark } from "./attention.js";

@@ -1,4 +1,5 @@
 /** Repository state: the open library, its projects, and helpers every repo module uses. */
+import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -8,6 +9,8 @@ import {
   Project,
   Session,
   Tag,
+  dateRuleZone,
+  type DateRule,
   type SourceFile,
   type AuditEvent,
 } from "@ao/core";
@@ -24,6 +27,12 @@ export interface IndexSink {
   indexSource(sf: SourceFile, extractedText?: string): void | Promise<void>;
   removeSource(id: string): void | Promise<void>;
   indexProject(p: Project): void | Promise<void>;
+  /**
+   * A locked encrypted project that is new to the index (a copy restored with a key that was not
+   * kept): the project and, from its manifest alone, its sources (R30: type and year, no titles, no
+   * text). Optional; absent means `indexProject` is called instead.
+   */
+  indexLockedProject?(p: Project, sources: ManifestEntry[]): void | Promise<void>;
   /**
    * Called synchronously when an encrypted project is locked: drop everything held for it beyond
    * manifest-level fields (R30). Optional; absent means nothing to drop.
@@ -112,7 +121,25 @@ export interface ProjectState {
    * audit or change-log line could not be trimmed, or an audit append failed while opening.
    */
   recoveryPending?: boolean;
+  /** The project's audit log did not verify when opened: marks cannot be recorded in it (Task 50). */
+  auditUnverified?: boolean;
 }
+
+/** One turn of a repo's write queue. */
+interface Turn {
+  readonly core: RepoCore;
+}
+/**
+ * The write-queue turn the current code runs in, if any. A timer or callback started inside a turn carries the
+ * turn's context with it, even after the turn has ended.
+ */
+const inTurn = new AsyncLocalStorage<Turn>();
+
+/**
+ * Run when a project is locked, in the lock's own turn (and when the lock is asked): each module that keeps a
+ * project's decrypted content in memory drops it there (R386 a: the watched-folders register, the Find queue).
+ */
+export const lockPurges: Array<(core: RepoCore, st: ProjectState) => void> = [];
 
 export class RepoCore {
   readonly projects = new Map<string, ProjectState>();
@@ -127,7 +154,24 @@ export class RepoCore {
   readonly device: string;
   readonly scryptN: number | undefined;
   readonly auditSegmentSize: number | undefined;
-  private queue: Promise<unknown> = Promise.resolve();
+  /** The library's own audit log (Task 50, R154 a), loaded at open; its latest event. */
+  libraryAudit?: AuditStore;
+  libraryAuditLast?: AuditEvent | null;
+  /** The library log's entries of its latest day, for dropping a repeated refusal (N6). */
+  libraryAuditRecent?: AuditEvent[];
+  /** The write queue: turns waiting, those asked to go next (`serialNext`) ahead of the rest. */
+  private readonly waiting: Array<() => void> = [];
+  private readonly urgent: Array<() => void> = [];
+  /** A turn is running or about to start. */
+  private writing = false;
+  /** The turn running now, if any. */
+  private running: Turn | undefined;
+  /** Locks asked and not yet done (the key is wiped when the turn in progress ends), by project id (R386 b). */
+  readonly pendingLocks = new Map<string, Promise<void>>();
+  /** Unlocks in progress, per project: a lock asked meanwhile is a new lock after them (R404 c). */
+  readonly pendingUnlocks = new Map<string, Promise<void>>();
+  /** Locks asked so far, per project: an unlock that sees this change while it runs was overtaken by a lock (R435 a). */
+  readonly lockAsks = new Map<string, number>();
 
   constructor(
     readonly library: Library,
@@ -149,6 +193,14 @@ export class RepoCore {
     return this.library.root;
   }
 
+  /**
+   * The zone a project's date rule is read in (R160 as amended, `dateRuleZone`): its time zone
+   * when set, else the computer's zone (`tz`) for protocol and other dates, UTC for retention.
+   */
+  zoneOf(project: { timeZone?: string | undefined }, rule: DateRule = "protocol"): string {
+    return dateRuleZone(project, rule, this.tz);
+  }
+
   abs(rel: string): string {
     return absPath(this.root, rel);
   }
@@ -162,9 +214,68 @@ export class RepoCore {
 
   /** Runs write operations one at a time, so audit sequence numbers and files never interleave. */
   serial<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(fn, fn);
-    this.queue = run.catch(() => {});
-    return run;
+    return this.enqueue(fn, false);
+  }
+
+  /**
+   * Runs `fn` as the next turn of the write queue: after the turn in progress, ahead of the turns already waiting.
+   * Locking a project (and unlocking an unlocked one) goes here (R379): it never lands inside a change being saved,
+   * and it waits only for that change, not for the queue behind it (each change of a long import is one turn).
+   */
+  serialNext<T>(fn: () => Promise<T>): Promise<T> {
+    return this.enqueue(fn, true);
+  }
+
+  /** No turn is running or about to start. */
+  queueIdle(): boolean {
+    return !this.writing;
+  }
+
+  /**
+   * A test that admits only the turn running now (none, when none is running) and the code that runs in its
+   * context: what still gets a project's key between a lock being asked and the key being wiped (R386 b).
+   * A later turn, and any code outside the write queue, is not admitted. A timer or callback started inside the
+   * running turn is (it carries that turn's context), until the key is wiped when the turn ends.
+   */
+  admitsOnlyRunningTurn(): () => boolean {
+    const turn = this.running;
+    return () => turn !== undefined && inTurn.getStore() === turn;
+  }
+
+  private enqueue<T>(fn: () => Promise<T>, next: boolean): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      // Bound to the caller's async context, as a promise reaction would be.
+      const start = AsyncResource.bind(() => {
+        const turn: Turn = { core: this };
+        this.running = turn;
+        let run: Promise<T>;
+        try {
+          run = Promise.resolve(inTurn.run(turn, fn));
+        } catch (err) {
+          run = Promise.reject(err);
+        }
+        run.then(resolve, reject).finally(() => {
+          if (this.running === turn) this.running = undefined;
+          this.startNext();
+        });
+      });
+      (next ? this.urgent : this.waiting).push(start);
+      if (!this.writing) {
+        this.writing = true;
+        queueMicrotask(() => this.startNext());
+      }
+    });
+  }
+
+  private startNext(): void {
+    const start = this.urgent.shift() ?? this.waiting.shift();
+    this.writing = start !== undefined;
+    start?.();
+  }
+
+  /** True while running in a turn of this repo's write queue (`serial`): no other write is in progress. */
+  holdsTurn(): boolean {
+    return inTurn.getStore()?.core === this;
   }
 
   state(projectId: string): ProjectState {

@@ -14,19 +14,24 @@ import {
   deleteOldCopy,
   executeMove,
   findLibrary,
+  freeRoomFor,
   listLibraries,
+  settleDamagedRegistry,
+  suggestedLibraryFolder,
   planMove,
-  rebuildIndex,
   reconnect,
   relinkMissing,
   scrubPaths,
   type IntegritySample,
   type Library,
 } from "@ao/library";
+import type { LibraryFolderRoomRequest, LibraryFolderRoomResponse, LibrarySuggestedFolderResponse } from "@ao/shared";
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
+import { cheapLocationEnv } from "./watched-folders.js";
 import { ndjsonWriter, sseWriter } from "../streams.js";
-import { bodyOf, queryOf, str, strArray, type Ctx } from "./util.js";
+import { bodyAs, bodyOf, optStr, queryOf, str, strArray, type Ctx } from "./util.js";
+import { isLocalAbsolutePath } from "./local-path.js";
 
 function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
   const s = ctx.state.session;
@@ -38,6 +43,8 @@ function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
     ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
     // Only the holding device's name (R118): never its id, process or a user name.
     ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
+    // Being rebuilt, failed, or not writable (read-only): absent when the index is ready (D8).
+    ...(s.indexStatus ? { index: s.indexStatus } : {}),
   };
 }
 
@@ -57,19 +64,40 @@ function ndjson(reply: FastifyReply): (value: unknown) => Promise<void> {
 
 const ndjsonError = (ctx: Ctx, err: unknown) => errorBody(toApiError(err), ctx.state.roots);
 
-const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 function absPath(o: Record<string, unknown>, key: string): string {
   const p = str(o, key, 4096);
-  if (!isAbsolute(p) || p.includes("\0")) throw badRequest(`"${key}" must be an absolute path.`);
+  if (!isLocalAbsolutePath(p)) throw badRequest(`"${key}" must be an absolute path.`);
   return p;
 }
+
+/** A rebuild the researcher asked for, stopped because the library was closed or moved meanwhile (M4). */
+const stoppedByClose = () =>
+  new ApiError(409, "CONFLICT", "The rebuild stopped because the library was closed or moved. Open the library and choose \"Rebuild library from folder\" again if it is still needed.");
 
 export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
   app.get("/libraries", async () => {
+    // At start the last open library is being reopened (D5): the first answers wait once for that
+    // attempt, at most 30 s (a network drive that does not answer); later ones answer at once and,
+    // while it still runs, name it as `reopening` (I1).
+    await state.waitForStartup();
+    // A damaged list is set aside now, with its notice, so the chooser does not just look empty (R181 a).
+    await settleDamagedRegistry(state.deps).catch((err: unknown) => state.opts.log.warn({ err: err instanceof Error ? err.name : "error" }, "the list of libraries could not be set aside"));
     const known = await listLibraries(state.deps).catch(() => []);
-    return { libraries: known.map((e) => ({ libraryId: e.libraryId, name: e.name, lastKnownPaths: e.lastKnownPaths })), ...(state.session ? { current: libraryView(ctx) } : {}) };
+    // This computer's own notices, for the chooser too (Task 68 fix round 1, M1).
+    await state.refreshNotices();
+    return {
+      libraries: known.map((e) => ({ libraryId: e.libraryId, name: e.name, lastKnownPaths: e.lastKnownPaths })),
+      notices: state.notices,
+      ...(state.session
+        ? { current: libraryView(ctx) }
+        : state.reopening
+          ? { reopening: state.reopening }
+          : state.notFound
+            ? { notFound: state.notFound }
+            : {}),
+    };
   });
 
   app.post("/libraries", async (req) => {
@@ -80,8 +108,22 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     await state.closeLibrary();
     if (state.shuttingDown) throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
     const lib = await createLibrary(path, name, state.deps);
-    await state.adopt(lib);
+    await state.adopt(lib, { newLibrary: true });
     return libraryView(ctx);
+  });
+
+  // R447: for "Choose a library", shown before any library is open. The folder to offer for a new library (nothing is
+  // created; only whether the few candidate folders in the home folder exist and are empty is read), and the free room on
+  // the disk under a folder the researcher has typed or picked (the path in the body; only the room is read).
+  app.get("/libraries/suggested-folder", async (): Promise<LibrarySuggestedFolderResponse> => {
+    const folder = await suggestedLibraryFolder(cheapLocationEnv()).catch(() => undefined);
+    return folder ? { folder } : {};
+  });
+
+  app.post("/libraries/folder-room", async (req): Promise<LibraryFolderRoomResponse> => {
+    const path = absPath(bodyAs<LibraryFolderRoomRequest>(req), "path");
+    const freeBytes = await freeRoomFor(path);
+    return freeBytes === undefined ? {} : { freeBytes };
   });
 
   app.post("/libraries/open", async (req) => {
@@ -95,6 +137,8 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
 
   app.post("/libraries/close", async () => {
     await state.closeLibrary();
+    // Closed by the researcher: the next start shows the chooser (D5).
+    await state.forgetOpenLibrary();
     return { closed: true };
   });
 
@@ -102,7 +146,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   app.post("/libraries/locate", async (req: FastifyRequest, reply: FastifyReply) => {
     const b = bodyOf(req);
     const libraryId = str(b, "libraryId", 64);
-    const given = b.roots === undefined ? undefined : strArray(b, "roots", { max: 50 }).map((r) => (isAbsolute(r) ? r : (() => { throw badRequest('"roots" must be absolute paths.'); })()));
+    const given = b.roots === undefined ? undefined : strArray(b, "roots", { max: 50 }).map((r) => (isLocalAbsolutePath(r) ? r : (() => { throw badRequest('"roots" must be absolute paths.'); })()));
     let roots = given;
     if (!roots) {
       const known = (await listLibraries(state.deps).catch(() => [])).find((e) => e.libraryId === libraryId);
@@ -156,13 +200,80 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   // the new copy. Nothing writes to the library meanwhile (R99 I5): imports are paused (the move is
   // refused if one cannot be), watches, queues and the backup scheduler stopped; afterwards they
   // start on the library now open, and the paused imports resume there.
-  app.post("/libraries/move", async (req: FastifyRequest, reply: FastifyReply) => {
+  //
+  // A move is marked as ASKED FOR at the earliest point of its request (R399 b): this route's own
+  // onRequest hook, which runs right after the global one (host, origin and token checks: nothing
+  // that has not passed them may change what move/status says) and before the body is read or
+  // anything waits. Fastify has no earlier per-route point. The mark ends when the handler ends
+  // (the move ran or was refused); a request refused before its handler (its body unreadable, the
+  // global 409) ends it when its answer is sent or the connection closes.
+  const asked = new Map<FastifyRequest, { handling: boolean }>();
+  const endAsked = (req: FastifyRequest) => {
+    if (asked.delete(req)) state.movesAsked--;
+  };
+  /** The destination and the screen's attempt id of a move request, when its body carries both. */
+  const askedFor = (req: FastifyRequest): { dest: string; attempt: string } | undefined => {
+    const b = req.body as Record<string, unknown> | null | undefined;
+    if (!b || typeof b !== "object" || typeof b.dest !== "string" || typeof b.attempt !== "string") return undefined;
+    if (!b.attempt || b.attempt.length > 64) return undefined;
+    return { dest: b.dest, attempt: b.attempt };
+  };
+  /** A move refused after it was marked keeps its reason under its attempt, as executeMove's failures are (R399 c). */
+  const recordRefusal = (req: FastifyRequest, error: { code: string; message: string; reason?: string }) => {
+    const a = askedFor(req);
+    if (a) state.recordMoveFailure({ newRoot: a.dest, attempt: a.attempt, error });
+  };
+  app.post(
+    "/libraries/move",
+    {
+      onRequest: async (req: FastifyRequest, reply: FastifyReply) => {
+        const mark = { handling: false };
+        asked.set(req, mark);
+        state.movesAsked++;
+        reply.raw.once("close", () => {
+          if (!mark.handling) endAsked(req);
+        });
+      },
+      // A refusal answered before the handler ran (the global 409 while another move runs, a body
+      // that could not be read): recorded before its answer goes out, so the mark never ends first.
+      onSend: async (req: FastifyRequest, reply: FastifyReply, payload: unknown) => {
+        if (asked.get(req)?.handling === false && reply.statusCode >= 400 && typeof payload === "string") {
+          try {
+            const body = JSON.parse(payload) as { error?: { code: string; message: string; reason?: string } };
+            if (body.error) recordRefusal(req, body.error);
+          } catch {
+            // not an error body: nothing to keep
+          }
+        }
+        return payload;
+      },
+    },
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const mark = asked.get(req);
+      if (mark) mark.handling = true;
+      let finished = false;
+      try {
+        await runMove(req, reply, () => (finished = true));
+      } catch (err) {
+        // Refused or failed before the move finished: its reason is kept before the mark ends.
+        if (!finished) recordRefusal(req, errorBody(toApiError(err), state.roots).error);
+        throw err;
+      } finally {
+        endAsked(req);
+      }
+    },
+  );
+  const runMove = async (req: FastifyRequest, reply: FastifyReply, onFinished: () => void) => {
     if (state.moving) throw new ApiError(409, "CONFLICT", "A move of this library is already running.");
     const s = state.requireWritable();
     const b = bodyOf(req);
     const dest = absPath(b, "dest");
     const excludeProjectIds = strArray(b, "excludeProjectIds", { optional: true, max: 10_000, itemMax: 64 });
+    // The screen's own id for this request: a failure is kept under it, so that a screen that lost
+    // its connection can tell its own move's failure from an earlier one (R379).
+    const attempt = optStr(b, "attempt", 64) ?? null;
     // From here every change is refused (503 MOVE_IN_PROGRESS) and background work waits (R102 N2).
+    // An earlier failure is kept until this move has its own outcome (R399 c).
     state.moving = true;
     try {
       // Changes already being made finish first (this request is one of the in-flight ones, R106 I1).
@@ -195,12 +306,17 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
           state.resumeBatches(paused);
           state.restartStoppedWork();
         }
-        await write(ndjsonError(ctx, err));
+        const body = ndjsonError(ctx, err);
+        state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
+        await write(body);
         reply.raw.end();
         return;
       }
       const r = moved;
-      const pending = state.recordMove({ oldRoot, newRoot: r.newRoot, confirmToken: r.confirmToken });
+      const warnings = r.warnings.map((w) => scrubPaths(w, state.roots));
+      const pending = state.recordMove({ oldRoot, newRoot: r.newRoot, confirmToken: r.confirmToken, warnings });
+      state.forgetMoveFailure();
+      onFinished();
       // The library now lives at the destination (the move closed the old copy): open it there, retrying once.
       // If it still cannot be opened, what was paused resumes once it is (R106).
       state.resumeWhenOpened(r.newRoot, paused, oldRoot);
@@ -227,25 +343,34 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       await state.adopt(lib);
       await write({
         done: true,
-        result: { newRoot: r.newRoot, confirmToken: r.confirmToken, expiresAt: pending.expiresAt, fileCount: r.fileCount, totalBytes: r.totalBytes, filesCopied: r.filesCopied, projectsMovedAway: r.projectsMovedAway, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) },
+        result: { newRoot: r.newRoot, confirmToken: r.confirmToken, expiresAt: pending.expiresAt, fileCount: r.fileCount, totalBytes: r.totalBytes, filesCopied: r.filesCopied, projectsMovedAway: r.projectsMovedAway, warnings },
       });
       reply.raw.end();
     } finally {
       state.moving = false;
     }
-  });
+  };
 
-  // The last move's token (single use, 15 minutes), e.g. after the move's stream was cut off.
+  // What is true of the moves, for a screen whose connection to its move was lost (R379): whether
+  // one is running now (or was asked for and has not yet ended or been refused, R399 b); the last finished move's token (single use, 15 minutes); the last move that
+  // stopped with an error (15 minutes, or until the next move starts).
   app.get("/libraries/move/status", async () => {
     const m = state.pendingMove();
-    return { pending: m ?? null };
+    const f = state.failedMove();
+    return { pending: m ?? null, running: state.moving || state.movesAsked > 0, failed: f ? { newRoot: f.newRoot, attempt: f.attempt, error: f.error } : null };
   });
 
   app.post("/libraries/move/delete-old", async (req) => {
     const token = str(bodyOf(req), "token", 256);
     const m = state.pendingMove();
     if (!m || m.confirmToken !== token) throw new ApiError(400, "VALIDATION", "That confirmation is not valid (it is single use and expires after 15 minutes).");
-    const r = await deleteOldCopy(m.oldRoot, token, { deps: state.deps, ...(state.session ? { destRepo: state.session.repo } : {}), tz: state.tz });
+    let r: Awaited<ReturnType<typeof deleteOldCopy>>;
+    try {
+      r = await deleteOldCopy(m.oldRoot, token, { deps: state.deps, ...(state.session ? { destRepo: state.session.repo } : {}), tz: state.tz });
+    } finally {
+      // A mark may have appeared (Task 50): the banner follows.
+      state.publishState();
+    }
     state.forgetMove();
     return { ...r, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) };
   });
@@ -295,9 +420,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     if (choice !== "roll-back" && choice !== "keep") throw badRequest('"choice" must be "roll-back" or "keep".');
     const r = await s.repo.resolvePendingWrite(txn, choice);
     // The index was built with the change half there (or, kept, without it): rebuild it in the background.
-    void state.startWork("index", async () => {
-      await rebuildIndex(s.index, s.ring, s.lib, (done, total) => state.events.publish("job.progress", { kind: "index", done, total }));
-    });
+    state.startIndexRebuild(s, true);
     state.publishState();
     return r;
   });
@@ -305,15 +428,29 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   app.post("/libraries/relink", async (req) => {
     const s = state.requireWritable();
     const searchDir = absPath(bodyOf(req), "searchDir");
-    const r = await relinkMissing(s.lib, searchDir, s.repo, { keyRing: s.ring });
-    return { ...r, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) };
+    try {
+      const r = await relinkMissing(s.lib, searchDir, s.repo, { keyRing: s.ring });
+      return { ...r, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) };
+    } finally {
+      // A mark may have appeared (Task 50): the banner follows.
+      state.publishState();
+    }
   });
 
+  // "Rebuild library from folder" (spec 4.3): the index made again from the files, whatever its state.
   app.post("/libraries/rebuild-index", async () => {
     const s = state.requireWritable();
-    const r = await rebuildIndex(s.index, s.ring, s.lib, (done, total) => state.events.publish("job.progress", { kind: "index", done, total }));
-    state.publishState();
-    return { indexed: r.indexed, lockedProjects: r.lockedProjects.length, errors: r.errors.length };
+    // One already running (e.g. the open's): wait for it, then rebuild as asked (M3).
+    for (let i = 0; s.indexRebuild && i < 3; i++) await s.indexRebuild.done;
+    if (state.session !== s) throw stoppedByClose();
+    try {
+      const r = await state.rebuildIndex(s, true);
+      return { indexed: r?.indexed ?? 0, lockedProjects: r?.lockedProjects.length ?? 0, errors: r?.errors.length ?? 0 };
+    } catch (err) {
+      // Stopped between sources because the library closed or moved (M4): said in plain words.
+      if (err instanceof Error && err.name === "AbortError") throw stoppedByClose();
+      throw err;
+    }
   });
 
   // Server-sent events; read with fetch streaming and the Authorization header (never a query token).

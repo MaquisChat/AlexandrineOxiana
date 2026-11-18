@@ -1,0 +1,20 @@
+/*
+ * pdf.js's guard for a selection let go in blank space (textLayerSelection.ts, Ruling R223), as
+ * pdfjs-dist's own viewer styles its `endOfContent`: an empty block at the layer's foot, under the
+ * text; while a selection is being made ("selecting") it covers the whole layer, so that blank space
+ * is this element rather than other text. It cannot itself be selected unless moved beside the
+ * selection's focus (the script then allows it). Nothing of it is drawn.
+ */
+.ao-reader-text-layer div.ao-reader-end-of-content {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  transform: none;
+  cursor: default;
+  user-select: none;
+}
+
+.ao-reader-text-layer.selecting div.ao-reader-end-of-content {
+  top: 0;
+}

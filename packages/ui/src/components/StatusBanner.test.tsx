@@ -1,6 +1,89 @@
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { StatusBanner, bannersFor, volumeOf, warningText } from "./StatusBanner";
+
+describe("device-level notices (Task 68)", () => {
+  it("the identity notice: what happened, what it changes (not the locks: review round 1, M2), the damaged file kept", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "device-identity-renewed" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toMatch(/This computer's identity for the app could not be read and had to be renewed/);
+    // R181 b: only what is true.
+    expect(t).toMatch(/Your libraries and what is in them are unchanged/);
+    expect(t).toMatch(/A library that was open when the app last stopped may show as read-only for up to 2 minutes; open it again after that/);
+    expect(t).toMatch(/recorded under this computer's new identity/);
+    expect(t).toMatch(/kept beside the app's settings/);
+  });
+
+  it("the old-copies notice: what happened, old copies may still be here, the damaged list is kept", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "old-copies-list-set-aside" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toMatch(/list of old library copies awaiting deletion was damaged and was set aside/);
+    expect(t).toMatch(/may still be on this computer/);
+    // Not an overstatement when only part of the list was damaged (review round 1, M6).
+    expect(t).toMatch(/Some old copies/);
+    expect(t).toMatch(/a move that had not finished may not be able to finish from here/);
+    expect(t).toMatch(/kept beside the app's settings/);
+  });
+
+  it("the watched-folders notice: what happened, what stopped, what to do, the damaged list is kept", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "watched-folders-list-set-aside" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toMatch(/list of watched folders was damaged and was set aside/);
+    // Partial damage is not overstated, and no screen that does not exist is named (R181 d; review Rm3).
+    expect(t).toMatch(/some watched folders on this computer may have stopped/);
+    expect(t).toMatch(/files put in those folders are not imported/);
+    expect(t).not.toMatch(/added again|import settings/);
+    expect(t).toMatch(/kept beside the app's settings/);
+  });
+
+  it("the Zotero sync settings notice (R242): what happened, that automatic sync is off, that the library is unchanged", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "zotero-sync-settings-set-aside" }} onDismiss={() => undefined} />);
+    expect(screen.getByRole("status").textContent).toContain(
+      "This computer's Zotero sync settings could not be read and were set aside. Automatic sync is off until you set it up again. Nothing in your library has changed.",
+    );
+    expect(bannersFor({ notices: [{ kind: "zotero-sync-settings-set-aside", at: "2026-11-13T10:15:30.000Z" }] })).toEqual([{ kind: "notice", notice: "zotero-sync-settings-set-aside" }]);
+  });
+
+  it("the Zotero sync settings from a newer version (R244 M7): says so, says what to do, nothing changed", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "zotero-sync-settings-newer" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toContain("These sync settings were written by a newer version of the app. Update the app to change them.");
+    expect(t).toMatch(/automatic sync with Zotero is off/);
+    expect(t).not.toMatch(/set aside|damaged/);
+  });
+
+  it("watched folders that could not be read at open: a plain warning for this session (review round 2, Rm4)", () => {
+    const t = warningText("watched-folders-unreadable", "library");
+    expect(t).toMatch(/list of watched folders could not be read when this library was opened/);
+    expect(t).toMatch(/files put in them are not imported/);
+    expect(t).toMatch(/Open the library again/);
+    expect(t).not.toMatch(/needs attention/);
+  });
+
+  it("“Got it” is a keyboard-operable button that names the notice it dismisses", async () => {
+    const onDismiss = vi.fn();
+    render(<StatusBanner variant={{ kind: "notice", notice: "old-copies-list-set-aside" }} onDismiss={onDismiss} />);
+    const b = screen.getByRole("button", { name: "Got it" });
+    b.focus();
+    await userEvent.setup().keyboard("{Enter}");
+    expect(onDismiss).toHaveBeenCalledWith("old-copies-list-set-aside");
+  });
+
+  it("bannersFor: one banner per known notice, after the others; none for an unknown kind or none at all", () => {
+    expect(bannersFor({ mode: "read-write", notices: [] })).toEqual([]);
+    expect(
+      bannersFor({
+        mode: "read-only",
+        readOnlyReason: "newer-format",
+        notices: [
+          { kind: "old-copies-list-set-aside", at: "2026-11-12T10:15:30.000Z" },
+          { kind: "unknown-kind" as never, at: "2026-11-12T10:15:30.000Z" },
+        ],
+      }),
+    ).toEqual([{ kind: "read-only-newer-format" }, { kind: "notice", notice: "old-copies-list-set-aside" }]);
+  });
+});
 
 describe("StatusBanner", () => {
   it("read-only, locked by another computer", () => {
@@ -34,7 +117,15 @@ describe("StatusBanner", () => {
     ["annotations-unreadable", /annotations in Dissertation could not be read/],
     ["destroy-incomplete", /destruction of raw data in Dissertation did not finish/],
     ["retention-due", /Dissertation has reached its retention date/],
+    ["recovery-code-unshown", /new recovery code for Dissertation was issued, but the app stopped before it could be shown.*New recovery code…/],
     ["anchor-missing", /audit log may have been changed outside the app/],
+    ["audit-unrecorded", /A change to Dissertation is not recorded in its audit log yet.*recorded the next time the library is opened with write access.*audit screen/],
+    ["audit-unrecorded-blocked", /A change to Dissertation is not recorded in its audit log, and it cannot be while that log does not verify or a problem reported for Dissertation is unresolved.*set it aside/],
+    ["attention-unreadable", /An unrecognised item is in the attention folder of Dissertation.*set it aside/],
+    ["audit-waiting", /kept on this computer.*another computer had the library open.*next opens the library with write access/],
+    ["permissions-not-set", /restored to Dissertation could not be made private to you.*tried again.*set it aside/],
+    ["audit-recorded-late", /recorded in the audit log of Dissertation now.*marked as recorded late/],
+    ["refusal-unrecorded", /refused request could not be recorded in the library's audit log. Nothing was changed/],
   ])("warning %s in plain language", (warning, text) => {
     render(<StatusBanner variant={{ kind: "warning", warning, project: "Dissertation" }} />);
     expect(screen.getByRole("status").textContent).toMatch(text);
@@ -63,7 +154,10 @@ describe("StatusBanner", () => {
       "chain-broken", "head-mismatch", "truncated", "empty", "anchor-missing", "anchors-unreadable", "rolled-back-incomplete-write",
       "invalid-txn-marker", "incomplete-write-pending", "txn-recovery-skipped-audit-unverifiable", "trimmed-incomplete-audit-line",
       "incomplete-audit-line-pending", "audit-append-failed-at-open", "deleted-records-unreadable", "annotations-unreadable",
-      "annotations-hash-mismatch", "destroy-incomplete", "backup-failed", "retention-due",
+      "annotations-hash-mismatch", "destroy-incomplete", "backup-failed", "retention-due", "protocol-manifest-unreadable",
+      "recovery-code-unshown", "recovery-staging-discarded", "recovery-staging-unverifiable",
+      "audit-unrecorded", "permissions-not-set", "audit-recorded-late", "refusal-unrecorded",
+      "audit-unrecorded-blocked", "attention-unreadable", "audit-waiting",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();
@@ -73,6 +167,78 @@ describe("StatusBanner", () => {
       seen.add(t);
     }
     expect(seen.size).toBe(kinds.length);
+  });
+
+});
+
+describe("R409 d: old copies of the library still holding destroyed data", () => {
+  const BY_HAND =
+    "Old copies of this library, left by a move, still hold data that was destroyed here. Delete the folder named below by hand to complete the destruction; the app will notice when it is gone.";
+  const IN_APP = "Old copies of this library, left by a move, still hold data that was destroyed here. Delete them on the Move library screen to complete the destruction.";
+  const NO_RECORD =
+    "An old copy of this library, left by the move of 2026-11-10, may still hold data that was destroyed here. This computer has no record of where it is: open the library on the computer that moved it.";
+  const UNCHECKED =
+    "This computer's list of old copies of this library left by a move could not be read, so whether such a copy still holds the destroyed data could not be checked. Any that does was not destroyed.";
+  const place = "/Volumes/Field <b>SSD</b>/Old library";
+  const banner = (oldCopies: Array<{ movedOn?: string; place?: string; canDelete: boolean }>, unchecked?: true) =>
+    bannersFor(
+      {
+        projectWarnings: { p1: ["destruction-old-copies-pending"] },
+        destructionOldCopiesPending: { p1: { message: "ignored: the sentence is chosen from the facts", destructions: [], oldCopies, ...(unchecked ? { unchecked } : {}) } },
+      },
+      { projectNames: { p1: "Dissertation" } },
+    )[0]!;
+
+  it("the app can no longer delete it: by hand, with the folder named below through UserText", () => {
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-10", place, canDelete: false }])} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toContain(BY_HAND);
+    const item = screen.getByRole("listitem");
+    expect(item.textContent).toBe(place);
+    expect(item.querySelector("b")).toBeNull(); // shown as text, never as markup
+    expect(item.querySelector("[dir=auto]")).not.toBeNull();
+  });
+
+  it("the app can still delete it: on the Move library screen, its place named", () => {
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-10", place, canDelete: true }])} />);
+    expect(screen.getByRole("status").textContent).toContain(IN_APP);
+    expect(screen.getByRole("listitem").textContent).toBe(place);
+  });
+
+  it("this computer has no record of where it is: the date of the move, no place", () => {
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-10", canDelete: false }])} />);
+    expect(screen.getByRole("status").textContent).toBe(NO_RECORD);
+    expect(screen.queryByRole("listitem")).toBeNull();
+  });
+
+  it("the list could not be checked: round 1's sentence", () => {
+    render(<StatusBanner variant={banner([], true)} />);
+    expect(screen.getByRole("status").textContent).toBe(UNCHECKED);
+  });
+
+  it("R429 f: one copy with no record beside one with a known place: both sentences, the known place listed", () => {
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-10", canDelete: false }, { movedOn: "2026-11-20", place, canDelete: false }])} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe(`${NO_RECORD} ${BY_HAND}${place}`);
+    expect(screen.getByRole("listitem").textContent).toBe(place);
+    expect(screen.getByRole("listitem").querySelector("b")).toBeNull();
+    // The known one can still be deleted in the app: that sentence beside the "no record" one.
+    cleanup();
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-10", canDelete: false }, { movedOn: "2026-11-20", place, canDelete: true }])} />);
+    expect(screen.getByRole("status").textContent).toBe(`${NO_RECORD} ${IN_APP}${place}`);
+  });
+
+  it("R429 f: a destruction that could not be checked: the known places stay listed under that sentence", () => {
+    render(<StatusBanner variant={banner([{ movedOn: "2026-11-20", place, canDelete: false }], true)} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe(`${UNCHECKED} ${BY_HAND}${place}`);
+    expect(screen.getByRole("list")).not.toBeNull();
+    expect(screen.getByRole("listitem").textContent).toBe(place);
+    expect(screen.getByRole("listitem").querySelector("[dir=auto]")).not.toBeNull();
+  });
+
+  it("without what stands behind it yet, the warning still has a sentence of its own", () => {
+    expect(warningText("destruction-old-copies-pending", "P")).toBe("Old copies of this library, left by a move, still hold data that was destroyed here.");
   });
 });
 

@@ -6,7 +6,10 @@
  *   sources.bib        BibTeX of the same (read back exactly by bibtexAdapter)
  *   notes.txt          what was left out and why (only when something was)
  *   Sources/<source folder name>/
- *     source.json      the source as stored (metadata, provenance, annotations …), decrypted
+ *     source.json      the source as stored (metadata, provenance, annotations …), decrypted; a file linked in
+ *                      place is recorded without where it is on the computer (R379, FR-A14): no `linked` paths,
+ *                      `linkedInPlace: true`, and `path` its place in this export (`files/<name>`), or its
+ *                      name alone when it is not in the export (see notes.txt)
  *     <name>.md        Markdown: metadata, annotations, notes — all user text escaped
  *     files/           the original files, decrypted
  *     files/derived/   derived text (transcripts, OCR, translations), decrypted, listed in the Markdown
@@ -47,7 +50,7 @@ import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.j
 import { shredPath } from "../fs/shred.js";
 import { LOCATED_MEDIA, mayHaveLocation } from "../import/resolve.js";
 import { stricterLocation, type LocationMode } from "../repo/assets.js";
-import { PolicyDeniedError } from "../repo/errors.js";
+import { PolicyDeniedError, isLockedRefusal } from "../repo/errors.js";
 import { foldName, namesIn } from "../repo/io.js";
 import {
   appendLibraryEvent,
@@ -62,7 +65,7 @@ import {
 } from "../repo/repo.js";
 import { activeTemp } from "../tmp-registry.js";
 import { WITHHELD_NOTE } from "./bibliography.js";
-import { buildExport } from "./refman-export.js";
+import { PARTICIPANT_CODE_MISSING_NOTE, PARTICIPANT_NO_LIST_NOTE, buildExport } from "./refman-export.js";
 
 /** The export destination is inside the library (or not a folder). */
 export class ExportDestinationError extends Error {
@@ -87,6 +90,23 @@ function isDerivedText(a: Asset): boolean {
   if (a.kind === "proxy" || a.kind === "thumbnail") return false;
   const m = a.mime.toLowerCase();
   return m.startsWith("text/") || /\.(?:txt|vtt|srt|md|json)(?:\.enc)?$/iu.test(a.path);
+}
+
+/**
+ * The source record as exported (R379, FR-A14): a file linked in place loses its `linked` paths (its absolute path, and
+ * a library-relative one that may climb out with ".."), is marked `linkedInPlace`, and its `path` becomes its place in
+ * this export, or its (exported) name alone when it is not in it. The library's own record is not changed.
+ */
+function exportedRecord(sf: SourceFile, exportedAs: ReadonlyMap<string, string>, nameOf: (n: string) => string): unknown {
+  if (!sf.assets.some((a) => a.linked)) return sf;
+  return {
+    ...sf,
+    assets: sf.assets.map((a) => {
+      if (!a.linked) return a;
+      const { linked: _linked, ...rest } = a;
+      return { ...rest, path: exportedAs.get(a.id) ?? nameOf(a.path.slice(a.path.lastIndexOf("/") + 1)), linkedInPlace: true };
+    }),
+  };
 }
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -185,16 +205,21 @@ function markdownOf(sf: SourceFile, files: string[], derived: Array<{ file: stri
       out.push("", `### ${KIND_LABEL[a.kind]}${escapeMarkdown(at)}`, "");
       if (a.quote) out.push(quote(a.quote), "");
       if (a.body) out.push(para(a.body), "");
-      out.push(`*${escapeMarkdown(a.author)}, ${escapeMarkdown(a.createdAt)}*`);
+      out.push(`*${byline(a)}*`);
     }
   }
   if (notes.length) {
     out.push("", "## Notes");
     for (const n of notes) {
-      out.push("", para(n.body ?? ""), "", `*${escapeMarkdown(n.author)}, ${escapeMarkdown(n.createdAt)}*`);
+      out.push("", para(n.body ?? ""), "", `*${byline(n)}*`);
     }
   }
   return `${out.join("\n")}\n`;
+}
+
+/** An annotation's author and time; an imported one its source gave no author for has none (D22): its time alone. */
+function byline(a: { author?: string; createdAt: string }): string {
+  return a.author ? `${escapeMarkdown(a.author)}, ${escapeMarkdown(a.createdAt)}` : escapeMarkdown(a.createdAt);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -237,14 +262,16 @@ const inside = (child: string, parent: string) => child === parent || child.star
 
 /**
  * Exports the project in open formats into a new folder in `dest` (outside the library). Errors
- * other than the plain refusals (destination, governance) become ExportFailedError, whose message
- * names no path (R94).
+ * other than the plain refusals (destination, governance) and "locked" become ExportFailedError, whose message
+ * names no path (R94). An export a lock cuts short is "locked" (R386 a), never a failure or a damaged file.
  */
 export async function exportProjectOpenFormats(repo: Repo, projectId: string, dest: string): Promise<ProjectExportResult> {
   try {
     return await exportInner(repo, projectId, dest);
   } catch (err) {
     if (err instanceof ExportDestinationError || err instanceof PolicyDeniedError || err instanceof ExportFailedError) throw err;
+    // Only a lock is "locked" (R435 d): a file sealed under another key id is damage, an ExportFailedError.
+    if (isLockedRefusal(err)) throw err;
     const code = (err as NodeJS.ErrnoException)?.code;
     throw new ExportFailedError(typeof code === "string" && /^[A-Z_]{2,32}$/u.test(code) ? code : undefined);
   }
@@ -371,9 +398,11 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
           ...(a.encrypted ? { decode: (r) => r.pipe(decryptStream(getKey)) } : {}),
         });
         if (!sub) written.push(fileName);
+        exportedAs.set(a.id, sub ? `files/${sub}/${fileName}` : `files/${fileName}`);
         filesWritten++;
         return fileName;
       };
+      const exportedAs = new Map<string, string>();
       const takenDerived = new Set<string>();
       const derivedOut: Array<{ file: string; kind: string; lang?: string }> = [];
       for (const a of sf.assets) {
@@ -421,7 +450,7 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
         const lang = typeof a.derivation?.params.lang === "string" ? a.derivation.params.lang : undefined;
         derivedOut.push({ file, kind: a.kind, ...(lang ? { lang } : {}) });
       }
-      await writeFileAtomic(join(dir, "source.json"), `${JSON.stringify(sf, null, 2)}\n`, { mode: 0o600 });
+      await writeFileAtomic(join(dir, "source.json"), `${JSON.stringify(exportedRecord(sf, exportedAs, nameOf), null, 2)}\n`, { mode: 0o600 });
       await writeFileAtomic(join(dir, `${name}.md`), markdownOf(sf, written, derivedOut), { mode: 0o600 });
     }
 
@@ -433,6 +462,20 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
     await writeFileAtomic(join(root, "sources.bib"), bib.text, { mode: 0o600 });
 
     if (withheld) notes.push(WITHHELD_NOTE(withheld));
+    // The reference files follow R88's participant rules (R379, FR-A14): a source failing closed is not in them.
+    const codeMissing = csl.excluded.filter((e) => e.reason === PARTICIPANT_CODE_MISSING_NOTE).length;
+    if (codeMissing) {
+      notes.push(
+        `${plural(codeMissing, "source is", "sources are")} not in sources.bib and sources.csl.json because a participant in ${codeMissing === 1 ? "it has" : "them has"} no participant code yet.`,
+      );
+    }
+    // No list of participants' names (an unencrypted project): the true reason and what can be done (R390 d).
+    const noList = csl.excluded.filter((e) => e.reason === PARTICIPANT_NO_LIST_NOTE).length;
+    if (noList) {
+      notes.push(
+        `${plural(noList, "source is", "sources are")} not in sources.bib and sources.csl.json because ${noList === 1 ? "it involves" : "they involve"} a participant and this project keeps no list of participants' names (it is not encrypted), so the app cannot tell which names to replace. Cite them by hand, or keep such sources in an encrypted project.`,
+      );
+    }
     if (omittedLocated) {
       notes.push(
         `${plural(omittedLocated, "file with a location was", "files with a location were")} left out: this project hides locations and no viewing copy without the location exists yet.`,

@@ -1,0 +1,105 @@
+{
+ "meta": {
+  "count": 2,
+  "db_response_time_ms": 0,
+  "page": 1,
+  "per_page": 20,
+  "groups_count": null
+ },
+ "results": [
+  {
+   "id": "https://openalex.org/A5055013655",
+   "orcid": "https://orcid.org/0000-0003-2435-9619",
+   "display_name": "David Stark",
+   "display_name_alternatives": [
+    "D. Stark",
+    "DAVID STARK",
+    "David C. Stark",
+    "David Stark",
+    "Stark D.",
+    "Stark, David",
+    "Stark, David C.",
+    "Давид Старк",
+    "Дэвид Старк"
+   ],
+   "works_count": 160,
+   "cited_by_count": 8650,
+   "last_known_institutions": [],
+   "topics": [
+    {
+     "id": "https://openalex.org/T14433",
+     "display_name": "Post-Communist Economic and Political Transition",
+     "count": 36
+    },
+    {
+     "id": "https://openalex.org/T14005",
+     "display_name": "Eastern European Communism and Reforms",
+     "count": 28
+    },
+    {
+     "id": "https://openalex.org/T10344",
+     "display_name": "Management and Organizational Studies",
+     "count": 22
+    },
+    {
+     "id": "https://openalex.org/T12231",
+     "display_name": "Contemporary Sociological Theory and Practice",
+     "count": 22
+    },
+    {
+     "id": "https://openalex.org/T13186",
+     "display_name": "Russia and Soviet political economy",
+     "count": 18
+    }
+   ]
+  },
+  {
+   "id": "https://openalex.org/A5108208998",
+   "orcid": null,
+   "display_name": "David Stark",
+   "display_name_alternatives": [
+    "DAVID STARK",
+    "David M. Stark",
+    "David Stark"
+   ],
+   "works_count": 46,
+   "cited_by_count": 877,
+   "last_known_institutions": [
+    {
+     "id": "https://openalex.org/I4210162304",
+     "ror": "https://ror.org/05w72d176",
+     "display_name": "The People of the United Methodist Church",
+     "country_code": "US",
+     "type": "other"
+    }
+   ],
+   "topics": [
+    {
+     "id": "https://openalex.org/T12144",
+     "display_name": "Colonialism, slavery, and trade",
+     "count": 22
+    },
+    {
+     "id": "https://openalex.org/T12512",
+     "display_name": "History of Colonial Brazil",
+     "count": 15
+    },
+    {
+     "id": "https://openalex.org/T12283",
+     "display_name": "Latin American history and culture",
+     "count": 11
+    },
+    {
+     "id": "https://openalex.org/T12375",
+     "display_name": "Cuban History and Society",
+     "count": 11
+    },
+    {
+     "id": "https://openalex.org/T13460",
+     "display_name": "Historical Studies in Latin America",
+     "count": 9
+    }
+   ]
+  }
+ ]
+}

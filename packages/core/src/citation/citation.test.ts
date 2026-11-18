@@ -468,6 +468,87 @@ describe("review round 1 (R88 I1, I2): participant names are matched however the
   });
 });
 
+describe("the participant-name rule shared with folder names (R378 a, FR-A10)", () => {
+  const interview = (title: string, creators: Creator[], extra: Partial<SourceFile["source"]> = {}) =>
+    source("interview", mt(["und", "original", title]), creators, { participantIds: [PARTICIPANT.id], ...extra });
+
+  it("C1: a creator's name written without spaces is replaced in the title too (王小明访谈录, 山田太郎さんへのインタビュー)", () => {
+    const item = toCslItem(interview("王小明访谈录", [{ role: "interviewee", literal: "王小明" }]), { ...OPTS, pseudonyms: new Map([["王小明", "P-001"]]) });
+    expect(item.author).toEqual([{ literal: "P-001" }]);
+    expect(item.title).toBe("P-001访谈录");
+    const yamada = toCslItem(interview("山田太郎さんへのインタビュー", [{ role: "interviewee", family: "山田", given: "太郎" }]), { ...OPTS, pseudonyms: new Map([["山田太郎", "P-005"]]) });
+    expect(yamada.author).toEqual([{ literal: "P-005" }]);
+    expect(yamada.title).toBe("P-005さんへのインタビュー");
+  });
+
+  it("C1: a map entry written without spaces is replaced in the title of a source by someone else", () => {
+    const sf = source("article-journal", mt(["zh", "original", "关于王小明的报道"]), [{ role: "author", given: "Wei", family: "Chen" }]);
+    expect(toCslItem(sf, { ...OPTS, pseudonyms: new Map([["王小明", "P-001"]]) }).title).toBe("关于P-001的报道");
+  });
+
+  it("C1: a one-character name of such a script is replaced only as a whole run", () => {
+    const sf = (t: string) => source("article-journal", mt(["zh", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]);
+    const map = new Map([["明", "P-007"]]);
+    expect(toCslItem(sf("王小明访谈录"), { ...OPTS, pseudonyms: map }).title).toBe("王小明访谈录");
+    expect(toCslItem(sf("Interview 明"), { ...OPTS, pseudonyms: map }).title).toBe("Interview P-007");
+  });
+
+  it("I1: the folding is the one folder names use (accents, width, '_' as a separator)", () => {
+    const map = new Map([["Lucía", "P-002"], ["Fernández", "P-002"], ["Lucía Fernández", "P-002"], ["lucia.cocina", "P-002"]]);
+    const t = (title: string) => toCslItem(source("article-journal", mt(["es", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: map }).title;
+    expect(t("Entrevista a Lucia Fernandez")).toBe("Entrevista a P-002");
+    expect(t("ＬＵＣÍＡ talks")).toBe("P-002 talks");
+    expect(t("lucia_cocina video")).toBe("P-002 video");
+  });
+
+  it("negative cases: a Latin name is not matched inside a longer word", () => {
+    const t = (title: string, key: string) =>
+      toCslItem(source("article-journal", mt(["en", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: new Map([[key, "P-010"]]) }).title;
+    expect(t("Annual report", "Ann")).toBe("Annual report");
+    expect(t("Marianne at home", "Maria")).toBe("Marianne at home");
+    expect(t("Ann's annual report", "Ann")).toBe("P-010's annual report");
+  });
+});
+
+describe("I2 (R378 a, FR-A10): a participant who is not a creator, in any word order and in any address form", () => {
+  const MAP = new Map([["Maria Lopez", "P-003"]]);
+  const story = (title: string, url?: string) =>
+    source("article-journal", mt(["en", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }], url ? { identifiers: { url } } : {});
+
+  it("the title: reversed, 'Family, Given' and upper case with accents are replaced", () => {
+    expect(toCslItem(story("Lopez, Maria: her life; and LÓPEZ MARIA"), { ...OPTS, pseudonyms: MAP }).title).toBe("P-003: her life; and P-003");
+    expect(toCslItem(story("lopezmaria and Maria  Lopez"), { ...OPTS, pseudonyms: MAP }).title).toBe("P-003 and P-003");
+    const three = new Map([["Lucía Fernández Ruiz", "P-014"]]);
+    expect(toCslItem(story("Fernández Ruiz, Lucía; Ruiz Fernández Lucía"), { ...OPTS, pseudonyms: three }).title).toBe("P-014; P-014");
+  });
+
+  it("the address: %20, '+', reversed and any separator drop the URL", () => {
+    for (const url of [
+      "https://news.example/Maria%20Lopez/story",
+      "https://news.example/search?q=maria+lopez",
+      "https://news.example/lopez-maria",
+      "https://news.example/lopez_maria",
+      "https://news.example/lopezmaria2024",
+      "https://news.example/Mar%C3%ADa%2BL%C3%B3pez",
+      "https://news.example/Maria%2520Lopez",
+    ]) {
+      expect(toCslItem(story("A story", url), { ...OPTS, pseudonyms: MAP }).URL, url).toBeUndefined();
+    }
+    expect(toCslItem(story("A story", "https://news.example/marianne-lopezia"), { ...OPTS, pseudonyms: MAP }).URL).toBe("https://news.example/marianne-lopezia");
+  });
+
+  it("a malformed escape in the address does not throw, and the name around it is still found", () => {
+    expect(() => toCslItem(story("A story", "https://news.example/%E0%A4%A/x"), { ...OPTS, pseudonyms: MAP })).not.toThrow();
+    expect(toCslItem(story("A story", "https://news.example/%E0%A4%A/x"), { ...OPTS, pseudonyms: MAP }).URL).toBe("https://news.example/%E0%A4%A/x");
+    expect(toCslItem(story("A story", "https://news.example/%ZZ/Maria%20Lopez/%E0%A4"), { ...OPTS, pseudonyms: MAP }).URL).toBeUndefined();
+  });
+
+  it("an address with a no-space-script name joined to other characters is dropped", () => {
+    const item = toCslItem(story("A story", "https://news.example/%E7%8E%8B%E5%B0%8F%E6%98%8E%E8%AE%BF%E8%B0%88"), { ...OPTS, pseudonyms: new Map([["王小明", "P-001"]]) });
+    expect(item.URL).toBeUndefined();
+  });
+});
+
 describe("locatorFromAnchor", () => {
   const base = { id: newId(), assetId: newId() };
   const tr = (startMs: number, endMs: number): Anchor => ({ kind: "time-range", ...base, startMs, endMs });
@@ -668,5 +749,464 @@ describe.skipIf(!HAVE_BUNDLE)("rendering with the bundled styles", () => {
     parts.push(renderBibliography(Object.values(items), style, "text").trim());
     parts.push("");
     await expect(parts.join("\n")).toMatchFileSnapshot(`./__snapshots__/${style}.txt`);
+  });
+});
+
+describe("R380: a Korean name with a particle or honorific joined to it", () => {
+  const t = (title: string, key = "김민수") =>
+    toCslItem(source("article-journal", mt(["ko", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: new Map([[key, "P-001"]]) }).title;
+
+  it("is replaced at the start of a run of Hangul; the particle stays", () => {
+    expect(t("김민수의 인터뷰")).toBe("P-001의 인터뷰");
+    expect(t("김민수씨와의 대화")).toBe("P-001씨와의 대화");
+  });
+
+  it("is not replaced in the middle or at the end of a longer run; one syllable only alone; Latin unchanged", () => {
+    expect(t("박김민수 인터뷰")).toBe("박김민수 인터뷰");
+    expect(t("민수의 인터뷰", "민")).toBe("민수의 인터뷰");
+    expect(t("Marianne", "Maria")).toBe("Marianne");
+  });
+
+  it("in a creator's own title, and in an address that holds Hangul", () => {
+    const sf = source("interview", mt(["ko", "original", "김민수씨와의 대화"]), [{ role: "interviewee", literal: "김민수" }], {
+      participantIds: [PARTICIPANT.id],
+      identifiers: { url: "https://news.example/%EA%B9%80%EB%AF%BC%EC%88%98%EC%9D%98-%EC%9D%B4%EC%95%BC%EA%B8%B0" },
+    });
+    const item = toCslItem(sf, { ...OPTS, pseudonyms: new Map([["김민수", "P-001"]]) });
+    expect(item.title).toBe("P-001씨와의 대화");
+    expect(item.URL).toBeUndefined();
+  });
+});
+
+describe("toCslItem: linear in the title (FR-A10)", () => {
+  it("a 100,000-character title with a map of 500 names is scrubbed in well under a second", () => {
+    const map = new Map<string, string>();
+    for (let i = 0; i < 500; i++) map.set(i % 5 === 0 ? `王${String.fromCodePoint(0x4e00 + i)}明` : `Given${i} Family${i}`, `P-${String(i).padStart(3, "0")}`);
+    const chunk = "Lopez maria and Given7 the 王小明访谈录 FAMILY12, given12 annual ";
+    const title = chunk.repeat(Math.ceil(100_000 / chunk.length)).slice(0, 100_000);
+    const sf = source("article-journal", mt(["en", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }], {
+      identifiers: { url: `https://news.example/${"a-".repeat(50_000)}` },
+    });
+    const t = performance.now();
+    const item = toCslItem(sf, { ...OPTS, pseudonyms: map });
+    expect(performance.now() - t).toBeLessThan(1000);
+    expect(item.title).not.toMatch(/family12/iu);
+    expect(item.URL).toBeDefined();
+  });
+});
+
+describe("R387 (a): a name with an invisible character inside it (C1 of the FR-A10 review)", () => {
+  const LUCIA = new Map([["Lucía", "P-002"], ["Fernández", "P-002"], ["Lucía Fernández", "P-002"]]);
+  const story = (title: string, url?: string) =>
+    source("article-journal", mt(["es", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }], url ? { identifiers: { url } } : {});
+  const title = (t: string, map: ReadonlyMap<string, string>) => toCslItem(story(t), { ...OPTS, pseudonyms: map }).title;
+
+  it("bidi controls, a mark and a soft hyphen inside the name, in the title", () => {
+    expect(title("Entrevista a Lu‪cía Fer⁦nández", LUCIA)).toBe("Entrevista a P-002");
+    expect(title("Entrevista a Luc‎ía Fernández", LUCIA)).toBe("Entrevista a P-002");
+    expect(title("Entrevista a Luc­ía Fernández", LUCIA)).toBe("Entrevista a P-002");
+    const map = new Map([["Maria", "P-001"]]);
+    for (const m of ["Ma­ria", "Ma​ria", "Ma‍ria", "Ma⁠ria", "Mar‎ia"]) expect(title(`Interview with ${m} today`, map), JSON.stringify(m)).toBe("Interview with P-001 today");
+    expect(title("Interview with ‮airaM‬ today", map)).not.toMatch(/aira/iu);
+  });
+
+  it("a creator whose name holds an invisible character is coded, and the title too", () => {
+    const sf = source("interview", mt(["es", "original", "Entrevista a Luc­ía Fernández"]), [{ role: "interviewee", given: "Luc­ía", family: "Fernández" }], { participantIds: [PARTICIPANT.id] });
+    const item = toCslItem(sf, { ...OPTS, pseudonyms: new Map([["Lucía Fernández", "P-002"]]) });
+    expect(item.author).toEqual([{ literal: "P-002" }]);
+    expect(item.title).toBe("Entrevista a P-002");
+  });
+
+  it("the address with a soft hyphen (Ma%C2%ADria-Lopez) is dropped", () => {
+    expect(toCslItem(story("A story", "https://news.example/Ma%C2%ADria-Lopez"), { ...OPTS, pseudonyms: new Map([["Maria Lopez", "P-003"]]) }).URL).toBeUndefined();
+  });
+
+  it("Devanagari with a ZWJ, Persian with a ZWNJ against the entry without it, a bidi-wrapped handle", () => {
+    expect(title("क्‍षमा का साक्षात्कार", new Map([["क्षमा", "P-003"]]))).toBe("P-003 का साक्षात्कार");
+    expect(title("گفتگو با علی‌رضا", new Map([["علیرضا", "P-004"]]))).toBe("گفتگو با P-004");
+    // The isolates at the edges of the handle stay around the code (R403 a).
+    expect(title("Video by ⁨@maria.cocina⁩", new Map([["@maria.cocina", "P-005"]]))).toBe("Video by ⁨P-005⁩");
+  });
+});
+
+describe("R403 (a): an invisible character is both nothing and a boundary (C1 of the FR-A10 second review)", () => {
+  const story = (title: string, url?: string) =>
+    source("article-journal", mt(["es", "original", title]), [{ role: "author", given: "Wei", family: "Chen" }], url ? { identifiers: { url } } : {});
+  const title = (t: string, map: ReadonlyMap<string, string>) => toCslItem(story(t), { ...OPTS, pseudonyms: map }).title;
+  const table: Array<[string, string, string]> = [
+    ["Lucía", "Lucía\u200Bhabla", "P-001\u200Bhabla"],
+    ["Maria Lopez", "Maria\u200BLopez\u200Bhabla", "P-001\u200Bhabla"],
+    ["Ana", "Ana\u200BLuis", "P-001\u200BLuis"],
+    ["Maria", "Maria\u200Eשלום", "P-001\u200Eשלום"],
+    ["Maria", "#Maria\u2060Day", "#P-001\u2060Day"],
+    ["Maria", "\u2068Maria\u2069\u2068Lopez\u2069", "\u2068P-001\u2069\u2068Lopez\u2069"],
+  ];
+  it.each(table)("%s in %j is replaced in the title", (entry, text, expected) => {
+    expect(title(text, new Map([[entry, "P-001"]]))).toBe(expected);
+  });
+
+  it("a creator's own name glued to the next word by a zero-width space is replaced in the title", () => {
+    const sf = source("interview", mt(["es", "original", "Lucía\u200Bhabla"]), [{ role: "interviewee", given: "Lucía", family: "Fernández" }], { participantIds: [PARTICIPANT.id] });
+    expect(toCslItem(sf, { ...OPTS, pseudonyms: new Map([["Lucía Fernández", "P-002"]]) }).title).toBe("P-002\u200Bhabla");
+  });
+
+  it("the address Luc%C3%ADa%E2%80%8Bhabla is dropped", () => {
+    expect(toCslItem(story("A story", "https://news.example/Luc%C3%ADa%E2%80%8Bhabla"), { ...OPTS, pseudonyms: new Map([["Lucía", "P-001"]]) }).URL).toBeUndefined();
+  });
+
+  it("'Ana\u200Bbel': the longer entry wins; 'Ana' alone leaves 'bel' (the price of the boundary); 'Marianne' is kept", () => {
+    expect(title("Ana\u200Bbel habla", new Map([["Ana", "P-002"], ["Anabel", "P-001"]]))).toBe("P-001 habla");
+    expect(title("Ana\u200Bbel habla", new Map([["Ana", "P-002"]]))).toBe("P-002\u200Bbel habla");
+    expect(title("Marianne habla", new Map([["Maria", "P-001"]]))).toBe("Marianne habla");
+  });
+});
+
+describe("R403 (c): a part of a name stands for the name only when it could be a name by itself (I2, M1 of the FR-A10 second review)", () => {
+  const story = (t: string) => source("article-journal", mt(["es", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]);
+  const title = (t: string, map: ReadonlyMap<string, string>) => toCslItem(story(t), { ...OPTS, pseudonyms: map }).title;
+  const own = (t: string, c: Omit<Creator, "role">, key: string) =>
+    toCslItem(source("interview", mt(["es", "original", t]), [{ ...c, role: "interviewee" }], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: new Map([[key, "P-001"]]) }).title;
+
+  it("runs of a map entry: only those with two words that stand alone", () => {
+    for (const [entry, text] of [
+      ["Maria de Lopez", "Ave Maria de Guadalupe"],
+      ["Maria de Lopez", "Calle de Lopez"],
+      ["Juan de la Cruz", "la Cruz Roja"],
+      ["Juan de la Cruz", "San Juan de Dios"],
+      ["Jan van der Berg", "Der Berg ruft"],
+    ] as const) {
+      expect(title(text, new Map([[entry, "P-001"]])), `${entry} / ${text}`).toBe(text);
+    }
+    const lucia = new Map([["Lucía Fernández Ruiz", "P-001"]]);
+    expect(title("Entrevista a Lucía Fernández", lucia)).toBe("Entrevista a P-001");
+    expect(title("Fernández Ruiz habla", lucia)).toBe("P-001 habla");
+  });
+
+  it("a creator's family words: 'de', 'la', 'van', 'der' stay; 'Cruz', 'Berg', 'Fernández', 'Ruiz' are replaced", () => {
+    expect(own("Historia de la ciudad y la Cruz Roja", { given: "Juan", family: "de la Cruz" }, "Juan de la Cruz")).toBe("Historia de la ciudad y la P-001 Roja");
+    expect(own("Der Berg ruft van Gogh", { given: "Jan", family: "van der Berg" }, "Jan van der Berg")).toBe("Der P-001 ruft van Gogh");
+    expect(own("Fernández habla y Ruiz calla", { given: "Lucía", family: "Fernández Ruiz" }, "Lucía Fernández Ruiz")).toBe("P-001 habla y P-001 calla");
+  });
+});
+
+describe("R416: where names fold alike, the participant whose name is exactly what the text says gives the code", () => {
+  const pena = new Map([["Ana Peña", "P-001"], ["Ana Pena", "P-002"]]);
+  const penaRev = new Map([["Ana Pena", "P-002"], ["Ana Peña", "P-001"]]);
+  const both = (t: string, map: ReadonlyMap<string, string>) =>
+    toCslItem(
+      source("interview", mt(["es", "original", t]), [{ role: "interviewee", given: "Ana", family: "Peña" }, { role: "interviewee", given: "Ana", family: "Pena" }], { participantIds: [PARTICIPANT.id] }),
+      { ...OPTS, pseudonyms: map },
+    );
+
+  it("both creators and both names in one title: each its own code, in either order of the map", () => {
+    for (const map of [pena, penaRev]) {
+      const item = both("Ana Peña y Ana Pena; ANA PEÑA; Ana Pe\u00ADna; Pena, Ana", map);
+      expect(item.author).toEqual([{ literal: "P-001" }, { literal: "P-002" }]);
+      expect(item.title).toBe("P-001 y P-002; P-001; P-002; P-002");
+    }
+  });
+
+  it("a creator alone gets its own code; a story's title takes the exact participant's code", () => {
+    const one = (c: { given: string; family: string }, map: ReadonlyMap<string, string>) =>
+      toCslItem(source("interview", mt(["es", "original", "x"]), [{ role: "interviewee", ...c }], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: map }).author;
+    expect(one({ given: "Ana", family: "Pena" }, pena)).toEqual([{ literal: "P-002" }]);
+    expect(one({ given: "Ana", family: "Peña" }, penaRev)).toEqual([{ literal: "P-001" }]);
+    const story = (t: string, map: ReadonlyMap<string, string>) =>
+      toCslItem(source("article-journal", mt(["vi", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: map }).title;
+    expect(story("Phỏng vấn Lê Thị Hường", new Map([["Lê Thị Hương", "P-001"], ["Lê Thị Hường", "P-002"]]))).toBe("Phỏng vấn P-002");
+    expect(story("バナコの話", new Map([["ハナコ", "P-003"], ["バナコ", "P-004"]]))).toBe("P-004の話");
+    expect(story("Entrevista a Lucia Fernandez", new Map([["Lucía Fernández", "P-005"]]))).toBe("Entrevista a P-005");
+  });
+});
+
+describe("R420 (a): a participant's WHOLE name inside the name of a creator who is not a participant", () => {
+  const MARIA = new Map([["Maria Cocina", "P-001"], ["@maria.cocina", "P-001"]]);
+  const page = (creators: Creator[], map: ReadonlyMap<string, string> = MARIA) =>
+    toCslItem(source("webpage", mt(["en", "original", "A page"]), creators), { ...OPTS, pseudonyms: map });
+
+  it("a literal, a handle-like literal and a given/family pair holding the whole name are coded", () => {
+    expect(page([{ role: "author", literal: "Friends of Maria Cocina" }]).author).toEqual([{ literal: "Friends of P-001" }]);
+    expect(page([{ role: "author", literal: "Friends of @maria.cocina" }]).author).toEqual([{ literal: "Friends of P-001" }]);
+    expect(page([{ role: "author", given: "Dr. Maria", family: "Cocina" }]).author).toEqual([{ literal: "Dr. P-001" }]);
+  });
+
+  it("guards (they hold before R420 too): parts of the name are not looked for inside another creator's name", () => {
+    expect(page([{ role: "author", given: "Maria", family: "Lopez" }]).author).toEqual([{ family: "Lopez", given: "Maria" }]);
+    expect(page([{ role: "author", literal: "Maria Lopez Institute" }]).author).toEqual([{ literal: "Maria Lopez Institute" }]);
+    expect(page([{ role: "author", given: "Juan", family: "Cocina" }]).author).toEqual([{ family: "Cocina", given: "Juan" }]);
+  });
+
+  it("a map entry of one word is a whole name", () => {
+    expect(page([{ role: "author", literal: "Friends of Lucía" }], new Map([["Lucía", "P-002"]])).author).toEqual([{ literal: "Friends of P-002" }]);
+  });
+
+  it("a creator changed this way counts as coded: the source's own citation key is withheld", () => {
+    expect(page([{ role: "author", literal: "Friends of Maria Cocina" }])["citation-key"]).toBeUndefined();
+    expect(page([{ role: "author", given: "Juan", family: "Cocina" }])["citation-key"]).toBe("key");
+  });
+
+  it("a no-space script: the whole name inside an organisation's name", () => {
+    expect(page([{ role: "author", literal: "北京王芳文化研究会" }], new Map([["王芳", "P-003"]])).author).toEqual([{ literal: "北京P-003文化研究会" }]);
+  });
+
+  it("a coded creator's whole forms, whatever the order of the creators; not its single names (changed by R427 b: a run of two words is replaced)", () => {
+    const map = new Map([["@rosa.d", "P-004"]]);
+    const coded: Creator = { role: "interviewee", handle: "@rosa.d", given: "Rosa", family: "Diaz Ruiz" };
+    const item = page([{ role: "author", literal: "Amigos de Rosa Diaz Ruiz" }, coded, { role: "author", literal: "Diaz Ruiz Foundation" }, { role: "author", literal: "Amigos de Rosa" }], map);
+    expect(item.author).toEqual([{ literal: "Amigos de P-004" }, { literal: "P-004" }, { literal: "P-004 Foundation" }, { literal: "Amigos de Rosa" }]);
+  });
+
+  it("names that fold alike: the exact one gives its code (R416)", () => {
+    const pena = new Map([["Ana Peña", "P-001"], ["Ana Pena", "P-002"]]);
+    expect(page([{ role: "author", literal: "Amigos de Ana Pena" }], pena).author).toEqual([{ literal: "Amigos de P-002" }]);
+    expect(page([{ role: "author", literal: "Amigos de Ana Peña" }], pena).author).toEqual([{ literal: "Amigos de P-001" }]);
+  });
+
+  it("an empty map: the creator is untouched", () => {
+    expect(page([{ role: "author", literal: "Friends of Maria Cocina" }], new Map()).author).toEqual([{ literal: "Friends of Maria Cocina" }]);
+  });
+});
+
+describe("R427 (c): every format character (\\p{Cf}) inside a run of letters is a soft boundary (M5 of the FR-A10 third review)", () => {
+  it.each([
+    ["Ma\uFFFBria habla", "P-001 habla"],
+    ["Ma\u0605ria habla", "P-001 habla"],
+  ])("%j is replaced in the title", (text, expected) => {
+    const sf = source("article-journal", mt(["es", "original", text]), [{ role: "author", given: "Wei", family: "Chen" }]);
+    expect(toCslItem(sf, { ...OPTS, pseudonyms: new Map([["Maria", "P-001"]]) }).title).toBe(expected);
+  });
+});
+
+describe("R427 (b): inside a creator who gets no code, whole names and runs are replaced, single names are not (I3 of the FR-A10 third review)", () => {
+  const LUCIA = new Map([["Lucía Fernández Ruiz", "P-005"]]);
+  const page = (t: string, creators: Creator[], map: ReadonlyMap<string, string> = LUCIA) =>
+    toCslItem(source("webpage", mt(["es", "original", t]), creators), { ...OPTS, pseudonyms: map });
+
+  it("a run of two words of the participant's name inside another creator's name: author and title agree, the key withheld", () => {
+    const item = page("Amigos de Lucía Fernández", [{ role: "author", literal: "Amigos de Lucía Fernández" }]);
+    expect(item.author).toEqual([{ literal: "Amigos de P-005" }]);
+    expect(item.title).toBe("Amigos de P-005");
+    expect(item["citation-key"]).toBeUndefined();
+  });
+
+  it("a creator who is the run (the participant under her usual short name) becomes the code", () => {
+    expect(page("x", [{ role: "author", given: "Lucía", family: "Fernández" }]).author).toEqual([{ literal: "P-005" }]);
+  });
+
+  it("guards (they hold before R427 too): a shared given name, and a coded creator's single name, are not looked for", () => {
+    expect(page("x", [{ role: "author", given: "Maria", family: "Lopez" }], new Map([["Maria Cocina", "P-001"]])).author).toEqual([{ family: "Lopez", given: "Maria" }]);
+    const coded: Creator = { role: "interviewee", given: "Rosa", family: "Díaz" };
+    const item = page("x", [coded, { role: "author", literal: "Amigos de Rosa" }], new Map([["Rosa Díaz", "P-004"]]));
+    expect(item.author).toEqual([{ literal: "P-004" }, { literal: "Amigos de Rosa" }]);
+  });
+});
+
+describe("R437 (a): in a creator written as given and family names, a run counts only when it takes words from both (I1 of the FR-A10 fourth review)", () => {
+  const page = (creators: Creator[], map: ReadonlyMap<string, string>) =>
+    toCslItem(source("webpage", mt(["es", "original", "A page"]), creators), { ...OPTS, pseudonyms: map });
+  const LUCIA = new Map([["Lucía Fernández Ruiz", "P-005"]]);
+
+  it.each<[string, string, string]>([
+    ["Juan Carlos", "Onetti", "Juan Carlos Pérez"],
+    ["María José", "Ortega", "María José Quispe"],
+    ["Anna Maria", "Schmidt", "Anna Maria Weber"],
+    ["Pedro", "Fernández Ruiz", "Lucía Fernández Ruiz"],
+  ])("given %j + family %j, the participant %j: a run wholly inside one field is another person's name, left as it is; the key is kept", (given, family, participant) => {
+    const item = page([{ role: "author", given, family }], new Map([[participant, "P-002"]]));
+    expect(item.author).toEqual([{ family, given }]);
+    expect(item["citation-key"]).toBe("key");
+  });
+
+  it("the same through a coded creator's forms", () => {
+    const coded: Creator = { role: "interviewee", handle: "@jc.perez", given: "Juan Carlos", family: "Pérez" };
+    const item = page([coded, { role: "author", given: "Juan Carlos", family: "Onetti" }], new Map([["@jc.perez", "P-002"]]));
+    expect(item.author).toEqual([{ literal: "P-002" }, { family: "Onetti", given: "Juan Carlos" }]);
+  });
+
+  it("guards: a run across the two fields (either way round) is coded; a whole name inside one field is coded; a creator of only one field is one text, so a run counts in it (R440 a)", () => {
+    expect(page([{ role: "author", given: "Lucía", family: "Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+    expect(page([{ role: "author", given: "Fernández", family: "Lucía" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+    expect(page([{ role: "author", given: "Dr. Maria", family: "Cocina" }], new Map([["Maria Cocina", "P-001"]])).author).toEqual([{ literal: "Dr. P-001" }]);
+    expect(page([{ role: "author", family: "Fernández Ruiz" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+    expect(page([{ role: "author", family: "Lucía Fernández Ruiz" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+  });
+
+  it("a creator written as one text: the run counts (R427 b stands)", () => {
+    expect(page([{ role: "author", literal: "Fernández Ruiz Abogados" }], LUCIA).author).toEqual([{ literal: "P-005 Abogados" }]);
+  });
+});
+
+describe("R427 (a): the more exact match wins (I1 of the FR-A10 third review)", () => {
+  // Two records an older library may hold, whose names the strict key now makes equal:
+  // [the spelling coded P-001, the spelling coded P-002, a spelling equal to neither as written but
+  // to both by the strict key, a title naming P-001 as written, the same naming P-002 as written].
+  const pairs: Array<[string, string, string, string, string]> = [
+    ["김 민수", "김민수", "김 민 수", "김 민수의 인터뷰", "김민수의 인터뷰"],
+    ["Ana  Peña", "Ana Peña", "ANA PEÑA", "Entrevista a Ana  Peña", "Entrevista a Ana Peña"],
+    ["ＡＮＡ", "ana", "Ana", "ＡＮＡ habla", "ana habla"],
+  ];
+  const cite = (t: string, literal: string, map: ReadonlyMap<string, string>) =>
+    toCslItem(source("interview", mt(["und", "original", t]), [{ role: "interviewee", literal }], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: map });
+
+  it.each(pairs)("%j (P-001) and %j (P-002): each spelling as written gives its own code, author and title alike, in either map order", (a, b, _s, ta, tb) => {
+    for (const map of [new Map([[a, "P-001"], [b, "P-002"]]), new Map([[b, "P-002"], [a, "P-001"]])]) {
+      const byB = cite(tb, b, map);
+      expect(byB.author).toEqual([{ literal: "P-002" }]);
+      expect(byB.title).toBe(tb.replace(b, "P-002"));
+      const byA = cite(ta, a, map);
+      expect(byA.author).toEqual([{ literal: "P-001" }]);
+      expect(byA.title).toBe(ta.replace(a, "P-001"));
+    }
+  });
+
+  it.each(pairs)("%j / %j: a spelling equal to neither as written but to both by the strict key takes the map's first", (a, b, s) => {
+    expect(cite("x", s, new Map([[a, "P-001"], [b, "P-002"]])).author).toEqual([{ literal: "P-001" }]);
+    expect(cite("x", s, new Map([[b, "P-002"], [a, "P-001"]])).author).toEqual([{ literal: "P-002" }]);
+  });
+});
+
+describe("R387 (b): one function makes a name's forms (I1 of the FR-A10 review)", () => {
+  const title = (t: string, map: ReadonlyMap<string, string>) =>
+    toCslItem(source("article-journal", mt(["ja", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]), { ...OPTS, pseudonyms: map }).title;
+
+  it("a map entry written apart in a no-space script matches in either order, as the folder name does", () => {
+    expect(title("太郎山田さん", new Map([["山田 太郎", "P-001"]]))).toBe("P-001さん");
+    expect(title("山田太郎さん", new Map([["山田 太郎", "P-001"]]))).toBe("P-001さん");
+    expect(title("小明王的故事", new Map([["王 小明", "P-002"]]))).toBe("P-002的故事");
+    expect(title("山田太郎さん", new Map([["太郎 山田", "P-003"]]))).toBe("P-003さん");
+  });
+});
+
+describe("R387 (c): R88's floor for a lone name, measured by script (I2 of the FR-A10 review)", () => {
+  const cite = (t: string, creator: Omit<Creator, "role">, key: string, code: string) =>
+    toCslItem(source("interview", mt(["und", "original", t]), [{ role: "interviewee", ...creator }], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: new Map([[key, code]]) });
+
+  it("a lone given name of two or more characters in a no-space script is replaced, as in the folder name", () => {
+    expect(cite("小明的故事", { family: "王", given: "小明" }, "王小明", "P-001").title).toBe("P-001的故事");
+    expect(cite("王老师和小明", { family: "王", given: "小明" }, "王小明", "P-001").title).toBe("王老师和P-001");
+    expect(cite("太郎の話", { family: "山田", given: "太郎" }, "山田太郎", "P-002").title).toBe("P-002の話");
+  });
+
+  it("a one-character Han family name alone is still not matched, inside a run or alone", () => {
+    expect(cite("王老师的课", { family: "王", given: "小明" }, "王小明", "P-001").title).toBe("王老师的课");
+  });
+
+  it("a Hangul name alone counts from two syllables", () => {
+    expect(cite("민수의 이야기", { family: "김", given: "민수" }, "김 민수", "P-004").title).toBe("P-004의 이야기");
+    expect(cite("민 이야기", { family: "박", given: "민" }, "박 민", "P-005").title).toBe("민 이야기");
+  });
+
+  it("Latin script keeps four letters: 'Li family history' is kept in the citation (as ruled)", () => {
+    expect(cite("Li family history", { family: "Li", given: "Rose" }, "Rose Li", "P-003").title).toBe("Li family history");
+    expect(cite("Rose Li family history", { family: "Li", given: "Rose" }, "Rose Li", "P-003").title).toBe("P-003 family history");
+  });
+});
+
+describe("R387 (e): partial names (I4 of the FR-A10 review)", () => {
+  const story = (t: string) => source("article-journal", mt(["es", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }]);
+
+  it("a map entry of three words: a run of two of its words in order is replaced", () => {
+    const map = new Map([["Lucía Fernández Ruiz", "P-001"]]);
+    expect(toCslItem(story("Entrevista a Lucía Fernández"), { ...OPTS, pseudonyms: map }).title).toBe("Entrevista a P-001");
+    expect(toCslItem(story("Fernández Ruiz habla"), { ...OPTS, pseudonyms: map }).title).toBe("P-001 habla");
+  });
+
+  it("a creator with a family name of two words: no 'P-001 Fernández', and each family word counts as a lone family name", () => {
+    const sf = (t: string) =>
+      source("interview", mt(["es", "original", t]), [{ role: "interviewee", given: "Lucía", family: "Fernández Ruiz" }], { participantIds: [PARTICIPANT.id] });
+    const opts = { ...OPTS, pseudonyms: new Map([["Lucía Fernández Ruiz", "P-001"]]) };
+    expect(toCslItem(sf("Entrevista a Lucía Fernández"), opts).title).toBe("Entrevista a P-001");
+    expect(toCslItem(sf("Fernández habla; Ruiz también"), opts).title).toBe("P-001 habla; P-001 también");
+    // Under R88's floor: a short family word alone is kept in a citation.
+    const li = source("interview", mt(["en", "original", "The Li family; Wang Li"]), [{ role: "interviewee", given: "Mei", family: "Wang Li" }], { participantIds: [PARTICIPANT.id] });
+    expect(toCslItem(li, { ...OPTS, pseudonyms: new Map([["Mei Wang Li", "P-002"]]) }).title).toBe("The Li family; P-002");
+  });
+});
+
+describe("R387 (f): minor points of the FR-A10 review", () => {
+  const story = (t: string, url?: string) =>
+    source("article-journal", mt(["en", "original", t]), [{ role: "author", given: "Wei", family: "Chen" }], url ? { identifiers: { url } } : {});
+
+  it("M1: a name's own exact form wins, whatever the map's order; a creator's code and the title agree", () => {
+    for (const map of [
+      new Map([["Maria Lopez", "P-001"], ["Lopez Maria", "P-002"]]),
+      new Map([["Lopez Maria", "P-002"], ["Maria Lopez", "P-001"]]),
+    ]) {
+      expect(toCslItem(story("Maria Lopez; Lopez Maria"), { ...OPTS, pseudonyms: map }).title).toBe("P-001; P-002");
+      const sf = source("interview", mt(["en", "original", "Lopez Maria talks"]), [{ role: "interviewee", literal: "Lopez Maria" }], { participantIds: [PARTICIPANT.id] });
+      const item = toCslItem(sf, { ...OPTS, pseudonyms: map });
+      expect(item.author).toEqual([{ literal: "P-002" }]);
+      expect(item.title).toBe("P-002 talks");
+    }
+    for (const map of [new Map([["Ann Marie", "P-001"], ["Annmarie", "P-002"]]), new Map([["Annmarie", "P-002"], ["Ann Marie", "P-001"]])]) {
+      expect(toCslItem(story("Annmarie and Ann Marie"), { ...OPTS, pseudonyms: map }).title).toBe("P-002 and P-001");
+    }
+  });
+
+  it("M2: the forms of a map are built once: 200 citations with a map of 5,000 three-word names", () => {
+    const map = new Map<string, string>();
+    for (let i = 0; i < 5_000; i++) map.set(`Given${i} Middle${i} Family${i}`, `P-${i}`);
+    toCslItem(story("warm up"), { ...OPTS, pseudonyms: map });
+    const t = performance.now();
+    for (let i = 0; i < 200; i++) expect(toCslItem(story(`About Family${i}, Middle${i}`), { ...OPTS, pseudonyms: map }).title).toBe(`About P-${i}`);
+    expect(performance.now() - t).toBeLessThan(3000);
+    // The time limit covers the one build of the map's forms (the warm-up), timed apart from the calls.
+  }, 120_000);
+
+  it("M3: an NFD title: the combining mark after a name goes with it", () => {
+    expect(toCslItem(story("Habla Luciá"), { ...OPTS, pseudonyms: new Map([["Lucía", "P-002"]]) }).title).toBe("Habla P-002");
+  });
+
+  it("M3: a malformed escape run: its ASCII escapes are still decoded and the name found", () => {
+    expect(toCslItem(story("A story", "https://news.example/%4D%61%72%69%61%E0%A4"), { ...OPTS, pseudonyms: new Map([["Maria", "P-001"]]) }).URL).toBeUndefined();
+  });
+
+  it("M6: a Korean creator written as family and given finds the map key written together, and is coded", () => {
+    const sf = source("interview", mt(["ko", "original", "김민수의 인터뷰"]), [{ role: "interviewee", family: "김", given: "민수" }], { participantIds: [PARTICIPANT.id] });
+    const item = toCslItem(sf, { ...OPTS, pseudonyms: new Map([["김민수", "P-001"]]) });
+    expect(item.author).toEqual([{ literal: "P-001" }]);
+    expect(item.title).toBe("P-001의 인터뷰");
+  });
+
+  it("M5: tatweel and kana through the citation", () => {
+    expect(toCslItem(story("مقابلة مـحـمـد"), { ...OPTS, pseudonyms: new Map([["محمد", "P-001"]]) }).title).toBe("مقابلة P-001");
+    expect(toCslItem(story("ヤマダタロウの話"), { ...OPTS, pseudonyms: new Map([["やまだ たろう", "P-002"]]) }).title).toBe("P-002の話");
+  });
+});
+
+describe("R440 (a): a creator of one field is one text, like a literal", () => {
+  const page = (creators: Creator[], map: ReadonlyMap<string, string>) =>
+    toCslItem(source("webpage", mt(["es", "original", "A page"]), creators), { ...OPTS, pseudonyms: map });
+  const LUCIA = new Map([["Lucía Fernández Ruiz", "P-005"]]);
+
+  it("a family name or a given name that is a run of a participant's name is coded", () => {
+    expect(page([{ role: "author", family: "Lucía Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+    expect(page([{ role: "author", given: "Lucía Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+  });
+});
+
+describe("R440 (b): no run in the family-given reading", () => {
+  const page = (creators: Creator[], map: ReadonlyMap<string, string>) =>
+    toCslItem(source("webpage", mt(["es", "original", "A page"]), creators), { ...OPTS, pseudonyms: map });
+  const LUCIA = new Map([["Lucía Fernández Ruiz", "P-005"]]);
+
+  it("a run that exists only in 'family given' (Fernández of Ortega Fernández + Lucía) is left as it is; the key is kept", () => {
+    const item = page([{ role: "author", given: "Lucía", family: "Ortega Fernández" }], LUCIA);
+    expect(item.author).toEqual([{ family: "Ortega Fernández", given: "Lucía" }]);
+    expect(item["citation-key"]).toBe("key");
+  });
+
+  it("guards (they hold before R440 b too): swapped fields and the plain order are coded", () => {
+    expect(page([{ role: "author", given: "Fernández", family: "Lucía" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+    expect(page([{ role: "author", given: "Lucía", family: "Fernández" }], LUCIA).author).toEqual([{ literal: "P-005" }]);
+  });
+});
+
+describe("R440 (e): a whole name is found even where a run of the same letters was indexed first", () => {
+  it("the map {Lucía Fernández Ruiz, Lucía Fernández} (one code): 'Fernández, Lucía' in a family field is coded", () => {
+    const map = new Map([["Lucía Fernández Ruiz", "P-005"], ["Lucía Fernández", "P-005"]]);
+    const item = toCslItem(source("webpage", mt(["es", "original", "A page"]), [{ role: "author", given: "Pedro", family: "Fernández, Lucía" }]), { ...OPTS, pseudonyms: map });
+    expect(JSON.stringify(item.author)).not.toContain("Lucía");
+    expect(JSON.stringify(item.author)).toContain("P-005");
   });
 });

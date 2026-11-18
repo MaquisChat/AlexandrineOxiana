@@ -384,6 +384,20 @@ describe("device import without media tools (R85: these never need them)", () =>
     expect(a.roots).toEqual([folder]);
   });
 
+  it("FR-A21 (R392): the scan tells its total (its groups, then its copies) before the first item", async () => {
+    const dir = join(tmp, "Recorder");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "Memo A.mp3"), Buffer.from("not really audio, one"));
+    await writeFile(join(dir, "Memo B.mp3"), Buffer.from("not really audio, one")); // a copy of A
+    await writeFile(join(dir, "Memo C.wav"), Buffer.from("not really audio, two"));
+    await writeFile(join(dir, "notes.txt"), "not device media");
+    const items: unknown[] = [];
+    const told: Array<{ n: number; after: number }> = [];
+    for await (const i of deviceAdapter(dir).scan(new AbortController().signal, { workDir: async () => tmp, total: (n) => told.push({ n, after: items.length }) })) items.push(i);
+    expect(items).toHaveLength(3);
+    expect(told).toEqual([{ n: 3, after: 0 }]);
+  });
+
   it("an unknown session or participant refuses the import before anything is stored", async () => {
     const { bulk } = await setup();
     const p = await project(gov(), true);

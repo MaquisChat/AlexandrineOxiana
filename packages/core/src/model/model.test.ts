@@ -10,10 +10,48 @@ import {
   BIBLIO_FIELDS,
   Source,
   SourceFile,
+  dateRuleZone,
   inLang,
   newId,
   primary,
+  timeZoneName,
+  Project,
+  WatchedFolderOptions,
 } from "../index.js";
+
+describe("project time zone (Task 58, R93)", () => {
+  it("accepts IANA zone names, in their usual spelling (aliases as written)", () => {
+    expect(timeZoneName("Europe/Berlin")).toBe("Europe/Berlin");
+    expect(timeZoneName("europe/berlin")).toBe("Europe/Berlin");
+    expect(timeZoneName("UTC")).toBe("UTC");
+    expect(timeZoneName("America/Argentina/Buenos_Aires")).toBe("America/Argentina/Buenos_Aires");
+    expect(timeZoneName("Pacific/Kiritimati")).toBe("Pacific/Kiritimati");
+  });
+  it("refuses anything that is not a zone name: unknown zones, offsets, padding, paths, overlong text", () => {
+    for (const bad of ["", "Mars/Olympus", "+05:00", "-0300", "Europe/Berlin\n", " Europe/Berlin", "../etc/passwd", "Europe//Berlin", "x".repeat(65), "Europe/Berlin; x", "Local", "\u0000"]) {
+      expect(timeZoneName(bad), JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+  it("refuses legacy and offset-style zones (Etc/GMT+2 means UTC-2) and stores a wrongly cased alias in the runtime's spelling (M4)", () => {
+    for (const bad of ["Etc/GMT+2", "Etc/GMT-5", "GMT+2", "SystemV/AST4", "EST", "CET", "EST5EDT", "Etc/UTC"]) expect(timeZoneName(bad), bad).toBeUndefined();
+    expect(timeZoneName("America/Argentina/buenos_aires")).toBe(timeZoneName("America/Buenos_Aires"));
+    expect(timeZoneName("utc")).toBe("UTC");
+  });
+});
+
+describe("the zone of a project's date rules (Task 58, R160 as amended)", () => {
+  it("a set zone governs protocol and retention dates; unset, protocol dates use the computer's zone and retention UTC", () => {
+    expect(dateRuleZone({ timeZone: "Asia/Tokyo" }, "protocol", "Europe/Paris")).toBe("Asia/Tokyo");
+    expect(dateRuleZone({ timeZone: "Asia/Tokyo" }, "retention", "Europe/Paris")).toBe("Asia/Tokyo");
+    expect(dateRuleZone({}, "protocol", "Europe/Paris")).toBe("Europe/Paris");
+    expect(dateRuleZone({}, "retention", "Europe/Paris")).toBe("UTC");
+    // A stored value that names no zone counts as unset.
+    expect(dateRuleZone({ timeZone: "Mars/Olympus" }, "protocol", "Europe/Paris")).toBe("Europe/Paris");
+    expect(dateRuleZone({ timeZone: "Mars/Olympus" }, "retention", "Europe/Paris")).toBe("UTC");
+    // No computer zone given: this runtime's.
+    expect(dateRuleZone({}, "protocol", undefined)).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  });
+});
 
 const now = "2026-11-09T10:00:00.000Z";
 
@@ -75,6 +113,28 @@ function fixture() {
     annotations: [],
   };
 }
+
+describe("Availability: gone from Zotero (Task Z5, R206 2)", () => {
+  it("an availability with zotero parses, and one without still does", () => {
+    const f = fixture();
+    const at = "2027-03-12T10:00:00.000Z";
+    const marked = { status: "unavailable-on-platform" as const, zotero: "deleted" as const, firstNoticedAt: at };
+    expect(Source.parse({ ...f.source, availability: marked }).availability).toEqual(marked);
+    expect(Source.parse({ ...f.source, availability: { ...marked, zotero: "bin" } }).availability.zotero).toBe("bin");
+    // Written before this task: no zotero field, and nothing else requires one.
+    expect(Source.parse({ ...f.source, availability: { status: "unavailable-on-platform", firstNoticedAt: at } }).availability).toEqual({ status: "unavailable-on-platform", firstNoticedAt: at });
+    expect(SourceFile.parse(f).source.availability).toEqual({ status: "available" });
+    expect(Source.safeParse({ ...f.source, availability: { ...marked, zotero: "trash" } }).success).toBe(false);
+  });
+});
+
+describe("Annotation author (D22)", () => {
+  it("an annotation may have no author; one with an author keeps it", () => {
+    const base = { id: newId(), sourceId: newId(), kind: "highlight" as const, anchors: [], createdAt: "2027-03-12T10:00:00.000Z" };
+    expect(Annotation.parse(base)).not.toHaveProperty("author");
+    expect(Annotation.parse({ ...base, author: "Ngozi Okafor" }).author).toBe("Ngozi Okafor");
+  });
+});
 
 describe("SourceFile", () => {
   it("parses a Spanish reel and applies defaults", () => {
@@ -145,6 +205,30 @@ describe("LinkedRelativePath (R24)", () => {
   });
 });
 
+describe("Asset.acquired: how a file was got (Find and acquire F11, plan ruling 6)", () => {
+  const base = () => ({ ...fixture().assets[0]! });
+  const acquired = {
+    method: "free_copy",
+    via: "service",
+    service: "arxiv",
+    address: "https://arxiv.org/pdf/2101.00001",
+    at: "2026-11-14T10:00:00.000Z",
+    tool: { name: "find-and-acquire", version: "0.1.0" },
+    access: "public",
+    check: { result: "match", by: "doi" },
+  };
+  it("is kept on an asset, with the check that let it in", () => {
+    expect(Asset.parse({ ...base(), acquired }).acquired).toEqual(acquired);
+    const accepted = { result: "accepted-after-mismatch", why: "other-doi" };
+    expect(Asset.parse({ ...base(), acquired: { ...acquired, check: accepted } }).acquired?.check).toEqual(accepted);
+  });
+  it("refuses an unknown method, way, service or access, and an address over 2,000 characters", () => {
+    for (const bad of [{ method: "browser_capture" }, { via: "email" }, { service: "scihub" }, { access: "private" }, { address: `https://arxiv.org/${"x".repeat(2000)}` }, { check: { result: "match", by: "guess" } }]) {
+      expect(Asset.safeParse({ ...base(), acquired: { ...acquired, ...bad } }).success, JSON.stringify(bad)).toBe(false);
+    }
+  });
+});
+
 describe("LibraryRelativePath", () => {
   it("rejects unsafe paths", () => {
     for (const p of ["/etc/x", "a\\b", "a/../b", "..", "C:/x", "c:x", ""]) {
@@ -179,6 +263,32 @@ describe("Anchor / Annotation", () => {
       expect(Annotation.safeParse({ ...base, anchors: [a] }).success, a.kind).toBe(true);
     }
     expect(Annotation.safeParse({ ...base, anchors: [{ kind: "bogus" }] }).success).toBe(false);
+  });
+
+  it("a pdf anchor takes a Zotero sort index and refuses a malformed one", () => {
+    const base = { id: newId(), assetId: newId(), kind: "pdf", page: 2, rects: [{ x: 0, y: 0, w: 1, h: 1 }] };
+    expect(Anchor.parse(base)).not.toHaveProperty("sortIndex");
+    expect(Anchor.parse({ ...base, sortIndex: "00001|000123|00456" })).toMatchObject({ sortIndex: "00001|000123|00456" });
+    for (const bad of ["", "1|2|3", "00001|000123|0045", "00001-000123-00456", "00001|000123|00456 ", "0000a|000123|00456"]) {
+      expect(Anchor.safeParse({ ...base, sortIndex: bad }).success, bad).toBe(false);
+    }
+  });
+
+  it("an annotation takes colorName, modifiedAt and modifiedBy; a source file takes deletedAnnotationKeys", () => {
+    const a = { id: newId(), sourceId: newId(), kind: "highlight", anchors: [], author: "me", createdAt: now };
+    expect(Annotation.parse(a)).not.toHaveProperty("colorName");
+    expect(Annotation.parse({ ...a, colorName: "blue", modifiedAt: now, modifiedBy: "me" })).toMatchObject({
+      colorName: "blue",
+      modifiedAt: now,
+      modifiedBy: "me",
+    });
+    expect(Annotation.safeParse({ ...a, colorName: "teal" }).success).toBe(false);
+    expect(Annotation.safeParse({ ...a, modifiedAt: "yesterday" }).success).toBe(false);
+    const f = fixture();
+    expect(SourceFile.parse(f)).not.toHaveProperty("deletedAnnotationKeys");
+    expect(SourceFile.parse({ ...f, deletedAnnotationKeys: ["zotero:ABCD2345"] }).deletedAnnotationKeys).toEqual(["zotero:ABCD2345"]);
+    expect(SourceFile.safeParse({ ...f, deletedAnnotationKeys: ["x".repeat(257)] }).success).toBe(false);
+    expect(SourceFile.safeParse({ ...f, deletedAnnotationKeys: Array.from({ length: 10_001 }, (_, i) => `k${i}`) }).success).toBe(false);
   });
 
   it("requires anchor id and lets a translation anchor reference the original", () => {
@@ -233,5 +343,28 @@ describe("ImportOptions / ImportBatch", () => {
       counts: { created: 0, merged: 0, skipped: 0, failed: 0, needsReview: 0 },
     };
     expect(ImportBatch.parse(b).options.ocr).toBe(true);
+  });
+});
+
+describe("watched folder options (cloud-drive folders, Task W3)", () => {
+  it("watched folder options take a collection id", () => {
+    const id = newId();
+    expect(WatchedFolderOptions.parse({ collectionId: id })).toEqual({ recursive: false, collectionId: id });
+    expect(() => WatchedFolderOptions.parse({ collectionId: "not an id" })).toThrow();
+  });
+
+  it("an old project.json without collectionId parses", () => {
+    const old = {
+      id: newId(),
+      name: "Old",
+      folder: "Projects/Old",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      targetLanguages: [],
+      encryption: { enabled: false },
+      watchedFolders: [{ id: newId(), options: { label: "Inbox", recursive: true }, createdAt: "2026-01-01T00:00:00.000Z" }],
+    };
+    const p = Project.parse(old);
+    expect(p.watchedFolders![0]!.options).toEqual({ label: "Inbox", recursive: true });
+    expect(p.watchedFolders![0]!.options.collectionId).toBeUndefined();
   });
 });

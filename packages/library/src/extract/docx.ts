@@ -1,7 +1,9 @@
 /** DOCX: `docProps/core.xml` (dc:title, dc:creator, dcterms:created, dc:language) and the body text. */
+import { basename } from "node:path";
 import { cleanText, decodeEntities, normalizeDate, parseNameList } from "./names.js";
 import { dcValues } from "./epub.js";
 import { tokens, tagIs } from "./scan.js";
+import { embeddedTitle, keepCreators } from "./title-like.js";
 import { MAX_TEXT_CHARS, type RawExtract } from "./types.js";
 import { openZip } from "./zip.js";
 
@@ -50,10 +52,13 @@ export async function extractDocx(path: string): Promise<RawExtract> {
     const out: RawExtract = {};
     const core = (await zip.read("docProps/core.xml", MAX_CORE_BYTES))?.toString("utf8");
     if (core) {
-      const title = dcValues(core, "title")[0]?.value;
+      // R394: a title that does not look like one ("Document1") and a stock author ("User") are dropped.
+      const rawTitle = dcValues(core, "title")[0]?.value;
+      const title = embeddedTitle(rawTitle, basename(path));
       if (title) out.title = title;
+      if (rawTitle) out.rawTitles = [rawTitle];
       const creator = dcValues(core, "creator")[0]?.value;
-      const creators = creator ? parseNameList(creator) : [];
+      const creators = creator ? keepCreators(parseNameList(creator)) : [];
       if (creators.length) out.creators = creators;
       // dcterms:created is when the file was made, never the publication date (R54b).
       const fileCreated = normalizeDate(dcValues(core, "created")[0]?.value);

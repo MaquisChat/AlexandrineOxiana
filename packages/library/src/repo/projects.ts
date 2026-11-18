@@ -1,7 +1,10 @@
 /** Projects: creation, project.json persistence, key files, lock/unlock. */
+import { createHash, timingSafeEqual } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import {
+  type AuditEvent,
   diffToChanges,
   effectivePolicy,
   evaluate,
@@ -23,11 +26,13 @@ import {
   type WrappedKey,
 } from "../crypto/keys.js";
 import { AuditStore } from "./audit-store.js";
+import { appendLibraryRefusal } from "./library-audit.js";
 import { appendChanges } from "./changelog-store.js";
-import { GovernanceViolationError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
+import { GovernanceViolationError, InvalidInputError, KeyFileChangedError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "./errors.js";
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
-import { CHANGE_LOG_MODE, type Tx } from "./mutate.js";
-import type { Manifest, ProjectJson, ProjectState, RepoCore } from "./state.js";
+import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
+import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
+import { lockPurges, type Manifest, type ProjectJson, type ProjectState, type RepoCore } from "./state.js";
 
 export interface CreateProjectInput {
   name: string;
@@ -46,6 +51,31 @@ export interface ProjectKeyFile {
 const KEY_FILE_MODE = 0o600;
 
 /**
+ * Records a refused project creation in the library's audit log (Task 50): who, what (the name
+ * asked for, whether encrypted) and the rule's reason; never the passphrase. If it cannot be
+ * written the refusal still stands, and the library warns (`refusal-unrecorded`, library-wide).
+ * Repeats of the latest entry on the same day are counted, not appended (R154 a).
+ */
+async function recordCreateRefusal(core: RepoCore, at: string, name: string, encrypted: boolean, reason: string): Promise<void> {
+  try {
+    await appendLibraryRefusal(core, {
+      at,
+      actor: core.actor,
+      device: core.device,
+      action: "store",
+      decision: { result: "deny", reason },
+      details: { op: "project.create", name, encrypted },
+    });
+  } catch (err) {
+    core.integrityWarnings.push({
+      projectId: "*",
+      kind: "refusal-unrecorded",
+      detail: `a refused project creation could not be recorded in the library's audit log (${err instanceof Error ? err.name : "Error"})`,
+    });
+  }
+}
+
+/**
  * Creates `Projects/<name>/` with project.json, governance.yaml (verbatim),
  * keys/project-key.json (encrypted projects), audit/0001.jsonl and
  * changes/<YYYY-MM>.jsonl. Everything is written into a hidden staging folder
@@ -62,32 +92,38 @@ export async function createProject(
     const cfg = parseGovernance(input.governanceYaml);
     const { policy } = effectivePolicy(cfg);
     const enc = input.encryption;
+    const now = core.clock();
+    const at = now.toISOString();
+    // A refusal has no project log to go to: it is recorded in the library's audit log (Task 50).
+    const refuse = async (err: GovernanceViolationError | PolicyDeniedError): Promise<never> => {
+      await recordCreateRefusal(core, at, input.name, enc.enabled === true, err.message);
+      throw err;
+    };
     if (!enc.enabled) {
       if (policy.identifiability.containsIdentifiable && policy.identifiability.pseudonymizeFileNames) {
-        throw new GovernanceViolationError(
-          "This project contains identifiable data and pseudonymizes file names; the pseudonym map must be stored encrypted, so enable encryption for this project",
+        await refuse(
+          new GovernanceViolationError(
+            "This project contains identifiable data and pseudonymizes file names; the pseudonym map must be stored encrypted, so enable encryption for this project",
+          ),
         );
       }
       if (policy.encryption.atRest === "required") {
-        throw new GovernanceViolationError("Governance requires encryption at rest; enable encryption for this project");
+        await refuse(new GovernanceViolationError("Governance requires encryption at rest; enable encryption for this project"));
       }
     } else if (typeof enc.passphrase !== "string" || enc.passphrase === "") {
       throw new TypeError("an encrypted project needs a passphrase");
     }
 
     const id = newId();
-    const now = core.clock();
-    const at = now.toISOString();
     const decision = evaluate(cfg, {
       action: "store",
       projectId: id,
       actor: core.actor,
       now: at,
-      tz: core.tz,
+      tz: core.zoneOf({}), // a new project has no time zone yet (R160)
       store: { identifiable: false, hasLocation: false },
     });
-    // Not audited: the project and its audit log do not exist yet, and nothing has been written.
-    if (decision.result === "deny") throw new PolicyDeniedError(decision.reason, "store");
+    if (decision.result === "deny") await refuse(new PolicyDeniedError(decision.reason, "store"));
 
     const projectsDir = join(core.root, "Projects");
     await fsp.mkdir(projectsDir, { recursive: true });
@@ -179,10 +215,33 @@ async function readKeyFile(core: RepoCore, st: ProjectState): Promise<ProjectKey
   return JSON.parse(raw.toString("utf8")) as ProjectKeyFile;
 }
 
-/** Unlocks with the passphrase or, failing that, the recovery code. */
-export async function unlockProject(core: RepoCore, projectId: string, secret: string): Promise<void> {
+/**
+ * Unlocks with the passphrase or, failing that, the recovery code. While it runs it is the project's pending unlock.
+ * R435 a: a lock asked meanwhile takes effect at once and OVERTAKES this unlock: the unlock then rejects with
+ * `ProjectLockedError` (its caller is told the project is locked and resumes nothing), its key is not added, its
+ * index reload is not run, and the project ends locked. An unlock asked after a lock waits for it and wins.
+ * R443 a: `lockAsksAtRequest`, when given, is the project's count of locks asked (`lockAsksOf`) noted when the
+ * unlock's request arrived, before it waited its turn: every lock asked after that overtakes this unlock.
+ */
+export function unlockProject(core: RepoCore, projectId: string, secret: string, lockAsksAtRequest?: number): Promise<void> {
+  const run = unlockNow(core, projectId, secret, lockAsksAtRequest);
+  const mark = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  core.pendingUnlocks.set(projectId, mark);
+  void mark.then(() => {
+    if (core.pendingUnlocks.get(projectId) === mark) core.pendingUnlocks.delete(projectId);
+  });
+  return run;
+}
+
+async function unlockNow(core: RepoCore, projectId: string, secret: string, lockAsksAtRequest?: number): Promise<void> {
   const st = core.state(projectId);
   if (!core.encrypted(st)) return;
+  // A lock asked from here on (R435 a), or since the request arrived when its count is given (R443 a), overtakes this unlock.
+  const asked = lockAsksAtRequest ?? core.lockAsks.get(projectId) ?? 0;
+  const overtaken = () => (core.lockAsks.get(projectId) ?? 0) !== asked;
   // Unlocking is audited; that append must wait until the interrupted write is resolved.
   if (st.recoveryPending && core.library.mode === "read-write") throw new RecoveryPendingError(projectId);
   const file = await readKeyFile(core, st);
@@ -198,33 +257,326 @@ export async function unlockProject(core: RepoCore, projectId: string, secret: s
     }
     key = await unwrapWithRecovery(file.recovery, secret);
   }
-  try {
+  let added = false;
+  /** When the key entered the ring: told in the `key.unlock` entry of an unlock a lock overtakes after it (R445). */
+  let addedAt = "";
+  // Checked in the same step as the add: a lock asked before it means the key never enters the ring (R435 a).
+  const add = () => {
+    if (overtaken()) return;
     core.keyRing.add(file.keyId, key);
+    addedAt = core.clock().toISOString();
+    added = true;
+  };
+  try {
+    // A lock asked before this unlock is done first: then the key is added again (R386 b).
+    if (!overtaken()) for (let p = core.pendingLocks.get(projectId); p; p = core.pendingLocks.get(projectId)) await p.catch(() => {});
+    // An unlocked project's key is replaced only between turns of the write queue (R379); the same key again
+    // changes nothing (KeyRing.add keeps the buffer a change may be sealing with).
+    if (core.keyRing.has(file.keyId) && !core.queueIdle()) await core.serialNext(async () => add());
+    else add();
   } finally {
     key.fill(0);
   }
+  if (!added) throw new ProjectLockedError(projectId);
+  // The unlock took effect (the key was in the ring), so it is audited even when a lock overtakes it now.
   if (core.library.mode === "read-write") {
     await core.serial(async () => {
+      // Timed when written, as every entry (R445); one a lock overtook says so, and when its key entered the ring.
       const at = core.clock().toISOString();
-      await core.auditNow(st, { ...core.auditBase(st, at), action: "key.unlock", entity: { type: "project", id: projectId } });
+      const late = overtaken() ? { details: { overtakenByLock: true, keyAddedAt: addedAt } } : {};
+      await core.auditNow(st, { ...core.auditBase(st, at), action: "key.unlock", entity: { type: "project", id: projectId }, ...late });
     });
   }
+  // Overtaken by a lock: no reload (a reload a lock cuts short ends as a locked project's, R404), and locked.
+  if (overtaken()) throw new ProjectLockedError(projectId);
   try {
     await core.index.projectUnlocked?.(projectId);
   } catch (error) {
     core.indexErrors.push({ op: "project.unlock", error });
   }
+  if (overtaken()) throw new ProjectLockedError(projectId);
 }
 
-export function lockProject(core: RepoCore, projectId: string): void {
-  const keyId = core.state(projectId).project.encryption.keyId;
-  // Drop the project's in-memory index content first; a failure must not keep the project unlocked.
+/** The staged key file of a new recovery code (R141), beside the active one until it is activated. */
+const STAGED_KEY_FILE = "keys/project-key.next.json";
+/** Present while a new recovery code was activated on open and may never have been shown (R141 b). */
+const UNSHOWN_FILE = "keys/recovery-code-unshown.json";
+/** The project warning while UNSHOWN_FILE is present. */
+export const RECOVERY_CODE_UNSHOWN_WARNING = "recovery-code-unshown";
+const ISSUE_OP = "project.recovery-code";
+
+/** `keys/project-key.next.json`: the key file to activate once issue `issueId` is committed. Wrapped keys only. */
+interface StagedKeyFile {
+  formatVersion: 1;
+  issueId: string;
+  keyFile: ProjectKeyFile;
+}
+
+/**
+ * Issues a new recovery code for an unlocked encrypted project (Task 61, R134 c, R141). The researcher
+ * gives the passphrase again; it is proved by unwrapping the stored passphrase wrapping (not only by
+ * the key being in the key ring). The project key does not change: only the recovery wrapping is
+ * replaced, so the old code stops working and the passphrase keeps working.
+ *
+ * Through the governed write path (`runMutation`): policy `store` of the project (as for its other
+ * settings), then the new key file is STAGED as keys/project-key.next.json beside the active one, then
+ * the allow audit event carrying this issue's id (the commit point, R26). Only after that is the staged
+ * file made active (replacing keys/project-key.json atomically, then removing the staged file), still
+ * inside the library's write queue. The active key file is never replaced before the commit point, so
+ * an uncommitted change is invisible to every open, read-only included. A crash between the commit
+ * and the end of activation is completed by the next writable open (`completeRecoveryActivation`),
+ * which raises the project warning `recovery-code-unshown`. The code is returned only once it is
+ * active, and is never stored, audited or logged.
+ */
+export async function issueRecoveryCode(core: RepoCore, projectId: string, passphrase: string): Promise<{ recoveryCode: string }> {
+  core.assertWritable();
+  const st = core.state(projectId);
+  if (!core.encrypted(st)) throw new InvalidInputError("This project is not encrypted, so it has no recovery code");
+  if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+  core.assertUnlocked(st);
+  if (typeof passphrase !== "string" || passphrase === "") throw new InvalidInputError("Enter the project's passphrase");
+
+  // The slow key derivations run outside the library's write queue; the file is checked unchanged inside it.
+  const rel = `${st.rel}/keys/project-key.json`;
+  const raw = await readMaybe(core.abs(rel));
+  if (!raw) throw new Error("this project's key file is missing");
+  const file = JSON.parse(raw.toString("utf8")) as ProjectKeyFile;
+  const key = await unwrapKey(file.passphrase, passphrase); // WrongPassphraseError: nothing written
+  let next: { recoveryCode: string; file: WrappedKey };
   try {
-    core.index.purgeProject?.(projectId);
-  } catch (error) {
-    core.indexErrors.push({ op: "project.lock", error });
+    const { key: ringKey, keyId } = core.key(st);
+    // Compared in place (no copies of the key are made).
+    const same = key.length === ringKey.length && timingSafeEqual(key, ringKey);
+    if (file.keyId !== keyId || file.passphrase.keyId !== keyId || !same) {
+      throw new Error("this project's key file does not hold the key the project is unlocked with");
+    }
+    next = await createRecoveryFile(key, keyId, core.scryptN ? { N: core.scryptN } : {});
+  } finally {
+    key.fill(0);
   }
-  if (keyId) core.keyRing.remove(keyId);
+  seams.onRecoveryCode?.(next.recoveryCode);
+  const issueId = newId();
+  const keyFile: ProjectKeyFile = { keyId: file.keyId, passphrase: file.passphrase, recovery: next.file };
+  const staged: StagedKeyFile = { formatVersion: 1, issueId, keyFile };
+  const stagedRel = `${st.rel}/${STAGED_KEY_FILE}`;
+  const stagedBytes = JSON.stringify(staged, null, 2);
+  const stagedSha256 = sha256Hex(stagedBytes);
+  const unshownRel = `${st.rel}/${UNSHOWN_FILE}`;
+
+  /** What stopped activation after the commit (a simulated crash in tests, or a real failure). */
+  let activation: unknown = null;
+  await runMutation(
+    core,
+    projectId,
+    { action: "store", store: { identifiable: false, hasLocation: false } },
+    async (tx) => {
+      const now = await readMaybe(core.abs(rel));
+      if (!now || !now.equals(raw)) throw new KeyFileChangedError();
+      maybeCrash("recovery-before-stage");
+      // A staged file left by an earlier issue whose activation failed is superseded by this one.
+      await tx.writeFile(stagedRel, stagedBytes, { mode: KEY_FILE_MODE });
+      // A new code supersedes one that was activated on open and may not have been shown.
+      if (await tx.exists(unshownRel)) await tx.trash(unshownRel);
+      // Activation runs after the commit, still inside the write queue. `tx.index` is the only
+      // asynchronous after-commit step mutate.ts offers; its failures never undo the commit.
+      tx.index(async () => {
+        try {
+          maybeCrash("recovery-before-activate");
+          await activateStaged(core, st, staged);
+        } catch (err) {
+          activation = err;
+        }
+      });
+    },
+    // The staged file's sha256 binds it to this event (R148): only these exact bytes are ever activated.
+    { op: ISSUE_OP, entity: { type: "project", id: projectId }, auditDetails: { issueId, stagedSha256 } },
+  );
+  if (activation instanceof SimulatedCrash) throw activation; // tests: the process "died" here
+  if (activation instanceof ActivationIncomplete) {
+    // The new file is active but the staged one could not be removed (M-b): the new code works and
+    // was not shown; the old one no longer works. The next writable open finishes it, with a warning.
+    throw new Error("A new recovery code was put in place, but the app could not finish, so it could not be shown. The earlier recovery code no longer works; the passphrase still does. Ask for a new recovery code again");
+  }
+  if (activation !== null) {
+    // Committed but not active: the old code still works, and this code would not. Asking again supersedes it.
+    throw new Error("The new recovery code was recorded but could not be put in place, so it was not shown. The current recovery code still works. Ask for a new recovery code again");
+  }
+  maybeCrash("recovery-after-activate");
+  return { recoveryCode: next.recoveryCode };
+}
+
+const sha256Hex = (data: string | Uint8Array): string => createHash("sha256").update(data).digest("hex");
+
+/** The new key file is active, but a later step failed (M-b). */
+class ActivationIncomplete extends Error {
+  override name = "ActivationIncomplete";
+}
+
+/** Makes a staged key file active: the active file replaced atomically (0600), then the staged one removed. Idempotent. */
+async function activateStaged(core: RepoCore, st: ProjectState, staged: StagedKeyFile): Promise<void> {
+  await writeFileAtomic(core.abs(`${st.rel}/keys/project-key.json`), JSON.stringify(staged.keyFile, null, 2), { mode: KEY_FILE_MODE });
+  maybeCrash("recovery-mid-activate");
+  try {
+    if (seams.failRecoveryCleanup) throw new Error("simulated failure removing the staged key file");
+    await fsp.rm(core.abs(`${st.rel}/${STAGED_KEY_FILE}`), { force: true });
+  } catch (err) {
+    if (err instanceof SimulatedCrash) throw err;
+    throw new ActivationIncomplete(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * Writable open, for a project with no unresolved interrupted change (R141 b, R148). A staged key
+ * file is activated only if ALL hold:
+ *   1. its sha256 equals `stagedSha256` in the allow event of its issue;
+ *   2. that event is the newest allowed issue of the project, and no `key.recovery-activated` event
+ *      follows it;
+ *   3. its key id and passphrase wrapping are identical to the active key file's;
+ *   4. the audit chain verifies (`chainOk`).
+ * Then the persistent warning that the code may never have been shown is raised (UNSHOWN_FILE, until
+ * another code is issued), the active file is replaced and the completion audited. Otherwise the active
+ * file is untouched: with a chain that verifies the staged file is not the committed one, so it is
+ * removed and reported ('recovery-staging-discarded'); with a chain that does not verify nothing can
+ * be decided, so it is left in place and reported ('recovery-staging-unverifiable'). The replaced
+ * active file is never kept aside: that would keep a revoked code usable. Throws when the audit
+ * append fails (the caller blocks the project, R28); the activation and warning are then already done.
+ */
+export async function completeRecoveryActivation(
+  core: RepoCore,
+  st: ProjectState,
+  events: ReadonlyArray<AuditEvent | null>,
+  chainOk: boolean,
+  at: string,
+): Promise<void> {
+  const stagedAbs = core.abs(`${st.rel}/${STAGED_KEY_FILE}`);
+  const raw = await readMaybe(stagedAbs);
+  if (!raw) return;
+  const report = (kind: "recovery-staging-discarded" | "recovery-staging-unverifiable", detail: string) =>
+    core.integrityWarnings.push({ projectId: st.project.id, kind, detail });
+  if (!chainOk) {
+    report("recovery-staging-unverifiable", "a new recovery code waiting to be put in place was left as it is, because the project's audit log does not verify, so it cannot show whether that code was really issued; the current recovery code is unchanged");
+    return;
+  }
+  const why = await stagedProblem(core, st, raw, events);
+  if (why) {
+    await fsp.rm(stagedAbs, { force: true });
+    report("recovery-staging-discarded", `a key file waiting to be put in place was removed and not used (${why}); the current recovery code and passphrase are unchanged`);
+    return;
+  }
+  const staged = JSON.parse(raw.toString("utf8")) as StagedKeyFile;
+  await writeFileAtomic(core.abs(`${st.rel}/${UNSHOWN_FILE}`), JSON.stringify({ formatVersion: 1, issueId: staged.issueId, activatedAt: at }), { mode: KEY_FILE_MODE });
+  await writeFileAtomic(core.abs(`${st.rel}/keys/project-key.json`), JSON.stringify(staged.keyFile, null, 2), { mode: KEY_FILE_MODE });
+  await core.auditNow(st, {
+    ...core.auditBase(st, at),
+    action: "key.recovery-activated",
+    entity: { type: "project", id: st.project.id },
+    details: { issueId: staged.issueId, reason: "a new recovery code was issued, but the app stopped before it could be shown; it was put in place when the library was next opened" },
+  });
+  await fsp.rm(stagedAbs, { force: true });
+}
+
+/** Why a staged key file is not the committed one (R148 conditions 1–3), or null when it is. */
+async function stagedProblem(core: RepoCore, st: ProjectState, raw: Buffer, events: ReadonlyArray<AuditEvent | null>): Promise<string | null> {
+  let staged: StagedKeyFile;
+  try {
+    staged = JSON.parse(raw.toString("utf8")) as StagedKeyFile;
+  } catch {
+    return "it could not be read";
+  }
+  if (staged?.formatVersion !== 1 || typeof staged.issueId !== "string" || typeof staged.keyFile !== "object" || staged.keyFile === null) return "it is not in the expected form";
+  // 2. The newest allowed issue, with no activation recorded after it.
+  let newest = -1;
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    const d = e?.details as { op?: unknown } | undefined;
+    if (e && e.decision?.result !== "deny" && d?.op === ISSUE_OP) newest = i;
+  }
+  if (newest < 0) return "no new recovery code was recorded as issued";
+  const issue = events[newest]!.details as { issueId?: unknown; stagedSha256?: unknown };
+  if (issue.issueId !== staged.issueId) return "it belongs to an earlier new recovery code, not the latest one recorded";
+  if (events.slice(newest + 1).some((e) => e?.action === "key.recovery-activated")) return "the latest new recovery code was already put in place";
+  // 1. Exactly the bytes recorded with the issue.
+  if (typeof issue.stagedSha256 !== "string" || issue.stagedSha256 !== sha256Hex(raw)) return "its content is not what was recorded when the code was issued";
+  // 3. Same key, same passphrase wrapping as the active file.
+  const activeRaw = await readMaybe(core.abs(`${st.rel}/keys/project-key.json`));
+  let active: ProjectKeyFile | undefined;
+  try {
+    active = activeRaw ? (JSON.parse(activeRaw.toString("utf8")) as ProjectKeyFile) : undefined;
+  } catch {
+    active = undefined;
+  }
+  if (!active) return "the project's key file could not be read";
+  if (staged.keyFile.keyId !== active.keyId || staged.keyFile.keyId !== st.project.encryption.keyId) return "it is for another key";
+  if (!isDeepStrictEqual(staged.keyFile.passphrase, active.passphrase)) return "its passphrase wrapping differs from the project's";
+  return null;
+}
+
+/** Whether the project carries the warning that a new recovery code may never have been shown (R141 b). */
+export async function recoveryCodeUnshown(core: RepoCore, st: ProjectState): Promise<boolean> {
+  return core.encrypted(st) && (await readMaybe(core.abs(`${st.rel}/${UNSHOWN_FILE}`))) !== null;
+}
+
+/**
+ * Locks the project: its in-memory content (index, kept registers and queues) is dropped and its key zeroed in the
+ * key ring. R379: the key is wiped only between turns of the write queue, never under a change being saved: at once
+ * when no write is running, else as the next turn (after the change in progress, ahead of those waiting, which then
+ * find the project locked). R386 b: locking is immediate for everyone but that change: before this returns, the
+ * project counts as locked for every read and every new change (the key ring answers only the turn running now);
+ * the returned promise settles when the key is wiped. An unknown project is a rejected promise, never a throw.
+ */
+export function lockProject(core: RepoCore, projectId: string): Promise<void> {
+  let st: ProjectState;
+  try {
+    st = core.state(projectId);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+  // R435 a: a lock takes effect at once, an unlock in flight included: that unlock is overtaken (it adds no key and
+  // ends as locked), and the returned promise settles once it has ended and the key is wiped.
+  core.lockAsks.set(projectId, (core.lockAsks.get(projectId) ?? 0) + 1);
+  const unlocking = core.pendingUnlocks.get(projectId);
+  const done = lockAtOnce(core, projectId, st);
+  return unlocking ? unlocking.then(() => done) : done;
+}
+
+function lockAtOnce(core: RepoCore, projectId: string, st: ProjectState): Promise<void> {
+  const pending = core.pendingLocks.get(projectId);
+  if (pending) return pending;
+  const keyId = st.project.encryption.keyId;
+  const purge = () => {
+    // A failure must not keep the project unlocked.
+    try {
+      core.index.purgeProject?.(projectId);
+    } catch (error) {
+      core.indexErrors.push({ op: "project.lock", error });
+    }
+    for (const p of lockPurges) {
+      try {
+        p(core, st);
+      } catch (error) {
+        core.indexErrors.push({ op: "project.lock", error });
+      }
+    }
+  };
+  const lock = () => {
+    purge();
+    if (keyId) core.keyRing.remove(keyId);
+  };
+  if (core.queueIdle()) {
+    lock();
+    return Promise.resolve();
+  }
+  // Locked for everyone at once but the turn running now, which may still be sealing with the key.
+  if (keyId) core.keyRing.markLocking(keyId, core.admitsOnlyRunningTurn());
+  purge();
+  const done = core.serialNext(async () => lock()).finally(() => core.pendingLocks.delete(projectId));
+  core.pendingLocks.set(projectId, done);
+  return done;
+}
+
+/** The project's count of locks asked so far (R443 a): read-only, for an unlock to note when its request arrives. */
+export function lockAsksOf(core: RepoCore, projectId: string): number {
+  return core.lockAsks.get(projectId) ?? 0;
 }
 
 export function isUnlocked(core: RepoCore, projectId: string): boolean {

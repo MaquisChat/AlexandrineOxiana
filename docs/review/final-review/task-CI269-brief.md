@@ -1,0 +1,36 @@
+# Task CI-269 — on GitHub one row of the lock-mid-read harness hung for 30 minutes and an error went uncaught: find the cause
+
+You have none of the coordinator's context; this brief stands alone. Read the common brief first, all of it: `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task54-fix-common.md` (tests first; one commit per point; NEVER use `git stash` — one stash list is shared by every worktree; the commit trailers it gives).
+
+## The project, in three lines
+A local-first research workbench (pnpm 10 monorepo, Node 22, TypeScript strict ESM, Vitest). A project can be ENCRYPTED: its files are sealed with a key held in memory while the project is unlocked; LOCKING the project wipes the key at once (Rulings R404, R435–R445: "a lock always takes effect at once"; a read that a lock cuts short must end as "locked" — never as "damaged", never as nothing, never hang, never crash). `packages/library/src/repo/lock-mid-read.test.ts` is the harness for that: for every reader of an encrypted project (43 rows) it lets a lock land at the Nth "opening" (`noteOpening` in `packages/library/src/crypto/format.ts`) and checks how the read ends.
+
+## What happened
+GitHub Actions, run 269 of `CI` (commit 4cc4348 on `claude/pdf-reader-highlights`, Ubuntu, 18 November 2026): the step `pnpm test` failed with ONE failure and ONE uncaught error, both from that file:
+
+- the row `R404: a lock at the Nth opening of every reading of an encrypted project > exportProjectOpenFormats — export/project-export.ts:248 (decryptStream :377, :412)` — `Error: Test timed out in 1800000ms` (the row's own limit, `ROW_MS`; it hung for half an hour, which is why the step took 42 minutes instead of 17);
+- `Uncaught Exception — KeyNotAvailableError: key 01a1ec3d-… is not available (project locked or key unknown)` with the stack `assertLiveKey packages/library/src/crypto/format.ts:103` ← `readHeader format.ts:361` ← `Transform.transform [as _transform] format.ts:379` ← `Transform._write` ← `ReadStream.ondata` ← `addChunk`; Vitest names the same row as the test running at the time.
+
+The same row passed on GitHub in run 265 (second attempt), 267 and in two full verifications on the development machine the same day. The code under test did not change between those runs (the commits since touch three test files and the CI's package-install step only). So something that differs between runs — timing, most likely — decides it. The full log of the failed job (15,494 lines; "Failed Tests" is at about line 5200) is at
+`/tmp/claude-0/-home-user-AlexandrineOxiana/ac3b5cb4-f467-5f83-9948-4e7d2e34f036/scratchpad/ci-269-test.log`
+(strip colour codes with `sed -E 's/\x1b\[[0-9;]*m//g'`; do not print the whole file).
+
+What the stack shows, and no more than that: `decryptStream`'s `transform` (format.ts about :366–385) catches what `readHeader` throws and hands it to its callback, so the Transform emits `'error'`; that error reached the process as UNCAUGHT, which in Node means the stream had no `'error'` listener at that moment; and whoever was waiting for that stream then waited forever.
+
+## What I need
+**The root cause, proven** — not a guess. Use the method of systematic debugging. Read `packages/library/src/export/project-export.ts` (around :248 and every place it makes or consumes a `decryptStream`), `crypto/format.ts` (`decryptStream`, `readHeader`, `assertLiveKey`, `noteOpening`), the harness row and its `exercise` function. Form hypotheses and test each by an experiment that can refute it. To consider, none assumed: a stream that starts flowing before its consumer has attached an `'error'` listener (a `pipe` into the Transform made ahead of its consumption; a queue of entries consumed one after another; an `await` between making the stream and handing it to `pipeline`/the archive); an error emitted after the consumer has finished listening; a promise that is settled only by `'end'`/`'close'` and never by `'error'`; the harness's own way of landing the lock. Then:
+
+1. **Reproduce it at will** in the worktree (temporary delays or yields at the places your hypothesis names; a slowed consumer; a lock landed at a chosen moment), and make it go away by removing that cause.
+2. **Say which it is:**
+   - **(B) a fault of the PRODUCT** — the likely one if the export can be left hanging or an error can go uncaught by a lock landing at some moment (in the real app the local service is ONE Node process: an uncaught exception there is a crash, and a hung export is a spinner that never ends). Then: say exactly which code path, under what timing; say whether the SAME fault can be reached WITHOUT a lock (a damaged or truncated encrypted file, a file sealed under another key, a file deleted mid-export) — try it; say whether other callers of `decryptStream` / `encryptStream` / `openDecryptedHandle` share the shape (grep all of `packages/library/src` and `apps/library-service/src`; list each caller as safe or not, with one line of why). Write a FAILING test that shows the fault deterministically (no reliance on machine speed: use an injected hook, a controlled stream or the harness's own lock hook), leave it UNCOMMITTED in the worktree named `*.ci269.test.ts`, and PROPOSE the smallest fix in the report (do not build it): what changes where, and what the researcher sees afterwards (it must be: the export ends, refused as locked, nothing half-written left behind, the service still running). The coordinator rules on product behaviour.
+   - **(A) a fault of the TESTS only** (the product cannot do this outside the harness — say why, convincingly). Then fix the harness minimally without weakening it, commit, and show the failure can no longer be produced.
+   - **(C) not proven.** Say what you tried and what each experiment showed. Change nothing.
+3. Also say, in one line: is a 30-minute limit per row (`ROW_MS`) needed, and what limit would have shown this fault in a minute instead of half an hour? (Do not change it unless the case is A.)
+
+## Where and how
+Worktree `/home/user/AlexandrineOxiana/.claude/worktrees/ci-flake`, branch `ci-find-runner-flake`, at 4cc4348 (dependencies installed). EVERY shell command starts with `cd /home/user/AlexandrineOxiana/.claude/worktrees/ci-flake &&` — nothing may run in the main checkout. Do not push. Do not touch any other worktree or branch. No installs. Do not run the whole suite or the end-to-end tests: `nice -n 10 pnpm --filter @ao/library exec vitest run src/repo/lock-mid-read.test.ts -t "exportProjectOpenFormats"` and the export's own tests (`src/export`) are the ones that matter; pass `--testTimeout` on the command line so that a hang costs a minute, not thirty. Temporary data only under `os.tmpdir()`. Remove every temporary delay before you finish; `git status --short` shows nothing but case B's one test file.
+
+## Report
+Write `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task-CI269-report.md`: the cause in a few sentences; the evidence (each experiment and its result, briefly); the case; for B the proposed fix, the answer about a damaged file without a lock, and the list of other callers; anything uncertain. No file dumps.
+
+Final message to me, at most 180 words: the case, the cause in two sentences, whether it can happen without a lock, the proposed fix in two sentences, anything needing my ruling.

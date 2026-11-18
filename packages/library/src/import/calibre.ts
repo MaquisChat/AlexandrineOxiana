@@ -24,6 +24,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Creator } from "@ao/core";
 import { parseName } from "../extract/names.js";
 import type { ImportSourceAdapter, ScanContext, ScanItem } from "./bulk/scan.js";
+import { isDiskFull } from "./bulk/space.js";
 import { CopyNoSpace, CopyTooLarge, CopyUnstable, CopyUnusual, UNUSUAL_STATE_REASON, cappedRows, copyDatabases, openCopy, plainTables, t64 } from "./sqlite-copy.js";
 import { exportIdentity, isbnsOf, recordItem, skippedNote, tagList, text, doiOf, issnOf, type RecordFields } from "./refman.js";
 
@@ -207,9 +208,16 @@ async function* scanCalibre(libraryDir: string, signal: AbortSignal, ctx: ScanCo
     }
   } catch (err) {
     if ((err as Error)?.name === "AbortError") throw err;
+    // R439 (4), as R436 a: a full disk (or a quota) while copying the database ends the scan: the run stops the batch,
+    // resumable (copyDatabases has removed its folder). Never "missing or damaged".
+    if (isDiskFull(err)) throw err;
     yield err instanceof CalibreUnreadable ? { ...fail(), unreadable: err.reason } : fail();
     return;
   }
+  // R392: the books read from the database's copy are the total, told before the first; a book with nothing to
+  // import (passed by below) lowers it.
+  let told = books.length;
+  ctx.total?.(told);
   let skipped = 0;
   for (const b of books) {
     signal.throwIfAborted();
@@ -218,7 +226,10 @@ async function* scanCalibre(libraryDir: string, signal: AbortSignal, ctx: ScanCo
     const { paths, outside } = await locate(root, realRoot, b.files);
     const item = await recordItem(key, b.fields, paths.map((p) => ({ paths: [p] })), { externalKeys, notes: Array<string>(outside).fill(CALIBRE_FILE_NOTE) });
     if (item) yield item;
-    else skipped++;
+    else {
+      skipped++;
+      ctx.total?.(--told);
+    }
   }
   if (skipped) ctx.note?.(skippedNote(skipped));
 }

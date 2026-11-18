@@ -1,6 +1,8 @@
 packages:
   - "packages/*"
   - "apps/*"
+  # The app's end-to-end suite (real UI, service and worker in a browser)
+  - "e2e"
 
 onlyBuiltDependencies:
   - better-sqlite3

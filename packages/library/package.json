@@ -15,10 +15,10 @@
   },
   "dependencies": {
     "@ao/core": "workspace:*",
+    "@ao/shared": "workspace:*",
     "@napi-rs/keyring": "2.1.2",
     "@xmldom/xmldom": "0.9.12",
     "better-sqlite3": "^12.11.1",
-    "chokidar": "5.0.0",
     "exiftool-vendored": "39.0.1",
     "file-type": "22.2.0",
     "parse5": "8.0.1",

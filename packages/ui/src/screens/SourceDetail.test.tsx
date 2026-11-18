@@ -1,13 +1,41 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { describe, expect, it, vi } from "vitest";
-import { server, SOURCE_FILE, STYLES, testApi, url, useMockService } from "../test/service";
-import { SourceDetail } from "./SourceDetail";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { server, serviceError, SOURCE_FILE, STYLES, testApi, TOKEN, url, useMockService } from "../test/service";
+import {
+  FIELD_CREATORS_UNVERIFIED,
+  FIELD_DOI_CONFIRMED,
+  FIELD_ISSUED_CONFLICT,
+  FIELD_PUBLISHER_SINGLE,
+  FIELD_TITLE_VERIFIED,
+  FIELDS,
+  installBlobUrls,
+  PICTURE_SOURCE,
+  pictureResponse,
+  PROXY_FAILED_SOURCE,
+  sourceHandlers,
+  TRANSCRIPT_SOURCE,
+  VERIFIED_SOURCE,
+  withFields,
+} from "../test/verification";
+import { FIELD_LABELS as CORE_FIELD_LABELS } from "@ao/core/verify/checks";
+import { FIELD_LABELS, SourceDetail } from "./SourceDetail";
 
 useMockService();
 
+// Task W9: the details also ask where the source came from; by default it came from no watched folder.
+beforeEach(() => {
+  server.use(http.get(url("/projects/:id/sources/:sid/watch-origin"), () => HttpResponse.json({ origins: [] })));
+});
+
 const handlers = () => [http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(SOURCE_FILE)), http.get(url("/styles"), () => HttpResponse.json(STYLES))];
+
+// Task 69 (M2): the date is shown in the researcher's own time zone, so the expected day comes from
+// the machine's zone (getDate, not the formatter under test). Mid-November keeps month and year the
+// same in every zone, so the test checks the local day and the wording wherever it runs.
+const NOTICED_AT = "2026-11-15T12:00:00.000Z";
+const NOTICED_TEXT = `No longer available at its source, noticed on Nov ${new Date(NOTICED_AT).getDate()}, 2026`;
 
 describe("SourceDetail", () => {
   it("shows the source's details and files, with user text marked dir=auto", async () => {
@@ -19,6 +47,70 @@ describe("SourceDetail", () => {
     expect(within(region).getByText("Smith, Jane")).toBeTruthy();
     expect(within(region).getByText("10.1000/xyz")).toBeTruthy();
     expect(within(region).getByText("smith-2019.pdf")).toBeTruthy();
+  });
+
+  it("shows where the source came from when it came from a watched folder (Task W9)", async () => {
+    server.use(
+      ...handlers(),
+      http.get(url("/projects/:id/sources/:sid/watch-origin"), () =>
+        HttpResponse.json({ origins: [{ watchId: "w1", folderLabel: "Fieldwork", folderRemoved: false, file: "smith-2019.pdf", state: "in-library", presence: "unknown" }] }),
+      ),
+    );
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const origin = await screen.findByRole("region", { name: "Watched folder" });
+    expect(origin.textContent).toContain("Came from the watched folder “Fieldwork” as “smith-2019.pdf”.");
+  });
+
+  it("after \"Bring in the new version\" the source's files are read again and the new file is in the list (R239 a)", async () => {
+    let added = false;
+    const withNew = { ...SOURCE_FILE, assets: [...SOURCE_FILE.assets, { ...SOURCE_FILE.assets[0]!, id: "a2", path: "Dissertation/Sources/s1/smith-2019-v2.pdf" }] };
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(added ? withNew : SOURCE_FILE)),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.get(url("/projects/:id/sources/:sid/watch-origin"), () =>
+        HttpResponse.json({ origins: [{ watchId: "w1", folderLabel: "Fieldwork", folderRemoved: false, file: "smith-2019.pdf", state: added ? "in-library" : "changed", presence: added ? "unknown" : "local" }] }),
+      ),
+      http.post(url("/projects/:id/sources/:sid/watch-origin/action"), () => {
+        added = true;
+        return HttpResponse.json({ done: "attached", sourceId: "s1" });
+      }),
+    );
+    const onChanged = vi.fn();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onChanged={onChanged} />);
+    const region = await screen.findByRole("region", { name: "Source details" });
+    const files = async () => (await within(region).findByRole("heading", { name: "Files" })).nextElementSibling as HTMLElement;
+    expect(within(await files()).getAllByRole("listitem")).toHaveLength(1);
+    await userEvent.click(await within(region).findByRole("button", { name: /^Bring in the new version/ }));
+    await waitFor(async () => expect(within(await files()).getAllByRole("listitem")).toHaveLength(2));
+    expect(within(region).getByText("smith-2019-v2.pdf")).toBeTruthy();
+    // The parent (the library list) is told once (N3).
+    expect(onChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("says in words that the source is no longer available at its source, with the date noticed; nothing while it is available (Task 69, D17)", async () => {
+    const gone = { ...SOURCE_FILE, source: { ...SOURCE_FILE.source, availability: { status: "unavailable-on-platform", firstNoticedAt: NOTICED_AT } } };
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(gone)), http.get(url("/styles"), () => HttpResponse.json(STYLES)));
+    const { unmount } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region = await screen.findByRole("region", { name: "Source details" });
+    const mark = await within(region).findByRole("note", { name: NOTICED_TEXT });
+    expect(mark.textContent).toBe(NOTICED_TEXT);
+    unmount();
+
+    const here = { ...SOURCE_FILE, source: { ...SOURCE_FILE.source, availability: { status: "available" } } };
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(here)));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region2 = await screen.findByRole("region", { name: "Source details" });
+    await within(region2).findByRole("heading", { name: "Ethnography at Work" });
+    expect(within(region2).queryByText(/no longer available/i)).toBeNull();
+  });
+
+  it("the title heading itself takes its direction from the text (D7): an Arabic title's heading is dir=auto, not only its inline text", async () => {
+    const arabic = { ...SOURCE_FILE, source: { ...SOURCE_FILE.source, title: { variants: [{ lang: "ar", kind: "original", value: "دراسة ميدانية في القاهرة" }] } } };
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(arabic)), http.get(url("/styles"), () => HttpResponse.json(STYLES)));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const heading = await screen.findByRole("heading", { level: 2, name: "دراسة ميدانية في القاهرة" });
+    expect(heading.getAttribute("dir")).toBe("auto");
+    expect(heading.getAttribute("lang")).toBe("ar");
   });
 
   it("edits the title through PATCH, keeping the other title variants", async () => {
@@ -63,5 +155,649 @@ describe("SourceDetail", () => {
     render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
     expect((await screen.findByText("smith2019")).closest("[dir=auto]")).toBeTruthy();
     expect(screen.getByText("2019").closest("[dir=auto]")).toBeTruthy();
+  });
+});
+
+// ---- Task 34d: verification badges, recheck, pictures, background work, transcript link ----
+
+const second = (fields = [FIELD_PUBLISHER_SINGLE]) => withFields(fields, { source: { ...SOURCE_FILE.source, id: "s2", title: { variants: [{ value: "Second source" }] } } });
+
+describe("SourceDetail: verification (Task 34d)", () => {
+  it("shows a badge beside each checked field, with the field and status in its name", async () => {
+    server.use(...sourceHandlers(VERIFIED_SOURCE));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region = await screen.findByRole("region", { name: "Source details" });
+    expect(await within(region).findByRole("button", { name: "Title: Verified" })).toBeTruthy();
+    expect(within(region).getByRole("button", { name: "Creators: Unverified" })).toBeTruthy();
+    expect(within(region).getByRole("button", { name: "Publication date: Conflict" })).toBeTruthy();
+    expect(within(region).getByRole("button", { name: "Publisher: Single source" })).toBeTruthy();
+    expect(within(region).getByRole("button", { name: "DOI: Confirmed by you" })).toBeTruthy();
+    // The heading keeps its own name (the badge sits beside it, not inside it).
+    expect(within(region).getByRole("heading", { level: 2, name: "Ethnography at Work" })).toBeTruthy();
+  });
+
+  it("a checked field the details do not list (here a missing container) is listed with its badge", async () => {
+    const container = { field: "/container", status: "unverified" as const, checks: ["present"], reason: "Container (journal or site name) is missing.", evidence: [] };
+    server.use(...sourceHandlers(withFields([...FIELDS, container])));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    expect(await screen.findByRole("button", { name: "Container (journal or site name): Unverified" })).toBeTruthy();
+  });
+
+  it("choosing a conflicting value posts the researcher's confirmation and the badge then says Confirmed by you", async () => {
+    let body: unknown;
+    server.use(
+      ...sourceHandlers(VERIFIED_SOURCE),
+      http.patch(url("/projects/:id/sources/:sid/fields"), async ({ request }) => {
+        body = await request.json();
+        const issued = { field: "/issued", status: "user-confirmed" as const, checks: ["user"], evidence: FIELD_ISSUED_CONFLICT.evidence };
+        return HttpResponse.json(withFields([FIELD_CREATORS_UNVERIFIED, FIELD_DOI_CONFIRMED, issued, FIELD_PUBLISHER_SINGLE, FIELD_TITLE_VERIFIED], { source: { ...SOURCE_FILE.source, issued: "2018" } }));
+      }),
+    );
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await user.click(await screen.findByRole("button", { name: "Publication date: Conflict" }));
+    await user.click(screen.getByRole("radio", { name: /2018/ }));
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    const confirmed = await screen.findByRole("button", { name: "Publication date: Confirmed by you" });
+    expect(body).toEqual({ field: "/issued", value: "2018" });
+    // R145: focus is back on the badge (re-rendered with its new status), and the page is no longer inert.
+    await waitFor(() => expect(document.activeElement).toBe(confirmed));
+    expect(document.querySelector("[inert]")).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("confirming a missing field moves its badge to the field's own row, and focus follows it there (re-review N1, R145)", async () => {
+    const missing = { field: "/publisher", status: "unverified" as const, checks: ["present"], reason: "Publisher is missing.", evidence: [] };
+    const noPublisher = { ...SOURCE_FILE.source, publisher: undefined };
+    server.use(
+      ...sourceHandlers(withFields([FIELD_TITLE_VERIFIED, missing], { source: noPublisher })),
+      http.patch(url("/projects/:id/sources/:sid/fields"), async () => {
+        const confirmed = { field: "/publisher", status: "user-confirmed" as const, checks: ["user"], evidence: [{ value: "Polity", from: { kind: "user", label: "the researcher" }, at: "2026-11-12T09:00:00.000Z" }] };
+        return HttpResponse.json(withFields([FIELD_TITLE_VERIFIED, confirmed], { source: { ...SOURCE_FILE.source, publisher: "Polity" } }));
+      }),
+    );
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const opener = await screen.findByRole("button", { name: "Publisher: Unverified" });
+    // Close without confirming: focus returns to the badge that opened the dialog.
+    await user.click(opener);
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+    await user.click(opener);
+    await user.type(screen.getByLabelText("Your value"), "Polity{Enter}");
+    const confirmed = await screen.findByRole("button", { name: "Publisher: Confirmed by you" });
+    expect(confirmed).not.toBe(opener);
+    await waitFor(() => expect(document.activeElement).toBe(confirmed));
+    expect(document.querySelector("[inert]")).toBeNull();
+  });
+
+  it("a DOI is confirmed through the field route under its own key (R149), and its badge then says Confirmed by you", async () => {
+    let body: unknown;
+    const doiUnverified = { ...FIELD_DOI_CONFIRMED, status: "unverified" as const, reason: "The DOI could not be checked." };
+    server.use(
+      ...sourceHandlers(withFields([doiUnverified])),
+      http.patch(url("/projects/:id/sources/:sid/fields"), async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json(withFields([FIELD_DOI_CONFIRMED]));
+      }),
+    );
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await user.click(await screen.findByRole("button", { name: "DOI: Unverified" }));
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    expect(await screen.findByRole("button", { name: "DOI: Confirmed by you" })).toBeTruthy();
+    expect(body).toEqual({ field: "/identifiers/doi", value: "10.1000/xyz" });
+  });
+
+  it("a confirm the service refuses is explained in plain words; the popover and the choice stay", async () => {
+    server.use(...sourceHandlers(VERIFIED_SOURCE), http.patch(url("/projects/:id/sources/:sid/fields"), () => serviceError(409, "READ_ONLY", "The library is read-only.")));
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await user.click(await screen.findByRole("button", { name: "Publication date: Conflict" }));
+    await user.click(screen.getByRole("radio", { name: /2018/ }));
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    const alert = await within(screen.getByRole("dialog")).findByRole("alert");
+    expect(alert.textContent).toContain("This library is read-only, so nothing was changed.");
+    expect(alert.textContent).not.toContain("{");
+    expect((screen.getByRole("radio", { name: /2018/ }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByRole("button", { name: "Publication date: Conflict" })).toBeTruthy();
+  });
+
+  it("a confirm refused because the project was locked returns to the unlock screen", async () => {
+    server.use(...sourceHandlers(VERIFIED_SOURCE), http.patch(url("/projects/:id/sources/:sid/fields"), () => serviceError(423, "PROJECT_LOCKED", "This project is locked.")));
+    const onLocked = vi.fn();
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onLocked={onLocked} />);
+    await user.click(await screen.findByRole("button", { name: "Publisher: Single source" }));
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    await waitFor(() => expect(onLocked).toHaveBeenCalled());
+  });
+
+  it("Recheck calls the route and re-renders the badges; the button is off while it runs", async () => {
+    let calls = 0;
+    let release: () => void = () => {};
+    server.use(
+      ...sourceHandlers(VERIFIED_SOURCE),
+      http.post(url("/projects/:id/sources/:sid/recheck"), async () => {
+        calls++;
+        await new Promise<void>((r) => (release = r));
+        return HttpResponse.json(withFields([{ ...FIELD_TITLE_VERIFIED, status: "conflict", reason: "The DOI resolves to a different work." }]));
+      }),
+    );
+    const onChanged = vi.fn();
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onChanged={onChanged} />);
+    await screen.findByRole("button", { name: "Title: Verified" });
+    await user.click(screen.getByRole("button", { name: "Recheck" }));
+    const busy = await screen.findByRole("button", { name: "Rechecking…" });
+    expect((busy as HTMLButtonElement).disabled).toBe(true);
+    await user.click(busy);
+    release();
+    expect(await screen.findByRole("button", { name: "Title: Conflict" })).toBeTruthy();
+    expect(calls).toBe(1);
+    expect(screen.getByText(/Rechecked\./)).toBeTruthy();
+    expect(onChanged).toHaveBeenCalled();
+  });
+
+  it("Recheck is off in a read-only library", async () => {
+    server.use(...sourceHandlers(VERIFIED_SOURCE));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly onClose={vi.fn()} />);
+    expect(((await screen.findByRole("button", { name: "Recheck" })) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("a failed recheck says why and keeps the badges", async () => {
+    server.use(...sourceHandlers(VERIFIED_SOURCE), http.post(url("/projects/:id/sources/:sid/recheck"), () => serviceError(503, "UNAVAILABLE", "x")));
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await user.click(await screen.findByRole("button", { name: "Recheck" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("The library service could not be reached.");
+    expect(screen.getByRole("button", { name: "Title: Verified" })).toBeTruthy();
+  });
+
+  it("a recheck result that arrives after another source was opened is dropped", async () => {
+    let release: () => void = () => {};
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), ({ params }) => HttpResponse.json(params.sid === "s2" ? second() : VERIFIED_SOURCE)),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.post(url("/projects/:id/sources/:sid/recheck"), async () => {
+        await new Promise<void>((r) => (release = r));
+        return HttpResponse.json(withFields([{ ...FIELD_TITLE_VERIFIED, status: "conflict" }]));
+      }),
+    );
+    const user = userEvent.setup();
+    const { rerender } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await user.click(await screen.findByRole("button", { name: "Recheck" }));
+    rerender(<SourceDetail api={testApi()} projectId="p1" sourceId="s2" readOnly={false} onClose={vi.fn()} />);
+    await screen.findByRole("heading", { name: "Second source" });
+    release();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.getByRole("heading", { name: "Second source" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Title: Conflict" })).toBeNull();
+    expect(screen.queryByText(/Rechecked\./)).toBeNull();
+    expect((screen.getByRole("button", { name: "Recheck" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("evidence read for a source that is no longer shown is dropped", async () => {
+    let releaseS1: (() => void) | undefined;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), async ({ params }) => {
+        if (params.sid === "s1") await new Promise<void>((r) => (releaseS1 = r));
+        return HttpResponse.json(params.sid === "s2" ? second() : VERIFIED_SOURCE);
+      }),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+    );
+    const { rerender } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await waitFor(() => expect(releaseS1).toBeDefined());
+    rerender(<SourceDetail api={testApi()} projectId="p1" sourceId="s2" readOnly={false} onClose={vi.fn()} />);
+    await screen.findByRole("heading", { name: "Second source" });
+    releaseS1!();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.getByRole("heading", { name: "Second source" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Title: Verified" })).toBeNull();
+  });
+
+  it("reads the source again when refreshKey changes (a project recheck finished), and the badges follow", async () => {
+    let reads = 0;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), () => {
+        reads++;
+        return HttpResponse.json(reads === 1 ? VERIFIED_SOURCE : withFields([{ ...FIELD_TITLE_VERIFIED, status: "unverified" }]));
+      }),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+    );
+    const { rerender } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} refreshKey={0} />);
+    await screen.findByRole("button", { name: "Title: Verified" });
+    rerender(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} refreshKey={1} />);
+    expect(await screen.findByRole("button", { name: "Title: Unverified" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Ethnography at Work" })).toBeTruthy();
+  });
+
+  it("R137: the badges come from the record's field checks only; a source with no review item waiting still shows its conflict, never 'confirmed by you'", async () => {
+    // The library row of s1 says no review is waiting (SOURCES: needsReview false); its date still conflicts.
+    server.use(...sourceHandlers(withFields([FIELD_ISSUED_CONFLICT])));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    expect(await screen.findByRole("button", { name: "Publication date: Conflict" })).toBeTruthy();
+    expect(screen.queryByText("Confirmed by you")).toBeNull();
+  });
+});
+
+describe("SourceDetail: pictures (R135: read with the token, shown as blobs)", () => {
+  let blobs: ReturnType<typeof installBlobUrls>;
+  beforeEach(() => {
+    blobs = installBlobUrls();
+  });
+  afterEach(() => blobs.restore());
+
+  it("shows the viewing copy and the screenshot as blob pictures read with the token; not the HEIC original, the videos or an SVG", async () => {
+    const asked: Array<{ aid: string; auth: string | null }> = [];
+    server.use(
+      http.get(url("/projects/:id/sources/:sid/assets/:aid/content"), ({ params, request }) => {
+        asked.push({ aid: String(params.aid), auth: request.headers.get("authorization") });
+        return pictureResponse(params.aid === "a-shot" ? "image/png" : "image/jpeg");
+      }),
+      ...sourceHandlers(PICTURE_SOURCE),
+    );
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region = await screen.findByRole("region", { name: "Source details" });
+    await waitFor(() => expect(within(region).getAllByRole("img")).toHaveLength(2));
+    const imgs = within(region).getAllByRole("img");
+    for (const img of imgs) expect(img.getAttribute("src")).toMatch(/^blob:/);
+    expect(imgs.map((i) => i.getAttribute("alt"))).toEqual(["Viewing copy: IMG_0001.proxy.jpg", "Page screenshot: page.png"]);
+    expect(asked.map((a) => a.aid).sort()).toEqual(["a-proxy", "a-shot"]);
+    for (const a of asked) expect(a.auth).toBe(`Bearer ${TOKEN}`);
+    expect(blobs.live()).toHaveLength(2);
+  });
+
+  it("revokes the blob URLs when another source is opened and when the screen closes", async () => {
+    server.use(...sourceHandlers(PICTURE_SOURCE));
+    const { rerender, unmount } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getAllByRole("img")).toHaveLength(2));
+    const first = blobs.live();
+    rerender(<SourceDetail api={testApi()} projectId="p1" sourceId="s2" readOnly={false} onClose={vi.fn()} />);
+    await waitFor(() => expect(first.every((u) => blobs.revoked.has(u))).toBe(true));
+    await waitFor(() => expect(blobs.live()).toHaveLength(2));
+    unmount();
+    expect(blobs.live()).toEqual([]);
+  });
+
+  it("review F6: on a source change, the old source's pictures are never asked for under the new source's address; a locked project is reported once", async () => {
+    const asked: string[] = [];
+    server.use(
+      http.get(url("/projects/:id/sources/:sid/assets/:aid/content"), ({ request }) => {
+        asked.push(new URL(request.url).pathname);
+        return serviceError(423, "PROJECT_LOCKED", "This project is locked.");
+      }),
+      http.get(url("/projects/:id/sources/:sid"), ({ params }) => HttpResponse.json(params.sid === "s2" ? second() : PICTURE_SOURCE)),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+    );
+    const onLocked = vi.fn();
+    const { rerender } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onLocked={onLocked} />);
+    await waitFor(() => expect(asked).toHaveLength(2));
+    await waitFor(() => expect(onLocked).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 30));
+    expect(onLocked).toHaveBeenCalledTimes(1);
+    rerender(<SourceDetail api={testApi()} projectId="p1" sourceId="s2" readOnly={false} onClose={vi.fn()} onLocked={onLocked} />);
+    await screen.findByRole("heading", { name: "Second source" });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(asked.filter((p) => p.includes("/sources/s2/"))).toEqual([]);
+  });
+
+  it("a picture that arrives after the screen closed is never turned into a blob URL", async () => {
+    let release: (() => void) | undefined;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid/assets/:aid/content"), async () => {
+        await new Promise<void>((r) => (release = r));
+        return pictureResponse();
+      }),
+      ...sourceHandlers(PICTURE_SOURCE),
+    );
+    const { unmount } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await waitFor(() => expect(release).toBeDefined());
+    unmount();
+    release!();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(blobs.created).toEqual([]);
+  });
+
+  it("a picture that cannot be read says so in words in its place", async () => {
+    server.use(http.get(url("/projects/:id/sources/:sid/assets/:aid/content"), () => serviceError(409, "CONFLICT", "This file is damaged and could not be read.")), ...sourceHandlers(PICTURE_SOURCE));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const msgs = await screen.findAllByText(/could not be shown/);
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0]!.textContent).toContain("damaged");
+    expect(screen.queryAllByRole("img")).toHaveLength(0);
+  });
+
+  it("a locked project: the picture read is refused and the screen returns to unlocking", async () => {
+    server.use(http.get(url("/projects/:id/sources/:sid/assets/:aid/content"), () => serviceError(423, "PROJECT_LOCKED", "This project is locked.")), ...sourceHandlers(PICTURE_SOURCE));
+    const onLocked = vi.fn();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onLocked={onLocked} />);
+    await waitFor(() => expect(onLocked).toHaveBeenCalled());
+    expect(blobs.live()).toEqual([]);
+  });
+
+  it("a locked project: the source itself is refused, the screen returns to unlocking, and Recheck is not offered", async () => {
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => serviceError(423, "PROJECT_LOCKED", "This project is locked.")), http.get(url("/styles"), () => HttpResponse.json(STYLES)));
+    const onLocked = vi.fn();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onLocked={onLocked} />);
+    await waitFor(() => expect(onLocked).toHaveBeenCalled());
+    const recheck = screen.queryByRole("button", { name: "Recheck" }) as HTMLButtonElement | null;
+    expect(recheck === null || recheck.disabled).toBe(true);
+  });
+});
+
+describe("SourceDetail: background work for the source (R84)", () => {
+  it("a failed viewing copy is shown with its plain reason and a retry; a waiting one says why it waits", async () => {
+    let reads = 0;
+    let retried: unknown;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), () => {
+        reads++;
+        return HttpResponse.json(reads === 1 ? PROXY_FAILED_SOURCE : { ...PROXY_FAILED_SOURCE, pendingProxies: PROXY_FAILED_SOURCE.pendingProxies.map(({ failed: _f, ...j }) => j) });
+      }),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.post(url("/jobs/retry"), async ({ request }) => {
+        retried = await request.json();
+        return HttpResponse.json({ retrying: true });
+      }),
+    );
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    const items = within(work).getAllByRole("listitem");
+    expect(items).toHaveLength(2);
+    expect(items[0]!.textContent).toMatch(/viewing copy of IMG_0001\.heic could not be made/i);
+    expect(items[0]!.textContent).toContain("still carried a location");
+    expect(items[0]!.textContent).toContain("3 attempts");
+    expect(items[1]!.textContent).toMatch(/viewing copy of IMG_0001\.mov has not been made yet/i);
+    await user.click(within(work).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(retried).toEqual({ projectId: "p1", sourceId: "s1" }));
+    await waitFor(() => expect(within(work).queryByText(/could not be made/)).toBeNull());
+    expect(within(work).getAllByRole("listitem")).toHaveLength(2);
+    expect(within(work).getByRole("status").textContent).toContain("Trying again");
+  });
+
+  it("review F4: the service clears a failure after it answers the retry; the screen keeps reading until the retried work settles", async () => {
+    // Every job had failed (no waiting job), and the first reads after the retry still show the old failure.
+    const onlyFailed = { ...PROXY_FAILED_SOURCE, pendingProxies: [PROXY_FAILED_SOURCE.pendingProxies[0]!] };
+    const cleared = { ...onlyFailed, pendingProxies: [{ ...PROXY_FAILED_SOURCE.pendingProxies[0]!, failed: undefined }] };
+    const done = { ...onlyFailed, pendingProxies: [] };
+    let reads = 0;
+    let retried = false;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), () => {
+        reads++;
+        if (!retried || reads <= 3) return HttpResponse.json(onlyFailed);
+        return HttpResponse.json(reads === 4 ? cleared : done);
+      }),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.post(url("/jobs/retry"), () => {
+        retried = true;
+        return HttpResponse.json({ retrying: true });
+      }),
+    );
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} retryPollMs={20} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    await user.click(within(work).getByRole("button", { name: "Try again" }));
+    // Not stuck on the old failure: it goes on reading until the job is done and the section goes away.
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Viewing copies and text recognition" })).toBeNull(), { timeout: 3000 });
+    expect(reads).toBeGreaterThanOrEqual(5);
+    const settled = reads;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(reads).toBe(settled);
+  });
+
+  it("re-review N4: a project locked during the follow-up after Try again ends the follow-up and goes to unlock, once", async () => {
+    let retried = false;
+    let readsAfter = 0;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), () => {
+        if (!retried) return HttpResponse.json(PROXY_FAILED_SOURCE);
+        readsAfter++;
+        return serviceError(423, "PROJECT_LOCKED", "This project is locked.");
+      }),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.post(url("/jobs/retry"), () => {
+        retried = true;
+        return HttpResponse.json({ retrying: true });
+      }),
+    );
+    const onLocked = vi.fn();
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onLocked={onLocked} retryPollMs={20} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    await user.click(within(work).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(onLocked).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 200));
+    expect(readsAfter).toBe(1);
+    expect(onLocked).toHaveBeenCalledTimes(1);
+  });
+
+  it("review F4: answers to the follow-up reads are dropped once another source is shown", async () => {
+    let retried = false;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), ({ params }) => {
+        if (params.sid === "s2") return HttpResponse.json(second());
+        return HttpResponse.json(retried ? { ...PROXY_FAILED_SOURCE, pendingProxies: [] } : PROXY_FAILED_SOURCE);
+      }),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.post(url("/jobs/retry"), async () => {
+        await new Promise((r) => setTimeout(r, 40));
+        retried = true;
+        return HttpResponse.json({ retrying: true });
+      }),
+    );
+    const user = userEvent.setup();
+    const { rerender } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} retryPollMs={20} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    await user.click(within(work).getByRole("button", { name: "Try again" }));
+    rerender(<SourceDetail api={testApi()} projectId="p1" sourceId="s2" readOnly={false} onClose={vi.fn()} retryPollMs={20} />);
+    await screen.findByRole("heading", { name: "Second source" });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(screen.getByRole("heading", { name: "Second source" })).toBeTruthy();
+    expect(screen.queryByText(/Trying again/)).toBeNull();
+  });
+
+  it("a retry the service refuses is explained, and the failure stays listed", async () => {
+    server.use(...sourceHandlers(PROXY_FAILED_SOURCE), http.post(url("/jobs/retry"), () => serviceError(409, "READ_ONLY", "read only")));
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    await user.click(within(work).getByRole("button", { name: "Try again" }));
+    expect((await within(work).findByRole("alert")).textContent).toContain("This library is read-only");
+    expect(within(work).getByText(/could not be made/)).toBeTruthy();
+  });
+
+  it("review F11: the field names copied for the badges are the verification report's own", () => {
+    expect(FIELD_LABELS).toEqual(CORE_FIELD_LABELS);
+  });
+
+  it("review F9/F10: a file with no text says so; waiting work does not claim the media helper is missing", async () => {
+    const src = {
+      ...SOURCE_FILE,
+      fields: [],
+      pendingOcr: [{ id: "o1", assetId: "a1", queuedAt: "2026-11-01T10:00:00Z", failed: { code: "NO_TEXT", at: "2026-11-01T10:01:00Z" } }],
+      pendingProxies: [{ id: "j9", type: "image.proxy", assetId: "a1", location: "coarsen", queuedAt: "2026-11-01T10:00:00Z" }],
+    };
+    server.use(...sourceHandlers(src));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    const [proxy, ocr] = within(work).getAllByRole("listitem");
+    expect(ocr!.textContent).toContain("no text that could be recognised");
+    expect(proxy!.textContent).toContain("has not been made yet");
+    expect(proxy!.textContent).toContain("waits until it is running");
+  });
+
+  it("text recognition that did not finish is listed too, with the same retry", async () => {
+    const ocr = { ...SOURCE_FILE, fields: [], pendingOcr: [{ id: "o1", assetId: "a1", queuedAt: "2026-11-01T10:00:00Z", failed: { code: "SOMETHING_NEW", at: "2026-11-01T10:01:00Z" } }] };
+    server.use(...sourceHandlers(ocr));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    expect(within(work).getByRole("listitem").textContent).toBe("Text recognition of smith-2019.pdf did not finish: the media helper could not finish it (1 attempt).");
+    expect(within(work).getByRole("button", { name: "Try again" })).toBeTruthy();
+  });
+
+  it("no background work: no such section", async () => {
+    server.use(...sourceHandlers(VERIFIED_SOURCE));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await screen.findByRole("heading", { name: "Ethnography at Work" });
+    expect(screen.queryByRole("region", { name: "Viewing copies and text recognition" })).toBeNull();
+  });
+});
+
+describe("SourceDetail: the transcript entry point", () => {
+  it("a source with a transcript links to the transcript viewer for this project and source", async () => {
+    server.use(...sourceHandlers(TRANSCRIPT_SOURCE));
+    const user = userEvent.setup();
+    const before = window.location.pathname + window.location.search;
+    render(<SourceDetail api={testApi()} projectId="p 1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const link = await screen.findByRole("link", { name: "Open the transcript" });
+    expect(link.getAttribute("href")).toBe("/transcript?project=p+1&source=s1");
+    await user.click(link);
+    expect(window.location.pathname).toBe("/transcript");
+    expect(new URLSearchParams(window.location.search).get("project")).toBe("p 1");
+    window.history.replaceState(null, "", before);
+  });
+
+  it("a recording without a transcript links to the viewer to play and transcribe it (Task 34c's link)", async () => {
+    server.use(...sourceHandlers({ ...TRANSCRIPT_SOURCE, assets: TRANSCRIPT_SOURCE.assets.filter((a) => a.kind !== "transcript") }));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const link = await screen.findByRole("link", { name: "Play the recording and transcribe it" });
+    expect(link.getAttribute("href")).toBe("/transcript?project=p1&source=s1");
+  });
+
+  it("no transcript, no link", async () => {
+    server.use(...sourceHandlers(VERIFIED_SOURCE));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await screen.findByRole("heading", { name: "Ethnography at Work" });
+    expect(screen.queryByRole("link", { name: "Open the transcript" })).toBeNull();
+  });
+});
+
+// Task F18b (R340 e, R330 b): how a file was got, from the asset's `acquired` record as the service's answer carries it
+// (apps/library-service/src/routes/sources.ts `sourceRecord` passes each asset on as stored).
+describe("SourceDetail: how a file was got (F18b; R340 e)", () => {
+  const AT = "2026-11-14T12:00:00.000Z";
+  const ADDED = `Fetched on Nov ${new Date(AT).getDate()}, 2026.`;
+  const tool = { name: "find-and-acquire", version: "0" };
+  const asset = (id: string, acquired?: unknown) => ({ ...SOURCE_FILE.assets[0]!, id, path: `Dissertation/Sources/s1/${id}.pdf`, ...(acquired !== undefined ? { acquired } : {}) });
+  async function filesWith(assets: unknown[]) {
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json({ ...SOURCE_FILE, assets })), http.get(url("/styles"), () => HttpResponse.json(STYLES)));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region = await screen.findByRole("region", { name: "Source details" });
+    const list = (await within(region).findByRole("heading", { name: "Files" })).nextElementSibling as HTMLElement;
+    return (id: string) => {
+      const li = [...list.querySelectorAll(":scope > li")].find((x) => x.textContent?.startsWith(`${id}.pdf`)) as HTMLElement | undefined;
+      if (!li) throw new Error(`no file ${id}`);
+      return li;
+    };
+  }
+  const how = (li: HTMLElement) => li.querySelector(".ao-source__acquired")?.textContent ?? undefined;
+
+  it("each method and each check result, in words", async () => {
+    const file = await filesWith([
+      asset("free-match", { method: "free_copy", via: "service", service: "arxiv", address: "https://arxiv.org/pdf/2101.00001", at: AT, tool, access: "public", check: { result: "match", by: "title" } }),
+      asset("free-no-service", { method: "free_copy", via: "service", address: "https://europepmc.org/articles/PMC1/pdf", at: AT, tool, access: "public", check: { result: "match", by: "doi" } }),
+      asset("free-doab", { method: "free_copy", via: "service", service: "doab", address: "https://library.oapen.org/bitstream/1/2.pdf", at: AT, tool, access: "public" }),
+      asset("library-doubt", { method: "library_access", via: "sign-in-window", address: "https://www.publisher.example/doi/pdf/10.5555/x", at: AT, tool, access: "signed-in-session", check: { result: "accepted-after-mismatch", why: "other-doi" } }),
+      asset("library-title", { method: "library_access", via: "sign-in-window", address: "https://www.publisher.example/doi/pdf/10.5555/y", at: AT, tool, access: "signed-in-session", check: { result: "accepted-after-mismatch", why: "title-absent" } }),
+      asset("later-method", { method: "some_later_way", via: "service", address: "https://files.example.org/a.pdf", at: AT, tool, access: "public" }),
+      asset("plain"),
+    ]);
+    expect(how(file("free-match"))).toBe(`A free copy from arxiv.org, found through arXiv. ${ADDED} The app's check had said it looked like the right file.`);
+    expect(how(file("free-no-service"))).toBe(`A free copy from europepmc.org. ${ADDED} The app's check had said it looked like the right file.`);
+    expect(how(file("free-doab"))).toBe(`A free copy from library.oapen.org, found through Directory of Open Access Books. ${ADDED}`);
+    expect(how(file("library-doubt"))).toBe(`Fetched through your library (www.publisher.example). ${ADDED} You used it although the app's check had a doubt: The file names another DOI as its own.`);
+    expect(how(file("library-title"))).toBe(`Fetched through your library (www.publisher.example). ${ADDED} You used it although the app's check had a doubt: The file does not show this record's title with its author.`);
+    expect(how(file("later-method"))).toBe(`Got through Find and acquire. ${ADDED}`);
+    // A file without such a record shows nothing new.
+    expect(how(file("plain"))).toBeUndefined();
+    expect(file("plain").textContent).toBe("plain.pdf pdf · 1 KB");
+  });
+
+  it("R347 c: a free copy fetched in the app's own window says where the window was opened, never \"A free copy from <host>\"; other ways read as before", async () => {
+    const window_ = { method: "free_copy", via: "sign-in-window", at: AT, tool, access: "signed-in-session" };
+    const file = await filesWith([
+      asset("window-host", { ...window_, address: "https://repository.example.edu/handle/1/2", check: { result: "match", by: "title" } }),
+      asset("window-doubt", { ...window_, address: "https://doi.org/10.5555/x", check: { result: "accepted-after-mismatch", why: "other-doi" } }),
+      asset("window-no-host", { ...window_, address: "" }),
+      asset("service", { method: "free_copy", via: "service", service: "arxiv", address: "https://arxiv.org/pdf/2101.00001", at: AT, tool, access: "public" }),
+      asset("later-via", { method: "free_copy", via: "from-a-later-build", address: "https://files.example.org/a.pdf", at: AT, tool, access: "public" }),
+      asset("no-via", { method: "free_copy", address: "https://files.example.org/b.pdf", at: AT, tool, access: "public" }),
+      asset("library", { method: "library_access", via: "sign-in-window", address: "https://ezproxy.example.edu/x.pdf", at: AT, tool, access: "signed-in-session" }),
+    ]);
+    expect(how(file("window-host"))).toBe(`Fetched in the app's own window, opened at repository.example.edu. ${ADDED} The app's check had said it looked like the right file.`);
+    expect(how(file("window-doubt"))).toBe(`Fetched in the app's own window, opened at doi.org. ${ADDED} You used it although the app's check had a doubt: The file names another DOI as its own.`);
+    expect(how(file("window-no-host"))).toBe(`Fetched in the app's own window. ${ADDED}`);
+    for (const id of ["window-host", "window-doubt", "window-no-host"]) expect(how(file(id))).not.toMatch(/free copy|library/iu);
+    // A service's free copy, and a free copy whose way this build does not know: as before, no service invented.
+    expect(how(file("service"))).toBe(`A free copy from arxiv.org, found through arXiv. ${ADDED}`);
+    expect(how(file("later-via"))).toBe(`A free copy from files.example.org. ${ADDED}`);
+    expect(how(file("no-via"))).toBe(`A free copy from files.example.org. ${ADDED}`);
+    expect(how(file("library"))).toBe(`Fetched through your library (ezproxy.example.edu). ${ADDED}`);
+    // The host is the record's, shown through UserText.
+    expect([...file("window-host").querySelectorAll(".ao-source__acquired [dir=auto]")].map((p) => p.textContent)).toEqual(["repository.example.edu", `Nov ${new Date(AT).getDate()}, 2026`]);
+  });
+
+  it("R348 g: a file got through the library in the researcher's own browser says so, with the tab's host; every other way reads as before", async () => {
+    const browser = { method: "library_access", via: "browser-extension", at: AT, tool, access: "signed-in-session" };
+    const file = await filesWith([
+      asset("browser-host", { ...browser, address: "https://www.publisher.example/doi/pdf/10.5555/z", check: { result: "match", by: "title" } }),
+      asset("browser-doubt", { ...browser, address: "https://someone:secret@ezproxy.example.edu:8443/x.pdf", check: { result: "accepted-after-mismatch", why: "other-version" } }),
+      asset("browser-no-host", { ...browser, address: "" }),
+      asset("browser-hostile", { ...browser, address: "javascript:alert(1)" }),
+      asset("window-library", { method: "library_access", via: "sign-in-window", address: "https://ezproxy.example.edu/x.pdf", at: AT, tool, access: "signed-in-session" }),
+      asset("library-later-via", { method: "library_access", via: "from-a-later-build", address: "https://ezproxy.example.edu/y.pdf", at: AT, tool, access: "signed-in-session" }),
+      asset("free-browser-via", { method: "free_copy", via: "browser-extension", address: "https://files.example.org/c.pdf", at: AT, tool, access: "public" }),
+    ]);
+    expect(how(file("browser-host"))).toBe(`Got through your library in your own browser, sent from www.publisher.example. ${ADDED} The app's check had said it looked like the right file.`);
+    expect(how(file("browser-doubt"))).toBe(
+      `Got through your library in your own browser, sent from ezproxy.example.edu:8443. ${ADDED} You used it although the app's check had a doubt: The file seems to be another volume, part or edition of this work.`,
+    );
+    expect(file("browser-doubt").textContent).not.toMatch(/someone|secret/u);
+    expect(how(file("browser-no-host"))).toBe(`Got through your library in your own browser. ${ADDED}`);
+    expect(how(file("browser-hostile"))).toBe(`Got through your library in your own browser. ${ADDED}`);
+    for (const id of ["browser-host", "browser-doubt", "browser-no-host"]) expect(how(file(id))).not.toMatch(/\badd(s|ed)?\b|window/iu);
+    // The host is the record's, through UserText.
+    expect([...file("browser-host").querySelectorAll(".ao-source__acquired [dir=auto]")].map((p) => p.textContent)).toEqual(["www.publisher.example", `Nov ${new Date(AT).getDate()}, 2026`]);
+    // Every other combination as before.
+    expect(how(file("window-library"))).toBe(`Fetched through your library (ezproxy.example.edu). ${ADDED}`);
+    expect(how(file("library-later-via"))).toBe(`Fetched through your library (ezproxy.example.edu). ${ADDED}`);
+    expect(how(file("free-browser-via"))).toBe(`A free copy from files.example.org. ${ADDED}`);
+  });
+
+  it("every service as the Search sources screen names it", async () => {
+    const names = { openalex: "OpenAlex", unpaywall: "Unpaywall", arxiv: "arXiv", europepmc: "Europe PMC", semanticscholar: "Semantic Scholar", doab: "Directory of Open Access Books", internetarchive: "Internet Archive" };
+    const file = await filesWith(Object.keys(names).map((s) => asset(s, { method: "free_copy", via: "service", service: s, address: "https://archive.org/download/x/x.pdf", at: AT, tool, access: "public" })));
+    for (const [s, name] of Object.entries(names)) expect(how(file(s))).toBe(`A free copy from archive.org, found through ${name}. ${ADDED}`);
+  });
+
+  it("the host is parsed from the recorded address, never taken as given; every part from the record through UserText; hostile values are text", async () => {
+    const file = await filesWith([
+      asset("userinfo", { method: "library_access", via: "sign-in-window", address: "https://someone:secret@ezproxy.example.edu:8443/x.pdf?token=abc#frag", at: AT, tool, access: "signed-in-session" }),
+      asset("markup", { method: "free_copy", via: "service", service: "<img src=x onerror=alert(1)>", address: "https://xn--bcher-kva.example/<b>bold</b>.pdf", at: AT, tool, access: "public", host: "<b>evil</b>" }),
+      asset("not-an-address", { method: "free_copy", via: "service", service: "arxiv", address: "javascript:alert(1)", at: AT, tool, access: "public" }),
+      asset("garbage", { method: "library_access", via: "sign-in-window", address: "not an address <i>x</i>", at: "not a date", tool, access: "signed-in-session", check: { result: "accepted-after-mismatch", why: "from-a-later-build" } }),
+      asset("looks-right-doubt", { method: "free_copy", via: "service", address: "https://arxiv.org/pdf/1", at: AT, tool, access: "public", check: { result: "accepted-after-mismatch", why: "looks-right" } }),
+      asset("later-check", { method: "free_copy", via: "service", address: "https://arxiv.org/pdf/1", at: AT, tool, access: "public", check: { result: "some-later-result" } }),
+      asset("not-an-object", "free_copy"),
+    ]);
+    expect(how(file("userinfo"))).toBe(`Fetched through your library (ezproxy.example.edu:8443). ${ADDED}`);
+    expect(file("userinfo").textContent).not.toMatch(/someone|secret|token|frag/u);
+    // An unknown service is no service; the host is the address's own; markup stays text.
+    expect(how(file("markup"))).toBe(`A free copy from xn--bcher-kva.example. ${ADDED}`);
+    expect(file("markup").querySelector("img, b")).toBeNull();
+    expect(file("markup").textContent).not.toContain("evil");
+    // No host can be read: said without one; no date: no "Fetched on"; a check this build does not know: no sentence.
+    expect(how(file("not-an-address"))).toBe(`A free copy, found through arXiv. ${ADDED}`);
+    expect(how(file("garbage"))).toBe("Fetched through your library.");
+    expect(file("garbage").querySelector("i")).toBeNull();
+    expect(how(file("looks-right-doubt"))).toBe(`A free copy from arxiv.org. ${ADDED}`);
+    expect(how(file("later-check"))).toBe(`A free copy from arxiv.org. ${ADDED}`);
+    expect(how(file("not-an-object"))).toBeUndefined();
+    // The parts from the record are outside text: bidi-isolated.
+    const parts = file("userinfo").querySelectorAll(".ao-source__acquired [dir=auto]");
+    expect([...parts].map((p) => p.textContent)).toEqual(["ezproxy.example.edu:8443", `Nov ${new Date(AT).getDate()}, 2026`]);
   });
 });

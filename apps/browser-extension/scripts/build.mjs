@@ -6,7 +6,7 @@ import { build } from "vite";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const configFile = fileURLToPath(new URL("../vite.config.ts", import.meta.url));
 
-for (const mode of ["popup", "background", "content"]) await build({ configFile, mode, logLevel: "warn" });
+for (const mode of ["popup", "background", "content", "find-tab"]) await build({ configFile, mode, logLevel: "warn" });
 
 copyFileSync(`${root}/manifest.json`, `${root}/dist/manifest.json`);
 // Checked against its schema when the extension loads it; parse here so a broken file fails the build.

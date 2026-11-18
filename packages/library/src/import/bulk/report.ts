@@ -12,7 +12,7 @@
 import { appendLibraryEvent, projectReviewEntries, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
 import { createHash } from "node:crypto";
-import { BOOKKEEPING, activeBatches, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, type GovernanceNote, type ShownState } from "./batch.js";
+import { BOOKKEEPING, activeBatches, unsavedStops, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, type GovernanceNote, type ShownState } from "./batch.js";
 
 export interface ImportReport {
   batchId: string;
@@ -21,13 +21,47 @@ export interface ImportReport {
   state: ShownState;
   startedAt: string;
   finishedAt?: string;
-  counts: { items: number; created: number; needsReview: number; duplicates: number; merged: number; updated: number; unchanged: number; deletedHere: number; failed: number };
+  counts: {
+    items: number;
+    created: number;
+    needsReview: number;
+    duplicates: number;
+    merged: number;
+    updated: number;
+    unchanged: number;
+    deletedHere: number;
+    failed: number;
+    /**
+     * Task Z5 (absent in reports written before it; R224): sources this batch marked gone from Zotero (of them in
+     * its bin), sources already marked so by an earlier batch, sources back (of them also updated, which are in
+     * `updated` too), and items gone with no source of their own here.
+     */
+    goneInZotero?: number;
+    goneInZoteroBin?: number;
+    goneAlready?: number;
+    backInZotero?: number;
+    backInZoteroUpdated?: number;
+    goneNotMarked?: number;
+    /**
+     * Task Z6 (absent in reports written before it): items with a field changed in Zotero and here, waiting for the
+     * researcher (an item that also took in other changes is in `updated` too); collections renamed in Zotero that
+     * arrived under their new name, the old one kept.
+     */
+    conflicts?: number;
+    collectionsRenamed?: number;
+    /** R236 a: items with a field Zotero cleared that keeps its value here. */
+    clearedInZoteroKept?: number;
+  };
+  /** Files this import stored: copied into the library, and left as links where they were (R136). Always given. */
+  files: { copied: number; linked: number };
   failures: Array<{ item: string; reason: string }>;
   /** Items imported without some of their linked files (e.g. "attached file not found"); never a path (R66). */
   fileNotes: Array<{ item: string; note: string }>;
   pendingReview: Array<{ reviewId: string; sourceId?: string; reasons: string[] }>;
   /** Re-imports (R72): fields not updated because they were changed after the last import (JSON pointers). */
   keptFields: Array<{ item: string; fields: string[] }>;
+  /** Annotations the researcher deleted here that Zotero still has: not imported again (counted over the newest line of each item). */
+  annotationsDeletedHere: number;
   governance: GovernanceNote[];
   notes: string[];
   /**
@@ -68,6 +102,17 @@ export function reportLabel(key: string, secret: string | null | undefined): str
 const droppedNote = (n: number): string[] =>
   n ? [`${n.toLocaleString("en-US")} ${n === 1 ? "annotation" : "annotations"} over the per-source limit (10,000 annotations or 16 MB of text) ${n === 1 ? "was" : "were"} not imported.`] : [];
 
+/** R393: failures by reason, in the order each reason first occurs, with their items in order. */
+export function failureGroups(failures: ImportReport["failures"]): Array<{ reason: string; items: string[] }> {
+  const groups = new Map<string, string[]>();
+  for (const f of failures) {
+    const items = groups.get(f.reason);
+    if (items) items.push(f.item);
+    else groups.set(f.reason, [f.item]);
+  }
+  return [...groups].map(([reason, items]) => ({ reason, items }));
+}
+
 function markdown(r: ImportReport): string {
   const lines = [
     `# Import report: batch ${r.number}`,
@@ -83,12 +128,34 @@ function markdown(r: ImportReport): string {
     `- Merged into existing sources: ${r.counts.merged}`,
     ...(r.counts.updated || r.counts.unchanged ? [`- Updated from a newer version: ${r.counts.updated}`, `- Unchanged since the last import: ${r.counts.unchanged}`] : []),
     ...(r.counts.deletedHere ? [`- Deleted here — not re-imported: ${r.counts.deletedHere}`] : []),
+    // Task Z5: kept here and marked, never deleted.
+    ...((r.counts.goneInZotero ?? 0) - (r.counts.goneInZoteroBin ?? 0) > 0 ? [`- Marked as no longer in Zotero: ${(r.counts.goneInZotero ?? 0) - (r.counts.goneInZoteroBin ?? 0)}`] : []),
+    ...(r.counts.goneInZoteroBin ? [`- In the Zotero bin: ${r.counts.goneInZoteroBin}`] : []),
+    ...(r.counts.goneAlready ? [`- Still gone from Zotero (marked earlier): ${r.counts.goneAlready}`] : []),
+    ...(r.counts.backInZotero ? [`- Back in Zotero: ${r.counts.backInZotero}`] : []),
+    // Task Z6: the researcher's value was kept; Zotero's waits beside it in the review queue.
+    ...(r.counts.conflicts ? [`- Changed in Zotero and here — waiting for you: ${r.counts.conflicts}`] : []),
+    ...(r.counts.clearedInZoteroKept ? [`- Cleared in Zotero, kept here: ${r.counts.clearedInZoteroKept}`] : []),
+    ...(r.counts.collectionsRenamed ? [`- Collections renamed in Zotero arrive under their new name; the old one is kept here: ${r.counts.collectionsRenamed}`] : []),
+    ...(r.annotationsDeletedHere ? [`- Annotations deleted here — not re-imported: ${r.annotationsDeletedHere}`] : []),
     `- Failed: ${r.counts.failed}`,
+    `- Files copied into the library: ${r.files.copied}`,
+    `- Files left as links: ${r.files.linked}`,
     "",
   ];
+  // R393: the notes (where a stopped batch says why) right under the counts, so that they cannot be missed.
+  if (r.notes.length) {
+    lines.push("## Notes", "");
+    for (const n of r.notes) lines.push(`- ${n}`);
+    lines.push("");
+  }
+  // R393: failures that share a reason are one entry, with their number and the items under it.
   if (r.failures.length) {
     lines.push("## Failures", "");
-    for (const f of r.failures) lines.push(`- ${f.item}: ${f.reason}`);
+    for (const g of failureGroups(r.failures)) {
+      lines.push(`- ${g.reason} (${g.items.length} ${g.items.length === 1 ? "item" : "items"})`);
+      for (const item of g.items) lines.push(`  - ${item}`);
+    }
     lines.push("");
   }
   if (r.fileNotes.length) {
@@ -112,15 +179,16 @@ function markdown(r: ImportReport): string {
     }
     lines.push("");
   }
-  if (r.notes.length) {
-    lines.push("## Notes", "");
-    for (const n of r.notes) lines.push(`- ${n}`);
-    lines.push("");
-  }
   return lines.join("\n");
 }
 
 /** The batch's report as it stands, from its record, journal and the review queue. Writes nothing. */
+/** The stopping note of a batch not running whose record could not be saved (unsavedStops), unless the record has it. */
+function unsavedNote(notes: string[], batchId: string): string[] {
+  const n = unsavedStops.get(batchId);
+  return n && !activeBatches.has(batchId) && !notes.includes(n) ? [n] : [];
+}
+
 export async function batchReport(repo: Repo, projectId: string, batchId: string): Promise<ImportReport> {
   const rec = await findBatch(repo, projectId, batchId);
   if (!rec) throw new NotFoundError("Import batch", batchId);
@@ -130,6 +198,16 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
   const notesByKey = new Map<string, string[]>();
   for (const e of journal) if (e.notes?.length && !notesByKey.has(e.key)) notesByKey.set(e.key, e.notes);
   const c = countOutcomes(latest.values());
+  // Files stored, by item (its first line that stored any); an item that failed or was skipped in review keeps none.
+  const filesByKey = new Map<string, { copied: number; linked: number }>();
+  for (const e of journal) if (e.files && !filesByKey.has(e.key)) filesByKey.set(e.key, e.files);
+  const files = { copied: 0, linked: 0 };
+  for (const [key, f] of filesByKey) {
+    const last = latest.get(key)?.outcome;
+    if (last === "failed" || last === "skipped") continue;
+    files.copied += f.copied;
+    files.linked += f.linked;
+  }
   const pending = (await projectReviewEntries(repo, projectId)).filter((e) => e.batchId === batchId && e.status === "pending");
   const report: ImportReport = {
     batchId,
@@ -139,12 +217,15 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     startedAt: rec.startedAt,
     ...(rec.finishedAt ? { finishedAt: rec.finishedAt } : {}),
     counts: c,
+    files,
     failures: [...latest.values()].filter((e) => e.outcome === "failed").map((e) => ({ item: reportLabel(e.key, rec.secret), reason: e.reason ?? "The item could not be imported." })),
     fileNotes: [...notesByKey].flatMap(([key, notes]) => notes.map((note) => ({ item: reportLabel(key, rec.secret), note }))),
     pendingReview: pending.map((e) => ({ reviewId: e.id, ...(e.sourceId ? { sourceId: e.sourceId } : {}), reasons: e.reasons })),
     keptFields: [...latest.values()].filter((e) => e.merge?.kept?.length).map((e) => ({ item: reportLabel(e.key, rec.secret), fields: e.merge!.kept! })),
+    annotationsDeletedHere: [...latest.values()].reduce((n, e) => n + (e.annotationsDeletedHere ?? 0), 0),
     governance: rec.governance,
-    notes: [...rec.notes, ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
+    // R413 b, c: a stop whose record could not be saved still says why.
+    notes: [...rec.notes, ...unsavedNote(rec.notes, batchId), ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
     created: { collectionIds: [...rec.createdCollectionIds], tagIds: [...rec.createdTagIds] },
   };
   return report;

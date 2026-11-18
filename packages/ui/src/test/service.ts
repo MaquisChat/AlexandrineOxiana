@@ -12,9 +12,16 @@ export const BASE = "http://127.0.0.1:4100";
 export const TOKEN = "t".repeat(40);
 export const url = (path: string) => `${BASE}${path}`;
 
-export const server = setupServer();
+/**
+ * The handlers every file starts with: "Choose a library" asks these two on its own (R447), so each screen that shows
+ * it has an answer — no suggestion, and no figure for the room. A test that is about them gives its own.
+ */
+export const server = setupServer(
+  http.get(url("/libraries/suggested-folder"), () => HttpResponse.json({})),
+  http.post(url("/libraries/folder-room"), () => HttpResponse.json({})),
+);
 
-/** Starts the mocked service for the file; every request must have a handler. */
+/** Starts the mocked service for the file; every request must have a handler (the two above are there from the start). */
 export function useMockService(): void {
   beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
   afterEach(() => server.resetHandlers());
@@ -154,6 +161,8 @@ export function libraryHandlers(opts: { current?: Record<string, unknown>; state
     http.get(url("/projects/:id/tags"), j(TAGS)),
     http.get(url("/projects/:id/sources"), j(SOURCES)),
     http.get(url("/projects/:id/sources/:sid"), j(SOURCE_FILE)),
+    // The project's review queue (Task 67): the count the library's link shows (s2 waits).
+    http.get(url("/projects/:id/review"), j({ items: [], total: 1, offset: 0, limit: 0 })),
     http.get(url("/styles"), j(STYLES)),
     http.get(url("/events"), () => sse([{ type: "library.state", data: state }, ...(opts.events ?? [])])),
   ];

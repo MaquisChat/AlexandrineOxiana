@@ -29,6 +29,13 @@ describe("Library screen", () => {
     expect(clinic.textContent).toMatch(/Locked/);
   });
 
+  it("the library's name heading takes its direction from the text itself (D7)", async () => {
+    server.use(...libraryHandlers());
+    renderLibrary({ ...CURRENT_RW, name: "مكتبة الأطروحة" });
+    const heading = await screen.findByRole("heading", { level: 1, name: "مكتبة الأطروحة" });
+    expect(heading.getAttribute("dir")).toBe("auto");
+  });
+
   it("shows nested collections, tags and the project's sources", async () => {
     server.use(...libraryHandlers());
     renderLibrary();
@@ -97,8 +104,64 @@ describe("Library screen", () => {
     const items = within(list).getAllByRole("listitem");
     expect(items).toHaveLength(3);
     expect(items[0]!.textContent).toMatch(/a\.pdf.*Added as a new source/);
-    expect(within(items[1]!).getByRole("link", { name: /needs review/i }).getAttribute("href")).toBe("/import/review");
+    // It leads to the project's queue, at that source's entries (Task 67).
+    expect(within(items[1]!).getByRole("link", { name: /needs review/i }).getAttribute("href")).toBe("/import/review?project=p1&source=s10");
     expect(items[2]!.textContent).toMatch(/c\.pdf.*The file could not be read\./);
+  });
+
+  it("links the project's review queue beside its other actions, with the count of waiting entries (Task 67)", async () => {
+    const asked: Array<string | null> = [];
+    server.use(
+      http.get(url("/projects/:id/review"), ({ request }) => {
+        asked.push(new URL(request.url).searchParams.get("limit"));
+        return HttpResponse.json({ items: [], total: 3, offset: 0, limit: 0 });
+      }),
+      ...libraryHandlers(),
+    );
+    renderLibrary();
+    const header = (await screen.findByRole("heading", { level: 1 })).closest("header")!;
+    const link = await within(header).findByRole("link", { name: "Review queue (3 waiting)" });
+    expect(link.getAttribute("href")).toBe("/import/review?project=p1");
+    // Only the count is asked for.
+    expect(asked.every((l) => l === "0")).toBe(true);
+  });
+
+  it("a row's Needs review badge leads to the project's queue at that source (Task 67)", async () => {
+    server.use(...libraryHandlers());
+    renderLibrary();
+    const table = await screen.findByRole("table", { name: "Sources" });
+    const badge = await within(table).findByRole("link", { name: /Needs review/ });
+    expect(badge.getAttribute("href")).toBe("/import/review?project=p1&source=s2");
+    expect(within(table).getAllByRole("link", { name: /Needs review/ })).toHaveLength(1);
+  });
+
+  it("in a read-only library the badge is shown but is not a link (the queue cannot be read or decided there; fix round 1, M4)", async () => {
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" };
+    server.use(...libraryHandlers({ current: ro }));
+    renderLibrary(ro);
+    const table = await screen.findByRole("table", { name: "Sources" });
+    expect(await within(table).findByText("Needs review")).toBeTruthy();
+    expect(within(table).queryByRole("link", { name: /Needs review/ })).toBeNull();
+  });
+
+  it("a locked project's queue count is neither asked for nor shown (Task 67)", async () => {
+    const asked: string[] = [];
+    server.use(
+      http.get(url("/projects/:id/review"), ({ params }) => {
+        asked.push(String(params.id));
+        return HttpResponse.json({ items: [], total: 5, offset: 0, limit: 0 });
+      }),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    const nav = await screen.findByRole("navigation", { name: "Projects" });
+    await screen.findByRole("link", { name: "Review queue (5 waiting)" });
+    await user.click(within(nav).getByRole("button", { name: /Clinic interviews/ }));
+    await screen.findByLabelText("Passphrase or recovery code");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByRole("link", { name: /Review queue/ })).toBeNull();
+    expect(asked).not.toContain("p2");
   });
 
   it("names the device holding the lock: read-only (locked by <hostname>), from the library and its state events", async () => {
@@ -113,6 +176,56 @@ describe("Library screen", () => {
     server.use(...libraryHandlers({ state: st }));
     renderLibrary();
     expect(await screen.findByText(/Read-only \(locked by lab-mac\)/)).toBeTruthy();
+  });
+
+  it("Capture from the web is offered for a project that can take sources, like Import: not while the library is read-only or the project locked (D10)", async () => {
+    server.use(...libraryHandlers());
+    const view = renderLibrary();
+    const user = userEvent.setup();
+    expect((await screen.findByRole("link", { name: "Capture from the web" })).getAttribute("href")).toBe("/capture?project=p1");
+    // The locked project p2: no Capture (and no Import) until it is unlocked.
+    await user.click(screen.getByRole("button", { name: /Clinic interviews/ }));
+    await screen.findByRole("heading", { name: /is locked/ });
+    expect(screen.queryByRole("link", { name: "Capture from the web" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "Import" })).toBeNull();
+    view.unmount();
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" };
+    server.use(...libraryHandlers({ current: ro }));
+    renderLibrary(ro);
+    await screen.findByRole("link", { name: "Governance and records" });
+    expect(screen.queryByRole("link", { name: "Capture from the web" })).toBeNull();
+  });
+
+  it("the Library screen links to Find and acquire beside Capture, under the same conditions (Task F6, R253)", async () => {
+    server.use(...libraryHandlers());
+    const view = renderLibrary();
+    const user = userEvent.setup();
+    const capture = await screen.findByRole("link", { name: "Capture from the web" });
+    const find = screen.getByRole("link", { name: "Find and acquire" });
+    expect(find.getAttribute("href")).toBe("/find?project=p1");
+    // Directly after Capture: the same element in the same row, next in the tab order.
+    expect(capture.nextElementSibling).toBe(find);
+    expect(find.tagName).toBe(capture.tagName);
+    expect(find.className).toBe(capture.className);
+    capture.focus();
+    await user.tab();
+    expect(document.activeElement).toBe(find);
+    // The locked project p2: no link until it is unlocked.
+    await user.click(screen.getByRole("button", { name: /Clinic interviews/ }));
+    await screen.findByRole("heading", { name: /is locked/ });
+    expect(screen.queryByRole("link", { name: "Find and acquire" })).toBeNull();
+    view.unmount();
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" };
+    server.use(...libraryHandlers({ current: ro }));
+    renderLibrary(ro);
+    await screen.findByRole("link", { name: "Governance and records" });
+    expect(screen.queryByRole("link", { name: "Find and acquire" })).toBeNull();
+  });
+
+  it("a read-only library offers no new project", async () => {
+    server.use(...libraryHandlers({ current: { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" } }));
+    renderLibrary({ libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" });
+    expect(await screen.findByRole("button", { name: "New project" })).toHaveProperty("disabled", true);
   });
 
   it("a read-only library shows the banner and disables the drop zone and edit buttons", async () => {
@@ -134,10 +247,144 @@ describe("Library screen", () => {
     expect(await screen.findByText(/last automatic backup of Dissertation failed/)).toBeTruthy();
   });
 
+  it("N3: when an index rebuild finishes the sources are read again, so the 'needs rebuilding' note goes", async () => {
+    let calls = 0;
+    let firstListed: () => void = () => {};
+    const listed = new Promise<void>((r) => (firstListed = r));
+    const enc = new TextEncoder();
+    const frame = (type: string, data: unknown) => enc.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+    server.use(
+      http.get(url("/projects/:id/sources"), () => {
+        calls++;
+        if (calls === 1) setTimeout(firstListed, 0);
+        return HttpResponse.json({ ...SOURCES, ...(calls === 1 ? { incomplete: true } : {}) });
+      }),
+      // The rebuild's last progress event arrives once the list (marked incomplete) is on screen.
+      http.get(url("/events"), () => {
+        const stream = new ReadableStream<Uint8Array>({
+          async start(c) {
+            c.enqueue(frame("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} }));
+            await listed;
+            c.enqueue(frame("job.progress", { kind: "index", done: 10, total: 10 }));
+          },
+        });
+        return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
+      }),
+      ...libraryHandlers(),
+    );
+    renderLibrary();
+    expect(await screen.findByText(/needs rebuilding/)).toBeTruthy();
+    await waitFor(() => expect(calls).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(screen.queryByText(/needs rebuilding/)).toBeNull());
+  });
+
   it("index rebuilding progress from job.progress events", async () => {
     server.use(...libraryHandlers({ events: [{ type: "job.progress", data: { kind: "index", done: 3, total: 10 } }] }));
     renderLibrary();
     expect(await screen.findByText(/Index rebuilding 3\/10/)).toBeTruthy();
+  });
+
+  it("a transcription in the jobs indicator is named in words (Task 62)", async () => {
+    server.use(...libraryHandlers({ events: [{ type: "job.progress", data: { kind: "transcription", jobId: "j1", done: 40, total: 100, finished: false } }] }));
+    renderLibrary();
+    expect(await screen.findByText(/Transcribing recordings 40\/100/)).toBeTruthy();
+  });
+
+  it("D8: while the index is rebuilt, the source list says so instead of showing an empty library, and fills in when it is ready", async () => {
+    const rebuilding = { state: "rebuilding", done: 0, total: 0 };
+    let calls = 0;
+    server.use(
+      http.get(url("/projects/:id/sources"), () => {
+        calls++;
+        return HttpResponse.json(calls === 1 ? { total: 0, items: [], index: rebuilding } : SOURCES);
+      }),
+      ...libraryHandlers({
+        current: { ...CURRENT_RW, index: rebuilding },
+        state: { open: true, ...CURRENT_RW, index: rebuilding, integrityWarnings: [], projectWarnings: {} },
+        events: [
+          { type: "job.progress", data: { kind: "index", done: 1, total: 4 } },
+          { type: "library.state", data: { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} } },
+        ],
+      }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: rebuilding });
+    expect(await screen.findByText(/The library's search index is being rebuilt from its files/)).toBeTruthy();
+    expect(screen.queryByText(/No sources/)).toBeNull();
+    // Once it is ready the sources are read again.
+    expect(await screen.findByText("Ethnography at Work", {}, { timeout: 5000 })).toBeTruthy();
+    expect(screen.queryByText(/being rebuilt from its files/)).toBeNull();
+  });
+
+  it("D8: the rebuilding banner shows from the library's state, before any progress arrives", async () => {
+    const rebuilding = { state: "rebuilding", done: 0, total: 0 };
+    server.use(...libraryHandlers({ current: { ...CURRENT_RW, index: rebuilding }, state: { open: true, ...CURRENT_RW, index: rebuilding, integrityWarnings: [], projectWarnings: {} } }));
+    renderLibrary({ ...CURRENT_RW, index: rebuilding });
+    expect((await screen.findByText(/^Index rebuilding\./)).closest("[role=status]")).toBeTruthy();
+  });
+
+  it("D8: an index that could not be rebuilt says so plainly and points to “Rebuild library from folder”", async () => {
+    const failed = { state: "failed", message: "The library's search index could not be rebuilt (disk trouble)." };
+    server.use(...libraryHandlers({ current: { ...CURRENT_RW, index: failed }, state: { open: true, ...CURRENT_RW, index: failed, integrityWarnings: [], projectWarnings: {} } }));
+    renderLibrary({ ...CURRENT_RW, index: failed });
+    const banner = (await screen.findByText(/search index could not be rebuilt/)).closest("[role=status]") as HTMLElement;
+    expect(banner).toBeTruthy();
+    expect(banner.textContent).toMatch(/Your sources are safe in the library folder/);
+    expect(banner.textContent).not.toMatch(/disk trouble/);
+    expect(within(banner).getByRole("link", { name: "Rebuild library from folder" }).getAttribute("href")).toBe("/missing-files");
+  });
+
+  it("D8: when the index could not be rebuilt and lists nothing, the list says so instead of “no sources”", async () => {
+    const failed = { state: "failed", message: "x" };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ total: 0, items: [], index: failed })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: failed }, state: { open: true, ...CURRENT_RW, index: failed, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: failed });
+    expect(await screen.findByText(/The sources cannot be listed: the library's search index could not be rebuilt/)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+  });
+
+  it("C1: a partial index being rebuilt is never shown as a short list: “being rebuilt” in its place", async () => {
+    const rebuilding = { state: "rebuilding", done: 0, total: 0, partial: true };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, total: 1, items: SOURCES.items.slice(0, 1), index: rebuilding })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: rebuilding }, state: { open: true, ...CURRENT_RW, index: rebuilding, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: rebuilding });
+    expect(await screen.findByText(/The library's search index is being rebuilt from its files/)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+  });
+
+  it("C1: a partial index whose rebuild failed is never shown as a short list: the failure in its place", async () => {
+    const failed = { state: "failed", message: "x", partial: true };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, total: 1, items: SOURCES.items.slice(0, 1), index: failed })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: failed }, state: { open: true, ...CURRENT_RW, index: failed, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: failed });
+    expect(await screen.findByText(/The sources cannot be listed: the library's search index could not be rebuilt/)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+  });
+
+  it("C1: a whole index being rebuilt (not partial) keeps its list shown", async () => {
+    const rebuilding = { state: "rebuilding", done: 1, total: 4 };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, index: rebuilding })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: rebuilding }, state: { open: true, ...CURRENT_RW, index: rebuilding, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: rebuilding });
+    expect(await screen.findByText("Ethnography at Work")).toBeTruthy();
+  });
+
+  it("D8: a read-only library says its index cannot be built here and search looks at titles only", async () => {
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "locked-by-other-device", lockedBy: "field-laptop", index: { state: "unavailable", reason: "locked-by-other-device" } };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, index: { state: "unavailable", reason: "locked-by-other-device" } })),
+      ...libraryHandlers({ current: ro }),
+    );
+    renderLibrary(ro);
+    expect(await screen.findByText("Ethnography at Work")).toBeTruthy();
+    expect(screen.getByText(/open read-only, so its search index cannot be built here.*titles only/)).toBeTruthy();
   });
 
   it("a locked encrypted project shows UnlockProject; a wrong passphrase says nothing was changed", async () => {
@@ -262,13 +509,15 @@ describe("Library screen", () => {
     await user.click(resolve);
     const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
     const first = await within(dialog).findByRole("group", { name: "Interrupted change in Dissertation" });
-    expect((within(first).getByRole("button", { name: "Keep it" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(first).queryByRole("button", { name: "Keep it" })).toBeNull();
     const second = within(dialog).getByRole("group", { name: "Interrupted change in library" });
     expect(within(second).queryByRole("button", { name: "Roll it back" })).toBeNull();
-    expect(second.textContent).toMatch(/cannot be undone or kept here/);
+    expect(second.textContent).toMatch(/restore the project from a backup/);
     await user.click(within(first).getByRole("button", { name: "Roll it back" }));
     // A confirmation first.
     expect(resolved).toEqual([]);
+    // An unverifiable change: the roll-back needs an explicit acknowledgement (41b2 I3).
+    await user.click(within(first).getByRole("checkbox", { name: /I understand/ }));
     await user.click(within(first).getByRole("button", { name: "Yes, roll it back" }));
     await waitFor(() => expect(resolved).toEqual([{ txn: T1, choice: "roll-back" }]));
     await waitFor(() => expect(within(dialog).queryByRole("group", { name: "Interrupted change in Dissertation" })).toBeNull());
@@ -358,10 +607,84 @@ describe("Library screen", () => {
     expect(screen.queryByRole("button", { name: "Load more sources" })).toBeNull();
   });
 
+  describe("a slow Load more answer is dropped when it is stale (41b1 I1)", () => {
+    const row = (i: number, title = `Source ${i}`) => ({ ...SOURCES.items[0]!, id: `s${i}`, title });
+    let slowFirstPage = false;
+    function slowPages() {
+      slowFirstPage = false;
+      server.use(
+        http.get(url("/projects/:id/sources"), async ({ request }) => {
+          const q = new URL(request.url).searchParams;
+          if (q.get("offset") === "2") {
+            await new Promise((r) => setTimeout(r, 600));
+            return HttpResponse.json({ total: 3, items: [row(3, "Old page three")] });
+          }
+          if (q.get("text") === "zebra") return HttpResponse.json({ total: 1, items: [row(9, "Zebra one")] });
+          if (slowFirstPage) await new Promise((r) => setTimeout(r, 400));
+          return HttpResponse.json({ total: 3, items: [row(1), row(2)] });
+        }),
+        http.post(url("/projects/:id/unlock"), () => HttpResponse.json({ unlocked: true })),
+        http.post(url("/projects/:id/lock"), () => HttpResponse.json({ unlocked: false })),
+        ...libraryHandlers(),
+      );
+    }
+
+    it("after the search changed", async () => {
+      slowPages();
+      const user = userEvent.setup();
+      renderLibrary();
+      await screen.findByText("Source 2");
+      await user.click(screen.getByRole("button", { name: "Load more sources" }));
+      await user.type(screen.getByRole("searchbox", { name: "Search sources" }), "zebra");
+      expect(await screen.findByText("Zebra one")).toBeTruthy();
+      await new Promise((r) => setTimeout(r, 700));
+      expect(screen.queryByText("Old page three")).toBeNull();
+      expect(screen.getByText("Zebra one")).toBeTruthy();
+    });
+
+    it("after the project was locked: no decrypted rows come back", async () => {
+      slowPages();
+      const user = userEvent.setup();
+      renderLibrary();
+      await user.click(await screen.findByRole("button", { name: /Clinic interviews/ }));
+      await user.type(await screen.findByLabelText("Passphrase or recovery code"), "pw");
+      await user.click(screen.getByRole("button", { name: "Unlock" }));
+      await screen.findByText("Source 2");
+      await user.click(screen.getByRole("button", { name: "Load more sources" }));
+      await user.click(screen.getByRole("button", { name: "Lock project" }));
+      expect(await screen.findByLabelText("Passphrase or recovery code")).toBeTruthy();
+      await new Promise((r) => setTimeout(r, 700));
+      expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+      // Unlock again: until the fresh answer arrives, nothing left over from before the lock shows.
+      slowFirstPage = true;
+      await user.type(screen.getByLabelText("Passphrase or recovery code"), "pw");
+      await user.click(screen.getByRole("button", { name: "Unlock" }));
+      expect(await screen.findByText("Loading sources…")).toBeTruthy();
+      expect(screen.queryByText("Old page three")).toBeNull();
+      expect(screen.queryByText("Source 1")).toBeNull();
+      expect(await screen.findByText("Source 1")).toBeTruthy();
+    });
+  });
+
   it("library.state open:false tells the shell the library closed", async () => {
     server.use(...libraryHandlers({ events: [{ type: "library.state", data: { open: false } }] }));
     const onClosed = vi.fn();
     render(<Library api={testApi()} current={CURRENT_RW as never} onClosed={onClosed} />);
     await waitFor(() => expect(onClosed).toHaveBeenCalled());
   });
+});
+
+describe("R362 h: the library screen tells its collection and tag fields when the project is encrypted", () => {
+  const NAME_NOTE = "In an encrypted project this name can be read without the passphrase. Do not put a person's name in it.";
+  for (const encrypted of [true, false]) {
+    it(`${encrypted ? "an encrypted (unlocked) project: the note" : "a project that is not encrypted: nothing"} on the new collection's and the new tag's name`, async () => {
+      server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [{ ...PROJECTS.projects[0], encrypted, unlocked: true }] })), ...libraryHandlers());
+      renderLibrary();
+      const user = userEvent.setup();
+      await screen.findByRole("tree", { name: "Collections" });
+      await user.click(screen.getByRole("button", { name: "New collection" }));
+      await user.click(screen.getByRole("button", { name: "New tag" }));
+      expect(screen.queryAllByText(NAME_NOTE)).toHaveLength(encrypted ? 2 : 0);
+    });
+  }
 });

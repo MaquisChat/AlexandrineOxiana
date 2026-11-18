@@ -22,12 +22,22 @@ export const Creator = z.object({
 });
 export type Creator = z.infer<typeof Creator>;
 
+/**
+ * The ways a record or file comes in through Find and acquire. They are not capture methods: the
+ * rules govern them by their own list, `acquireMethods`, which allows all three unless a
+ * project's file says otherwise.
+ */
+export const ACQUIRE_METHODS = ["reference_lookup", "free_copy", "library_access"] as const;
+export type AcquireMethod = (typeof ACQUIRE_METHODS)[number];
+
+const CAPTURE_METHOD_NAMES = [
+  "official_api", "browser_capture", "downloader", "manual_upload",
+  "zotero_import", "device_import", "refman_import", "calibre_import",
+] as const;
+
 /** Immutable after creation (enforced in the repository layer). */
 export const Provenance = z.object({
-  captureMethod: z.enum([
-    "official_api", "browser_capture", "downloader", "manual_upload",
-    "zotero_import", "device_import", "refman_import", "calibre_import",
-  ]),
+  captureMethod: z.enum([...CAPTURE_METHOD_NAMES, ...ACQUIRE_METHODS]),
   capturedAt: Timestamp,
   originalUrl: z.string().optional(),
   tool: z.object({ name: z.string(), version: z.string() }),
@@ -50,6 +60,12 @@ export const Availability = z.object({
   status: z.enum(["available", "incomplete", "unavailable-on-platform"]),
   reason: z.string().optional(),
   firstNoticedAt: Timestamp.optional(),
+  /**
+   * Task Z5 (R206 2): with `unavailable-on-platform`, why: the item was deleted in the researcher's Zotero
+   * library, or moved to its bin. Optional: a source written before it parses, and an older reader that does
+   * not know it still reads the status ("No longer available at its source").
+   */
+  zotero: z.enum(["deleted", "bin"]).optional(),
 });
 export type Availability = z.infer<typeof Availability>;
 
@@ -218,6 +234,11 @@ export const SourceFile = z.object({
    * (which never changes after creation); written by merges, reverted by undo.
    */
   mergedExternalKeys: z.record(z.string(), z.array(z.string().max(256)).max(10_000)).optional(),
+  /**
+   * externalKeys of imported annotations the researcher deleted here (≤ 10,000): a re-import never
+   * brings them back.
+   */
+  deletedAnnotationKeys: z.array(z.string().max(256)).max(10_000).optional(),
   fieldEvidence: z.array(FieldEvidence).default([]),
   verification: z.record(z.string(), FieldVerification).default({}),
   /** Viewing proxies still to be made (R83); absent or empty when none are pending. */

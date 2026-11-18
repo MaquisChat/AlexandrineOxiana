@@ -1,0 +1,73 @@
+/* The "Zotero" screen (Task Z9). Colours from theme tokens only; focus rings come from base.css.
+   Group names and the service's sentences can be long or right-to-left: they wrap anywhere and never widen the page. */
+.ao-zotero {
+  overflow-wrap: anywhere;
+}
+
+.ao-zotero h1[tabindex="-1"]:focus {
+  outline: none;
+}
+
+.ao-zotero__note {
+  color: var(--ink-2);
+}
+
+.ao-zotero__lib {
+  border: 1px solid var(--line-control);
+  border-radius: 6px;
+  margin: var(--space-2) 0;
+  padding: var(--space-2) var(--space-3);
+}
+
+.ao-zotero__lib h3 {
+  margin: 0 0 var(--space-1);
+}
+
+.ao-zotero__status,
+.ao-zotero__pause {
+  margin: var(--space-1) 0;
+}
+
+.ao-zotero__pause {
+  font-weight: 700;
+}
+
+.ao-zotero__controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  margin: var(--space-2) 0;
+}
+
+.ao-zotero__option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.ao-zotero__field {
+  display: inline-flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.ao-zotero__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin: var(--space-1) 0;
+}
+
+.ao-zotero__progress {
+  min-height: 1.5em;
+}
+
+.ao-zotero__history {
+  margin: var(--space-1) 0;
+  padding-inline-start: var(--space-4);
+}
+
+.ao-zotero__history li {
+  margin: var(--space-1) 0;
+}

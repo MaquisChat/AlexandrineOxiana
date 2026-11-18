@@ -1,12 +1,15 @@
 import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { newId, type Provenance, type SourceDraft } from "@ao/core";
+import Database from "better-sqlite3";
+import { newId, type Annotation, type Provenance, type SourceDraft } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
+import { backupProject, restoreBackup } from "../export/backup.js";
 import { createLibrary, type Library } from "../library.js";
 import { ReadOnlyLibraryError, type Repo } from "../repo/index.js";
+import { importChange } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
 import {
   INDEX_FILE,
@@ -17,14 +20,16 @@ import {
   indexSource,
   isIndexStale,
   openIndex,
+  openIndexChecked,
   rebuildIndex,
+  rebuildIndexIfNeeded,
   search,
 } from "./index.js";
 import { changeLogReads, newestProjectChangeId } from "./changes.js";
 import { indexProjectEntities, openIndexAt, purgeProject } from "./db.js";
 import { indexUnlockedProject } from "./sink.js";
 import { stripVtt } from "./load.js";
-import { buildMatchQuery, cjkBigrams } from "./text.js";
+import { ANNOTATION_CHUNK_BYTES, ANNOTATION_INDEX_BYTES, annotationChunks, buildMatchQuery, cjkBigrams } from "./text.js";
 
 const NOW = "2026-11-09T14:30:00.000Z";
 const OPEN_GOV = `identifiability:
@@ -127,17 +132,18 @@ afterEach(async () => {
 
 
 describe("schema", () => {
-  it("uses WAL, records schemaVersion 1 and creates the required tables", () => {
+  it("uses WAL, records the latest schemaVersion and creates the required tables", () => {
     expect(handle.db.pragma("journal_mode", { simple: true })).toBe("wal");
-    expect(getMeta(handle.db, "schemaVersion")).toBe("1");
+    expect(getMeta(handle.db, "schemaVersion")).toBe("3");
     const names = (handle.db.prepare("SELECT name FROM sqlite_master").all() as Array<{ name: string }>).map((r) => r.name);
     for (const t of [
       "projects", "sources", "assets", "collections", "tags", "source_collections", "source_tags", "participants",
-      "sessions", "consents", "import_batches", "review_items", "jobs", "meta", "source_text", "source_hashes",
+      "sessions", "consents", "review_items", "jobs", "meta", "source_text", "source_hashes",
     ]) expect(names).toContain(t);
+    expect(names).not.toContain("import_batches"); // never written; dropped by migration 0003
     // reopening does not re-run migrations
     handle.reopen();
-    expect(getMeta(handle.db, "schemaVersion")).toBe("1");
+    expect(getMeta(handle.db, "schemaVersion")).toBe("3");
   });
 });
 
@@ -348,6 +354,35 @@ describe("rebuildIndex", () => {
     const res2 = await rebuildIndex(handle, ring, lib);
     expect(res2.lockedProjects).toEqual([]);
     expect(search(handle.db, { text: "identifying" }).items[0]).toMatchObject({ id: sf.source.id, locked: false, title: "Very identifying title" });
+  });
+});
+
+describe("a copy restored with the passphrase while its project is locked (Task 50b, I1)", () => {
+  it("is indexed as any locked project is: from its manifest only, nothing identifying; unlocking it indexes it fully", async () => {
+    const created = await repo.createProject({ name: "Secret", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const pid = created.project.id;
+    await repo.createSource(pid, draft("Very identifying title", { type: "interview" }), files(), {
+      provenance: prov({ identifiable: true, legal: { status: "consented", basis: "consent form" } }),
+    });
+    const b = await backupProject(repo, pid);
+    repo.lockProject(pid);
+    const r = await restoreBackup(repo, b.path, { passphrase: "pw" });
+    expect(repo.indexErrors).toEqual([]);
+    // The restore unlocked nothing: no title of either project can be found.
+    expect(search(handle.db, { text: "identifying" }).total).toBe(0);
+    expect(handle.db.prepare("SELECT COUNT(*) AS n FROM temp.t_sources").get()).toEqual({ n: 0 });
+    const [sid] = repo.listSourceIds(r.projectId);
+    const rows = search(handle.db, { projectId: r.projectId }).items;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: sid, projectId: r.projectId, type: "interview", title: "", creatorsText: "", issuedYear: "2025", needsReview: false, locked: true });
+    expect(rows[0]!.folder.startsWith(`${r.folder}/`)).toBe(true);
+    expect(handle.db.prepare("SELECT locked FROM projects WHERE id = ?").get(r.projectId)).toEqual({ locked: 1 });
+    // Its change state is recorded as a locked project's is (by its manifest), so the copy alone does not make the index stale.
+    expect((JSON.parse(getMeta(handle.db, "projectStamps")!) as Record<string, { mode: string }>)[r.projectId]!.mode).toBe("manifest");
+
+    await repo.unlockProject(r.projectId, "pw");
+    expect(repo.indexErrors).toEqual([]);
+    expect(search(handle.db, { text: "identifying", projectId: r.projectId }).items[0]).toMatchObject({ id: sid, locked: false, title: "Very identifying title" });
   });
 });
 
@@ -608,17 +643,17 @@ describe("review fixes", () => {
     expect(search(handle.db, { text: "stays" }).total).toBe(1);
   });
 
-  it("I4: rebuild carries review_items, import_batches and jobs over", async () => {
+  it("I4: rebuild carries review_items over; jobs come from the journals (R31), never from old rows", async () => {
     const pid = await openProject();
     handle.db.prepare("INSERT INTO review_items VALUES ('r1', ?, NULL, NULL, 'import', 'pending', '{\"a\":1}', ?)").run(pid, NOW);
-    handle.db.prepare("INSERT INTO import_batches VALUES ('b1', ?, 1, ?, NULL, '{}')").run(pid, NOW);
-    handle.db.prepare("INSERT INTO jobs VALUES ('j1', ?, 'ocr', 'queued', '{}', ?)").run(pid, NOW);
+    handle.db.prepare("INSERT INTO jobs VALUES ('j1', ?, 'pdf.ocr', 'queued', '{}', ?)").run(pid, NOW);
     await rebuildIndex(handle, ring, lib);
     expect(handle.db.prepare("SELECT id, kind, status, payload_json FROM review_items").all()).toEqual([
       { id: "r1", kind: "import", status: "pending", payload_json: '{"a":1}' },
     ]);
-    expect(handle.db.prepare("SELECT id FROM import_batches").all()).toEqual([{ id: "b1" }]);
-    expect(handle.db.prepare("SELECT id FROM jobs").all()).toEqual([{ id: "j1" }]);
+    // This version writes a job's journal line before its row: a row without one is not a record.
+    // (Rows of databases made before the journal are upgraded: job-journal.test.ts.)
+    expect(handle.db.prepare("SELECT id FROM jobs").all()).toEqual([]);
   });
 
   it("I5: rebuild restores extracted text from ocr-text and transcript (.vtt) assets, plain and encrypted", async () => {
@@ -815,5 +850,426 @@ describe("change-log stamp, read incrementally (R62)", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("D8: a missing or stale index is rebuilt when the library is opened", () => {
+  async function seedTwo() {
+    const pid = await openProject();
+    await repo.createSource(pid, draft("Harbour ledger of 1932"), files(), { provenance: prov() });
+    await repo.createSource(pid, draft("Salt marsh survey"), files(), { provenance: prov() });
+    return pid;
+  }
+
+  it("openIndexChecked: says the index was missing, and creates an empty one to rebuild into", async () => {
+    await seedTwo();
+    handle.close();
+    for (const s of ["", "-wal", "-shm"]) await rm(join(lib.root, INDEX_FILE + s), { force: true });
+    const c = await openIndexChecked(lib.root);
+    try {
+      expect(c.needsRebuild).toBe("missing");
+      expect(search(c.handle.db, {}).total).toBe(0);
+    } finally {
+      c.handle.close();
+    }
+  });
+
+  it("openIndexChecked: an existing index needs no rebuild by itself (staleness is checked later)", async () => {
+    await seedTwo();
+    handle.close();
+    const c = await openIndexChecked(lib.root);
+    expect(c.needsRebuild).toBeUndefined();
+    expect(search(c.handle.db, {}).total).toBe(2);
+    c.handle.close();
+  });
+
+  it("openIndexChecked: an unreadable index is set aside (it is only a cache) and a new one started", async () => {
+    await seedTwo();
+    handle.close();
+    for (const s of ["-wal", "-shm"]) await rm(join(lib.root, INDEX_FILE + s), { force: true });
+    await writeFile(join(lib.root, INDEX_FILE), "this is not a database at all, it is long enough to be read as a header ".repeat(20));
+    const c = await openIndexChecked(lib.root);
+    try {
+      expect(c.needsRebuild).toBe("unreadable");
+      expect((await readdir(lib.root)).some((f) => f.startsWith(`${INDEX_FILE}.corrupt-`))).toBe(true);
+      expect(c.warnings.join(" ")).not.toContain(lib.root);
+    } finally {
+      c.handle.close();
+    }
+  });
+
+  it("rebuildIndexIfNeeded: a current index is left alone; a stale one is rebuilt, with progress", async () => {
+    await seedTwo();
+    expect(await rebuildIndexIfNeeded(handle, ring, lib)).toBeUndefined();
+    // a change made by something that does not feed the index: stale
+    const plain = await mkRepo(false);
+    const pid = plain.listProjects()[0]!.id;
+    await plain.createSource(pid, draft("Tide notes"), files(), { provenance: prov() });
+    expect(search(handle.db, { text: "tide" }).total).toBe(0);
+    const progress: Array<[number, number]> = [];
+    let started = 0;
+    const r = await rebuildIndexIfNeeded(handle, ring, lib, { onStart: () => started++, onProgress: (d, t) => progress.push([d, t]) });
+    expect(r).toMatchObject({ indexed: 3, errors: [] });
+    expect(started).toBe(1);
+    expect(progress.at(-1)).toEqual([3, 3]);
+    expect(search(handle.db, { text: "tide" }).total).toBe(1);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
+  });
+
+  it("rebuildIndexIfNeeded: force rebuilds even a current index", async () => {
+    await seedTwo();
+    const r = await rebuildIndexIfNeeded(handle, ring, lib, { force: true });
+    expect(r).toMatchObject({ indexed: 2 });
+  });
+
+  it("rebuildIndexIfNeeded: a change made during the rebuild is caught by a second pass", async () => {
+    const pid = await seedTwo();
+    const plain = await mkRepo(false);
+    let passes = 0;
+    const r = await rebuildIndexIfNeeded(handle, ring, lib, {
+      force: true,
+      rebuild: {
+        beforeRename: async () => {
+          // written after the first pass walked the files (no sink: only a rebuild can see it)
+          if (passes++ === 0) await plain.createSource(pid, draft("Written during the rebuild"), files(), { provenance: prov() });
+        },
+      },
+    });
+    expect(passes).toBe(2);
+    expect(r).toMatchObject({ indexed: 3 });
+    expect(search(handle.db, { text: "during" }).total).toBe(1);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
+  });
+
+  it("rebuildIndexIfNeeded: an aborted rebuild leaves the old index in place and open", async () => {
+    await seedTwo();
+    const ac = new AbortController();
+    await expect(
+      rebuildIndexIfNeeded(handle, ring, lib, {
+        force: true,
+        signal: ac.signal,
+        onProgress: (d) => {
+          if (d === 1) ac.abort();
+        },
+      }),
+    ).rejects.toThrow();
+    expect(handle.isOpen).toBe(true);
+    expect(search(handle.db, {}).total).toBe(2);
+    expect((await readdir(lib.root)).filter((f) => f.includes("rebuild"))).toEqual([]);
+  });
+
+  it("rebuildIndexIfNeeded: refuses a read-only library", async () => {
+    await expect(rebuildIndexIfNeeded(handle, ring, { mode: "read-only", readOnlyReason: "locked-by-other-device" }, { force: true })).rejects.toBeInstanceOf(ReadOnlyLibraryError);
+  });
+});
+
+// ---- Task 58: the text of annotations is searchable (R74) ----
+
+describe("annotation text (Task 58, R74)", () => {
+  const ann = (sourceId: string, over: Partial<Annotation> = {}): Annotation => ({
+    id: newId(),
+    sourceId,
+    kind: "highlight",
+    anchors: [],
+    author: "tester",
+    createdAt: NOW,
+    ...over,
+  });
+  /** Replaces a source's annotations through one governed change (as an import or the reader would). */
+  const setAnnotations = (pid: string, sid: string, make: (cur: Annotation[]) => Annotation[], identifiable = false) =>
+    importChange(
+      repo,
+      pid,
+      { action: "store", store: { identifiable, hasLocation: false, ...(identifiable ? { legalBasis: SECRET_GOV_LEGAL.basis } : {}) } },
+      async (ops) => {
+        const cur = await ops.readSource(sid);
+        await ops.writeSource(cur, { ...cur, annotations: make(cur.annotations) });
+      },
+      { op: "test.annotations" },
+    );
+  const annRows = () =>
+    handle.db
+      .prepare(
+        `SELECT c.source_id, c.seq, c.sha256, a.project_id, a.annotations, a.annotation_bigrams, s.annotations_partial
+         FROM main.annotation_chunks c JOIN main.annotation_text a ON a.rowid = c.fts_rowid JOIN main.sources s ON s.id = c.source_id
+         ORDER BY c.source_id, c.seq`,
+      )
+      .all();
+
+  it("finds a source by an annotation's quoted text or comment and says the match is in an annotation", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Plain title"), files(), { provenance: prov() });
+    const other = await repo.createSource(pid, draft("Another plain one"), files(), { provenance: prov() });
+    await setAnnotations(pid, sf.source.id, () => [
+      ann(sf.source.id, { quote: "informal xylophonic markets", body: "quibbleclaim comment" }),
+      ann(sf.source.id, { kind: "note", body: "家庭料理の記憶 in a note" }),
+    ]);
+    const hit = search(handle.db, { text: "xylophonic" });
+    expect(hit.items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    expect(hit.total).toBe(1);
+    expect(search(handle.db, { text: "quibbleclaim" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    expect(search(handle.db, { text: "料理" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // A match in the record itself carries no annotation mark.
+    const rec = search(handle.db, { text: "plain" });
+    expect(ids(rec)).toEqual([sf.source.id, other.source.id].sort());
+    for (const i of rec.items) expect(i).not.toHaveProperty("matchedIn");
+    // The terms may be spread over the record and the annotations (N1).
+    expect(search(handle.db, { text: "plain quibbleclaim" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    expect(search(handle.db, { text: "xylophonic quibbleclaim" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // Filters still apply.
+    expect(search(handle.db, { text: "xylophonic", types: ["book"] }).total).toBe(0);
+    expect(search(handle.db, { text: "xylophonic", projectId: await openProject("Other") }).total).toBe(0);
+  });
+
+  it("an edit that changes or removes an annotation updates the index; an unrelated edit keeps it; deletion removes it", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Plain title"), files(), { provenance: prov() });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "firstzebra" }), ann(sf.source.id, { body: "secondyak" })]);
+    expect(search(handle.db, { text: "firstzebra" }).total).toBe(1);
+    await setAnnotations(pid, sf.source.id, (cur) => cur.map((a) => (a.quote === "firstzebra" ? { ...a, quote: "thirdgnu" } : a)));
+    expect(search(handle.db, { text: "firstzebra" }).total).toBe(0);
+    expect(search(handle.db, { text: "thirdgnu" }).total).toBe(1);
+    await repo.updateSource(pid, sf.source.id, { title: { variants: [{ lang: "en", kind: "original", value: "Renamed" }] } });
+    expect(search(handle.db, { text: "thirdgnu" }).total).toBe(1);
+    expect(search(handle.db, { text: "secondyak" }).total).toBe(1);
+    await setAnnotations(pid, sf.source.id, (cur) => cur.filter((a) => a.body !== "secondyak"));
+    expect(search(handle.db, { text: "secondyak" }).total).toBe(0);
+    expect(search(handle.db, { text: "thirdgnu" }).total).toBe(1);
+    await repo.deleteSource(pid, sf.source.id);
+    expect(search(handle.db, { text: "thirdgnu" }).total).toBe(0);
+  });
+
+  it("a rebuild from the files gives the same index as the incremental writes", async () => {
+    const pid = await openProject();
+    const a = await repo.createSource(pid, draft("Alpha"), files(), { provenance: prov() });
+    const b = await repo.createSource(pid, draft("Beta"), files(), { provenance: prov() });
+    await setAnnotations(pid, a.source.id, () => [ann(a.source.id, { quote: "ocelot", body: "家庭料理" }), ann(a.source.id, { kind: "note", body: "marmot" })]);
+    await setAnnotations(pid, b.source.id, () => [ann(b.source.id, { quote: "ocelot again" })]);
+    await setAnnotations(pid, b.source.id, () => []);
+    const queries = [{ text: "ocelot" }, { text: "marmot" }, { text: "料理" }, { text: "beta" }, {}, { text: "smith marmot" }, { text: "alpha ocelot 料理" }];
+    const before = { rows: annRows(), results: queries.map((q) => search(handle.db, q)) };
+    expect(before.results[0]!.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    expect(before.results[5]!.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    expect(before.results[6]!.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    await rebuildIndex(handle, ring, lib);
+    expect({ rows: annRows(), results: queries.map((q) => search(handle.db, q)) }).toEqual(before);
+  });
+
+  it("an encrypted project's annotation text is in memory only, gone on lock, back on unlock and after a rebuild", async () => {
+    const pid = (await repo.createProject({ name: "Secret", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } })).project.id;
+    const sf = await repo.createSource(pid, draft("Sealed source"), files(), { provenance: prov({ identifiable: true, legal: SECRET_GOV_LEGAL }) });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "Qwombatquote", body: "Qcapybaracomment 秘密の注釈" })], true);
+    expect(search(handle.db, { text: "qwombatquote" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    expect(search(handle.db, { text: "qcapybaracomment" }).total).toBe(1);
+    const secrets = ["Qwombatquote", "Qcapybaracomment", "秘密", "密の"];
+    const inFile = async () => {
+      handle.db.pragma("wal_checkpoint(TRUNCATE)");
+      const raw = (await rawIndexBytes()).split(sf.source.folder).join("<folder>");
+      // UTF-8 bytes of the CJK secrets, read as latin1 like the rest
+      return secrets.filter((x) => raw.includes(Buffer.from(x, "utf8").toString("latin1")));
+    };
+    expect(await inFile()).toEqual([]);
+    repo.lockProject(pid);
+    expect(search(handle.db, { text: "qwombatquote" }).total).toBe(0);
+    expect(search(handle.db, { text: "秘密" }).total).toBe(0);
+    expect(await inFile()).toEqual([]);
+    await repo.unlockProject(pid, "pw");
+    expect(search(handle.db, { text: "qwombatquote" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    await rebuildIndex(handle, ring, lib);
+    expect(search(handle.db, { text: "qcapybaracomment" }).total).toBe(1);
+    expect(search(handle.db, { text: "秘密" }).total).toBe(1);
+    expect(await inFile()).toEqual([]);
+    repo.lockProject(pid);
+    await rebuildIndex(handle, ring, lib);
+    expect(search(handle.db, { text: "qwombatquote" }).total).toBe(0);
+    expect(await inFile()).toEqual([]);
+  });
+
+  /** Replaces the index with a version-1 one holding `sf`'s record (as an existing library has it). */
+  async function oldIndex(sf: { source: { id: string } }, pid: string): Promise<void> {
+    handle.close();
+    for (const s of ["", "-wal", "-shm"]) await rm(join(lib.root, INDEX_FILE + s), { force: true });
+    const old = new Database(join(lib.root, INDEX_FILE));
+    old.exec(await readFile(new URL("./migrations/0001.sql", import.meta.url), "utf8"));
+    old.prepare("INSERT INTO meta (key, value) VALUES ('schemaVersion', '1'), ('projectStamps', '{}')").run();
+    old.prepare("INSERT INTO sources (id, fts_rowid, project_id, type, title, folder) VALUES (?, 1, ?, 'article-journal', 'Old index title', 'f')").run(sf.source.id, pid);
+    old.prepare("INSERT INTO source_projects VALUES (?, ?)").run(sf.source.id, pid);
+    old.prepare("INSERT INTO source_text (rowid, source_id, project_id, title_all, creators, container, extracted_text, cjk_bigrams) VALUES (1, ?, ?, 'Old index title', '', '', 'kept text', '')").run(sf.source.id, pid);
+    old.close();
+  }
+
+  it("R161 (a): a migrated index stays marked incomplete through writes and reopening until a completed rebuild", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Old index title"), files(), { provenance: prov() });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "pangolinquote" })]);
+    await oldIndex(sf, pid);
+    handle.reopen();
+    expect(getMeta(handle.db, "schemaVersion")).toBe("3");
+    // The old rows still answer, and the answer says the index is incomplete.
+    const kept = search(handle.db, { text: "kept" });
+    expect(kept.items.map((i) => i.id)).toEqual([sf.source.id]);
+    expect(kept.incomplete).toBe(true);
+    expect(search(handle.db, {}).incomplete).toBe(true);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
+    // An ordinary write in another project records fresh stamps: still stale, still incomplete.
+    const other = await openProject("Other");
+    await repo.createSource(other, draft("Fresh write"), files(), { provenance: prov() });
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
+    handle.reopen();
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
+    expect(search(handle.db, { text: "pangolinquote" })).toMatchObject({ total: 0, incomplete: true });
+    // A rebuild that crashes before it completes leaves the marker.
+    await expect(rebuildIndex(handle, ring, lib, undefined, { beforeRename: () => Promise.reject(new Error("power cut")) })).rejects.toThrow("power cut");
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
+    expect(search(handle.db, {}).incomplete).toBe(true);
+    // A completed rebuild clears it.
+    await rebuildIndex(handle, ring, lib);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
+    const found = search(handle.db, { text: "pangolinquote" });
+    expect(found.items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    expect(found).not.toHaveProperty("incomplete");
+  });
+
+  it("R161 (a): a new index is not marked; a migrated empty one is not either", async () => {
+    expect(search(handle.db, {})).not.toHaveProperty("incomplete");
+    expect(getMeta(handle.db, "needsRebuild")).toBeUndefined();
+  });
+
+  it("I3: a title match ranks above a body-text match, which ranks above an annotation-only match", async () => {
+    const pid = await openProject();
+    const viaAnn = await repo.createSource(pid, draft("Spice notes"), files(), { provenance: prov() });
+    await setAnnotations(pid, viaAnn.source.id, () => [ann(viaAnn.source.id, { body: "a short note on tamarind" })]);
+    const byTitle = await repo.createSource(pid, draft("Tamarind trade"), files(), { provenance: prov() });
+    const filler = Array.from({ length: 5_000 }, (_, i) => `word${i}`).join(" ");
+    await setAnnotations(pid, byTitle.source.id, () => [ann(byTitle.source.id, { body: filler })]);
+    const byBody = await repo.createSource(pid, draft("Market ledgers"), files(), { provenance: prov() });
+    indexSource(handle.db, await repo.getSource(pid, byBody.source.id), `${filler} tamarind`);
+    const r = search(handle.db, { text: "tamarind" });
+    expect(r.items.map((i) => i.id)).toEqual([byTitle.source.id, byBody.source.id, viaAnn.source.id]);
+    expect(r.items.map((i) => i.matchedIn ?? null)).toEqual([null, null, "annotation"]);
+    expect(r.total).toBe(3);
+    expect(search(handle.db, { text: "tamarind", limit: 1, offset: 2 }).items.map((i) => i.id)).toEqual([viaAnn.source.id]);
+  });
+
+  it("N2: the column weights put a title match above a short body that names the word", async () => {
+    const pid = await openProject();
+    // The title source also has a long body; without weights its length makes it lose (probe W2).
+    const byTitle = await repo.createSource(pid, draft("Okra history"), files(), { provenance: prov() });
+    indexSource(handle.db, await repo.getSource(pid, byTitle.source.id), Array.from({ length: 3_000 }, (_, i) => `word${i}`).join(" "));
+    const byBody = await repo.createSource(pid, draft("Market ledgers"), files(), { provenance: prov() });
+    indexSource(handle.db, await repo.getSource(pid, byBody.source.id), "a short note on okra and its sellers");
+    expect(search(handle.db, { text: "okra" }).items.map((i) => i.id)).toEqual([byTitle.source.id, byBody.source.id]);
+  });
+
+  it("R161 (b): at most 2 MB of annotation text is indexed, in document order and bounded chunks; the source says it is partly searchable", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Heavily annotated"), files(), { provenance: prov() });
+    // 3,000 annotations of 1,000 characters: 3 MB, over the 2 MB cap.
+    await setAnnotations(pid, sf.source.id, () => Array.from({ length: 3_000 }, (_, i) => ann(sf.source.id, { quote: `firstword${i} ${"x".repeat(980)}` })));
+    expect(search(handle.db, { text: "firstword0" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation", annotationsPartial: true })]);
+    expect(search(handle.db, { text: "firstword1500" }).total).toBe(1);
+    expect(search(handle.db, { text: "firstword2999" }).total).toBe(0); // past the cap
+    const rows = annRows() as Array<{ annotations: string }>;
+    const bytes = rows.reduce((n, r) => n + Buffer.byteLength(r.annotations), 0);
+    expect(bytes).toBeLessThanOrEqual(ANNOTATION_INDEX_BYTES);
+    expect(bytes).toBeGreaterThan(ANNOTATION_INDEX_BYTES - 2_000);
+    for (const r of rows) expect(Buffer.byteLength(r.annotations)).toBeLessThanOrEqual(ANNOTATION_CHUNK_BYTES);
+    // A source within the cap is not marked.
+    await setAnnotations(pid, sf.source.id, (cur) => cur.slice(0, 10));
+    expect(search(handle.db, { text: "firstword0" }).items[0]).not.toHaveProperty("annotationsPartial");
+  });
+
+  it("chunks annotation text by whole annotations, splits only a longer one, with overlap, never inside a character, and caps the count (M3)", () => {
+    const { chunks, partial } = annotationChunks([{ quote: "a", body: "b" }, { body: "c" }, { quote: "" }], 100, 10, 10_000, 4);
+    expect([...chunks]).toEqual(["a\nb\nc"]);
+    expect(partial).toBe(false);
+    // An annotation that fits a chunk of its own is never split across two (N1).
+    expect(annotationChunks([{ body: "a".repeat(6) }, { body: "b".repeat(6) }], 100, 10, 10_000, 4).chunks).toEqual(["aaaaaa", "bbbbbb"]);
+    // A longer one is split; each part repeats the end of the one before (at most `overlap` bytes).
+    const long = annotationChunks([{ body: "😀".repeat(20) }], 1_000, 10, 10_000, 4);
+    const parts = [...long.chunks];
+    let joined = parts[0]!;
+    for (const [i, p] of parts.entries()) {
+      expect(Buffer.byteLength(p)).toBeLessThanOrEqual(10);
+      expect(p).not.toMatch(/[\uD800-\uDBFF]$/u);
+      if (i === 0) continue;
+      expect(p.startsWith("😀")).toBe(true); // the previous part's last character (4 bytes)
+      joined += p.slice("😀".length);
+    }
+    expect(joined).toBe("😀".repeat(20));
+    const many = annotationChunks(Array.from({ length: 10_005 }, () => ({ body: "w" })), 1_000_000, 1_000);
+    expect([...many.chunks].join("\n").split("\n")).toHaveLength(10_000);
+    expect(many.partial).toBe(true);
+  });
+
+  // ---- N1: the terms of a query may be spread over the record and the annotations ----
+
+  it("N1: a query matches a source whose record and annotations together hold every term", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Feeding the city", { creators: [{ family: "Bourdieu", given: "Pierre", role: "author" }] }), files(), { provenance: prov() });
+    const other = await repo.createSource(pid, draft("Habitus elsewhere"), files(), { provenance: prov() });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "the habitus of vendors" }), ann(sf.source.id, { body: "fieldwork diary" })]);
+    // Author (record) plus a word of an annotation.
+    expect(search(handle.db, { text: "bourdieu habitus" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // Two words in two different annotations.
+    expect(search(handle.db, { text: "vendors diary" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // A record match still ranks first and carries no annotation mark.
+    const both = search(handle.db, { text: "habitus" });
+    expect(both.items.map((i) => i.id)).toEqual([other.source.id, sf.source.id]);
+    expect(both.items[0]).not.toHaveProperty("matchedIn");
+    // A term found nowhere still finds nothing.
+    expect(search(handle.db, { text: "bourdieu nowhereword" }).total).toBe(0);
+  });
+
+  it("N1: a pair of words is found whichever side of a chunk boundary each falls on, and a phrase across a split annotation is found", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Chunked"), files(), { provenance: prov() });
+    const filler = (n: number) => Array.from({ length: n }, (_, i) => ann(sf.source.id, { body: `filler${i} ${"y".repeat(990)}` }));
+    // alphaword in the first annotation, omegaword about 100 KB later: two chunks.
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { body: "alphaword" }), ...filler(100), ann(sf.source.id, { body: "omegaword" })]);
+    const seqs = (word: string) =>
+      (handle.db.prepare("SELECT c.seq FROM main.annotation_chunks c JOIN main.annotation_text a ON a.rowid = c.fts_rowid WHERE a.annotation_text MATCH ? AND c.source_id = ?").all(`"${word}"`, sf.source.id) as Array<{ seq: number }>).map((r) => r.seq);
+    expect(seqs("alphaword")).not.toEqual(seqs("omegaword"));
+    expect(search(handle.db, { text: "alphaword omegaword" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // The same pair in one chunk.
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { body: "alphaword" }), ann(sf.source.id, { body: "omegaword" })]);
+    expect(search(handle.db, { text: "alphaword omegaword" }).total).toBe(1);
+    // One annotation longer than a chunk, with a CJK phrase across the split.
+    const head = "z ".repeat((ANNOTATION_CHUNK_BYTES - 6) / 2);
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { body: `${head}家庭料理の記憶 ${"w ".repeat(1000)}` })]);
+    expect(search(handle.db, { text: "家庭料理の記憶" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+  });
+
+  it("N1: a query whose words match too much, or with too many words, is refused in plain words", async () => {
+    const pid = await openProject();
+    for (let i = 0; i < 6; i++) await repo.createSource(pid, draft(`Common word ${i}`), files(), { provenance: prov() });
+    // A bound set very low for the test: each word may match at most 5 rows.
+    expect(() => search(handle.db, { text: "common word", maxTermMatches: 5 })).toThrow(/matches too many sources to combine its words.*more specific/i);
+    expect(search(handle.db, { text: "common word" }).total).toBe(6);
+    expect(() => search(handle.db, { text: Array.from({ length: 17 }, (_, i) => `w${i}`).join(" ") })).toThrow(/at most 16 words/);
+  });
+
+  it("N6: the bound counts only the searched project's matches", async () => {
+    const busy = await openProject("Busy");
+    for (let i = 0; i < 6; i++) await repo.createSource(busy, draft(`Thing ${i}`), files(), { provenance: prov() });
+    const quiet = await openProject("Quiet");
+    const sf = await repo.createSource(quiet, draft("Thing apart"), files(), { provenance: prov() });
+    await setAnnotations(quiet, sf.source.id, () => [ann(sf.source.id, { body: "uniqueword here" })]);
+    // Six "thing" sources elsewhere do not refuse a search of this project.
+    expect(search(handle.db, { text: "thing uniqueword", projectId: quiet, maxTermMatches: 5 }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // The library-wide search still counts them all.
+    expect(() => search(handle.db, { text: "thing uniqueword", maxTermMatches: 5 })).toThrow(/too many sources/);
+    // A word found nowhere in the project ends the search at once, with nothing.
+    expect(search(handle.db, { text: "thing nowhereword", projectId: quiet, maxTermMatches: 5 }).total).toBe(0);
+  });
+
+  it("N1: a locked encrypted project's annotations combine with nothing (R30); unlocked they do", async () => {
+    const pid = (await repo.createProject({ name: "Secret", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } })).project.id;
+    const sf = await repo.createSource(pid, draft("Sealed source"), files(), { provenance: prov({ identifiable: true, legal: SECRET_GOV_LEGAL }) });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "qwombatquote" }), ann(sf.source.id, { body: "qcapybara" })], true);
+    expect(search(handle.db, { text: "smith qwombatquote qcapybara" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    repo.lockProject(pid);
+    expect(search(handle.db, { text: "smith qwombatquote" }).total).toBe(0);
+    expect(search(handle.db, { text: "qwombatquote qcapybara" }).total).toBe(0);
   });
 });

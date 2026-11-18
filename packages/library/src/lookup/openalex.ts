@@ -50,7 +50,8 @@ export function mapOpenAlex(w: OpenAlexWork): LookupResult | null {
     ...cleanBiblio(biblioOf({ volume: b?.volume, issue: b?.issue, page })),
     ...(source?.display_name ? { container: clean(source.display_name) } : {}),
     ...(source?.host_organization_name ? { publisher: clean(source.host_organization_name) } : {}),
-    type: TYPES[w.type ?? ""] ?? "other",
+    // An own property only: a kind such as "constructor" or "__proto__" is "other" (R271 M1).
+    type: typeof w.type === "string" && Object.hasOwn(TYPES, w.type) ? TYPES[w.type]! : "other",
     identifiers: doi ? { doi } : {},
     provider: "openalex",
   };

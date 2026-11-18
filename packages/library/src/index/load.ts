@@ -1,21 +1,44 @@
 /** Reading sources (and their extracted text) from the library's files for indexing. */
 import { join } from "node:path";
-import { SourceFile } from "@ao/core";
+import { Annotation, SourceFile } from "@ao/core";
 import { decryptBytes, readMaybe } from "../repo/io.js";
 
 export type ProjectKey = { key: Uint8Array; keyId: string };
 
-/** The SourceFile in `dir` (source.json, or source.json.enc with `k`); null when there is none. */
-export async function readSource(dir: string, k: ProjectKey | null | undefined): Promise<SourceFile | null> {
+/**
+ * The SourceFile in `dir` (source.json, or source.json.enc with `k`) with its annotations (from
+ * annotations.json(.enc), R74 I4, so their text can be indexed); null when there is none.
+ */
+export async function readSource(dir: string, k: ProjectKey | null | undefined, opts: { annotations?: boolean } = {}): Promise<SourceFile | null> {
+  let sf: SourceFile;
   if (k) {
     const raw = await readMaybe(join(dir, "source.json.enc"));
     if (!raw) return null;
     const text = await decryptBytes((id) => (id === k.keyId ? k.key : undefined), raw);
-    return SourceFile.parse(JSON.parse(text.toString("utf8")));
+    sf = SourceFile.parse(JSON.parse(text.toString("utf8")));
+  } else {
+    const raw = await readMaybe(join(dir, "source.json"));
+    if (!raw) return null;
+    sf = SourceFile.parse(JSON.parse(raw.toString("utf8")));
   }
-  const raw = await readMaybe(join(dir, "source.json"));
-  if (!raw) return null;
-  return SourceFile.parse(JSON.parse(raw.toString("utf8")));
+  return opts.annotations === false ? sf : withAnnotations(dir, sf, k);
+}
+
+/**
+ * `sf` with the annotations kept in its folder's annotations.json(.enc) when source.json lists
+ * only their count. Read as the repository reads them (R77): a missing, damaged or undecryptable
+ * file gives no annotations (the repository raises the warning when the source is opened).
+ */
+export async function withAnnotations(dir: string, sf: SourceFile, k: ProjectKey | null | undefined): Promise<SourceFile> {
+  if (sf.annotations.length || !sf.annotationCount) return sf;
+  try {
+    let raw = await readMaybe(join(dir, k ? "annotations.json.enc" : "annotations.json"));
+    if (!raw) return sf;
+    if (k) raw = await decryptBytes((id) => (id === k.keyId ? k.key : undefined), raw);
+    return { ...sf, annotations: Annotation.array().parse(JSON.parse(raw.toString("utf8"))) };
+  } catch {
+    return sf;
+  }
 }
 
 /** Plain text of a WebVTT transcript: no header, cue ids, timings, notes or markup. */

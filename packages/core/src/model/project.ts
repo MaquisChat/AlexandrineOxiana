@@ -7,6 +7,11 @@ export const WatchedFolderOptions = z.object({
   label: z.string().max(200).optional(),
   /** Also watch subfolders (default: only files directly in the folder). */
   recursive: z.boolean().default(false),
+  /**
+   * The collection new sources from this folder go into (cloud-drive folders, Task W3). Optional: an
+   * old project.json has none; a collection that no longer exists means no collection.
+   */
+  collectionId: Id.optional(),
 });
 export type WatchedFolderOptions = z.infer<typeof WatchedFolderOptions>;
 
@@ -49,10 +54,56 @@ export const Project = z.object({
    * `keep` — how many backups of this project are kept (absent: 10).
    */
   /**
-   * The IANA time zone the project's calendar rules are read in (e.g. the retention date, R92);
-   * absent: UTC.
+   * The IANA time zone every date rule of the project is read in: protocol validity and retention
+   * (R93, R160 as amended; see `dateRuleZone`). Absent: protocol dates in the computer's zone
+   * (R17), retention in UTC (R92). Set through a governed, audited change that accepts only a
+   * real zone name (`timeZoneName`); read leniently: a value that names no zone counts as unset.
    */
   timeZone: z.string().min(1).max(64).optional(),
   backups: z.object({ automatic: z.boolean().optional(), keep: z.number().int().min(1).max(1000).optional() }).optional(),
 });
 export type Project = z.infer<typeof Project>;
+
+/**
+ * Area/Location names of the geographic IANA areas (letters, digits, `_`, `+`, `-`; no offsets,
+ * spaces or empty parts), or "UTC". Legacy and offset-style zones (`Etc/GMT+2`, which means
+ * UTC−2; `EST`, `CET`, `SystemV/…`) are refused: they are easy to misread.
+ */
+const ZONE_SHAPE = /^(?:Africa|America|Antarctica|Arctic|Asia|Atlantic|Australia|Europe|Indian|Pacific)(?:\/[A-Za-z0-9][A-Za-z0-9_+-]*)+$/iu;
+
+/**
+ * An IANA time zone name in its usual spelling (e.g. "europe/berlin" → "Europe/Berlin"), or
+ * undefined when `name` is not one this runtime knows: unknown zones, UTC offsets ("+05:00"),
+ * legacy zones, padded or overlong text are refused (R93: the project time-zone setting).
+ */
+export function timeZoneName(name: string): string | undefined {
+  if (typeof name !== "string" || name.length < 1 || name.length > 64) return undefined;
+  if (name.toUpperCase() === "UTC") return "UTC";
+  if (!ZONE_SHAPE.test(name)) return undefined;
+  try {
+    const resolved = new Intl.DateTimeFormat("en-CA", { timeZone: name }).resolvedOptions().timeZone;
+    // The runtime's spelling when only the letter case differs. An alias it maps to another name
+    // ("America/Argentina/Buenos_Aires" → "America/Buenos_Aires") is kept as written when written
+    // in the usual case (every part capitalised), else the runtime's name is stored.
+    if (resolved.toLowerCase() === name.toLowerCase()) return resolved;
+    return name.split("/").every((part) => /^[A-Z]/u.test(part) && /[a-z]/u.test(part)) ? name : resolved;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The date rules of a project: protocol validity (R16, R17) and every other date; retention (R92). */
+export type DateRule = "protocol" | "retention";
+
+/**
+ * THE zone a project's date rule is read in (R160 as amended): the project's time zone when one
+ * is set (and names a zone), for every rule; else each rule's own default: the computer's zone
+ * (`computerZone`, else this runtime's) for protocol dates and other dates (R17), UTC for
+ * retention (R92). Every caller that gives the policy engine or a date check a zone uses this.
+ */
+export function dateRuleZone(project: { timeZone?: string | undefined }, rule: DateRule, computerZone: string | undefined): string {
+  const set = project.timeZone ? timeZoneName(project.timeZone) : undefined;
+  if (set) return set;
+  if (rule === "retention") return "UTC";
+  return computerZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+}

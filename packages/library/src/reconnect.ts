@@ -11,11 +11,10 @@ import { LibraryRelativePath, type Asset } from "@ao/core";
 import { CHUNK_SIZE, HEADER_LEN, TAG_LEN, decryptStream, readKeyId } from "./crypto/format.js";
 import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
-import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
+import { copyFileAtomic } from "./fs/atomic.js";
 import { listProjectEntries, projectKey, type ProjectEntry } from "./index/changes.js";
-import { INDEX_FILE, IndexHandle } from "./index/db.js";
 import { readSource } from "./index/load.js";
-import { isIndexStale, rebuildIndex } from "./index/rebuild.js";
+import { openIndexChecked, rebuildIndexIfNeeded } from "./index/rebuild.js";
 import {
   LibraryMovedError,
   MOVED_MARKER,
@@ -32,9 +31,21 @@ import {
 import type { LocationEnv } from "./location.js";
 import { listUnfinishedMoves, movedToFor } from "./old-copies.js";
 import { recordLocation } from "./registry.js";
-import { ReadOnlyLibraryError } from "./repo/errors.js";
+import { ReadOnlyLibraryError, isLockedRefusal } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
-import { appendLibraryEvent, openRepo, relinkLinkedAsset, repoLibrary, type Repo } from "./repo/repo.js";
+import { holdsLock, newAttentionId, projectFolders, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
+import {
+  appendLibraryEvent,
+  openRepo,
+  recordOrMark,
+  relinkLinkedAsset,
+  removeProjectAttention,
+  repoLibrary,
+  repoProjectInfo,
+  writeProjectAttention,
+  type Repo,
+} from "./repo/repo.js";
+import { SimulatedCrash } from "./repo/seams.js";
 import { LinkedContentChangedError } from "./repo/sources.js";
 import { LockNotWritableError } from "./lock.js";
 import type { Manifest } from "./repo/state.js";
@@ -430,6 +441,7 @@ async function expectedFiles(
           });
         }
       } catch (err) {
+        if (isLockedRefusal(err)) throw err; // locked during the walk: the caller decides (R404), never an error row
         errors.push({ path: folder, message: msg(err) });
       }
     }
@@ -459,6 +471,19 @@ export async function checkIntegrity(lib: Pick<Library, "id" | "root">, sample: 
   if (sample !== "full" && !(typeof sample === "number" && sample >= 0 && sample <= 1)) {
     throw new TypeError("sample must be a fraction between 0 and 1, or 'full'");
   }
+  // A project locked while it is checked (its key wiped mid-read) is never reported "mismatched" or in error
+  // (R404): the check is made again, that project now checked as a locked project is (presence only). Retries are
+  // bounded; then the refusal stands.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await checkOnce(lib, sample, opts);
+    } catch (err) {
+      if (!isLockedRefusal(err) || attempt >= 3) throw err;
+    }
+  }
+}
+
+async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySample, opts: IntegrityOptions): Promise<IntegrityReport> {
   const stat: StatFn = opts.stat ?? ((p) => fsp.lstat(p));
   const openRead = opts.openRead ?? defaultOpenRead;
   const report = emptyReport();
@@ -501,6 +526,7 @@ export async function checkIntegrity(lib: Pick<Library, "id" | "root">, sample: 
     try {
       if ((await hashStream(abs, openRead, a.encrypted ? f.key : undefined)) !== a.sha256) report.mismatched.push(entry);
     } catch (err) {
+      if (isLockedRefusal(err)) throw err; // locked meanwhile: checked again (see checkIntegrity)
       if (isGone(err)) report.missing.push(entry);
       else report.mismatched.push(entry); // unreadable or fails to decrypt
     }
@@ -580,10 +606,12 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
     const writable = library.mode === "read-write";
     // The repo first: opening it finishes or rolls back writes interrupted by a crash.
     let repo: Repo | undefined;
+    let repoError: unknown;
     if (writable) {
       try {
         repo = await openRepo(library, keyRing, { clock: deps.clock, ...(opts.tz ? { tz: opts.tz } : {}), ...(opts.actor ? { actor: opts.actor } : {}) });
       } catch (err) {
+        repoError = err;
         warnings.push(`The library's projects could not be opened (${msg(err)}); the library.reconnect audit event was not recorded`);
       }
     }
@@ -625,15 +653,57 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
           errors: i.errors.length,
         },
       };
+      // A project whose event cannot be written is marked; the next open records it (Task 50).
       for (const pr of repo.listProjects()) {
+        const w = await recordOrMark(repo, pr.id, "library.reconnect", details);
+        if (w) warnings.push(w);
+      }
+    } else {
+      // No repo: the projects could not be opened, or the library is read-only here. Each readable
+      // project gets a mark: in its folder when this device holds the lock, else (or when the folder
+      // cannot take it) kept on this device until its next writable open (R154 e).
+      const at = deps.clock().toISOString();
+      const i = result.integrity;
+      let marked = 0;
+      let kept = 0;
+      for (const [projectId, rel] of await projectFolders(root)) {
+        const rec: UnrecordedAudit = {
+          formatVersion: 1,
+          id: newAttentionId(),
+          kind: "audit-unrecorded",
+          occurredAt: at,
+          actor: opts.actor ?? "local-user",
+          device: deps.deviceId,
+          action: "library.reconnect",
+          details: {
+            hint: `${deps.hostname}:${basename(resolve(root))}`,
+            sample,
+            rebuilt: false,
+            ...(writable ? { projectsNotOpened: true } : { readOnly: library.readOnlyReason ?? "unknown" }),
+            integrity: { checked: i.checked, missing: i.missing.length, mismatched: i.mismatched.length },
+          },
+          state: "ready",
+          reason: writable ? reasonOf(repoError) : "ReadOnlyLibrary",
+        };
         try {
-          await appendLibraryEvent(repo, pr.id, "library.reconnect", details);
-        } catch (err) {
-          warnings.push(`The library.reconnect audit event could not be recorded for project ${pr.id} (${msg(err)})`);
+          if (!(await holdsLock(library))) throw new Error("not held");
+          await writeAttention(root, rel, rec);
+          marked++;
+        } catch {
+          try {
+            await writeOutbox(deps.appConfigDir, library.id, projectId, rec);
+            kept++;
+          } catch (err) {
+            warnings.push(`The library.reconnect audit event for a project could not be kept for later (${msg(err)})`);
+          }
         }
       }
-    } else if (!writable) {
-      warnings.push(`The library.reconnect audit event was not recorded: the library is read-only (${library.readOnlyReason ?? "unknown"})`);
+      if (marked > 0) warnings.push(`${marked} project(s) are marked as needing attention; the reconnect is recorded in their audit logs when they can be opened`);
+      if (kept > 0) {
+        warnings.push(
+          `The library.reconnect audit event was not recorded${writable ? "" : `: the library is read-only (${library.readOnlyReason ?? "unknown"})`}; it is kept on this computer for ${kept} project(s) and recorded when the library is next opened here with write access`,
+        );
+      }
     }
     return result;
   } catch (err) {
@@ -644,28 +714,15 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
 
 /** Rebuilds library.sqlite when it is missing, unreadable or stale. True when rebuilt. */
 async function rebuildIfNeeded(library: Library, keyRing: KeyRing, warnings: string[]): Promise<boolean> {
-  const dbPath = join(library.root, INDEX_FILE);
-  let stale = !(await pathExists(dbPath));
-  let handle: IndexHandle;
+  const checked = await openIndexChecked(library.root);
+  warnings.push(...checked.warnings);
   try {
-    handle = new IndexHandle(library.root);
-  } catch {
-    // Unreadable database: keep it aside (it is only a cache) and start over.
-    const stamp = new Date().toISOString().replace(/[-:.]/g, "");
-    await renameWithRetry(dbPath, `${dbPath}.corrupt-${stamp}`);
-    for (const s of ["-wal", "-shm"]) await fsp.rm(dbPath + s, { force: true });
-    warnings.push("library.sqlite could not be opened; it was kept as library.sqlite.corrupt-<time> and rebuilt");
-    handle = new IndexHandle(library.root);
-    stale = true;
-  }
-  try {
-    if (!stale) stale = await isIndexStale(library.root, handle.db, keyRing).catch(() => true);
-    if (!stale) return false;
-    const res = await rebuildIndex(handle, keyRing, library);
+    const res = await rebuildIndexIfNeeded(checked.handle, keyRing, library, { force: checked.needsRebuild !== undefined });
+    if (!res) return false;
     for (const e of res.errors) warnings.push(`Index rebuild: ${e.folder}: ${e.message}`);
     return true;
   } finally {
-    handle.close();
+    checked.handle.close();
   }
 }
 
@@ -812,7 +869,11 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
     const k = `${key?.keyId ?? ""}:${c.abs}`;
     let h = memo.get(k);
     if (!h) {
-      h = hashStream(c.abs, openRead, key).catch(() => null);
+      // A key a lock wiped mid-read is "locked", not a candidate that does not match (R404).
+      h = hashStream(c.abs, openRead, key).catch((err: unknown) => {
+        if (isLockedRefusal(err)) throw err;
+        return null;
+      });
       memo.set(k, h);
     }
     return h;
@@ -821,6 +882,33 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
   const realRoot = await fsp.realpath(lib.root);
   /** Per project: asset ids restored by copying, for the audit event. */
   const copied = new Map<string, string[]>();
+  /** Per project: asset ids restored whose owner-only permissions could not be set (ledger line 115). */
+  const modeNotSet = new Map<string, string[]>();
+  /**
+   * Per project: the record written BEFORE its first copy (Task 50), so a crash between a copy and
+   * the audit event leaves something the next open records; updated after each copy.
+   */
+  const intents = new Map<string, UnrecordedAudit>();
+  const intentFor = async (projectId: string): Promise<UnrecordedAudit> => {
+    let rec = intents.get(projectId);
+    if (!rec) {
+      const info = repoProjectInfo(repo, projectId);
+      rec = {
+        formatVersion: 1,
+        id: newAttentionId(),
+        kind: "audit-unrecorded",
+        occurredAt: info.at,
+        actor: info.actor,
+        device: info.device,
+        action: "library.relink",
+        details: { files: 0, assetIds: [] },
+        state: "intent",
+      };
+      await writeProjectAttention(repo, projectId, rec);
+      intents.set(projectId, rec);
+    }
+    return rec;
+  };
   const placeholderOfSize = (size: number) => found.placeholders.some((c) => c.size === size);
 
   for (const f of missing) {
@@ -889,29 +977,86 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
         if (placeholderOfSize(size)) result.skipped.push({ path: f.path, reason: "placeholder" });
         continue;
       }
-      const verify = async (staged: string) => (await hashStream(staged, defaultOpenRead, key).catch(() => null)) === a.sha256;
+      const verify = async (staged: string) =>
+        (await hashStream(staged, defaultOpenRead, key).catch((err: unknown) => {
+          if (isLockedRefusal(err)) throw err; // locked, not "verify-failed" (R404)
+          return null;
+        })) === a.sha256;
       const mode = f.identifiable || a.encrypted || f.keyId ? 0o600 : undefined;
+      // Nothing is copied into a project that cannot first be marked (fail closed). The record
+      // names this file before it is copied (M8), so a crash right after the copy still counts it.
+      const intent = await intentFor(f.projectId);
+      const planned = [...(copied.get(f.projectId) ?? []), a.id];
+      intent.details = { files: planned.length, assetIds: planned };
+      await writeProjectAttention(repo, f.projectId, intent);
       const placed = await copyBack(lib.root, src.abs, target, mode, verify);
-      if (placed !== "ok") {
+      if (placed !== "ok" && placed !== "ok-mode-not-set") {
         result.skipped.push({ path: f.path, reason: placed });
         continue;
       }
       used.add(src.abs);
       result.relinked++;
       result.relinkedPaths.push(f.path);
-      copied.set(f.projectId, [...(copied.get(f.projectId) ?? []), a.id]);
+      const ids = [...(copied.get(f.projectId) ?? []), a.id];
+      copied.set(f.projectId, ids);
+      if (placed === "ok-mode-not-set") {
+        // The file stays (verified); the project is marked until its permissions are set (R28 precedent).
+        modeNotSet.set(f.projectId, [...(modeNotSet.get(f.projectId) ?? []), a.id]);
+        const info = repoProjectInfo(repo, f.projectId);
+        try {
+          await writeProjectAttention(repo, f.projectId, {
+            formatVersion: 1,
+            id: newAttentionId(),
+            kind: "permissions-not-set",
+            occurredAt: info.at,
+            actor: info.actor,
+            device: info.device,
+            sourceIds: [f.sourceId!],
+            action: "library.relink",
+          });
+          result.warnings.push(`${f.path}: the file was restored but its owner-only permissions could not be set; the project is marked as needing attention and they are set again when the library is next opened`);
+        } catch (err) {
+          result.warnings.push(`${f.path}: the file was restored but its owner-only permissions could not be set, and the project could not be marked as needing attention (${msg(err)})`);
+        }
+      }
     } catch (err) {
-      result.warnings.push(`${f.path}: ${msg(err)}`);
+      // Its project was locked meanwhile: skipped as a locked project's file is (R35), never a warning (R404).
+      if (isLockedRefusal(err)) result.skipped.push({ path: f.path, reason: "project-locked" });
+      else result.warnings.push(`${f.path}: ${msg(err)}`);
     }
   }
   result.stillMissing = missing.length - result.relinked;
 
-  for (const [projectId, assetIds] of copied) {
-    try {
-      await appendLibraryEvent(repo, projectId, "library.relink", { files: assetIds.length, assetIds });
-    } catch (err) {
-      result.warnings.push(`The library.relink audit event could not be recorded for project ${projectId} (${msg(err)})`);
+  if (relinkSeams.crashBeforeAudit) {
+    relinkSeams.crashBeforeAudit = undefined;
+    throw new SimulatedCrash("simulated crash after the copies, before their audit events");
+  }
+  for (const [projectId, intent] of intents) {
+    const assetIds = copied.get(projectId) ?? [];
+    if (assetIds.length === 0) {
+      await removeProjectAttention(repo, projectId, intent.id).catch(() => {});
+      continue;
     }
+    const notSet = modeNotSet.get(projectId);
+    const details = { files: assetIds.length, assetIds, ...(notSet ? { permissionsNotSet: notSet } : {}), attentionId: intent.id };
+    try {
+      await appendLibraryEvent(repo, projectId, "library.relink", details);
+    } catch (err) {
+      // Not undone: the files are verified. The record stays, now complete, and the next open records it (Task 50).
+      try {
+        await writeProjectAttention(repo, projectId, { ...intent, details: { files: assetIds.length, assetIds, ...(notSet ? { permissionsNotSet: notSet } : {}) }, state: "ready", reason: reasonOf(err) });
+        result.warnings.push(
+          `The library.relink audit event could not be recorded for project ${projectId} (${msg(err)}); the project is marked as needing attention and the event is recorded when the library is next opened`,
+        );
+      } catch (e) {
+        result.warnings.push(
+          `The library.relink audit event could not be recorded for project ${projectId} (${msg(err)}); the project stays marked as needing attention (${msg(e)})`,
+        );
+      }
+      continue;
+    }
+    // Recorded: the record goes (if this fails, the next open finds the event by its id and removes it).
+    await removeProjectAttention(repo, projectId, intent.id).catch(() => {});
   }
   return result;
 }
@@ -924,6 +1069,10 @@ export const relinkSeams: {
   beforeLinkedUpdate?: (abs: string) => Promise<void>;
   /** Behave as on a file system without hard links (FAT/exFAT). */
   noHardLinks?: boolean;
+  /** Setting permissions after an exclusive copy fails (ledger line 115). */
+  failChmod?: boolean;
+  /** Simulated crash after the copies, before their audit events (Task 50). */
+  crashBeforeAudit?: boolean;
 } = {};
 
 async function fsyncDir(dir: string): Promise<void> {
@@ -950,7 +1099,7 @@ async function copyBack(
   target: string,
   mode: number | undefined,
   verify: (staged: string) => Promise<boolean>,
-): Promise<"ok" | "verify-failed" | "target-exists"> {
+): Promise<"ok" | "ok-mode-not-set" | "verify-failed" | "target-exists"> {
   if (await pathExists(target)) return "target-exists";
   await assertContained(root, target);
   await fsp.mkdir(dirname(target), { recursive: true });
@@ -971,7 +1120,16 @@ async function copyBack(
         if ((e as NodeJS.ErrnoException).code === "EEXIST") return "target-exists";
         throw e;
       }
-      if (mode !== undefined && process.platform !== "win32") await fsp.chmod(target, mode);
+      if (mode !== undefined && process.platform !== "win32") {
+        try {
+          if (relinkSeams.failChmod) throw Object.assign(new Error("permission change refused (simulated)"), { code: "EPERM" });
+          await fsp.chmod(target, mode);
+        } catch {
+          // The verified file stays; the caller counts, audits and marks it (never silent).
+          await fsyncDir(dirname(target));
+          return "ok-mode-not-set";
+        }
+      }
     }
     await fsyncDir(dirname(target));
     return "ok";

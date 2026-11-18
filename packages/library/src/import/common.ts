@@ -5,7 +5,7 @@
  */
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { primary, type DupKey, type PolicyDecision, type PolicyRequest, type Provenance, type SourceFile } from "@ao/core";
+import { nonBlank, primary, type DupKey, type PolicyDecision, type PolicyRequest, type Provenance, type SourceFile } from "@ao/core";
 import type { ReviewInput } from "../repo/review.js";
 import { projectPolicy, type Repo } from "../repo/repo.js";
 import { AUTO_ACCEPT_THRESHOLD, type Resolution } from "./resolve.js";
@@ -75,7 +75,8 @@ export async function storeInputs(
     }
   }
   const identifiable = policy?.identifiability.containsIdentifiable ?? true;
-  const legalBasis = policy?.consent.defaultLegalBasis?.[category]?.trim() || undefined;
+  // A blank basis (invisible characters only) is none: core's one `blank()` (R391 c, R415 d).
+  const legalBasis = nonBlank(policy?.consent.defaultLegalBasis?.[category]);
   return { identifiable, ...(legalBasis ? { legalBasis } : {}) };
 }
 

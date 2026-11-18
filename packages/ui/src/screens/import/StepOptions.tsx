@@ -1,7 +1,10 @@
 /**
  * Step 5: options for this import (spec 5.4). Defaults: copy, collections, merge, OCR on,
  * transcription off — except that projects that pseudonymise names default to ignoring folder
- * structure (R64), and projects that keep files encrypted cannot link in place (R24).
+ * structure (R64), and projects that keep files encrypted cannot link in place (R24). With "Copy into
+ * the library", files the source links in place (Zotero linked attachments) are copied too; keeping
+ * them as links is a separate, explicit choice, shown only when the scan found some and never where
+ * the project's rules require encryption (R136).
  */
 import type { ImportOptions, ImportPolicy } from "../../api/import";
 import { DescribedRadio } from "./StepSource";
@@ -19,9 +22,11 @@ export interface StepOptionsProps {
   options: WizardOptions;
   onOptions(o: WizardOptions): void;
   policy: ImportPolicy;
+  /** Files the scan found that the source links in place (Zotero linked attachments; R136). */
+  linkedAttachments?: number;
 }
 
-export function StepOptions({ options, onOptions, policy }: StepOptionsProps) {
+export function StepOptions({ options, onOptions, policy, linkedAttachments = 0 }: StepOptionsProps) {
   const set = <K extends keyof WizardOptions>(k: K, v: WizardOptions[K]) => onOptions({ ...options, [k]: v });
   return (
     <Section title="Options">
@@ -40,6 +45,21 @@ export function StepOptions({ options, onOptions, policy }: StepOptionsProps) {
           <p className="ao-import__warning" role="note">
             {LINK_WARNING}
           </p>
+        )}
+        {options.fileHandling === "copy" && linkedAttachments > 0 && !policy.encryptionRequired && (
+          <>
+            <label className="ao-import__choice">
+              <input type="checkbox" checked={options.linkedFiles === "link"} onChange={(e) => set("linkedFiles", e.target.checked ? "link" : "copy")} />
+              <span>
+                Keep the {linkedAttachments === 1 ? "file" : `${linkedAttachments.toLocaleString("en-US")} files`} Zotero links to where {linkedAttachments === 1 ? "it is, as a link" : "they are, as links"}
+              </span>
+            </label>
+            {options.linkedFiles === "link" && (
+              <p className="ao-import__warning" role="note">
+                {LINK_WARNING}
+              </p>
+            )}
+          </>
         )}
       </fieldset>
 

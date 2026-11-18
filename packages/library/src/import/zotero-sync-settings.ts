@@ -1,0 +1,663 @@
+/**
+ * Zotero account sync (Task Z7): this computer's two device files for it. They are about this computer (the key is
+ * per computer, R206 6), never library data, and they hold nothing of a library's content: no title, no name, no
+ * collection, no file name, no path, no key.
+ *
+ *   `<appConfigDir>/zotero-sync.json`          `{ v: 1, libraries: { [libraryId]: ZoteroSyncSettings } }`
+ *        which Zotero library (`user:<n>` / `group:<n>`) feeds which project, with what import options, how often,
+ *        whether automatic runs are on, and each link's pause and `fullDone`.
+ *   `<appConfigDir>/zotero-sync-history.json`  `{ v: 1, libraries: { [libraryId]: ZoteroSyncRun[] } }`
+ *        newest first, at most ZOTERO_SYNC_HISTORY_MAX per library: ids, times, outcomes, reasons, counts (never for an
+ *        encrypted project, Accept 4), host NAMES of refused redirect hosts (at most 5) and the back-off time.
+ *
+ * Both are 0600 in the 0700 settings folder, written atomically through updateAppSettingStrict, one write at a time
+ * per file in this process and, across processes (the app's service and the command line both change them, R299 c),
+ * under the file's lock (withFileLock, `<name>.lock`: held only for the read, the change and the atomic write); they are
+ * read strictly (Accept 5): a missing file is "nothing yet"; a file that is there but
+ * cannot be read (permissions, an I/O error) is refused (ZoteroSyncFileUnreadableError) and nothing is written on its
+ * strength; DAMAGED content (not JSON, the wrong shape, an entry this app cannot use, an unknown field) is set aside
+ * as `<name>.unreadable-<stamp>` (never deleted or overwritten) and the file starts again empty:
+ *   - settings: automatic sync is then off for every library (nothing is linked) until the researcher sets it up
+ *     again; the researcher is told through the device notice `zotero-sync-settings-set-aside` (R242), and the caller
+ *     through `onSetAside`;
+ *   - history: it starts empty, and never blocks a sync.
+ *
+ * Pauses (R206 4, Accept 3) are written by the runner (`key-refused` on every link of the library, `library-gone` on
+ * one link) and by Z8 after an undo of a sync batch (`pauseLink(…, "undone")`). The runner never clears a pause: a
+ * pause is cleared only by writeZoteroSyncSettings with that link written without `paused` (the researcher saving
+ * the settings again, after the key check for `key-refused`).
+ */
+import * as fsp from "node:fs/promises";
+import { join } from "node:path";
+import { AppSettingUnreadableError, ensurePrivateDir, readAppSettingStrict, setAppSettingAside } from "../app-settings.js";
+import { raiseDeviceNotice } from "../device-notices.js";
+import { writeFileAtomic } from "../fs/atomic.js";
+import { FileLockBusyError, FileLockUnavailableError, withFileLock } from "../fs/file-lock.js";
+import { InvalidInputError } from "../repo/errors.js";
+
+export const ZOTERO_SYNC_FILE = "zotero-sync.json";
+export const ZOTERO_SYNC_HISTORY_FILE = "zotero-sync-history.json";
+/** Links per library (one per Zotero library). */
+export const ZOTERO_SYNC_MAX_LINKS = 20;
+/** Runs kept per library (the newest). */
+export const ZOTERO_SYNC_HISTORY_MAX = 200;
+/** Refused redirect hosts kept in a run's record. */
+export const ZOTERO_SYNC_MAX_HOSTS = 5;
+export const ZOTERO_SYNC_INTERVALS = [30, 60, 240] as const;
+
+export type ZoteroSyncReason =
+  | "offline"
+  | "zotero-error"
+  | "key-missing"
+  | "key-refused"
+  | "no-store"
+  | "library-gone"
+  | "backing-off"
+  | "project-locked"
+  | "library-read-only"
+  | "library-changing"
+  | "too-large"
+  | "stopped-by-you"
+  | "app-closed"
+  /** R248: the library was closed, switched or moved during the run while the app stayed open. */
+  | "library-closed"
+  | "import-running"
+  | "error"
+  /** R242 (b): a run refused because the link was paused after an undo of a sync batch. */
+  | "sync-undone"
+  /**
+   * R244 (a), R246 (a): `finished-with-problems` — a FULL run finished but its scan was not complete (its key list was
+   * not whole, a listing cut, moved or short of its total): the library version was not recorded, fullDone is false,
+   * and the next sync reads the whole library again.
+   */
+  | "deletions-unconfirmed"
+  /**
+   * R246 (a): `finished-with-problems` — an INCREMENTAL run finished but did not read everything that changed (a
+   * listing cut, moved or short of its total): since and fullDone as they were; the next sync asks for the same changes.
+   */
+  | "changes-incomplete"
+  /** R244 (b): `failed` — this link's unfinished batch could never be resumed and was ended (what came in stays); `note` holds the engine's sentence. */
+  | "batch-ended"
+  /** R295 (b): `failed` — the project's rules refused the sync (at a batch's start or its resumption); nothing was changed. */
+  | "rules-denied";
+
+export const ZOTERO_SYNC_REASONS: readonly ZoteroSyncReason[] = [
+  "offline",
+  "zotero-error",
+  "key-missing",
+  "key-refused",
+  "no-store",
+  "library-gone",
+  "backing-off",
+  "project-locked",
+  "library-read-only",
+  "library-changing",
+  "too-large",
+  "stopped-by-you",
+  "app-closed",
+  "library-closed",
+  "import-running",
+  "error",
+  "sync-undone",
+  "deletions-unconfirmed",
+  "changes-incomplete",
+  "batch-ended",
+  "rules-denied",
+];
+
+export type ZoteroSyncPause = "key-refused" | "library-gone" | "undone";
+const PAUSES: readonly ZoteroSyncPause[] = ["key-refused", "library-gone", "undone"];
+
+export interface ZoteroSyncLink {
+  ref: string;
+  projectId: string;
+  paused?: ZoteroSyncPause;
+  /** A full run of this link truly finished (the key list whole, nothing held back, the version recorded): later runs are incremental. */
+  fullDone: boolean;
+  options: { structure: "collections" | "tags" | "none"; duplicates: "merge" | "skip" | "keep-both" };
+  /**
+   * The runner's own bookkeeping (R244 M9), never set by a settings write: where this link's unfinished sync batch is,
+   * as `batch-NNNN/<batchId>`, or `unknown` while a batch is being started (the record is then looked for). Absent:
+   * this link has no unfinished batch — the runner writes `unknown` BEFORE it starts any batch and clears the hint
+   * only when its batch ended for good, so an absent hint on a stored link is a safe "nothing to resume".
+   */
+  unfinished?: string;
+}
+
+/** One library's settings on this computer. */
+export interface ZoteroSyncSettings {
+  automatic: boolean;
+  everyMinutes: 30 | 60 | 240;
+  links: ZoteroSyncLink[];
+}
+
+export const DEFAULT_ZOTERO_SYNC_SETTINGS: Readonly<ZoteroSyncSettings> = Object.freeze({ automatic: false, everyMinutes: 60, links: [] as ZoteroSyncLink[] });
+
+/**
+ * A run's numbers (plan A8, A9), mapped from the batch in ONE place (zoteroSyncCounts in zotero-sync.ts). The plan's
+ * seven plus `back` (returned from Zotero's bin or deletion) and `clearedKept` (a field cleared in Zotero, kept here).
+ */
+export interface ZoteroSyncCounts {
+  new: number;
+  changed: number;
+  unchanged: number;
+  waiting: number;
+  conflicts: number;
+  goneMarked: number;
+  failed: number;
+  back: number;
+  clearedKept: number;
+}
+const COUNT_KEYS = ["back", "changed", "clearedKept", "conflicts", "failed", "goneMarked", "new", "unchanged", "waiting"];
+
+export type ZoteroSyncOutcome = "up-to-date" | "finished" | "finished-with-problems" | "stopped" | "failed";
+const OUTCOMES: readonly ZoteroSyncOutcome[] = ["up-to-date", "finished", "finished-with-problems", "stopped", "failed"];
+
+export interface ZoteroSyncRun {
+  id: string;
+  ref: string;
+  projectId: string;
+  trigger: "manual" | "automatic";
+  startedAt: string;
+  /** Absent while the run goes on; a record without it read later (another process) is a run the app closed during. */
+  finishedAt?: string;
+  outcome: ZoteroSyncOutcome;
+  reason?: ZoteroSyncReason;
+  batchId?: string;
+  /** Never written to the device file for an encrypted project (zoteroSyncRunCounts reads them while it is unlocked). */
+  counts?: ZoteroSyncCounts;
+  refusedHosts?: string[];
+  /** ISO time before which no run of any kind may start (Zotero's Backoff / Retry-After, at least an hour). */
+  backoffUntil?: string;
+  /** With `batch-ended`: the engine's own fixed sentence for why the batch could not be resumed (no title, no path). */
+  note?: string;
+  /** Only on a returned record, never saved: false when the history file could not take it (R244 M3). */
+  recordSaved?: false;
+}
+
+/** The sentence for a sync file written by a newer version of the app (R244 M7). */
+export const ZOTERO_SYNC_NEWER_SENTENCE = "These sync settings were written by a newer version of the app. Update the app to change them.";
+
+/** A settings or history file written by a newer version of the app: left exactly as it is; not read, not changed (R244 M7). */
+export class ZoteroSyncFileNewerError extends Error {
+  constructor(readonly fileName: string) {
+    super(ZOTERO_SYNC_NEWER_SENTENCE);
+    this.name = "ZoteroSyncFileNewerError";
+  }
+}
+
+/** A settings or history file is there but cannot be read (not damaged content: permissions, an I/O error). Nothing was written. No path. */
+export class ZoteroSyncFileUnreadableError extends Error {
+  constructor(readonly fileName: string) {
+    super(`This computer's Zotero sync file "${fileName}" could not be read, so it was not changed. Check that the app's settings folder can be read and try again.`);
+    this.name = "ZoteroSyncFileUnreadableError";
+  }
+}
+
+/** R299 c: the sentence for a change that waited for another program's lock on the file and gave up (no path). */
+export const ZOTERO_SYNC_BUSY_SENTENCE = "The Zotero sync settings are in use by another program. Try again.";
+
+/**
+ * R299 c: another program (the app's service, or the command line) held the file's lock for the whole wait
+ * (FILE_LOCK_WAIT_MS): nothing was read or written. It is a kind of ZoteroSyncFileUnreadableError on purpose, so every
+ * caller ends it exactly as it ends a file that could not be changed (the service's and the command line's words for
+ * that; the runner's debug note); its own message is the sentence above.
+ */
+export class ZoteroSyncFileBusyError extends ZoteroSyncFileUnreadableError {
+  constructor(fileName: string) {
+    super(fileName);
+    this.message = ZOTERO_SYNC_BUSY_SENTENCE;
+    this.name = "ZoteroSyncFileBusyError";
+  }
+}
+
+// ------------------------------------------------------------------------------------------
+// Shapes, checked strictly.
+
+const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+const keysWithin = (o: Record<string, unknown>, required: string[], optional: string[] = []) =>
+  required.every((k) => Object.hasOwn(o, k)) && Object.keys(o).every((k) => required.includes(k) || optional.includes(k));
+const count = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+const ID = /^[A-Za-z0-9_-]{1,128}$/u;
+/** An id the device files accept (project, batch, run, library). */
+export const isZoteroSyncId = (v: unknown): v is string => typeof v === "string" && ID.test(v);
+export const ZOTERO_REF = /^(user|group):[1-9]\d{0,11}$/u;
+const HOST = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/u;
+/** The hint of a link's unfinished batch: `batch-NNNN/<batchId>`, or `unknown`. */
+export const ZOTERO_SYNC_UNFINISHED = /^(?:unknown|batch-\d{4,9}\/[A-Za-z0-9_-]{1,128})$/u;
+const NOTE = /^[^\p{Cc}\p{Cf}]{1,500}$/u;
+const isTime = (v: unknown): v is string => typeof v === "string" && v.length <= 40 && !Number.isNaN(Date.parse(v));
+
+export function isZoteroSyncLink(v: unknown): v is ZoteroSyncLink {
+  if (!isObj(v) || !keysWithin(v, ["ref", "projectId", "fullDone", "options"], ["paused", "unfinished"])) return false;
+  if (typeof v.ref !== "string" || !ZOTERO_REF.test(v.ref) || typeof v.projectId !== "string" || !ID.test(v.projectId) || typeof v.fullDone !== "boolean") return false;
+  if (v.paused !== undefined && !PAUSES.includes(v.paused as ZoteroSyncPause)) return false;
+  if (v.unfinished !== undefined && !(typeof v.unfinished === "string" && ZOTERO_SYNC_UNFINISHED.test(v.unfinished))) return false;
+  const o = v.options;
+  return isObj(o) && keysWithin(o, ["structure", "duplicates"]) && ["collections", "tags", "none"].includes(o.structure as string) && ["merge", "skip", "keep-both"].includes(o.duplicates as string);
+}
+
+export function isZoteroSyncSettings(v: unknown): v is ZoteroSyncSettings {
+  if (!isObj(v) || !keysWithin(v, ["automatic", "everyMinutes", "links"])) return false;
+  if (typeof v.automatic !== "boolean" || !(ZOTERO_SYNC_INTERVALS as readonly unknown[]).includes(v.everyMinutes)) return false;
+  if (!Array.isArray(v.links) || v.links.length > ZOTERO_SYNC_MAX_LINKS || !v.links.every(isZoteroSyncLink)) return false;
+  return new Set(v.links.map((l) => (l as ZoteroSyncLink).ref)).size === v.links.length;
+}
+
+function isCounts(v: unknown): v is ZoteroSyncCounts {
+  return isObj(v) && Object.keys(v).sort().join() === COUNT_KEYS.join() && COUNT_KEYS.every((k) => count(v[k]));
+}
+
+export function isZoteroSyncRun(v: unknown): v is ZoteroSyncRun {
+  if (!isObj(v) || !keysWithin(v, ["id", "ref", "projectId", "trigger", "startedAt", "outcome"], ["finishedAt", "reason", "batchId", "counts", "refusedHosts", "backoffUntil", "note"])) return false;
+  if (v.note !== undefined && !(typeof v.note === "string" && NOTE.test(v.note))) return false;
+  if (typeof v.id !== "string" || !ID.test(v.id) || typeof v.ref !== "string" || !ZOTERO_REF.test(v.ref) || typeof v.projectId !== "string" || !ID.test(v.projectId)) return false;
+  if (v.trigger !== "manual" && v.trigger !== "automatic") return false;
+  if (!isTime(v.startedAt) || (v.finishedAt !== undefined && !isTime(v.finishedAt)) || (v.backoffUntil !== undefined && !isTime(v.backoffUntil))) return false;
+  if (!OUTCOMES.includes(v.outcome as ZoteroSyncOutcome)) return false;
+  if (v.reason !== undefined && !ZOTERO_SYNC_REASONS.includes(v.reason as ZoteroSyncReason)) return false;
+  if (v.batchId !== undefined && (typeof v.batchId !== "string" || !ID.test(v.batchId))) return false;
+  if (v.counts !== undefined && !isCounts(v.counts)) return false;
+  if (v.refusedHosts !== undefined && !(Array.isArray(v.refusedHosts) && v.refusedHosts.length <= ZOTERO_SYNC_MAX_HOSTS && v.refusedHosts.every((h) => typeof h === "string" && HOST.test(h)))) return false;
+  return true;
+}
+
+const fileOf =
+  <T>(entry: (v: unknown) => boolean) =>
+  (v: unknown): v is { v: 1; libraries: Record<string, T> } =>
+    isObj(v) && keysWithin(v, ["v", "libraries"]) && v.v === 1 && isObj(v.libraries) && Object.entries(v.libraries).every(([id, e]) => ID.test(id) && entry(e));
+
+const isSettingsFile = fileOf<ZoteroSyncSettings>(isZoteroSyncSettings);
+const isHistoryFile = fileOf<ZoteroSyncRun[]>((e) => Array.isArray(e) && e.length <= ZOTERO_SYNC_HISTORY_MAX && e.every(isZoteroSyncRun));
+
+// ------------------------------------------------------------------------------------------
+// Reading and writing, strictly.
+
+export interface ZoteroSyncFileOptions {
+  /** Told when damaged content was set aside (the file's own name and the name it is kept under; no path). */
+  onSetAside?(fileName: string, keptAs: string): void;
+  /**
+   * R269 c: told, on every read or refused write, that the file was written by a newer version of the app and so was
+   * not read (it is left exactly as it is; the device notice is raised once per process). Only for that: a missing,
+   * unreadable or damaged file is never "newer".
+   */
+  onNewer?(fileName: string): void;
+  /** Test seam: the clock for the set-aside name. */
+  now?: () => Date;
+}
+
+/**
+ * Missing → undefined; there but not readable → ZoteroSyncFileUnreadableError; written by a newer version of the app
+ * (an object whose `v` is a whole number above 1) → "newer", left exactly as it is (R244 M7); damaged → "damaged".
+ */
+async function classify<T>(dir: string, name: string, check: (v: unknown) => v is T): Promise<T | undefined | "damaged" | "newer"> {
+  let text: string;
+  try {
+    text = await fsp.readFile(join(dir, name), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+    throw new ZoteroSyncFileUnreadableError(name);
+  }
+  try {
+    const v = JSON.parse(text) as unknown;
+    if (isObj(v) && Number.isSafeInteger(v.v) && (v.v as number) > 1) return "newer";
+    return check(v) ? v : "damaged";
+  } catch {
+    return "damaged";
+  }
+}
+
+/**
+ * Every read and every read-modify-write of one file, one at a time in this process (R244 M6): the runner's changes
+ * and a settings write (Z8's routes) cannot lose each other's change. (The set-aside and the write itself also take
+ * the app settings' per-file turn, inside this one.)
+ */
+const turns = new Map<string, Promise<unknown>>();
+function inTurn<T>(dir: string, name: string, step: () => Promise<T>): Promise<T> {
+  const key = join(dir, name);
+  const run = (turns.get(key) ?? Promise.resolve()).then(step);
+  turns.set(
+    key,
+    run.catch(() => undefined),
+  );
+  return run;
+}
+
+/**
+ * R299 c: `step` (a read-modify-write of the file, or the setting aside of its damaged content) under the file's lock,
+ * which holds across processes. Called inside the file's in-process turn; the lock is held only while `step` runs, and
+ * `step` only reads, changes and writes (the notices it gives rise to are raised after the lock is released). A read
+ * alone never takes it: the file is replaced atomically, so a reader sees the old file or the new one, whole. A lock
+ * that stays taken ends as ZoteroSyncFileBusyError; one that cannot be made at all as ZoteroSyncFileUnreadableError.
+ */
+async function underLock<T>(dir: string, name: string, step: (stillMine: () => Promise<boolean>) => Promise<T>): Promise<T> {
+  try {
+    ensurePrivateDir(dir);
+  } catch {
+    throw new ZoteroSyncFileUnreadableError(name);
+  }
+  try {
+    return await withFileLock(join(dir, name), step);
+  } catch (err) {
+    if (err instanceof FileLockBusyError) throw new ZoteroSyncFileBusyError(name);
+    if (err instanceof FileLockUnavailableError) throw new ZoteroSyncFileUnreadableError(name);
+    throw err;
+  }
+}
+
+/** Settings files of a newer version already told about in this process (R246 M-b: a dismissed notice stays dismissed). */
+const newerTold = new Set<string>();
+/** Said once per process for the file (never on every read or refused write) when the settings were written by a newer version; never throws. */
+function newerNotice(dir: string, name: string, o: ZoteroSyncFileOptions): Promise<void> {
+  o.onNewer?.(name);
+  if (name !== ZOTERO_SYNC_FILE || newerTold.has(join(dir, name))) return Promise.resolve();
+  newerTold.add(join(dir, name));
+  return raiseDeviceNotice(dir, "zotero-sync-settings-newer", (o.now ?? (() => new Date()))());
+}
+
+/** A set-aside done (under the lock), to be told about once the lock is released. */
+interface SetAside {
+  keptAs: string;
+  at: Date;
+}
+
+/** Renames damaged content aside (the caller holds the lock); undefined when it was put right (or removed) meanwhile. */
+async function setAside(dir: string, name: string, check: (v: unknown) => v is unknown, o: ZoteroSyncFileOptions): Promise<SetAside | undefined> {
+  const at = (o.now ?? (() => new Date()))();
+  try {
+    return { keptAs: await setAppSettingAside(dir, name, check, at), at };
+  } catch (err) {
+    if ((err as Error)?.name === "AppSettingReadableError") return undefined; // put right (or removed) meanwhile
+    throw new ZoteroSyncFileUnreadableError(name);
+  }
+}
+
+/** Tells of a set-aside, after the lock is released: the settings through the device notices (R242; never throws), the history with none; then the caller. */
+async function toldSetAside(dir: string, name: string, done: SetAside, o: ZoteroSyncFileOptions): Promise<void> {
+  if (name === ZOTERO_SYNC_FILE) await raiseDeviceNotice(dir, "zotero-sync-settings-set-aside", done.at);
+  o.onSetAside?.(name, done.keptAs);
+}
+
+/** The file's content (undefined: missing, set aside just now, or written by a newer version: nothing is read from it). */
+function readFileStrict<T>(dir: string, name: string, check: (v: unknown) => v is T, o: ZoteroSyncFileOptions): Promise<T | undefined> {
+  return inTurn(dir, name, async () => {
+    // The read itself takes no lock (the file is replaced atomically).
+    const got = await classify(dir, name, check);
+    if (got === "newer") {
+      await newerNotice(dir, name, o);
+      return undefined;
+    }
+    if (got !== "damaged") return got;
+    // Setting damaged content aside changes the file: under the lock (setAppSettingAside checks again that it is still damaged).
+    const done = await underLock(dir, name, () => setAside(dir, name, check, o));
+    if (done) await toldSetAside(dir, name, done, o);
+    return undefined;
+  });
+}
+
+/** R309 a: the holder's lock was taken over (or removed) before it wrote: nothing was written. */
+class LockLost extends Error {}
+
+/**
+ * A read-modify-write of the file in its turn; damaged content is set aside first (then `edit` gets undefined). A file
+ * written by a newer version is never changed: ZoteroSyncFileNewerError.
+ *
+ * R309 a: the last thing before the atomic write is to ask whether the lock is still this holder's. A holder that was
+ * stopped past the stale bound (its lock taken over meanwhile) writes NOTHING and makes the whole change again, from the
+ * read, under a new lock — once; lost a second time, it ends as a busy file does (ZoteroSyncFileBusyError). What remains
+ * is the instant between that check and the write.
+ */
+function updateFile<T>(dir: string, name: string, check: (v: unknown) => v is T, edit: (cur: T | undefined) => T, o: ZoteroSyncFileOptions): Promise<T> {
+  return inTurn(dir, name, async () => {
+    // Told once the lock is released (R299 c: the lock is held for the read, the change and the write only).
+    const asides: SetAside[] = [];
+    let newer = false;
+    const once = () =>
+      underLock(dir, name, async (stillMine) => {
+        for (let attempt = 0; ; attempt++) {
+          // A file there but unreadable (not damaged) is refused before anything is set aside or written.
+          const got = await classify(dir, name, check);
+          if (got === "newer") {
+            newer = true;
+            throw new ZoteroSyncFileNewerError(name);
+          }
+          if (got === "damaged") {
+            const done = await setAside(dir, name, check, o);
+            if (done) asides.push(done);
+          }
+          let cur: T | undefined;
+          try {
+            cur = await readAppSettingStrict(dir, name, check);
+          } catch (err) {
+            if (!(err instanceof AppSettingUnreadableError) || attempt >= 2) throw err instanceof AppSettingUnreadableError ? new ZoteroSyncFileUnreadableError(name) : err;
+            continue;
+          }
+          const next = edit(cur);
+          if (!(await stillMine())) throw new LockLost();
+          await writeFileAtomic(join(dir, name), `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+          return next;
+        }
+      });
+    try {
+      try {
+        return await once();
+      } catch (err) {
+        if (!(err instanceof LockLost)) throw err;
+      }
+      try {
+        return await once();
+      } catch (err) {
+        throw err instanceof LockLost ? new ZoteroSyncFileBusyError(name) : err;
+      }
+    } finally {
+      if (newer) await newerNotice(dir, name, o);
+      for (const done of asides) await toldSetAside(dir, name, done, o);
+    }
+  });
+}
+
+const own = <T>(o: Record<string, T> | undefined, k: string): T | undefined => (o && Object.hasOwn(o, k) ? o[k] : undefined);
+const copyLink = (l: ZoteroSyncLink): ZoteroSyncLink => ({
+  ref: l.ref,
+  projectId: l.projectId,
+  ...(l.paused ? { paused: l.paused } : {}),
+  fullDone: l.fullDone,
+  options: { structure: l.options.structure, duplicates: l.options.duplicates },
+  ...(l.unfinished ? { unfinished: l.unfinished } : {}),
+});
+const copySettings = (s: ZoteroSyncSettings): ZoteroSyncSettings => ({ automatic: s.automatic, everyMinutes: s.everyMinutes, links: s.links.map(copyLink) });
+
+/** The given settings as they will be stored: the runner's `unfinished` hint comes from the stored link of the same ref and project, never from the caller. */
+function withStoredHints(next: ZoteroSyncSettings, stored: ZoteroSyncSettings | undefined): ZoteroSyncSettings {
+  return {
+    ...next,
+    links: next.links.map((l) => {
+      const { unfinished: _given, ...rest } = copyLink(l);
+      const hint = stored?.links.find((s) => s.ref === l.ref && s.projectId === l.projectId)?.unfinished;
+      return hint ? { ...rest, unfinished: hint } : rest;
+    }),
+  };
+}
+
+function checkSettings(libraryId: string, s: ZoteroSyncSettings): void {
+  if (typeof libraryId !== "string" || !ID.test(libraryId)) throw new InvalidInputError("libraryId is not a library id.");
+  if (!isObj(s)) throw new InvalidInputError("The settings are not valid.");
+  if (typeof s.automatic !== "boolean") throw new InvalidInputError("automatic must be yes or no.");
+  if (!(ZOTERO_SYNC_INTERVALS as readonly unknown[]).includes(s.everyMinutes)) throw new InvalidInputError("everyMinutes must be 30, 60 or 240.");
+  if (!Array.isArray(s.links) || s.links.length > ZOTERO_SYNC_MAX_LINKS) throw new InvalidInputError(`links: at most ${ZOTERO_SYNC_MAX_LINKS} Zotero libraries can be linked.`);
+  if (!s.links.every(isZoteroSyncLink)) throw new InvalidInputError("links: a link is not valid (ref user:<n> or group:<n>, a project id, the import options).");
+  if (new Set(s.links.map((l) => l.ref)).size !== s.links.length) throw new InvalidInputError("links: each Zotero library can be linked to one project only.");
+}
+
+/**
+ * This library's sync settings on this computer: the defaults (automatic off, every hour, nothing linked) when
+ * none were saved, or when the file was damaged and has just been set aside. Throws ZoteroSyncFileUnreadableError
+ * when the file is there but cannot be read.
+ */
+export async function readZoteroSyncSettings(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<ZoteroSyncSettings> {
+  const f = await readFileStrict(dir, ZOTERO_SYNC_FILE, isSettingsFile, o);
+  const s = own(f?.libraries, libraryId);
+  return s ? copySettings(s) : copySettings(DEFAULT_ZOTERO_SYNC_SETTINGS);
+}
+
+/**
+ * Saves this library's sync settings on this computer (other libraries' are kept). What is given is written, except
+ * the runner's `unfinished` hint (kept from the stored link of the same ref and project; never taken from the caller):
+ * a link written without `paused` is un-paused (the only way a pause is cleared), and `fullDone` is as given — a
+ * caller that does not mean to change them should use updateZoteroSyncSettings, which edits what is stored in the
+ * file's own turn (R244 M6). Refuses settings that are not valid (InvalidInputError naming the field), and a file
+ * written by a newer version (ZoteroSyncFileNewerError), writing nothing.
+ */
+export async function writeZoteroSyncSettings(dir: string, libraryId: string, s: ZoteroSyncSettings, o: ZoteroSyncFileOptions = {}): Promise<ZoteroSyncSettings> {
+  return updateZoteroSyncSettings(dir, libraryId, () => s, o);
+}
+
+/**
+ * The read-modify-write of this library's settings, in the file's one turn (R244 M6): `edit` gets what is stored now
+ * (the defaults when nothing is) and returns the settings to keep, checked as writeZoteroSyncSettings checks them.
+ * Nothing the runner wrote meanwhile is lost, and the runner's `unfinished` hint is kept whatever `edit` returns.
+ */
+export async function updateZoteroSyncSettings(
+  dir: string,
+  libraryId: string,
+  edit: (cur: ZoteroSyncSettings) => ZoteroSyncSettings,
+  o: ZoteroSyncFileOptions = {},
+): Promise<ZoteroSyncSettings> {
+  if (typeof libraryId !== "string" || !ID.test(libraryId)) throw new InvalidInputError("libraryId is not a library id.");
+  let out: ZoteroSyncSettings | undefined;
+  await updateFile(
+    dir,
+    ZOTERO_SYNC_FILE,
+    isSettingsFile,
+    (cur) => {
+      const stored = own(cur?.libraries, libraryId);
+      const next = edit(copySettings(stored ?? DEFAULT_ZOTERO_SYNC_SETTINGS));
+      checkSettings(libraryId, next);
+      out = withStoredHints(copySettings(next), stored);
+      return { v: 1 as const, libraries: { ...(cur?.libraries ?? {}), [libraryId]: out } };
+    },
+    o,
+  );
+  return copySettings(out!);
+}
+
+/** Changes the stored links of a library in one turn (nothing is written when the library has none or nothing changes). */
+async function editLinks(dir: string, libraryId: string, fn: (l: ZoteroSyncLink) => ZoteroSyncLink, o: ZoteroSyncFileOptions): Promise<void> {
+  await updateFile(
+    dir,
+    ZOTERO_SYNC_FILE,
+    isSettingsFile,
+    (cur) => {
+      const s = own(cur?.libraries, libraryId);
+      if (!cur || !s) return cur ?? { v: 1 as const, libraries: {} };
+      return { v: 1 as const, libraries: { ...cur.libraries, [libraryId]: { ...s, links: s.links.map((l) => fn(copyLink(l))) } } };
+    },
+    o,
+  );
+}
+
+/**
+ * Pauses one link (`library-gone`: Zotero says the key can no longer read it; `undone`: the researcher undid one of
+ * its sync batches — Z8 calls this, so the sync does not at once bring back what was undone; `key-refused`: see
+ * pauseAllZoteroSyncLinks). A paused link refuses every run until the settings are written with it un-paused.
+ * Returns how many links it paused (0 or 1: one link per Zotero library; 0 when it is not linked).
+ */
+export async function pauseLink(dir: string, libraryId: string, ref: string, reason: ZoteroSyncPause, o: ZoteroSyncFileOptions = {}): Promise<number> {
+  if (!PAUSES.includes(reason)) throw new TypeError("not a pause");
+  // R250 d: how many links are paused by it (0: this Zotero library is not linked in this library).
+  let paused = 0;
+  await editLinks(
+    dir,
+    libraryId,
+    (l) => {
+      if (l.ref !== ref) return l;
+      paused = 1; // one link per Zotero library (a retried edit counts it once)
+      return { ...l, paused: reason };
+    },
+    o,
+  );
+  return paused;
+}
+
+/** Zotero refused the key: every link of the library is paused (`key-refused`). */
+export async function pauseAllZoteroSyncLinks(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<void> {
+  await editLinks(dir, libraryId, (l) => ({ ...l, paused: "key-refused" }), o);
+}
+
+/** Package-internal (the runner): a full run of the link truly finished (`done` true), or the next run must be full (false). */
+export async function markZoteroSyncFullDone(dir: string, libraryId: string, ref: string, projectId: string, o: ZoteroSyncFileOptions = {}, done = true): Promise<void> {
+  await editLinks(dir, libraryId, (l) => (l.ref === ref && l.projectId === projectId ? { ...l, fullDone: done } : l), o);
+}
+
+/** Package-internal (the runner): its hint of the link's unfinished batch (`batch-NNNN/<id>`, `unknown`, or none). */
+export async function setZoteroSyncUnfinished(dir: string, libraryId: string, ref: string, projectId: string, hint: string | undefined, o: ZoteroSyncFileOptions = {}): Promise<void> {
+  if (hint !== undefined && !ZOTERO_SYNC_UNFINISHED.test(hint)) throw new TypeError("not a batch hint");
+  await editLinks(
+    dir,
+    libraryId,
+    (l) => {
+      if (l.ref !== ref || l.projectId !== projectId) return l;
+      const { unfinished: _u, ...rest } = l;
+      return hint ? { ...rest, unfinished: hint } : rest;
+    },
+    o,
+  );
+}
+
+// ------------------------------------------------------------------------------------------
+// History.
+
+/** Runs going on in this process (their records have no `finishedAt` yet and are not "closed during"). */
+export const runningZoteroSyncRuns = new Set<string>();
+
+/** A record without an end, not running in this process: the app closed during it (it continues next time). */
+function settled(r: ZoteroSyncRun): ZoteroSyncRun {
+  if (r.finishedAt !== undefined || runningZoteroSyncRuns.has(r.id)) return r;
+  return { ...r, outcome: "stopped", reason: "app-closed" };
+}
+
+/**
+ * This library's sync runs on this computer, newest first (at most ZOTERO_SYNC_HISTORY_MAX). A record started by an
+ * earlier process and never finished reads as `stopped` / `app-closed`. A damaged file is set aside and the history
+ * starts empty; a file that cannot be read throws ZoteroSyncFileUnreadableError.
+ */
+export async function readZoteroSyncHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<ZoteroSyncRun[]> {
+  const f = await readFileStrict(dir, ZOTERO_SYNC_HISTORY_FILE, isHistoryFile, o);
+  return (own(f?.libraries, libraryId) ?? []).map((r) => settled(structuredClone(r)));
+}
+
+/**
+ * R295 (a): the latest back-off any record of the history carries (ms since the epoch), so a back-off outlives a restart
+ * of the service and is seen by the command line. Undefined when no record carries one; an unreadable date is ignored.
+ * The caller gives it to `zoteroSyncBackoff` (the clock rule) or to the runner as `backoffUntil`.
+ */
+export function zoteroHistoryBackoff(runs: readonly Pick<ZoteroSyncRun, "backoffUntil">[]): number | undefined {
+  let max: number | undefined;
+  for (const r of runs) {
+    const t = r.backoffUntil ? Date.parse(r.backoffUntil) : NaN;
+    if (Number.isFinite(t)) max = Math.max(max ?? t, t);
+  }
+  return max;
+}
+
+/**
+ * Package-internal (the runner): puts `run` in the library's history (replacing the record with its id, else as the
+ * newest), keeps the newest ZOTERO_SYNC_HISTORY_MAX, and turns records an earlier process left unfinished into
+ * `stopped` / `app-closed` on the way. A damaged file is set aside first.
+ */
+export async function putZoteroSyncRun(dir: string, libraryId: string, run: ZoteroSyncRun, o: ZoteroSyncFileOptions = {}): Promise<void> {
+  if (!isZoteroSyncRun(run)) throw new TypeError("not a sync run record");
+  await updateFile(
+    dir,
+    ZOTERO_SYNC_HISTORY_FILE,
+    isHistoryFile,
+    (cur) => {
+      const list = (own(cur?.libraries, libraryId) ?? []).filter((r) => r.id !== run.id).map(settled);
+      const at = (own(cur?.libraries, libraryId) ?? []).findIndex((r) => r.id === run.id);
+      if (at >= 0 && at <= list.length) list.splice(at, 0, run);
+      else list.unshift(run);
+      return { v: 1 as const, libraries: { ...(cur?.libraries ?? {}), [libraryId]: list.slice(0, ZOTERO_SYNC_HISTORY_MAX) } };
+    },
+    o,
+  );
+}

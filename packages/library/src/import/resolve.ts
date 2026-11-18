@@ -39,7 +39,9 @@
  * metadata or a sidecar file are trusted as given.
  *
  * Lookups run only through the LookupContext the caller built with `lookupContextFor` (policy per
- * provider, sensitive for encrypted projects); `null` means no lookups at all.
+ * provider, sensitive for encrypted projects); `null` means no lookups at all. Title searches (steps
+ * 5 and 6) are made only when the context allows them (`titleSearchAllowed`: the project holds no
+ * identifiable data) and never for an audio, video or image file (R379).
  */
 import { basename, extname } from "node:path";
 import {
@@ -86,6 +88,52 @@ const MAX_IDENTIFIER_LOOKUPS = 3;
 /** Confidence of an identifier lookup whose title disagrees with the file's own title (R49e). */
 const CONFLICT_CONFIDENCE = 0.6;
 const AGREE = 0.9;
+/** Small words: they do not count towards the three real words a running head or a cut-off title needs (R410 a iii). */
+const SMALL_WORDS = new Set(["a", "an", "the", "of", "in", "on", "at", "by", "for", "from", "to", "and", "or", "with", "de", "la", "le", "les", "du", "des", "el", "los", "las", "y", "e", "der", "die", "das", "und", "il", "lo", "di"]);
+/** What begins a subtitle, looked at in the original text right after the shorter title's last word (R410 a ii, iv). */
+const SUBTITLE_MARK = /^(?:\s*[:–—?!]|\s+-\s|\s*\.\s)/u;
+
+/** The folded words of a title (normalizeTitle per white-space-separated chunk) and, for each, where its last letter or digit ends in the original. */
+function foldedWords(title: string): Array<{ word: string; end: number }> {
+  const out: Array<{ word: string; end: number }> = [];
+  for (const m of title.matchAll(/\S+/gu)) {
+    const word = normalizeTitle(m[0]);
+    if (!word || word.includes(" ")) continue;
+    const tail = /[\p{L}\p{M}\p{N}][^\p{L}\p{M}\p{N}]*$/u.exec(m[0]);
+    out.push({ word, end: m.index + (tail ? tail.index + 1 : m[0].length) });
+  }
+  return out;
+}
+
+/** `short` is a prefix of `long` ending at a word, and what follows in `long`'s original text begins a subtitle. */
+function withoutSubtitle(short: string, long: string): boolean {
+  const s = normalizeTitle(short).split(" ");
+  const l = foldedWords(long);
+  if (!s[0] || s.length >= l.length || !s.every((w, i) => l[i]!.word === w)) return false;
+  return SUBTITLE_MARK.test(long.slice(l[s.length - 1]!.end));
+}
+
+/** `part` is a run of whole words inside `whole` (anywhere), with at least three words that are not small words. */
+function runOfRealWords(part: string, whole: string): boolean {
+  const p = normalizeTitle(part).split(" ");
+  const w = normalizeTitle(whole).split(" ");
+  if (!p[0] || p.length >= w.length || p.filter((x) => !SMALL_WORDS.has(x)).length < 3) return false;
+  for (let k = 0; k + p.length <= w.length; k++) if (p.every((x, i) => w[k + i] === x)) return true;
+  return false;
+}
+
+/**
+ * R410 a: how the file's embedded title stands to the reference manager's title. "same": equal after folding case,
+ * accents, punctuation and white space, or a similarity at or above the import's threshold (AGREE). "part": the same
+ * work's title in part — the title without its subtitle, a running head or a title cut off at a word (three real words
+ * or more), or the reference without the subtitle the embedded title carries. "other": anything else, another work's
+ * title (a conflict, as before R394: the wrong file may be attached).
+ */
+function embeddedAgainstReference(reference: string, embedded: string): "same" | "part" | "other" {
+  if (normalizeTitle(reference) === normalizeTitle(embedded) || titleSimilarity(reference, embedded) >= AGREE) return "same";
+  if (withoutSubtitle(embedded, reference) || runOfRealWords(embedded, reference) || withoutSubtitle(reference, embedded)) return "part";
+  return "other";
+}
 
 export interface ResolveInput {
   /** The file; absent for a metadata-only item (reference metadata, no file): nothing is extracted. */
@@ -96,6 +144,8 @@ export interface ResolveInput {
   /** The evidence kind of the reference metadata (default refman; Zotero items: zotero, R72). */
   referenceSource?: FieldEvidence["source"];
   sidecarPaths?: string[];
+  /** Asked immediately before each sidecar is read; false: that sidecar is not used (a watched folder's check, Task W2/A6). */
+  sidecarReadable?: (path: string) => Promise<boolean>;
   /** The name file-name patterns are matched against (default: the path's base name). */
   fileName?: string;
   /**
@@ -103,6 +153,11 @@ export interface ResolveInput {
    * runs them under a watchdog, R49d). Given: used instead of the user patterns in `ctx.patterns`.
    */
   userParsedName?: ParsedFileName;
+  /**
+   * Doubts about the reference metadata as its source gave it (ScanItem.doubts, R362 g): the item
+   * goes to review with them as reasons. A sidecar that is used adds its own (SidecarMetadata.doubt).
+   */
+  doubts?: string[];
 }
 
 export interface ResolveContext {
@@ -256,6 +311,8 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   const hints: string[] = [];
   /** The item's identity rests on an unconfirmed identifier: it goes to review. */
   let unconfirmed = false;
+  /** Doubts about the metadata as its source gave it (R362 g): it goes to review with them. */
+  const doubts = [...(input.doubts ?? [])];
   /** Upper bound on the final confidence (R58 near match). */
   let cap = 1;
   const done = () => confidence >= AUTO_ACCEPT_THRESHOLD;
@@ -302,10 +359,18 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     }
   };
   const searched = new Set<string>();
+  /**
+   * R379 (i): an audio, video or image file is never searched for by title (steps 5 and 6): its
+   * name and embedded title may name a participant, and a bibliographic search means nothing for
+   * it. Decided by the sniffed type; an item with no file (mime "") is not a media file.
+   * R379 (ii): nor is any item searched for by title unless the lookup context allows it (the
+   * project's rules say it holds no identifiable data). Identifier look-ups (step 3) stay.
+   */
+  const titleSearch = lookup?.titleSearchAllowed === true && !LOCATED_MEDIA.test(mime);
   /** Title search; returns the best result and its similarity (results kept as candidates, best first). */
   const search = async (title: string, creator: string | undefined): Promise<{ best?: LookupResult; sim: number }> => {
     const q = `${title}\u0000${creator ?? ""}`.toLowerCase();
-    if (!lookup || searched.has(q)) return { sim: 0 };
+    if (!lookup || !titleSearch || searched.has(q)) return { sim: 0 };
     searched.add(q);
     const rs = await ask(() => searchTitle(title, creator, lookup), [] as LookupResult[]);
     const ranked = rs.map((r) => ({ r, sim: titleSimilarity(title, r.title) })).sort((a, b) => b.sim - a.sim);
@@ -326,7 +391,10 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       ...(extracted.issued ? { issued: extracted.issued } : {}),
     }, { kind: "embedded" });
   } else if (done() && extracted.title) {
-    record("title", extracted.title, { kind: "embedded" });
+    // R394 c, R410 a: agreement before conflict. An embedded title that is the same as the reference title is recorded
+    // (it corroborates); one that is only a part of the same work's title agrees and is not recorded (core's checks
+    // would call it a conflict; R406 a); any other is recorded and stays a conflict, worth the researcher's look.
+    if (!refFields.title || embeddedAgainstReference(refFields.title, extracted.title) !== "part") record("title", extracted.title, { kind: "embedded" });
   }
 
   // 3. Identifiers (+ lookup). An identifier from the file (metadata fields or the first pages'
@@ -442,9 +510,11 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   // 4. Sidecar files.
   if (!done() && !titleConflict) {
     for (const p of input.sidecarPaths ?? []) {
+      if (input.sidecarReadable && !(await input.sidecarReadable(p).catch(() => false))) continue;
       const m = await readSidecar(p);
       if (!m) continue;
       step(scoreConfidence({ method: "sidecar" }), { method: "sidecar" }, fromSidecar(m), { kind: "refman", ref: `sidecar${extname(p).toLowerCase()}` });
+      if (m.doubt) doubts.push(m.doubt);
       break;
     }
   }
@@ -528,6 +598,8 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       "An identifier found in the file could not be confirmed as this item's own (it may belong to a cited work), so it was not recorded.",
     );
   }
+  for (const d of new Set(doubts)) if (!report.reasons.includes(d)) report.reasons.push(d);
+  if (doubts.length) report.overall = "needs-review";
   return {
     draft,
     confidence: Math.min(applyVerification(confidence, report), cap),

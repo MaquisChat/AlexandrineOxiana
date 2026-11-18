@@ -19,15 +19,17 @@ import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { evaluate, newId, parseGovernance, type PolicyDecision, type ResidencyKind } from "@ao/core";
+import { dateRuleZone, evaluate, newId, parseGovernance, type PolicyDecision, type ResidencyKind } from "@ao/core";
+import { scrubPaths } from "./app-settings.js";
 import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
 import { copyFileAtomic, writeFileAtomic } from "./fs/atomic.js";
 import { checkpointTruncate, INDEX_FILE, type IndexHandle } from "./index/db.js";
-import { MOVED_MARKER, MOVE_JOURNAL, openLibraryInternal, projectMovedAway, type Library, type LibraryJson } from "./library.js";
+import { FINDER_FILES, MOVED_MARKER, MOVE_JOURNAL, entriesBesidesFinderFiles, isClosed, openLibraryInternal, projectMovedAway, type Library, type LibraryJson } from "./library.js";
 import { classifyLocation, type Location, type LocationEnv } from "./location.js";
 import { acquireLock, peekLock, readLock, releaseLock } from "./lock.js";
 import {
+  OldCopiesUnreadableError,
   addPendingOldCopy,
   getPendingOldCopy,
   isExpired,
@@ -35,13 +37,14 @@ import {
   listUnfinishedMoves,
   markPendingComplete,
   readVerifiedHashes,
-  removePendingOldCopy,
+  markPendingDeleted,
   type PendingOldCopy,
 } from "./old-copies.js";
 import { addKnownPath, registerLibrary } from "./registry.js";
 import { PathEscapeError } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
-import { appendLibraryEvent, openRepo, recoveryPendingProjects, repoLibrary, type Repo } from "./repo/repo.js";
+import { holdsLock, newAttentionId, projectFolderOf, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
+import { openRepo, recordOrMark, recoveryPendingProjects, repoLibrary, type Repo } from "./repo/repo.js";
 import { parseProjectJson } from "./repo/state.js";
 
 export { MOVE_JOURNAL, MOVED_MARKER };
@@ -329,7 +332,7 @@ async function preflight(lib: Library, destRoot: string, repo?: Repo): Promise<J
   try {
     const st = await fsp.stat(destRoot);
     if (!st.isDirectory()) throw new MoveNotAllowedError("destination-not-empty", "The destination exists and is not a folder");
-    names = await fsp.readdir(destRoot);
+    names = await entriesBesidesFinderFiles(destRoot); // the Finder's own files count as empty (FR-047)
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
@@ -351,7 +354,7 @@ const isThere = (p: string) => fsp.lstat(p).then(() => true, () => false);
  * looks like a project (governance.yaml or Sources) but whose project.json is
  * missing or unreadable refuses the move: its governance cannot be checked.
  */
-async function readProjects(root: string): Promise<{ projects: Array<{ id: string; name: string; folder: string }>; movedAway: string[] }> {
+async function readProjects(root: string): Promise<{ projects: Array<{ id: string; name: string; folder: string; timeZone?: string }>; movedAway: string[] }> {
   let names: string[] = [];
   try {
     names = (await fsp.readdir(join(root, "Projects"))).sort();
@@ -369,7 +372,7 @@ async function readProjects(root: string): Promise<{ projects: Array<{ id: strin
       movedAway.push(folder);
       continue;
     }
-    let p: { id: string; name: string } | null = null;
+    let p: { id: string; name: string; timeZone?: string } | null = null;
     if (!n.startsWith(".")) {
       try {
         p = parseProjectJson(JSON.parse(await fsp.readFile(join(dir, "project.json"), "utf8"))).project;
@@ -377,7 +380,7 @@ async function readProjects(root: string): Promise<{ projects: Array<{ id: strin
         p = null;
       }
     }
-    if (p) projects.push({ id: p.id, name: p.name, folder });
+    if (p) projects.push({ id: p.id, name: p.name, folder, ...(p.timeZone ? { timeZone: p.timeZone } : {}) });
     else if ((await isThere(join(dir, "governance.yaml"))) || (await isThere(join(dir, "Sources"))) || (await isThere(join(dir, "project.json")))) {
       unreadable.push(folder);
     }
@@ -427,8 +430,8 @@ function assertNoCollisions(w: Walked): void {
   }
 }
 
-/** Classifications of the typed path and its real path; the first cloud folder, else the real path's. */
-async function locate(destRoot: string, env: LocationEnv): Promise<{ destination: Location; destinations: Location[] }> {
+/** Package-internal (also backups, R125). Classifications of the typed path and its real path; the first cloud folder, else the real path's. */
+export async function locate(destRoot: string, env: LocationEnv): Promise<{ destination: Location; destinations: Location[] }> {
   const typed = classifyLocation(resolve(destRoot), env);
   const realPath = await realish(destRoot);
   const destinations = realPath === resolve(destRoot) ? [typed] : [typed, classifyLocation(realPath, env)];
@@ -436,8 +439,8 @@ async function locate(destRoot: string, env: LocationEnv): Promise<{ destination
   return { destination, destinations };
 }
 
-/** Each destination candidate: a certain classification as is; an uncertain one as every plausible kind. */
-function candidates(destinations: Location[]): Array<{ loc: Location; guessed: boolean }> {
+/** Package-internal (also backups, R125). Each destination candidate: a certain classification as is; an uncertain one as every plausible kind. */
+export function candidates(destinations: Location[]): Array<{ loc: Location; guessed: boolean }> {
   const out: Array<{ loc: Location; guessed: boolean }> = [];
   const add = (loc: Location, guessed: boolean) => {
     if (!out.some((c) => c.loc.kind === loc.kind && c.loc.cloudFolderId === loc.cloudFolderId)) out.push({ loc, guessed });
@@ -460,7 +463,6 @@ export async function planMove(lib: Library, destRoot: string, env: LocationEnv,
   await preflight(lib, destRoot, opts.sourceRepo);
   const { destination, destinations } = await locate(destRoot, env);
   const now = (opts.now ?? new Date()).toISOString();
-  const tz = opts.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   const { projects, movedAway } = await readProjects(lib.root);
   const perProject: ProjectPlan[] = [];
   for (const p of projects) {
@@ -473,7 +475,8 @@ export async function planMove(lib: Library, destRoot: string, env: LocationEnv,
           projectId: p.id,
           actor: opts.actor ?? "local-user",
           now,
-          tz,
+          // The project's zone when set, else the computer's (R160 as amended).
+          tz: dateRuleZone(p, "protocol", opts.tz),
           move: { destination: loc.kind, ...(loc.cloudFolderId ? { cloudFolderId: loc.cloudFolderId } : {}) },
         });
         if (d.result === "deny") {
@@ -483,7 +486,8 @@ export async function planMove(lib: Library, destRoot: string, env: LocationEnv,
         decision ??= d;
       }
     } catch (e) {
-      decision = denyOf(`Policy could not be evaluated: ${msg(e)}`);
+      // Error text is scrubbed of absolute paths where it is captured: it may be recorded (Task 50 N5).
+      decision = denyOf(`Policy could not be evaluated: ${scrubPaths(msg(e), [lib.root])}`);
     }
     perProject.push({ projectId: p.id, name: p.name, folder: p.folder, decision: decision ?? denyOf("Policy could not be evaluated") });
   }
@@ -527,8 +531,25 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   const moved = plan.perProject.filter((p) => !exclude.includes(p.projectId));
   const denied = moved.filter((p) => p.decision.result === "deny");
   if (denied.length > 0) {
+    // Each refusal is audited in the refused project (Task 50); one that cannot be is marked for the next open.
+    const details = {
+      op: "library.move",
+      toHint: hintFor(dest, deps),
+      destinationKind: plan.destination.kind,
+      destinationCertain: plan.destinations.every((d) => d.certain),
+      ...(plan.destination.cloudFolderId ? { cloudFolderId: plan.destination.cloudFolderId } : {}),
+    };
+    let unrecorded = false;
+    for (const p of denied) {
+      const reason = p.decision.result === "deny" ? p.decision.reason : "";
+      const w = await auditOrMark(lib.root, p.projectId, p.folder, opts.sourceRepo, lib, "move", details, { actor: opts.actor, deps }, { libraryId: lib.id, held: await holdsLock(lib) }, { reason });
+      if (w?.includes("either")) unrecorded = true;
+    }
     const why = denied.map((p) => `${p.name}: ${p.decision.result === "deny" ? p.decision.reason : ""}`).join("; ");
-    throw new MoveNotAllowedError("policy-denied", `Some projects may not be moved there (exclude them or choose another destination): ${why}`);
+    throw new MoveNotAllowedError(
+      "policy-denied",
+      `Some projects may not be moved there (exclude them or choose another destination): ${why}${unrecorded ? " (this refusal could not be recorded in the audit log)" : ""}`,
+    );
   }
   const excludedFolders = plan.perProject.filter((p) => exclude.includes(p.projectId)).map((p) => p.folder);
   const { movedAway } = await readProjects(lib.root);
@@ -629,7 +650,8 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   }
   const dirSet = new Set([...src.dirs.map((d) => d.rel), ...LIBRARY_DIRS]);
   const atDest = await walk(dest, (rel) => rel === MOVE_JOURNAL || rel === ".tmp");
-  for (const f of atDest.files) if (!expected.has(f.rel)) bad.push(f.rel);
+  // The Finder's own files at the destination's top (there before the move, which counted the folder as empty; FR-047) are left.
+  for (const f of atDest.files) if (!expected.has(f.rel) && !FINDER_FILES.has(f.rel)) bad.push(f.rel);
   for (const d of atDest.dirs) if (!dirSet.has(d.rel)) bad.push(d.rel);
   bad.push(...atDest.odd);
   if (bad.length > 0) {
@@ -643,6 +665,7 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   const moveId = newId();
   // Durably, before the old copy is marked: the destination stays findable after any crash
   // (listUnfinishedMoves, Library.movedTo, and the registry's known paths).
+  // A list that cannot be read stops the move here, before anything is switched (Task 68, ruling 1).
   const rec = await addPendingOldCopy(
     deps,
     {
@@ -656,7 +679,9 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
       moveId,
     },
     { files: hashes, dirs: src.dirs.map((d) => d.rel) },
-  );
+  ).catch((err: unknown) => {
+    throw err instanceof OldCopiesUnreadableError ? new OldCopiesUnreadableError("move") : err;
+  });
   await addKnownPath(lib.id, dest, deps);
   j.phase = "switching";
   j.filesDone = [...done];
@@ -794,10 +819,70 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
 }
 
 /**
+ * Records `action` for one project through `repo` when it is open on the library at `root` and
+ * holds the project; otherwise (no open repo, or not this library) marks the project as needing
+ * attention (`<Project>/attention/`) so the next writable open records it late (Task 50, R28,
+ * R82). Returns a plain warning when the event was not recorded now.
+ */
+async function auditOrMark(
+  root: string,
+  projectId: string,
+  folder: string | null,
+  repo: Repo | undefined,
+  lib: Pick<Library, "id" | "root"> | undefined,
+  action: string,
+  details: Record<string, unknown>,
+  who: { actor?: string; deps: Deps },
+  where: { libraryId: string; held: boolean },
+  refusal?: { reason: string },
+  cause?: unknown,
+): Promise<string | undefined> {
+  if (repo) {
+    const l = repoLibrary(repo);
+    const sameLib = resolve(l.root) === resolve(root) && (!lib || l.id === lib.id);
+    if (sameLib && repo.listProjects().some((p) => p.id === projectId)) return recordOrMark(repo, projectId, action, details, refusal);
+  }
+  const what = `The ${action} audit event could not be recorded for project ${projectId}${cause !== undefined ? ` (${msg(cause)})` : ""}`;
+  const rec: UnrecordedAudit = {
+    formatVersion: 1,
+    id: newAttentionId(),
+    kind: "audit-unrecorded",
+    occurredAt: who.deps.clock().toISOString(),
+    actor: who.actor ?? "local-user",
+    device: who.deps.deviceId,
+    action,
+    ...(refusal ? { decision: { result: "deny" as const, reason: refusal.reason } } : {}),
+    details,
+    state: "ready",
+    reason: cause !== undefined ? reasonOf(cause) : "RepoNotOpen",
+  };
+  // Only into a library this device holds the lock for (R154 e); otherwise, or when the project
+  // folder cannot take it, the mark waits on this device and is delivered at its next writable open.
+  if (where.held) {
+    try {
+      const rel = folder ?? (await projectFolderOf(root, projectId));
+      if (!rel) throw new Error("the project folder was not found");
+      await writeAttention(root, rel, rec);
+      return `${what}; the project is marked as needing attention and the event is recorded when the library is next opened`;
+    } catch {
+      // falls through to the outbox
+    }
+  }
+  try {
+    await writeOutbox(who.deps.appConfigDir, where.libraryId, projectId, rec);
+  } catch (e) {
+    return `${what}; it could not be kept for later either (${msg(e)})`;
+  }
+  return `${what}; it is kept on this computer and recorded when the library is next opened here with write access`;
+}
+
+/**
  * Appends `action` to each project through `ctx.repo` or a repo opened on
  * `root` (which also records the location hint when it opens the library).
- * A failure is reported in `warnings` and does not undo the move: the data is
- * already verified at the destination.
+ * A failure does not undo the move (the data is already verified at the
+ * destination): it is reported in `warnings` and the project is marked as
+ * needing attention, so the next writable open records the event (Task 50).
+ * A mark is only written in a folder that holds the expected library.
  */
 async function auditIn(
   root: string,
@@ -811,8 +896,10 @@ async function auditIn(
 ): Promise<void> {
   if (projectIds.length === 0) return;
   let lib: Library | undefined;
+  let repo: Repo | undefined;
+  let cause: unknown;
   try {
-    let repo = ctx.repo;
+    repo = ctx.repo;
     if (repo) {
       const l = repoLibrary(repo);
       if (resolve(l.root) !== resolve(root) || l.id !== check.expectId) throw new Error("the repo passed is not open on this library");
@@ -822,15 +909,17 @@ async function auditIn(
       if (lib.mode !== "read-write") throw new Error(`the library opened read-only (${lib.readOnlyReason ?? "unknown"}); pass its open repo`);
       repo = await openRepo(lib, new KeyRing(), { clock: deps.clock, ...(ctx.tz ? { tz: ctx.tz } : {}), ...(ctx.actor ? { actor: ctx.actor } : {}) });
     }
-    for (const id of projectIds) {
-      try {
-        await appendLibraryEvent(repo, id, action, details);
-      } catch (err) {
-        warnings.push(`The ${action} audit event could not be recorded for project ${id} (${msg(err)})`);
-      }
-    }
   } catch (err) {
-    warnings.push(`The ${action} audit events could not be recorded (${msg(err)})`);
+    repo = undefined;
+    cause = err;
+  }
+  try {
+    // This device may write into the folder only while it holds that library's lock (R154 e).
+    const held = lib !== undefined && lib.id === check.expectId && (await holdsLock(lib));
+    for (const id of projectIds) {
+      const w = await auditOrMark(root, id, null, repo, undefined, action, details, { actor: ctx.actor, deps }, { libraryId: check.expectId, held }, undefined, cause);
+      if (w) warnings.push(w);
+    }
   } finally {
     await lib?.close();
   }
@@ -1024,7 +1113,13 @@ export async function deleteOldCopy(
     if (acquired) await releaseLock(root, deps).catch(() => {});
   }
   if (!rec.split) rootRemoved = await fsp.rmdir(root).then(() => true, () => false);
-  await removePendingOldCopy(deps, rec.id);
+  // The record is not dropped while anything of the library stays at the old place (R409 a): it is
+  // marked deleted (with `remains` when a file was kept or left, or the place still holds data of
+  // the moved projects), so a destruction under the retention rule that names this copy goes on
+  // looking there. (Imported when needed: retention.ts imports backups, which import this module.)
+  const { oldPlaceLook, pruneDeletedOldCopy, recordOldCopyDeleted } = await import("./retention.js");
+  const remains = kept.length > 0 || leftovers.length > 0 || (await oldPlaceLook(rec)) !== "none";
+  await markPendingDeleted(deps, rec.id, remains);
 
   await auditIn(
     rec.newRoot,
@@ -1036,5 +1131,18 @@ export async function deleteOldCopy(
     warnings,
     { expectId: rec.libraryId },
   );
+  // A destruction under the retention rule that named this old copy as not destroyed records it as
+  // removed once none of its files is left there, and its warning ends (R379), in the library open
+  // here. Elsewhere, the next retry pass there looks at the place.
+  const dest = opts.destRepo && repoLibrary(opts.destRepo).id === rec.libraryId ? opts.destRepo : undefined;
+  if (dest) {
+    for (const p of dest.listProjects()) {
+      await recordOldCopyDeleted(dest, p.id, rec.id).catch((err: unknown) => {
+        warnings.push(`That the old copy was deleted could not be recorded for a destruction in project ${p.id} yet (${msg(err)}); it is recorded when the library is next opened`);
+      });
+    }
+  }
+  // Dropped now when nothing of the library is left there and no destruction names it.
+  await pruneDeletedOldCopy(deps, rec.libraryId, rec.id, join(dest ? repoLibrary(dest).root : rec.newRoot, "Backups")).catch(() => {});
   return { filesDeleted, kept: kept.sort(), leftovers, movedAwayKept, rootRemoved, warnings };
 }

@@ -16,26 +16,11 @@
  * Typed methods exist for what the UI uses so far (appearance); later screens add theirs on top of
  * `request()` (Tasks 33+).
  */
-import { isCredentialQueryKey } from "@ao/shared";
+import { DOCUMENT_RANGE_MAX_BYTES, isCredentialQueryKey, isMediaTicketPath, type ServiceErrorCode } from "@ao/shared";
 import type { AppearancePatch, AppearanceSettings } from "../theme/appearance";
 
-export type ErrorCode =
-  | "POLICY_DENIED"
-  | "READ_ONLY"
-  | "LIBRARY_OFFLINE"
-  | "WRONG_PASSPHRASE"
-  | "NOT_FOUND"
-  | "VALIDATION"
-  | "UNAUTHORIZED"
-  | "FORBIDDEN"
-  | "PAYLOAD_TOO_LARGE"
-  | "RATE_LIMITED"
-  | "PROJECT_LOCKED"
-  | "CONFLICT"
-  | "ACKNOWLEDGEMENT_REQUIRED"
-  | "WORKER_UNAVAILABLE"
-  | "UNAVAILABLE"
-  | "INTERNAL";
+/** The codes the service answers with: its own list, declared once in @ao/shared (Task 47). */
+export type ErrorCode = ServiceErrorCode;
 
 export interface ServiceError {
   code: ErrorCode | (string & {});
@@ -58,7 +43,7 @@ export class ApiClientError extends Error {
   }
 }
 
-export type EventType = "library.state" | "job.progress" | "import.progress" | "capture.progress";
+export type EventType = "library.state" | "job.progress" | "import.progress" | "capture.progress" | "watch.status";
 export interface ServiceEvent {
   type: EventType | (string & {});
   data: unknown;
@@ -88,6 +73,32 @@ export interface ApiClient {
    * called once the service has accepted the stream (events published from then on arrive).
    */
   events(opts?: { signal?: AbortSignal; onOpen?: () => void }): AsyncGenerator<ServiceEvent, void, undefined>;
+  /**
+   * The address a media element loads for a media ticket (R135): the base URL plus the ticket path
+   * the service gave (`/media/<ticket>`), nothing added. Only that exact form is accepted: no query,
+   * no fragment, never the service token. The result is a secret (R135 5): give it to the media
+   * element only — never show, log, store it or put it in the page address. Fetches nothing.
+   */
+  mediaUrl(ticketPath: string): string;
+  /**
+   * A file's content (GET), e.g. a picture for a `blob:` address (R135 1) or a font file (R100):
+   * the token in the Authorization header as always, the body as a Blob of the type the service
+   * sent. An answer larger than `maxBytes` is refused (PAYLOAD_TOO_LARGE). Same path rules as
+   * request(); a bad path throws before anything is sent.
+   */
+  bytes(path: string, opts?: { signal?: AbortSignal; maxBytes?: number }): Promise<Blob>;
+  /**
+   * Bytes `start` to `end` (inclusive) of a stored file, e.g. a PDF for the reader (Task R5): one
+   * GET with `Range: bytes=start-end` and the token in the Authorization header (never a media
+   * ticket, never anything in the URL). The answer must be 206 with `Content-Range` starting at
+   * `start` and ending at `end`, or earlier only where the service may cut it (the file's last byte,
+   * or DOCUMENT_RANGE_MAX_BYTES), and a body of exactly that length; anything else is refused
+   * (status 502, INTERNAL) and never handed on. The service's own refusals (404, 413, 423…) are
+   * thrown as they are; a 416 (no body) as VALIDATION with the file's length as `reason`. An answer
+   * whose signal was aborted meanwhile is never returned (AbortError). Same path rules as
+   * request(); bad arguments throw before anything is sent.
+   */
+  byteRange(path: string, start: number, end: number, opts?: { signal?: AbortSignal }): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
 }
 
 /** `onOpen` is called once the service has answered with a stream (its headers arrived), before any line. */
@@ -325,7 +336,12 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     };
     let buf = "";
     // A read the body never answers still ends promptly on abort.
-    const aborted = new Promise<"aborted">((resolve) => o.signal?.addEventListener("abort", () => resolve("aborted"), { once: true }));
+    // The listener is removed when the generator ends, so a long-lived signal does not collect one per call (41b1 M13).
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<"aborted">((resolve) => {
+      onAbort = () => resolve("aborted");
+      o.signal?.addEventListener("abort", onAbort, { once: true });
+    });
     try {
       for (;;) {
         let chunk: ReadableStreamReadResult<Uint8Array> | "aborted";
@@ -354,6 +370,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
         throw new ApiClientError(0, { code: "INTERNAL", message: "The library service's answer was cut off before it finished." });
       }
     } finally {
+      if (onAbort) o.signal?.removeEventListener("abort", onAbort);
       reader.cancel().catch(() => {});
     }
   }
@@ -395,13 +412,141 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     }
   }
 
+  /** R135: a ticket address is `/media/` and 43 base64url characters; the token is never in it. */
+  function mediaUrl(ticketPath: string): string {
+    if (typeof ticketPath !== "string" || !isMediaTicketPath(ticketPath)) throw new Error("Not a media address: expected /media/<ticket> and nothing else."); // not echoed
+    if (tokenForms.some((t) => ticketPath.includes(t))) throw new Error("Refusing a media address that contains the service token.");
+    return `${base}${ticketPath}`;
+  }
+
+  function bytes(path: string, o: { signal?: AbortSignal; maxBytes?: number } = {}): Promise<Blob> {
+    const url = urlFor(path); // throws synchronously on a bad path or a credential in the URL
+    const tooLarge = () => new ApiClientError(0, { code: "PAYLOAD_TOO_LARGE", message: "The file is too large to show here." });
+    return (async () => {
+      const init: RequestInit = { method: "GET", headers: { ...auth, Accept: "*/*" } };
+      if (o.signal) init.signal = o.signal;
+      let res: Response;
+      try {
+        res = await doFetch(url, init);
+      } catch (err) {
+        if (o.signal?.aborted) throw err;
+        throw unreachable();
+      }
+      if (!res.ok) throw await errorFrom(res);
+      const declared = Number(res.headers.get("content-length"));
+      if (o.maxBytes !== undefined && Number.isFinite(declared) && declared > o.maxBytes) {
+        res.body?.cancel().catch(() => {});
+        throw tooLarge();
+      }
+      const type = res.headers.get("content-type") ?? "";
+      if (o.maxBytes === undefined || !res.body) {
+        let blob: Blob;
+        try {
+          blob = await res.blob();
+        } catch (err) {
+          if (o.signal?.aborted) throw err;
+          throw unreachable();
+        }
+        if (o.maxBytes !== undefined && blob.size > o.maxBytes) throw tooLarge();
+        return blob;
+      }
+      // With a limit, the body is read in chunks and given up as soon as it passes the limit, so a
+      // body that does not say its length is never held whole first (M11).
+      const reader = res.body.getReader();
+      const parts: Uint8Array[] = [];
+      let total = 0;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > o.maxBytes) {
+            reader.cancel().catch(() => {});
+            throw tooLarge();
+          }
+          parts.push(value);
+        }
+      } catch (err) {
+        if (err instanceof ApiClientError || o.signal?.aborted) throw err;
+        throw unreachable();
+      }
+      return new Blob(parts as BlobPart[], { type });
+    })();
+  }
+
+  async function byteRange(path: string, start: number, end: number, o: { signal?: AbortSignal } = {}): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }> {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
+      throw new Error("A byte range needs whole numbers with 0 ≤ start ≤ end.");
+    }
+    const url = urlFor(path); // throws on a bad path or a credential in the URL
+    const mismatch = () => new ApiClientError(502, { code: "INTERNAL", message: "The library service answered with another part of the file than was asked for." });
+    const init: RequestInit = { method: "GET", headers: { ...auth, Accept: "*/*", Range: `bytes=${start}-${end}` }, cache: "no-store" };
+    if (o.signal) init.signal = o.signal;
+    let res: Response;
+    try {
+      res = await doFetch(url, init);
+    } catch (err) {
+      if (o.signal?.aborted) throw err;
+      throw unreachable();
+    }
+    if (res.status === 416) {
+      // No error body: said in plain words, with the file's length (`bytes */<total>`) as the reason.
+      res.body?.cancel().catch(() => {});
+      const total = /^bytes \*\/(\d{1,16})$/.exec(res.headers.get("content-range") ?? "")?.[1];
+      throw new ApiClientError(416, { code: "VALIDATION", message: "The part of the file asked for is past its end.", ...(total !== undefined ? { reason: total } : {}) });
+    }
+    if (!res.ok) throw await errorFrom(res);
+    const refuse = (): never => {
+      res.body?.cancel().catch(() => {});
+      throw mismatch();
+    };
+    if (res.status !== 206) refuse();
+    const m = /^bytes (\d{1,16})-(\d{1,16})\/(\d{1,16})$/.exec(res.headers.get("content-range") ?? "");
+    if (!m) return refuse();
+    const [a, b, total] = [Number(m[1]), Number(m[2]), Number(m[3])];
+    // The start asked; an end no later than asked and inside the file; cut short only where the service may cut.
+    if (a !== start || b < a || b > end || b >= total || !Number.isSafeInteger(total)) refuse();
+    const length = b - a + 1;
+    if (b < end && b !== total - 1 && length !== DOCUMENT_RANGE_MAX_BYTES) refuse();
+    const declared = res.headers.get("content-length");
+    if (declared !== null && Number(declared) !== length) refuse();
+    // Read into exactly `length` bytes; a body longer or shorter than that is refused.
+    const bytes = new Uint8Array(length);
+    let got = 0;
+    if (res.body) {
+      const reader = res.body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (got + value.byteLength > length) {
+            reader.cancel().catch(() => {});
+            throw mismatch();
+          }
+          bytes.set(value, got);
+          got += value.byteLength;
+        }
+      } catch (err) {
+        if (err instanceof ApiClientError || o.signal?.aborted) throw err;
+        throw unreachable();
+      }
+    }
+    if (got !== length) throw mismatch();
+    // Aborted while the body was being read: the answer is stale, never handed back.
+    if (o.signal?.aborted) throw o.signal.reason instanceof Error ? o.signal.reason : new DOMException("The range was no longer wanted.", "AbortError");
+    return { bytes, start: a, end: b, total };
+  }
+
   return {
     request,
+    bytes,
+    byteRange,
     appearance: {
       get: () => request<AppearanceSettings>("GET", "/settings/appearance"),
       put: (patch) => request<AppearanceSettings>("PUT", "/settings/appearance", { body: patch }),
     },
     ndjson,
     events,
+    mediaUrl,
   };
 }

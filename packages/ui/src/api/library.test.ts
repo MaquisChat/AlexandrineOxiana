@@ -6,6 +6,38 @@ import { ApiClientError } from "./client";
 useMockService();
 
 describe("library API (R113: typed methods on request())", () => {
+  it("creates a project with POST /projects: name, rules and encryption; the recovery code comes back once", async () => {
+    const bodies: unknown[] = [];
+    server.use(
+      http.post(url("/projects"), async ({ request }) => {
+        const b = (await request.json()) as { encryption: { enabled: boolean } };
+        bodies.push(b);
+        const project = { id: "p9", name: "N", folder: "Projects/N", encrypted: b.encryption.enabled, unlocked: true, profiles: [] };
+        return HttpResponse.json(b.encryption.enabled ? { project, recoveryCode: "CODE" } : { project });
+      }),
+    );
+    const open = await testApi().projects.create({ name: "N", governanceYaml: "encryption:\n  atRest: optional\n", encryption: { enabled: false } });
+    expect(open).toEqual({ project: { id: "p9", name: "N", folder: "Projects/N", encrypted: false, unlocked: true, profiles: [] } });
+    const enc = await testApi().projects.create({ name: "N", governanceYaml: "", encryption: { enabled: true, passphrase: "pw" } });
+    expect(enc.recoveryCode).toBe("CODE");
+    expect(bodies).toEqual([
+      { name: "N", governanceYaml: "encryption:\n  atRest: optional\n", encryption: { enabled: false } },
+      { name: "N", governanceYaml: "", encryption: { enabled: true, passphrase: "pw" } },
+    ]);
+  });
+
+  it("asks for a new recovery code with POST /projects/:id/recovery-code { passphrase }; the code comes back once", async () => {
+    const seen: Array<{ path: string; body: unknown }> = [];
+    server.use(
+      http.post(url("/projects/:id/recovery-code"), async ({ request }) => {
+        seen.push({ path: new URL(request.url).pathname, body: await request.json() });
+        return HttpResponse.json({ recoveryCode: "CODE" });
+      }),
+    );
+    expect(await testApi().projects.newRecoveryCode("p 1", { passphrase: "pw" })).toEqual({ recoveryCode: "CODE" });
+    expect(seen).toEqual([{ path: "/projects/p%201/recovery-code", body: { passphrase: "pw" } }]);
+  });
+
   it("searches sources with text, collection and tag as query values", async () => {
     let seen: URL | undefined;
     server.use(

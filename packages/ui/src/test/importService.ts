@@ -89,8 +89,28 @@ export interface ServiceSetup {
   dryRunDelayMs?: number;
   /** Delay (ms) before the governance answers. */
   governanceDelayMs?: number;
+  /** The service says it cannot read the project's rules (`readable: false`, R379 FR-A18). */
+  governanceUnreadable?: boolean;
   /** Source ids whose first request fails (HTTP 500). */
   failSourcesOnce?: string[];
+  /** The Zotero key in the password store (Task 57): stored at the start, or no store at all. */
+  zoteroKey?: { stored?: boolean; noStore?: boolean };
+  /** What GET /import/zotero-data-folders answers (default none). */
+  zoteroFolders?: Array<{ path: string; from: "usual-place" | "zotero-setting" }>;
+  /** Picture bytes by asset id, for GET …/assets/:aid/content; anything else is 400. */
+  pictures?: Record<string, { type: string; bytes: Uint8Array }>;
+  /** Delay (ms) before each picture answer. */
+  pictureDelayMs?: number;
+  /** The project's whole review queue (GET /projects/:id/review, Task 67), by project id; a decision removes its entry. */
+  projectReview?: Record<string, ReviewItem[]>;
+  /** Delay (ms) before each page of the project's queue. */
+  projectReviewDelayMs?: number;
+  /** Projects that answer PROJECT_LOCKED until POST /projects/:id/unlock. */
+  locked?: string[];
+  /** Decisions answered PROJECT_LOCKED (the project was locked meanwhile). */
+  decideLocked?: boolean;
+  /** What PATCH /projects/:id/sources/:sid/fields answers, by source id (the record after the confirm; a list: one per confirm, in turn). */
+  confirmed?: Record<string, unknown>;
 }
 
 export const server = setupServer();
@@ -117,11 +137,33 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
   let inFlight = 0;
   let peak = 0;
   const failOnce = new Set(o.failSourcesOnce ?? []);
+  let keyStored = !!o.zoteroKey?.stored;
+  const queues = new Map(Object.entries(o.projectReview ?? {}).map(([k, v]) => [k, [...v]]));
+  const locked = new Set(o.locked ?? []);
+  // Copied: a list is answered in turn, and the setup object may be shared between tests.
+  const confirmedSeq = new Map(Object.entries(o.confirmed ?? {}).map(([k, v]) => [k, Array.isArray(v) ? [...v] : v]));
+  const lockedAnswer = () => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "This project is locked. Its passphrase is needed." } }, { status: 423 });
+  const noStore = () => HttpResponse.json({ error: { code: "UNAVAILABLE", message: "No secure key store is available on this computer, so the key was not saved." } }, { status: 503 });
 
   // Replaces the previous test's handlers (rather than resetting after each test), so a request a
   // component sends while a test is being torn down still finds a handler.
   server.resetHandlers(
     ...(o.extra ?? []),
+    // First: queue tests send it thousands of times, and MSW parses the request's address and
+    // cookies once for every handler it tries (in jsdom, most of a long test's time).
+    http.get(url("/projects/:id/sources/:sid"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/sources/${params.sid as string}`);
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      try {
+        await wait(o.sourceDelayMs);
+      } finally {
+        inFlight--;
+      }
+      if (failOnce.delete(params.sid as string)) return HttpResponse.json({ error: { code: "INTERNAL", message: "The source could not be read." } }, { status: 500 });
+      const s = o.sources?.[params.sid as string];
+      return s ? HttpResponse.json(s) : HttpResponse.json({ error: { code: "NOT_FOUND", message: "That source was not found." } }, { status: 404 });
+    }),
     http.get(url("/projects"), async ({ request }) => {
       await rec(request, "/projects");
       return HttpResponse.json({ projects: [PROJECT, { id: P2, name: "Fieldwork", encrypted: true, unlocked: true }] });
@@ -129,7 +171,15 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
     http.get(url("/projects/:id/governance"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/governance`);
       await wait(o.governanceDelayMs);
-      return HttpResponse.json({ yaml: o.governance ?? OPEN_GOVERNANCE, sha256: "0".repeat(64), violations: [] });
+      const unreadable = o.governanceUnreadable ?? false;
+      return HttpResponse.json({
+        yaml: o.governance ?? OPEN_GOVERNANCE,
+        sha256: "0".repeat(64),
+        violations: [],
+        readable: !unreadable,
+        issues: unreadable ? ["residencey: unknown key (check spelling) in governance.yaml"] : [],
+        warnings: [],
+      });
     }),
     http.post(url("/projects/:id/import/dry-run"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/import/dry-run`);
@@ -164,18 +214,34 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
       await rec(request, `/projects/${params.id as string}/tags`);
       return HttpResponse.json({ tags: o.tags ?? [], workspaceTags: o.workspaceTags ?? [] });
     }),
-    http.get(url("/projects/:id/sources/:sid"), async ({ request, params }) => {
-      await rec(request, `/projects/${params.id as string}/sources/${params.sid as string}`);
-      inFlight++;
-      peak = Math.max(peak, inFlight);
-      try {
-        await wait(o.sourceDelayMs);
-      } finally {
-        inFlight--;
-      }
-      if (failOnce.delete(params.sid as string)) return HttpResponse.json({ error: { code: "INTERNAL", message: "The source could not be read." } }, { status: 500 });
-      const s = o.sources?.[params.sid as string];
-      return s ? HttpResponse.json(s) : HttpResponse.json({ error: { code: "NOT_FOUND", message: "That source was not found." } }, { status: 404 });
+    http.get(url("/secrets/zotero-api-key"), async ({ request }) => {
+      await rec(request, "/secrets/zotero-api-key");
+      return o.zoteroKey?.noStore ? noStore() : HttpResponse.json({ stored: keyStored });
+    }),
+    http.put(url("/secrets/zotero-api-key"), async ({ request }) => {
+      await rec(request, "/secrets/zotero-api-key");
+      await wait(20);
+      if (o.zoteroKey?.noStore) return noStore();
+      keyStored = true;
+      return HttpResponse.json({ stored: true });
+    }),
+    http.delete(url("/secrets/zotero-api-key"), async ({ request }) => {
+      await rec(request, "/secrets/zotero-api-key");
+      if (o.zoteroKey?.noStore) return noStore();
+      const removed = keyStored;
+      keyStored = false;
+      return HttpResponse.json({ removed });
+    }),
+    http.get(url("/import/zotero-data-folders"), async ({ request }) => {
+      await rec(request, "/import/zotero-data-folders");
+      return HttpResponse.json({ folders: o.zoteroFolders ?? [] });
+    }),
+    http.get(url("/projects/:id/sources/:sid/assets/:aid/content"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/sources/${params.sid as string}/assets/${params.aid as string}/content`);
+      await wait(o.pictureDelayMs);
+      const p = o.pictures?.[params.aid as string];
+      if (!p) return HttpResponse.json({ error: { code: "VALIDATION", message: "This file is not a picture." } }, { status: 400 });
+      return new HttpResponse(p.bytes, { headers: { "Content-Type": p.type } });
     }),
     http.get(url("/projects/:id/sources"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/sources`);
@@ -200,8 +266,68 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
       return HttpResponse.json({ edited: b.itemIds.length });
     }),
     http.post(url("/review/:itemId/decide"), async ({ request, params }) => {
-      await rec(request, `/review/${params.itemId as string}/decide`);
+      const b = (await rec(request, `/review/${params.itemId as string}/decide`)) as { projectId?: string };
+      if (o.decideLocked || (b?.projectId && locked.has(b.projectId))) return lockedAnswer();
+      const q = b?.projectId ? queues.get(b.projectId) : undefined;
+      if (q) {
+        const at = q.findIndex((e) => e.id === params.itemId);
+        if (at >= 0 && q[at]!.kind !== "import") return HttpResponse.json({ error: { code: "VALIDATION", message: "This review entry is not an import item; it is reviewed with the source's verification." } }, { status: 400 });
+        if (at >= 0) q.splice(at, 1);
+      }
       return HttpResponse.json({ decided: true });
+    }),
+    http.get(url("/projects/:id/review"), async ({ request, params }) => {
+      const id = params.id as string;
+      await rec(request, `/projects/${id}/review`);
+      await wait(o.projectReviewDelayMs);
+      if (locked.has(id)) return lockedAnswer();
+      const sp = new URL(request.url).searchParams;
+      const offset = Number(sp.get("offset") ?? 0);
+      const limit = Number(sp.get("limit") ?? 500);
+      const source = sp.get("source");
+      const all = (queues.get(id) ?? []).filter((e) => !source || e.sourceId === source);
+      return HttpResponse.json({ items: all.slice(offset, offset + limit), total: all.length, offset, limit });
+    }),
+    http.post(url("/projects/:id/unlock"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/unlock`);
+      locked.delete(params.id as string);
+      return HttpResponse.json({ unlocked: true });
+    }),
+    http.patch(url("/projects/:id/sources/:sid/fields"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/sources/${params.sid as string}/fields`);
+      if (locked.has(params.id as string)) return lockedAnswer();
+      const sid = params.sid as string;
+      // One record, or a list answered in turn (the last one repeats).
+      const seq = confirmedSeq.get(sid);
+      const after = (Array.isArray(seq) ? (seq.length > 1 ? seq.shift() : seq[0]) : seq) as { fields?: Array<{ field: string; status: string }> } | undefined;
+      if (!after) return HttpResponse.json({ error: { code: "VALIDATION", message: "That field cannot be set here." } }, { status: 400 });
+      // As the library does (R176 1): a capture entry none of whose fields is left unsettled is resolved by the confirm.
+      const settled = new Set(["verified", "single-source", "user-confirmed"]);
+      const q = queues.get(params.id as string);
+      if (q) {
+        for (let i = q.length - 1; i >= 0; i--) {
+          const e = q[i]!;
+          if (e.sourceId === sid && e.group === "capture" && Object.keys(e.fields).every((f) => settled.has(after.fields?.find((x) => x.field === f)?.status ?? ""))) q.splice(i, 1);
+        }
+      }
+      return HttpResponse.json(after);
+    }),
+    // "Reviewed after the withdrawal" (R176 2), as routes/review.ts answers it (WithdrawalReviewedRequest / Response).
+    http.post(url("/review/:itemId/reviewed-after-withdrawal"), async ({ request, params }) => {
+      const b = (await rec(request, `/review/${params.itemId as string}/reviewed-after-withdrawal`)) as { projectId?: string; reason?: unknown };
+      if (o.decideLocked || (b?.projectId && locked.has(b.projectId))) return lockedAnswer();
+      if (typeof b?.reason !== "string") return HttpResponse.json({ error: { code: "VALIDATION", message: '"reason" is required.' } }, { status: 400 });
+      if (b.reason.trim() === "") {
+        return HttpResponse.json(
+          { error: { code: "POLICY_DENIED", message: "This project's rules do not allow that.", reason: "A reason is required to record that this source was reviewed after the withdrawal" } },
+          { status: 403 },
+        );
+      }
+      const q = b.projectId ? queues.get(b.projectId) : undefined;
+      const at = q ? q.findIndex((e) => e.id === params.itemId) : -1;
+      if (at < 0) return HttpResponse.json({ error: { code: "CONFLICT", message: "This entry has already been reviewed." } }, { status: 409 });
+      const [e] = q!.splice(at, 1);
+      return HttpResponse.json({ entry: { id: e!.id, sourceId: e!.sourceId, status: "resolved", decision: "reviewed-after-withdrawal", resolvedAt: "2026-11-12T10:00:00.000Z", reason: b.reason } });
     }),
     http.get(url("/events"), async ({ request }) => {
       await rec(request, "/events");

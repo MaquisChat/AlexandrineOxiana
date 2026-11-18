@@ -13,6 +13,12 @@ export const PATHS = {
   library: "/",
   libraryAlias: "/library",
   appearance: "/settings/appearance",
+  extension: "/settings/extension",
+  tools: "/settings/tools",
+  watchedFolders: "/settings/watched-folders",
+  zotero: "/settings/zotero",
+  searchSources: "/settings/search-sources",
+  yourLibrary: "/settings/your-library",
   importWizard: "/import",
   reviewQueue: "/import/review",
   governance: "/governance",
@@ -20,6 +26,11 @@ export const PATHS = {
   fieldwork: "/fieldwork",
   moveLibrary: "/move-library",
   missingFiles: "/missing-files",
+  transcript: "/transcript",
+  reader: "/reader",
+  capture: "/capture",
+  find: "/find",
+  about: "/about",
 } as const;
 
 /** Where the Bulk Import screens live (R113): the wizard and its review queue. */
@@ -33,12 +44,44 @@ export interface AppLocation {
 /** "/library/" → "/library"; "/" stays "/". */
 export const normalisePath = (p: string): string => (p.length > 1 ? p.replace(/\/+$/, "") || "/" : p || "/");
 
-/** Moves to an in-app path ("/…", query allowed) without reloading; listeners of popstate re-render. */
-export function navigate(href: string): void {
+/** While set, navigate() moves nowhere and calls it instead (see blockNavigation). */
+let navigationBlock: ((href: string) => void) | null = null;
+
+/**
+ * Refuses in-app navigation (links and navigate()) until the returned function is called; each
+ * refused attempt calls `onRefused` with the address it was refused (to say why, or to go there once
+ * the researcher agrees). Used while something shown once must not be lost,
+ * such as a new project's recovery code (R134). The browser's Back and Forward are guarded by the
+ * caller (they do not go through navigate()).
+ */
+export function blockNavigation(onRefused: (href: string) => void): () => void {
+  navigationBlock = onRefused;
+  return () => {
+    if (navigationBlock === onRefused) navigationBlock = null;
+  };
+}
+
+/**
+ * Moves to an in-app path ("/…", query allowed) without reloading; listeners of popstate re-render.
+ * `replace` rewrites the current history entry instead of adding one (for example to keep the
+ * selected project in the library's address).
+ */
+export function navigate(href: string, opts: { replace?: boolean } = {}): void {
   if (!href.startsWith("/") || href.startsWith("//")) throw new Error(`navigate() takes an in-app path starting with "/" (got "${href}").`);
-  window.history.pushState(null, "", href);
+  if (navigationBlock) {
+    navigationBlock(href);
+    return;
+  }
+  if (opts.replace) window.history.replaceState(null, "", href);
+  else window.history.pushState(null, "", href);
   window.dispatchEvent(new PopStateEvent("popstate"));
 }
+
+/** The project named in an address's query (`?project=<id>`), or undefined. */
+export const projectInQuery = (search: string): string | undefined => new URLSearchParams(search).get("project") || undefined;
+
+/** The library's address, naming a project when there is one (41b2 I1). */
+export const libraryHref = (projectId?: string): string => (projectId ? `${PATHS.library}?project=${encodeURIComponent(projectId)}` : PATHS.library);
 
 type LinkClick = Pick<MouseEvent<HTMLElement>, "button" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey" | "preventDefault"> & {
   currentTarget: { getAttribute(n: string): string | null };
@@ -68,21 +111,37 @@ export function useLocation(): AppLocation {
 
 export const usePathname = (): string => useLocation().pathname;
 
-/** The link every screen other than the library shows at its top. */
-export function BackToLibrary() {
+/** The link every screen other than the library shows at its top; it keeps the screen's project. */
+export function BackToLibrary({ projectId }: { projectId?: string | undefined } = {}) {
   return (
     <nav aria-label="Library" className="ao-back">
-      <a href={PATHS.library} onClick={inAppLink}>
+      <a href={libraryHref(projectId)} onClick={inAppLink}>
         Back to library
       </a>
     </nav>
   );
 }
 
-/** Files dropped anywhere but a drop zone must not make the webview open them (and leave the app). */
+const editable = (t: EventTarget | null): boolean =>
+  t instanceof HTMLElement && (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t.isContentEditable);
+
+/** Whether a drag may carry files or links the webview would open (unknown counts as yes). */
+const carriesFiles = (e: DragEvent): boolean => {
+  const types = e.dataTransfer?.types;
+  if (!types) return true;
+  return Array.from(types).some((t) => t === "Files" || t === "text/uri-list");
+};
+
+/**
+ * Files dropped anywhere but a drop zone must not make the webview open them (and leave the app).
+ * Text dragged into a field is left alone, so it still drops there (41b1 M9).
+ */
 export function useDropGuard(): void {
   useEffect(() => {
-    const stop = (e: DragEvent) => e.preventDefault();
+    const stop = (e: DragEvent) => {
+      if (editable(e.target) && !carriesFiles(e)) return;
+      e.preventDefault();
+    };
     window.addEventListener("dragover", stop);
     window.addEventListener("drop", stop);
     return () => {

@@ -40,6 +40,10 @@ export interface IntegrityWarning {
     | "incomplete-audit-line-pending"
     /** An audit event could not be appended while opening; the project refuses writes until reopened. */
     | "audit-append-failed-at-open"
+    /** Actions whose audit entry (or file permissions) could not be written at the time were recorded on this open (Task 50). */
+    | "audit-recorded-late"
+    /** A refusal with no project to hold it could not be recorded in the library's audit log (Task 50). */
+    | "refusal-unrecorded"
     /** The project's record of sources deleted here could not be read; set aside (R74 I2). */
     | "deleted-records-unreadable"
     /** A source's annotations file is missing or damaged; the source is read without annotations (R77). */
@@ -47,7 +51,11 @@ export interface IntegrityWarning {
     /** A source's annotations file does not match its recorded hash; read as it is (R77). */
     | "annotations-hash-mismatch"
     /** Files destroyed under the retention rule could not be overwritten yet; retried on each open (R94). */
-    | "destroy-incomplete";
+    | "destroy-incomplete"
+    /** A staged recovery-code key file that is not the committed one was removed, not activated (R148). */
+    | "recovery-staging-discarded"
+    /** A staged recovery-code key file was left in place, not activated: the audit log does not verify (R148). */
+    | "recovery-staging-unverifiable";
   detail: string;
   /** Library-relative file, for the two incomplete-line kinds. */
   file?: string;
@@ -98,6 +106,41 @@ export class AuditStore {
     return out;
   }
 
+  /**
+   * A cheap pass over a long log for a few kinds of event (R147): like `read`, but only the lines
+   * that contain one of `needles` are parsed (one that cannot be parsed is left out). `last` is the
+   * last complete line of the log, parsed (null: none, or it cannot be parsed): what the log ends
+   * at, to compare with a head the caller holds.
+   */
+  static async readMatching(dir: string, needles: readonly string[]): Promise<{ events: AuditEvent[]; last: AuditEvent | null }> {
+    const names = await auditSegments(dir);
+    const events: AuditEvent[] = [];
+    let lastLine: string | undefined;
+    for (const [i, n] of names.entries()) {
+      const lines = (await fsp.readFile(join(dir, n), "utf8")).split("\n");
+      if (i === names.length - 1) lines.pop();
+      for (const line of lines) {
+        if (line.trim() === "") continue;
+        lastLine = line;
+        if (!needles.some((s) => line.includes(s))) continue;
+        try {
+          events.push(JSON.parse(line) as AuditEvent);
+        } catch {
+          // not an event: the full read (and the chain check) reports it
+        }
+      }
+    }
+    let last: AuditEvent | null = null;
+    if (lastLine !== undefined) {
+      try {
+        last = JSON.parse(lastLine) as AuditEvent;
+      } catch {
+        last = null;
+      }
+    }
+    return { events, last };
+  }
+
   /** Opens the log: returns the store (appending after the last readable event) and the chain check. */
   static async load(
     dir: string,
@@ -115,6 +158,11 @@ export class AuditStore {
 
   segmentName(seq: number): string {
     return `${String(Math.ceil(seq / this.segmentSize)).padStart(4, "0")}.jsonl`;
+  }
+
+  /** The event `append(input)` would write next (its seq and hash), without writing anything (R362 b). */
+  peek(input: AuditInput): AuditEvent {
+    return sealEvent(stripUndefined(input), this.head);
   }
 
   /** Seals and durably appends one event. Returns an undo that removes it again. */

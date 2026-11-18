@@ -69,6 +69,19 @@ export class CorruptLibraryError extends Error {
     this.name = "CorruptLibraryError";
   }
 }
+/**
+ * FR-047: the Finder's housekeeping files, which it writes into any folder it has shown. A folder whose only entries are
+ * these — regular files of exactly these names — counts as empty where the library needs an empty folder (a new
+ * library, a move's destination); they are left where they are. Anything else (another hidden file, a folder or a
+ * link of such a name) still counts.
+ */
+export const FINDER_FILES: ReadonlySet<string> = new Set([".DS_Store", ".localized"]);
+
+/** The names in `dir` other than the Finder's own housekeeping files (FINDER_FILES, as regular files). */
+export async function entriesBesidesFinderFiles(dir: string): Promise<string[]> {
+  return (await readdir(dir, { withFileTypes: true })).filter((e) => !(FINDER_FILES.has(e.name) && e.isFile())).map((e) => e.name);
+}
+
 export class FolderNotEmptyError extends Error {
   constructor(root: string) {
     super(`Folder is not empty: ${root}`);
@@ -174,7 +187,7 @@ export async function createLibrary(
   if (await exists(metaPath(root))) throw new AlreadyALibraryError(root);
   try {
     await mkdir(root, { recursive: true });
-    if ((await readdir(root)).length > 0) throw new FolderNotEmptyError(root);
+    if ((await entriesBesidesFinderFiles(root)).length > 0) throw new FolderNotEmptyError(root);
     for (const d of SUBDIRS) await mkdir(join(root, d), { recursive: true });
     const at = deps.clock().toISOString();
     const meta: LibraryJson = {
@@ -382,7 +395,7 @@ function holderName(holder: LockInfo | null | undefined): { lockedBy?: string } 
   const h = holder?.hostname;
   if (typeof h !== "string") return {};
   const name = h.trim();
-  if (name.length === 0 || name.length > 253 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(name)) return {};
+  if (name.length === 0 || name.length > 253 || /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(name)) return {};
   return { lockedBy: name };
 }
 

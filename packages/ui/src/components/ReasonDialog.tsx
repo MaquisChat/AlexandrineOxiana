@@ -5,16 +5,21 @@
  * cancels (not while the action runs), Tab stays inside and skips disabled controls. The dialog is
  * rendered on <body> and everything else is made inert while it is open (R117).
  */
-import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 
 const FOCUSABLE = "textarea:not([disabled]), input:not([disabled]), select:not([disabled]), button:not([disabled])";
 
-export function useTrap(onCancel: () => void, busy = false) {
+/**
+ * `initialFocus` (R371 a): an element of the dialog to focus on open instead of its first field —
+ * its heading (tabIndex -1) for a dialog whose first control would decide on Enter. Shift+Tab from
+ * that element goes to the dialog's last control; Tab goes on to the first in the page's order.
+ */
+export function useTrap(onCancel: () => void, busy = false, initialFocus?: RefObject<HTMLElement | null>) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const before = document.activeElement as HTMLElement | null;
-    ref.current?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
+    (initialFocus?.current ?? ref.current?.querySelector<HTMLElement>(FOCUSABLE))?.focus();
     return () => before?.focus?.();
   }, []);
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
@@ -31,7 +36,10 @@ export function useTrap(onCancel: () => void, busy = false) {
     }
     const first = items[0]!;
     const last = items[items.length - 1]!;
-    if (e.shiftKey && document.activeElement === first) {
+    if (e.shiftKey && initialFocus?.current && document.activeElement === initialFocus.current) {
+      e.preventDefault();
+      last.focus();
+    } else if (e.shiftKey && document.activeElement === first) {
       e.preventDefault();
       last.focus();
     } else if (!e.shiftKey && document.activeElement === last) {
@@ -43,10 +51,11 @@ export function useTrap(onCancel: () => void, busy = false) {
 }
 
 /** Renders on <body>; every other child of <body> is inert while the dialog is open. */
-function DialogShell({ labelledBy, describedBy, onCancel, busy, children }: { labelledBy: string; describedBy?: string; onCancel: () => void; busy?: boolean; children: ReactNode }) {
-  const { ref, onKeyDown } = useTrap(onCancel, busy);
+export function DialogShell({ labelledBy, describedBy, onCancel, busy, className, initialFocus, children }: { labelledBy: string; describedBy?: string; onCancel: () => void; busy?: boolean; className?: string; initialFocus?: RefObject<HTMLElement | null>; children: ReactNode }) {
+  const { ref, onKeyDown } = useTrap(onCancel, busy, initialFocus);
   const [host] = useState(() => document.createElement("div"));
-  useEffect(() => {
+  // A layout effect: the host must be in the document before useTrap's effect moves focus into the dialog.
+  useLayoutEffect(() => {
     document.body.appendChild(host);
     const others = [...document.body.children].filter((el) => el !== host && !el.hasAttribute("inert"));
     for (const el of others) el.setAttribute("inert", "");
@@ -57,7 +66,7 @@ function DialogShell({ labelledBy, describedBy, onCancel, busy, children }: { la
   }, [host]);
   return createPortal(
     <div className="ao-dialog-backdrop">
-      <div ref={ref} role="dialog" aria-modal="true" aria-labelledby={labelledBy} aria-describedby={describedBy} aria-busy={busy || undefined} className="ao-dialog" onKeyDown={onKeyDown}>
+      <div ref={ref} role="dialog" aria-modal="true" aria-labelledby={labelledBy} aria-describedby={describedBy} aria-busy={busy || undefined} className={className ? `ao-dialog ${className}` : "ao-dialog"} onKeyDown={onKeyDown}>
         {children}
       </div>
     </div>,
@@ -65,15 +74,25 @@ function DialogShell({ labelledBy, describedBy, onCancel, busy, children }: { la
   );
 }
 
-export function ReasonDialog({ message, onConfirm, onCancel }: { message: ReactNode; onConfirm: (reason: string, by: string) => void; onCancel: () => void }) {
+/** Whether the text holds something a person can see: not only white space and invisible format characters (R421 a). */
+const seen = (t: string): boolean => t.replace(/[\s\p{Cf}]/gu, "") !== "";
+
+export function ReasonDialog({ message, fieldNote, onConfirm, onCancel }: { message: ReactNode; /** Said under the message and tied to both fields (R369 a). */ fieldNote?: string; onConfirm: (reason: string, by: string) => void; onCancel: () => void }) {
   const id = useId();
+  const noteId = fieldNote ? `${id}-n` : undefined;
   const [reason, setReason] = useState("");
   const [by, setBy] = useState("");
-  const ok = reason.trim() !== "" && by.trim() !== "";
+  // R421 a: a field of only white space and invisible format characters counts as empty.
+  const ok = seen(reason) && seen(by);
   return (
     <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel}>
       <h2 id={`${id}-t`}>Record a reason</h2>
       <p id={`${id}-d`}>{message}</p>
+      {fieldNote ? (
+        <p id={noteId} className="ao-hint">
+          {fieldNote}
+        </p>
+      ) : null}
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -82,11 +101,11 @@ export function ReasonDialog({ message, onConfirm, onCancel }: { message: ReactN
       >
         <label className="ao-stack">
           Reason
-          <textarea required rows={3} value={reason} onChange={(e) => setReason(e.target.value)} />
+          <textarea required rows={3} aria-describedby={noteId} value={reason} onChange={(e) => setReason(e.target.value)} />
         </label>
         <label className="ao-stack">
           Approved by
-          <input type="text" required value={by} onChange={(e) => setBy(e.target.value)} />
+          <input type="text" required aria-describedby={noteId} value={by} onChange={(e) => setBy(e.target.value)} />
         </label>
         <div className="ao-actions">
           <button type="submit" disabled={!ok}>
@@ -150,11 +169,16 @@ export function ConfirmDialog({
 }
 
 /** A yes/no confirmation (deleting a record that can be deleted). */
-export function ChoiceDialog({ title, children, action, onConfirm, onCancel, busy }: { title: string; children: ReactNode; action: string; onConfirm: () => void; onCancel: () => void; busy?: boolean }) {
+export function ChoiceDialog({ title, children, action, onConfirm, onCancel, busy }: { title: ReactNode; children: ReactNode; action: string; onConfirm: () => void; onCancel: () => void; busy?: boolean }) {
   const id = useId();
+  // First focus on the heading (R376 c): a held or repeated Enter on the opener must not confirm.
+  // `title` may carry user text through UserText (R399 e); the heading names the dialog either way.
+  const heading = useRef<HTMLHeadingElement>(null);
   return (
-    <DialogShell labelledBy={`${id}-t`} onCancel={onCancel} busy={!!busy}>
-      <h2 id={`${id}-t`}>{title}</h2>
+    <DialogShell labelledBy={`${id}-t`} onCancel={onCancel} busy={!!busy} initialFocus={heading}>
+      <h2 id={`${id}-t`} ref={heading} tabIndex={-1}>
+        {title}
+      </h2>
       <div>{children}</div>
       <div className="ao-actions">
         <button type="button" className="ao-danger" onClick={onConfirm} disabled={busy}>

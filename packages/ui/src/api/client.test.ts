@@ -162,6 +162,133 @@ describe("createClient", () => {
   });
 });
 
+describe("bytes() — a file's content, with the token in the header (R135 1, Task 57)", () => {
+  it("GETs the path with the Authorization header and gives the body as a Blob of its type", async () => {
+    const f = fakeFetch(() => new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-type": "image/png" } }));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    const b = await api.bytes("/projects/p/sources/s/assets/a/content");
+    expect(b.type).toBe("image/png");
+    expect([...new Uint8Array(await b.arrayBuffer())]).toEqual([1, 2, 3]);
+    expect(f.calls[0]!.url).toBe(`${BASE}/projects/p/sources/s/assets/a/content`);
+    expect(f.calls[0]!.init.method).toBe("GET");
+    expect(header(f.calls[0]!.init, "authorization")).toBe(`Bearer ${TOKEN}`);
+    expect(f.calls[0]!.url).not.toContain(TOKEN);
+  });
+
+  it("an error answer is the service's error; a bad path is refused before any request", async () => {
+    const f = fakeFetch(() => json({ error: { code: "PROJECT_LOCKED", message: "This project is locked." } }, 423));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    await expect(api.bytes("/x")).rejects.toMatchObject({ status: 423, code: "PROJECT_LOCKED", message: "This project is locked." });
+    expect(() => api.bytes(`/x?t=${TOKEN}`)).toThrow();
+    expect(() => api.bytes(`/x/${TOKEN}`)).toThrow();
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("an answer larger than the limit given is refused", async () => {
+    const f = fakeFetch(() => new Response(new Uint8Array(100), { status: 200, headers: { "content-type": "image/png", "content-length": "100" } }));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    await expect(api.bytes("/x", { maxBytes: 10 })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+  });
+
+  it("with no Content-Length, it stops reading once the limit is passed and gives up the rest (M11)", async () => {
+    // A body of 4-byte chunks that would go on for 40 000 bytes; nothing says how long it is.
+    let pulls = 0;
+    let cancelled = false;
+    const body = () =>
+      new ReadableStream<Uint8Array>({
+        pull(c) {
+          pulls++;
+          if (pulls > 10_000) c.close();
+          else c.enqueue(new Uint8Array([1, 2, 3, 4]));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+    const f = fakeFetch(() => new Response(body(), { status: 200, headers: { "content-type": "image/png" } }));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    await expect(api.bytes("/x", { maxBytes: 10 })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+    expect(pulls).toBeLessThan(10); // 3 chunks pass 10 bytes; the stream may pull a little ahead
+    expect(cancelled).toBe(true);
+  });
+
+  it("with no Content-Length, a body within the limit is given whole, of its type (M10 d)", async () => {
+    const chunks = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5]), new Uint8Array([6, 7, 8, 9, 10])];
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const ch of chunks) c.enqueue(ch);
+        c.close();
+      },
+    });
+    const f = fakeFetch(() => new Response(stream, { status: 200, headers: { "content-type": "font/woff2" } }));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    const b = await api.bytes("/x", { maxBytes: 10 });
+    expect(b.type).toBe("font/woff2");
+    // Read as the interface does where Blob.arrayBuffer is missing (this test DOM's Blob lacks it).
+    const read = await new Promise<ArrayBuffer>((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result as ArrayBuffer);
+      r.onerror = () => reject(r.error);
+      r.readAsArrayBuffer(b);
+    });
+    expect([...new Uint8Array(read)]).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    // One byte more than the limit, sent in small pieces: refused.
+    const over = new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const ch of [...chunks, new Uint8Array([11])]) c.enqueue(ch);
+        c.close();
+      },
+    });
+    const g = fakeFetch(() => new Response(over, { status: 200, headers: { "content-type": "font/woff2" } }));
+    await expect(createClient(BASE, TOKEN, { fetch: g.fetch }).bytes("/x", { maxBytes: 10 })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+  });
+});
+
+describe("mediaUrl() — the address a media element loads (R135)", () => {
+  const TICKET = "Ab3_-".repeat(8) + "xyz"; // 43 base64url characters
+  const B64_TOKEN = "Q".repeat(40); // a token that could sit inside a ticket-shaped path
+
+  it("gives the base URL plus the ticket path, nothing else, and fetches nothing", () => {
+    const f = fakeFetch(() => json({}));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    expect(api.mediaUrl(`/media/${TICKET}`)).toBe(`${BASE}/media/${TICKET}`);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("refuses anything but /media/<43 base64url characters>: a query, a fragment, other routes, other hosts", () => {
+    const api = createClient(BASE, TOKEN, { fetch: fakeFetch(() => json({})).fetch });
+    for (const path of [
+      `/media/${TICKET}?x=1`,
+      `/media/${TICKET}?`,
+      `/media/${TICKET}#t=10`,
+      `/media/${TICKET}%3Fx=1`,
+      `/media/${TICKET}%23t`,
+      `/media/${TICKET}/x`,
+      `/media/${TICKET.slice(1)}`,
+      "/projects",
+      `//evil.example/media/${TICKET}`,
+      `http://127.0.0.1:4317/media/${TICKET}`,
+      `/media/../media/${TICKET}`,
+    ]) {
+      expect(() => api.mediaUrl(path), path).toThrow(/media address/);
+    }
+  });
+
+  it("refuses an address carrying the service token, however it is written", () => {
+    const api = createClient(BASE, B64_TOKEN, { fetch: fakeFetch(() => json({})).fetch });
+    expect(() => api.mediaUrl(`/media/${B64_TOKEN}abc`)).toThrow(/token/);
+    expect(() => api.mediaUrl(`/media/abc${B64_TOKEN}`)).toThrow(/token/);
+    expect(() => api.mediaUrl(`/media/${TICKET}`)).not.toThrow();
+  });
+
+  it("the ordinary request paths still refuse ?, # and the token (unchanged by the media address)", () => {
+    const api = createClient(BASE, B64_TOKEN, { fetch: fakeFetch(() => json({})).fetch });
+    for (const path of [`/media/${TICKET}?a=1`, `/media/${TICKET}#f`, `/media/${B64_TOKEN}abc`]) {
+      expect(() => api.request("GET", path), path).toThrow(/path|token/);
+    }
+  });
+});
+
 describe("events() — SSE over fetch streaming (not EventSource)", () => {
   function streamOf(chunks: string[]) {
     const enc = new TextEncoder();
@@ -302,5 +429,125 @@ describe("ndjson() — streamed NDJSON answers (Task 36: library move)", () => {
     const api = createClient(BASE, TOKEN, { fetch: f.fetch });
     const it = api.ndjson("POST", "/libraries/move", { body: {} });
     await expect(it.next()).rejects.toMatchObject({ status: 409, code: "CONFLICT" });
+  });
+});
+
+describe("byteRange() — a range of a stored file with the token in the header (Task R5)", () => {
+  const PATH = "/projects/p1/sources/s1/assets/a1/document";
+  /** A 206 answer as the service gives it. */
+  const partial = (body: Uint8Array, contentRange: string | null, status = 206, extra: Record<string, string> = {}) =>
+    new Response(body as BodyInit, { status, headers: { "content-type": "application/pdf", ...(contentRange !== null ? { "content-range": contentRange } : {}), ...extra } });
+  const bytesOf = (n: number, from = 0) => Uint8Array.from({ length: n }, (_, i) => (from + i) % 251);
+  /** A header as sent (jsdom's Headers drops Range, which browsers send with fetch). */
+  const sent = (init: RequestInit, name: string): string | undefined => Object.entries((init.headers ?? {}) as Record<string, string>).find(([k]) => k.toLowerCase() === name)?.[1];
+
+  it("byteRange sends the token in the header and returns the bytes and total", async () => {
+    const f = fakeFetch(() => partial(bytesOf(10, 5), "bytes 5-14/100"));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    const r = await api.byteRange(PATH, 5, 14);
+    expect(r.start).toBe(5);
+    expect(r.end).toBe(14);
+    expect(r.total).toBe(100);
+    expect(r.bytes).toBeInstanceOf(Uint8Array);
+    expect([...r.bytes]).toEqual([...bytesOf(10, 5)]);
+    expect(f.calls).toHaveLength(1);
+    const c = f.calls[0]!;
+    expect(c.url).toBe(`${BASE}${PATH}`);
+    expect(c.url).not.toContain(TOKEN);
+    expect(c.init.method).toBe("GET");
+    expect(header(c.init, "authorization")).toBe(`Bearer ${TOKEN}`);
+    expect(sent(c.init, "range")).toBe("bytes=5-14");
+    expect(sent(c.init, "if-range")).toBeUndefined();
+  });
+
+  it("byteRange accepts an answer cut short by the service (its 4 MiB limit, or the end of the file)", async () => {
+    const f = fakeFetch((_url, init) => {
+      const asked = sent(init, "range");
+      return asked === "bytes=0-9999999" ? partial(bytesOf(4194304), "bytes 0-4194303/20000000") : partial(bytesOf(3, 97), "bytes 97-99/100");
+    });
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    const big = await api.byteRange(PATH, 0, 9999999);
+    expect({ start: big.start, end: big.end, total: big.total, length: big.bytes.length }).toEqual({ start: 0, end: 4194303, total: 20000000, length: 4194304 });
+    const tail = await api.byteRange(PATH, 97, 500);
+    expect({ start: tail.start, end: tail.end, total: tail.total }).toEqual({ start: 97, end: 99, total: 100 });
+  });
+
+  it("byteRange refuses a mismatched Content-Range", async () => {
+    const cases: Array<[string, () => Response]> = [
+      ["another start", () => partial(bytesOf(10), "bytes 0-9/100")],
+      ["an end past what was asked", () => partial(bytesOf(11), "bytes 5-15/100")],
+      ["an end past the file", () => partial(bytesOf(10), "bytes 5-14/14")],
+      ["no Content-Range", () => partial(bytesOf(10), null)],
+      ["an unknown total", () => partial(bytesOf(10), "bytes 5-14/*")],
+      ["another unit", () => partial(bytesOf(10), "items 5-14/100")],
+      ["not a number", () => partial(bytesOf(10), "bytes 5-1e1/100")],
+      ["the whole file (200), not a range", () => partial(bytesOf(100), "bytes 5-14/100", 200)],
+      ["a shorter body", () => partial(bytesOf(9, 5), "bytes 5-14/100")],
+      ["a longer body", () => partial(bytesOf(11, 5), "bytes 5-14/100")],
+      ["a declared length that differs", () => partial(bytesOf(10, 5), "bytes 5-14/100", 206, { "content-length": "11" })],
+      ["cut short in the middle of the file without reason", () => partial(bytesOf(5, 5), "bytes 5-9/100")],
+    ];
+    for (const [what, respond] of cases) {
+      const api = createClient(BASE, TOKEN, { fetch: fakeFetch(respond).fetch });
+      const err = await api.byteRange(PATH, 5, 14).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(err, what).toBeInstanceOf(ApiClientError);
+      expect((err as ApiClientError).code, what).toBe("INTERNAL");
+      // Not a success status: the answer was wrong, as a bad gateway's would be (review M5).
+      expect((err as ApiClientError).status, what).toBe(502);
+      expect((err as ApiClientError).message, what).not.toContain(TOKEN);
+    }
+  });
+
+  it("byteRange gives the service's own refusals as they are, and checks its arguments before sending", async () => {
+    const f = fakeFetch(() => json({ error: { code: "PROJECT_LOCKED", message: "This project is locked. Its passphrase is needed." } }, 423));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    await expect(api.byteRange(PATH, 0, 9)).rejects.toMatchObject({ status: 423, code: "PROJECT_LOCKED" });
+    const unsatisfiable = createClient(BASE, TOKEN, { fetch: fakeFetch(() => new Response(null, { status: 416, headers: { "content-range": "bytes */100" } })).fetch });
+    // A 416 has no error body: it is said in plain words, with the file's length when the service gave it (review M5).
+    await expect(unsatisfiable.byteRange(PATH, 200, 300)).rejects.toMatchObject({ status: 416, code: "VALIDATION", message: "The part of the file asked for is past its end.", reason: "100" });
+    const empty = createClient(BASE, TOKEN, { fetch: fakeFetch(() => new Response(null, { status: 416, headers: { "content-range": "bytes */0" } })).fetch });
+    await expect(empty.byteRange(PATH, 0, 9)).rejects.toMatchObject({ status: 416, reason: "0" });
+    const before = f.calls.length;
+    for (const [a, b] of [
+      [-1, 9],
+      [10, 9],
+      [0.5, 9],
+      [0, Number.NaN],
+      [0, 2 ** 53],
+    ] as Array<[number, number]>) {
+      await expect(api.byteRange(PATH, a, b)).rejects.toThrow();
+    }
+    await expect(api.byteRange(`${PATH}?token=${TOKEN}`, 0, 9)).rejects.toThrow();
+    await expect(api.byteRange(`/x/${TOKEN}`, 0, 9)).rejects.toThrow();
+    expect(f.calls.length).toBe(before);
+  });
+
+  it("byteRange passes its signal to the request", async () => {
+    const ctl = new AbortController();
+    const f = fakeFetch((_url, init) => {
+      expect(init.signal).toBe(ctl.signal);
+      return partial(bytesOf(2), "bytes 0-1/2");
+    });
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    await api.byteRange(PATH, 0, 1, { signal: ctl.signal });
+    ctl.abort();
+    const g = fakeFetch((_url, init) => (init.signal?.aborted ? Promise.reject(new DOMException("aborted", "AbortError")) : partial(bytesOf(2), "bytes 0-1/2")));
+    await expect(createClient(BASE, TOKEN, { fetch: g.fetch }).byteRange(PATH, 0, 1, { signal: ctl.signal })).rejects.toMatchObject({ name: "AbortError" });
+    // Aborted once the body is read but before the bytes are handed back: no stale answer (review M5).
+    const late = new AbortController();
+    const h = fakeFetch(() => {
+      const body = new ReadableStream<Uint8Array>({
+        pull(c) {
+          c.enqueue(bytesOf(2));
+          c.close();
+          late.abort();
+        },
+      });
+      return new Response(body, { status: 206, headers: { "content-range": "bytes 0-1/2" } });
+    });
+    await expect(createClient(BASE, TOKEN, { fetch: h.fetch }).byteRange(PATH, 0, 1, { signal: late.signal })).rejects.toMatchObject({ name: "AbortError" });
   });
 });

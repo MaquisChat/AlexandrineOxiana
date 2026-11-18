@@ -6,6 +6,7 @@
  * Governance edits always name the version they were made from (`baseSha256`, the sha256 GET
  * returned; R99): the service answers 409 CONFLICT when the file changed elsewhere meanwhile.
  */
+import type { AttentionMarksResponse, AuditReasonView, GovernanceReadability, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "./client";
 
 /**
@@ -48,13 +49,15 @@ export interface Violation {
   profile: Profile;
 }
 
-export interface GovernanceFile {
+/** The rules as written, and whether the policy engine can read them (R379 FR-A18). */
+export interface GovernanceFile extends GovernanceReadability {
   yaml: string;
   sha256: string;
   violations: Violation[];
 }
 
-export interface GovernanceSaved {
+/** The answer to a save; its readability is that of the text just saved (R379 FR-A18). */
+export interface GovernanceSaved extends GovernanceReadability {
   violations: Violation[];
   loosened: string[];
   sha256: string;
@@ -75,6 +78,8 @@ export interface ProtocolDocumentResult {
 
 export interface RetentionDue {
   destroyAfter: string | null;
+  /** The project's time zone the date is read in (R93); null or absent: UTC. */
+  timeZone?: string | null;
   due: Array<{ sourceId: string; title: string; assetIds: string[] }>;
 }
 
@@ -97,7 +102,11 @@ export interface AuditEvent {
   entity?: { type: string; id: string };
   decision?: { result: "allow" | "deny" | "allow_with_conditions"; reason?: string };
   details?: Record<string, unknown>;
+  /** The reason the researcher typed, as the service reads it (R362 b): sealed reasons of an encrypted project included. */
+  reasonShown?: AuditReasonView;
 }
+
+export type { AttentionMarkView, AttentionMarksResponse, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";
 
 export interface AuditPage {
   events: AuditEvent[];
@@ -178,6 +187,18 @@ export interface PendingMove {
   newRoot: string;
   confirmToken: string;
   expiresAt: string;
+  /** The finished move's own warnings (R379, I2); absent from an older service. */
+  warnings?: string[];
+}
+
+/**
+ * GET /libraries/move/status (R379): whether a move runs now; the last finished move (its token);
+ * the last move that stopped with an error, under the `attempt` id its screen sent.
+ */
+export interface MoveStatus {
+  pending: PendingMove | null;
+  running?: boolean;
+  failed?: { newRoot: string; attempt: string | null; error: { code: string; message: string; reason?: string } } | null;
 }
 
 export interface RelinkResult {
@@ -203,6 +224,9 @@ export interface IntegrityAnswer {
 export interface ProjectSummary {
   id: string;
   name: string;
+  encrypted?: boolean;
+  /** An encrypted project that is not unlocked cannot be changed (PROJECT_LOCKED). */
+  unlocked?: boolean;
 }
 
 const p = (projectId: string) => `/projects/${encodeURIComponent(projectId)}`;
@@ -211,6 +235,8 @@ export function governanceApi(client: ApiClient) {
   const r = client.request;
   return {
     projects: () => r<{ projects: ProjectSummary[] }>("GET", "/projects"),
+    /** Whether the open library may be changed here (its mode), for screens that say so before a change is refused. */
+    libraryMode: async () => (await r<{ current?: { mode?: string } }>("GET", "/libraries")).current?.mode,
 
     getGovernance: (projectId: string) => r<GovernanceFile>("GET", `${p(projectId)}/governance`),
     /** Always sends the version the edit was made from (R99). */
@@ -223,12 +249,23 @@ export function governanceApi(client: ApiClient) {
       r<{ results: ProtocolDocumentResult[]; documents: ProtocolDocument[] }>("POST", `${p(projectId)}/protocol/documents`, { body: { paths } }),
 
     retention: (projectId: string) => r<RetentionDue>("GET", `${p(projectId)}/retention`),
+    /** Sets (an IANA zone name) or clears (null: UTC) the time zone the project's dates are read in (R93). */
+    setTimeZone: (projectId: string, timeZone: string | null) => r<{ timeZone: string | null }>("PUT", `${p(projectId)}/time-zone`, { body: { timeZone } }),
     destroyRaw: (projectId: string, assetIds: string[]) =>
       r<{ certificate: DestructionCertificate; certificateFile: string }>("POST", `${p(projectId)}/retention/destroy`, { body: { assetIds, confirm: true } }),
 
     audit: (projectId: string, opts: { limit?: number; before?: number } = {}) =>
       r<AuditPage>("GET", `${p(projectId)}/audit`, { query: { limit: opts.limit, before: opts.before } }),
     verifyAudit: (projectId: string) => r<AuditCheck>("GET", `${p(projectId)}/audit/verify`),
+
+    /** The project's attention marks (Task 50, R154 b). */
+    attention: (projectId: string) => r<AttentionMarksResponse>("GET", `${p(projectId)}/attention`),
+    /** Sets a mark aside with a reason (decided and audited, R154 d). */
+    setAsideMark: (projectId: string, markId: string, reason: string) =>
+      r<SetAsideResponse>("POST", `${p(projectId)}/attention/${encodeURIComponent(markId)}/set-aside`, { body: { reason } }),
+    /** The library's own audit log (refused project creations, set-asides; R154 a, b). */
+    libraryAudit: (opts: { limit?: number; before?: number } = {}) => r<LibraryAuditPage>("GET", "/libraries/audit", { query: { limit: opts.limit, before: opts.before } }),
+    verifyLibraryAudit: () => r<LibraryAuditCheck>("GET", "/libraries/audit/verify"),
 
     participants: (projectId: string) => r<{ participants: Participant[]; complete: boolean }>("GET", `${p(projectId)}/participants`),
     sessions: (projectId: string) => r<{ sessions: Session[]; complete: boolean }>("GET", `${p(projectId)}/sessions`),
@@ -259,13 +296,16 @@ export function governanceApi(client: ApiClient) {
     movePlan: (dest: string) => r<MovePlan>("POST", "/libraries/move/plan", { body: { dest } }),
     /** Streams the move's progress; ends with `done` (verified and switched) or `error`. */
     /** `onOpen`: the service accepted the move (its answer's headers arrived); from then on a broken stream is not "not started". */
-    move: (dest: string, excludeProjectIds: string[], signal?: AbortSignal, onOpen?: () => void) =>
-      client.ndjson<MoveLine>("POST", "/libraries/move", { body: { dest, excludeProjectIds }, ...(signal ? { signal } : {}), ...(onOpen ? { onOpen } : {}) }),
-    moveStatus: () => r<{ pending: PendingMove | null }>("GET", "/libraries/move/status"),
+    /** `attempt`: the screen's own id for this request; a failure is kept under it in move/status (R379). */
+    move: (dest: string, excludeProjectIds: string[], signal?: AbortSignal, onOpen?: () => void, attempt?: string) =>
+      client.ndjson<MoveLine>("POST", "/libraries/move", { body: { dest, excludeProjectIds, ...(attempt ? { attempt } : {}) }, ...(signal ? { signal } : {}), ...(onOpen ? { onOpen } : {}) }),
+    moveStatus: () => r<MoveStatus>("GET", "/libraries/move/status"),
     deleteOldCopy: (token: string) => r<{ warnings: string[]; [k: string]: unknown }>("POST", "/libraries/move/delete-old", { body: { token } }),
 
     integrity: () => r<IntegrityAnswer>("GET", "/libraries/integrity"),
     relink: (searchDir: string) => r<RelinkResult>("POST", "/libraries/relink", { body: { searchDir } }),
+    /** "Rebuild library from folder" (spec 4.3, D8). */
+    rebuildIndex: () => r<{ indexed: number; lockedProjects: number; errors: number }>("POST", "/libraries/rebuild-index"),
   };
 }
 

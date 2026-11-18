@@ -9,14 +9,20 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import { createHash } from "node:crypto";
-import { BIBLIO_FIELDS, type Annotation, type Asset, type FieldEvidence, type Source, type SourceDraft, type SourceFile } from "@ao/core";
+import { BIBLIO_FIELDS, type Annotation, type Asset, type Availability, type FieldEvidence, type FieldVerification, type Source, type SourceDraft, type SourceFile } from "@ao/core";
 
 /** Hash of an annotation's content (kind, text, colour, page label, anchors without their ids): what Annotation.externalHash records. */
-export function annotationHash(a: Pick<Annotation, "kind" | "body" | "quote" | "color" | "pageLabel" | "anchors">): string {
-  const anchors = a.anchors.map(({ id: _id, ...rest }) => rest);
-  return createHash("sha256")
-    .update(JSON.stringify([a.kind, a.body ?? null, a.quote ?? null, a.color ?? null, a.pageLabel ?? null, anchors]))
-    .digest("hex");
+export function annotationHash(a: Pick<Annotation, "kind" | "body" | "quote" | "color" | "pageLabel" | "anchors"> & { colorName?: string }): string {
+  // The sort index is ordering, not content (R195): giving an annotation one, or a newer one, must not make it read as edited here.
+  const anchors = a.anchors.map((x) => {
+    const { id: _id, ...rest } = x;
+    if ("sortIndex" in rest) delete (rest as { sortIndex?: string }).sortIndex;
+    return rest;
+  });
+  // The colour chosen here is content, but appended only when present: every hash made before it existed stays as it was.
+  const parts: unknown[] = [a.kind, a.body ?? null, a.quote ?? null, a.color ?? null, a.pageLabel ?? null, anchors];
+  if (a.colorName) parts.push(a.colorName);
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }
 
 /** Whether an imported annotation is still as it was imported (nobody edited it here). */
@@ -44,6 +50,48 @@ export interface MergeRecord {
   addedMergedKeys?: string[];
   /** Updates (R72): fields kept because they were changed after the last import (JSON pointers). */
   kept?: string[];
+  /**
+   * Task Z5: the source's availability as this change found it and as it left it (a mark "gone from Zotero", or
+   * its removal when the item came back). Undo puts `before` back while the availability is still `after`.
+   */
+  availability?: MarkRecord;
+  /**
+   * Task Z6: fields an update put in conflict (changed in Zotero and here): each field's verification entry before
+   * (absent: none) and after, and the evidence of Zotero's value it added. Undo puts `before` back and takes the
+   * evidence off while the entry is still `after`; when the researcher has decided it since (or a later batch changed
+   * it), both are kept and reported. The value here was never changed, so undo never touches it.
+   */
+  conflicts?: Array<{ path: string; before?: FieldVerification; after: FieldVerification; evidence: FieldEvidence[] }>;
+  /** Task Z6: collections an update put the source in (memberships new in Zotero); undo takes them off while still there. */
+  addedCollectionIds?: string[];
+  /** R236 a: fields Zotero cleared that were kept here, with the evidence that notes the clearing; undo takes it off. */
+  clearedKept?: Array<{ path: string; evidence: FieldEvidence[] }>;
+  /**
+   * R236 d (R38): fields the update filled whose entry said `user-confirmed` for a value the researcher's own evidence
+   * no longer matches: the entry before and the fresh one after (absent: none). Undo puts `before` back with the value.
+   */
+  reverified?: Array<{ path: string; before?: FieldVerification; after?: FieldVerification }>;
+}
+
+/**
+ * Task Z5 (R224 b): what a mark (or the removal of one) changed, and what its undo needs without reading any other
+ * batch's journal. `marks`: the "gone from Zotero" marks under `before` (oldest first, with the batch that made each);
+ * `preMark`: the availability before any of them. Undo puts back the newest of `marks` whose batch still stands, or,
+ * when every one of them is undone, `preMark`; so a mark whose own batch was undone never comes back. Records made
+ * before R224 have neither: their undo puts back `before`.
+ */
+export interface MarkRecord {
+  before: Availability;
+  after: Availability;
+  preMark?: Availability;
+  marks?: Array<{ batchId: string; after: Availability }>;
+}
+
+/** What undoing a MarkRecord puts back, given which batches are undone (R224 b). */
+export function markUndoTarget(a: MarkRecord, undone: (batchId: string) => boolean): Availability {
+  if (!a.marks) return a.before;
+  const live = [...a.marks].reverse().find((m) => !undone(m.batchId));
+  return live ? live.after : (a.preMark ?? a.before);
 }
 
 type Src = SourceFile["source"];
@@ -132,7 +180,19 @@ export function revertMerge(
   rec: MergeRecord,
   at: string,
   actor: string,
-): { next: SourceFile; removed: Asset[]; kept: string[]; keptAnnotations: string[]; changed: boolean } {
+  /** Z5 (R224 b): whether a batch is undone (a mark it made is then never put back). Default: none is. */
+  undone: (batchId: string) => boolean = () => false,
+): {
+  next: SourceFile;
+  removed: Asset[];
+  kept: string[];
+  keptAnnotations: string[];
+  keptAvailability: boolean;
+  /** Task Z6: conflicts taken off (their entries are to be resolved "undone"), and those the researcher decided since (kept). */
+  conflictsReverted: string[];
+  keptConflicts: string[];
+  changed: boolean;
+} {
   const ids = new Set(rec.addedAssetIds);
   // Derived assets made from a removed original (its viewing proxy, R85 I1) go with it.
   for (const a of cur.assets) if (a.derivation?.parents.some((p) => ids.has(p))) ids.add(a.id);
@@ -149,7 +209,35 @@ export function revertMerge(
   }
   const dropTags = new Set((rec.addedTagIds ?? []).filter((t) => source.tagIds.includes(t)));
   if (dropTags.size) source = { ...source, tagIds: source.tagIds.filter((t) => !dropTags.has(t)) };
+  // Task Z6: memberships the update added (new in Zotero) come off while the source is still in them.
+  const dropCollections = new Set((rec.addedCollectionIds ?? []).filter((c) => source.collectionIds.includes(c)));
+  if (dropCollections.size) source = { ...source, collectionIds: source.collectionIds.filter((c) => !dropCollections.has(c)) };
   const drop = new Set(rec.addedEvidence.filter((e) => reverted.has(e.field)).map((e) => JSON.stringify(e)));
+  // Task Z6: a conflict the update raised is taken off (the verification entry before it back, Zotero's value's
+  // evidence off) while its entry is still the one written; one the researcher decided since is kept, with its evidence.
+  let verification = cur.verification;
+  const conflictsReverted: string[] = [];
+  const keptConflicts: string[] = [];
+  for (const c of rec.conflicts ?? []) {
+    if (isDeepStrictEqual(verification[c.path], c.after)) {
+      const { [c.path]: _off, ...rest } = verification;
+      verification = c.before ? { ...rest, [c.path]: c.before } : rest;
+      for (const e of c.evidence) drop.add(JSON.stringify(e));
+      conflictsReverted.push(c.path);
+    } else keptConflicts.push(c.path);
+  }
+  // R236 a: the note that Zotero cleared a field comes off (the value here was never touched).
+  for (const c of rec.clearedKept ?? []) for (const e of c.evidence) drop.add(JSON.stringify(e));
+  const clearedOff = (rec.clearedKept ?? []).some((c) => c.evidence.some((e) => cur.fieldEvidence.some((x) => JSON.stringify(x) === JSON.stringify(e))));
+  // R236 d: a field whose value this undo put back gets back the entry it had (user-confirmed), while the entry is
+  // still the one the update gave it.
+  let reverifiedBack = false;
+  for (const r of rec.reverified ?? []) {
+    if (!reverted.has(r.path) || !isDeepStrictEqual(verification[r.path], r.after)) continue;
+    const { [r.path]: _x, ...rest } = verification;
+    verification = r.before ? { ...rest, [r.path]: r.before } : rest;
+    reverifiedBack = true;
+  }
   // Annotations: added ones go and updated ones are put back — unless edited here since (kept, R74 M3).
   const keptAnnotations: string[] = [];
   const annIds = new Set<string>();
@@ -159,10 +247,16 @@ export function revertMerge(
     else keptAnnotations.push(a.id);
   }
   const restore = new Map<string, Annotation>();
+  // Taking back only a back-filled sort index (R196) is not a modification of the source.
+  let contentRestored = false;
+  const withoutSortIndex = (a: Annotation) => ({ ...a, anchors: a.anchors.map((x) => (x.kind === "pdf" ? { ...x, sortIndex: undefined } : x)) });
   for (const u of rec.updatedAnnotations ?? []) {
     const now = cur.annotations.find((a) => a.id === u.after.id);
     if (!now) continue;
-    if (isDeepStrictEqual(now, u.after)) restore.set(now.id, u.before);
+    if (isDeepStrictEqual(now, u.after)) {
+      restore.set(now.id, u.before);
+      if (!isDeepStrictEqual(withoutSortIndex(u.before), withoutSortIndex(u.after))) contentRestored = true;
+    }
     else keptAnnotations.push(now.id);
   }
   // Merged Zotero keys the merge added come off again (R76: on the source file, not provenance).
@@ -173,16 +267,34 @@ export function revertMerge(
     const left = zotero.filter((k) => !dropKeys.has(k));
     mergedExternalKeys = left.length ? { ...others, zotero: left } : Object.keys(others).length ? others : undefined;
   }
+  // Task Z5: the availability this change wrote goes back to the one before, while it is still the one written
+  // (a later batch or the researcher may have changed it since: then it is kept, and reported). Not a modification
+  // of the source: the mark itself did not mark it modified.
+  // R224: it goes back to the newest mark still standing (or to the availability before every mark); one that already
+  // holds what this undo would put back (an undo run again, or a later batch that gave it back) is left, not reported.
+  let availabilityRestored = false;
+  let keptAvailability = false;
+  if (rec.availability) {
+    const target = markUndoTarget(rec.availability, undone);
+    if (isDeepStrictEqual(source.availability, rec.availability.after)) {
+      if (!isDeepStrictEqual(target, source.availability)) {
+        source = { ...source, availability: target };
+        availabilityRestored = true;
+      }
+    } else if (!isDeepStrictEqual(source.availability, target)) keptAvailability = true;
+  }
   const droppedAnnotations = annIds.size > 0 || restore.size > 0;
   const droppedPending = pendingLeft.length !== (cur.pendingProxies ?? []).length;
-  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || droppedAnnotations || dropKeys.size > 0 || droppedPending;
+  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || dropCollections.size > 0 || droppedAnnotations || dropKeys.size > 0 || droppedPending || availabilityRestored || conflictsReverted.length > 0 || clearedOff || reverifiedBack;
   const { mergedExternalKeys: _m, pendingProxies: _p, ...base } = cur;
   return {
     next: {
       ...base,
       ...(mergedExternalKeys ? { mergedExternalKeys } : {}),
       ...(pendingLeft.length ? { pendingProxies: pendingLeft } : {}),
-      source: changed ? { ...source, modifiedAt: at, modifiedBy: actor } : source,
+      verification,
+      // Taking a conflict off alone is not a modification of the source (raising it was not one either).
+      source: changed && (contentRestored || removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || dropCollections.size > 0 || annIds.size > 0 || dropKeys.size > 0 || droppedPending) ? { ...source, modifiedAt: at, modifiedBy: actor } : source,
       assets: cur.assets.filter((a) => !ids.has(a.id)),
       // An annotation anchored in a removed asset goes with it.
       annotations: cur.annotations
@@ -194,6 +306,9 @@ export function revertMerge(
     removed,
     kept,
     keptAnnotations,
+    keptAvailability,
+    conflictsReverted,
+    keptConflicts,
     changed,
   };
 }
