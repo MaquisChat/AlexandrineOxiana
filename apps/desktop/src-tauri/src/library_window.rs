@@ -2195,6 +2195,11 @@ fn store_can_stay() -> bool {
 /// tried again a few times.
 #[cfg(target_os = "macos")]
 fn remove_data_stores(app: &tauri::AppHandle) -> bool {
+    // R457: WebKit first (`start_webkit`); where it could not be started, nothing is asked of it and
+    // the emptying counts as failed, as any other failure of it does.
+    if !start_webkit(app) {
+        return false;
+    }
     tauri::async_runtime::block_on(async {
         let Ok(ids) = app.fetch_data_store_identifiers().await else { return false };
         let mut all = true;
@@ -2211,6 +2216,44 @@ fn remove_data_stores(app: &tauri::AppHandle) -> bool {
         }
         all
     })
+}
+
+/// Starts WebKit in this process, once, before `WKWebsiteDataStore`'s class methods are used (R457):
+/// obtains the default data store on the main thread and waits for that (at most 10 s). True when
+/// WebKit has been started. Never on the main thread (it waits for it).
+///
+/// Without it the first start crashed (Mac build 6): EXC_BAD_ACCESS at 0x30 on the queue
+/// com.apple.WebKit.WebsiteDataStoreIO, in WTF::RunLoop::dispatch <- WebsiteDataStore::fetchAllDataStoreIdentifiers.
+/// The store is emptied at start-up before the service and the main window exist (so that a sign-in
+/// never outlives a forced quit), so no web view has started WebKit yet and its answer went to a
+/// main run loop that did not exist; `+defaultDataStore` runs WebKit's initialisation.
+#[cfg(target_os = "macos")]
+fn start_webkit(app: &tauri::AppHandle) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.load(Ordering::SeqCst) {
+        return true;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let posted = app.run_on_main_thread(move || {
+        let started = if let Some(mtm) = objc2::MainThreadMarker::new() {
+            // SAFETY: on the main thread, as the marker proves; the method takes nothing and returns
+            // the shared default store, retained, released again here on the same thread.
+            let _store = unsafe { objc2_web_kit::WKWebsiteDataStore::defaultDataStore(mtm) };
+            true
+        } else {
+            false
+        };
+        let _ = tx.send(started);
+    });
+    if posted.is_err() {
+        return false;
+    }
+    let started = rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false);
+    if started {
+        STARTED.store(true, Ordering::SeqCst);
+    }
+    started
 }
 
 /// Elsewhere the window's store is ephemeral: there is nothing to remove.
