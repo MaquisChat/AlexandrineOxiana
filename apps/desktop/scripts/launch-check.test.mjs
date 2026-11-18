@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { appProcesses, capLines, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
+import { appProcesses, capLines, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -650,5 +650,40 @@ describe("the sign-in window's probe says how far it got, not only by navigating
     const events = await runProbe("http://127.0.0.1:40125/page", { invoke: (cmd) => (cmd === "open_library_window" ? Promise.resolve(true) : Promise.reject(new Error("boom"))) });
     assert.equal(events[2], "progress /1-allowed");
     assert.equal(events[3], "progress /2-error");
+  });
+});
+
+describe("the shell's trace of the sign-in window (Task MAC7)", () => {
+  const LINES = [
+    "AO_SHELL_SERVICE pid=12 port=4000 shell=11",
+    "AO_SHELL_LIBRARY opened",
+    "AO_SHELL_LIBRARY_TRACE navigation https://127.0.0.1:40125/sign-in allowed",
+    "something else",
+    "AO_SHELL_LIBRARY_TRACE address after 10 s: none (WKWebView URL is nil)",
+    "AO_SHELL_LIBRARY_TRACE fallback: no page started in 10 s; the shell opens the check's page",
+  ];
+
+  it("is not read as a state of the window (the 'changed nothing' item counts those)", () => {
+    for (const l of LINES.filter((l) => l.startsWith("AO_SHELL_LIBRARY_TRACE"))) assert.equal(parseShellLine(l), null, l);
+  });
+
+  it("is picked out of the shell's output, and the fallback is told", () => {
+    const t = libraryTrace(LINES);
+    assert.deepEqual(t.lines, [
+      "navigation https://127.0.0.1:40125/sign-in allowed",
+      "address after 10 s: none (WKWebView URL is nil)",
+      "fallback: no page started in 10 s; the shell opens the check's page",
+    ]);
+    assert.equal(t.fallback, true);
+    assert.deepEqual(libraryTrace(["AO_SHELL_LIBRARY_TRACE page-load started http://127.0.0.1:40125/page"]), { lines: ["page-load started http://127.0.0.1:40125/page"], fallback: false });
+    assert.deepEqual(libraryTrace([]), { lines: [], fallback: false });
+  });
+
+  it("the item fails when the probe got to the check's page only through the shell's fallback", () => {
+    const p = libraryProbeProblems(LIBRARY_GOOD, { fallback: true });
+    assert.equal(p.length, 1);
+    assert.match(p[0], /only through the shell's fallback/);
+    assert.deepEqual(libraryProbeProblems(LIBRARY_GOOD, { fallback: false }), []);
+    assert.deepEqual(libraryProbeProblems(null, { fallback: true }), ["the sign-in window's probe reported nothing", "no page started in the sign-in window: the shell opened the check's page itself (its fallback), and the probe reported nothing even there"]);
   });
 });
