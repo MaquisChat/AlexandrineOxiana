@@ -342,7 +342,14 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 **It is merged.** You asked me to check and merge. `main` now holds everything built so far, and its files are identical to the branch that was verified.
 
-**There is no new Mac download yet; keep using build 4.** Build 5 was built, and then GitHub's start-up check found that the app crashed within two seconds of starting on a Mac. The cause is found and mended: at every start the app asked Apple's web engine to clear the sign-in window's saved data before the web engine had been started. With that mended the app starts on GitHub's Mac and passes every check but one: the check that a web page shown in the sign-in window cannot reach anything of the app could not complete on a Mac (its test page sent no report). Until that check passes, GitHub does not publish the download. The Mac fixes are on the working branch, not yet on `main`. The checklist in part 4 is for the new build when it exists.
+**Your new Mac build exists: build 8.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. It passed every start-up check on GitHub's Mac, in both the debug app and the release app from the disk image.
+
+- **Where:** GitHub → Actions → "Desktop (macOS)" → run 10 → Artifacts → `alexandrine-oxiana-macos-apple-silicon` (209 MB). The browser extension is beside it. GitHub keeps both until 18 December 2026. Direct link to the run: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/44271123395
+- **Use only run 10.** Runs 6, 8 and 9 also show a download of the same name, but those builds failed their checks: two crash at start-up, and the third lacks the last check's proof.
+- **What it took.** Build 5 crashed within two seconds of starting on a Mac: at every start the app asked Apple's web engine to clear the sign-in window's saved data before the web engine had been started. That is mended. One check then could not complete on a Mac, the one proving that a web page shown in the sign-in window cannot reach anything of the app; its method relied on an error page that only Linux shows. With the method mended the check passed: on a Mac too, every attempt by such a page was refused.
+- **The checklist in part 4 is for this build.**
+- **These Mac fixes are on the working branch, not yet on `main`.** They go to `main` when you say so.
+- **One thing to know when you try "Get through my library" (FR-715):** on a Mac, if your library's site cannot be loaded (no network, a wrong address, the site down), the sign-in window stays blank with no message. Deciding what it should say is on the list.
 
 **Before you import again:** undo the import that stopped when the disk filled, then import again with enough free space, or choose "leave the files where they are".
 
