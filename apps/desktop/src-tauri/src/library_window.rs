@@ -2147,11 +2147,14 @@ pub mod library_probe {
         report_address(&std::env::var(SWITCH).ok()?)
     }
 
-    /// The probe with its configuration: the report address and the check's own page beside it.
+    /// The probe with its configuration: the report address and the check's own page beside it, and
+    /// (Task MAC7) where it says how far it got (`/progress/<step>`, the same server).
     pub fn script(report: &Url) -> String {
         let mut page = report.clone();
         page.set_path("/page");
-        let cfg = serde_json::json!({ "report": report.as_str(), "page": page.as_str() });
+        let mut progress = report.clone();
+        progress.set_path("/progress");
+        let cfg = serde_json::json!({ "report": report.as_str(), "page": page.as_str(), "progress": progress.as_str() });
         SCRIPT.replace("__LIBRARY_PROBE_CONFIG__", &cfg.to_string())
     }
 
@@ -4797,7 +4800,8 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         assert_eq!(r.as_str(), "http://127.0.0.1:40125/report");
         let s = script(&r);
         assert!(!s.contains("__LIBRARY_PROBE_CONFIG__"));
-        assert!(s.contains(r#"{"page":"http://127.0.0.1:40125/page","report":"http://127.0.0.1:40125/report"}"#), "{s}");
+        // Task MAC7: and where it says how far it got (`/progress/<step>`), on the same server.
+        assert!(s.contains(r#"{"page":"http://127.0.0.1:40125/page","progress":"http://127.0.0.1:40125/progress","report":"http://127.0.0.1:40125/report"}"#), "{s}");
         // The main window's probe opens the sign-in window at an https address of the same port.
         assert_eq!(open_address(&r), "https://127.0.0.1:40125/sign-in");
         assert!(window_address(&open_address(&r)).is_some());

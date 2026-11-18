@@ -599,3 +599,56 @@ describe("the report server tells what it saw (Task MAC7)", () => {
     ]);
   });
 });
+
+describe("the sign-in window's probe says how far it got, not only by navigating (Task MAC7)", () => {
+  const CFG = { report: "http://127.0.0.1:40125/report", page: "http://127.0.0.1:40125/page", progress: "http://127.0.0.1:40125/progress" };
+  /** Runs the probe in a stand-in page; resolves with what it fetched and where it navigated. */
+  const runProbe = async (href, { invoke = () => Promise.reject(new Error("command not allowed")) } = {}) => {
+    const vm = await import("node:vm");
+    const events = [];
+    let navigated;
+    const done = new Promise((r) => (navigated = r));
+    const u = new URL(href);
+    const location = { href, protocol: u.protocol, origin: u.origin, replace: (to) => (events.push(`navigate ${to.split("?")[0]}`), navigated()) };
+    const window = { location, __TAURI_INTERNALS__: { invoke, transformCallback: () => 1 } };
+    window.top = window;
+    // The probe's own timers, cleared when it is done (its limits would otherwise hold the test).
+    const timers = [];
+    const later = (fn, ms) => {
+      const t = setTimeout(fn, ms);
+      timers.push(t);
+      return t;
+    };
+    const fetch = (to, opts) => {
+      if (String(to).startsWith(CFG.progress)) events.push(`progress ${String(to).slice(CFG.progress.length)}${opts?.mode === "no-cors" ? "" : " (not no-cors)"}`);
+      return Promise.reject(new Error("unreachable"));
+    };
+    assert.ok(LIBRARY_PROBE_JS.includes("__LIBRARY_PROBE_CONFIG__"));
+    vm.runInNewContext(LIBRARY_PROBE_JS.replace("__LIBRARY_PROBE_CONFIG__", JSON.stringify(CFG)), { window, document: { readyState: "complete", addEventListener() {} }, fetch, setTimeout: later, clearTimeout, navigator: {} });
+    await Promise.race([done, new Promise((r) => later(r, 5000))]);
+    for (const t of timers) clearTimeout(t);
+    return events;
+  };
+
+  it("in an outside page: when its script runs, when it starts, after each attempt, after the raw attempts and just before it navigates", async () => {
+    const events = await runProbe("http://127.0.0.1:40125/page");
+    const n = Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).length;
+    assert.deepEqual(events.slice(0, 2), ["progress /script-http", "progress /start"]);
+    assert.deepEqual(events.slice(2, 2 + n), Array.from({ length: n }, (_, i) => `progress /${i + 1}-denied`));
+    assert.equal(events[2 + n], "progress /raw");
+    assert.match(events[3 + n], /^progress \/report-\d+$/);
+    assert.equal(events[4 + n], `navigate ${CFG.report}`);
+    assert.equal(events.length, 5 + n);
+  });
+
+  it("in an error page: that it ran there, and that it goes on to the check's page", async () => {
+    const events = await runProbe("about:blank");
+    assert.deepEqual(events, ["progress /script-about", "progress /error-page", `navigate ${CFG.page}`]);
+  });
+
+  it("names each attempt by its outcome (allowed, denied, error; 'no answer' for one that waited out its limit)", async () => {
+    const events = await runProbe("http://127.0.0.1:40125/page", { invoke: (cmd) => (cmd === "open_library_window" ? Promise.resolve(true) : Promise.reject(new Error("boom"))) });
+    assert.equal(events[2], "progress /1-allowed");
+    assert.equal(events[3], "progress /2-error");
+  });
+});
