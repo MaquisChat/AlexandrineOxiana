@@ -1,5 +1,5 @@
 {
-  "request": 4,
+  "request": 5,
   "architectures": "apple-silicon",
-  "note": "Build 3 plus the three fixes made after the owner's hands-on tests found no errors: the extension remembers the downloader choice (D18), a conflict found by a later check enters the review queue (D19), the audit names the confirmed field (D20). Requested after GitHub's run 206 was green."
+  "note": "Build 5 (the owner's app is build 4, Phase 1 only): the first Mac build with the PDF reader and highlights, Zotero account sync, cloud-drive folders, Find and acquire, the final review's fixes (the import's total, the import stopped by a full disk, the title conflicts), the suggested library folder with the free space shown, and the copy fault found by GitHub's run 269 (a copy whose source fails at once could hang). Requested with the merge to main, after GitHub's run 271 of this code was green and the verification FR5/FR5b passed."
 }
