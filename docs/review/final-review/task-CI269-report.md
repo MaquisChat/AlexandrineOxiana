@@ -54,3 +54,71 @@ A 30-minute limit per row is not needed: the slowest passing row at CI took 188 
 ## Uncertain
 - I could not reproduce the natural race here without the delay. The CI identification rests on the identical stack plus the deterministic reproduction.
 - The service has no `uncaughtException` handler (grep of `apps/library-service/src`), so I infer it would crash. I did not run the service to see it.
+
+## The fix (R454)
+
+Branch `ci-find-runner-flake` (worktree `.claude/worktrees/ci-flake`). Three commits, not pushed:
+
+- `c4644c8` — **(a, b, c) `copyFileAtomic`** (`packages/library/src/fs/atomic.ts`).
+  - The temp file is opened and its mode applied first, in one try. If that fails, both handles (`fh`, `srcFh`) are closed and the temp file is removed; it is removed only when this call created it.
+  - Only then are the streams made. Every listener is attached with no `await` before the `for await`, and `raw` always has an error listener.
+  - The catch also closes `srcFh`.
+  - The opening comment now states the rule, and that an `await` there breaks it.
+- `e53c0ee` — **(d) harness** (`packages/library/src/repo/lock-mid-read.test.ts`).
+  - Every reading is raced against a 120 s limit (`READ_MS`, `hangLimit()`). With a lock, the clock starts when the lock lands; without one, it starts with the reading.
+  - It covers the base, locked-from-start, lock-point and after-unlock readings.
+  - A hang fails the row at once: "`<row>`: the reading did not end within 120 s after the lock landed at opening N: a hang".
+  - `ROW_MS` is unchanged.
+- `c563bd3` — **(e) two mends of the same shape.**
+  - `extract/zip.ts` `extractArchive` with `sparse` (a restore): the sparse target is opened before the entry's stream. yauzl pipes that stream into the inflater at once.
+  - `export/backup.ts` `writeZip`: the temp file is opened before the zip is built. yazl starts reading files as they are added.
+
+### Tests, each seen first on the old code
+- **`src/fs/atomic.test.ts`**, describe "copyFileAtomic: a source that fails at once (R454)". The temp file's chmod is held until the named stream has closed. Each test checks the right rejection, no temp file, no destination, every handle `fd === -1`, and no `uncaughtException`/`unhandledRejection` (process listeners).
+  - A decode failing on its first bytes: FAILED first (hang plus uncaught).
+  - A missing source with a mode: FAILED first (hang plus uncaught `ENOENT`).
+  - A transform that fails at once: passed on the old code too. The transform is applied after the old await, so it is a regression guard.
+  - A chmod that itself fails (with `noFollow` plus `decode`, so 2 handles): passed on the old code too, a guard.
+- **`src/export/project-export-read-fails.test.ts`** (my five CI-269 tests moved here and renamed; the `.ci269` file is gone). Cases: a lock at the decrypt opening, another key, damage, a missing file. All 4 FAILED first (hang plus uncaught). Each now ends: refused as locked, or `ExportFailedError`; nothing in the destination folder; nothing uncaught.
+- **`src/extract/zip.test.ts`** (new). A corrupt deflated entry, sparse extraction, with the target's open held until the entry stream emitted its error (seen through `emit`, not as a listener). It FAILED first with an uncaught `invalid block type`; it is now refused as `zip-invalid`.
+- **`src/export/backup-read-fails.test.ts`** (new). A file is deleted after the snapshot (the `backupSeams.afterSnapshot` seam), and the temp file's open is held until the zip reported the error. It FAILED first with an uncaught `ENOENT` plus a hang; it now ends.
+- **(d) shown:** with the old `copyFileAtomic` and the 30 ms delay put back temporarily, the export row failed in 136 s: "exportProjectOpenFormats: the reading did not end within 120 s after the lock landed at opening 14: a hang". Before, it took 30 min.
+
+### (e) Every place that makes a file stream (non-test; packages/library, packages/core, apps/library-service, apps/cli)
+
+| file:line | verdict | why |
+|---|---|---|
+| fs/atomic.ts:226 (`createReadStream`, `srcFh.createReadStream`, `.pipe`) | mended (a) | the await on the chmod was between making the stream and listening to it |
+| export/project-export.ts:398, :435 | mended via (a) | `decode` through `copyFileAtomic` |
+| repo/mutate.ts:273/276/278 | mended via (a) | `copyFileAtomic` with `decode`/`transform` |
+| worker-client.ts:518, :908, :914 | mended via (a) | `copyFileAtomic` |
+| import/proxies.ts:334 | mended via (a) | `copyFileAtomic` |
+| repo/txn.ts:145, reconnect.ts:1110, move.ts:606 | mended via (a) | `copyFileAtomic` with a mode |
+| extract/zip.ts:301 (sparse) | **mended** | `await sparseWriter(target)` was evaluated inside `pipeline`'s arguments, after yauzl had set the entry reading |
+| export/backup.ts:790 (`pipeline`, yazl) | **mended** | `await fsp.open(tmp)` came after the zip was built (lazy reads start) and before `zip.once("error")` |
+| export/backup.ts:764 | safe | the lazy getter attaches `open`/`error` synchronously |
+| export/backup.ts:507, repo/sources.ts:363, import/common.ts:53, import/zotero-web.ts:622, :1322, reconnect.ts:134 | safe | `for await` straight on the new stream |
+| reconnect.ts:88–100 (`hashOf`) | safe | pipe, the forwarding listener and the `for await` are synchronous together |
+| move.ts:262 | safe | listeners chained on creation |
+| import/sqlite-copy.ts:91 | safe | both streams made inside `pipeline`'s arguments, no await |
+| repo/watch-register.ts:230 | safe | a handle stream (no open, no read until consumed); `createInterface` and `for await` follow synchronously |
+| find/queue-store.ts:411 | safe | a handle stream, consumed at once by `yield*` |
+| find/queue-store.ts:741, asset-content.ts:141, crypto/random-access.ts:162, library-service routes/documents.ts:112 | safe | `Readable.from` over memory or a generator: nothing runs until it is read |
+| find/fetch-file.ts:422–424, import/zotero-web.ts:599 | safe | an undici body that fails is given undici's own no-op error listener (api-request.js `onError`), and `pipeline` on an errored stream rejects. The write stream is made inside the arguments |
+| library-service media.ts:508 | listed | `await hooks.beforeSend()` sits between `rest.pipe(out)` and `reply.send(out)`, and a `stop` meanwhile would `out.destroy(err)` with no listener. `beforeSend` is a test-only seam (`mediaBeforeSend`, server option), so production has no await. Moving it would change what the tests that use it simulate, so I left it |
+
+There are no file streams in `packages/core/src` or `apps/cli/src`.
+Count: 2 mended directly, plus `copyFileAtomic` (a) covering its 13 call sites; 18 safe rows; 1 listed.
+
+(f) FR-711, the service's last handler: listed, not built.
+
+### Runs (each at nice 10)
+- `vitest run src/fs src/export src/repo/lock-mid-read.test.ts`: 336 passed, 3 failed, 20 skipped, in 8 m 10 s. The export row passed.
+- `pnpm --filter @ao/library test`: 4385 passed, 3 failed, 73 skipped (128 files), in 11 m 25 s.
+- `pnpm --filter @ao/library-service test`: 1085 passed, 2 failed, in 3 m 32 s.
+- `pnpm -r typecheck`: clean (exit 0).
+- **All 5 failures are `CslBundleMissingError`**: "the CSL bundle is not set up". This worktree has no fetched citation styles (`pnpm fetch-csl` downloads them, which the "no installs" rule ruled out).
+  - library: `refman-participants` R379 probe, and the harness rows `exportBibliography` and `citeSources`, which fail in their unlocked base reading;
+  - service: `POST /cite` and R390 (c) `/bibliography`.
+  - None of them touches a changed file. They need a re-run where the bundle exists (the main verification, or GitHub).
+- `git status --short`: empty. Every temporary delay is out.
