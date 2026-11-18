@@ -342,7 +342,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 **It is merged.** You asked me to check and merge. `main` now holds everything built so far, and its files are identical to the branch that was verified.
 
-**Mac build 5 is requested.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. When it is ready it is on GitHub under Actions, "Desktop (macOS)", run 6. The checklist in part 4 is for this build.
+**Mac build 5 failed: there is no new download yet.** GitHub built the app and then its own start-up check failed: the app crashes within two seconds of starting on GitHub's Mac machine. Your build 4 passed the same check. Since build 4, a large part of the Mac shell is new (the sign-in window, the remembered folder access for watched folders) and had never run on a Mac. I do not yet know where it crashes; the next build attempt is set up to say. Keep using build 4 until I tell you build 5 exists. The checklist in part 4 is for build 5.
 
 **Before you import again:** undo the import that stopped when the disk filled, then import again with enough free space, or choose "leave the files where they are".
 
