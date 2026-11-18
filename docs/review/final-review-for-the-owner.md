@@ -342,7 +342,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 **It is merged.** You asked me to check and merge. `main` now holds everything built so far, and its files are identical to the branch that was verified.
 
-**Mac build 5 failed: there is no new download yet.** GitHub built the app and then its own start-up check failed: the app crashes within two seconds of starting on GitHub's Mac machine. Your build 4 passed the same check. Since build 4, a large part of the Mac shell is new (the sign-in window, the remembered folder access for watched folders) and had never run on a Mac. I do not yet know where it crashes; the next build attempt is set up to say. Keep using build 4 until I tell you build 5 exists. The checklist in part 4 is for build 5.
+**There is no new Mac download yet; keep using build 4.** Build 5 was built, and then GitHub's start-up check found that the app crashed within two seconds of starting on a Mac. The cause is found and mended: at every start the app asked Apple's web engine to clear the sign-in window's saved data before the web engine had been started. With that mended the app starts on GitHub's Mac and passes every check but one: the check that a web page shown in the sign-in window cannot reach anything of the app could not complete on a Mac (its test page sent no report). Until that check passes, GitHub does not publish the download. The Mac fixes are on the working branch, not yet on `main`. The checklist in part 4 is for the new build when it exists.
 
 **Before you import again:** undo the import that stopped when the disk filled, then import again with enough free space, or choose "leave the files where they are".
 
