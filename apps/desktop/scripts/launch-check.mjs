@@ -40,7 +40,7 @@
 // checks are skipped and say so. Everything it writes is under one temporary folder, removed at the end.
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -375,6 +375,85 @@ export function parseLsofListen(text) {
   return [...text.matchAll(/TCP (\[[^\]]+\]|[^\s:]+):(\d+) \(LISTEN\)/g)].map((m) => ({ host: m[1].replace(/^\[|\]$/g, ""), port: Number(m[2]) }));
 }
 
+// ---------- a Mac crash at start-up: where (Task MAC5) ----------
+//
+// When the shell dies on a Mac before its service is ready (scenarios A-C) or before its service
+// started (R), the check prints what can say where: the system's crash report, a debugger's
+// backtrace, and the bundle's context. Diagnostics only: nothing here changes a result or an exit
+// code, every command has a time limit, every step is wrapped, and none of it runs anywhere else
+// than on a Mac or when the check passes.
+
+/** Where macOS writes the user's crash reports (ReportCrash; the real home, not the shell's HOME). */
+export const CRASH_REPORT_DIR = join(homedir(), "Library", "Logs", "DiagnosticReports");
+const CRASH_PROCESS = "alexandrine-oxiana";
+
+/** At most `max` lines of a text, then one line saying how many were left out. */
+export function capLines(text, max) {
+  const s = String(text ?? "").replace(/\n+$/, "");
+  if (!s) return "";
+  const lines = s.split("\n");
+  if (lines.length <= max) return lines.join("\n");
+  return `${lines.slice(0, max).join("\n")}\n… (${lines.length - max} more lines not shown)`;
+}
+
+/** Whether a file in the crash-report folder is a report of the app's program (.ips; .crash on older systems). */
+export function isCrashReportOf(name, proc = CRASH_PROCESS) {
+  return name.startsWith(proc) && /\.(ips|crash)$/.test(name);
+}
+
+/** The newest crash report of the app that was not in the folder before the start (`before`), or null. */
+export function newCrashReport(before, now, proc = CRASH_PROCESS) {
+  const seen = new Set(before);
+  // The names end with the time of the crash (…-YYYY-MM-DD-HHMMSS…): the last by name is the newest.
+  return now.filter((n) => isCrashReportOf(n, proc) && !seen.has(n)).sort().at(-1) ?? null;
+}
+
+/**
+ * An .ips crash report: one line of JSON (the header), then the body as one JSON document
+ * (`exception`, `termination`, `faultingThread`, `threads[n].frames[]`, `usedImages[]`). Null when
+ * it cannot be read; the caller then shows the file as it is.
+ */
+export function parseIps(text) {
+  const s = String(text ?? "");
+  const nl = s.indexOf("\n");
+  let body = null;
+  for (const candidate of [nl === -1 ? null : s.slice(nl + 1), s]) {
+    if (candidate === null) continue;
+    try {
+      body = JSON.parse(candidate);
+      break;
+    } catch {}
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const threads = Array.isArray(body.threads) ? body.threads : [];
+  const thread = Number.isInteger(body.faultingThread) ? body.faultingThread : threads.findIndex((t) => t?.triggered);
+  const used = Array.isArray(body.usedImages) ? body.usedImages : [];
+  const imageName = (i) => used[i]?.name ?? (used[i]?.path ? String(used[i].path).split("/").at(-1) : `image ${i}`);
+  const hex = (n) => (typeof n === "number" ? `0x${n.toString(16)}` : "?");
+  const frames = (threads[thread]?.frames ?? []).map((f) => ({
+    image: imageName(f?.imageIndex),
+    symbol: f?.symbol ?? "?",
+    offset: f?.symbolLocation !== undefined ? `+${f.symbolLocation} (image offset ${hex(f.imageOffset)})` : `image offset ${hex(f?.imageOffset)}`,
+  }));
+  const e = body.exception ?? {};
+  const t = body.termination ?? {};
+  return {
+    exception: [e.type, e.signal && `(${e.signal})`].filter(Boolean).join(" ") + [e.codes && `, codes ${e.codes}`, e.subtype && `, ${e.subtype}`].filter(Boolean).join(""),
+    termination: [[t.namespace, t.code].filter((x) => x !== undefined).join(" "), t.indicator, t.byProc && `by ${t.byProc}`].filter(Boolean).join(", "),
+    thread,
+    frames,
+    images: used.map((_, i) => imageName(i)),
+  };
+}
+
+/** The parsed report as text: at most 60 frames of the crashed thread and 40 image names. */
+export function formatCrashReport(p) {
+  const frames = p.frames.slice(0, 60).map((f, i) => `  #${i} ${f.image.padEnd(28)} ${f.symbol} ${f.offset}`);
+  if (p.frames.length > 60) frames.push(`  … (${p.frames.length - 60} more frames not shown)`);
+  const images = p.images.slice(0, 40).join(", ") + (p.images.length > 40 ? `, … (${p.images.length - 40} more)` : "");
+  return [`exception: ${p.exception || "?"}`, `termination: ${p.termination || "?"}`, `crashed thread ${p.thread}:`, ...frames, `loaded images (${p.images.length}): ${images}`].join("\n");
+}
+
 // ---------- processes (Linux /proc; ps on a Mac) ----------
 
 const ps = (args) => spawnSync("ps", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).stdout ?? "";
@@ -477,6 +556,132 @@ function processesMarkedBy(marker) {
   return allPids().filter((p) => p !== process.pid && running(p) && readProc(p, "environ").includes(marker));
 }
 
+/** The names in the crash-report folder ([] when it cannot be read). */
+function listCrashReports(dir = CRASH_REPORT_DIR) {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+/** Runs a command with a time limit and never throws: {ok, out (standard output, then error), reason}. */
+function runCapped(cmd, args, { env = process.env, timeout = 20_000 } = {}) {
+  const r = spawnSync(cmd, args, { env, timeout, killSignal: "SIGKILL", encoding: "utf8", maxBuffer: 32 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  if (r.error?.code === "ETIMEDOUT") return { ok: false, out, reason: `timed out after ${Math.round(timeout / 1000)} s` };
+  if (r.error) return { ok: false, out, reason: r.error.code === "ENOENT" ? `not found (${r.error.message})` : r.error.message };
+  if (r.status !== 0) return { ok: false, out, reason: `exit ${r.status ?? r.signal}` };
+  return { ok: true, out };
+}
+
+/** The context is printed once per run of the check. */
+const MAC_DIAG_STATE = { contextShown: false };
+
+/**
+ * Task MAC5: on a Mac, after the shell died before its service was ready, prints (a) the new crash
+ * report in the system's folder (waiting up to 40 s for it), (b) a backtrace of the program run once
+ * more under lldb with the shell's own environment and arguments (a debug build; a release build only
+ * when no report came), (c) the bundle's context, once. Returns false, doing nothing, on any other
+ * system. Never throws; never changes a result.
+ */
+export async function macCrashDiagnostics({
+  platform = process.platform,
+  app,
+  binary,
+  env,
+  args = [],
+  baseline = [],
+  debug = false,
+  reportDir = CRASH_REPORT_DIR,
+  waitMs = 40_000,
+  print = (s) => process.stdout.write(s),
+  listDir = listCrashReports,
+  readText = (p) => readFileSync(p, "utf8"),
+  run = runCapped,
+  sleep: wait = sleep,
+  now = Date.now,
+  stopApp = stopAppProcesses,
+  state = MAC_DIAG_STATE,
+} = {}) {
+  if (platform !== "darwin") return false;
+  const note = (s) => print(`launch-check: note ${s}\n`);
+  const block = (title, text) => print(`--- ${title} ---\n${text}${text.endsWith("\n") ? "" : "\n"}--- end ---\n`);
+  const step = async (what, fn) => {
+    try {
+      await fn();
+    } catch (err) {
+      try {
+        note(`${what} failed: ${err instanceof Error ? err.message : String(err)}`);
+      } catch {}
+    }
+  };
+  let reportFound = false;
+  // (a) The system's crash report: a new file, written a few seconds after the crash.
+  await step("the crash report", async () => {
+    const end = now() + waitMs;
+    let name = null;
+    for (;;) {
+      name = newCrashReport(baseline, listDir(reportDir));
+      if (name || now() >= end) break;
+      await wait(1000);
+    }
+    if (!name) {
+      note(`no new crash report of ${CRASH_PROCESS} appeared in ${reportDir} within ${Math.round(waitMs / 1000)} s`);
+      return;
+    }
+    reportFound = true;
+    const path = join(reportDir, name);
+    // Give ReportCrash a moment to finish writing the file.
+    await wait(1000);
+    const text = readText(path);
+    const parsed = parseIps(text);
+    block(`crash report: ${path}`, parsed && parsed.frames.length ? formatCrashReport(parsed) : `(not read as .ips, or no frames: the first 250 lines as they are)\n${capLines(text, 250)}`);
+  });
+  // (b) A debugger's backtrace: the debug build has symbols; the release build only when nothing else came.
+  if (debug || !reportFound) {
+    await step("lldb", async () => {
+      const r = run("lldb", ["--batch", "-o", "run", "-k", "thread backtrace all", "-k", "image list -b", "-k", "quit", "--", binary, ...args], { env, timeout: 90_000 });
+      const launchError = /^error: .*(launch|attach).*$/im.exec(r.out ?? "");
+      if (!r.ok) note(`lldb: ${r.reason}`);
+      else if (launchError) note(`lldb could not launch the program: ${launchError[0]}`);
+      if (r.out?.trim()) block(`lldb ${debug ? "(the debug build)" : "(the release build, no symbols)"}`, capLines(r.out, 400));
+    });
+    await step("stopping what lldb started", async () => {
+      const left = stopApp();
+      if (left.length) note(`stopped ${left.length} process(es) of the app left after lldb`);
+    });
+  }
+  // (c) The bundle's context, once.
+  if (!state.contextShown) {
+    state.contextShown = true;
+    const ctx = [
+      ["sw_vers", []],
+      ["plutil", ["-p", join(app, "Contents", "Info.plist")]],
+      ["codesign", ["-d", "--entitlements", "-", "-v", app]],
+      ["otool", ["-L", binary]],
+      ["ls", ["-la", join(app, "Contents", "MacOS"), join(app, "Contents", "Resources"), join(app, "Contents", "Frameworks")]],
+    ];
+    for (const [cmd, a] of ctx) {
+      await step(cmd, async () => {
+        const r = run(cmd, a, { timeout: 20_000 });
+        if (!r.ok) note(`${cmd}: ${r.reason}${cmd === "ls" ? " (a missing folder is expected)" : ""}`);
+        if (r.out?.trim()) block(`${cmd} ${a.join(" ")}`, capLines(r.out, 80));
+      });
+    }
+  }
+  return true;
+}
+
+/** The diagnostics for a run of the shell that died before its service (`startShell` noted what it needs). */
+async function diagnoseMacCrash(run, { debug }) {
+  if (!MAC) return;
+  try {
+    process.stdout.write(`launch-check: ${run.label}: the shell exited (${run.child.signalCode ?? `exit ${run.child.exitCode}`}); what macOS can say follows (Task MAC5)\n`);
+    await macCrashDiagnostics({ app: resolve(run.shell, "..", "..", ".."), binary: run.shell, env: run.env, args: run.args, baseline: run.crashBaseline, debug });
+  } catch {}
+}
+
 // ---------- running the shell ----------
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -493,6 +698,8 @@ async function until(what, ms, test) {
 
 /** Starts the shell under xvfb-run, or directly on `env.DISPLAY` when `direct` (a display the check owns). */
 function startShell(env, label, { direct = MAC, shell = SHELL } = {}) {
+  // Task MAC5: the crash reports already there, so that a crash of this run is told by a new one.
+  const crashBaseline = MAC ? listCrashReports() : [];
   const child = direct ? spawn(shell, [], { env, stdio: ["pipe", "pipe", "pipe"] }) : spawn("xvfb-run", ["-a", "-s", "-screen 0 1400x900x24", shell], { env, stdio: ["pipe", "pipe", "pipe"] });
   const lines = [];
   const events = [];
@@ -515,7 +722,7 @@ function startShell(env, label, { direct = MAC, shell = SHELL } = {}) {
   });
   child.stdin.on("error", () => {});
   const exit = new Promise((r) => child.once("exit", (code, signal) => r({ code, signal })));
-  return { child, label, lines, events, log: () => log, exit, find: (kind) => events.find((e) => e.kind === kind), all: (kind) => events.filter((e) => e.kind === kind) };
+  return { child, label, shell, env, args: [], crashBaseline, lines, events, log: () => log, exit, find: (kind) => events.find((e) => e.kind === kind), all: (kind) => events.filter((e) => e.kind === kind) };
 }
 
 function writeProbeFiles(dir) {
@@ -622,7 +829,9 @@ async function upAndProbed(run, media, problems) {
     if (failed) throw new Error(`the shell could not start: ${failed.message}`);
     if (run.child.exitCode !== null || run.child.signalCode !== null) throw new Error("the shell exited before the service was ready");
     return run.find("service");
-  }).catch((err) => {
+  }).catch(async (err) => {
+    // Task MAC5: a shell that died (not one that reported a failure) is examined on a Mac first.
+    if ((run.child.exitCode !== null || run.child.signalCode !== null) && !run.find("failed")) await diagnoseMacCrash(run, { debug: true });
     throw new Error(`${run.label}: ${err.message}\n--- the shell's output (end) ---\n${run.lines.slice(-20).join("\n")}\n${run.log().slice(-3000)}`);
   });
   const win = await until("the window", 60_000, async () => run.find("window"));
@@ -707,7 +916,9 @@ async function releaseCheck(app, problems) {
       const kids = under();
       const svc = kids.find((k) => k.cmd.includes(join(resources, "library-service", "service.mjs")));
       return svc ? { svc, kids } : null;
-    }).catch((err) => {
+    }).catch(async (err) => {
+      // Task MAC5: the release app died before its service started: what macOS can say, first.
+      if (run.child.exitCode !== null || run.child.signalCode !== null) await diagnoseMacCrash(run, { debug: false });
       // The release app says nothing by itself: show what the check could see.
       const seen = under().map((k) => `${k.pid} ${k.cmd.slice(0, 300)}`).join("\n") || "(none)";
       throw new Error(`${err.message}\n--- processes under the shell ---\n${seen}\n--- the shell's output (end) ---\n${run.lines.slice(-20).join("\n")}\n${run.log().slice(-3000)}`);
