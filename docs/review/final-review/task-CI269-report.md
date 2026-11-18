@@ -122,3 +122,14 @@ Count: 2 mended directly, plus `copyFileAtomic` (a) covering its 13 call sites; 
   - service: `POST /cite` and R390 (c) `/bibliography`.
   - None of them touches a changed file. They need a re-run where the bundle exists (the main verification, or GitHub).
 - `git status --short`: empty. Every temporary delay is out.
+
+## The small round (R455)
+- `26ccbc6` (M1, M2): `copyFileAtomic` now gives the raw stream its `'error'` listener as soon as the stream is made, before `decode` is called. The listener forwards to the decoded stream once one exists, otherwise to the hasher.
+  - Test (i), a missing source with a `decode` that throws: it failed first with an uncaught `ENOENT`. It now rejects with decode's error, leaves no temp file, and nothing is uncaught after several event-loop turns and 50 ms.
+  - Test (ii), a missing source with a pass-through decode: it rejects with `ENOENT`. With the raw listener taken away temporarily, it failed by hanging; the listener was then put back.
+- `e470217` (M3): each whole reading that has a lock point gets 300 s from its start. The failure reads "`<row>`: the reading did not end within 300 s (the lock had not landed yet | the lock landed at opening N): a hang". This 300 s message has not been shown firing.
+- **Runs:**
+  - `vitest run src/fs src/export`: 318/318 passed. The CSL failures are gone.
+  - `src/repo/lock-mid-read.test.ts` alone: 43/43 passed, in 7 m 57 s.
+  - `pnpm -r typecheck`: clean.
+  - `git status`: empty.

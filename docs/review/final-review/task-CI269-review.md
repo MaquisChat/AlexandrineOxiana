@@ -131,3 +131,64 @@ The fault is closed on every production path I could reach. Every failure I trie
 - How long the slowest single reading takes under artificial load (`nice -n 19` plus a busy loop on every core): not run. Unloaded, at load average 0.3, whole rows took 3–25 s over up to 40+ readings, which is far below 120 s.
 - The Windows behaviour in the note above.
 - GitHub's run.
+
+## Second look (R455)
+
+Scope: `git diff c563bd3..e470217`: commits 26ccbc6 (M1, M2) and e470217 (M3). Every probe is deleted, and `git status --short` is empty.
+
+**Verdict for this round: APPROVED.** M1, M2 and M3 are closed. One cosmetic point, which needs no change.
+
+### M1: the raw stream is listened to before `decode` is called (`atomic.ts:228-233`)
+
+The new listener is `r.on("error", err => (source !== undefined && source !== r ? source : hasher).destroy(err))`. It is attached before `decode` runs. It forwards to the decoded stream when there is one, and to the hasher otherwise. When `decode` throws, `source` is undefined, so the error goes to the hasher, which the catch destroys anyway.
+
+A probe (13 cases) ran against the new code. For each case it checked:
+- the promise settles exactly once (a counter);
+- the error;
+- 10 `setImmediate` turns, plus 150 ms, plus 10 more turns afterwards with nothing uncaught;
+- `/proc/self/fd` before and after;
+- the folder listing.
+
+The cases:
+- a `decode` that throws at once:
+  - with a missing source, with and without a mode;
+  - with a source that exists, with and without `noFollow`;
+- a missing source:
+  - plain;
+  - with a `decryptStream` decode;
+  - with a decode and a transform;
+- a directory as the source, with and without a decode (EISDIR on read);
+- an error on `raw` in the middle (chunk 2 of a 400 KB file), with and without a decoded stream;
+- a decoded stream that fails in the middle;
+- a decoded stream that fails first, followed by a late `destroy(err)` and then an `emit('error')` on `raw`.
+
+Result: every case rejected with the FIRST error. That is "decode boom", ENOENT, EISDIR, "raw mid", "dec mid" or "first", never "premature close" or a secondary error. The fd count was unchanged and no temp file or destination was left. Nothing was uncaught.
+
+The success path is unchanged: a 5 MB + 7 byte file, copied plain, with mode 0o640, with `noFollow`, with a decode, and with a decode and a transform, gave the same sha256 and byte count as the source.
+
+Does the listener ever send an error to the wrong stream?
+- When a decoded stream exists, `raw`'s error goes to it, and that stream's own listener passes it to the hasher, so the error stays the same object.
+- When the decoded stream is already destroyed, `destroy(err)` on it is a no-op, so the first error stands. The late-raw case shows this.
+
+### M2: do the two new tests fail without their guards?
+
+The probe was a mutant copy of `atomic.ts` with the new raw listener removed and the old `s.on("error")` put back for the no-decode case, run against a copy of `atomic.test.ts`.
+- Test (i) ("decode that throws when called") FAILS: "an uncaught exception or unhandled rejection".
+- Test (ii) ("missing source with a decode") FAILS in 5 s: `expected 'hung' to match object { code: 'ENOENT' }`.
+
+The test's own 5-second race turns the hang into a plain assertion failure, so this is not a hang until Vitest's limit. That is an acceptable and readable way for it to fail. Its `nothingLeft` checks then never run, but the failure is already clear.
+
+### M3: the 300 s limit on a whole reading (`lock-mid-read.test.ts`)
+
+- **When the timer starts and is cleared:**
+  - The timer `w` starts when `hangLimit(whole)` is called. Nothing is awaited between that call and the reading's `try`.
+  - In `cold` and in `exercise`, `clear()` clears both timers in the `finally` around the reading. So no timer outlives its reading or can fire into a later one.
+  - Readings without a lock point (`cold(row)` and the locked-from-start reading) pass no `whole`, so they create no timer.
+- **It fired once.** The probe was a copy of the harness with one extra row whose readings after the first hang before any opening. Message:
+  `PROBE hangs before its lock: the reading did not end within 300 s (the lock had not landed yet): a hang`.
+  The row failed at 300.2 s, the run ended in 5 m 7 s, and the process exited normally with no timer left behind. The getFieldwork row in the same run passed in 1.5 s.
+- **Can it fire on a merely slow machine?** Not plausibly. In my first-round run, the `backupProject` row took 25.5 s for all of its lock-point readings together, and `checkIntegrity (quick)` took 3.4 s, at load average about 0.3. One whole reading is therefore well under a second here, so 300 s leaves a margin of more than 100×. I did not measure it under an artificial full-core load.
+
+### Point (cosmetic, no change needed)
+
+- When the lock has not landed, the 300 s message gives the row but not the planned lock point. For example, `exercise` says "(the lock had not landed yet)" without `n`. Which lock point hung could only be inferred from the order of the tests. Adding "(lock point N)" would make it exact.
