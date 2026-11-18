@@ -679,10 +679,9 @@ describe("the shell's trace of the sign-in window (Task MAC7)", () => {
     assert.deepEqual(libraryTrace([]), { lines: [], fallback: false });
   });
 
-  it("the item fails when the probe got to the check's page only through the shell's fallback", () => {
-    const p = libraryProbeProblems(LIBRARY_GOOD, { fallback: true });
-    assert.equal(p.length, 1);
-    assert.match(p[0], /only through the shell's fallback/);
+  it("after the shell's fallback the probe's report decides, as without it (R458 a); no report still fails", () => {
+    assert.deepEqual(libraryProbeProblems(LIBRARY_GOOD, { fallback: true }), []);
+    assert.match(libraryProbeProblems({ ...LIBRARY_GOOD, ipc: { ...EXPECTED_LIBRARY_WINDOW_IPC, "library.take": "allowed" } }, { fallback: true }).join("\n"), /library\.take is allowed, expected denied/);
     assert.deepEqual(libraryProbeProblems(LIBRARY_GOOD, { fallback: false }), []);
     assert.deepEqual(libraryProbeProblems(null, { fallback: true }), ["the sign-in window's probe reported nothing", "no page started in the sign-in window: the shell opened the check's page itself (its fallback), and the probe reported nothing even there"]);
   });

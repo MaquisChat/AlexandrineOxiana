@@ -166,13 +166,12 @@ export const LIBRARY_PROBE_JS = readFileSync(join(REPO, "apps", "desktop", "src-
 /**
  * What is wrong with the sign-in window's probe report (empty when everything was refused).
  * `fallback` (Task MAC7): the shell opened the check's page itself because no page started in the
- * window (`libraryTrace`) — the probe's own way there did not work, which fails the item whatever
- * the report says.
+ * window (`libraryTrace`). R458 a: a report then decides exactly as without the fallback (the caller
+ * prints a note); no report even then is said with the reason.
  */
 export function libraryProbeProblems(r, { fallback = false } = {}) {
-  const how = fallback ? [`no page started in the sign-in window: the shell opened the check's page itself (its fallback), and the probe ${r && typeof r === "object" ? "reached it only through the shell's fallback" : "reported nothing even there"}`] : [];
-  if (!r || typeof r !== "object") return ["the sign-in window's probe reported nothing", ...how];
-  const out = [...how];
+  if (!r || typeof r !== "object") return ["the sign-in window's probe reported nothing", ...(fallback ? ["no page started in the sign-in window: the shell opened the check's page itself (its fallback), and the probe reported nothing even there"] : [])];
+  const out = [];
   if (r.probe !== "library") out.push("the report is not the sign-in window's probe");
   if (!/^https?:\/\//.test(String(r.origin))) out.push(`the probe ran in ${r.origin}, not in an outside page`);
   // Without Tauri's IPC object in the page nothing can be called at all: each command is "no IPC".
@@ -1076,17 +1075,20 @@ async function main() {
         );
         const trace = libraryTrace(run.lines);
         const lp = libraryProbeProblems(libraryReport, { fallback: trace.fallback });
-        if (!report(`${run.label}: a page in the sign-in window can call nothing of the app (${Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).length} commands and events, and the raw entry points; origin ${libraryReport?.origin})`, lp.length === 0, lp.length ? lp.join("; ") : `IPC object ${libraryReport.internals ? "present, every command refused" : "absent"}; raw ${JSON.stringify(libraryReport.raw)}`)) {
-          problems.push(...lp);
-          // Task MAC7: what the report server saw, and what the shell said of the window, to tell
-          // where the probe stopped.
+        const evidence = () => {
           for (const line of describeReportServer(reports.requests())) process.stdout.write(`launch-check:   ${line}\n`);
           if (!trace.lines.length) process.stdout.write("launch-check:   the shell said nothing of the sign-in window's navigations or page loads\n");
           else {
             process.stdout.write(`launch-check:   the shell said of the sign-in window (${trace.lines.length}):\n`);
             for (const line of trace.lines) process.stdout.write(`launch-check:     ${line}\n`);
           }
-        }
+        };
+        const passed = report(`${run.label}: a page in the sign-in window can call nothing of the app (${Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).length} commands and events, and the raw entry points; origin ${libraryReport?.origin})`, lp.length === 0, lp.length ? lp.join("; ") : `IPC object ${libraryReport.internals ? "present, every command refused" : "absent"}; raw ${JSON.stringify(libraryReport.raw)}`);
+        if (!passed) problems.push(...lp);
+        // R458 a: the fallback is a note, with the evidence once; a failure prints the evidence too
+        // (Task MAC7: what the report server saw and what the shell said of the window).
+        if (trace.fallback) process.stdout.write(`launch-check: note ${run.label}: the first address showed no page (as on WKWebView); the shell's test-mode fallback opened the check's page\n`);
+        if (trace.fallback || !passed) evidence();
         // What the raw attempts would have done is printed by the shell in test mode: nothing may be.
         const effects = [...(run.find("browser-opened") ? ["the researcher's browser would have been started"] : []), ...run.all("library").filter((e) => e.state !== "opened").map((e) => `the sign-in window said ${e.state}`), ...(run.all("library").length !== 1 ? [`the sign-in window was opened ${run.all("library").filter((e) => e.state === "opened").length} times`] : [])];
         report(`${run.label}: the sign-in window's attempts changed nothing (no browser started, no fetch, the window still open)`, effects.length === 0, effects.join("; ")) || problems.push(...effects);
