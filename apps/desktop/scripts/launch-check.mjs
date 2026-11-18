@@ -798,27 +798,73 @@ function report(label, ok, detail = "") {
  * an outside page for the probe to run in; `/report?r=<json>` is its report (the first one is kept).
  * Anything else, the window's first https address included (a TLS greeting this server cannot
  * read), gets no page.
+ *
+ * Task MAC7: it also keeps what it saw, so that a missing report can be told apart from a page
+ * that never loaded: each connection, each request by method and path (its query by its length
+ * only: the report's content is read above and never kept here), and each greeting it could not
+ * read as HTTP, with the time since the server started (`requests()`, `describeReportServer`).
  */
-async function startReportServer() {
+export async function startReportServer() {
   const { createServer } = await import("node:http");
+  const started = performance.now();
+  const at = () => Math.round(performance.now() - started);
+  const seen = [];
   let got;
   const server = createServer((req, res) => {
-    const r = libraryReportFrom(req.url ?? "/");
+    const raw = req.url ?? "/";
+    const q = raw.indexOf("?");
+    seen.push({ ms: at(), kind: "request", method: String(req.method).slice(0, 16), path: printable(q === -1 ? raw : raw.slice(0, q)), query: q === -1 ? 0 : raw.length - q - 1 });
+    const r = libraryReportFrom(raw);
     if (r !== undefined && got === undefined) got = r;
-    const page = r !== undefined ? "Reported." : new URL(req.url ?? "/", "http://127.0.0.1").pathname === "/page" ? "An outside page." : null;
+    const path = new URL(raw, "http://127.0.0.1").pathname;
+    // The probe's progress (`/progress/<step>`): reached is enough, nothing to read.
+    if (path.startsWith("/progress/")) {
+      res.writeHead(204, { "cache-control": "no-store" });
+      res.end();
+      return;
+    }
+    const page = r !== undefined ? "Reported." : path === "/page" ? "An outside page." : null;
     res.writeHead(page ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
     res.end(page ? `<!doctype html><title>Library probe</title><p>${page}</p>` : "");
+  });
+  server.on("connection", () => seen.push({ ms: at(), kind: "connection" }));
+  // Node's own answer to what it cannot read (400, then the connection closed), with the error noted.
+  server.on("clientError", (err, socket) => {
+    seen.push({ ms: at(), kind: "unreadable", code: printable(String(err?.code ?? "unknown")) });
+    if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    else socket.destroy();
   });
   await new Promise((done) => server.listen(0, "127.0.0.1", done));
   return {
     address: `http://127.0.0.1:${server.address().port}/report`,
     report: () => got,
+    requests: () => seen.slice(),
     close: () =>
       new Promise((done) => {
         server.close(() => done());
         server.closeAllConnections();
       }),
   };
+}
+
+/** A path or code as printed: visible ASCII only, at most 120 characters. */
+function printable(s) {
+  const t = s.replace(/[^\x21-\x7e]/g, "?");
+  return t.length > 120 ? `${t.slice(0, 120)}…` : t;
+}
+
+/** What the report server saw (`startReportServer().requests()`), as lines to print. */
+export function describeReportServer(seen) {
+  if (!seen.length) return ["the report server saw nothing (no connection at all)"];
+  const when = (ms) => `+${(ms / 1000).toFixed(3)} s`;
+  return [
+    `the report server saw ${seen.length} thing${seen.length === 1 ? "" : "s"}:`,
+    ...seen.map((e) => {
+      if (e.kind === "connection") return `  ${when(e.ms)} a connection`;
+      if (e.kind === "unreadable") return `  ${when(e.ms)} a request it could not read as HTTP (${e.code}; a TLS greeting reads so)`;
+      return `  ${when(e.ms)} ${e.method} ${e.path}${e.query ? ` (query of ${e.query} characters)` : ""}`;
+    }),
+  ];
 }
 
 /** Starts the shell and waits for the service, the window and the probe's result; returns the helpers' pids. */
@@ -1017,7 +1063,11 @@ async function main() {
           () => null,
         );
         const lp = libraryProbeProblems(libraryReport);
-        report(`${run.label}: a page in the sign-in window can call nothing of the app (${Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).length} commands and events, and the raw entry points; origin ${libraryReport?.origin})`, lp.length === 0, lp.length ? lp.join("; ") : `IPC object ${libraryReport.internals ? "present, every command refused" : "absent"}; raw ${JSON.stringify(libraryReport.raw)}`) || problems.push(...lp);
+        if (!report(`${run.label}: a page in the sign-in window can call nothing of the app (${Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).length} commands and events, and the raw entry points; origin ${libraryReport?.origin})`, lp.length === 0, lp.length ? lp.join("; ") : `IPC object ${libraryReport.internals ? "present, every command refused" : "absent"}; raw ${JSON.stringify(libraryReport.raw)}`)) {
+          problems.push(...lp);
+          // Task MAC7: what the report server saw, to tell where the probe stopped.
+          for (const line of describeReportServer(reports.requests())) process.stdout.write(`launch-check:   ${line}\n`);
+        }
         // What the raw attempts would have done is printed by the shell in test mode: nothing may be.
         const effects = [...(run.find("browser-opened") ? ["the researcher's browser would have been started"] : []), ...run.all("library").filter((e) => e.state !== "opened").map((e) => `the sign-in window said ${e.state}`), ...(run.all("library").length !== 1 ? [`the sign-in window was opened ${run.all("library").filter((e) => e.state === "opened").length} times`] : [])];
         report(`${run.label}: the sign-in window's attempts changed nothing (no browser started, no fetch, the window still open)`, effects.length === 0, effects.join("; ")) || problems.push(...effects);

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { appProcesses, capLines, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, libraryProbeProblems, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
+import { appProcesses, capLines, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -547,5 +547,55 @@ describe("Mac crash diagnostics: when and what (Task MAC5)", () => {
     const m = fakeMac({ throws: true });
     assert.equal(await macCrashDiagnostics({ ...m.deps, debug: true, readText: () => { throw new Error("x"); }, stopApp: () => { throw new Error("y"); } }), true);
     assert.match(m.out(), /launch-check: note/);
+  });
+});
+
+describe("the report server tells what it saw (Task MAC7)", () => {
+  it("logs every connection and request by method and path, the query by its length only, and a greeting it cannot read", async () => {
+    const { connect } = await import("node:net");
+    const server = await startReportServer();
+    try {
+      assert.match(server.address, /^http:\/\/127\.0\.0\.1:\d+\/report$/);
+      const base = server.address.replace(/\/report$/, "");
+      assert.equal((await fetch(`${base}/page`)).status, 200);
+      assert.equal((await fetch(`${base}/progress/start`)).status, 204);
+      const r = encodeURIComponent(JSON.stringify(LIBRARY_GOOD));
+      assert.equal((await fetch(`${base}/report?r=${r}`)).status, 200);
+      // A TLS greeting (as a web view's first https address on this port sends): not HTTP.
+      await new Promise((done) => {
+        const s = connect(Number(new URL(base).port), "127.0.0.1", () => s.write(Buffer.from([0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00])));
+        s.on("data", () => {});
+        s.on("close", done);
+        s.on("error", done);
+      });
+      const seen = server.requests();
+      const requests = seen.filter((e) => e.kind === "request").map((e) => `${e.method} ${e.path} ${e.query}`);
+      assert.deepEqual(requests, ["GET /page 0", "GET /progress/start 0", `GET /report ${`r=${r}`.length}`]);
+      assert.ok(seen.some((e) => e.kind === "connection"));
+      assert.ok(seen.some((e) => e.kind === "unreadable" && /^HPE_/.test(e.code)), JSON.stringify(seen));
+      for (const e of seen) assert.equal(typeof e.ms, "number");
+      // The query's content is never kept, only its length.
+      assert.ok(!JSON.stringify(seen).includes("library"));
+      assert.deepEqual(server.report(), LIBRARY_GOOD);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("says what it saw, or that it saw nothing", () => {
+    assert.deepEqual(describeReportServer([]), ["the report server saw nothing (no connection at all)"]);
+    const lines = describeReportServer([
+      { ms: 12, kind: "connection" },
+      { ms: 15, kind: "unreadable", code: "HPE_INVALID_METHOD" },
+      { ms: 230, kind: "request", method: "GET", path: "/page", query: 0 },
+      { ms: 1234, kind: "request", method: "GET", path: "/report", query: 2048 },
+    ]);
+    assert.deepEqual(lines, [
+      "the report server saw 4 things:",
+      "  +0.012 s a connection",
+      "  +0.015 s a request it could not read as HTTP (HPE_INVALID_METHOD; a TLS greeting reads so)",
+      "  +0.230 s GET /page",
+      "  +1.234 s GET /report (query of 2048 characters)",
+    ]);
   });
 });
