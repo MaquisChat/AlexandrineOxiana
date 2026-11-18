@@ -68,6 +68,31 @@ import { watchCacheSize, type WatchRegisterEntry } from "./watch-register.js";
 
 /** The harness's own time limit per row (the machine is shared and heavily loaded). */
 const ROW_MS = 30 * 60_000;
+/**
+ * R454 d: a single reading must end within this long (after its lock landed, when one does); one that does not is a
+ * hang, reported at once with its row and opening — the row's own limit (ROW_MS) is for a slow machine, not a hang.
+ */
+const READ_MS = 120_000;
+class ReadingHung extends Error {}
+
+/**
+ * A limit on one reading: armed (once), it rejects `race` READ_MS later with "<what> within 120 s<when>: a hang"
+ * (e.g. "<row>: the reading did not end within 120 s after the lock landed at opening 3: a hang").
+ */
+function hangLimit(): { arm(what: string, when?: string): void; race<T>(p: Promise<T>): Promise<T>; clear(): void } {
+  let fail!: (e: Error) => void;
+  const hung = new Promise<never>((_r, j) => (fail = j));
+  hung.catch(() => {});
+  let t: NodeJS.Timeout | undefined;
+  return {
+    arm(what, when = "") {
+      t ??= setTimeout(() => fail(new ReadingHung(`${what} within ${READ_MS / 1000} s${when}: a hang`)), READ_MS);
+    },
+    race: (p) => Promise.race([p, hung]),
+    clear: () => clearTimeout(t),
+  };
+}
+
 /** At most this many lock points per row, evenly spread over its openings. */
 const CAP = 40;
 
@@ -190,20 +215,25 @@ async function cold(row: Row, lockAt?: number): Promise<{ outcome: { ok: unknown
   await row.prepare?.(c);
   let openings = 0;
   let lock: Promise<void> | undefined;
+  const limit = hangLimit();
+  if (lockAt === undefined) limit.arm(`${row.name}: the reading did not end`);
   openingSeam.onOpen = () => {
     openings++;
     if (openings === lockAt) {
       lock = c.kit.repo.lockProject(c.p.id);
       lock.catch(() => {});
+      limit.arm(`${row.name}: the reading did not end`, ` after the lock landed at opening ${lockAt}`);
     }
   };
   let outcome: { ok: unknown } | { err: unknown };
   try {
-    outcome = { ok: norm(await row.run(c)) };
+    outcome = { ok: norm(await limit.race(row.run(c))) };
   } catch (err) {
+    if (err instanceof ReadingHung) throw err;
     outcome = { err };
   } finally {
     openingSeam.onOpen = undefined;
+    limit.clear();
   }
   return lock ? { outcome, openings, lock } : { outcome, openings };
 }
@@ -272,10 +302,15 @@ async function exercise(row: Row): Promise<void> {
     await c.kit.repo.lockProject(c.p.id);
     await row.prepare?.(c);
     const before = await tree(c.kit.lib.root);
+    const limit = hangLimit();
+    limit.arm(`${row.name}: the reading with the project locked from the start did not end`);
     try {
-      lockedWant = norm(await row.run(c));
+      lockedWant = norm(await limit.race(row.run(c)));
     } catch (err) {
+      if (err instanceof ReadingHung) throw err;
       lockedWant = { lockedRunFailed: String(err) };
+    } finally {
+      limit.clear();
     }
     if (row.lockedWrites) lockedDiff = new Set(treeDiff(before, await tree(c.kit.lib.root)));
     await c.kit.repo.unlockProject(c.p.id, PASS);
@@ -305,7 +340,9 @@ async function exercise(row: Row): Promise<void> {
     }
     let openings = 0;
     let lock: Promise<void> | undefined;
+    const limit = hangLimit();
     const ask = () => {
+      limit.arm(`${row.name}: the reading did not end`, ` after the lock landed at opening ${n}${pt.after ? " (a microtask after it)" : ""}${pt.mark ? " (mark)" : ""}`);
       const size = c.kit.ring.size;
       lock = c.kit.repo.lockProject(c.p.id);
       lock.catch(() => {});
@@ -339,12 +376,14 @@ async function exercise(row: Row): Promise<void> {
     };
     let outcome: { ok: unknown } | { err: unknown };
     try {
-      outcome = { ok: norm(await row.run(c)) };
+      outcome = { ok: norm(await limit.race(row.run(c))) };
     } catch (err) {
+      if (err instanceof ReadingHung) throw err;
       outcome = { err };
     } finally {
       openingSeam.onOpen = undefined;
       if (stall) clearInterval(stall);
+      limit.clear();
     }
     await new Promise((r) => setImmediate(r));
     releaseAll();
@@ -380,11 +419,16 @@ async function exercise(row: Row): Promise<void> {
     // After an unlock the same reading gives the full right result; the index holds the same rows.
     await c.kit.repo.unlockProject(c.p.id, PASS);
     await row.prepare?.(c);
+    const againLimit = hangLimit();
+    againLimit.arm(`${row.name}: the reading after the unlock did not end`, ` (lock point ${n})`);
     try {
-      const again = norm(await row.run(c));
+      const again = norm(await againLimit.race(row.run(c)));
       if (JSON.stringify(again) !== JSON.stringify(want)) problems.push(`${tag}: after the unlock, a different result: ${JSON.stringify(again).slice(0, 600)}`);
     } catch (err) {
+      if (err instanceof ReadingHung) throw err;
       problems.push(`${tag}: after the unlock, rejected with ${(err as Error)?.name}: ${(err as Error)?.message}`);
+    } finally {
+      againLimit.clear();
     }
     await relock();
     if (JSON.stringify(indexRows()) !== JSON.stringify(rowsWant)) problems.push(`${tag}: the index's rows changed: ${JSON.stringify(indexRows()).slice(0, 400)}`);
