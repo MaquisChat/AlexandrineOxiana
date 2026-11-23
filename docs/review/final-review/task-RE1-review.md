@@ -107,3 +107,93 @@ Worktree `.claude/worktrees/re-1-core`, branch `re-1-core`, 567d98d..05451c3 (si
 - The FR-425 open-time causes: a read-only library, a marker still pending at open, `audit-append-failed-at-open`. Only the in-process case was probed.
 - M7: an XMP DOI.
 - A backup whose log has been cut at the end (chain still verifying), which would drop an earlier restore's mark: whether the backup's seal or hash catches that.
+
+## Second look (R473)
+
+Scope: 05451c3..74ef3ad (RE-1c, seven commits): R473's points I2 with M1 and M5, then M2, I3, M7, M3, M4 and M6. Not looked at: I1 (FR-425) and the queue work of FR-368/420/423 (they are on `re-1b-core`).
+
+**Verdict for this round: NOT APPROVED.** One Important finding remains (S-I1). Everything else holds as ruled, apart from four Minor points.
+
+### What I ran
+All at `nice -n 10`. Every probe was deleted; `git status --short` is empty; head is 74ef3ad.
+
+- **Probes on the export** (`export/restore-governed.probeRE1`, a copy of the test file):
+  - P1: a destruction entry of the earlier form (no file list), made before the backup.
+  - P2: the project's own destruction and a bystander's verified one, at the same moment.
+  - P3: one export of a copy that has all three kinds — its own later destruction, a file left out on a verified record, and one left out on unverified records.
+  - P4: the copy's log cut at its end, so the restore entry is gone, then the library reopened.
+- **Probes on the import** (`import/attach.probeRE1`), five orders:
+  - a sidecar with the item's own title;
+  - a sidecar with an identifier only;
+  - a sidecar whose title equals the cited work's;
+  - two sidecars;
+  - no sidecar.
+- **Probes A, B and C are now part of the implementer's tests:** "probe A … three restores deep", "probe C … encrypted", "probe B's ground". With them: a restore of a restore, a file destroyed before the backup, the legacy entry (M1) and the failed log read (M2). I read each of these tests.
+- **Test files of this round**, re-run after the restart:
+  - library `restore-governed`, `attach`, `registry-notice`: 133 passed;
+  - library `move`, `profile-capture`: 107 passed;
+  - core `engine`: 140 passed;
+  - shared: 14 passed;
+  - cli `output`: 3 passed;
+  - ui `CaptureQueue`: 22 passed.
+
+### Findings
+
+**S-I1 (Important) — FR-410/618: the copy's log cut at its end, and the export states as fact what only unverified records said.**
+- Where: `packages/library/src/export/project-export.ts`, `destroyedBasis` (~:155-178) and the read through `verifiedAuditEvents`.
+- Probe P4:
+  - A copy's file was left out on a bystander's damaged log (unverified).
+  - The copy's log was cut at its last line, which is the `project.restored` entry, and the library reopened.
+  - The app knows the log was cut: integrity warning `truncated`; an `audit.anchor-mismatch` event in the log; `repo.verifyAudit(copy)` returns `{ok:false, anchored:true, alteredAt:[…]}`.
+  - Yet the chain verifies again from the reopen's head, so `verifiedAuditEvents` answers `ok`. With no restore entry left, `destroyedBasis` takes the copy for a project never restored.
+  - The notes say: **"1 file was destroyed under the project's retention rule and is not included."**
+- The first round's code did the same. But this is exactly what FR-410 exists to stop, and the app holds the evidence.
+- Direction: for these notes, take the log as intact only where `verifyAudit` says so (no recorded anchor mismatch, no cut). Otherwise use the `logNotIntact` sentence. Add a test with the end of the log cut.
+
+**S-M1 (Minor) — FR-724 is not the only inaccuracy, because the destruction is matched by its time.**
+- P1, the earlier form of the destruction entry (no `destroyedAssets`, a form real older libraries hold):
+  - That entry adds nothing to `recordedAt` (`Array.isArray` guard).
+  - A file destroyed in the original BEFORE its backup therefore reads in the copy as "It was left out when this project was restored from a backup, because a verified record in this library shows it was destroyed."
+  - That is false: `leftOut` was 0. The origin itself still says the own-rule sentence correctly.
+- P2, a match by moment:
+  - A file left out because a BYSTANDER's verified record destroyed the same bytes at the same millisecond as one of the project's own destructions is counted as "own".
+  - The result was "2 files were destroyed under the project's retention rule…", where one was another project's.
+  - In real use this needs the same millisecond. It has the same root as FR-724.
+- Direction: record the destruction's time even for the earlier form; and list FR-724 together with these two (matching by moment can name the wrong rule), or match by the destruction's own record of hashes.
+
+**S-M2 (Minor) — M1 is applied wider than the ruling.**
+- A legacy entry anywhere in the log (`countOnly`) turns every file of the copy left out on a verified record into "records the app could not verify" — including files left out by LATER restores on verified records.
+- That is safe, but the sentence is then untrue for those files. R473 M1 says "every file **that restore** left out".
+- Judged by reading.
+- Direction: limit it to the files whose `destroyedAt`/restore matches that legacy entry, or accept it and say so in the ledger.
+
+**S-M3 (Minor) — M3: a set-aside list can overwrite another.**
+- `registry.ts` `update`: when the list read again is also damaged (another process wrote a damaged list in the window), `backupIfDamaged` renames it onto the SAME `libraries.json.corrupt-<stamp>` name. The stamp is to the second, so the first copy set aside is overwritten. Its usable entries are merged first; the rest of it is lost.
+- Only with two processes in the same second. Judged by reading.
+- Direction: a unique suffix for the second set-aside copy.
+- Note: the list is read again only after a damaged list was set aside, not before every save. The ordinary race between processes is left to FR-721, as ruled.
+
+**S-M4 (Minor) — Two stray comments, cosmetic.**
+- `packages/shared/src/api/capture.ts:24`: the comment "How long a finished queue stays readable (1 hour)." now sits above `editsNotCheckedText`, not above `CAPTURE_QUEUE_KEEP_MS`.
+- `packages/ui/src/components/CaptureQueue.tsx:53`: the FR-106 comment is left above the `lead` line.
+
+### Per point
+
+| Point | Verdict | Note |
+|---|---|---|
+| I2 + M5 (four sentences) | holds, except S-I1 and S-M1 | All eight sentences (four kinds, singular and plural) match R473 I2 word for word; the plural audit-log sentence keeps "confirm it", as the implementer says. P3: own, restored-verified and restored-unverified each say their sentence once in one export; `omittedFiles` 3 is the sum. Three generations deep: each file keeps its sentence. Encrypted project: the same. A file destroyed before the backup: own-rule sentence. The copy's log damaged inside the chain: the audit-log sentence for every destroyed file. Its end cut: S-I1. |
+| M1 (legacy entry) | holds, wider than ruled (S-M2) | The test rewrites a real entry and reopens; both the export and a restore of its backup say "could not verify". |
+| M2 (failed log read) | holds | The log is read before `mkdir` and `activePartials.add`; the test makes `AuditStore.read` fail with EIO and the destination stays empty. The list of active partial folders is never touched on this path. |
+| I3 (FR-124) | holds | Own title from a sidecar: journal, volume and publisher are gone; the cited title stays as evidence (the conflict is shown); the candidate and the hint stay; `LOOKED_UP_FROM_TEXT` is not said. Two sidecars: the first, without a title, is passed over; the cited work's creators and date are dropped (the review then says "Creators is missing", which is true). A sidecar with an identifier only is not taken, so no own DOI sits beside cited details. A sidecar whose title equals the cited work's: the lookup's details stay, with the sidecar's author and `LOOKED_UP_FROM_TEXT`. I accept that, since the researcher's own record names that work. "The sidecar first" cannot happen: step 3 always runs before step 4. |
+| M7 (FR-123) | holds | "found in the file"; no old sentence left. |
+| M3 (FR-411) | holds (S-M3) | Reads wait in the turn, and no registry function calls another inside its turn (no deadlock). The comment names the command line as a second writer (FR-721). Both new tests fail without the change, by the report and by reading. |
+| M4 (FR-030) | holds | `uncertain` is checked with `bool` (fails closed). The only caller of the move request is `move.ts:481`, and no screen or test matched the old "Destination type could not be determined" prefix. A guessed kind now says "may be <plain words>", and the cloud-folder refusal is a plain sentence with no id. The backup's and restore's cloud-folder sentences still name the folder id (the implementer's deferred point, outside M4). |
+| M6 (FR-106) | holds (S-M4) | One sentence from `@ao/shared`, used by the command line, the capture queue and the report file. No old wording is left (grep). The queue summary always has parts before it, so it never reads "Finished: .". |
+
+### Broken in what was approved before
+Nothing found. FR-030's plain sentence, FR-106's count, FR-123's guard and FR-411's turn all still hold, and their tests pass.
+
+### Could only judge by reading
+- S-M2 and S-M3.
+- Two real processes racing on the libraries list (FR-721).
+- Whether a cut at the end of a BACKUP's log is caught before a restore.

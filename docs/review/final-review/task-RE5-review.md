@@ -92,3 +92,93 @@ Worktree `.claude/worktrees/re-5-service`, branch `re-5-service`, 567d98d..a307e
 - How fast the real faster-whisper worker answers a cancel. A slow cancel makes the move wait, up to `suspendTimeoutMs`, and then refuses it; the run then starts again.
 - The extension's sentences in a real browser. The e2e spec was not run.
 - That a crash during the switch never re-runs the job in the old copy (it is read-only: `move.ts` header, `MOVED.json`).
+
+## Second look (R464, R466)
+
+Worktree `.claude/worktrees/re-5b`, branch `re-5b-service`, a307e02..d4396fc (10 commits; no commit was added while I looked). Rulings read: R464, R466 and R480 (c, d). The machine restarted part-way through. I re-ran what was needed with nothing else running. All probes are deleted and `git status --short` is empty.
+
+**Verdict for this round: APPROVE WITH SMALL POINTS.** There are no Critical or Important findings. R464 (a)–(c) and R466 I1, M1–M6 are built, and each holds against probes. Three Minor points are below.
+
+### What I ran
+- The implementer's tests:
+  - `transcript-store.test.ts`: 6 passed.
+  - `capture-queues.test.ts -t lock`: 19 passed, including the two FR-370/371 tests.
+  - `Capture.test.tsx -t "lock cut"`: 4 passed.
+  - `transcription-jobs.test.ts -t "R466|FR-385"`: 5 passed.
+  - `server.test.ts -t FR-329`: 2 passed.
+- Probe `transcript-store.probeRE5.test.ts`:
+  - a crash at `between-audit` and at `torn-audit`;
+  - two transcripts of one source in a row.
+- Probe `transcription.probeRE5.test.ts`:
+  - Q1: three moves in a row while a run goes on (this is my old P1, extended);
+  - Q2: a move that the move itself refuses at its plan (the destination is not empty);
+  - Q3: a close, then a reopen whose re-run is itself moved.
+- Probe `ExtensionPairing.probeRE5.test.tsx`:
+  - V1: the service starts saving between the last poll and the code's expiry;
+  - V2: the screen is left while the code is being saved.
+
+### Findings
+
+**Minor**
+- **S1 — FR-335: the screen still says "expired" in the last poll interval of a code.**
+  - Where: `packages/ui/src/screens/ExtensionPairing.tsx:223-228`. When the countdown reaches 0, it clears the code as "expired" without asking the service.
+  - The gap: the screen only learns that the code is being saved (`confirming`) from its next status poll, every 3 s by default.
+  - Probe V1: a 28 s code, with polls every 5 s; the service turns `confirming` at 26 s. At 29 s the alert reads "The code expired and was removed from this page. Show a new code to pair."
+  - After that the pairing is saved but the screen does not learn it: the poll has stopped, and there is no result.
+  - The window is small (the last few seconds of a 5-minute code), but it breaks "never expired while saving".
+  - Direction: at 0, ask the service for the code's status once before saying "expired".
+- **S2 — FR-385 / R466 M1: a move refused at its own plan still stops the transcription, and the run then starts again from the beginning.**
+  - Probe Q2: a destination that is not empty. `executeMove` refuses it with "The library cannot be moved there." after `quiesce` has stopped the run. The worker shows `w1` cancelled, then `w2` started from scratch; the result is still stored once.
+  - R466 M1 says the stop happens when the move "actually begins (its plan accepted and confirmed)". The plan checks inside `executeMove` (destination, residency, read-only library, pending changes) run after the stop.
+  - This is rare in practice: the move screen's plan step catches most of these refusals first.
+  - Direction: run `executeMove`'s plan checks before the transcriptions are stopped, or accept this case as built.
+- **S3 — a race left in `worker-client.ts:415-418`: two re-runs of the same pending job at once.**
+  - What happens: both pass the `claimed.has` check before their own `prepare` finishes. The second then gets `ALREADY_RUNNING` from `run`, which counts as "claimed". `tell(extras, {claimed:true, error})` then marks the screen's entry for that job (the second `track` replaced the first) as **failed** while the first run is still going.
+  - The implementer found this and removed the trigger it found (the carried-on re-run, `state.ts:1596-1600`). The root cause stays.
+  - None of my probes reached it again (Q1, Q3: one uncancelled run each time, stored once). I could not prove that no other overlap of two `resumeWorkerJobs` calls exists. For example, a move refused at the second drain both restarts the stopped work and calls `resumeStoppedTranscriptions`.
+  - Direction: in `resumePending`, treat `ALREADY_RUNNING` like `NotClaimed`.
+
+### Checked and sound
+- **FR-393 — one governed change for both files.**
+  - One `store` entry with `files: [{asset, ext}]` (ids and extensions only), `changes: 2`, and its entity is the first asset. The chain verifies.
+  - The one-file entry is unchanged: `auditDetails` is added only when there are 2 or more inputs. The one-file callers (`link-capture.ts:596`, `profile-capture.ts:842`, `transcript-segments.ts:415`, and the proxy and OCR completions `repo.ts:1027,1063`) go through the same body with one input.
+  - Names: each name is added to `taken` within the change. A second transcript gets ` (2)` on both files, giving 4 versions.
+  - A crash at `between-audit` does not occur, because there is one audit event: the store completes and verifies. `torn-audit` leaves neither file. The implementer's tests cover a lock at 16 points, a failed second copy, and crashes at `before-changes`, `before-audit` and `before-marker-delete`. All of these use encrypted projects.
+  - A policy refusal is the same single policy request as before (`storeRequest`), evaluated before anything is copied; judged by reading.
+- **FR-370/371 — the count of links a lock cut.**
+  - It is counted from the queue's counters only (`total - done`, the in-flight link included, as R480 c accepted), and only for a lock. A queue already ended is not counted twice. It is kept per project and in memory only.
+  - No address is added anywhere: the count's record is a number, and the end event carries a fixed text. The implementer's test searches the record, the list, the events and the logs, after the lock and again after the in-flight download returns. The in-flight download still holds its own address until it returns; that was already so before and is said in the report.
+  - The read and the acknowledgement both answer 423 while the project is locked. The acknowledgement is not open to the extension (403) and is safe to call twice (a second call deletes nothing and answers 200).
+  - A second lock before "Got it" adds to the count. That is right: both sets of links are lost. When the wording is redone under R480 c, note that "A lock" then covers two locks.
+  - A restart of the service loses the count without saying so, as R464 b rules ("until acknowledged or the app is closed").
+  - The screen: the sentence is built in `Capture.tsx:88-92` (to be reworded under R480 c). Its status region is always mounted. "Got it" sends one request (a guard against a double click), then moves focus to the links field. A failure is said in a `role="alert"`, and the reminder stays.
+- **FR-335 (apart from S1):**
+  - once a poll sees `confirming`, the countdown and "Valid for" stop;
+  - at 60 s the slow sentence appears and the list is read exactly once, and again when the status changes;
+  - a later failure (`not-saved`) clears the status and gives the alert; a later `used` clears it too;
+  - the status region is always mounted;
+  - leaving the screen leaves no timers and makes no reads (V2: 0 reads, 0 timers).
+- **R466 I1:** every running transcription is stopped by a move, whatever started it. In Q1, three moves in a row all go through; the run is carried on each time, and in the end one uncancelled run is stored once (2 files), with no false "done". In Q3 a re-run after a close and reopen is stopped by the move and carried on.
+- **The re-run race fix (R466 I1):** a re-run that was abandoned part-way gives no continuation, and a pending job is still never left without a re-run:
+  - after a move that goes through, `adopt` → `attachWorker` re-runs everything;
+  - after a move that fails at the copy, `activate` → `attachWorker` re-runs it;
+  - after a move refused at the second drain, `resumeStoppedTranscriptions` re-runs it;
+  - after a close, the next open's `attachWorker` re-runs it, or `ensureWorker` once the media helper is back;
+  - an encrypted project's job waits for that project's unlock, as before.
+- **R466 M1:** a move refused at the first drain or at the imports does not stop the transcription (test: one run, stored once). The case the plan refuses is S2.
+- **R466 M2:** the comment at `transcriptions.ts:5-14` is true in each case it names: probes P6 and P9 of the first review, Q2 above, and the failed-copy test. R480 d accepts the split-move case as a comment only.
+- **R466 M3:** a successful read turns "unread" into "missing", which then hides once the list holds the browser. Two tests, both failing first; this closes my U1.
+- **R466 M4:**
+  - `/tools/*` get their own true sentence. `PUT /find/screen` gets the device sentence.
+  - The three routes that write nothing go through during a move. They are `your-library/derive` and `your-library/test` (both only read settings and work out an address), and `search-sources/.../test` (a fresh lookup client whose requests stay in memory; its folder is never created).
+  - Because they skip the change gate, they are not counted as changes in flight either, which is harmless.
+  - Left as before: `POST /cite` and `POST /export/refman` without `outputPath` are reads of the library and still get the move's sentence, which is true of them.
+- **R466 M5:** the extension's sentence now names what to do next ("Open the PDF in a tab again and press “Send this tab's PDF” again, or download the PDF and add it to the record in the app."). It is true for each path that gives it.
+- **R466 M6:** GET answers `running` through `jobRunningHere`. The run is taken back into the registry at its next progress, but only while its project is unlocked and in the same library, so nothing is held while it is locked. The test failed first.
+- **What I approved before still holds:** move during the store write, the encrypted move, the split move, the failed copy, and the pairing and extension items. FR-386 and FR-392 are untouched apart from M6.
+
+### Could only judge by reading
+- That each guard's test fails without it (from the implementer's report and the code).
+- How quickly the real media helper stops a job when cancelled.
+- Screen readers announcing the two new status regions.
+- Whether any overlap of two re-runs other than the one removed is still reachable (S3).
