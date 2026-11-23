@@ -47,7 +47,7 @@ export interface MediaTicketRevokeRequest {
 }
 /**
  * Why a ticket's stream stopped, when the service found the stored file not as the app stored it
- * (an encrypted chunk that fails its check: changed or damaged outside the app) (FR-217, FR-219).
+ * (its header or a chunk fails its check: changed outside the app, or damaged) (FR-217, FR-219, R467 M1).
  * A code, never a sentence: the player says it in its own words.
  */
 export const MEDIA_FILE_CHANGED = "FILE_CHANGED";

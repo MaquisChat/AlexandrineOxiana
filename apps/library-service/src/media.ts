@@ -14,9 +14,12 @@
  * project is locked, when the library is closed or moved, and when the service stops; at most 16
  * are live (the 17th is refused, 429, until one ends: evicting one silently would stop a recording
  * that is playing). Ending a ticket also ends its streams in progress.
- * A read that finds an encrypted chunk failing its check (the file changed outside the app) cuts the
- * stream (after the first byte nothing else can be sent) and marks the ticket, so its revoke answers
- * `ended: "FILE_CHANGED"` and the player can say why it stopped (FR-217, FR-219).
+ * A read that finds an encrypted file failing its check — its header or a chunk: changed outside the
+ * app, or damaged — cuts the stream (after the first byte nothing else can be sent) and marks the
+ * ticket, so its revoke answers `ended: "FILE_CHANGED"` and the player can say why it stopped
+ * (FR-217, FR-219, R467 M1). The mark outlives the ticket (a revoke in the route, the idle sweep)
+ * until it is read once, the ticket's lifetime is over, or MEDIA_TICKET_MARKS_MAX newer marks push
+ * it out; it holds the ticket's digest and why only, nothing of the file (R467 M2).
  *
  * Who may load `/media/<ticket>` (decided here, checked in server.ts before any token logic):
  *  - Host must be ours (as for every route).
@@ -79,11 +82,16 @@ interface Ticket {
   fileChanged?: boolean;
 }
 
+/** Marks of ended tickets kept at most (R467 M2): the oldest give way. */
+export const MEDIA_TICKET_MARKS_MAX = 2 * MEDIA_TICKETS_MAX;
+
 const digest = (ticket: string) => createHash("sha256").update(ticket, "utf8").digest("hex");
 
 /** The live media tickets (memory only). */
 export class MediaTickets {
   private readonly tickets = new Map<string, Ticket>();
+  /** Ended tickets whose file was found changed: digest → when the mark lapses (R467 M2). */
+  private readonly marks = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly now: () => number) {}
@@ -157,6 +165,20 @@ export class MediaTickets {
     return true;
   }
 
+  /**
+   * Ends `ticket` for its player (POST /media-tickets/revoke): whether it was live, and whether a
+   * read for it found the stored file changed — said once, also after the ticket ended (R467 M2).
+   */
+  revokeForPlayer(ticket: string): { revoked: boolean; fileChanged: boolean } {
+    this.sweep();
+    const key = digest(ticket);
+    const changed = this.tickets.get(key)?.fileChanged === true;
+    const revoked = this.revoke(ticket);
+    const marked = this.marks.has(key);
+    this.marks.delete(key);
+    return { revoked, fileChanged: changed || marked };
+  }
+
   revokeProject(projectId: string): void {
     for (const [k, t] of this.tickets) if (t.projectId === projectId) this.end(k, t);
   }
@@ -172,6 +194,7 @@ export class MediaTickets {
    */
   sweep(): void {
     const now = this.now();
+    for (const [k, until] of this.marks) if (now >= until) this.marks.delete(k);
     for (const [k, t] of this.tickets) {
       const idle = now - t.lastUsed >= MEDIA_TICKET_IDLE_MS;
       if (idle || now - t.issuedAt >= MEDIA_TICKET_LIFETIME_MS) this.end(k, t);
@@ -186,6 +209,13 @@ export class MediaTickets {
 
   private end(key: string, t: Ticket): void {
     this.tickets.delete(key);
+    if (t.fileChanged && this.now() < t.issuedAt + MEDIA_TICKET_LIFETIME_MS) {
+      this.marks.set(key, t.issuedAt + MEDIA_TICKET_LIFETIME_MS);
+      for (const k of this.marks.keys()) {
+        if (this.marks.size <= MEDIA_TICKET_MARKS_MAX) break;
+        this.marks.delete(k);
+      }
+    }
     for (const s of t.streams) {
       this.orphans.add(s);
       s.destroy(ticketEnded());
@@ -343,8 +373,8 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
     if (!isMediaTicketPath(path)) throw badRequest('"path" must be a media address (/media/…).');
     const ticket = path.slice("/media/".length);
     // FR-219: the player learns by this code that its recording stopped because the file was changed outside the app.
-    const changed = tickets.use(ticket)?.fileChanged === true;
-    return { revoked: tickets.revoke(ticket), ...(changed ? { ended: MEDIA_FILE_CHANGED } : {}) };
+    const { revoked, fileChanged } = tickets.revokeForPlayer(ticket);
+    return { revoked, ...(fileChanged ? { ended: MEDIA_FILE_CHANGED } : {}) };
   });
 
   // ---- the media route (no token: the ticket is the credential; checks in server.ts) ----
@@ -372,6 +402,8 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
     try {
       c = await openAssetContent(s.repo, t.projectId, t.sourceId, t.assetId, (a) => isMediaMime(a.mime));
     } catch (err) {
+      // R467 M1: a header that fails its check is marked like a chunk that does.
+      if (err instanceof DecryptionError || err instanceof EncryptionFormatError) t.fileChanged = true;
       tickets.revoke(ticket);
       throw err;
     }

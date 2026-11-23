@@ -17,7 +17,7 @@
  * by play or a seek and then the failure is a renewal (FR-260, R467 I1). A ticket that fails while
  * younger than that counts, so renewal cannot go on for ever.
  * Before a renewal the ended ticket is revoked, and its answer says whether the service found the
- * stored file changed outside the app (FILE_CHANGED): then the player stops at once and says so,
+ * stored file no longer as the app stored it (FILE_CHANGED): then the player stops at once and says so,
  * instead of retrying into "may be damaged" (FR-218, FR-219).
  *
  * The position is kept by the player, not read back from the element while a new `src` loads: a
@@ -99,8 +99,12 @@ function idleLifetime(t: Partial<MediaTicketResponse>): number {
   const ms = Date.parse(t.idleExpiresAt ?? "") - (Date.parse(t.expiresAt ?? "") - MEDIA_TICKET_LIFETIME_MS);
   return Number.isFinite(ms) && ms > 0 ? ms : MEDIA_TICKET_IDLE_MS;
 }
-/** The service found the file not as the app stored it (FR-218, FR-219). */
-const CHANGED = "The recording stopped: its file was changed outside the app, so it cannot be played from here. Check the verification report.";
+/**
+ * The service found the file not as the app stored it (FR-218, FR-219): it cannot tell who or what
+ * changed it, so the sentence asserts no one's act (R462 a). The player's one sentence for it.
+ */
+export const MEDIA_FILE_CHANGED_SENTENCE =
+  "The recording stopped: its file is no longer as the app stored it — it was changed outside the app, or it is damaged — so it cannot be played from here. Check the verification report.";
 
 function refusal(err: unknown, renewing: boolean): string {
   if (isProjectLocked(err)) return renewing ? "The project was locked, so the recording stopped. Unlock the project to play it again." : "The recording cannot be played while the project is locked.";
@@ -251,7 +255,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
         }
       }
       if (!live || halted) return;
-      if (changed) halt({ kind: "failed", message: CHANGED, retry: true });
+      if (changed) halt({ kind: "failed", message: MEDIA_FILE_CHANGED_SENTENCE, retry: true });
       else await attach(true);
     };
     const onTimeUpdate = (e: Event) => {

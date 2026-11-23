@@ -17,8 +17,9 @@ import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { deviceDeps, type Deps } from "@ao/library";
-import { MEDIA_TICKET_PATH, type MediaTicketResponse } from "@ao/shared";
+import { MEDIA_TICKET_IDLE_MS, MEDIA_TICKET_LIFETIME_MS, MEDIA_TICKET_PATH, type MediaTicketResponse } from "@ao/shared";
 import { tinyPng } from "../../../tests/fixtures/generate.mjs";
+import { MEDIA_TICKET_MARKS_MAX } from "./media.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -990,5 +991,53 @@ describe("a stored file found changed while it is played (FR-217, FR-219)", () =
     await tamperAt(pid, sid, aid, () => 38 + 10);
     expect((await media(t.path, { range: "bytes=10-20" })).status).toBe(409);
     expect((await revoke(t.path)).json).toEqual({ revoked: true, ended: "FILE_CHANGED" });
+  });
+
+  it("a change in the file's header (its first bytes) is marked like a change in its body (M1, R467)", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(3 * CHUNK)), "video");
+    const t = await ticket(pid, sid, aid);
+    await tamperAt(pid, sid, aid, () => 0);
+    const r = await media(t.path, { range: "bytes=0-9" });
+    expect(r.status).toBe(409);
+    const v = await revoke(t.path);
+    expect(v.json).toEqual({ revoked: false, ended: "FILE_CHANGED" });
+    expect(v.body).not.toContain(tmp);
+  });
+  it("the mark outlives the ticket's idle sweep long enough to be read once; it is bounded in time and in number (M2, R467)", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(3 * CHUNK)), "video");
+    const t = await ticket(pid, sid, aid);
+    await tamperAt(pid, sid, aid, () => 38 + 10);
+    expect((await media(t.path, { range: "bytes=10-20" })).status).toBe(409);
+    clock.ms += MEDIA_TICKET_IDLE_MS + 60_000;
+    expect(svc.state.media.live()).toBe(0);
+    expect((await revoke(t.path)).json).toEqual({ revoked: false, ended: "FILE_CHANGED" });
+    // Read once.
+    expect((await revoke(t.path)).json).toEqual({ revoked: false });
+    // In time: no ticket lives longer than its lifetime, so neither does its mark.
+    const late = await ticket(pid, sid, aid);
+    expect((await media(late.path, { range: "bytes=10-20" })).status).toBe(409);
+    clock.ms += MEDIA_TICKET_LIFETIME_MS + 60_000;
+    expect(svc.state.media.live()).toBe(0);
+    expect((await revoke(late.path)).json).toEqual({ revoked: false });
+    // In number: the oldest marks give way.
+    // (Each is swept as idle before the next, so no more than one is live at once.)
+    const first = await ticket(pid, sid, aid);
+    expect((await media(first.path, { range: "bytes=10-20" })).status).toBe(409);
+    let last = first;
+    for (let i = 0; i < MEDIA_TICKET_MARKS_MAX; i++) {
+      clock.ms += MEDIA_TICKET_IDLE_MS + 1000;
+      last = await ticket(pid, sid, aid);
+      expect((await media(last.path, { range: "bytes=10-20" })).status).toBe(409);
+    }
+    clock.ms += MEDIA_TICKET_IDLE_MS + 1000;
+    expect(svc.state.media.live()).toBe(0);
+    expect((await revoke(first.path)).json).toEqual({ revoked: false });
+    expect((await revoke(last.path)).json).toEqual({ revoked: false, ended: "FILE_CHANGED" });
   });
 });

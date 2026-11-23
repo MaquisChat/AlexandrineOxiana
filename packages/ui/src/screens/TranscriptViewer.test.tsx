@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MEDIA_TICKET_IDLE_MS } from "@ao/shared";
+import { MEDIA_FILE_CHANGED_SENTENCE } from "../components/MediaTicketPlayer";
 import { transcriptApi } from "../api/transcripts";
 import { setMedia } from "../test/media";
 import { navigate } from "../navigation";
@@ -605,7 +606,9 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     svc.state.fileChanged = true;
     fireEvent(el, new Event("error"));
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toBe("The recording stopped: its file was changed outside the app, so it cannot be played from here. Check the verification report.");
+    expect(alert.textContent).toBe(MEDIA_FILE_CHANGED_SENTENCE);
+    // R462 a: the ruled sentence, word for word.
+    expect(MEDIA_FILE_CHANGED_SENTENCE).toBe("The recording stopped: its file is no longer as the app stored it — it was changed outside the app, or it is damaged — so it cannot be played from here. Check the verification report.");
     expect(alert.textContent).not.toMatch(/may be damaged|\//);
     // No new ticket was asked for, and the ended one was let go.
     expect(svc.log.tickets).toHaveLength(1);
