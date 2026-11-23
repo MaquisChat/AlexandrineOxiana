@@ -44,7 +44,7 @@ export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
   "watched-folders-list-set-aside":
     "This computer's list of watched folders was damaged and was set aside, so some watched folders on this computer may have stopped: files put in those folders are not imported. The damaged list is kept beside the app's settings.",
   "libraries-list-set-aside":
-    "This computer's list of libraries was damaged and was set aside; the libraries it could still read are listed as before. Your libraries themselves are untouched. A library missing from the list can be opened again from its folder with “Open library”. The damaged list is kept beside the app's settings.",
+    "This computer's list of libraries was damaged and was set aside. Any libraries it could still read are listed as before. Your libraries themselves are untouched. A library missing from the list can be opened again from its folder with “Open library”. The damaged list is kept beside the app's settings.",
   "approved-folders-list-set-aside":
     "This computer's list of folders approved for imports was damaged and was set aside. An import will ask again before it uses files from a folder outside the one you import from. The damaged list is kept beside the app's settings.",
   "watched-folder-choices-set-aside":

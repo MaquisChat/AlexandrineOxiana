@@ -53,12 +53,13 @@ describe("device-level notices on the library chooser", () => {
     expect(screen.getByRole("button", { name: "Open library" })).toBeTruthy();
   });
 
-  it("a libraries list only partly damaged: the notice does not tell the researcher to open every library again (FR-412)", async () => {
+  it("a damaged libraries list (partly or wholly): the notice does not tell the researcher to open every library again (FR-412)", async () => {
     server.use(http.get(url("/libraries"), () => HttpResponse.json({ ...LIBRARIES, notices: [{ kind: "libraries-list-set-aside", at: AT }] })));
     render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
     const region = await screen.findByRole("region", { name: "Notices" });
     expect(region.textContent).not.toMatch(/open each one again/);
-    expect(region.textContent).toMatch(/libraries it could still read are listed as before/);
+    // R468 (M3): true also when none could be read (the whole list unreadable).
+    expect(region.textContent).toMatch(/set aside\. Any libraries it could still read are listed as before\./);
     expect(region.textContent).toMatch(/A library missing from the list can be opened again from its folder with “Open library”/);
   });
 
