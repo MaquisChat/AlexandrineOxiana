@@ -547,7 +547,8 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
       if (closed) throw new Ending("stopped", "app-closed");
       if (o.signal.aborted) throw new Ending("stopped", stopReason(o.signal));
       const locked = (encrypted && !deps.repo.isUnlocked(link.projectId)) || rec?.notes.some((n) => /project was locked/u.test(n));
-      throw new Ending(locked ? "stopped" : "failed", locked ? "project-locked" : "error");
+      // FR-512 (R295 b): a batch the rules stopped in the middle of its run says so, as a refusal at its start does.
+      throw new Ending(locked ? "stopped" : "failed", locked ? "project-locked" : result.deniedByRules ? "rules-denied" : "error");
     }
     if (result.state !== "finished") throw new Ending("failed", "error");
     if (detail.scanFailure !== undefined) {

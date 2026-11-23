@@ -1318,6 +1318,24 @@ describe("R295 b: a sync the project's rules refuse says so", () => {
     expect(again).toMatchObject({ outcome: "finished", batchId: stopped.batchId });
   });
 
+  it("FR-512: a batch the rules stop in the middle of its run is failed / rules-denied, not error", async () => {
+    const p = await project();
+    await articles(230);
+    await linked(linkOf(p));
+    // After two items, the project's rules can no longer be read (damaged outside the app): every write is refused
+    // (fail closed), the items fail, and the batch's own record cannot be saved, which stops it in the middle of its run.
+    let changed: Promise<void> | undefined;
+    const onBatch = (_p: string, h: BatchHandle) => {
+      void (async () => {
+        for await (const pr of h.progress) if (pr.done >= 2 && !changed) changed = writeFile(join(lib.root, p.folder, "governance.yaml"), "identifiability: [unclosed\n");
+      })();
+    };
+    const r = await sync(await stored(), {}, { onBatch });
+    await changed;
+    expect(r).toMatchObject({ outcome: "failed", reason: "rules-denied", batchId: expect.any(String) });
+    expect((await history())[0]).toMatchObject({ id: r.id, outcome: "failed", reason: "rules-denied" });
+  }, 120_000);
+
   it("an older record with a reason this build knows reads as before", async () => {
     const p = await project();
     await articles(1);

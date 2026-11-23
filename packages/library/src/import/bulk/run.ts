@@ -455,6 +455,8 @@ export interface BatchResult {
   batchId: string;
   state: BatchState;
   counts: BatchCounts;
+  /** FR-512: the run was stopped (state `failed`) by the project's rules refusing a change; absent otherwise. */
+  deniedByRules?: true;
 }
 
 export interface BatchHandle {
@@ -750,6 +752,8 @@ class Run {
   private readonly latest: Map<string, JournalEntry>;
   private readonly createdIds: Set<string>;
   private readonly denies = new Map<string, number>();
+  /** FR-512: this run was stopped by a rules refusal. */
+  private deniedByRules = false;
   private workDir: string | null = null;
   /** File notes per item key (ScanItem.fileNotes), added to the item's journal line. */
   private fileNotes = new Map<string, string[]>();
@@ -1089,6 +1093,8 @@ class Run {
               ? err.reason
               : stoppedNote(causeOf(err)),
         );
+        // FR-512: a stop the rules caused is told to whoever waits for the batch (the Zotero sync says so).
+        if ((err instanceof BatchRefusedError && err.denied) || err instanceof PolicyDeniedError) this.deniedByRules = true;
         // R393 a, b: the stopping error's kind is kept with the batch and logged with the program's stack.
         if (!(err instanceof ProjectLockedError || err instanceof BatchRefusedError || err instanceof PolicyDeniedError)) this.rec.stopCause = causeOf(err);
         this.deps.debug?.(`bulk import stopped: ${errorForLog(err)}`);
@@ -1136,7 +1142,7 @@ class Run {
       active.delete(this.rec.id);
       this.feed.end();
     }
-    this.settle({ batchId: this.rec.id, state, counts: this.counts() });
+    this.settle({ batchId: this.rec.id, state, counts: this.counts(), ...(this.deniedByRules && state === "failed" ? { deniedByRules: true as const } : {}) });
   }
 
   /** Processes one item (null: queued in the current group); never throws for item-level problems (they become `failed`). */
