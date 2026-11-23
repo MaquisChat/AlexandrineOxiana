@@ -375,6 +375,9 @@ describe("gone from Zotero, and back (Z5)", () => {
     expect(deletedMark).toEqual({ status: "unavailable-on-platform", zotero: "deleted", firstNoticedAt: expect.any(String) });
     expect(deletedMark.firstNoticedAt).not.toBe(binMark.firstNoticedAt);
     expect((await marks(p)).map((e) => (e.details as { marked: string }).marked)).toEqual(["bin", "deleted"]);
+    // R474 M7: the report (whose counts the undo question reads) knows it before the undo; the bin mark's own batch does not.
+    expect((await bulk().batchReport(p.id, b3.batchId)).counts).toMatchObject({ goneInZotero: 1, goneInZoteroMarkBefore: 1 });
+    expect((await bulk().batchReport(p.id, b2.batchId)).counts.goneInZoteroMarkBefore).toBeUndefined();
     // FR-467: the undo of the deletion mark put the bin mark back; it did not take the mark off.
     expect((await bulk().undoBatch(p.id, b3.batchId)).reverted).toEqual({ merged: 0, updated: 0, unmarked: 0, remarked: 0, restoredMarks: 1 });
     expect(await folderBytes(sf.source.folder)).toEqual(binBytes);
@@ -637,6 +640,9 @@ describe("undoing marks and backs in any order (R224 b)", () => {
     const r2 = await bulk().undoBatch(p.id, b2.batchId);
     expect(r2.kept.map((k) => k.kind)).toEqual(["availability"]);
     expect(await avail(p, id)).toEqual(deletedMark);
+    // R474 M7: with the bin batch undone, undoing the deletion takes the mark off: the report says no mark comes back.
+    expect((await bulk().batchReport(p.id, b3.batchId)).counts).toMatchObject({ goneInZotero: 1 });
+    expect((await bulk().batchReport(p.id, b3.batchId)).counts.goneInZoteroMarkBefore).toBeUndefined();
     expect((await bulk().undoBatch(p.id, b3.batchId)).reverted).toEqual({ merged: 0, updated: 0, unmarked: 1, remarked: 0 });
     expect(await avail(p, id)).toEqual(INCOMPLETE);
     // Zotero still has it deleted: the next (full) sync marks it so again, and nothing comes back.

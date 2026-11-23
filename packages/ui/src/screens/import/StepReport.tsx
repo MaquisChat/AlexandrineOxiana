@@ -18,13 +18,16 @@ import { ZOTERO_REPORT_ROWS } from "@ao/shared";
  * and gone items with no source of their own here are not changed by the undo. Z6 (R236 e): the sources whose field
  * changed in Zotero and here have Zotero's waiting value taken off (`unconflict`; the researcher's value stays).
  */
-export function undoCounts(r: ImportReport): { remove: number; restore: number; revert: number; unmark: number; remark: number; unconflict: number } {
+export function undoCounts(r: ImportReport): { remove: number; restore: number; revert: number; unmark: number; markBefore: number; remark: number; unconflict: number } {
   const c = r.counts;
+  // R474 M7: a mark this import made over an earlier one still standing gets that one back (`markBefore`), not none.
+  const markBefore = Math.min(c.goneInZoteroMarkBefore ?? 0, c.goneInZotero ?? 0);
   return {
     remove: c.created + c.needsReview,
     restore: c.merged,
     revert: c.updated,
-    unmark: c.goneInZotero ?? 0,
+    unmark: (c.goneInZotero ?? 0) - markBefore,
+    markBefore,
     remark: Math.max(0, (c.backInZotero ?? 0) - (c.backInZoteroUpdated ?? 0)),
     unconflict: c.conflicts ?? 0,
   };
@@ -53,15 +56,16 @@ function sentence(parts: string[]): string {
 
 /** "Remove 1,284 imported sources, restore 3 merged sources and revert 2 updated sources?" — a part whose number is 0 is left out. */
 export function undoQuestion(r: ImportReport): string {
-  const { remove, restore, revert, unmark, remark, unconflict } = undoCounts(r);
+  const { remove, restore, revert, unmark, markBefore, remark, unconflict } = undoCounts(r);
   // A run that added or changed no source can still have written something small (for instance the order of
   // highlights); undo stays available and puts that back, but the question does not call it a change to sources.
-  if (remove === 0 && restore === 0 && revert === 0 && unmark === 0 && remark === 0 && unconflict === 0) return "This import added and changed no sources. Undo it anyway?";
+  if (remove === 0 && restore === 0 && revert === 0 && unmark === 0 && markBefore === 0 && remark === 0 && unconflict === 0) return "This import added and changed no sources. Undo it anyway?";
   const parts: string[] = [];
   if (remove > 0) parts.push(`remove ${count(remove, "imported source")}`);
   if (restore > 0) parts.push(`restore ${count(restore, "merged source")}`);
   if (revert > 0) parts.push(`revert ${count(revert, "updated source")}`);
   if (unmark > 0) parts.push(`take the Zotero mark off ${count(unmark, "source")}`);
+  if (markBefore > 0) parts.push(`put back the Zotero mark ${count(markBefore, "source")} had before`);
   if (remark > 0) parts.push(`mark ${count(remark, "source")} as gone from Zotero again`);
   if (unconflict > 0) parts.push(`take the Zotero values waiting for your decision off ${count(unconflict, "source")} (your values stay as they are)`);
   return `${sentence(parts)}?`;

@@ -115,6 +115,11 @@ describe("gone from Zotero, and back (Z5, R224)", () => {
     }
   });
 
+  it("R474 M7: the undo question says that undoing a mark made over an earlier one puts that mark back", () => {
+    expect(undoQuestion(report({}, { goneInZotero: 1, goneInZoteroMarkBefore: 1 }))).toBe("Put back the Zotero mark 1 source had before?");
+    expect(undoQuestion(report({}, { goneInZotero: 3, goneInZoteroMarkBefore: 2 }))).toBe("Take the Zotero mark off 1 source and put back the Zotero mark 2 sources had before?");
+  });
+
   it("the undo's result line says what was done in the question's terms, leaving out zeros", async () => {
     const r = report({}, { goneInZotero: 1, backInZotero: 1 });
     const api = { report: async () => r, undo: async () => ({ removedSources: 0, revertedMerges: 2, reverted: { merged: 0, updated: 0, unmarked: 1, remarked: 1 }, kept: [] }) } as unknown as ImportApi;

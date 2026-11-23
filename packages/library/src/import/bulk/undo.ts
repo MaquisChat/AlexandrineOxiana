@@ -30,7 +30,7 @@ import { join } from "node:path";
 import { zoteroKeysOf } from "../../repo/tombstones.js";
 import type { ImportOps } from "../../repo/import-ops.js";
 import { reviewCauseOf } from "../../repo/review.js";
-import { BOOKKEEPING, PRIVATE_MODE, activeBatches, batchDirs, findBatch, readBatchAt, readJournal, writeBatchRecord } from "./batch.js";
+import { BOOKKEEPING, PRIVATE_MODE, activeBatches, findBatch, readJournal, undoneBatchIds, writeBatchRecord } from "./batch.js";
 import { getAt, revertMerge } from "./merge.js";
 import { asEvidence } from "./update.js";
 import { isDeepStrictEqual } from "node:util";
@@ -110,19 +110,6 @@ async function resolveUndoneConflicts(ops: ImportOps, sourceId: string, paths: s
   }
 }
 
-/** The ids of the project's batches whose record says undone (an unreadable record is taken as standing). */
-async function undoneBatchIds(repo: Repo, projectId: string): Promise<Set<string>> {
-  const out = new Set<string>();
-  for (const d of await batchDirs(repo, projectId)) {
-    try {
-      const r = await readBatchAt(repo, projectId, d.name);
-      if (r?.state === "undone") out.add(r.id);
-    } catch {
-      // unreadable: not known to be undone
-    }
-  }
-  return out;
-}
 
 export async function undoBatch(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
   // The batch's slot is taken before anything is awaited (R63): no resume, start or second undo meanwhile.

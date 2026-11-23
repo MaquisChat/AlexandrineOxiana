@@ -12,8 +12,9 @@
 import { ZOTERO_REPORT_ROWS } from "@ao/shared";
 import { appendLibraryEvent, projectReviewEntries, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
+import { markUndoTarget } from "./merge.js";
 import { createHash } from "node:crypto";
-import { BOOKKEEPING, activeBatches, unsavedStops, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, type GovernanceNote, type ShownState } from "./batch.js";
+import { BOOKKEEPING, activeBatches, unsavedStops, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, undoneBatchIds, type GovernanceNote, type ShownState } from "./batch.js";
 
 export interface ImportReport {
   batchId: string;
@@ -43,6 +44,11 @@ export interface ImportReport {
     backInZotero?: number;
     backInZoteroUpdated?: number;
     goneNotMarked?: number;
+    /**
+     * R474 M7 (present only when not 0): of `goneInZotero`, the sources whose undo would put back the mark an earlier
+     * batch still standing gave them (a deletion over a bin mark), not take the mark off. Counted when the report is read.
+     */
+    goneInZoteroMarkBefore?: number;
     /**
      * Task Z6 (absent in reports written before it): items with a field changed in Zotero and here, waiting for the
      * researcher (an item that also took in other changes is in `updated` too); collections renamed in Zotero that
@@ -203,6 +209,10 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
   const notesByKey = new Map<string, string[]>();
   for (const e of journal) if (e.notes?.length && !notesByKey.has(e.key)) notesByKey.set(e.key, e.notes);
   const c = countOutcomes(latest.values());
+  // R474 M7: the marks whose undo puts an earlier mark back (as undo does: the newest mark whose batch still stands).
+  const marked = [...latest.values()].filter((e) => e.outcome === "zotero-gone" && e.merge?.availability);
+  const undone = marked.some((e) => e.merge!.availability!.marks?.length) ? await undoneBatchIds(repo, projectId) : new Set<string>();
+  const markBefore = marked.filter((e) => markUndoTarget(e.merge!.availability!, (id) => undone.has(id)).zotero !== undefined).length;
   // Files stored, by item (its first line that stored any); an item that failed or was skipped in review keeps none.
   const filesByKey = new Map<string, { copied: number; linked: number }>();
   for (const e of journal) if (e.files && !filesByKey.has(e.key)) filesByKey.set(e.key, e.files);
@@ -221,7 +231,7 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     state: rec.state === "running" && !activeBatches.has(batchId) ? "interrupted" : rec.state,
     startedAt: rec.startedAt,
     ...(rec.finishedAt ? { finishedAt: rec.finishedAt } : {}),
-    counts: c,
+    counts: { ...c, ...(markBefore ? { goneInZoteroMarkBefore: markBefore } : {}) },
     files,
     failures: [...latest.values()].filter((e) => e.outcome === "failed").map((e) => ({ item: reportLabel(e.key, rec.secret), reason: e.reason ?? "The item could not be imported." })),
     fileNotes: [...notesByKey].flatMap(([key, notes]) => notes.map((note) => ({ item: reportLabel(key, rec.secret), note }))),
