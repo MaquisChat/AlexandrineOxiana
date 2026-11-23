@@ -20,6 +20,8 @@
  * (FR-217, FR-219, R467 M1). The mark outlives the ticket (a revoke in the route, the idle sweep)
  * until it is read once, the ticket's lifetime is over, or MEDIA_TICKET_MARKS_MAX newer marks push
  * it out; it holds the ticket's digest and why only, nothing of the file (R467 M2).
+ * The app's own destruction of raw data ends the tickets of the files it destroys before it
+ * overwrites them, and their revoke answers `ended: "FILE_DESTROYED"` instead (R467 M3).
  *
  * Who may load `/media/<ticket>` (decided here, checked in server.ts before any token logic):
  *  - Host must be ours (as for every route).
@@ -48,6 +50,7 @@ import { DecryptionError, EncryptionFormatError, KeyNotAvailableError, ProjectLo
 import {
   MEDIA_TICKETS_MAX,
   MEDIA_FILE_CHANGED,
+  MEDIA_FILE_DESTROYED,
   MEDIA_TICKET_IDLE_MS,
   MEDIA_TICKET_LIFETIME_MS,
   PICTURE_MAX_BYTES,
@@ -80,7 +83,12 @@ interface Ticket {
   streams: Set<Stream>;
   /** A read for it found the stored file changed outside the app (FR-217): said when it is revoked. */
   fileChanged?: boolean;
+  /** The app destroyed its file (R467 M3): said when it is revoked, before any change. */
+  destroyed?: boolean;
 }
+
+/** Why an ended ticket's stream stopped, as its revoke says it. */
+type EndedWhy = "changed" | "destroyed";
 
 /** Marks of ended tickets kept at most (R467 M2): the oldest give way. */
 export const MEDIA_TICKET_MARKS_MAX = 2 * MEDIA_TICKETS_MAX;
@@ -90,8 +98,8 @@ const digest = (ticket: string) => createHash("sha256").update(ticket, "utf8").d
 /** The live media tickets (memory only). */
 export class MediaTickets {
   private readonly tickets = new Map<string, Ticket>();
-  /** Ended tickets whose file was found changed: digest → when the mark lapses (R467 M2). */
-  private readonly marks = new Map<string, number>();
+  /** Ended tickets whose file was found changed or destroyed: digest → why, and when the mark lapses (R467 M2). */
+  private readonly marks = new Map<string, { why: EndedWhy; until: number }>();
   private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly now: () => number) {}
@@ -169,14 +177,33 @@ export class MediaTickets {
    * Ends `ticket` for its player (POST /media-tickets/revoke): whether it was live, and whether a
    * read for it found the stored file changed — said once, also after the ticket ended (R467 M2).
    */
-  revokeForPlayer(ticket: string): { revoked: boolean; fileChanged: boolean } {
+  revokeForPlayer(ticket: string): { revoked: boolean; why?: EndedWhy } {
     this.sweep();
     const key = digest(ticket);
-    const changed = this.tickets.get(key)?.fileChanged === true;
     const revoked = this.revoke(ticket);
-    const marked = this.marks.has(key);
+    const why = this.marks.get(key)?.why;
     this.marks.delete(key);
-    return { revoked, fileChanged: changed || marked };
+    return { revoked, ...(why ? { why } : {}) };
+  }
+
+  /**
+   * Ends the tickets of these assets because the app is destroying them (R467 M3), before any byte
+   * of them is overwritten. Gives their keys, to take the marks back if the destruction is refused.
+   */
+  endDestroyed(projectId: string, assetIds: ReadonlySet<string>): string[] {
+    const keys: string[] = [];
+    for (const [k, t] of this.tickets) {
+      if (t.projectId !== projectId || !assetIds.has(t.assetId)) continue;
+      t.destroyed = true;
+      this.end(k, t);
+      keys.push(k);
+    }
+    return keys;
+  }
+
+  /** The destruction was refused: those tickets ended, but not because their file was destroyed. */
+  forgetDestroyed(keys: readonly string[]): void {
+    for (const k of keys) if (this.marks.get(k)?.why === "destroyed") this.marks.delete(k);
   }
 
   revokeProject(projectId: string): void {
@@ -194,7 +221,7 @@ export class MediaTickets {
    */
   sweep(): void {
     const now = this.now();
-    for (const [k, until] of this.marks) if (now >= until) this.marks.delete(k);
+    for (const [k, m] of this.marks) if (now >= m.until) this.marks.delete(k);
     for (const [k, t] of this.tickets) {
       const idle = now - t.lastUsed >= MEDIA_TICKET_IDLE_MS;
       if (idle || now - t.issuedAt >= MEDIA_TICKET_LIFETIME_MS) this.end(k, t);
@@ -209,8 +236,8 @@ export class MediaTickets {
 
   private end(key: string, t: Ticket): void {
     this.tickets.delete(key);
-    if (t.fileChanged && this.now() < t.issuedAt + MEDIA_TICKET_LIFETIME_MS) {
-      this.marks.set(key, t.issuedAt + MEDIA_TICKET_LIFETIME_MS);
+    if ((t.destroyed || t.fileChanged) && this.now() < t.issuedAt + MEDIA_TICKET_LIFETIME_MS) {
+      this.marks.set(key, { why: t.destroyed ? "destroyed" : "changed", until: t.issuedAt + MEDIA_TICKET_LIFETIME_MS });
       for (const k of this.marks.keys()) {
         if (this.marks.size <= MEDIA_TICKET_MARKS_MAX) break;
         this.marks.delete(k);
@@ -373,8 +400,8 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
     if (!isMediaTicketPath(path)) throw badRequest('"path" must be a media address (/media/…).');
     const ticket = path.slice("/media/".length);
     // FR-219: the player learns by this code that its recording stopped because the file was changed outside the app.
-    const { revoked, fileChanged } = tickets.revokeForPlayer(ticket);
-    return { revoked, ...(fileChanged ? { ended: MEDIA_FILE_CHANGED } : {}) };
+    const { revoked, why } = tickets.revokeForPlayer(ticket);
+    return { revoked, ...(why === "destroyed" ? { ended: MEDIA_FILE_DESTROYED } : why === "changed" ? { ended: MEDIA_FILE_CHANGED } : {}) };
   });
 
   // ---- the media route (no token: the ticket is the credential; checks in server.ts) ----
@@ -427,7 +454,7 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
       sent: (n) => tickets.sentBytes(t, n),
       // An encrypted chunk that fails its check: the file was changed (or damaged) outside the app (FR-217).
       failed: (cause) => {
-        if (cause instanceof DecryptionError || cause instanceof EncryptionFormatError) t.fileChanged = true;
+        if (!t.destroyed && (cause instanceof DecryptionError || cause instanceof EncryptionFormatError)) t.fileChanged = true;
       },
       // Between the first read and the first byte: the ticket must still be live and its project unlocked.
       check: () => {

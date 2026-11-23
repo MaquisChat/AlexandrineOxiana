@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MEDIA_TICKET_IDLE_MS } from "@ao/shared";
-import { MEDIA_FILE_CHANGED_SENTENCE, REVOKE_WAIT_MS } from "../components/MediaTicketPlayer";
+import { MEDIA_FILE_CHANGED_SENTENCE, NO_RECORDING_SENTENCE, REVOKE_WAIT_MS } from "../components/MediaTicketPlayer";
 import { transcriptApi } from "../api/transcripts";
 import { setMedia } from "../test/media";
 import { navigate } from "../navigation";
@@ -615,6 +615,22 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(svc.log.revoked).toEqual([svc.log.tickets[0]!.path]);
     expect(el.getAttribute("src")).toBeNull();
     // R467 M5: a retry cannot help, so none is offered: the sentence and the controls agree.
+    expect(screen.queryByRole("button", { name: "Try the recording again" })).toBeNull();
+  });
+
+  it("a recording whose raw data the app destroyed while it played says what the app says of a destroyed recording, not 'changed outside the app', and offers no Try again (R467 M3)", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4);
+    svc.state.fileDestroyed = true;
+    fireEvent(el, new Event("error"));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(NO_RECORDING_SENTENCE);
+    expect(NO_RECORDING_SENTENCE).toBe("This source has no recording to play. Its transcript is shown below.");
+    expect(svc.log.tickets).toHaveLength(1);
+    expect(el.getAttribute("src")).toBeNull();
     expect(screen.queryByRole("button", { name: "Try the recording again" })).toBeNull();
   });
 

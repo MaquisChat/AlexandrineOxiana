@@ -33,7 +33,7 @@
  * logged, stored, or put in the page address. No `crossorigin` attribute: the service expects the
  * element's plain (no-cors) range reads.
  */
-import { MEDIA_FILE_CHANGED, MEDIA_TICKET_IDLE_MS, MEDIA_TICKET_LIFETIME_MS, type MediaTicketResponse } from "@ao/shared";
+import { MEDIA_FILE_CHANGED, MEDIA_FILE_DESTROYED, MEDIA_TICKET_IDLE_MS, MEDIA_TICKET_LIFETIME_MS, type MediaTicketResponse } from "@ao/shared";
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import { ApiClientError } from "../api/client";
 import { errorText, isProjectLocked } from "../api/library";
@@ -87,6 +87,12 @@ interface Pending {
 type Phase = { kind: "loading" } | { kind: "ready" } | { kind: "renewing" } | { kind: "failed"; message: string; retry: boolean };
 
 const isVideo = (asset: { mime: string; kind?: string }) => /^video\//i.test(asset.mime) || (!/^audio\//i.test(asset.mime) && asset.kind === "video");
+
+/**
+ * What the app says of a source whose recording was destroyed (the transcript viewer shows it when
+ * it opens one): the player says it too when the app destroys the recording while it plays (R467 M3).
+ */
+export const NO_RECORDING_SENTENCE = "This source has no recording to play. Its transcript is shown below.";
 
 /** How long a renewal waits for the ended ticket's revoke to answer before it goes on without its code (R467 M4). */
 export const REVOKE_WAIT_MS = 10_000;
@@ -249,7 +255,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     const renew = async () => {
       const old = ticket;
       ticket = null;
-      let changed = false;
+      let ended: string | undefined;
       if (old) {
         // R467 M4: waited for no longer than REVOKE_WAIT_MS; no answer by then is no code.
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -257,7 +263,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
           timer = setTimeout(() => resolve(undefined), REVOKE_WAIT_MS);
         });
         try {
-          changed = (await Promise.race([api.revokeTicket(old), limit]))?.ended === MEDIA_FILE_CHANGED;
+          ended = (await Promise.race([api.revokeTicket(old), limit]))?.ended;
         } catch {
           /* not known: renewed as before */
         } finally {
@@ -265,8 +271,9 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
         }
       }
       if (!live || halted) return;
-      // R467 M5: trying again cannot help a changed file, so no "Try again" is offered.
-      if (changed) halt({ kind: "failed", message: MEDIA_FILE_CHANGED_SENTENCE, retry: false });
+      // R467 M5: trying again cannot help a changed or destroyed file, so no "Try again" is offered.
+      if (ended === MEDIA_FILE_CHANGED) halt({ kind: "failed", message: MEDIA_FILE_CHANGED_SENTENCE, retry: false });
+      else if (ended === MEDIA_FILE_DESTROYED) halt({ kind: "failed", message: NO_RECORDING_SENTENCE, retry: false });
       else await attach(true);
     };
     const onTimeUpdate = (e: Event) => {

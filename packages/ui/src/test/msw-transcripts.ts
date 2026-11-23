@@ -120,6 +120,8 @@ export function transcriptService(opts: { versions?: TranscriptVersionSummary[];
     job: (opts.job ?? null) as TranscriptionJob | null,
     /** The service found the recording's file changed outside the app: a revoke says so (FR-219). */
     fileChanged: false,
+    /** The app destroyed the recording's raw data while it played: a revoke says so (R467 M3). */
+    fileDestroyed: false,
   };
   const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const enc = new TextEncoder();
@@ -158,7 +160,7 @@ export function transcriptService(opts: { versions?: TranscriptVersionSummary[];
     http.post(url("/media-tickets/revoke"), async ({ request }) => {
       const body = (await request.json()) as { path: string };
       log.revoked.push(body.path);
-      return HttpResponse.json(state.fileChanged ? { revoked: true, ended: "FILE_CHANGED" } : { revoked: true });
+      return HttpResponse.json(state.fileDestroyed ? { revoked: false, ended: "FILE_DESTROYED" } : state.fileChanged ? { revoked: true, ended: "FILE_CHANGED" } : { revoked: true });
     }),
     http.post(url("/projects/:id/sources/:sid/transcripts"), async ({ request, params }) => {
       const body = (await request.json()) as Record<string, unknown>;

@@ -226,7 +226,19 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     const now = state.deps.clock();
     const due = new Set((await retentionDue(s.repo, projectId, now)).flatMap((d) => d.assetIds));
     if (!assetIds.length || assetIds.some((id) => !due.has(id))) throw badRequest("Only raw originals that are due for destruction can be destroyed.");
-    const r = await destroyRaw(s.repo, projectId, assetIds, by, { includeDerived, onlyDue: now });
+    // R467 M3: a recording of these files playing now stops before any byte is overwritten, and its
+    // player is told the app destroyed it (not that it changed outside the app).
+    const ended = state.media.endDestroyed(projectId, new Set(assetIds));
+    let r: Awaited<ReturnType<typeof destroyRaw>>;
+    try {
+      r = await destroyRaw(s.repo, projectId, assetIds, by, { includeDerived, onlyDue: now });
+    } catch (err) {
+      state.media.forgetDestroyed(ended);
+      throw err;
+    }
+    // Derived files destroyed with them (a viewing copy) end too.
+    const destroyedIds = (r.certificate.assets as Array<{ assetId?: unknown }> | undefined)?.map((a) => String(a.assetId)) ?? [];
+    state.media.endDestroyed(projectId, new Set(destroyedIds));
     state.publishState();
     const root = s.lib.root.replace(/[\\/]+$/, "");
     const rel = r.certificatePath.startsWith(root) ? r.certificatePath.slice(root.length + 1).split(/[\\/]/).join("/") : "";

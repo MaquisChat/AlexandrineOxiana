@@ -82,20 +82,20 @@ async function openLibrary(): Promise<void> {
   expect(r.status, r.body).toBe(200);
 }
 
-async function newProject(encrypted = false, name = "Study"): Promise<string> {
-  const r = await call({ method: "POST", url: "/projects", body: { name, governanceYaml: OPEN_GOV, encryption: encrypted ? { enabled: true, passphrase: PASS } : { enabled: false } } });
+async function newProject(encrypted = false, name = "Study", governanceYaml = OPEN_GOV): Promise<string> {
+  const r = await call({ method: "POST", url: "/projects", body: { name, governanceYaml, encryption: encrypted ? { enabled: true, passphrase: PASS } : { enabled: false } } });
   expect(r.status, r.body).toBe(200);
   return r.json.project.id as string;
 }
 
 /** A source with one original made from `file` (through the library, as an import would). */
-async function sourceWith(projectId: string, file: string, type = "audio"): Promise<{ sid: string; aid: string }> {
+async function sourceWith(projectId: string, file: string, type = "audio", identifiable = false): Promise<{ sid: string; aid: string }> {
   const repo = svc.state.session!.repo;
   const sf = await repo.createSource(
     projectId,
     { projectIds: [projectId], type: type as never, title: { variants: [{ lang: "en", kind: "original", value: "Recording" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
     [{ path: file, role: "original", handling: "copy" }],
-    { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable } },
   );
   return { sid: sf.source.id, aid: sf.assets[0]!.id };
 }
@@ -1006,6 +1006,46 @@ describe("a stored file found changed while it is played (FR-217, FR-219)", () =
     expect(v.json).toEqual({ revoked: false, ended: "FILE_CHANGED" });
     expect(v.body).not.toContain(tmp);
   });
+  it("a recording the app destroys while it streams is not 'changed outside the app': its stream ends and the revoke says FILE_DESTROYED (M3, R467)", async () => {
+    await start();
+    const port = await svc.listen(0);
+    hostHeader = { host: `127.0.0.1:${port}` };
+    await openLibrary();
+    // An interview due for destruction under the project's retention rule.
+    const gov = `${OPEN_GOV.replace("containsIdentifiable: false", "containsIdentifiable: true\n  pseudonymizeFileNames: false")}retention:\n  rawDataDestroyAfter: 2020-01-01\n`;
+    const pid = await newProject(true, "Study", gov);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(16 * CHUNK)), "video", true);
+    const t = await ticket(pid, sid, aid);
+    let destroyed: { status: number; body: string } | undefined;
+    const got = await new Promise<number>((resolve) => {
+      let n = 0;
+      const req = httpRequest({ host: "127.0.0.1", port, path: t.path, method: "GET", headers: { host: `127.0.0.1:${port}` } }, (res) => {
+        res.on("data", (d: Buffer) => {
+          n += d.length;
+          if (!destroyed) {
+            destroyed = { status: 0, body: "" };
+            // The raw data is destroyed (on the researcher's order) while the recording streams.
+            res.pause();
+            void call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [aid], confirm: true } }).then((r) => {
+              destroyed = { status: r.status, body: r.body };
+              res.resume();
+            });
+          }
+        });
+        res.on("end", () => resolve(n));
+        res.on("error", () => resolve(n));
+        res.on("aborted", () => resolve(n));
+      });
+      req.on("error", () => resolve(n));
+      req.end();
+    });
+    expect(destroyed?.status, destroyed?.body).toBe(200);
+    expect(got).toBeLessThan(16 * CHUNK);
+    const v = await revoke(t.path);
+    expect(v.json).toEqual({ revoked: false, ended: "FILE_DESTROYED" });
+    expect(v.body).not.toContain(tmp);
+  });
+
   it("the mark outlives the ticket's idle sweep long enough to be read once; it is bounded in time and in number (M2, R467)", async () => {
     await start();
     await openLibrary();
