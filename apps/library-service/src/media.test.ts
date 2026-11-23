@@ -972,7 +972,7 @@ describe("a stored file found changed while it is played (FR-217, FR-219)", () =
     const got = await getAll(port, t.path);
     expect(got).toBeGreaterThan(0);
     expect(got).toBeLessThan(3 * CHUNK);
-    for (let i = 0; i < 100 && svc.state.media.activeStreams() > 0; i++) await new Promise((res) => setTimeout(res, 20));
+    // No wait (R467 M9): the ticket is marked before its stream is cut, and the cut is what ended `getAll`.
     const r = await revoke(t.path);
     expect(r.status).toBe(200);
     expect(r.json).toEqual({ revoked: true, ended: "FILE_CHANGED" });
