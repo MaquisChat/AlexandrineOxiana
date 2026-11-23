@@ -9,6 +9,7 @@ import type { ImportApi, ImportReport, UndoResult } from "../../api/import";
 import { UserText } from "../../components/UserText";
 import { IMPORT_PATHS, inAppLink } from "../../navigation";
 import { count, ErrorNote, errorText, fmt, Section } from "./shared";
+import { ZOTERO_REPORT_ROWS } from "@ao/shared";
 
 /**
  * What undo would remove and restore, from the report's counts. Zotero (Z5, R224): the sources this import marked
@@ -105,8 +106,9 @@ function zoteroRows(r: ImportReport): Array<[string, number]> {
     ["Back in Zotero", c.backInZotero ?? 0],
     ["Still gone from Zotero (marked earlier)", c.goneAlready ?? 0],
     // Z6 (R236 e): the account sync's own rows.
-    ["Changed in Zotero and here — waiting for you", c.conflicts ?? 0],
-    ["Cleared in Zotero, kept here", c.clearedInZoteroKept ?? 0],
+    // R474 M4: the words of the report file, which say that these rows overlap others.
+    [ZOTERO_REPORT_ROWS.conflicts, c.conflicts ?? 0],
+    [ZOTERO_REPORT_ROWS.clearedInZoteroKept, c.clearedInZoteroKept ?? 0],
   ];
   return rows.filter(([, n]) => n > 0);
 }

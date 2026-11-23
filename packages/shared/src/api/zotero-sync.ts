@@ -250,6 +250,16 @@ export const ZOTERO_SYNC_SENTENCES = {
   keyPausesNotCleared: "This computer's Zotero sync settings could not be read or changed, so a Zotero library paused because of the key stays paused. Run the check again in a moment.",
 } as const;
 
+/**
+ * FR-463 (R474 M4): the Zotero rows of an import's report that count items also counted in another row (an item
+ * waiting for you that took other changes is also updated; a field cleared in Zotero and kept here belongs to an item
+ * counted under its own outcome). The screen's table and the report file say the same words.
+ */
+export const ZOTERO_REPORT_ROWS = {
+  conflicts: "Changed in Zotero and here — waiting for you (also counted in another row when other changes came in too)",
+  clearedInZoteroKept: "Cleared in Zotero, kept here (also counted in another row)",
+} as const;
+
 /** FR-507 (R474): how many links a key check that worked turned on again (said only when at least one was). */
 export const zoteroSyncsAgainLine = (n: number): string => `Syncing is on again for ${n} linked Zotero ${n === 1 ? "library" : "libraries"}.`;
 

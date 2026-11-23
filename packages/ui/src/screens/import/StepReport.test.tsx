@@ -1,6 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
+import { ZOTERO_REPORT_ROWS } from "@ao/shared";
 import type { ImportApi, ImportReport } from "../../api/import";
 import { REPORT } from "../../test/importService";
 import { StepReport, undoQuestion } from "./StepReport";
@@ -77,8 +78,10 @@ describe("changed in Zotero and here (Z6, R236 e)", () => {
     show(report({}, { conflicts: 2, clearedInZoteroKept: 1 }));
     const table = await screen.findByRole("table", { name: "Items by outcome" });
     const row = (name: string) => within(table).getByRole("rowheader", { name }).closest("tr")!.textContent;
-    expect(row("Changed in Zotero and here — waiting for you")).toContain("2");
-    expect(row("Cleared in Zotero, kept here")).toContain("1");
+    // R474 M4: the same words as the report file, saying that the rows overlap others.
+    expect(row(ZOTERO_REPORT_ROWS.conflicts)).toContain("2");
+    expect(row(ZOTERO_REPORT_ROWS.clearedInZoteroKept)).toContain("1");
+    expect(ZOTERO_REPORT_ROWS.clearedInZoteroKept).toContain("also counted in another row");
   });
 
   it("no such rows when zero", async () => {
