@@ -35,6 +35,7 @@ import { flagIfWithdrawn } from "./withdrawn.js";
 import { appendReviewEntry, queueUnlistedConflicts, resolveCaptureEntriesAfterEdit, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type QueuedConflicts, type ReexaminedBy, type ReviewInput } from "./review.js";
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
+import { isClosed } from "../library.js";
 
 
 export interface SourceInputFile {
@@ -144,17 +145,87 @@ const annotationsRel = (folder: string, encrypted: boolean) => `${folder}/${encr
 type AnnotationProblem = { file: string; kind: "annotations-unreadable" | "annotations-hash-mismatch"; detail: string };
 
 export async function readSourceFile(core: RepoCore, st: ProjectState, id: string): Promise<SourceFile> {
-  let read = await readSourcePair(core, st, id);
+  const read = await readSourcePair(core, st, id);
+  if (!read.problem) return read.sf;
+  // Inside a turn no write is in progress: the problem is recorded as found.
+  if (core.holdsTurn()) {
+    recordProblem(core, st, read.problem);
+    return read.sf;
+  }
   // A read outside the write queue can fall between the two files a write updates (the annotations
   // file, then source.json): a problem is confirmed in the queue's turn, after any write in progress,
-  // and recorded only if it is still there (D21). Inside a turn no write is in progress.
-  if (read.problem && !core.holdsTurn()) read = await core.serial(() => readSourcePair(core, st, id));
-  // A change of this project whose roll-back failed is finished at the next open (R26), and until
-  // then its own leftover files may be on disk: they are not reported as changed outside the app
-  // (FR-425). Until then the project refuses changes and says to reopen the library
-  // (RecoveryPendingError); a real change outside the app is still found by a read after that open.
-  if (read.problem && !st.recoveryPending) annotationWarning(core, st, read.problem.file, read.problem.kind, read.problem.detail);
-  return read.sf;
+  // and recorded only if it is still there (D21). The read waits for that turn at most CONFIRM_WAIT_MS
+  // (FR-423, R469 c): a long write (a restore) holds the queue for its whole length. If the turn has
+  // not come by then, the read answers without the warning (nothing unconfirmed is reported) and the
+  // confirmation goes on in the queue, recording the warning when its turn comes.
+  const confirmed = await withinConfirmWait(confirmProblem(core, st, id));
+  return confirmed === undefined ? read.sf : confirmed.sf;
+}
+
+/** How long a read waits for the write queue's turn to confirm a problem it found (FR-423, R469 c). */
+export const CONFIRM_WAIT_MS = 2_000;
+
+/** Test seam (R47): `onRun` is called when a confirmation runs in its turn, only while NODE_ENV is "test". */
+export const confirmationSeams: { onRun?: (sourceId: string) => void } = {};
+
+/** The confirmations waiting for their turn, per repository, by project and source: one per source at a time. */
+const confirmations = new WeakMap<RepoCore, Map<string, Promise<{ sf: SourceFile; problem?: AnnotationProblem } | undefined>>>();
+
+/**
+ * One confirmation of a source's annotation problem, in the write queue's turn: the pair read again there, and a
+ * problem still there recorded there. It ends, recording nothing, when by its turn the library was closed (as a
+ * move closes it), the project is no longer this one, or a lock was asked since it was made (the key may be gone:
+ * reading then refuses, which also records nothing). A refusal reaches the readers still waiting for it, as before;
+ * with none waiting it ends as `undefined`, and the confirmation always has a handler: never an unhandled rejection.
+ */
+function confirmProblem(core: RepoCore, st: ProjectState, id: string): Promise<{ sf: SourceFile; problem?: AnnotationProblem } | undefined> {
+  let mine = confirmations.get(core);
+  if (!mine) confirmations.set(core, (mine = new Map()));
+  const key = `${st.project.id}\0${id}`;
+  const waiting = mine.get(key);
+  if (waiting) return waiting;
+  const asks = core.lockAsks.get(st.project.id) ?? 0;
+  const run = core
+    .serial(async () => {
+      if (confirmationSeams.onRun && process.env.NODE_ENV === "test") confirmationSeams.onRun(id);
+      if (isClosed(core.library) || core.projects.get(st.project.id) !== st || (core.lockAsks.get(st.project.id) ?? 0) !== asks) return undefined;
+      const again = await readSourcePair(core, st, id);
+      if (again.problem) recordProblem(core, st, again.problem);
+      return again;
+    })
+    .catch((err: unknown) => {
+      // A lock (the key gone), or the source deleted meanwhile: nothing to record. A refusal while a reader still
+      // waits reaches that reader, as before.
+      if (waitingReaders.get(run) ?? 0) throw err;
+      return undefined;
+    })
+    .finally(() => mine.delete(key));
+  run.catch(() => {});
+  mine.set(key, run);
+  return run;
+}
+
+/** Readers still waiting for a confirmation (within their bound). */
+const waitingReaders = new WeakMap<Promise<unknown>, number>();
+
+/** The confirmation's outcome, or `undefined` when it has not come within CONFIRM_WAIT_MS. */
+async function withinConfirmWait<T>(p: Promise<T>): Promise<T | undefined> {
+  waitingReaders.set(p, (waitingReaders.get(p) ?? 0) + 1);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([p, new Promise<undefined>((r) => (timer = setTimeout(r, CONFIRM_WAIT_MS)))]);
+  } finally {
+    clearTimeout(timer);
+    waitingReaders.set(p, (waitingReaders.get(p) ?? 1) - 1);
+  }
+}
+
+/**
+ * Records a confirmed problem. A change of this project whose roll-back failed is finished at the next open (R26),
+ * and until then its own leftover files may be on disk: they are not reported as changed outside the app (FR-425).
+ */
+function recordProblem(core: RepoCore, st: ProjectState, problem: AnnotationProblem): void {
+  if (!st.recoveryPending) annotationWarning(core, st, problem.file, problem.kind, problem.detail);
 }
 
 /** Reads source.json and its annotations file; a problem with the pair is returned, not recorded. */
