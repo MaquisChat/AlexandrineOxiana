@@ -479,7 +479,7 @@ describe("Library screen", () => {
     const field = screen.getByLabelText("New name for methods");
     await user.clear(field);
     await user.type(field, "method{Enter}");
-    await user.click(within(screen.getByRole("group", { name: "Rename workspace tag methods?" })).getByRole("button", { name: "Rename" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" })).getByRole("button", { name: "Rename" }));
     await waitFor(() => expect(calls).toEqual(['PATCH w1 {"name":"method"}']));
     await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));
     await user.click(within(screen.getByRole("group", { name: "Delete workspace tag methods?" })).getByRole("button", { name: "Delete" }));
@@ -509,6 +509,33 @@ describe("Library screen", () => {
       "Deleting the workspace tag could not be done. Unlock every encrypted project first (Clinic interviews is locked): a workspace tag can be on sources in any project, so each one records the change.",
     );
     await waitFor(() => expect(tagReads).toBe(2));
+  });
+
+  it("after a workspace tag's rename is refused, focus is on that tag's Rename button (FR-165, R468)", async () => {
+    let tagReads = 0;
+    server.use(
+      http.get(url("/projects/:id/tags"), () => {
+        tagReads++;
+        return HttpResponse.json(TAGS);
+      }),
+      http.patch(url("/workspace-tags/:tid"), () =>
+        HttpResponse.json({ error: { code: "CONFLICT", message: "Unlock every encrypted project first (Clinic interviews is locked): a workspace tag can be on sources in any project, so each one records the change." } }, { status: 409 }),
+      ),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    await screen.findByText("Ethnography at Work");
+    await waitFor(() => expect(tagReads).toBe(1));
+    await user.click(screen.getByRole("button", { name: "Rename workspace tag methods" }));
+    const field = screen.getByLabelText("New name for methods");
+    await user.clear(field);
+    await user.type(field, "method{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" })).getByRole("button", { name: "Rename" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/^Renaming the workspace tag could not be done\. Unlock every encrypted project first/);
+    await waitFor(() => expect(tagReads).toBe(2));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Rename workspace tag methods" }));
   });
 
   it("Resolve… on an interrupted-change banner lists the changes and resolves one by the researcher's choice (R27)", async () => {

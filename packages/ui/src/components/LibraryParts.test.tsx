@@ -155,11 +155,10 @@ describe("TagList", () => {
     const field = screen.getByLabelText("New name for methods");
     await user.clear(field);
     await user.type(field, "method{Enter}");
-    // A workspace tag's rename reaches every project, so it is confirmed first (FR-165).
+    // A workspace tag's rename reaches every project, so it is confirmed first (FR-165), in a dialog (R468).
     expect(onRenameWorkspace).not.toHaveBeenCalled();
-    const ask = screen.getByRole("group", { name: "Rename workspace tag methods?" });
+    const ask = screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" });
     expect(ask.textContent).toMatch(/every project/);
-    expect(ask.textContent).toContain("method");
     await user.click(within(ask).getByRole("button", { name: "Rename" }));
     expect(onRenameWorkspace).toHaveBeenCalledWith("w1", "method");
     await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));
@@ -177,9 +176,61 @@ describe("TagList", () => {
     const field = screen.getByLabelText("New name for methods");
     await user.clear(field);
     await user.type(field, "method{Enter}");
-    await user.click(within(screen.getByRole("group", { name: "Rename workspace tag methods?" })).getByRole("button", { name: "Cancel" }));
-    expect(screen.queryByRole("group", { name: "Rename workspace tag methods?" })).toBeNull();
+    await user.click(within(screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" })).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
     expect(onRenameWorkspace).not.toHaveBeenCalled();
+  });
+
+  // R468 (I1): the rename's confirmation is one of the app's dialogs — focus goes in (to its heading,
+  // so the Enter that opened it, held or pressed again, confirms nothing: R376 c), Escape and Cancel
+  // close it, and afterwards focus is on the tag's Rename button (the name field is closed by then).
+  describe("the workspace tag rename confirmation's focus (FR-165, R468)", () => {
+    const open = async () => {
+      const onRenameWorkspace = vi.fn();
+      const user = userEvent.setup();
+      render(<TagList tags={TAGS.tags} workspaceTags={TAGS.workspaceTags} onSelect={vi.fn()} onRename={vi.fn()} onDelete={vi.fn()} onRenameWorkspace={onRenameWorkspace} onDeleteWorkspace={vi.fn()} onCreate={vi.fn()} />);
+      await user.click(screen.getByRole("button", { name: "Rename workspace tag methods" }));
+      const field = screen.getByLabelText("New name for methods");
+      await user.clear(field);
+      await user.type(field, "method{Enter}");
+      const dialog = screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" });
+      return { user, onRenameWorkspace, dialog };
+    };
+    const renameButton = () => screen.getByRole("button", { name: "Rename workspace tag methods" });
+
+    it("focus goes to the dialog's heading, and the Enter that opened it, pressed again, confirms nothing", async () => {
+      const { user, onRenameWorkspace, dialog } = await open();
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Rename the workspace tag methods to method?" }));
+      await user.keyboard("{Enter}{Enter}");
+      expect(onRenameWorkspace).not.toHaveBeenCalled();
+      expect(screen.getByRole("dialog")).toBe(dialog);
+    });
+
+    it("Tab then Enter confirms once, and focus is back on the tag's Rename button", async () => {
+      const { user, onRenameWorkspace, dialog } = await open();
+      await user.tab();
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Rename" }));
+      await user.keyboard("{Enter}");
+      expect(onRenameWorkspace).toHaveBeenCalledTimes(1);
+      expect(onRenameWorkspace).toHaveBeenCalledWith("w1", "method");
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(renameButton());
+    });
+
+    it("Escape closes it as Cancel does, and focus is back on the tag's Rename button", async () => {
+      const { user, onRenameWorkspace } = await open();
+      await user.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(onRenameWorkspace).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(renameButton());
+    });
+
+    it("Cancel closes it, and focus is back on the tag's Rename button", async () => {
+      const { user, onRenameWorkspace, dialog } = await open();
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(onRenameWorkspace).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(renameButton());
+    });
   });
 
   it("workspace tag buttons are off while read-only", () => {

@@ -3,9 +3,10 @@
  * (toggle). Both can be renamed and deleted (a delete is confirmed); a workspace tag's change reaches
  * every project (R118), so its rename is confirmed too (FR-165), and its buttons and confirmations say so.
  */
-import { useId, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import type { Tag } from "../api/library";
 import { CodeSwatch } from "./CodeSwatch";
+import { DialogShell } from "./ReasonDialog";
 import { useReadableNote } from "./ReadableNameNote";
 import { UserText } from "./UserText";
 import "./library.css";
@@ -47,6 +48,21 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
   const [mode, setMode] = useState<"view" | "rename" | "confirm-rename" | "delete">("view");
   const [name, setName] = useState(tag.name);
   const fieldId = useId();
+  const askId = useId();
+  // R468 (FR-165): the rename's confirmation is a dialog whose first focus is its heading (R376 c: the
+  // Enter that opened it, held or pressed again, confirms nothing). When it closes — confirmed,
+  // cancelled or Escape — focus goes back to this tag's Rename button: the name field is closed by
+  // then, and the button stays the same element while the tags are read again (after a refusal too).
+  const heading = useRef<HTMLHeadingElement>(null);
+  const renameButton = useRef<HTMLButtonElement>(null);
+  const [refocus, setRefocus] = useState(0);
+  useEffect(() => {
+    if (refocus) renameButton.current?.focus();
+  }, [refocus]);
+  const closeAsk = () => {
+    setMode("view");
+    setRefocus((n) => n + 1);
+  };
   const save = (e: FormEvent) => {
     e.preventDefault();
     const n = name.trim();
@@ -66,6 +82,7 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
       </button>
       {onRename && (
         <button
+          ref={renameButton}
           type="button"
           className="ao-small"
           aria-label={`Rename ${what} ${tag.name}`}
@@ -105,23 +122,26 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
         </form>
       )}
       {mode === "confirm-rename" && !readOnly && (
-        <div role="group" aria-label={`Rename ${what} ${tag.name}?`} className="ao-inline-form">
-          <span>
-            Rename the workspace tag <UserText>{tag.name}</UserText> to <UserText>{name}</UserText> in every project?
-          </span>
-          <button
-            type="button"
-            onClick={() => {
-              setMode("view");
-              onRename?.(name);
-            }}
-          >
-            Rename
-          </button>
-          <button type="button" onClick={() => setMode("view")}>
-            Cancel
-          </button>
-        </div>
+        <DialogShell labelledBy={askId} onCancel={closeAsk} initialFocus={heading}>
+          <h2 id={askId} ref={heading} tabIndex={-1}>
+            Rename the workspace tag <UserText>{tag.name}</UserText> to <UserText>{name}</UserText>?
+          </h2>
+          <p>A workspace tag is shared by every project, so it is renamed in every project.</p>
+          <div className="ao-actions">
+            <button
+              type="button"
+              onClick={() => {
+                closeAsk();
+                onRename?.(name);
+              }}
+            >
+              Rename
+            </button>
+            <button type="button" onClick={closeAsk}>
+              Cancel
+            </button>
+          </div>
+        </DialogShell>
       )}
       {mode === "delete" && !readOnly && (
         <div role="group" aria-label={`Delete ${what} ${tag.name}?`} className="ao-inline-form">
