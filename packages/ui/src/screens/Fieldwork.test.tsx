@@ -326,6 +326,8 @@ describe("Fieldwork", () => {
       expect(within(c).queryByText("Signed form attached.")).toBeNull();
       expect(screen.getByRole("status", { name: "Fieldwork result" }).textContent).toMatch(/The signed form was detached/);
       expect(screen.queryByRole("dialog")).toBeNull();
+      // R463 M3: focus goes to the control that attaches a form to this record, not to the page.
+      await waitFor(() => expect(document.activeElement).toBe(within(c).getByRole("textbox", { name: "Or add the form by its full path" })));
     });
 
     it("R463 M2: a form detached meanwhile elsewhere: the screen says nothing was changed and shows the record as it is", async () => {

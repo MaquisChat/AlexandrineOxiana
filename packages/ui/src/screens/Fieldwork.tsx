@@ -114,6 +114,9 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
   const [withdrawing, setWithdrawing] = useState<ConsentRecord | null>(null);
   /** FR-160: the consent record whose signed form the researcher asked to detach (asked in a dialog, with a reason). */
   const [detaching, setDetaching] = useState<ConsentRecord | null>(null);
+  /** R463 M3: the record whose form was just detached: once its drop zone is back, focus goes to the control that attaches a form. */
+  const [detachedFrom, setDetachedFrom] = useState<string | null>(null);
+  const attachAreas = useRef(new Map<string, HTMLDivElement>());
   /** A dropped form the service refused because it was detached from this record before (R119): offered for an explicit re-attach. */
   const [reattach, setReattach] = useState<{ consentId: string; path: string } | null>(null);
   /** FR-168: the re-attach offer takes focus when it appears, so that it is not missed (a screen reader reads it). */
@@ -189,6 +192,14 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
     const first = el.closest("form")?.querySelector<HTMLElement>("input:not([disabled]), select:not([disabled]), textarea:not([disabled])");
     first?.focus();
   }, [busy]);
+
+  useEffect(() => {
+    if (!detachedFrom || busy) return;
+    const area = attachAreas.current.get(detachedFrom);
+    if (!area) return;
+    setDetachedFrom(null);
+    area.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled)")?.focus();
+  }, [detachedFrom, busy, consents]);
 
   const codeOf = (id: string) => participants?.find((p) => p.id === id)?.code ?? "(removed participant)";
 
@@ -383,27 +394,34 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
                   ) : null}
                 </p>
               ) : !c.withdrawn ? (
-                <FileDrop
-                  prompt="Drop the signed consent form here (a PDF or an image, up to 100 MB)."
-                  fieldLabel="Or add the form by its full path"
-                  single={{ message: "Drop one signed form at a time: each consent record holds one form. Nothing was added." }}
-                  disabled={busy}
-                  onPaths={(paths) =>
-                    void run(async () => {
-                      setReattach(null);
-                      try {
-                        const r = await api.attachConsentDocument(projectId, c.id, paths[0]!);
-                        return r.note ? `Signed form attached. ${r.note}` : undefined;
-                      } catch (err) {
-                        if (err instanceof ApiClientError && err.reason === "detached-form") {
-                          setReattach({ consentId: c.id, path: paths[0]! });
-                          return;
+                <div
+                  ref={(el) => {
+                    if (el) attachAreas.current.set(c.id, el);
+                    else attachAreas.current.delete(c.id);
+                  }}
+                >
+                  <FileDrop
+                    prompt="Drop the signed consent form here (a PDF or an image, up to 100 MB)."
+                    fieldLabel="Or add the form by its full path"
+                    single={{ message: "Drop one signed form at a time: each consent record holds one form. Nothing was added." }}
+                    disabled={busy}
+                    onPaths={(paths) =>
+                      void run(async () => {
+                        setReattach(null);
+                        try {
+                          const r = await api.attachConsentDocument(projectId, c.id, paths[0]!);
+                          return r.note ? `Signed form attached. ${r.note}` : undefined;
+                        } catch (err) {
+                          if (err instanceof ApiClientError && err.reason === "detached-form") {
+                            setReattach({ consentId: c.id, path: paths[0]! });
+                            return;
+                          }
+                          throw err;
                         }
-                        throw err;
-                      }
-                    })
-                  }
-                />
+                      })
+                    }
+                  />
+                </div>
               ) : null}
               {reattach?.consentId === c.id && !c.documentAssetId && (
                 <div ref={reattachOffer} tabIndex={-1} role="group" aria-label={`Re-attach the signed form of ${codeOf(c.participantId)}?`} className="ao-field">
@@ -542,6 +560,7 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
             // A governed, audited change in the library (updateConsent: `consent.document-detach`, R117 I3); the form stays a source of the project.
             void run(async () => {
               await api.updateConsent(projectId, c.id, { documentAssetId: null, detachReason: reason });
+              setDetachedFrom(c.id);
               return "The signed form was detached. It stays in the project; you can now attach the right form to this consent record.";
             });
           }}
