@@ -79,6 +79,9 @@ export const YOUR_LIBRARY_SCREEN_TEXT = {
   waitDerive: "Wait until the address is worked out.",
   waitStay: "Wait until “Stay signed in” is changed.",
   waitSave: "Wait until your changes are saved.",
+  // FR-557: a press on a control whose own request is out says to wait (never a silent press, R336 a).
+  waitTest: "Wait until the test has started.",
+  waitSignOut: "Wait until signing out is finished.",
   saved: "Saved.",
   saveTimedOut: "The service did not answer. Your changes are still here; save again in a moment.",
   saveFailed: "The settings could not be saved.",
@@ -356,7 +359,11 @@ export function YourLibrary({ client }: { client: ApiClient }) {
   };
   const derive = async () => {
     const c = confirmedRef.current;
-    if (deriveBusy.current || saveBusy.current || !c || c.problem?.code === "newer") return;
+    if (deriveBusy.current) {
+      say(T.waitDerive);
+      return;
+    }
+    if (saveBusy.current || !c || c.problem?.code === "newer") return;
     const link = linkRef.current?.value ?? "";
     if (link.trim() === "") {
       setDerived(T.pasteFirst);
@@ -403,7 +410,11 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       say(T.waitSave);
       return;
     }
-    if (!shell || stayBusy.current || !c || c.problem?.code === "newer") return;
+    if (stayBusy.current) {
+      say(T.waitStay);
+      return;
+    }
+    if (!shell || !c || c.problem?.code === "newer") return;
     stayBusy.current = true;
     setStayPending(on);
     setStayNote(undefined);
@@ -455,7 +466,11 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       return;
     }
     const c = confirmedRef.current;
-    if (saveBusy.current || deriveBusy.current || stayBusy.current || !c || c.problem?.code === "newer") return;
+    if (saveBusy.current) {
+      say(T.waitSave);
+      return;
+    }
+    if (deriveBusy.current || stayBusy.current || !c || c.problem?.code === "newer") return;
     if (Date.now() - saveEndedAt.current < SECOND_PRESS_MS) return;
     const d = draftRef.current ?? fromAnswer(c);
     // "Stay signed in" is sent as saved: a save never changes it (R335 a).
@@ -515,7 +530,11 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       say(testBlocked);
       return;
     }
-    if (!shell || testBusy.current) return;
+    if (testBusy.current) {
+      say(T.waitTest);
+      return;
+    }
+    if (!shell) return;
     if (windowMayBeOpen.current) {
       setTestResult(T.windowAlreadyOpen);
       say(T.windowAlreadyOpen);
@@ -564,7 +583,10 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       say(T.onlyDesktop);
       return;
     }
-    if (signOutBusy.current) return;
+    if (signOutBusy.current) {
+      say(T.waitSignOut);
+      return;
+    }
     signOutBusy.current = true;
     setSigningOut(true);
     const r = await within(shell.signOutOfLibrary());
