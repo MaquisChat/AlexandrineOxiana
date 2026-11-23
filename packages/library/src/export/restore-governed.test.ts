@@ -605,6 +605,20 @@ async function rewriteAudit(p: Project, edit: (e: AuditEvent) => void): Promise<
   await writeFile(join(dir, names[0]!), `${lines.join("\n")}\n`);
 }
 
+/**
+ * After `rewriteAudit`: records the rewritten log's head as its anchor, as the app that wrote it would have, so that
+ * the reopen takes the log as whole (an entry in an earlier form, not a change made outside the app).
+ */
+async function reanchor(p: Project): Promise<void> {
+  const file = join(kit.tmp, "config", "audit-anchors.json");
+  const j = JSON.parse(await readFile(file, "utf8")) as { anchors: Record<string, { seq: number; hash: string }> };
+  const key = Object.keys(j.anchors).find((k) => k.endsWith(`/${p.id}`));
+  expect(key).toBeDefined();
+  const last = (await auditEvents(kit, kit.repo.getProject(p.id))).at(-1)!;
+  j.anchors[key!] = { ...j.anchors[key!], seq: last.seq, hash: last.hash };
+  await writeFile(file, JSON.stringify(j));
+}
+
 /** Changes one entry of the project's audit log on disk (not the last): the chain no longer verifies. Returns how to put it back. */
 async function breakAudit(p: Project, pick: (line: string) => boolean): Promise<() => Promise<void>> {
   const dir = join(kit.lib.root, kit.repo.getProject(p.id).folder, "audit");
@@ -1401,6 +1415,74 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([OWN_RULE]);
   });
 
+  /** Removes lines of the project's audit log on disk (the last line, or another): the app finds the log cut. */
+  async function cutAudit(p: Project, pick: (lines: string[]) => number): Promise<AuditEvent> {
+    const dir = join(kit.lib.root, kit.repo.getProject(p.id).folder, "audit");
+    const segment = join(dir, (await readdir(dir)).sort().at(-1)!);
+    const lines = (await readFile(segment, "utf8")).split("\n").filter((l) => l.trim());
+    const i = pick(lines);
+    const [cut] = lines.splice(i, 1);
+    await writeFile(segment, `${lines.join("\n")}\n`);
+    return JSON.parse(cut!) as AuditEvent;
+  }
+
+  it("S-I1 (R484 i), probe P4: the copy's log cut at its end (the restore's entry gone), the library reopened: nothing is stated as fact", async () => {
+    const z = await makeProject(kit, RETAIN_EXPORTABLE, false, "Bystander");
+    const zRaw = await rawSource(z);
+    await addSource(kit, z, { title: "something else" });
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T09:59:00.000Z");
+    const offline = join(kit.tmp, "Origin offline copy.zip");
+    await writeFile(offline, await readFile((await backupProject(kit.repo, p.id)).path));
+    at("2026-12-02T10:00:00.000Z");
+    backupSeams.failBackup = true;
+    await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    await breakAudit(z, (l) => l.includes('"op":"retention.destroy"'));
+    const r = await restore(offline);
+    expect(r.leftOut).toEqual([expect.objectContaining({ unverified: true })]);
+    const copy = kit.repo.getProject(r.projectId);
+    expect((await cutAudit(copy, (lines) => lines.length - 1)).action).toBe("project.restored");
+    await kit.reopen();
+    // What the app knows: the warning, the recorded mismatch, verifyAudit not whole; the chain itself verifies again.
+    expect(kit.repo.integrityWarnings.some((w) => w.projectId === r.projectId && w.kind === "truncated")).toBe(true);
+    expect((await eventsOf(r.projectId)).some((e) => e.action === "audit.anchor-mismatch")).toBe(true);
+    expect(await kit.repo.verifyAudit(r.projectId)).toMatchObject({ ok: false, anchored: true, alteredAt: [expect.any(String)] });
+    expect(verifyChain(await eventsOf(r.projectId)).ok).toBe(true);
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([LOG_NOT_INTACT]);
+  });
+
+  it("S-I1 (R484 i): a line cut from the middle of the project's log, the library reopened: nothing is stated as fact", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    await addSource(kit, p, { title: "added later" });
+    await cutAudit(p, (lines) => lines.findIndex((l) => l.includes('"op":"retention.destroy"')) - 1);
+    await kit.reopen();
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([LOG_NOT_INTACT]);
+  });
+
+  it("S-I1 (R484 i): an anchor mismatch recorded earlier in a log that is otherwise whole: nothing is stated as fact", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([OWN_RULE]);
+    await addSource(kit, p, { title: "added later" });
+    expect((await cutAudit(p, (lines) => lines.length - 1)).action).not.toBe("delete");
+    await kit.reopen();
+    // The log goes on, whole from the reopen: its chain verifies and it ends where the app holds its head.
+    await addSource(kit, p, { title: "added after the reopen" });
+    expect(verifyChain(await eventsOf(p.id)).ok).toBe(true);
+    expect((await kit.repo.verifyAudit(p.id)).alteredAt).toHaveLength(1);
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([LOG_NOT_INTACT]);
+  });
+
   it("M1: a copy restored before the files were named (a count only): its export and a restore of its backup state none of that restore's destructions as fact", async () => {
     const { offline } = await mixed();
     const r = await restore(offline);
@@ -1409,7 +1491,9 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     await rewriteAudit(copy, (e) => {
       if (e.action === "project.restored") delete (e.details as Details).destroyedUnverifiedAssetIds;
     });
+    await reanchor(copy);
     await kit.reopen();
+    expect((await kit.repo.verifyAudit(r.projectId)).ok).toBe(true);
     expect(verifyChain(await eventsOf(r.projectId)).ok).toBe(true);
     expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([TWO_UNVERIFIED]);
     later(HOUR);

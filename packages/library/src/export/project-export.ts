@@ -122,7 +122,8 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
  *     project it was restored from, before the backup was made);
  *   restoredVerified — a restore left it out on a verified record in this library (possibly another project's);
  *   restoredUnverified — a restore left it out on records the app could not verify;
- *   logNotIntact — the project's own audit log does not verify, so nothing is stated as fact.
+ *   logNotIntact — the project's own audit log is not whole (`Repo.verifyAudit`: its chain, its anchor, no
+ *     alteration recorded at an earlier opening), so nothing is stated as fact.
  */
 type DestroyedBasis = "own" | "restoredVerified" | "restoredUnverified" | "logNotIntact";
 const DESTROYED_BASES: DestroyedBasis[] = ["own", "restoredVerified", "restoredUnverified", "logNotIntact"];
@@ -397,8 +398,13 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
   /** Read only when there is a destroyed original; before the export folder is made, so a read that fails leaves none (R473 M2). */
   let basisOf: (a: Asset) => DestroyedBasis = () => "own";
   if (allowed.some(({ sf }) => sf.assets.some((a) => a.role === "original" && a.status === "destroyed"))) {
+    // The log counts as intact only where `verifyAudit` finds it whole (R484 i): besides a chain that
+    // verifies to the head this process holds (`verifiedAuditEvents`), it ends where the anchor kept
+    // outside the library says and no earlier opening recorded it altered — a log cut at its end
+    // verifies again from the reopen's head, and would otherwise lose the restore's entry unnoticed.
     const log = await verifiedAuditEvents(repo, projectId);
-    basisOf = log.ok ? destroyedBasis(log.events) : () => "logNotIntact";
+    const whole = log.ok && (await repo.verifyAudit(projectId)).ok;
+    basisOf = log.ok && whole ? destroyedBasis(log.events) : () => "logNotIntact";
   }
 
   // 2. The export folder (new; never an existing one), written as "<folder>.partial" and renamed
