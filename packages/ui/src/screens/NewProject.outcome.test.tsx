@@ -584,6 +584,57 @@ describe("New project dialog: an unknown outcome is never left behind (fix round
     server.events.removeAllListeners();
   });
 
+  it("FR-182 (R463 M8): an automatic re-check that still cannot tell leaves the alert untouched, so it is not announced again", async () => {
+    const svc = serveLost(NEW_ENC);
+    svc.listFails = true;
+    const events = controllableEvents();
+    server.use(events.handler);
+    let lists = 0;
+    server.events.on("request:start", ({ request }) => {
+      if (request.method === "GET" && new URL(request.url).pathname === "/projects") lists++;
+    });
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    await toCannotTell(user, fillEncrypted);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(within(notice()).getByRole("button", { name: "Check again" }).hasAttribute("disabled")).toBe(false));
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(notice().textContent).toMatch(/still cannot tell/i));
+    await waitFor(() => expect(within(notice()).getByRole("button", { name: "Check again" }).hasAttribute("disabled")).toBe(false));
+    const alert = within(notice()).getByRole("alert");
+    const said = alert.textContent;
+    const changes: MutationRecord[] = [];
+    const watch = new MutationObserver((m) => changes.push(...m));
+    watch.observe(notice(), { subtree: true, childList: true, characterData: true, attributes: true });
+
+    // The service is slow to fail, as a real one is: the re-check's read is held, then fails.
+    let fail!: () => void;
+    const held = new Promise<void>((r) => (fail = r));
+    let answered = 0;
+    server.use(
+      http.get(url("/projects"), async () => {
+        await held;
+        queueMicrotask(() => answered++);
+        return HttpResponse.error();
+      }),
+    );
+    const before = lists;
+    act(() => events.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} }));
+    await waitFor(() => expect(lists).toBe(before + 1));
+    fail();
+    await waitFor(() => expect(answered).toBe(1));
+    // The failed read has been handled (its rejection settles before the next task).
+    await act(async () => {});
+    changes.push(...watch.takeRecords());
+    watch.disconnect();
+    expect(within(notice()).getByRole("alert")).toBe(alert);
+    expect(alert.textContent).toBe(said);
+    expect(changes).toEqual([]);
+    expect(svc.posted).toHaveLength(1);
+    server.events.removeAllListeners();
+  });
+
   it("FR-204, FR-205: two new projects with the name: the notice says so and opens neither", async () => {
     const svc = serveLost(null);
     svc.listFails = true;

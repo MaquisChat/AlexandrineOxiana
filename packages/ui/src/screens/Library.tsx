@@ -327,15 +327,23 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
    * Settles a create whose answer was lost (fix round 2): a successful read of the list says whether
    * the project was made; until then the notice stays. `auto`: the read made as the dialog closed.
    */
+  /** A check is in flight: an automatic one does not start another (R463 M8). */
+  const checkingNow = useRef(false);
   const checkUnresolved = useCallback(
-    async (create: UnresolvedCreate, auto = false) => {
-      setUnresolved({ create, state: "checking" });
+    async (create: UnresolvedCreate, auto = false, quiet = false) => {
+      // R463 M8: an automatic re-check (`quiet`) changes nothing on screen unless it settles the outcome, so the alert
+      // that says the app cannot tell is not taken down and announced again at each one.
+      if (quiet && checkingNow.current) return;
+      checkingNow.current = true;
+      if (!quiet) setUnresolved({ create, state: "checking" });
       try {
         const fresh = madeSince(await reloadProjects(), create);
         // FR-204, FR-205: more than one new project with that name is said, and none is taken for the one made then.
-        if (mounted.current) setUnresolved({ create, state: fresh.length > 1 ? { many: fresh } : fresh.length ? { found: fresh[0]! } : "not-created" });
+        if (mounted.current) setUnresolved((u) => (quiet && u?.create !== create ? u : { create, state: fresh.length > 1 ? { many: fresh } : fresh.length ? { found: fresh[0]! } : "not-created" }));
       } catch {
-        if (mounted.current) setUnresolved({ create, state: auto ? "unknown" : "still-unknown" });
+        if (mounted.current && !quiet) setUnresolved({ create, state: auto ? "unknown" : "still-unknown" });
+      } finally {
+        checkingNow.current = false;
       }
     },
     [reloadProjects],
@@ -346,7 +354,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   unresolvedRef.current = unresolved;
   useEffect(() => {
     const u = unresolvedRef.current;
-    if (stateSeq && u && (u.state === "unknown" || u.state === "still-unknown")) void checkUnresolved(u.create, u.state === "unknown");
+    if (stateSeq && u && (u.state === "unknown" || u.state === "still-unknown")) void checkUnresolved(u.create, u.state === "unknown", true);
   }, [stateSeq, checkUnresolved]);
   const dialogClosed = (unresolvedCreate?: UnresolvedCreate, made?: ProjectSummary) => {
     setCreating(false);
