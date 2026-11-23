@@ -118,6 +118,13 @@ declare module "fastify" {
  * browser and the PDF itself — both with the paired Origin (neither is a no-Origin route; the list is a POST so that
  * Chrome sends it).
  */
+/** During a move (FR-329, R466 M4): a change to this app's own settings, secrets, pairings or remembered choices. */
+const MOVE_DEVICE_TEXT = "While the library is being moved, this app changes nothing, not even its own settings or its list of paired browsers. Try again when the move has finished.";
+/** During a move: the optional tools on this computer (installed, updated, removed, or an install stopped). */
+const MOVE_TOOLS_TEXT = "While the library is being moved, this app installs, updates and removes no tools, and stops none being installed. Try again when the move has finished.";
+/** Requests that are not GETs but write nothing (no file, no setting, nothing in a library): not changes (R466 M4). */
+const WRITES_NOTHING = new Set(["POST /settings/your-library/derive", "POST /settings/your-library/test", "POST /settings/search-sources/:group/:id/test"]);
+
 const EXTENSION_ROUTES = new Set(["POST /capture/browser", "POST /capture/browser/links", "GET /projects", "POST /find/browser/waiting", "POST /find/browser/file/:ticket"]);
 /** The browser's file route as a preflight asks for it (R353 c). */
 const BROWSER_FILE_PREFLIGHT = /^\/find\/browser\/file\/[^/]+$/u;
@@ -296,12 +303,16 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   // never holds up a move: it is refused here if a move started meanwhile.
   app.addHook("preHandler", async (req: FastifyRequest, reply: FastifyReply) => {
     if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return;
+    const route = `${req.method} ${req.routeOptions.url ?? ""}`;
+    // Asked with a body, but they write nothing anywhere: answered as at any other time (R466 M4).
+    if (WRITES_NOTHING.has(route)) return;
     if (state.moving) {
-      if (`${req.method} ${req.routeOptions.url ?? ""}` === "POST /libraries/move") return fail(reply, new ApiError(409, "CONFLICT", "A move of this library is already running."));
-      // A change to this app's own settings, secrets or pairings is refused too (R102 N2), in words
-      // that do not suggest the change belongs to the library being moved (FR-329).
-      const deviceOnly = /^\/(settings|secrets|extension)\//.test(req.routeOptions.url ?? "");
-      return fail(reply, new ApiError(503, "MOVE_IN_PROGRESS", deviceOnly ? "While the library is being moved, this app changes nothing, not even its own settings or its list of paired browsers. Try again when the move has finished." : "The library is being moved. Try again when the move has finished."));
+      if (route === "POST /libraries/move") return fail(reply, new ApiError(409, "CONFLICT", "A move of this library is already running."));
+      // A change on this computer outside the library is refused too (R102 N2), in words that do not
+      // suggest the change belongs to the library being moved (FR-329, R466 M4).
+      const url = req.routeOptions.url ?? "";
+      const message = /^\/tools\//.test(url) ? MOVE_TOOLS_TEXT : /^\/(settings|secrets|extension)\//.test(url) || route === "PUT /find/screen" ? MOVE_DEVICE_TEXT : "The library is being moved. Try again when the move has finished.";
+      return fail(reply, new ApiError(503, "MOVE_IN_PROGRESS", message));
     }
     inFlightMutating++;
     reply.raw.once("close", () => inFlightMutating--);
