@@ -78,6 +78,26 @@ async function save(deps: RegDeps, entries: RegistryEntry[]): Promise<void> {
   await writeFileAtomic(file(deps), JSON.stringify(entries, null, 2));
 }
 
+/**
+ * One change of the libraries list at a time (FR-411): each read-modify-write (and the setting aside
+ * of a damaged list) waits for the one before it, per settings folder. Without this, the chooser
+ * setting a damaged list aside while a library is opened or created made one of the two renames fail.
+ */
+const turns = new Map<string, Promise<unknown>>();
+function inTurn<T>(deps: RegDeps, work: () => Promise<T>): Promise<T> {
+  const key = file(deps);
+  const run = (turns.get(key) ?? Promise.resolve()).then(work, work);
+  const settled = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  turns.set(key, settled);
+  void settled.then(() => {
+    if (turns.get(key) === settled) turns.delete(key);
+  });
+  return run;
+}
+
 async function loadForUpdate(deps: RegDeps): Promise<RegistryEntry[]> {
   const { entries, damaged } = await load(deps);
   await backupIfDamaged(deps, damaged);
@@ -92,29 +112,33 @@ export async function registerLibrary(
   lib: { libraryId: string; name: string; path: string },
   deps: RegDeps,
 ): Promise<void> {
-  const entries = await loadForUpdate(deps);
-  const at = deps.clock().toISOString();
-  const i = entries.findIndex((e) => e.libraryId === lib.libraryId);
-  const prev = i >= 0 ? entries[i]! : undefined;
-  const entry: RegistryEntry = {
-    libraryId: lib.libraryId,
-    name: lib.name,
-    lastKnownPaths: withPath(prev?.lastKnownPaths ?? [], lib.path),
-    lastOpenedAt: at,
-  };
-  if (i >= 0) entries[i] = entry;
-  else entries.push(entry);
-  await save(deps, entries);
+  return inTurn(deps, async () => {
+    const entries = await loadForUpdate(deps);
+    const at = deps.clock().toISOString();
+    const i = entries.findIndex((e) => e.libraryId === lib.libraryId);
+    const prev = i >= 0 ? entries[i]! : undefined;
+    const entry: RegistryEntry = {
+      libraryId: lib.libraryId,
+      name: lib.name,
+      lastKnownPaths: withPath(prev?.lastKnownPaths ?? [], lib.path),
+      lastOpenedAt: at,
+    };
+    if (i >= 0) entries[i] = entry;
+    else entries.push(entry);
+    await save(deps, entries);
+  });
 }
 
 /** Moves `path` to the front of the library's known paths. No-op if unknown. */
 export async function recordLocation(libraryId: string, path: string, deps: RegDeps): Promise<void> {
-  const entries = await loadForUpdate(deps);
-  const e = entries.find((x) => x.libraryId === libraryId);
-  if (!e) return;
-  e.lastKnownPaths = withPath(e.lastKnownPaths, path);
-  e.lastOpenedAt = deps.clock().toISOString();
-  await save(deps, entries);
+  return inTurn(deps, async () => {
+    const entries = await loadForUpdate(deps);
+    const e = entries.find((x) => x.libraryId === libraryId);
+    if (!e) return;
+    e.lastKnownPaths = withPath(e.lastKnownPaths, path);
+    e.lastOpenedAt = deps.clock().toISOString();
+    await save(deps, entries);
+  });
 }
 
 /**
@@ -123,11 +147,13 @@ export async function recordLocation(libraryId: string, path: string, deps: RegD
  * make a move's destination findable before it becomes the library's location.
  */
 export async function addKnownPath(libraryId: string, path: string, deps: RegDeps): Promise<void> {
-  const entries = await loadForUpdate(deps);
-  const e = entries.find((x) => x.libraryId === libraryId);
-  if (!e || e.lastKnownPaths.includes(path)) return;
-  e.lastKnownPaths = [...e.lastKnownPaths.slice(0, 1), path, ...e.lastKnownPaths.slice(1)].slice(0, MAX_PATHS);
-  await save(deps, entries);
+  return inTurn(deps, async () => {
+    const entries = await loadForUpdate(deps);
+    const e = entries.find((x) => x.libraryId === libraryId);
+    if (!e || e.lastKnownPaths.includes(path)) return;
+    e.lastKnownPaths = [...e.lastKnownPaths.slice(0, 1), path, ...e.lastKnownPaths.slice(1)].slice(0, MAX_PATHS);
+    await save(deps, entries);
+  });
 }
 
 /**
@@ -136,16 +162,20 @@ export async function addKnownPath(libraryId: string, path: string, deps: RegDep
  * error other than "missing" throws, as every other registry read does.
  */
 export async function settleDamagedRegistry(deps: RegDeps): Promise<void> {
-  const { entries, damaged } = await load(deps);
-  if (!damaged) return;
-  await backupIfDamaged(deps, true);
-  await save(deps, entries);
+  return inTurn(deps, async () => {
+    const { entries, damaged } = await load(deps);
+    if (!damaged) return;
+    await backupIfDamaged(deps, true);
+    await save(deps, entries);
+  });
 }
 
 export async function forgetLibrary(libraryId: string, deps: RegDeps): Promise<void> {
-  const entries = await loadForUpdate(deps);
-  const rest = entries.filter((e) => e.libraryId !== libraryId);
-  if (rest.length !== entries.length) await save(deps, rest);
+  return inTurn(deps, async () => {
+    const entries = await loadForUpdate(deps);
+    const rest = entries.filter((e) => e.libraryId !== libraryId);
+    if (rest.length !== entries.length) await save(deps, rest);
+  });
 }
 
 // ---------------------------------------------------------------------------------------------

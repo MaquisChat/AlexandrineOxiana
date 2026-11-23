@@ -18,7 +18,7 @@ vi.mock("node:fs/promises", async (orig) => {
 });
 
 import { deviceNoticesIdle, readDeviceNotices } from "./device-notices.js";
-import { listLibraries, registerLibrary } from "./registry.js";
+import { listLibraries, registerLibrary, settleDamagedRegistry } from "./registry.js";
 
 let dir: string;
 const at = new Date("2026-11-12T10:15:30.000Z");
@@ -52,6 +52,20 @@ describe("libraries.json set aside (R181 a)", () => {
     await deviceNoticesIdle();
     expect(await readDeviceNotices(dir)).toEqual([]);
     expect(await readFile(join(dir, "libraries.json"), "utf8")).toBe("{broken");
+  });
+
+  it("FR-411: the chooser setting a damaged list aside while a library is opened or created: both succeed, one copy set aside", async () => {
+    await writeFile(join(dir, "libraries.json"), JSON.stringify([{ libraryId: "L0", name: "Zero", lastKnownPaths: ["/a/Zero"], lastOpenedAt: "2026-01-01T00:00:00Z" }, 7]));
+    await Promise.all([
+      settleDamagedRegistry(deps()),
+      registerLibrary({ libraryId: "L1", name: "One", path: "/a/One" }, deps()),
+      settleDamagedRegistry(deps()),
+      registerLibrary({ libraryId: "L2", name: "Two", path: "/a/Two" }, deps()),
+    ]);
+    await deviceNoticesIdle();
+    expect((await readdir(dir)).filter((n) => n.startsWith("libraries.json.corrupt-"))).toHaveLength(1);
+    expect(await readDeviceNotices(dir)).toEqual([{ kind: "libraries-list-set-aside", at: at.toISOString() }]);
+    expect((await listLibraries(deps())).map((e) => e.libraryId).sort()).toEqual(["L0", "L1", "L2"]);
   });
 
   it("a list that is fine, or missing: no notice", async () => {
