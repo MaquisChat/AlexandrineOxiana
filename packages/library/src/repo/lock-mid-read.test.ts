@@ -43,7 +43,7 @@ import { appendJobRecords, readJobJournal, refreshJobRows, type JobRecord } from
 import { HttpClient } from "../lookup/index.js";
 import { checkIntegrity, relinkMissing } from "../reconnect.js";
 import { readAssetText, transcriptVersions } from "../source-actions.js";
-import { openAssetContent } from "../asset-content.js";
+import { openAssetContent, openHeldFileContent } from "../asset-content.js";
 import { readTranscript } from "../transcript-segments.js";
 import { TRANSCRIBE_KIND, transcriptionRecords } from "../transcription-jobs.js";
 import { ProjectLockedError } from "./errors.js";
@@ -61,6 +61,7 @@ import {
   readFindQueueDetailedIn,
   readFindQueueIn,
   appendFindEntriesIn,
+  holdMismatchedFileIn,
   importChange,
 } from "./repo.js";
 import { openingSeam } from "./testing.js";
@@ -137,6 +138,8 @@ interface Ctx {
   /** The project's sealed backup (in Backups/) and a copy of it outside the library (restored by the restore row). */
   backupFile: string;
   backupCopy: string;
+  /** R470 b: the review entry of a file Find and acquire holds for the researcher's decision (sealed at rest). */
+  heldReview: string;
 }
 
 interface Row {
@@ -552,6 +555,22 @@ async function build(): Promise<Ctx> {
     attempts: 0,
   }));
   await appendFindEntriesIn(kit.repo, p.id, entries, "add");
+  // R470 b: a file held for a record without a file, waiting for the researcher's decision (sealed, as every held file here).
+  const wanting = await kit.repo.createSource(
+    p.id,
+    { projectIds: [], type: "article-journal", title: mt("Wanting a file"), creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+    [],
+    { provenance: { captureMethod: "manual_upload", capturedAt: kit.clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+  );
+  const waiting: FindEntry = { ...entries[0]!, id: newId(), state: "fetching", sourceId: wanting.source.id };
+  await appendFindEntriesIn(kit.repo, p.id, [waiting], "add");
+  const heldPdf = await scratchFile(kit, "held.pdf", PDF(3 * 1024 * 1024));
+  const { reviewId: heldReview } = await holdMismatchedFileIn(kit.repo, p.id, {
+    entry: { ...waiting, state: "needs-check", reason: { code: "file-other-doi" } },
+    sourceId: wanting.source.id,
+    fromPath: heldPdf,
+    facts: { why: "other-doi", kind: "pdf", bytes: 1, acquired: { method: "free_copy", via: "service", service: "arxiv", address: "https://arxiv.org/pdf/2101.00001", at: kit.clock.now.toISOString(), tool: { name: "find-and-acquire", version: "0" }, access: "public" } },
+  });
   // A watched folder's register.
   const watchId = newId();
   await kit.repo.recordWatchedFiles(p.id, watchId, [reg(0, sources[1]!.source.id), reg(1, sources[2]!.source.id), reg(2, newId())]);
@@ -616,6 +635,7 @@ async function build(): Promise<Ctx> {
     other,
     backupFile: basename(made.path),
     backupCopy,
+    heldReview,
   };
   ctx.sources = [];
   for (const id of kit.repo.listSourceIds(p.id).sort()) ctx.sources.push(await kit.repo.getSource(p.id, id));
@@ -646,6 +666,19 @@ const ROWS: Row[] = [
     where: "asset-content.ts:58 (open :100)",
     run: async () => {
       const a = await openAssetContent(c.kit.repo, c.p.id, c.pdf.source.id, c.pdf.assets[0]!.id, () => true);
+      try {
+        return await a.read(0, a.size);
+      } finally {
+        await a.close();
+      }
+    },
+  },
+  {
+    // R470 b: a file Find and acquire holds, looked at before the researcher decides (the held-file route's reading).
+    name: "openHeldFileContent (a whole held PDF, looked at)",
+    where: "asset-content.ts (openHeldFileContent → openStored)",
+    run: async () => {
+      const a = await openHeldFileContent(c.kit.repo, c.p.id, c.heldReview);
       try {
         return await a.read(0, a.size);
       } finally {
