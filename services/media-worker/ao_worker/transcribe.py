@@ -69,6 +69,15 @@ def model_path(name: str) -> str:
     if absent:
         log.info("the %s speech model is not installed", name)
         raise not_installed(f"speech-{name}")
+    if not folder.is_dir() or not os.access(folder, os.R_OK | os.X_OK):
+        # The FOLDER cannot be read: installing the model again would not help (FR-254, R467 M8). No path.
+        log.warning("the speech models folder cannot be read; not downloading")
+        raise JobError(
+            "MODEL_UNAVAILABLE",
+            f"the folder that holds the speech models could not be read, so the {name} model could not be used; "
+            "check that the folder can be read, then try again",
+            tool=f"speech-{name}",
+        )
     try:
         path = download_model(name, cache_dir=cache, local_files_only=True)
     except Exception as e:  # noqa: BLE001 - reported, never answered with a download

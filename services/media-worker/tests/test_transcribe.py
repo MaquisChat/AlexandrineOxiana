@@ -105,9 +105,10 @@ def test_unreadable_models_folder_is_reported_and_not_downloaded(worker_env, tmp
     with pytest.raises(JobError) as e:
         transcribe.model_path("tiny")
     assert e.value.code == "MODEL_UNAVAILABLE"
-    assert "could not be read" in e.value.message
-    # A next step the researcher can take (FR-254).
-    assert e.value.message.endswith("; remove it and install it again from the Optional tools screen")
+    # A next step that fits the case (FR-254, R467 M8): the FOLDER cannot be read, so installing the
+    # model again would not help; no path in it.
+    assert e.value.message == "the folder that holds the speech models could not be read, so the tiny model could not be used; check that the folder can be read, then try again"
+    assert str(not_a_folder) not in e.value.message
     assert nn.attempts == []
 
 
