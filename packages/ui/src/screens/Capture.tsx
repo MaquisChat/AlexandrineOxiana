@@ -85,11 +85,11 @@ function hasCredentials(u: string): boolean {
  * internal (a read-only reason word, the media helper's start-up text, which can name shell commands
  * or paths) and is left out. A media helper that is not running gets one sentence of what to do.
  */
-/** What a lock cut from this project's capture queues: only the count is known (R464 b). */
+/** What a lock cut from this project's capture queues: only the count is known (R464 b), the link in flight at the lock included (R480 c). */
 const cutByLockText = (n: number): string =>
   n === 1
-    ? "A lock stopped the capture of 1 link in this project before it was tried. The link was not kept while the project was locked: add it again to capture it."
-    : `A lock stopped the capture of ${n} links in this project before they were tried. The links were not kept while the project was locked: add them again to capture them.`;
+    ? "A lock stopped 1 link in this project from being captured. The link was not kept while the project was locked: add it again to capture it."
+    : `A lock stopped ${n} links in this project from being captured. The links were not kept while the project was locked: add them again to capture them.`;
 
 function plainError(err: unknown, fallback: string): string {
   if (!(err instanceof ApiClientError)) return fallback;

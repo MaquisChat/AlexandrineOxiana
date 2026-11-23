@@ -869,8 +869,8 @@ describe("Capture screen — capture tools", () => {
 
 describe("Capture screen — what a lock cut (FR-370, FR-371; R464 b)", () => {
   const MANY =
-    "A lock stopped the capture of 3 links in this project before they were tried. The links were not kept while the project was locked: add them again to capture them.";
-  const ONE = "A lock stopped the capture of 1 link in this project before it was tried. The link was not kept while the project was locked: add it again to capture it.";
+    "A lock stopped 3 links in this project from being captured. The links were not kept while the project was locked: add them again to capture them.";
+  const ONE = "A lock stopped 1 link in this project from being captured. The link was not kept while the project was locked: add it again to capture it.";
   const ACK = `/projects/${P1}/captures/cut-by-lock/acknowledge`;
 
   it("says how many links a lock cut, as a status, and 'Got it' acknowledges it once and moves focus to the links field", async () => {
