@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MEDIA_TICKET_IDLE_MS } from "@ao/shared";
 import { transcriptApi } from "../api/transcripts";
 import { setMedia } from "../test/media";
 import { navigate } from "../navigation";
@@ -510,6 +511,49 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     }
     expect(svc.log.tickets).toHaveLength(5);
     expect(screen.queryByText(/The recording could not be played/)).toBeNull();
+  });
+
+  it("a resume seek that never lands: once the element is playing again its time is taken, so the playing segment follows (FR-259)", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 1);
+    fireEvent(el, new Event("error"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    browserReset(el);
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(1);
+    // No `seeked` ever comes, and the element plays on from elsewhere.
+    fireEvent(el, new Event("playing"));
+    playTo(el, 5.2);
+    playTo(el, 6);
+    expect(segmentItems()[2]!.getAttribute("aria-current")).toBe("true");
+    expect(segmentItems()[0]!.getAttribute("aria-current")).toBeNull();
+  });
+
+  it("three ticket expiries after long pauses near one spot are renewals, never 'may be damaged' (FR-260)", async () => {
+    const realNow = Date.now.bind(Date);
+    let skipped = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + skipped);
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    for (const [i, at] of [50, 50.8, 51.5, 50.2].entries()) {
+      playTo(el, at);
+      // Paused here longer than a ticket lives without reads: the ticket ended on its own.
+      skipped += MEDIA_TICKET_IDLE_MS + 60_000;
+      fireEvent(el, new Event("error"));
+      await waitFor(() => expect(svc.log.tickets).toHaveLength(i + 2));
+      await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[i + 1]!.path}`));
+      browserReset(el);
+      fireEvent(el, new Event("loadedmetadata"));
+      expect(el.currentTime).toBe(at);
+      fireEvent(el, new Event("seeked"));
+    }
+    expect(screen.queryByText(/The recording could not be played/)).toBeNull();
+    expect(svc.log.tickets).toHaveLength(5);
   });
 
   it("too many recordings open at once is said in one plain sentence (review M3)", async () => {

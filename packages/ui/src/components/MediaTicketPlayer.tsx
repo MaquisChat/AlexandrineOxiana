@@ -11,7 +11,8 @@
  * position moving RENEWAL_PROGRESS_S beyond where it failed; loading alone does not count — and a
  * place that fails a third time (within SAME_PLACE_S) ends it however much was played in between.
  * Then the player stops, says so, and offers "Try the recording again". Every ticket is revoked
- * once it is replaced or given up.
+ * once it is replaced or given up. A failure after the element was idle longer than a ticket lives
+ * unused is the ticket ending on its own: it is renewed and counts toward none of these (FR-260).
  *
  * The position is kept by the player, not read back from the element while a new `src` loads: a
  * browser reports 0 then, and a resume seeks to the kept position before any report counts.
@@ -26,6 +27,7 @@
  * logged, stored, or put in the page address. No `crossorigin` attribute: the service expects the
  * element's plain (no-cors) range reads.
  */
+import { MEDIA_TICKET_IDLE_MS } from "@ao/shared";
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import { ApiClientError } from "../api/client";
 import { errorText, isProjectLocked } from "../api/library";
@@ -130,6 +132,16 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     let failedAt = 0;
     /** Every failure position since the player opened (or Try again): a damaged place is bounded. */
     let failures: number[] = [];
+    /**
+     * When the element last did anything (a new source, a time report, a play, a seek, bytes read).
+     * A failure after longer than a ticket lives unused is the ticket ending on its own, not damage
+     * (FR-260): it is renewed without counting as a strike, so long pauses near one spot never read
+     * as "may be damaged". It cannot loop: each such failure needs that long without activity.
+     */
+    let lastActivity = Date.now();
+    const active = () => {
+      lastActivity = Date.now();
+    };
 
     const revoke = (path: string) => {
       void api.revokeTicket(path).catch(() => {});
@@ -181,6 +193,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       ticket = path;
       if (old && old !== path) revoke(old);
       el.src = address;
+      active();
       if (pending) pending.srcSet = true;
       setPhase({ kind: "ready" });
     };
@@ -189,8 +202,10 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       if (!ticket || !live || halted) return;
       const at = pending ? pending.at : position;
       const play = pending ? pending.play : wantPlay;
-      const samePlace = failures.filter((f) => Math.abs(f - at) <= SAME_PLACE_S).length;
-      failures.push(at);
+      const idleExpiry = Date.now() - lastActivity >= MEDIA_TICKET_IDLE_MS;
+      if (idleExpiry) renewals = 0;
+      const samePlace = idleExpiry ? 0 : failures.filter((f) => Math.abs(f - at) <= SAME_PLACE_S).length;
+      if (!idleExpiry) failures.push(at);
       if (renewals >= MAX_RENEWALS_WITHOUT_PROGRESS || samePlace >= MAX_RENEWALS_WITHOUT_PROGRESS) {
         pending = { at, play, seekIssued: false, srcSet: false, playedSince: false };
         halt({ kind: "failed", message: `The recording could not be played: it stopped at the same place again. Its file may be damaged or in a format this app cannot play. You can choose ${RETRY}.`, retry: true });
@@ -205,8 +220,11 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     };
     const onTimeUpdate = (e: Event) => {
       if (halted) return;
+      active();
       if (pending) {
-        const done = pending.seekIssued && (e.type === "seeked" || Math.abs(el.currentTime - pending.at) < SEEK_TOLERANCE_S);
+        // FR-259: `playing` after the resume seek was issued also ends the wait, so a seek that never
+        // reports landing does not leave the player ignoring the element's time for good.
+        const done = pending.seekIssued && (e.type === "seeked" || e.type === "playing" || Math.abs(el.currentTime - pending.at) < SEEK_TOLERANCE_S);
         if (!done) return;
         // R371 b: a pause or a play pressed after the metadata, before the seek landed, is what the next renewal resumes with.
         wantPlay = pending.play;
@@ -218,6 +236,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     };
     const onPlay = () => {
       if (halted) return;
+      active();
       if (!pending) wantPlay = true;
       else {
         // R362 f: a play pressed during a renewal still plays when it lands.
@@ -234,6 +253,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     };
     const onSeeking = () => {
       if (halted) return;
+      active();
       // R371 c: a seek's target is recorded when it is asked, so a ticket that ends before it lands resumes there.
       if (!pending) {
         position = el.currentTime;
@@ -258,6 +278,8 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     el.addEventListener("error", onError);
     el.addEventListener("timeupdate", onTimeUpdate);
     el.addEventListener("seeked", onTimeUpdate);
+    el.addEventListener("playing", onTimeUpdate);
+    el.addEventListener("progress", active);
     el.addEventListener("play", onPlay);
     el.addEventListener("pause", onPause);
     el.addEventListener("seeking", onSeeking);
@@ -296,6 +318,8 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       el.removeEventListener("error", onError);
       el.removeEventListener("timeupdate", onTimeUpdate);
       el.removeEventListener("seeked", onTimeUpdate);
+      el.removeEventListener("playing", onTimeUpdate);
+      el.removeEventListener("progress", active);
       el.removeEventListener("play", onPlay);
       el.removeEventListener("pause", onPause);
       el.removeEventListener("seeking", onSeeking);
