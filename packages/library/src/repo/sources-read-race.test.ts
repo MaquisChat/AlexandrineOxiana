@@ -16,7 +16,7 @@ import { createLibrary, openLibrary, type Library } from "../library.js";
 import type { Repo } from "./index.js";
 import { importChange } from "./repo.js";
 import { pauseBetweenSourceFilesForTests } from "./sources.js";
-import { SimulatedCrash, openTestRepo } from "./testing.js";
+import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
 
 const OPEN_GOV = `identifiability:
   containsIdentifiable: false
@@ -107,6 +107,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   pauseBetweenSourceFilesForTests(undefined);
+  seams.failUndo = undefined;
   await lib.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
@@ -208,5 +209,30 @@ describe("D21: a write cut off between its two files (the process dies)", () => 
     await consistentOnDisk(sf, folder);
     // Today's R26 recovery, unchanged: the interrupted change is rolled back and that is reported.
     expect(warnings().map((w) => w.kind)).toEqual(["rolled-back-incomplete-write"]);
+  });
+});
+
+describe("FR-425: a change whose in-process roll-back failed", () => {
+  it("its own leftover files are not reported as changed outside the app; the next open rolls it back", async () => {
+    pauseBetweenSourceFilesForTests(async () => {
+      throw new Error("the disk refused source.json");
+    });
+    seams.failUndo = "replaced"; // putting the annotations file back fails too
+    await expect(setAnnotations(repo, pid, sid, ["replaced"])).rejects.toThrow("the disk refused source.json");
+    pauseBetweenSourceFilesForTests(undefined);
+    seams.failUndo = undefined;
+    // The new annotations file is on disk beside the old source.json: the app's own half-undone change.
+    await repo.getSource(pid, sid);
+    await repo.getSource(pid, sid);
+    expect(warnings("annotations-hash-mismatch")).toEqual([]);
+    expect(warnings("annotations-unreadable")).toEqual([]);
+    // The next open finishes the roll-back (R26): the pair before the change, and no annotation warning.
+    await lib.close();
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    const sf = await repo.getSource(pid, sid);
+    expect(sf.annotations.map((a) => a.body)).toEqual(["first", "second"]);
+    await consistentOnDisk(sf, folder);
+    expect(warnings().filter((w) => w.kind.startsWith("annotations-"))).toEqual([]);
   });
 });

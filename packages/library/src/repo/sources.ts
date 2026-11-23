@@ -149,7 +149,11 @@ export async function readSourceFile(core: RepoCore, st: ProjectState, id: strin
   // file, then source.json): a problem is confirmed in the queue's turn, after any write in progress,
   // and recorded only if it is still there (D21). Inside a turn no write is in progress.
   if (read.problem && !core.holdsTurn()) read = await core.serial(() => readSourcePair(core, st, id));
-  if (read.problem) annotationWarning(core, st, read.problem.file, read.problem.kind, read.problem.detail);
+  // A change of this project whose roll-back failed is finished at the next open (R26), and until
+  // then its own leftover files may be on disk: they are not reported as changed outside the app
+  // (FR-425). Until then the project refuses changes and says to reopen the library
+  // (RecoveryPendingError); a real change outside the app is still found by a read after that open.
+  if (read.problem && !st.recoveryPending) annotationWarning(core, st, read.problem.file, read.problem.kind, read.problem.detail);
   return read.sf;
 }
 
