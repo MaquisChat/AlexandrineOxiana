@@ -645,6 +645,20 @@ describe("capture methods, smaller points (Task 64 review)", () => {
     expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it("a comma-separated list whose reason is cancelled goes back to the saved value (FR-390)", async () => {
+    serve({ yaml: "protocol:\n  platforms: [youtube]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = () => within(card("Protocol record")).getByRole("textbox", { name: "Platforms" }) as HTMLInputElement;
+    expect(field().value).toBe("youtube");
+    await user.type(field(), ", vimeo");
+    await user.tab();
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field().value).toBe("youtube"));
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("the reason dialog shows the typed legal basis as the person's own text, with its own direction (M7)", async () => {
     serve();
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);

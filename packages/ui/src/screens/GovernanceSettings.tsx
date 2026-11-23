@@ -326,7 +326,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
         <ControlCard violations={violations} title="Processing location" controls={["processing", "vendors"]}>
           <p className="ao-hint">Per operation: "local" (on this computer) or named vendors, separated by commas.</p>
           {PROCESSING_OPS.map((op) => (
-            <ListInput key={op} label={PROCESSING_LABEL[op]} disabled={off} value={cfg?.processing[op] ?? []} onCommit={(v) => change(`processing.${op}`, v)} />
+            <ListInput key={`${op}-${cancelled}`} label={PROCESSING_LABEL[op]} disabled={off} value={cfg?.processing[op] ?? []} onCommit={(v) => change(`processing.${op}`, v)} />
           ))}
           <ProfileNotes cfg={cfg} rules={PROFILE_VENDOR_RULES} />
         </ControlCard>
@@ -425,9 +425,9 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
           <TextField type="date" label="Approved from" disabled={off} value={cfg?.protocol.approvedFrom ?? ""} onChange={(v) => change("protocol.approvedFrom", v || null)} />
           <TextField type="date" label="Approval expires" disabled={off} value={cfg?.protocol.expires ?? ""} onChange={(v) => change("protocol.expires", v || null)} />
           <p className="ao-hint">Approved scope, separated by commas (empty: not restricted).</p>
-          <ListInput label="Platforms" disabled={off} value={cfg?.protocol.platforms ?? []} onCommit={(v) => change("protocol.platforms", v)} />
-          <ListInput label="Populations" disabled={off} value={cfg?.protocol.populations ?? []} onCommit={(v) => change("protocol.populations", v)} />
-          <ListInput label="Languages" disabled={off} value={cfg?.protocol.languages ?? []} onCommit={(v) => change("protocol.languages", v)} />
+          <ListInput key={`platforms-${cancelled}`} label="Platforms" disabled={off} value={cfg?.protocol.platforms ?? []} onCommit={(v) => change("protocol.platforms", v)} />
+          <ListInput key={`populations-${cancelled}`} label="Populations" disabled={off} value={cfg?.protocol.populations ?? []} onCommit={(v) => change("protocol.populations", v)} />
+          <ListInput key={`languages-${cancelled}`} label="Languages" disabled={off} value={cfg?.protocol.languages ?? []} onCommit={(v) => change("protocol.languages", v)} />
           <CheckControl cfg={cfg} disabled={off} onChange={change} control="protocol.requireBeforeCapture" label="A protocol record is required before capture" />
           <ProtocolDocuments api={api} projectId={projectId} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} />
         </ControlCard>
@@ -439,7 +439,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
             <Required cfg={cfg} control="dmp.repository" />
           </div>
           <div className="ao-field">
-            <ListInput label="Formats" disabled={off} value={cfg?.dmp.formats ?? []} onCommit={(v) => change("dmp.formats", v)} />
+            <ListInput key={`formats-${cancelled}`} label="Formats" disabled={off} value={cfg?.dmp.formats ?? []} onCommit={(v) => change("dmp.formats", v)} />
             <Required cfg={cfg} control="dmp.formats" />
           </div>
           <TextField label="Metadata standard" disabled={off} value={cfg?.dmp.metadataStandard ?? ""} onChange={(v) => change("dmp.metadataStandard", v || null)} />
@@ -935,7 +935,11 @@ function TextField({ label, value, onChange, disabled, type = "text" }: { label:
   );
 }
 
-/** A comma-separated list, committed when the field loses focus or on Enter. */
+/**
+ * A comma-separated list, committed when the field loses focus or on Enter. Its parent keys it by
+ * the count of cancelled reason dialogs, so a list whose loosening was not recorded goes back to
+ * the rules as they are (FR-390, as review M2 for the legal basis).
+ */
 function ListInput({ label, value, onCommit, disabled }: { label: string; value: string[]; onCommit: (v: string[]) => void; disabled?: boolean }) {
   const id = useId();
   const joined = value.join(", ");
