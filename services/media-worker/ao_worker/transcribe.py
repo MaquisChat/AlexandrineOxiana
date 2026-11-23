@@ -65,19 +65,36 @@ def model_path(name: str) -> str:
     cache = str(folder)
     # Hugging Face cache layout: <models dir>/models--<owner>--<repo>/snapshots/<revision>/
     repo = folder / ("models--" + _MODELS[name].replace("/", "--"))
-    absent = (not folder.exists() or folder.is_dir()) and not os.path.lexists(repo)
-    if absent:
-        log.info("the %s speech model is not installed", name)
-        raise not_installed(f"speech-{name}")
-    if not folder.is_dir() or not os.access(folder, os.R_OK | os.X_OK):
+
+    def unreadable() -> JobError:
         # The FOLDER cannot be read: installing the model again would not help (FR-254, R467 M8). No path.
         log.warning("the speech models folder cannot be read; not downloading")
-        raise JobError(
+        return JobError(
             "MODEL_UNAVAILABLE",
             f"the folder that holds the speech models could not be read, so the {name} model could not be used; "
             "check that the folder can be read, then try again",
             tool=f"speech-{name}",
         )
+
+    # Asked of the system, so that a folder that exists but cannot be listed or searched is told apart
+    # from one that is not there (R481 b): only "no such file" is "not installed".
+    try:
+        with os.scandir(folder):
+            pass
+    except FileNotFoundError:
+        log.info("the %s speech model is not installed", name)
+        raise not_installed(f"speech-{name}") from None
+    except OSError:  # not a folder, or no permission to list it
+        raise unreadable() from None
+    try:
+        os.lstat(repo)
+    except FileNotFoundError:
+        log.info("the %s speech model is not installed", name)
+        raise not_installed(f"speech-{name}") from None
+    except OSError:  # the folder cannot be searched
+        raise unreadable() from None
+    if not os.access(folder, os.R_OK | os.X_OK):
+        raise unreadable()
     try:
         path = download_model(name, cache_dir=cache, local_files_only=True)
     except Exception as e:  # noqa: BLE001 - reported, never answered with a download
