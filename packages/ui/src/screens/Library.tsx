@@ -110,6 +110,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [error, setError] = useState<string | undefined>();
   const [sourcesError, setSourcesError] = useState<string | undefined>();
   const [loadingMore, setLoadingMore] = useState(false);
+  /**
+   * The list on screen answers the current search: false from a new search (or reload) until its
+   * first page arrives, so "Load more" never asks at the old list's offset (FR-152).
+   */
+  const [listCurrent, setListCurrent] = useState(false);
   const [reload, setReload] = useState(0);
   /** The address named a project this library does not have (41b2 I1). */
   const [unknownProject, setUnknownProject] = useState(false);
@@ -348,6 +353,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   // ---- the sources for the current search and filters ----
   useEffect(() => {
     staleMore();
+    setListCurrent(false);
     if (!projectId || locked) return;
     const ac = new AbortController();
     const asked = filter.text;
@@ -356,6 +362,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       .then((r) => {
         if (ac.signal.aborted) return;
         setSources(r);
+        setListCurrent(true);
         setSearched(asked);
         setSourcesError(undefined); // only the sources' own error: other errors stay until dismissed or replaced
       })
@@ -420,7 +427,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const query = () => ({ text: filter.text, ...(filter.collection ? { collection: filter.collection } : {}), ...(filter.tag ? { tag: filter.tag } : {}) });
 
   const loadMore = async () => {
-    if (!projectId || !sources) return;
+    if (!projectId || !sources || !listCurrent) return;
     const pid = projectId;
     const gen = pageGen.current;
     const ac = new AbortController();
@@ -873,7 +880,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                   onShowInReader={showInReader}
                 />
                 {sources.items.length < sources.total && (
-                  <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
+                  <button type="button" disabled={loadingMore || !listCurrent} onClick={() => void loadMore()}>
                     Load more sources
                   </button>
                 )}
