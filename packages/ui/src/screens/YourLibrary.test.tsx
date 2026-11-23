@@ -1214,6 +1214,42 @@ describe("Your library: a press on a control whose own request is out (FR-557)",
     for (const t of [T.waitDerive, T.waitStay, T.waitSave, T.waitTest, T.waitSignOut]) expect(h.said).toContain(t);
     expect([T.waitTest, T.waitSignOut]).toEqual(["Wait until the test has started.", "Wait until signing out is finished."]);
   });
+
+  it("when the test then fails, or signing out then fails, the failure's own sentence is what shows, said once", async () => {
+    const svc = useSvc(SET);
+    await show(svc);
+    const user = userEvent.setup();
+    // Test: the second press says to wait; the test then cannot be started.
+    const test = held();
+    svc.onTest = async () => {
+      await test.p;
+      return HttpResponse.json({ error: { code: "CONFLICT", message: YOUR_LIBRARY_TEXT.unreadable } }, { status: 409 });
+    };
+    await user.click(btn("Test"));
+    await waitFor(() => expect(svc.count("POST", "/settings/your-library/test")).toBe(1));
+    await user.click(btn("Test"));
+    expect(liveText()).toBe(T.waitTest);
+    let h = heard();
+    await act(async () => test.release());
+    await waitFor(() => expect(screen.getByTestId("yl-test-result").textContent).toBe(YOUR_LIBRARY_TEXT.unreadable));
+    expect(liveText()).toBe(YOUR_LIBRARY_TEXT.unreadable);
+    h.stop();
+    expect(h.said).toEqual([YOUR_LIBRARY_TEXT.unreadable]);
+    expect(screen.queryByText(T.waitTest)).toBeNull();
+    // Sign out: the second press says to wait; signing out then fails.
+    const out = held<boolean>();
+    fake.shell!.signOutOfLibrary.mockReturnValueOnce(out.p);
+    await user.click(btn("Sign out of my library"));
+    await user.click(btn("Signing out…"));
+    expect(liveText()).toBe(T.waitSignOut);
+    h = heard();
+    await act(async () => out.release(false));
+    await waitFor(() => expect(screen.getByTestId("yl-signout-result").textContent).toBe(T.signOutFailed));
+    expect(liveText()).toBe(T.signOutFailed);
+    h.stop();
+    expect(h.said).toEqual([T.signOutFailed]);
+    expect(screen.queryByText(T.waitSignOut)).toBeNull();
+  });
 });
 
 describe("Your library: sentences (R334 d) and keyboard", () => {
