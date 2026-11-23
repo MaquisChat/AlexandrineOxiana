@@ -171,8 +171,9 @@ What the popup can say instead:
   password, of at most 2,048 characters once its query is removed.
 - "This tab is not showing a PDF. Open the PDF itself, then try again." The tab shows a page about the
   work, not the PDF. Open the PDF so that it fills the tab, then press again.
-- "The extension could not read this tab, so its PDF cannot be sent. Either this browser did not let it
-  in here in time, or the tab was closed or changed page meanwhile." Some browsers do not let an
+- "The extension could not read this tab, so its PDF cannot be sent: this browser did not let it read the
+  page, or the tab was closed or changed page meanwhile. Open the PDF in a tab again and press “Send this
+  tab's PDF” again, or download the PDF and add it to the record in the app." Some browsers do not let an
   extension into their own PDF viewer or their own pages. Firefox's PDF viewer is one of them; download
   the PDF instead and give it to the work's record in the app yourself. If the tab was closed or moved
   to another page while the PDF was being read, open the PDF again and press again.

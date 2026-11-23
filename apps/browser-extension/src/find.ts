@@ -66,7 +66,7 @@ export const FIND_TEXT = {
   tooLong: "This tab's address is too long for the app, so its file cannot be sent.",
   notGivenAgain: "The file the site gave when the extension read it again does not start as a PDF does, so nothing was sent. Download the PDF and add it to the record in the app instead.",
   notShowingPdf: "This tab is not showing a PDF. Open the PDF itself, then try again.",
-  notAllowed: "The extension could not read this tab, so its PDF cannot be sent. Either this browser did not let it in here in time, or the tab was closed or changed page meanwhile.",
+  notAllowed: "The extension could not read this tab, so its PDF cannot be sent: this browser did not let it read the page, or the tab was closed or changed page meanwhile. Open the PDF in a tab again and press “Send this tab's PDF” again, or download the PDF and add it to the record in the app.",
   couldNotRead: "The PDF could not be read from this tab, so nothing was sent. Try again.",
   couldNotSend: "The PDF could not be sent. The work is still waiting — try again.",
   noAnswer: "The app's answer did not arrive, and the work is no longer waiting for a PDF from this browser. The app shows what became of it.",

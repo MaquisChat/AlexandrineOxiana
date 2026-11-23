@@ -245,8 +245,9 @@ describe("the extension's numbers and the service's sentences are the service's 
   it("the extension's own sentences are R348's and the dispatch's; none says a file was added (R301)", () => {
     expect(FIND_TEXT.notHttps).toBe("This tab's address is not https, so its file cannot be sent.");
     expect(FIND_TEXT.notShowingPdf).toBe("This tab is not showing a PDF. Open the PDF itself, then try again.");
-    // FR-584: true also for a tab closed or changed mid-way and for a browser that does not let the script in in time.
-    expect(FIND_TEXT.notAllowed).toBe("The extension could not read this tab, so its PDF cannot be sent. Either this browser did not let it in here in time, or the tab was closed or changed page meanwhile.");
+    // FR-584: true also for a tab closed or changed mid-way and for a browser that does not let the script in; it ends
+    // with what the researcher can do next (R466 M5).
+    expect(FIND_TEXT.notAllowed).toBe("The extension could not read this tab, so its PDF cannot be sent: this browser did not let it read the page, or the tab was closed or changed page meanwhile. Open the PDF in a tab again and press “Send this tab's PDF” again, or download the PDF and add it to the record in the app.");
     expect(FIND_TEXT.couldNotSend).toBe("The PDF could not be sent. The work is still waiting — try again.");
     // "Add it to the record" (R357 f) asks the researcher to do it; no sentence says a file WAS added.
     for (const s of [...Object.values(FIND_TEXT), ...Object.values(FIND_SERVICE_TEXT)]) expect(s).not.toMatch(/\badded\b|\badds\b|\bwas add/i);
