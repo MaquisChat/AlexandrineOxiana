@@ -158,7 +158,7 @@ export interface ReviewQueueProps {
 export const SOURCE_POOL = 6;
 
 
-/** R313 e: a decision on a waiting file with no answer in this long is given up (the request aborted). */
+/** R313 e: a decision on a waiting file with no answer in this long is given up (its late answer only reads the queue again). */
 export const HELD_DECISION_TIMEOUT_MS = 60_000;
 /** R313 e: said on the card when a decision was given up. */
 export const HELD_NO_ANSWER_TEXT = "The service did not answer. Look at the queue again before deciding.";
@@ -803,13 +803,16 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const g = gen.current;
     setHeldBusy((cur) => ({ ...cur, [item.id]: decision }));
     setHeldErrors((cur) => withoutKey(cur, item.id));
-    // R313 e: no answer in HELD_DECISION_TIMEOUT_MS: the request is aborted, the card usable again and saying so, and
-    // the queue read again (the decision may or may not have been recorded); its late answer changes nothing.
-    const abort = new AbortController();
+    // R313 e: no answer in HELD_DECISION_TIMEOUT_MS: the decision is given up — the card usable again and saying so, and
+    // the queue read again (the decision may or may not have been recorded). The request is left to finish: its late
+    // answer decides nothing here, but the queue is read once more then, so a late record by the service shows at once
+    // (FR-529) — while the file is still listed here (not after a lock, or once another project is shown).
     let late = false;
+    const readLate = () => {
+      if ((itemsRef.current ?? []).some((x) => x.id === item.id)) setReadKey((k) => k + 1);
+    };
     const timer = setTimeout(() => {
       late = true;
-      abort.abort();
       heldBusyRef.current.delete(item.id);
       setHeldBusy((cur) => withoutKey(cur, item.id));
       setHeldErrors((cur) => ({ ...cur, [item.id]: HELD_NO_ANSWER_TEXT }));
@@ -820,10 +823,12 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     }, HELD_DECISION_TIMEOUT_MS);
     try {
       const body: HeldFileDecisionRequest = { projectId, decision };
-      await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body, signal: abort.signal });
+      await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body });
+      if (late) readLate();
       if (late || g !== gen.current) return;
       fileLeft(item, decision, (n) => `${FOUND_FILES_TEXT.result[decision]}: ${titleFor(item, n)}`);
     } catch (e) {
+      if (late) readLate();
       if (late || g !== gen.current) return;
       if (isProjectLocked(e)) {
         forget();

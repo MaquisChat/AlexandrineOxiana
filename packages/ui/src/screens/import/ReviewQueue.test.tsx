@@ -1160,6 +1160,47 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     await waitFor(() => expect(heldCalls).toHaveLength(2));
   });
 
+  it("FR-529: a decision given up at 60 seconds that the service records later shows as soon as the service answers, without waiting for the next read", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const o = project();
+    let list = o.projectReview![P1]!;
+    let listReads = 0;
+    o.extra = [
+      http.get(`${SERVICE}/projects/:id/review`, () => {
+        listReads++;
+        return HttpResponse.json({ items: list, total: list.length, offset: 0, limit: 500 });
+      }),
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        await gate;
+        // The service records the decision late: the file no longer waits.
+        list = list.filter((x) => x.id !== params.itemId);
+        return HttpResponse.json({ decided: true });
+      }),
+    ];
+    open(o);
+    await ready(RECORD);
+    const reads = () => listReads;
+    refake(["setTimeout", "clearTimeout", "Date"]);
+    try {
+      fireEvent.click(use(RECORD));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+    } finally {
+      vi.useRealTimers();
+      vi.useFakeTimers({ toFake: ["Date"] });
+    }
+    await waitFor(() => expect(within(card(RECORD)).getByText("The service did not answer. Look at the queue again before deciding.")).toBeTruthy());
+    const readsAfterGiveUp = reads();
+    expect(use(RECORD)).toBeTruthy();
+    // The late answer: the queue is read again by itself, and the card says what the service now holds.
+    release();
+    await waitFor(() => expect(within(card(RECORD)).getByText("No longer waiting.")).toBeTruthy());
+    expect(reads()).toBe(readsAfterGiveUp + 1);
+    expect(noUse(RECORD)).toBeNull();
+    expect(heldCalls).toHaveLength(1);
+  });
+
   it("R313 f: a why of __proto__, toString or constructor shows no advice and breaks nothing", async () => {
     const o = project();
     o.projectReview = {
