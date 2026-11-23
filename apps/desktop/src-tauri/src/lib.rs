@@ -311,11 +311,13 @@ async fn library_window_take_pdf(app: AppHandle, window: tauri::WebviewWindow) -
     detached(move || shell.library.take_pdf(&library_host(&app, &shell), &label, std::time::Instant::now())).await.unwrap_or(false)
 }
 
+/// `close_library_window(ticket?)`: with the ticket of the open that made the window, only that
+/// window is closed (FR-561, R472); without one, whatever sign-in window is open (`Library::close_for`).
 #[tauri::command]
-async fn close_library_window(app: AppHandle, window: tauri::WebviewWindow) {
+async fn close_library_window(app: AppHandle, window: tauri::WebviewWindow, ticket: Option<String>) {
     let Some(shell) = app.try_state::<Arc<Shell>>().map(|s| s.inner().clone()) else { return };
     let label = window.label().to_string();
-    detached(move || shell.library.close(&library_host(&app, &shell), &label)).await;
+    detached(move || shell.library.close_for(&library_host(&app, &shell), &label, ticket.as_deref())).await;
 }
 
 #[tauri::command]
