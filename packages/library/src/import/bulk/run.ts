@@ -147,6 +147,7 @@ import { folderId, importOverlapsLibrary, insideFolder, insideLibrary, libraryRe
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
+import { ZOTERO_NOTES } from "../zotero-local.js";
 import { DISK_FULL_NOTE, DISK_FULL_UNDONE_NOTE, NoRoomError, RECOVERY_NOTE, fileMargin, fitSentence, freeRoom, isDiskFull, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir, type ScanApprovals } from "./space.js";
 import { capAnnotations, conflictVerification, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
@@ -221,6 +222,8 @@ async function libraryFileTest(repo: Repo, work: string, kind: string): Promise<
 
 /** The run's note on files removed here and not brought back (Z4), counted over the batch's lines. */
 const removedNote = (n: number) => (n === 1 ? "An attached file you removed here was not brought in again." : `${n} attached files you removed here were not brought in again.`);
+/** FR-132: the outcomes of an item a Zotero run had imported before. */
+const SEEN_AGAIN: ReadonlySet<string> = new Set(["updated", "unchanged", "zotero-back", "zotero-conflict"]);
 const REMOVED_NOTE = /^(?:An attached file you removed here was|\d+ attached files you removed here were) not brought in again\.$/u;
 
 /** A stored file's parts as journaled (Z4). */
@@ -1113,6 +1116,9 @@ class Run {
     const removed = [...this.latest.values()].reduce((n, e) => n + (e.notes?.filter((x) => x === ENGINE_FILE_NOTES.removedHere).length ?? 0), 0);
     this.rec.notes = this.rec.notes.filter((n) => !REMOVED_NOTE.test(n));
     if (removed) this.note(removedNote(removed));
+    // FR-132: a Zotero run that saw items again says that what was taken away in Zotero stays here.
+    const kind = this.rec.source.kind;
+    if ((kind === "zotero-local" || kind === "zotero-web") && [...this.latest.values()].some((e) => SEEN_AGAIN.has(e.outcome))) this.note(ZOTERO_NOTES.removalsKept(kind));
     for (const id of watchdog.disabled) {
       this.note(`The file-name pattern "${id}" took too long on a file name and was switched off for the rest of this import.`);
     }
