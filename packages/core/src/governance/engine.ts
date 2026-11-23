@@ -274,7 +274,9 @@ function move(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): Poli
   str(destination, "move.destination");
   if (cloudFolderId !== undefined) str(cloudFolderId, "move.cloudFolderId");
   const problem = residencyProblem(p, destination, cloudFolderId);
-  if (problem === "kind") return deny(`Destination ${destination} is not permitted for project ${req.projectId}`, warnings);
+  // The move screen shows the project's name beside the reason, so it names neither the
+  // project's id nor an internal kind of storage (FR-030).
+  if (problem === "kind") return deny(`The library would be moved to ${storageWords(destination)}; this project's rules do not allow its data there.`, warnings);
   if (problem === "folder") return deny(`Cloud folder ${cloudFolderId ?? "(unspecified)"} is not on this project's approved list`, warnings);
   return allow(warnings);
 }
