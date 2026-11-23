@@ -181,11 +181,12 @@ export const PROJECT_PAGE = 500;
 
 /**
  * What the batch made from folder names (R64): the collections and tags it reports it created (R118). The warning fails
- * closed (FR-157): an entry from a batch the screen does not know (the list of imports unread, or without it), or from a
- * folder batch that reports nothing of what it created (an older service), has every collection and tag flagged.
+ * closed (FR-157) once the list of imports is known: an entry from a batch not in it, or from a folder batch that reports
+ * nothing of what it created (an older service), has every collection and tag flagged. Until the list is known (still
+ * being read, or refused, as in a read-only library) nothing is flagged, never every entry (R463 M1).
  */
-function madeByBatch(id: string, batchId: string | undefined, batch: BatchSummary | undefined): boolean {
-  if (!batchId) return false;
+function madeByBatch(id: string, batchId: string | undefined, batch: BatchSummary | undefined, known: boolean): boolean {
+  if (!batchId || !known) return false;
   if (!batch) return true;
   if (!FOLDER_KINDS.has(batch.kind)) return false;
   if (!batch.created) return true;
@@ -258,6 +259,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   failedRef.current = failed;
   const [policy, setPolicy] = useState<ImportPolicy | null>(null);
   const [batches, setBatches] = useState<BatchSummary[]>([]);
+  /** The list of imports has been read for this project (R463 M1). */
+  const [batchesKnown, setBatchesKnown] = useState(false);
   const batch = batchId ? batches.find((b) => b.batchId === batchId) : undefined;
   const [collections, setCollections] = useState<Collection[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
@@ -512,7 +515,15 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     api.policy(projectId).then((x) => ok() && setPolicy(x), () => ok() && setPolicy({ pseudonymizeNames: true, encryptionRequired: true }));
     api.collections(projectId).then((c) => ok() && setCollections(c), () => {});
     api.tags(projectId).then((t) => ok() && setTags(t), () => {});
-    api.batches(projectId).then((b) => ok() && setBatches(b), () => {});
+    setBatchesKnown(false);
+    api.batches(projectId).then(
+      (b) => {
+        if (!ok()) return;
+        setBatches(b);
+        setBatchesKnown(true);
+      },
+      () => {},
+    );
     return () => {
       live = false;
       p.live = false;
@@ -1026,7 +1037,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               collections={collections}
               tags={tags}
               flagTitle={flagging && titleFromFileName(item, shownSource)}
-              flagFolderNames={flagging ? (id: string) => madeByBatch(id, batchId ?? item.batchId, itemBatch(item)) : () => false}
+              flagFolderNames={flagging ? (id: string) => madeByBatch(id, batchId ?? item.batchId, itemBatch(item), batchesKnown) : () => false}
               busy={busy}
               onDecide={(d, done) => void decide(item, d, done)}
               onConfirm={(field, value) => confirmField(item, field, value)}

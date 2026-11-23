@@ -301,6 +301,30 @@ describe("Review queue", () => {
       expect(within(preview).getByText(/collection names come from folder names/i)).toBeTruthy();
     });
 
+    it("FR-157 (R463 M1): the list of imports could not be read (a read-only library): no folder-name warning on any entry", async () => {
+      let answered!: () => void;
+      const refused = new Promise<void>((r) => (answered = r));
+      setup({ ...flagged, batchesRefused: true, onBatchesAnswered: () => answered(), sources: { s1: source(1, "Interview 3", { collectionIds: [made, older], tagIds: [madeTag] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      await refused;
+      // The refusal has been handled (its promise settles before the next task).
+      await act(async () => {});
+      expect(within(preview).queryByText(/collection names come from folder names/i)).toBeNull();
+      expect(within(preview).queryByText(/tag names come from folder names/i)).toBeNull();
+    });
+
+    it("FR-157 (R463 M1): no folder-name warning before the list of imports is known; once known, the batch's own are flagged", async () => {
+      let release!: () => void;
+      const batchesHeld = new Promise<void>((r) => (release = r));
+      setup({ ...flagged, batchesHeld, sources: { s1: source(1, "Interview 3", { collectionIds: [made, older], tagIds: [] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      expect(within(preview).queryByText(/collection names come from folder names/i)).toBeNull();
+      release();
+      expect(await within(preview).findByText(/collection names come from folder names/i)).toBeTruthy();
+    });
+
     it("does not flag them when names are not pseudonymised", async () => {
       setup({ ...flagged, governance: undefined });
       const preview = await screen.findByRole("region", { name: "Imported record" });
