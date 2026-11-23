@@ -80,6 +80,8 @@ export function profileLines(r: ProfileCaptureReport): string[] {
     `  saved ${r.created}, already had ${r.duplicates}, partly saved ${r.incomplete}, failed ${r.failed}`,
     `  edited since last time ${r.edited}, no longer on the platform ${r.newlyUnavailable}, back again ${r.reappeared}`,
   );
+  // FR-106: posts that look edited but whose own data could not be fetched to check.
+  if (r.editsNotChecked) lines.push(`  ${r.editsNotChecked} possible edit(s) not checked: run the same command later to check them.`);
   if (r.status === "completed" && !r.listComplete) lines.push("  The list was filtered or cut short, so removed posts were not checked.");
   if (r.status === "paused-rate-limited") lines.push("  Run the same command later: it continues where it stopped.");
   return lines;

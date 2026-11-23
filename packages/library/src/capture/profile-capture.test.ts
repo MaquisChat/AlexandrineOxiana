@@ -357,6 +357,27 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).edited).toBe(0);
   });
 
+  it("FR-106: a caption that looks edited but whose post cannot be fetched is counted as not checked, in the report and the audit", async () => {
+    const p = await project();
+    await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    const dir = join(lib.root, p.folder, "profiles", "tiktok-fake.dancer");
+    const firstReports = (await walk(dir)).filter((f) => f.startsWith("reports/"));
+    const target = ttId(6);
+    const prof = synthetic();
+    // The listing shows the edit; fetching the post itself is refused by the platform (429).
+    await setProfile({ ...prof, rateLimitAfter: 0, items: prof.items.map((it) => (it.id === target ? { ...it, caption: "Evening dance at the old market (edited)\n#dance" } : it)) });
+    process.env.FAKE_TOOL_MODE = "ratelimit";
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(r).toMatchObject({ status: "completed", edited: 0, editsNotChecked: 1 });
+    expect((await byPost(p.id, target)).assets.filter((a) => a.kind === "platform-metadata")).toHaveLength(1);
+
+    const text = await readFile(join(dir, (await walk(dir)).find((f) => f.startsWith("reports/") && !firstReports.includes(f))!), "utf8");
+    expect(text).toContain("- Captions that look edited but could not be checked: 1");
+    expect(text).toContain("Run the capture again later to check them.");
+    const runs = (await auditEvents(p.folder)).filter((e) => e.action === "capture.profile");
+    expect(runs.at(-1)!.details).toMatchObject({ edited: 0, editsNotChecked: 1 });
+  });
+
   // Task 63 item 3: the run's title edit is read, merged and written in one governed change, so an
   // edit made at the same time is kept (R26).
   it("a title edit made while a profile run records an edit is not lost: both land, each audited", async () => {

@@ -49,11 +49,13 @@ function reportSummary(r: ProfileReport): string {
   if (r.newlyUnavailable) parts.push(`${plural(r.newlyUnavailable, "post")} no longer on the platform`);
   if (r.reappeared) parts.push(`${plural(r.reappeared, "post")} back on the platform`);
   if (r.edited) parts.push(`${plural(r.edited, "post")} edited since the last capture`);
+  // Known posts whose caption looks edited but whose own data could not be fetched (FR-106).
+  if (r.editsNotChecked) parts.push(`${plural(r.editsNotChecked, "possible edit")} not checked (capture the profile again later to check ${r.editsNotChecked === 1 ? "it" : "them"})`);
   const lead = r.status === "completed" ? "Finished:" : r.status === "paused-rate-limited" ? "Paused:" : "Stopped:";
   return `${lead} ${parts.join(", ")}.`;
 }
 
-const hasCounts = (r: ProfileReport) => r.created + r.duplicates + r.incomplete + r.failed + r.newlyUnavailable + r.reappeared + r.edited > 0;
+const hasCounts = (r: ProfileReport) => r.created + r.duplicates + r.incomplete + r.failed + r.newlyUnavailable + r.reappeared + r.edited + (r.editsNotChecked ?? 0) > 0;
 
 /** "Of 3 links: 1 done, 1 failed, 1 not known." — only what was seen. */
 function countsLine(q: CaptureQueueState, unit: string): string {

@@ -69,6 +69,8 @@ export interface CaptureRunReport {
   newlyUnavailable: number;
   reappeared: number;
   edited: number;
+  /** Posts whose caption looks edited but could not be checked (FR-106); absent from older reports. */
+  editsNotChecked?: number;
   errorCode?: string;
   /** The library's own sentence for a stopped or paused run. */
   reason?: string;
