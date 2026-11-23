@@ -118,6 +118,11 @@ export function CitePanel({ api, projectId, sourceIds, initialStyle = DEFAULT_ST
           value={query}
           onChange={(e) => search(e.target.value)}
           onKeyDown={onKey}
+          // The list goes with the focus (R145): a list left open after Tab would answer no key.
+          onBlur={() => {
+            setOpen(false);
+            setActive(-1);
+          }}
           placeholder="Search styles"
           aria-describedby={`${id}-current`}
         />

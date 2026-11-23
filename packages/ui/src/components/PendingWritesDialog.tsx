@@ -215,11 +215,14 @@ export function PendingWritesDialog({ api, readOnly, onClose, onResolved, change
       return;
     }
     if (e.key !== "Tab") return;
-    const items = Array.from(box.current?.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), [tabindex='-1']") ?? []);
+    // The controls Tab stops at. From the heading or the message (focusable by script only), Shift+Tab
+    // wraps to the last control: nothing before them in the dialog takes the focus (R145).
+    const items = Array.from(box.current?.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled])") ?? []);
     if (!items.length) return;
     const first = items[0]!;
     const last = items[items.length - 1]!;
-    if (e.shiftKey && document.activeElement === first) {
+    const active = document.activeElement as HTMLElement | null;
+    if (e.shiftKey && (active === first || !active || !items.includes(active))) {
       e.preventDefault();
       last.focus();
     } else if (!e.shiftKey && document.activeElement === last) {
