@@ -183,6 +183,8 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
         setListUnreadable(answer.unreadable === true);
         setListError(null);
         lastReadFailed.current = false;
+        // The list was read after all: "could not be read" is no longer true; whether the browser is in it now says (R466 M3).
+        setPairedMissing((m) => (m === "unread" ? "missing" : m));
         return list;
       } catch (err) {
         if (my === listSeq.current) lastReadFailed.current = true;
