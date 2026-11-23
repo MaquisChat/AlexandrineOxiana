@@ -96,6 +96,18 @@ describe("the optional tools screen", () => {
     expect(screen.getByText(/sends nothing about your projects or about you/i).textContent).not.toMatch(/addresses listed/);
   });
 
+  it("the screen's general sentence says the servers that host each tool, not its publisher (some are hosted by a third party) (FR-291)", async () => {
+    const { view } = await shown();
+    const listed = screen.getByText(/sends nothing about your projects or about you/i).textContent!;
+    expect(listed).not.toMatch(/publisher/);
+    expect(listed).toMatch(/^Each download contacts only the addresses listed with the tool and sends nothing about your projects or about you\./);
+    view.unmount();
+    await shown(toolsService({ tools: catalogueWithoutHosts() }));
+    const unlisted = screen.getByText(/sends nothing about your projects or about you/i).textContent!;
+    expect(unlisted).not.toMatch(/publisher/);
+    expect(unlisted).toMatch(/^Each download contacts only the servers that host the tool and sends nothing about your projects or about you\./);
+  });
+
   it("without hosts anywhere in the catalogue it names none and claims no list", async () => {
     await shown(toolsService({ tools: catalogueWithoutHosts() }));
     expect(screen.getByText(/sends nothing about your projects or about you/i).textContent).not.toMatch(/addresses listed/);
