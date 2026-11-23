@@ -14,7 +14,8 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readerApi, type AnnotationRecord } from "../api/reader";
-import { PdfOpenError, type PdfHandle } from "../reader/pdfjs";
+import { PdfOpenError, toPdfOpenError, type PdfHandle } from "../reader/pdfjs";
+import { onRangeFailure } from "../reader/rangeTransport";
 import { server, serviceError, SOURCE_FILE, testClient, url, useMockService } from "../test/service";
 import { QUESTION_RETRY_MS, QUESTION_TIMEOUT_MS, ReaderRoute } from "../routes/reader";
 import { ReaderScreen } from "./Reader";
@@ -353,6 +354,73 @@ describe("ReaderScreen (Task R7)", () => {
     screenFor();
     await expectState("Library service not reachable", SENTENCES.unreachable);
     expect(f.destroy).toHaveBeenCalled();
+  });
+
+  describe("a range whose answer began and then broke off (FR-350, R481 a)", () => {
+    const CUT_OFF = "The library service's answer was cut off before it finished. Open the PDF again to read it.";
+    /** The route: a range answered whole, or (once `cut`) a 206 that sends a few bytes and then breaks off. */
+    function serveCutting(cutFrom: number) {
+      server.use(
+        http.get(url(DOC), ({ request }) => {
+          const m = /^bytes=(\d+)-(\d+)$/.exec(request.headers.get("range") ?? "")!;
+          const start = Number(m[1]);
+          const end = Math.min(Number(m[2]), 4095);
+          const headers = { "content-type": "application/pdf", "content-range": `bytes ${start}-${end}/4096` };
+          if (start < cutFrom) return new HttpResponse(new Uint8Array(end - start + 1), { status: 206, headers });
+          const body = new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(new Uint8Array(3));
+              c.error(new TypeError("network error"));
+            },
+          });
+          return new HttpResponse(body, { status: 206, headers }) as unknown as Response;
+        }),
+      );
+    }
+
+    it("the first range broken off says the answer was cut off, not that the service could not be reached", async () => {
+      serveCutting(0);
+      screenFor();
+      await expectState("PDF not shown", CUT_OFF);
+      expect(screen.queryByText(/could not be reached/)).toBeNull();
+      expect(screen.getByRole("button", { name: "Open again" })).toBeTruthy();
+      expect(openPdf).not.toHaveBeenCalled();
+    });
+
+    it("a later range broken off while reading says the same, and the document is destroyed", async () => {
+      serveCutting(2048);
+      const f = fakeHandle(4);
+      openPdf.mockImplementationOnce(async (o: { transport: { requestDataRange(b: number, e: number): void } }) => {
+        // As openPdf does: the transport's first failed range fails the handle.
+        onRangeFailure(o.transport as never, (e) => f.fail(toPdfOpenError(e)));
+        o.transport.requestDataRange(2048, 4096);
+        return f.handle;
+      });
+      screenFor();
+      await expectState("PDF not shown", CUT_OFF);
+      expect(screen.queryByText(/could not be reached/)).toBeNull();
+      expect(f.destroy).toHaveBeenCalled();
+    });
+
+    it("a range that never got an answer still says the service could not be reached", async () => {
+      server.use(
+        http.get(url(DOC), ({ request }) => {
+          const m = /^bytes=(\d+)-(\d+)$/.exec(request.headers.get("range") ?? "")!;
+          const start = Number(m[1]);
+          const end = Math.min(Number(m[2]), 4095);
+          if (start >= 2048) return HttpResponse.error();
+          return new HttpResponse(new Uint8Array(end - start + 1), { status: 206, headers: { "content-type": "application/pdf", "content-range": `bytes ${start}-${end}/4096` } });
+        }),
+      );
+      const f = fakeHandle(4);
+      openPdf.mockImplementationOnce(async (o: { transport: { requestDataRange(b: number, e: number): void } }) => {
+        onRangeFailure(o.transport as never, (e) => f.fail(toPdfOpenError(e)));
+        o.transport.requestDataRange(2048, 4096);
+        return f.handle;
+      });
+      screenFor();
+      await expectState("Library service not reachable", SENTENCES.unreachable);
+    });
   });
 
   it("leaving the screen destroys the document, and one opened after leaving is destroyed at once", async () => {

@@ -52,7 +52,8 @@
 import { matchAnnotations } from "@ao/core/annotations/match";
 import { READER_PDF_MAX_BYTES } from "@ao/shared";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
-import { ApiClientError } from "../api/client";
+import { ANSWER_CUT_OFF, ApiClientError } from "../api/client";
+import { isStreamCutOff } from "../api/governance";
 import type { SourceAvailability } from "../api/library";
 import type { AnnotationRecord, HighlightColourName, ReaderApi } from "../api/reader";
 import { AvailabilityMark } from "../components/AvailabilityMark";
@@ -177,13 +178,23 @@ type Phase =
   | { kind: "failed"; state: ReaderStateKind; sentence: string; attempt: number };
 
 const isAbort = (e: unknown) => e instanceof Error && e.name === "AbortError";
-const unreachable = (e: unknown) => e instanceof ApiClientError && e.status === 0;
+/**
+ * A range that never got an answer: the client's own "could not be reached" (status 0, UNAVAILABLE).
+ * A range whose answer began and then broke off (status 0, INTERNAL: the same test as the move's
+ * `isStreamCutOff` before anything was read) was answered, so it is not said to be out of reach (R481 a).
+ */
+const unreachable = (e: unknown) => e instanceof ApiClientError && e.status === 0 && e.code === "UNAVAILABLE";
+const cutOff = (e: unknown) => isStreamCutOff(e, false);
+/** Said when a range's answer broke off: the client's sentence, and what to do next. */
+export const READER_CUT_OFF = `${ANSWER_CUT_OFF} Open the PDF again to read it.`;
 
-/** The state a failure is shown as: its kind, and "out of reach" when the last range could not reach the service. */
+/** The state a failure is shown as: its kind, and "out of reach" or "cut off" by what the last range met. */
 function stateOf(err: unknown, lastRangeError: unknown): { state: ReaderStateKind; sentence: string } {
   if (unreachable(err)) return { state: "unreachable", sentence: READER_STATES.unreachable.sentence };
+  if (cutOff(err)) return { state: "other", sentence: READER_CUT_OFF };
   const e: PdfOpenError = toPdfOpenError(err);
   if (e.kind === "other" && unreachable(lastRangeError)) return { state: "unreachable", sentence: READER_STATES.unreachable.sentence };
+  if (e.kind === "other" && cutOff(lastRangeError)) return { state: "other", sentence: READER_CUT_OFF };
   // "other" carries its own sentence (a file that changed while it was read, a worker that did not start…).
   return { state: e.kind, sentence: e.kind === "other" ? e.message : READER_STATES[e.kind].sentence };
 }

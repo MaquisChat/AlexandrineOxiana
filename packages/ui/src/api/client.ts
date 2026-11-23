@@ -127,8 +127,10 @@ function checkToken(token: string): void {
 }
 
 const unreachable = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: "The library service could not be reached." });
+/** Said of an answer that began and then broke off (FR-350); also said by the reader (R481 a). */
+export const ANSWER_CUT_OFF = "The library service's answer was cut off before it finished.";
 /** An answer that began and then broke off: the service was reached, so it is not said to be out of reach (FR-350). */
-const cutOff = (): ApiClientError => new ApiClientError(0, { code: "INTERNAL", message: "The library service's answer was cut off before it finished." });
+const cutOff = (): ApiClientError => new ApiClientError(0, { code: "INTERNAL", message: ANSWER_CUT_OFF });
 const unexpected = (status: number): ApiClientError =>
   new ApiClientError(status, { code: "INTERNAL", message: `The library service answered with something unexpected (HTTP ${status}).` });
 
