@@ -192,10 +192,14 @@ export function ChoiceDialog({ title, children, action, onConfirm, onCancel, bus
   );
 }
 
-/** A dialog body with an optional reason, for withdrawals and similar (uses the same shell). */
-export function ReasonOptionalDialog({ title, children, label, action, onConfirm, onCancel }: { title: string; children: ReactNode; label: string; action: string; onConfirm: (reason: string) => void; onCancel: () => void }) {
+/**
+ * A dialog body with a reason, for withdrawals and similar (uses the same shell). The reason is optional unless
+ * `required` (detaching a consent form, FR-160): then the action is off until the reason holds something a person can see.
+ */
+export function ReasonOptionalDialog({ title, children, label, action, onConfirm, onCancel, required = false }: { title: string; children: ReactNode; label: string; action: string; onConfirm: (reason: string) => void; onCancel: () => void; required?: boolean }) {
   const id = useId();
   const [reason, setReason] = useState("");
+  const ok = !required || seen(reason);
   return (
     <DialogShell labelledBy={`${id}-t`} onCancel={onCancel}>
       <h2 id={`${id}-t`}>{title}</h2>
@@ -203,15 +207,15 @@ export function ReasonOptionalDialog({ title, children, label, action, onConfirm
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          onConfirm(reason.trim());
+          if (ok) onConfirm(reason.trim());
         }}
       >
         <label className="ao-stack">
           {label}
-          <textarea rows={3} value={reason} onChange={(e) => setReason(e.target.value)} />
+          <textarea rows={3} required={required} value={reason} onChange={(e) => setReason(e.target.value)} />
         </label>
         <div className="ao-actions">
-          <button type="submit" className="ao-danger">
+          <button type="submit" className="ao-danger" disabled={!ok}>
             {action}
           </button>
           <button type="button" onClick={onCancel}>

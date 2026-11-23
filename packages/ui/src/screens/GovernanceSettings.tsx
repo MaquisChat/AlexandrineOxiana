@@ -201,11 +201,19 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
 
   const toggleProfile = (profile: Profile, on: boolean) => {
     if (!cfg) return;
+    // FR-156: the text as it is now, parsed once here (R119), not the rules parsed 300 ms after the last raw keystroke,
+    // so that a profiles list or a control just typed in the editor is neither overwritten nor missed.
+    let now: Config;
+    try {
+      now = readConfig(text);
+    } catch {
+      return;
+    }
     setStatus(null);
-    const profiles = on ? [...new Set([...cfg.profiles, profile])] : cfg.profiles.filter((p) => p !== profile);
+    const profiles = on ? [...new Set([...now.profiles, profile])] : now.profiles.filter((p) => p !== profile);
     if (on) {
-      // Every requirement of the profile, worked out from the rules already parsed, applied in one edit (R119).
-      setText(setManyIn(text, profileOnEntries(cfg, profile)));
+      // Every requirement of the profile, worked out from the current text, applied in one edit (R119).
+      setText(setManyIn(text, profileOnEntries(now, profile)));
       return;
     }
     setPending({

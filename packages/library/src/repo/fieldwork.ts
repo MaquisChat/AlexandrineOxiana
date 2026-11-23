@@ -326,6 +326,8 @@ export async function updateConsent(core: RepoCore, projectId: string, id: strin
       const c = data.consents.find((x) => x.id === id);
       if (!c) throw new NotFoundError("Consent record", id);
       if (c.withdrawn) throw new InvalidInputError("This consent was withdrawn; the record is kept as it was and cannot be changed");
+      // R463 M2: a form already gone (detached from another window) is not "detached" again: nothing written or audited.
+      if (detaching && !c.documentAssetId) throw new InvalidInputError(NOTHING_TO_DETACH);
       const before = structuredClone(c);
       if (patch.scope !== undefined) c.scope = patch.scope;
       if (patch.date !== undefined) c.date = patch.date;
@@ -356,6 +358,9 @@ export async function updateConsent(core: RepoCore, projectId: string, id: strin
     },
   );
 }
+
+/** A detach asked of a consent record with no signed form attached (R463 M2). */
+export const NOTHING_TO_DETACH = "That form was no longer attached. Nothing was changed.";
 
 /** The consent already holds a different form (R119 I-b). */
 export const DETACH_FIRST = "This consent record already has a signed form. Detach the current form first, and give a reason";

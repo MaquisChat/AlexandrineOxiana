@@ -50,8 +50,49 @@ describe("governance routes (R113, R118)", () => {
     expect((screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement).value).toBe("");
   });
 
+  it.each(["/governance", "/audit", "/fieldwork"])("FR-163: on %s a locked project is marked in the picker, and the screen offers to unlock it in the library", async (path) => {
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: false }, { id: "p2", name: "Coastal kinship", encrypted: true, unlocked: true }] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
+      // What the screen itself reads of a locked project is refused as the service refuses it.
+      http.get(url("/projects/p1/*"), () => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "This project is locked." } }, { status: 423 })),
+    );
+    window.history.replaceState(null, "", `${path}?project=p1`);
+    render(<Host />);
+    const picker = await screen.findByRole("combobox", { name: "Project" });
+    await waitFor(() => expect([...picker.querySelectorAll("option")].map((o) => o.textContent)).toEqual(["\u2068Clinic\u2069 (locked)", "\u2068Coastal kinship\u2069"]));
+    const link = await screen.findByRole("link", { name: "Unlock it in the library" });
+    expect(link.getAttribute("href")).toBe("/?project=p1");
+    expect(link.closest("p")?.textContent).toBe("This project is locked. Unlock it in the library to see and change everything in it here.");
+  });
+
+  it("FR-158 (R463 M7): a right-to-left project name in the picker is isolated with the Unicode isolate marks, “(locked)” outside them", async () => {
+    const name = "مقابلات هرات 2";
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name, encrypted: true, unlocked: false }] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
+      http.get(url("/projects/p1/*"), () => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "This project is locked." } }, { status: 423 })),
+    );
+    window.history.replaceState(null, "", "/audit?project=p1");
+    render(<Host />);
+    const picker = await screen.findByRole("combobox", { name: "Project" });
+    await waitFor(() => expect([...picker.querySelectorAll("option")].map((o) => o.textContent)).toEqual([`\u2068${name}\u2069 (locked)`]));
+  });
+
+  it("FR-163: an unlocked project is not marked and nothing offers to unlock it", async () => {
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p2", name: "Coastal kinship", encrypted: true, unlocked: true }] })),
+      http.get(url("/projects/p2/audit"), () => HttpResponse.json({ events: [], total: 0 })),
+    );
+    window.history.replaceState(null, "", "/audit?project=p2");
+    render(<Host />);
+    expect(await screen.findByRole("heading", { name: "Audit log", level: 1 })).toBeTruthy();
+    expect([...screen.getByRole("combobox", { name: "Project" }).querySelectorAll("option")].map((o) => o.textContent)).toEqual(["\u2068Coastal kinship\u2069"]);
+    expect(screen.queryByRole("link", { name: "Unlock it in the library" })).toBeNull();
+  });
+
   it.each([
-    ["a locked project", { projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: false }] }, { mode: "read-write" }, "This project is locked. Unlock it in the library to change its rules."],
+    ["a locked project", { projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: false }] }, { mode: "read-write" }, "This project is locked, so its rules cannot be changed until it is unlocked."],
     ["a read-only library", { projects: [{ id: "p1", name: "Clinic", encrypted: false, unlocked: true }] }, { mode: "read-only", readOnlyReason: "locked-by-other-device" }, "This library is open read-only here, so its rules cannot be changed."],
   ])("the Governance form of %s shows the rules, capture methods included, but cannot change them, and says why (D11)", async (_what, projects, current, why) => {
     server.use(
@@ -134,4 +175,33 @@ describe("R362 h: the Fieldwork screen is told whether its project is encrypted"
       await waitFor(() => expect(screen.queryAllByText(SCOPE_NOTE)).toHaveLength(encrypted ? 1 : 0));
     });
   }
+});
+
+describe("R463 M4: Fieldwork in a read-only library does not offer to detach a signed form", () => {
+  it.each([
+    ["read-only", false],
+    ["read-write", true],
+  ])("a %s library", async (mode, offered) => {
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted: false, unlocked: true }] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode } })),
+      http.get(url("/projects/p1/participants"), () => HttpResponse.json({ participants: [{ id: "f1", code: "P-001", consentIds: ["c1"] }], complete: true })),
+      http.get(url("/projects/p1/sessions"), () => HttpResponse.json({ sessions: [], complete: true })),
+      http.get(url("/projects/p1/consents"), () =>
+        HttpResponse.json({ consents: [{ id: "c1", participantId: "f1", scope: "Audio", date: "2026-03-14", documentAssetId: "0190f0f0-0000-7000-8000-0000000000aa" }], complete: true }),
+      ),
+    );
+    window.history.replaceState(null, "", "/fieldwork?project=p1");
+    render(<Host />);
+    const records = await screen.findByRole("region", { name: "Consent records" });
+    await within(records).findByText(/Signed form attached\./);
+    const why = "This library is open read-only here, so a signed form cannot be detached.";
+    if (offered) {
+      expect(await within(records).findByRole("button", { name: "Detach the signed form of P-001…" })).toBeTruthy();
+      expect(screen.queryByText(why)).toBeNull();
+    } else {
+      expect(await within(records).findByText(why)).toBeTruthy();
+      expect(within(records).queryByRole("button", { name: /Detach/ })).toBeNull();
+    }
+  });
 });

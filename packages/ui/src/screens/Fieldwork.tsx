@@ -89,7 +89,14 @@ function ConsentEditor({ c, onSave, onCancel, encrypted, busy }: { c: ConsentRec
 }
 
 /** `encrypted`: the project is encrypted (R362 h: a consent's scope typed here says it can be read without the passphrase). */
-export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; projectId: string; encrypted?: boolean | undefined }) {
+/** The last part of a dropped file's path: its name, never the folders it is in (FR-168). */
+const fileName = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+
+/** R463 M4: why a signed form cannot be detached here. */
+export const DETACH_READ_ONLY = "This library is open read-only here, so a signed form cannot be detached.";
+
+/** `readOnly`: the library is open read-only here; the detach is then not offered (R463 M4). */
+export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: GovernanceApi; projectId: string; encrypted?: boolean | undefined; readOnly?: boolean }) {
   const readableScope = useReadableNote(encrypted, READABLE_SCOPE_TEXT);
   const [participants, setParticipants] = useState<Participant[] | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -109,8 +116,18 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
   }, [sessionGone]);
   const [busy, setBusy] = useState(false);
   const [withdrawing, setWithdrawing] = useState<ConsentRecord | null>(null);
+  /** FR-160: the consent record whose signed form the researcher asked to detach (asked in a dialog, with a reason). */
+  const [detaching, setDetaching] = useState<ConsentRecord | null>(null);
+  /** R463 M3: the record whose form was just detached: once its drop zone is back, focus goes to the control that attaches a form. */
+  const [detachedFrom, setDetachedFrom] = useState<string | null>(null);
+  const attachAreas = useRef(new Map<string, HTMLDivElement>());
   /** A dropped form the service refused because it was detached from this record before (R119): offered for an explicit re-attach. */
   const [reattach, setReattach] = useState<{ consentId: string; path: string } | null>(null);
+  /** FR-168: the re-attach offer takes focus when it appears, so that it is not missed (a screen reader reads it). */
+  const reattachOffer = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (reattach) reattachOffer.current?.focus();
+  }, [reattach]);
   const [session, setSession] = useState({ date: "", place: "", notes: "", participantIds: [] as string[] });
   const [consent, setConsent] = useState({ participantId: "", scope: "", date: "", expires: "" });
   const ids = useId();
@@ -125,6 +142,8 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
       setConsents(c.consents);
       setComplete(p.complete && s.complete && c.complete);
     } catch (err) {
+      // A pending focus target must never fire later, by surprise (n2).
+      setDetachedFrom(null);
       setError(err instanceof Error ? err.message : "The fieldwork records could not be loaded.");
     }
   }, [api, projectId]);
@@ -179,6 +198,14 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
     const first = el.closest("form")?.querySelector<HTMLElement>("input:not([disabled]), select:not([disabled]), textarea:not([disabled])");
     first?.focus();
   }, [busy]);
+
+  useEffect(() => {
+    if (!detachedFrom || busy) return;
+    const area = attachAreas.current.get(detachedFrom);
+    if (!area) return;
+    setDetachedFrom(null);
+    area.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled)")?.focus();
+  }, [detachedFrom, busy, consents]);
 
   const codeOf = (id: string) => participants?.find((p) => p.id === id)?.code ?? "(removed participant)";
 
@@ -361,34 +388,56 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
                 </div>
               )}
               {c.documentAssetId ? (
-                <p className="ao-hint">Signed form attached.</p>
+                <p className="ao-hint">
+                  Signed form attached.
+                  {!c.withdrawn && readOnly ? (
+                    <>
+                      {" "}
+                      <span>{DETACH_READ_ONLY}</span>
+                    </>
+                  ) : !c.withdrawn ? (
+                    <>
+                      {" "}
+                      <button type="button" aria-label={`Detach the signed form of ${codeOf(c.participantId)}…`} disabled={busy} onClick={() => setDetaching(c)}>
+                        Detach the form…
+                      </button>
+                    </>
+                  ) : null}
+                </p>
               ) : !c.withdrawn ? (
-                <FileDrop
-                  prompt="Drop the signed consent form here (a PDF or an image, up to 100 MB)."
-                  fieldLabel="Or add the form by its full path"
-                  single={{ message: "Drop one signed form at a time: each consent record holds one form. Nothing was added." }}
-                  disabled={busy}
-                  onPaths={(paths) =>
-                    void run(async () => {
-                      setReattach(null);
-                      try {
-                        const r = await api.attachConsentDocument(projectId, c.id, paths[0]!);
-                        return r.note ? `Signed form attached. ${r.note}` : undefined;
-                      } catch (err) {
-                        if (err instanceof ApiClientError && err.reason === "detached-form") {
-                          setReattach({ consentId: c.id, path: paths[0]! });
-                          return;
+                <div
+                  ref={(el) => {
+                    if (el) attachAreas.current.set(c.id, el);
+                    else attachAreas.current.delete(c.id);
+                  }}
+                >
+                  <FileDrop
+                    prompt="Drop the signed consent form here (a PDF or an image, up to 100 MB)."
+                    fieldLabel="Or add the form by its full path"
+                    single={{ message: "Drop one signed form at a time: each consent record holds one form. Nothing was added." }}
+                    disabled={busy}
+                    onPaths={(paths) =>
+                      void run(async () => {
+                        setReattach(null);
+                        try {
+                          const r = await api.attachConsentDocument(projectId, c.id, paths[0]!);
+                          return r.note ? `Signed form attached. ${r.note}` : undefined;
+                        } catch (err) {
+                          if (err instanceof ApiClientError && err.reason === "detached-form") {
+                            setReattach({ consentId: c.id, path: paths[0]! });
+                            return;
+                          }
+                          throw err;
                         }
-                        throw err;
-                      }
-                    })
-                  }
-                />
+                      })
+                    }
+                  />
+                </div>
               ) : null}
               {reattach?.consentId === c.id && !c.documentAssetId && (
-                <div role="group" aria-label={`Re-attach the signed form of ${codeOf(c.participantId)}?`} className="ao-field">
+                <div ref={reattachOffer} tabIndex={-1} role="group" aria-label={`Re-attach the signed form of ${codeOf(c.participantId)}?`} className="ao-field">
                   <span>
-                    This form was detached from this consent record before. Re-attach it? Re-attaching is recorded in the project&apos;s audit log.
+                    “<UserText>{fileName(reattach.path)}</UserText>” was detached from this consent record before. Re-attach it? Re-attaching is recorded in the project&apos;s audit log.
                   </span>
                   <button
                     type="button"
@@ -507,6 +556,37 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
             will be deleted, with its date, place and notes. A session that sources refer to cannot be deleted.
           </p>
         </ChoiceDialog>
+      ) : null}
+
+      {detaching ? (
+        <ReasonOptionalDialog
+          title="Detach the signed form"
+          label="Reason (kept in the project's audit log, sealed in encrypted projects)"
+          action="Detach the form"
+          required
+          onCancel={() => setDetaching(null)}
+          onConfirm={(reason) => {
+            const c = detaching;
+            setDetaching(null);
+            // A governed, audited change in the library (updateConsent: `consent.document-detach`, R117 I3); the form stays a source of the project.
+            void run(async () => {
+              try {
+                await api.updateConsent(projectId, c.id, { documentAssetId: null, detachReason: reason });
+              } catch (err) {
+                // n1: the form was already detached elsewhere: the reload shows the attach control, so focus goes there too.
+                if (err instanceof Error && /no longer attached/.test(err.message)) setDetachedFrom(c.id);
+                throw err;
+              }
+              setDetachedFrom(c.id);
+              return "The signed form was detached. It stays in the project; you can now attach the right form to this consent record.";
+            });
+          }}
+        >
+          <p>
+            The signed form attached to the consent record of <UserText>{codeOf(detaching.participantId)}</UserText> (“<UserText>{detaching.scope}</UserText>”, <UserText>{detaching.date}</UserText>) will be detached
+            from it. The form itself stays in the project; only its link to this record is removed. Detaching it needs a reason.
+          </p>
+        </ReasonOptionalDialog>
       ) : null}
 
       {withdrawing ? (

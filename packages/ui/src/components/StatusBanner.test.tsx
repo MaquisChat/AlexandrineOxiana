@@ -149,6 +149,20 @@ describe("StatusBanner", () => {
     expect(t).not.toContain("7f3a");
   });
 
+  it("FR-158: a right-to-left project name is isolated on its own; the English sentence keeps its direction", () => {
+    const name = "مقابلات هرات";
+    render(<StatusBanner variant={{ kind: "warning", warning: "retention-due", project: name }} />);
+    const banner = screen.getByRole("status");
+    expect(banner.textContent).toBe(`${name} has reached its retention date. Review which raw data must now be destroyed or kept.`);
+    // Only the name is laid out by its own direction: nothing around the sentence takes it from its first letter.
+    const isolated = [...banner.querySelectorAll("[dir=auto]")];
+    expect(isolated.map((el) => el.textContent)).toEqual([name]);
+    // A name named twice in one sentence is isolated each time.
+    cleanup();
+    render(<StatusBanner variant={{ kind: "warning", warning: "audit-append-failed-at-open", project: name }} />);
+    expect([...screen.getByRole("status").querySelectorAll("[dir=auto]")].map((el) => el.textContent)).toEqual([name, name]);
+  });
+
   it("every warning kind the service emits has its own sentence", () => {
     const kinds = [
       "chain-broken", "head-mismatch", "truncated", "empty", "anchor-missing", "anchors-unreadable", "rolled-back-incomplete-write",

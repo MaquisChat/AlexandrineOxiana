@@ -213,6 +213,10 @@ describe("Review queue", () => {
   });
 
   describe("pseudonymised projects (R64)", () => {
+    const HEDGED_COLLECTIONS =
+      "The app has no record of which collections this import made, so these collection names may come from folder names, which can carry participants' names. Check them, and rename the collection or move the item if one names someone.";
+    const HEDGED_TAGS =
+      "The app has no record of which tags this import made, so these tag names may come from folder names, which can carry participants' names. Check them, and rename or remove a tag that names someone.";
     const made = idAt("2026-11-11T10:05:00.000Z", 1); // created by the batch
     const older = idAt("2026-10-01T09:00:00.000Z", 2); // existed before it
     const madeTag = idAt("2026-11-11T10:06:00.000Z", 3);
@@ -283,6 +287,60 @@ describe("Review queue", () => {
       const preview = await screen.findByRole("region", { name: "Imported record" });
       await within(preview).findByText("Amina Rahimi");
       expect(within(preview).queryByText(/collection names come from folder names/i)).toBeNull();
+    });
+
+    it("FR-157: a folder batch from an older service that reports nothing it created flags its collections and tags (fails closed)", async () => {
+      const { created: _c, ...olderBatch } = BATCH;
+      setup({ ...flagged, batches: [olderBatch], sources: { s1: source(1, "Interview 3", { collectionIds: [older], tagIds: [madeTag] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      // R465 a: no record of what it made, so the sentence is hedged, never that the names DO come from folder names.
+      expect(await within(preview).findByText(HEDGED_COLLECTIONS)).toBeTruthy();
+      expect(within(preview).getByText(HEDGED_TAGS)).toBeTruthy();
+      expect(within(preview).queryByText(/^These (collection|tag) names come from folder names/)).toBeNull();
+    });
+
+    it("FR-157: a batch the screen does not know (not in the list of imports it read) flags them too", async () => {
+      setup({ ...flagged, batches: [], sources: { s1: source(1, "Interview 3", { collectionIds: [older], tagIds: [] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      expect(await within(preview).findByText(HEDGED_COLLECTIONS)).toBeTruthy();
+      expect(within(preview).queryByText(/^These collection names come from folder names/)).toBeNull();
+    });
+
+    it("R465 a: an import that reports what it created keeps the asserting sentence, for exactly those", async () => {
+      setup({ ...flagged, sources: { s1: source(1, "Interview 3", { collectionIds: [made, older], tagIds: [madeTag] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      expect(
+        await within(preview).findByText("These collection names come from folder names, which can carry participants' names. Check them, and rename the collection or move the item if one names someone."),
+      ).toBeTruthy();
+      expect(within(preview).getByText("These tag names come from folder names, which can carry participants' names. Check them, and rename or remove a tag that names someone.")).toBeTruthy();
+      expect(within(preview).queryByText(HEDGED_COLLECTIONS)).toBeNull();
+      expect(within(preview).queryByText(HEDGED_TAGS)).toBeNull();
+    });
+
+    it("FR-157 (R463 M1): the list of imports could not be read (a read-only library): no folder-name warning on any entry", async () => {
+      let answered!: () => void;
+      const refused = new Promise<void>((r) => (answered = r));
+      setup({ ...flagged, batchesRefused: true, onBatchesAnswered: () => answered(), sources: { s1: source(1, "Interview 3", { collectionIds: [made, older], tagIds: [madeTag] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      await refused;
+      // The refusal has been handled (its promise settles before the next task).
+      await act(async () => {});
+      expect(within(preview).queryByText(/collection names come from folder names/i)).toBeNull();
+      expect(within(preview).queryByText(/tag names come from folder names/i)).toBeNull();
+    });
+
+    it("FR-157 (R463 M1): no folder-name warning before the list of imports is known; once known, the batch's own are flagged", async () => {
+      let release!: () => void;
+      const batchesHeld = new Promise<void>((r) => (release = r));
+      setup({ ...flagged, batchesHeld, sources: { s1: source(1, "Interview 3", { collectionIds: [made, older], tagIds: [] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      expect(within(preview).queryByText(/collection names come from folder names/i)).toBeNull();
+      release();
+      expect(await within(preview).findByText(/collection names come from folder names/i)).toBeTruthy();
     });
 
     it("does not flag them when names are not pseudonymised", async () => {

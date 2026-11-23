@@ -77,6 +77,12 @@ export interface ServiceSetup {
   collections?: Array<{ id: string; name: string }>;
   tags?: Array<{ id: string; name: string; color?: string }>;
   batches?: unknown[];
+  /** GET /projects/:id/imports is refused (as in a read-only library, where the service asks for a writable one). */
+  batchesRefused?: boolean;
+  /** GET /projects/:id/imports waits for this before it answers. */
+  batchesHeld?: Promise<void>;
+  /** Called as GET /projects/:id/imports answers. */
+  onBatchesAnswered?: () => void;
   participants?: unknown[];
   sessions?: unknown[];
   workspaceTags?: Array<{ id: string; name: string; color?: string }>;
@@ -196,6 +202,9 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
     }),
     http.get(url("/projects/:id/imports"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/imports`);
+      if (o.batchesHeld) await o.batchesHeld;
+      queueMicrotask(() => o.onBatchesAnswered?.());
+      if (o.batchesRefused) return HttpResponse.json({ error: { code: "READ_ONLY", message: "This library is read-only." } }, { status: 409 });
       return HttpResponse.json({ batches });
     }),
     http.get(url("/projects/:id/participants"), async ({ request, params }) => {

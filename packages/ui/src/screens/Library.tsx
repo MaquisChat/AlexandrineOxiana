@@ -30,11 +30,12 @@ import "../components/library.css";
 import { navigate as goTo, PATHS } from "../navigation";
 import { clearPendingFind, guardPendingFind, setPendingFind } from "../reader/readerHandoff";
 import { readerHref } from "../routes/reader";
-import { madeSince, NewProject, type UnresolvedCreate } from "./NewProject";
+import { listInWords, madeSince, NewProject, SameNamedProjects, stillToFillIn, type UnresolvedCreate } from "./NewProject";
 import { NewRecoveryCode } from "./NewRecoveryCode";
 import { SourceDetail } from "./SourceDetail";
 import { UnlockProject } from "./UnlockProject";
 import { LibraryZotero, type ZoteroEvents } from "./LibraryZotero";
+import { noteLostCreate } from "./lostCreates";
 
 /** Where "needs review" outcomes send the researcher (the import review queue, Task 35). */
 export const REVIEW_QUEUE_PATH = PATHS.reviewQueue;
@@ -138,7 +139,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /** The library closed while that code was on screen. */
   const [closedUnder, setClosedUnder] = useState(false);
   /** A create whose answer was lost and could not be checked when the dialog closed (fix round 2). */
-  const [unresolved, setUnresolved] = useState<{ create: UnresolvedCreate; state: "unknown" | "still-unknown" | "checking" | "not-created" | { found: ProjectSummary } } | null>(null);
+  const [unresolved, setUnresolved] = useState<{ create: UnresolvedCreate; state: "unknown" | "still-unknown" | "checking" | "not-created" | { found: ProjectSummary } | { many: ProjectSummary[] } } | null>(null);
+  /** FR-187, FR-188: a project just made whose rules ask for what only the researcher can give: a hint, until dismissed. */
+  const [toFillIn, setToFillIn] = useState<{ project: ProjectSummary; words: string[] } | null>(null);
   /** Counts library.state events: an open "Resolve…" dialog reads its list again on each. */
   const [stateSeq, setStateSeq] = useState(0);
   /** What the Zotero sync's events said (Task Z12: the lines under the header read again after a finished one), and whether the library is still open. */
@@ -166,6 +169,18 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
 
   const closedRef = useRef(onClosed);
   closedRef.current = onClosed;
+  /** The new-project dialog's create whose outcome is being checked or cannot be told (FR-194). */
+  const dialogUncertain = useRef<UnresolvedCreate | null>(null);
+  const libraryNameRef = useRef(current.name);
+  /**
+   * FR-194 (R461 b): as the library closes, each create whose outcome is not known (in the dialog, or this screen's
+   * notice) is left for the chooser, which asks the researcher to look for it when the library is open again.
+   */
+  const noteUnknownCreates = useCallback(() => {
+    const u = unresolvedRef.current;
+    const creates = [u && (u.state === "unknown" || u.state === "still-unknown" || u.state === "checking") ? u.create : null, dialogUncertain.current];
+    for (const c of creates) if (c) noteLostCreate(current.libraryId, libraryNameRef.current, c.name);
+  }, [current.libraryId]);
 
   /**
    * Forgets everything read from a project that is now locked (R114): its collections, tags,
@@ -228,6 +243,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             const d = e.data as LibraryState;
             if (d.open === false) {
               setLibraryOpen(false);
+              noteUnknownCreates();
               clearPendingFind();
               // A new project's recovery code on screen is never taken away (R134 I2): the dialog
               // says the library closed, and the library is left once the code is confirmed.
@@ -273,7 +289,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       ac.abort();
       clearTimeout(retry);
     };
-  }, [api]);
+  }, [api, noteUnknownCreates]);
 
   // ---- projects and their profile badges ----
   const showProjects = useCallback((list: ProjectSummary[]) => {
@@ -311,18 +327,35 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
    * Settles a create whose answer was lost (fix round 2): a successful read of the list says whether
    * the project was made; until then the notice stays. `auto`: the read made as the dialog closed.
    */
+  /** A check is in flight: an automatic one does not start another (R463 M8). */
+  const checkingNow = useRef(false);
   const checkUnresolved = useCallback(
-    async (create: UnresolvedCreate, auto = false) => {
-      setUnresolved({ create, state: "checking" });
+    async (create: UnresolvedCreate, auto = false, quiet = false) => {
+      // R463 M8: an automatic re-check (`quiet`) changes nothing on screen unless it settles the outcome, so the alert
+      // that says the app cannot tell is not taken down and announced again at each one.
+      if (quiet && checkingNow.current) return;
+      checkingNow.current = true;
+      if (!quiet) setUnresolved({ create, state: "checking" });
       try {
         const fresh = madeSince(await reloadProjects(), create);
-        if (mounted.current) setUnresolved({ create, state: fresh.length ? { found: fresh[fresh.length - 1]! } : "not-created" });
+        // FR-204, FR-205: more than one new project with that name is said, and none is taken for the one made then.
+        if (mounted.current) setUnresolved((u) => (quiet && u?.create !== create ? u : { create, state: fresh.length > 1 ? { many: fresh } : fresh.length ? { found: fresh[0]! } : "not-created" }));
       } catch {
-        if (mounted.current) setUnresolved({ create, state: auto ? "unknown" : "still-unknown" });
+        if (mounted.current && !quiet) setUnresolved({ create, state: auto ? "unknown" : "still-unknown" });
+      } finally {
+        checkingNow.current = false;
       }
     },
     [reloadProjects],
   );
+  // FR-182: a notice that cannot tell yet checks again by itself each time the service reports the library's state (it
+  // is answering again); a check that fails leaves the notice as it was, and "Check again" stays.
+  const unresolvedRef = useRef(unresolved);
+  unresolvedRef.current = unresolved;
+  useEffect(() => {
+    const u = unresolvedRef.current;
+    if (stateSeq && u && (u.state === "unknown" || u.state === "still-unknown")) void checkUnresolved(u.create, u.state === "unknown", true);
+  }, [stateSeq, checkUnresolved]);
   const dialogClosed = (unresolvedCreate?: UnresolvedCreate, made?: ProjectSummary) => {
     setCreating(false);
     if (unresolvedCreate) void checkUnresolved(unresolvedCreate, true);
@@ -521,6 +554,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   };
 
   const projectNames = useMemo(() => Object.fromEntries((projects ?? []).map((p) => [p.id, p.name])), [projects]);
+  libraryNameRef.current = state.name ?? current.name;
   const banners = bannersFor(state, { projectNames, index, ...(libraryPath ? { volume: volumeOf(libraryPath) } : {}), ...(state.lockedBy ? { hostname: state.lockedBy } : {}) });
   const readOnlyReason = state.readOnlyReason === "offline" ? "The library is offline; attaching waits until it is back." : "This library is read-only.";
 
@@ -592,7 +626,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           {project && <a href={watchedFoldersHref(project.id)} onClick={(e) => follow(e, watchedFoldersHref(project.id))}>Watched folders</a>}
           <a href={PATHS.about} onClick={(e) => follow(e, PATHS.about)}>About and third-party notices</a>
           {onSwitchLibrary && (
-            <button type="button" onClick={onSwitchLibrary}>
+            <button
+              type="button"
+              onClick={() => {
+                noteUnknownCreates();
+                onSwitchLibrary();
+              }}
+            >
               Switch library
             </button>
           )}
@@ -675,8 +715,21 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               holdClose.current = pending;
             }}
             libraryClosed={closedUnder}
-            onCancel={dialogClosed}
+            onUncertain={(c) => {
+              dialogUncertain.current = c;
+            }}
+            onCancel={(u) => {
+              if (closedUnder) {
+                // The library went away while a held panel was on screen (FR-194): now leave it.
+                setCreating(false);
+                closedRef.current?.();
+                return;
+              }
+              dialogClosed(u);
+            }}
             onCreated={(made) => {
+              // FR-180: a project this dialog made is known, so a notice still unsettled never takes it for the lost create.
+              setUnresolved((u) => (u ? { ...u, create: { ...u.create, before: new Set([...u.create.before, made.id]) } } : u));
               if (closedUnder) {
                 // The library went away while the recovery code was on screen: now leave it.
                 setCreating(false);
@@ -684,6 +737,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                 return;
               }
               dialogClosed(undefined, made);
+              const words = stillToFillIn(made.profiles);
+              setToFillIn(words.length ? { project: made, words } : null);
               setProjects((list) => [...(list ?? []).filter((p) => p.id !== made.id), made]);
               setProfiles((all) => ({ ...all, [made.id]: knownProfiles(made.profiles) }));
               // Selected like any other project: the address names it (41b2 I1).
@@ -691,9 +746,39 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             }}
           />
         )}
+        {toFillIn && (
+          <section aria-label="What the new project still needs" className="ao-newproject-notice">
+            <p role="status">
+              “<UserText>{toFillIn.project.name}</UserText>” follows rules that ask for what only you can give: {listInWords(toFillIn.words)}. Fill them in under Governance; until then, Governance lists them as not met.
+            </p>
+            <div className="ao-row">
+              <a href={governanceHref(toFillIn.project.id)} onClick={(e) => follow(e, governanceHref(toFillIn.project.id))}>
+                Open Governance
+              </a>
+              <button type="button" onClick={() => setToFillIn(null)}>
+                Dismiss
+              </button>
+            </div>
+          </section>
+        )}
         {unresolved && (
           <section aria-label="A project that may have been created" className="ao-newproject-notice">
-            {typeof unresolved.state === "object" ? (
+            {typeof unresolved.state === "object" && "many" in unresolved.state ? (
+              <>
+                <p role="status">
+                  {unresolved.state.many.length} projects named “<UserText>{unresolved.create.name}</UserText>” were found that were not there before, so the app cannot tell which one was made then.
+                  {unresolved.create.encrypted &&
+                    " The one made then opens with the passphrase you chose; its recovery code was not shown and cannot be shown again. Once it is unlocked, choose “New recovery code…” to get a recovery code you can save."}
+                </p>
+                <SameNamedProjects
+                  projects={unresolved.state.many}
+                  onOpen={(p) => {
+                    setUnresolved(null);
+                    selectProject(p.id);
+                  }}
+                />
+              </>
+            ) : typeof unresolved.state === "object" ? (
               <p role="status">
                 “<UserText>{unresolved.create.name}</UserText>” was created.
                 {unresolved.create.encrypted &&
@@ -712,7 +797,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               </p>
             )}
             <div className="ao-row">
-              {typeof unresolved.state === "object" ? (
+              {typeof unresolved.state === "object" && "found" in unresolved.state ? (
                 <button
                   type="button"
                   onClick={() => {
@@ -723,7 +808,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                 >
                   Open the project
                 </button>
-              ) : unresolved.state === "not-created" ? (
+              ) : unresolved.state === "not-created" || typeof unresolved.state === "object" ? (
                 <button type="button" onClick={() => setUnresolved(null)}>
                   Dismiss
                 </button>

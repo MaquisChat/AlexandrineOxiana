@@ -244,7 +244,8 @@ describe("Library screen", () => {
   it("the library state event's warnings appear in plain language", async () => {
     server.use(...libraryHandlers({ state: { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: { p1: ["backup-failed"] } } }));
     renderLibrary();
-    expect(await screen.findByText(/last automatic backup of Dissertation failed/)).toBeTruthy();
+    // The project's name is its own element inside the sentence (FR-158): the banner's whole text is read.
+    await waitFor(() => expect(screen.getAllByRole("status").some((el) => /last automatic backup of Dissertation failed/.test(el.textContent ?? ""))).toBe(true));
   });
 
   it("N3: when an index rebuild finishes the sources are read again, so the 'needs rebuilding' note goes", async () => {

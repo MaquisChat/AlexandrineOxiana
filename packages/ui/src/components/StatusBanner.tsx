@@ -4,7 +4,7 @@
  * library's integrity warnings and projects' standing warnings. Warning codes are never shown as
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
-import { useRef, useState } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, isDeviceNoticeKind, oldCopiesPendingText, type DeviceNoticeKind } from "@ao/shared";
 import { errorText, type IntegrityWarning, type LibraryState } from "../api/library";
 import { inAppLink, PATHS } from "../navigation";
@@ -122,6 +122,17 @@ export function warningText(kind: string, project: string): string {
   return known ? known(project) : `Something in ${project} needs attention. Open the verification report for details.`;
 }
 
+/**
+ * A warning's sentence with only the project's name laid out by its own direction (FR-158): a right-to-left name at the
+ * start of the sentence no longer turns the whole English sentence round. Each place the name stands is isolated.
+ */
+function warningSentence(kind: string, project: string): ReactNode {
+  const mark = "\u0000";
+  return warningText(kind, mark)
+    .split(mark)
+    .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={i}>{project}</UserText>, part]));
+}
+
 function text(v: BannerVariant): string {
   switch (v.kind) {
     case "read-only-locked":
@@ -201,10 +212,10 @@ export const RESOLVABLE_WARNINGS: ReadonlySet<string> = new Set(["incomplete-wri
 
 export function StatusBanner({ variant, onResolve, onDismiss }: { variant: BannerVariant; onResolve?: () => void; onDismiss?: (notice: DeviceNoticeKind) => void }) {
   const resolvable = !!onResolve && variant.kind === "warning" && RESOLVABLE_WARNINGS.has(variant.warning);
-  // Project names and service details are user text: shown with dir=auto inside the sentence.
+  // Project names and service details are user text, shown with dir=auto; in a warning only the project's name (FR-158).
   return (
     <div role="status" className={`ao-banner ao-banner--${TONE[variant.kind]}`}>
-      <UserText>{text(variant)}</UserText>
+      {variant.kind === "warning" && !variant.oldCopies ? <span>{warningSentence(variant.warning, variant.project)}</span> : <UserText>{text(variant)}</UserText>}
       {variant.kind === "warning" && !!variant.oldCopies?.places.length && (
         <ul>
           {variant.oldCopies.places.map((p) => (

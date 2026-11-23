@@ -48,6 +48,13 @@ export function useProjectRecheck(api: Pick<LibraryApi, "verification">, opts: {
       if (seen.current.size > 50) seen.current.delete(seen.current.keys().next().value!);
       const cur = jobsRef.current[data.projectId];
       if (cur?.state === "running" && cur.jobId === data.jobId) apply(data.projectId, data);
+      // FR-348: a recheck of a project this screen is not following (started before the researcher left the library and
+      // came back, so its start is not known here) is taken up from its event, so its progress and end are shown again
+      // and the button stays off while it runs. A start being answered keeps its own job (its early events are kept above).
+      else if (!cur || cur.state === "finished" || cur.state === "failed") {
+        if (!data.finished) jobsRef.current = { ...jobsRef.current, [data.projectId]: { state: "running", jobId: data.jobId, done: data.done, total: data.total } };
+        apply(data.projectId, data);
+      }
     },
     [apply],
   );

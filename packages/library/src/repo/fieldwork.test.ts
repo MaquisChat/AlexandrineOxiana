@@ -424,6 +424,22 @@ describe("a consent's document is set only by attaching the form (R117 I3)", () 
     // The form's source itself is kept.
     expect(repo.listSourceIds(pid)).toContain(r.sourceId);
   });
+
+  it("R463 M2: detaching a form that is no longer attached changes nothing and is not audited as a detach", async () => {
+    const p = await repo.createParticipant(pid, {});
+    const c = await repo.createConsent(pid, { participantId: p.id, scope: "audio", date: "2026-03-14" });
+    await attachConsentDocument(repo, pid, c.id, pdf);
+    await repo.updateConsent(pid, c.id, { documentAssetId: null, detachReason: "wrong participant's form" });
+    const detaches = async () => (await auditEvents(folder())).filter((e) => e.details?.op === "consent.document-detach").length;
+    const before = await detaches();
+    // Detached meanwhile (from another window): asked again from a screen that still showed it attached.
+    await expect(repo.updateConsent(pid, c.id, { documentAssetId: null, detachReason: "asked again" })).rejects.toThrow("That form was no longer attached. Nothing was changed.");
+    expect(await detaches()).toBe(before);
+    // Never attached at all: the same.
+    const never = await repo.createConsent(pid, { participantId: p.id, scope: "video", date: "2026-03-15" });
+    await expect(repo.updateConsent(pid, never.id, { documentAssetId: null, detachReason: "nothing there" })).rejects.toThrow("That form was no longer attached. Nothing was changed.");
+    expect(await detaches()).toBe(before);
+  });
 });
 
 describe("consent forms follow attach's rules (R117 I4)", () => {
