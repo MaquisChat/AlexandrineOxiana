@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -61,6 +61,34 @@ describe("CitePanel", () => {
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("Smith 2019"));
     expect(body.style).toBe("chicago-author-date");
     expect(body.format).toBe("html");
+  });
+
+  it("the style list stays open while its scrollbar is dragged, and closes when focus really leaves (Tab, a click elsewhere) (R467 M10)", async () => {
+    server.use(http.get(url("/styles"), () => HttpResponse.json(STYLES)));
+    const user = userEvent.setup();
+    render(
+      <>
+        <CitePanel api={testApi()} projectId="p1" sourceIds={["s1"]} />
+        <button type="button">Elsewhere</button>
+      </>,
+    );
+    const field = screen.getByRole("combobox", { name: "Citation style" });
+    await user.type(field, "a");
+    const list = await screen.findByRole("listbox", { name: "Citation styles" });
+    // A press on the list itself (its scrollbar) does not take focus from the field.
+    expect(fireEvent.mouseDown(list)).toBe(false);
+    // A browser that focuses a scroller anyway (keyboard-focusable scrollers): the list stays open, and it is no Tab stop.
+    expect(list.getAttribute("tabindex")).toBe("-1");
+    fireEvent.blur(field, { relatedTarget: list });
+    expect(screen.queryByRole("listbox", { name: "Citation styles" })).toBeTruthy();
+    // Focus really leaves: the list closes.
+    fireEvent.blur(field, { relatedTarget: screen.getByRole("button", { name: "Elsewhere" }) });
+    await waitFor(() => expect(screen.queryByRole("listbox", { name: "Citation styles" })).toBeNull());
+    field.focus();
+    await user.type(field, "b");
+    await screen.findByRole("listbox", { name: "Citation styles" });
+    await user.tab();
+    await waitFor(() => expect(screen.queryByRole("listbox", { name: "Citation styles" })).toBeNull());
   });
 
   it("a refusal from the service is shown and nothing is copied", async () => {

@@ -26,6 +26,7 @@ export function CitePanel({ api, projectId, sourceIds, initialStyle = DEFAULT_ST
   const [query, setQuery] = useState("");
   const [options, setOptions] = useState<StyleEntry[]>([]);
   const [open, setOpen] = useState(false);
+  const listRef = useRef<HTMLUListElement | null>(null);
   const [active, setActive] = useState(-1);
   const [format, setFormat] = useState<CitationFormat>("text");
   const [result, setResult] = useState<{ text: string; copied: boolean } | undefined>();
@@ -118,8 +119,10 @@ export function CitePanel({ api, projectId, sourceIds, initialStyle = DEFAULT_ST
           value={query}
           onChange={(e) => search(e.target.value)}
           onKeyDown={onKey}
-          // The list goes with the focus (R145): a list left open after Tab would answer no key.
-          onBlur={() => {
+          // The list goes with the focus (R145): a list left open after Tab would answer no key. Focus
+          // moved onto the list itself (a browser that focuses a scroller on a press of its scrollbar) is not leaving (R467 M10).
+          onBlur={(e) => {
+            if (e.relatedTarget instanceof Node && listRef.current?.contains(e.relatedTarget)) return;
             setOpen(false);
             setActive(-1);
           }}
@@ -130,7 +133,8 @@ export function CitePanel({ api, projectId, sourceIds, initialStyle = DEFAULT_ST
           Using: <UserText>{style.title}</UserText>
         </p>
         {open && options.length > 0 && (
-          <ul id={listId} role="listbox" aria-label="Citation styles" className="ao-listbox">
+          // A press anywhere on the list, its scrollbar too, keeps focus in the field; the list is no Tab stop (R467 M10).
+          <ul id={listId} ref={listRef} role="listbox" aria-label="Citation styles" className="ao-listbox" tabIndex={-1} onMouseDown={(e) => e.preventDefault()}>
             {options.map((s, i) => (
               <li
                 key={s.id}
