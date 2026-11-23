@@ -571,10 +571,12 @@ const sha256File = async (abs: string): Promise<string | null> => {
  */
 export async function changedSinceMarker(root: string, m: TxnMarker): Promise<string[]> {
   const out: string[] = [];
-  for (const e of m.entries) {
+  for (const [k, e] of m.entries.entries()) {
     try {
       if (e.kind === "trashed") {
-        if (await exists(fromRel(root, e.from))) out.push(e.from);
+        // Something there again is the change's own when a later step of it wrote at or under that path.
+        const rewritten = m.entries.slice(k + 1).some((x) => x.kind !== "trashed" && (x.path === e.from || x.path.startsWith(`${e.from}/`)));
+        if (!rewritten && (await exists(fromRel(root, e.from)))) out.push(e.from);
       } else if ((e.kind === "created" || e.kind === "replaced") && e.sha256) {
         const now = await sha256File(fromRel(root, e.path));
         if (now === null || now === e.sha256) continue; // as before (created) or as the change left it
