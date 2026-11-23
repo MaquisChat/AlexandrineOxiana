@@ -117,8 +117,13 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
   const [focusList, setFocusList] = useState(0);
   /** The service refused to say what became of the code (review round 1, M1). */
   const [statusRefused, setStatusRefused] = useState(false);
-  /** A used code's browser never appeared in the list (review round 1, I1). */
-  const [pairedMissing, setPairedMissing] = useState(false);
+  /**
+   * A used code's browser never appeared in the list (review round 1, I1): `missing` when the list was
+   * read without it, `unread` when the last read failed (FR-337: then nothing says it is missing).
+   */
+  const [pairedMissing, setPairedMissing] = useState<false | "missing" | "unread">(false);
+  /** Whether the newest list read failed (FR-337). */
+  const lastReadFailed = useRef(false);
 
   const alive = useRef(true);
   const aborts = useRef(new Set<AbortController>());
@@ -162,8 +167,10 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
         setServicePort(answer.port);
         setListUnreadable(answer.unreadable === true);
         setListError(null);
+        lastReadFailed.current = false;
         return list;
       } catch (err) {
+        if (my === listSeq.current) lastReadFailed.current = true;
         if (alive.current && my === listSeq.current && !quiet) setListError(errorText(err, "The list of paired browsers could not be read."));
         return undefined;
       } finally {
@@ -290,7 +297,7 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
       tries++;
       await refresh(true);
       if (stopped || !alive.current || has()) return;
-      if (tries >= LIST_TRIES_AFTER_USE) setPairedMissing(true);
+      if (tries >= LIST_TRIES_AFTER_USE) setPairedMissing(lastReadFailed.current ? "unread" : "missing");
       else timer = setTimeout(() => void attempt(), pollMs);
     };
     void attempt();
@@ -415,7 +422,8 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
     setRevoked(target.origin);
     // The "was paired" message is no longer true once that browser is revoked (M3).
     setOutcome((o) => (o?.kind === "used" && o.browserId === target.id ? null : o));
-    setPairedMissing(false);
+    // The "not in the list" warning goes only with the browser it is about (FR-338).
+    if (outcome?.kind === "used" && outcome.browserId === target.id) setPairedMissing(false);
     const next = (browsersRef.current ?? []).filter((b) => b.id !== target.id);
     browsersRef.current = next;
     setBrowsers(next);
@@ -536,9 +544,14 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
             The list of paired browsers was reset. Pair each browser again with a new code.
           </p>
         ) : null}
-        {pairedMissing ? (
+        {pairedMissing === "missing" && !(browsers ?? []).some((b) => b.id === usedBrowser) ? (
           <p role="alert" className="ao-warning">
             The code was used, but the paired browser is not in the list yet. Reload this page to see it; if it is still missing, pair the browser again with a new code.
+          </p>
+        ) : null}
+        {pairedMissing === "unread" ? (
+          <p role="alert" className="ao-warning">
+            The code was used, but the list of paired browsers could not be read just now, so the browser just paired is not shown. Reload this page to read the list again.
           </p>
         ) : null}
         {revoked ? (

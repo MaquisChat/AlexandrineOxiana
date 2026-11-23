@@ -573,6 +573,45 @@ describe("used only once written (review round 1: I1, M1, M2, M3)", () => {
     expect(lists()).toBe(n);
   });
 
+  it("if the list cannot be read after a use, the screen says the list could not be read, not that the browser is missing, and does not suggest pairing again (FR-337)", async () => {
+    const svc = pairingService();
+    let reads = 0;
+    server.use(
+      http.get(url("/extension/pairings"), () => (++reads === 1 ? HttpResponse.json({ extensions: [] }) : apiError(500, "INTERNAL", "Something went wrong in the library service."))),
+      ...svc.handlers,
+    );
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={2000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    svc.pairWith(BROWSER_B);
+    await tick(2500);
+    await tick(30_000);
+    const alert = screen.getByRole("alert").textContent ?? "";
+    expect(alert).toBe("The code was used, but the list of paired browsers could not be read just now, so the browser just paired is not shown. Reload this page to read the list again.");
+    expect(screen.getByRole("status", { name: "Pairing result" }).textContent).toContain(BROWSER_B.origin);
+  });
+
+  it("revoking another browser keeps the 'not in the list' warning while the paired browser is still missing (FR-338)", async () => {
+    const svc = pairingService({ pairings: [BROWSER_A] });
+    // The list never shows the browser the code paired (BROWSER_B), only BROWSER_A until it is revoked.
+    server.use(http.get(url("/extension/pairings"), () => HttpResponse.json({ extensions: svc.state.pairings.filter((p) => p.id !== BROWSER_B.id) })), ...svc.handlers);
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={2000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    svc.pairWith(BROWSER_B);
+    await tick(2500);
+    await tick(30_000);
+    expect(screen.getByRole("alert").textContent).toMatch(/not in the list/i);
+    await user.click(screen.getByRole("button", { name: `Revoke ${BROWSER_A.origin}` }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Revoke pairing" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await tick(2500);
+    expect(screen.getByRole("status", { name: "Revoke result" }).textContent).toContain(BROWSER_A.origin);
+    expect(screen.getByRole("alert").textContent).toMatch(/not in the list/i);
+  });
+
   it("a refusal from the status route stops the asking and says plainly that the screen cannot tell (M1)", async () => {
     const svc = pairingService();
     let reads = 0;
