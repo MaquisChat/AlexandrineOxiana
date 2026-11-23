@@ -234,6 +234,8 @@ const OUTCOME_TEXT: Record<string, string> = {
   CAPTURE_FAILED: "Something went wrong while saving this link. Nothing was saved.",
   // The media helper's own job codes.
   TOOL_DOWNLOAD_FAILED: "A tool could not be downloaded. Check the internet connection, then install it again from the Optional tools screen.",
+  TOOL_DOWNLOAD_UNTRUSTED:
+    "A tool could not be downloaded because the secure connection to its publisher could not be verified. A VPN, a security program or a network that inspects secure connections can cause this: try again without it, or on another network, from the Optional tools screen.",
   TOOL_CHECKSUM_MISMATCH: "The downloader tool that was fetched did not match its published checksum, so it was not installed. Try again later.",
   TOOL_UPDATE_FAILED: "The downloader tool could not be updated. Try again later.",
   TOOL_MISSING: "A tool this capture needs is not installed on this computer. Install it from the Optional tools screen.",

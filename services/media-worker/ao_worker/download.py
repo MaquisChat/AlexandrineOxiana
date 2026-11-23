@@ -199,7 +199,9 @@ def _download_ytdlp(dest: Path, progress=None, cancelled=None) -> None:
     except JobError as e:
         raise ToolError(e.code, e.message, e.detail) from e
     except (OSError, ValueError) as e:
-        raise ToolError("TOOL_DOWNLOAD_FAILED", "yt-dlp could not be downloaded", type(e).__name__) from e
+        if fetch.untrusted(e):  # the release lookup's own connection (R476 b)
+            raise ToolError("TOOL_DOWNLOAD_UNTRUSTED", fetch.UNTRUSTED_MESSAGE, fetch.failure_detail(e)) from e
+        raise ToolError("TOOL_DOWNLOAD_FAILED", "yt-dlp could not be downloaded", fetch.failure_detail(e)) from e
     expected = None
     for line in sums.splitlines():
         parts = line.split()

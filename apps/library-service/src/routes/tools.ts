@@ -22,6 +22,9 @@ const KEEP_FINISHED = 50;
 /** Plain words for a failed tool job, by the worker's code. */
 const MESSAGES: Record<string, string> = {
   TOOL_DOWNLOAD_FAILED: "The download did not finish. Check the internet connection, then try again.",
+  // R476 b: a certificate that could not be verified is not "no connection".
+  TOOL_DOWNLOAD_UNTRUSTED:
+    "The download was stopped because the secure connection to the publisher could not be verified, so nothing was installed. A VPN, a security program or a network that inspects secure connections can cause this: try again without it, or on another network.",
   TOOL_CHECKSUM_MISMATCH: "The downloaded file did not match its published checksum, so it was not installed. Try again later.",
   TOOL_ARCHIVE_UNSAFE: "The downloaded archive was not safe to unpack, so nothing was installed.",
   TOOL_WRITE_FAILED: "The tool could not be saved on this computer. Check that there is enough free disk space, then try again.",

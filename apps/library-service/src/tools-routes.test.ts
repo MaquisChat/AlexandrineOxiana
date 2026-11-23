@@ -288,6 +288,22 @@ describe("installing a tool", () => {
     expect(again.json.job.jobId).not.toBe(job.jobId);
   });
 
+  it("a download refused for an unverifiable certificate is told apart, in plain words, and can be retried (R476 b)", async () => {
+    const worker = stubWorker();
+    await start({ worker, autoStartWorker: false });
+    const job = (await call({ method: "POST", url: "/tools/speech-tiny/install" })).json.job as ToolJob;
+    await until(() => worker.runs.length === 1);
+    worker.runs[0]!.finish(new WorkerToolError("TOOL_DOWNLOAD_UNTRUSTED", "the download was refused: the server's certificate could not be verified", "speech-tiny"));
+    await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status === "failed");
+    const failed = (await call({ url: `/tools/jobs/${job.jobId}` })).json.job as ToolJob;
+    expect(failed.error?.code).toBe("TOOL_DOWNLOAD_UNTRUSTED");
+    expect(failed.error?.message).toBe(
+      "The download was stopped because the secure connection to the publisher could not be verified, so nothing was installed. A VPN, a security program or a network that inspects secure connections can cause this: try again without it, or on another network.",
+    );
+    const again = await call({ method: "POST", url: "/tools/speech-tiny/install" });
+    expect(again.status).toBe(202);
+  });
+
   it("an unknown tool, action or job is 404", async () => {
     await start({ worker: stubWorker(), autoStartWorker: false });
     expect((await call({ method: "POST", url: "/tools/nope/install" })).status).toBe(404);

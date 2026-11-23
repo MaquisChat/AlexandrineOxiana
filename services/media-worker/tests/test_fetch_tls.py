@@ -191,3 +191,115 @@ def test_certifi_is_a_declared_dependency_pinned_exactly():
     deps = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())["project"]["dependencies"]
     pins = [d for d in deps if d.split("==")[0].strip().lower() == "certifi"]
     assert len(pins) == 1 and "==" in pins[0], deps
+
+
+# ---------- (b) a certificate that cannot be verified is told apart from "no connection" ----------
+
+UNTRUSTED_MESSAGE = "the download was refused: the server's certificate could not be verified"
+
+
+def test_an_unverifiable_certificate_is_its_own_code_with_class_names_only(server, no_default_paths, tmp_path):
+    with pytest.raises(fetch.ToolInstallError) as e:
+        fetch.download(server.url, tmp_path / "f", sha256=None, size=None, hosts=("127.0.0.1",), max_bytes=1000)
+    assert e.value.code == "TOOL_DOWNLOAD_UNTRUSTED"
+    assert e.value.message == UNTRUSTED_MESSAGE
+    assert e.value.detail == "URLError/SSLCertVerificationError"
+    assert "127.0.0.1" not in str(e.value.to_json())
+
+
+class Redirector:
+    """A plain HTTP server that redirects every GET to `target`."""
+
+    def __init__(self, target: str):
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):  # noqa: ANN002
+                pass
+
+            def do_GET(self):  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}/start"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def test_an_unverifiable_certificate_after_a_redirect_is_told_apart_too(server, no_default_paths, tmp_path):
+    r = Redirector(server.url)
+    try:
+        with pytest.raises(fetch.ToolInstallError) as e:
+            fetch.download(r.url, tmp_path / "f", sha256=None, size=None, hosts=("127.0.0.1",), max_bytes=1000)
+    finally:
+        r.close()
+    assert e.value.code == "TOOL_DOWNLOAD_UNTRUSTED" and e.value.detail == "URLError/SSLCertVerificationError"
+
+
+def test_a_refused_connection_names_its_inner_class(no_proxy, tmp_path):
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    with pytest.raises(fetch.ToolInstallError) as e:
+        fetch.download(f"http://127.0.0.1:{port}/x", tmp_path / "f", sha256=None, size=None, hosts=("127.0.0.1",), max_bytes=10)
+    assert e.value.code == "TOOL_DOWNLOAD_FAILED" and "no connection" in e.value.message
+    assert e.value.detail == "URLError/ConnectionRefusedError"
+
+
+@pytest.mark.parametrize("err, code, detail", [
+    (ssl.SSLCertVerificationError(1, "certificate verify failed"), "TOOL_DOWNLOAD_UNTRUSTED", "SSLCertVerificationError"),
+    (__import__("urllib.error").error.URLError(ssl.SSLCertVerificationError(1, "x")), "TOOL_DOWNLOAD_UNTRUSTED", "URLError/SSLCertVerificationError"),
+    (__import__("urllib.error").error.URLError(__import__("socket").gaierror(-2, "Name or service not known")), "TOOL_DOWNLOAD_FAILED", "URLError/gaierror"),
+    (__import__("urllib.error").error.URLError(TimeoutError("timed out")), "TOOL_DOWNLOAD_FAILED", "URLError/TimeoutError"),
+    (__import__("urllib.error").error.URLError("no host given"), "TOOL_DOWNLOAD_FAILED", "URLError"),
+    (TimeoutError("timed out"), "TOOL_DOWNLOAD_FAILED", "TimeoutError"),
+])
+def test_opening_failures_are_classified_by_class_names(err, code, detail):
+    e = fetch.opening_error(err)
+    assert (e.code, e.detail) == (code, detail)
+    assert e.message == (UNTRUSTED_MESSAGE if code == "TOOL_DOWNLOAD_UNTRUSTED" else "the download failed (no connection)")
+
+
+def test_an_unverifiable_certificate_while_reading_the_body_is_told_apart(server, pki, monkeypatch, tmp_path):
+    monkeypatch.setenv("SSL_CERT_FILE", str(pki["ca"]))
+    real = fetch.open_watched
+
+    def wrapped(*a, **k):
+        resp, sockets = real(*a, **k)
+
+        def read1(n):  # noqa: ARG001
+            raise ssl.SSLCertVerificationError(1, "certificate verify failed")
+
+        resp.read1 = read1
+        return resp, sockets
+
+    monkeypatch.setattr(fetch, "open_watched", wrapped)
+    with pytest.raises(fetch.ToolInstallError) as e:
+        fetch.download(server.url, tmp_path / "f", sha256=None, size=None, hosts=("127.0.0.1",), max_bytes=1000)
+    assert e.value.code == "TOOL_DOWNLOAD_UNTRUSTED" and e.value.detail == "SSLCertVerificationError"
+    assert not (tmp_path / "f").exists()
+
+
+def test_the_ytdlp_release_lookup_tells_an_unverifiable_certificate_apart(server, no_default_paths, monkeypatch, tmp_path):
+    from ao_worker import download
+
+    monkeypatch.setenv("AO_TOOLS_DIR", str(tmp_path / "tools"))
+    monkeypatch.setattr(download, "YTDLP_RELEASES", server.url.rsplit("/", 1)[0] + "/releases/")
+    monkeypatch.setattr(download, "YTDLP_HOSTS", ("127.0.0.1",))
+    with pytest.raises(download.ToolError) as e:
+        download.install_ytdlp()
+    assert e.value.code == "TOOL_DOWNLOAD_UNTRUSTED" and e.value.detail == "URLError/SSLCertVerificationError"
+    assert "127.0.0.1" not in str(e.value.to_json())
