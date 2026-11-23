@@ -17,18 +17,72 @@ let pdfjs: Promise<PdfJs> | undefined;
 const loadPdfJs = () => (pdfjs ??= import("pdfjs-dist/legacy/build/pdf.mjs"));
 
 const TEXT_PAGES = 3;
+/** FR-577: the file is read in ranges of this size, as pdf.js asks for them, never whole. */
+const RANGE_CHUNK = 64 * 1024;
 /** Larger PDFs are not read into memory for metadata. */
 const MAX_PDF_BYTES = 512 * 1024 * 1024;
+
+/** Test seam (R47: honoured only under NODE_ENV=test): told the size of each read of the file. */
+export const pdfSeams: { onRead?: (bytes: number) => void } = {};
 
 const str = (v: unknown): string | undefined => (typeof v === "string" && clean(v) ? clean(v) : undefined);
 
 export async function extractPdf(path: string): Promise<RawExtract> {
   const stat = await fsp.stat(path);
   if (stat.size > MAX_PDF_BYTES) return {};
-  const data = new Uint8Array(await fsp.readFile(path));
-  const { getDocument } = await loadPdfJs();
+  const { getDocument, PDFDataRangeTransport } = await loadPdfJs();
+  // FR-577: pdf.js reads the file by ranges, as it needs them (the cross-reference table, the metadata, the first
+  // pages), through this transport — never the whole file into memory. A range that cannot be read ends the document
+  // (pdf.js has no way to fail a range, so its reads would otherwise wait for ever): the file counts as unreadable.
+  const fh = await fsp.open(path, "r");
+  const size = stat.size;
+  let ended = false;
+  let task: ReturnType<typeof getDocument> | undefined;
+  /** Rejects when a range could not be read: what waits on pdf.js then stops waiting. */
+  let failRead!: (err: unknown) => void;
+  const readFailed = new Promise<never>((_, reject) => (failRead = reject));
+  readFailed.catch(() => {});
+  const readRange = async (begin: number, end: number): Promise<Uint8Array> => {
+    const buf = Buffer.alloc(Math.max(0, end - begin));
+    let at = 0;
+    while (at < buf.length) {
+      const { bytesRead } = await fh.read(buf, at, buf.length - at, begin + at);
+      if (bytesRead === 0) throw new Error("the file is shorter than it was");
+      at += bytesRead;
+    }
+    if (pdfSeams.onRead && process.env.NODE_ENV === "test") pdfSeams.onRead(buf.length);
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
+  };
+  class FileRangeTransport extends PDFDataRangeTransport {
+    override requestDataRange(begin: number, end: number): void {
+      if (ended) return;
+      readRange(begin, Math.min(end, size)).then(
+        (chunk) => {
+          if (ended) return;
+          try {
+            this.onDataRange(begin, chunk);
+          } catch {
+            // pdf.js no longer waits for this range.
+          }
+        },
+        (err: unknown) => {
+          ended = true;
+          failRead(err);
+          void task?.destroy().catch(() => {});
+        },
+      );
+    }
+  }
+  let first: Uint8Array;
+  try {
+    first = await readRange(0, Math.min(size, RANGE_CHUNK));
+  } catch {
+    await fh.close().catch(() => {});
+    return { readFailed: true };
+  }
   const params = {
-    data,
+    range: new FileRangeTransport(size, first),
+    rangeChunkSize: RANGE_CHUNK,
     isEvalSupported: false,
     useWorkerFetch: false,
     enableXfa: false,
@@ -42,8 +96,23 @@ export async function extractPdf(path: string): Promise<RawExtract> {
     disableStream: true,
     verbosity: 0,
   };
-  const task = getDocument(params as Parameters<typeof getDocument>[0]);
+  task = getDocument(params as Parameters<typeof getDocument>[0]);
+  const loading = task;
   try {
+    return await Promise.race([readFailed, read(loading, path)]);
+  } catch {
+    // Not a readable PDF (damaged, truncated, or encrypted with a password), or a range of it could not be read.
+    return { readFailed: true };
+  } finally {
+    ended = true;
+    await loading.destroy().catch(() => {});
+    await fh.close().catch(() => {});
+  }
+}
+
+/** The metadata and the first pages' text of the document `task` opens (`path`: the file's, for its name). */
+async function read(task: ReturnType<PdfJs["getDocument"]>, path: string): Promise<RawExtract> {
+  {
     const doc = await task.promise;
     const out: RawExtract = {};
     const { info, metadata } = await doc.getMetadata().catch(() => ({ info: {} as Record<string, unknown>, metadata: null }));
@@ -106,10 +175,5 @@ export async function extractPdf(path: string): Promise<RawExtract> {
     if (text) out.text = text;
     out.needsOcr = (pages[0] ?? "").replace(/\s+/gu, "").length < OCR_THRESHOLD_CHARS;
     return out;
-  } catch {
-    // Not a readable PDF (damaged, truncated, or encrypted with a password).
-    return { readFailed: true };
-  } finally {
-    await task.destroy().catch(() => {});
   }
 }
