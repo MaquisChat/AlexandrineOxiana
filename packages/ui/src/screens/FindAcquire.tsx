@@ -1632,9 +1632,11 @@ function ProjectQueue(props: {
         if (libTicket.current?.ticket === ticket) libTicket.current = null;
         p.then(
           (late) => {
-            // FR-561: the window this late answer opened is closed — unless the page has started a newer window since
-            // (it holds that ticket): the one window open is then the newer one, or the newer open will find this one
-            // and close it itself (R342 b), so closing here could end the newer wait.
+            // FR-561 (R472): the shell is the guard — it closes a sign-in window only on behalf of the open that made
+            // it (its ticket), so a late answer never ends a newer window's wait. This check is only a second guard: it
+            // does not ask the shell to close when this part of the screen has itself started a newer window since (it
+            // holds that ticket). It sees nothing beyond this part of the screen: not a start made after the screen was
+            // left and opened again or another project chosen, nor the window "Test" opened on Your library.
             if (late === true && !libTicket.current) void shellWithin(shell.closeLibraryWindow());
           },
           () => {},
