@@ -95,3 +95,65 @@ Names inside `aria-label`s are not visible sentences. The one new unisolated pla
 - M1 (the loading flash and the read-only case), M2 (a repeated detach is audited), M7 (the picker's bidi).
 - That the FR-156, 157, 158, 163, 168, 182, 187/188, 204/205 and 348 tests fail without their fixes: I read each test against the old code and did not take those guards out.
 - FR-158's real right-to-left layout in WebKit.
+
+## Second look (R461, R463, R465 a)
+
+Worktree `.claude/worktrees/re-2b` (branch `re-2b-projects`), commits 22afe32..6c792cf. That is 13 commits, including 6c792cf, the encrypted "more than one" panel holding a library's close, which arrived while I looked.
+
+**Verdict for this round: approve with small points.** No Critical and no Important findings. Every point is closed as ruled. I found nothing this round broke in what I approved before.
+
+### What I ran
+- **Guard removal (M2):** with the new `if (detaching && !c.documentAssetId) throw …` line taken out of `packages/library/src/repo/fieldwork.ts`, `fieldwork.test.ts -t M2` fails (`promise resolved … instead of rejecting`). Restored afterwards.
+- **Probe** `LibraryChooser.lostCreate.probeRE2.test.tsx` (deleted afterwards), 2 passed:
+  - A "may have been created" notice that the automatic re-check settles as "was not created" before the library closes leaves no notice in the chooser.
+  - The researcher's own "Switch library" notes the lost create. The only writes are `POST /projects` and `POST /libraries/close`.
+- **Interference:** while I worked, the implementer's uncommitted edits for 6c792cf sat in the worktree. I touched only the line I restored and my own probe. `git status --short` is empty at the end.
+
+### R461 a: the encrypted "found" panel, and since 6c792cf the encrypted "more than one" panel
+- **How the hold works:** it reuses the recovery-code step's hold (`onRecoveryPending` → `holdClose`). That step's own hold is unchanged, and the two cannot be on screen together.
+- **How a library closes:** every close reaches the Library screen as `library.state {open:false}` on the event stream: another window, the service, a move, or a reconnect to a service with no library. Each one meets the hold.
+- **"Switch library":** it sits behind the modal dialog, so it cannot be pressed while the panel is up.
+- **Escape:**
+  - On "found", Escape is refused (`cancel` returns while `found` is set).
+  - On the held "more than one" panel, Escape and the button both go to `onCancel`. Library now sends that call to the chooser when `closedUnder` is set (6c792cf).
+- **After the close:**
+  - "Open the project" turns into "Back to choosing a library" and leaves through the existing `closedUnder` branch.
+  - On "more than one", "Open this one" is removed after the close.
+  - The added sentence is the existing closed-library sentence, as a `role="status"`.
+  - Focus stays on the panel's heading.
+- **Unencrypted projects are not held:** tested for both panels.
+
+### R461 b: the chooser's session-only notice
+- **Where it lives:** module memory (`lostCreates.ts`), read through `useSyncExternalStore`. It survives leaving the Library screen and any other route, and a reload or the app's closing clears it. Nothing goes to storage, disk or the service (tested, and in my probe).
+- **One per library and name:** the key is (libraryId, name). The library's name is in the sentence, so notices from two libraries cannot be confused.
+- **Settled projects:** a project resolved before the close is not noted (my probe).
+- **Wording:** the sentence is exactly as ruled. The two names, and the second mention of the project, are in `UserText`; a right-to-left name is tested.
+- **"Got it" and focus:** "Got it" moves focus to the next notice or to the heading, and focus is not taken on arrival.
+- **Could not verify:** each notice is a `role="status"` already present when the chooser mounts. Some screen readers do not announce a live region inserted with its content, so "announced once" may in practice be "not announced". Only a real screen reader can tell.
+
+### R461 c: same-named projects
+- Only the last part of `folder` is shown, through `UserText`.
+- Each button is named "Open the project in the folder “X”".
+- The list maps any number of projects.
+- For an encrypted create, the passphrase and recovery-code sentence is kept.
+- The notice no longer says "Each is in the list of projects." That is a changed assertion, and it is right, because the list is now on screen.
+
+### R463 and R465 a
+
+| Point | Verdict | Note |
+|---|---|---|
+| M1 | holds | Nothing is flagged until the list of imports is read, and nothing when the read is refused (read-only). As ruled; a read that fails briefly in a read-write library also leaves the warnings off without saying so. |
+| R465 a | holds | The hedged sentences match the ruling word for word. "made" keeps the asserting sentence for exactly the ids the import reports. |
+| M2 | holds | Checked inside the transaction, before anything changes. The `InvalidInputError` rolls the transaction back, so nothing is written or audited (guard removal fails the test). It is the only detach path (`updateConsent`). The service passes the sentence through and the screen shows it, then reloads. A PATCH that also changes the scope is refused whole, but the screen never sends both. |
+| M3 | partly | After a successful detach, focus goes to the record's attach control. After the M2 refusal ("That form was no longer attached…"), focus still falls to the body (n1). |
+| M4 | holds | Read-only: "This library is open read-only here, so a signed form cannot be detached." The library mode is read when Fieldwork mounts, as on Governance. Edit and Withdraw are unchanged, as ruled. |
+| M5 | holds | The comment says what was shown. |
+| M6 | holds | |
+| M7 | holds | U+2068/U+2069 around the name in the governance picker, with "(locked)" outside the marks. `FindAcquire.tsx:818` has the same option on another batch's screen; the implementer left it, rightly. |
+| M8 | holds | The automatic re-check is quiet and does not change the screen unless it settles the outcome. Overlapping automatic checks are stopped. |
+
+### Small points (all Minor)
+- **n1 (R463 M3, FR-160)** `Fieldwork.tsx` ~569: `setDetachedFrom` runs only when the detach succeeds. When the library answers "That form was no longer attached. Nothing was changed.", the reload replaces the "Detach the form…" button with the drop zone, and focus falls to the body. Direction: set the focus target on that refusal too.
+- **n2 (FR-160, nit)** If the detach succeeds but the reload fails, `detachedFrom` stays set, and focus jumps to that record's attach control whenever its area next appears.
+- **n3 (M2 wording, nit)** A record that never had a form is told "That form was no longer attached". The screen never offers that detach, so only a direct API call meets it.
+- **n4 (R461 b)** Could not verify that the chooser's notices are announced at all (see above).

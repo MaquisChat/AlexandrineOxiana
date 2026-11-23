@@ -251,6 +251,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 - [ ] Add references with VoiceOver on and listen to what is said when the status line replaces "Added 2 references." (FR-482)
 - [ ] Note whether your own result is the first thing said. (FR-483)
 - [ ] Note how a work in the results list is read out. (FR-492)
+- [ ] If the library chooser ever shows a notice that begins "When “…” was being created in “…”, the app could not tell whether it was made", note whether VoiceOver reads it out when the chooser appears. (FR-194)
 
 ## 5. What happens next without waiting for you
 
