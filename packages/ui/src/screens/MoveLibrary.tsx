@@ -19,6 +19,7 @@ import { isStreamCutOff, normaliseRoot, type GovernanceApi, type MovePlan, type 
 import { ConfirmDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import { PathField } from "../components/PathField";
+import { desktopShell } from "../desktopShell";
 import "./GovernanceScreens.css";
 
 type Stage = "pick" | "plan" | "moving" | "verified" | "failed" | "deleted";
@@ -243,7 +244,8 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
           describedBy={`${ids}-dest-hint`}
         />
         <p id={`${ids}-dest-hint`} className="ao-hint">
-          The folder must be new or empty. In the dialog you can make one with New Folder.
+          {/* The dialog exists only in the desktop app (FR-391). */}
+          {desktopShell() ? "The folder must be new or empty. In the dialog you can make one with New Folder." : "The folder must be new or empty."}
         </p>
         <button type="submit" disabled={!dest.trim() || stage === "moving" || stage === "verified"}>
           Check destination
