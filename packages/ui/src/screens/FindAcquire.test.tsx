@@ -5252,3 +5252,62 @@ describe("FindAcquire: rough edges (R460)", () => {
     expect(screen.getAllByText("The library service could not be reached.")).toHaveLength(1);
   });
 });
+
+describe("FindAcquire: a source whose linked file cannot be found (R470 a; FR-504, FR-527)", () => {
+  const TYPED = "Quillfeather, Zorblatt Grammar of Habitus";
+  const resting = () => entry({ typed: TYPED, sourceId: SID, chosen: "c1", candidates: [cand({ id: "c1" })], state: "record-complete", reason: { code: "linked-file-missing" } });
+
+  it("the row says why in the service's sentence and offers Get a copy for this source, named for the source, before Open and Remove; never Try again", async () => {
+    useService({ queues: { [PID]: queue([resting()]) } });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const r = row(TYPED);
+    expect(r.querySelector(".ao-find__state")?.textContent).toBe("Record complete");
+    expect(r.querySelector(".ao-find__reason")?.textContent).toBe(FIND_REASON_TEXT["linked-file-missing"]);
+    expect(FIND_REASON_TEXT["linked-file-missing"]).toBe("Its linked file cannot be found at the moment; the drive it is on may not be connected.");
+    const controls = [...r.querySelectorAll(".ao-find__actions button, .ao-find__actions a")].map((el) => el.getAttribute("aria-label"));
+    expect(controls).toEqual([`Get a copy for this source: “${TYPED}”`, `Open: “${TYPED}”`, `Remove from the queue: “${TYPED}”`]);
+    expect(within(r).getByRole("button", { name: `Get a copy for this source: “${TYPED}”` }).textContent).toBe("Get a copy for this source");
+    expect(r.textContent).not.toContain("linked-file-missing");
+  });
+
+  it("the press sends one request, with no body, to the entry's own route; the row shows it under way and then follows the answer, focus kept in the row", async () => {
+    const e = resting();
+    useService({ queues: { [PID]: queue([e]) } });
+    const answer = held<void>();
+    server.use(
+      http.post(url(`/projects/${PID}/find/${e.id}/get-copy`), async () => {
+        await answer.p;
+        const next: FindEntryView = { ...e, state: "looking-for-copy", reason: undefined as never, updatedAt: "2026-11-13T11:00:00.000Z" };
+        delete (next as { reason?: unknown }).reason;
+        queues[PID] = queue([next]);
+        return HttpResponse.json(next);
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const h = heard();
+    const button = within(row(TYPED)).getByRole("button", { name: `Get a copy for this source: “${TYPED}”` });
+    await user.click(button);
+    await waitFor(() => expect(button.getAttribute("aria-busy")).toBe("true"));
+    expect(button.textContent).toBe("Asking for a copy…");
+    // A second press while the first is out sends nothing more.
+    await user.click(button);
+    answer.release();
+    await waitFor(() => expect(row(TYPED).querySelector(".ao-find__state")?.textContent).toBe("Looking for a copy"));
+    const sent = calls.filter((c) => c.method === "POST" && c.path.startsWith(`/projects/${PID}/find/`));
+    expect(sent).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/get-copy`, body: undefined }]);
+    expect(row(TYPED).querySelector(".ao-find__reason")).toBeNull();
+    await waitFor(() => expect(row(TYPED).contains(document.activeElement)).toBe(true));
+    expect(h.said.join(" | ")).toContain(`“${TYPED}”: Looking for a copy.`);
+    h.stop();
+  });
+
+  it("in a read-only library the press is not offered as usable", async () => {
+    useService({ queues: { [PID]: queue([resting()], { readOnly: true }) }, mode: "read-only" });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    expect((within(row(TYPED)).getByRole("button", { name: `Get a copy for this source: “${TYPED}”` }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});

@@ -78,6 +78,7 @@ import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { AcquiredFrom, SourceFile } from "@ao/core";
 import { heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
+import { originalsReach } from "../repo/linked-file.js";
 import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, HeldFileSourceHasFileError, sourceHasFile, type HeldFileFacts } from "../repo/review.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FETCH_FILE_DEADLINE_MS, FetchFileError, downloadFailurePasses, fetchFile, fileTypeByBytes, holdFindTemp } from "./fetch-file.js";
@@ -631,6 +632,14 @@ export interface FindRunner {
    * "choose-works". Refused after `stop` or `stopAll` (R245).
    */
   asAuthor(projectId: string, entryId: string): Promise<FindEntry>;
+  /**
+   * R470 a: the researcher's "Get a copy for this source", on an entry resting "record-complete" with "linked-file-missing"
+   * only (else FindEntryStateError, nothing changed; refused after `stop` or `stopAll`, like every act). In one write the
+   * entry becomes "looking-for-copy" and keeps the pick (`copyDespiteLink`, remembered across a restart); its copy part
+   * then looks for a copy despite the linked original, under the project's rules and the Search sources settings as for
+   * every copy. A copy found waits for the researcher's check (R301); "Use this file" adds it beside the link.
+   */
+  getCopy(projectId: string, entryId: string): Promise<FindEntry>;
   /** Removes the entry; a file held for it is destroyed and its review entry closed in the same change (F11, R277 c). */
   remove(projectId: string, entryId: string): Promise<void>;
   /**
@@ -1941,6 +1950,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   const RECORD_REMOVED: FindReason = { code: "record-removed" };
   /** R296 d: FIND_HELD_MAX files already wait for the researcher: the entry waits, "record-complete", asking nothing. */
   const HELD_FULL: FindReason = { code: "held-full" };
+  /** R470 a: the record's only originals are linked files that cannot be found now: the entry rests, asking nothing. */
+  const LINKED_MISSING: FindReason = { code: "linked-file-missing" };
   /**
    * Why the rules refused a free copy's file at its hold (M8): the capture of `free_copy`, or its store. (At "Use this
    * file" the same rules are evaluated again by `resolveHeldFile`, and a refusal is the service's usual sentence.)
@@ -2068,9 +2079,21 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
     if (!live()) return;
     if (sourceHasFile(sf)) {
-      // Its source has a readable file already (the researcher's own: added by hand, or a held file used).
-      await finish({ state: "in-library" }, ["nextTryAt", "reason"]);
-      return;
+      // R470 a: a record whose only originals are LINKED files that cannot be found now (the Missing files rule) is not
+      // "in your library": the entry rests with its own reason and nothing is asked or fetched for it — unless the
+      // researcher pressed "Get a copy for this source" (`copyDespiteLink`). Judged again at every opening and unlock by
+      // `judgeResting` (R483 a), which moves resting entries only.
+      const reach = await guard(r, originalsReach(repoLibrary(repo).root, sf));
+      if (!live()) return;
+      if (reach !== "linked-missing") {
+        // Its source has a readable file already (the researcher's own: added by hand, or a held file used).
+        await finish({ state: "in-library" }, ["nextTryAt", "reason", "copyDespiteLink"]);
+        return;
+      }
+      if (!entry.copyDespiteLink) {
+        if (!(entry.state === "record-complete" && entry.reason?.code === LINKED_MISSING.code)) await finish({ state: "record-complete", reason: LINKED_MISSING }, ["nextTryAt", "offers"]);
+        return;
+      }
     }
     const ctx = await guard(r, lookupContextFor(repo, pid, http, deps.debug ? { debug } : {}));
     if (!live()) return;
@@ -2307,7 +2330,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         }
         const said = await copyEnded(pid, err, prov);
         if (!said) throw err;
-        const [w] = await write(pid, [evolve(cur, said, ["nextTryAt", "reason", "offers"], stamp())], "update");
+        // R470 a: once in the library, the researcher's "Get a copy for this source" is not kept.
+        const [w] = await write(pid, [evolve(cur, said, ["nextTryAt", "reason", "offers", ...(said.state === "in-library" ? (["copyDespiteLink"] as const) : [])], stamp())], "update");
         if (w) version.set(w);
         return;
       }
@@ -2472,6 +2496,21 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     return w;
   }
 
+  async function getCopy(projectId: string, entryId: string): Promise<FindEntry> {
+    assertOpen();
+    assertId(entryId);
+    const w = await act(projectId, async () => {
+      const cur = await current(projectId, entryId);
+      if (!cur) throw new NotFoundError("Queue entry", entryId);
+      if (!cur.sourceId || cur.state !== "record-complete" || cur.reason?.code !== LINKED_MISSING.code) throw new FindEntryStateError();
+      cancelLater(projectId, entryId);
+      const [next] = await write(projectId, [evolve(cur, { state: "looking-for-copy", attempts: 0, copyDespiteLink: true }, ["reason", "nextTryAt", "offers"], stamp())], "update");
+      return next!;
+    });
+    enqueue(projectId, entryId);
+    return w;
+  }
+
   async function remove(projectId: string, entryId: string): Promise<void> {
     assertOpen();
     assertId(entryId);
@@ -2578,6 +2617,65 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
   }
 
+  /** R470 a: an entry resting for want of its linked file, without the researcher's "Get a copy for this source". */
+  const restsForLink = (e: FindEntry): boolean => e.state === "record-complete" && e.reason?.code === LINKED_MISSING.code && !e.copyDespiteLink;
+
+  /**
+   * R483 a: at a project's opening (the library opened, the project unlocked: `resume`), each entry that RESTS with
+   * its record is judged by the Missing files rule (`originalsReach`) —
+   *  - "in your library", whose record's only originals are linked files that cannot be found now: it rests
+   *    "record-complete" with `linked-file-missing`, as the copy part would leave it;
+   *  - resting `linked-file-missing`, whose record has a file that can be reached now: "in your library" again.
+   * It MOVES ENTRIES BETWEEN RESTING STATES ONLY: no copy part, nothing asked or fetched, no pick set, nothing woken
+   * (R303). An entry with the pick, and every other state, is left as it is; so is one whose record cannot be read
+   * (the project locked meanwhile, say). The records are read outside the store turn; the moves are written in one
+   * change, each only on the version judged. One pass per opening: no timer, nothing at a read of the queue.
+   * R488 a: only an entry whose record STILL HAS a linked original that cannot be found is left resting for its link.
+   * One resting so whose record has no original any more, or was deleted, goes through the ordinary resume, as it did
+   * before R483 a: queued in the copy part like any record without a file (which then looks for a copy, or says the
+   * record was removed). An "in your library" entry whose record has no file any more is left as it is (never woken).
+   */
+  /** The copy part's ordinary resume of an entry (as `resume` queues it). */
+  function ordinary(pid: string, e: FindEntry): void {
+    if (e.nextTryAt && Date.parse(e.nextTryAt) > now().getTime()) later(pid, e.id, e.nextTryAt);
+    else enqueue(pid, e.id);
+  }
+
+  async function judgeResting(pid: string, gen: number, q: ReadonlyMap<string, FindEntry>): Promise<void> {
+    const r = runOf(pid);
+    const live = () => alive(pid, gen);
+    const root = repoLibrary(repo).root;
+    const moves: Array<{ from: FindEntry; to: Partial<FindEntry>; drop: Array<keyof FindEntry> }> = [];
+    for (const e of q.values()) {
+      if (!live()) return;
+      const inLibrary = e.state === "in-library" && !e.copyDespiteLink;
+      if (!e.sourceId || (!inLibrary && !restsForLink(e))) continue;
+      let reach: Awaited<ReturnType<typeof originalsReach>>;
+      try {
+        reach = await guard(r, repo.getSource(pid, e.sourceId).then((sf) => originalsReach(root, sf)));
+      } catch (err) {
+        if (err instanceof Abandoned) throw err;
+        // R488 a: a deleted record's entry resting for its link goes on as at any resume (it says the record was removed).
+        if (!inLibrary && err instanceof NotFoundError) ordinary(pid, e);
+        continue; // otherwise its record cannot be read now: left as it is
+      }
+      if (!inLibrary && reach === "none") ordinary(pid, e); // R488 a: no original any more: the ordinary resume
+      else if (inLibrary && reach === "linked-missing") moves.push({ from: e, to: { state: "record-complete", reason: LINKED_MISSING }, drop: ["nextTryAt", "offers"] });
+      else if (!inLibrary && reach === "reachable") moves.push({ from: e, to: { state: "in-library" }, drop: ["nextTryAt", "reason", "offers"] });
+    }
+    if (!moves.length || !live()) return;
+    await inTurn(r, pid, live, async () => {
+      const now = await readFindQueueIn(repo, pid);
+      const next: FindEntry[] = [];
+      for (const m of moves) {
+        const cur = now.get(m.from.id);
+        if (!cur || !sameVersion(cur, m.from) || cur.copyDespiteLink) continue;
+        next.push(evolve(cur, m.to, m.drop, stamp()));
+      }
+      if (next.length) await write(pid, next, "update");
+    });
+  }
+
   function resume(projectId: string): void {
     if (closed || readOnly()) return;
     let unlocked: boolean;
@@ -2630,9 +2728,16 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       // with `elsewhere`): "not-found", "failed" and "already" here neither are nor move the scan's bound back (m1).
       const madeFrom = (e: FindEntry) => e.state === "choose" || e.state === "maybe-duplicate" || (e.state === "already" && e.elsewhere === true);
       const unmade = [...q.values()].filter((e) => madeFrom(e) && !e.sourceId);
+      // R483 a: the entries that rest are judged by the Missing files rule, apart, without delaying the rest.
+      const judging = judgeResting(projectId, gen, q).catch((err: unknown) => {
+        if (!(err instanceof Abandoned)) debug(`find: the resting entries could not be judged (${errName(err)})`);
+      });
+      inflight.add(judging);
+      void judging.finally(() => inflight.delete(judging));
       // F11: the free copy's part goes on (a "fetching" entry resumes as "looking-for-copy": a download is never resumed).
+      // An entry resting for want of its linked file, with no pick, is judged by `judgeResting` alone (R483 a).
       for (const e of q.values()) {
-        if (!inCopyPart(e)) continue;
+        if (!inCopyPart(e) || restsForLink(e)) continue;
         if (e.nextTryAt && Date.parse(e.nextTryAt) > now().getTime()) later(projectId, e.id, e.nextTryAt);
         else enqueue(projectId, e.id);
       }
@@ -3243,7 +3348,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           } catch (err) {
             if (err instanceof HeldFileEntryGoneError || err instanceof NotFoundError) return;
             if (err instanceof HeldFileSourceHasFileError) {
-              await write(projectId, [evolve(cur, { state: "in-library" }, ["returnTo", "reason", "nextTryAt", "offers"], stamp())], "update");
+              // R483 b: once in the library, the researcher's "Get a copy for this source" is not kept.
+              await write(projectId, [evolve(cur, { state: "in-library" }, ["returnTo", "reason", "nextTryAt", "offers", "copyDespiteLink"], stamp())], "update");
               written = true;
               return;
             }
@@ -3295,6 +3401,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     confirmDuplicate,
     addHereAsWell,
     retry,
+    getCopy,
     remove,
     resolveHeld,
     wakeHeldFull,

@@ -77,6 +77,7 @@ const UI_ONLY: ReadonlyArray<readonly [method: "GET" | "POST" | "PUT" | "PATCH" 
   ["POST", "/projects/:id/find/:eid/author", FIND],
   ["POST", "/projects/:id/find/:eid/choose", FIND],
   ["POST", "/projects/:id/find/:eid/duplicate", FIND],
+  ["POST", "/projects/:id/find/:eid/get-copy", FIND],
   ["GET", "/projects/:id/find/:eid/elsewhere", FIND],
   ["GET", "/projects/:id/find/:eid/options", FIND],
   ["POST", "/projects/:id/find/:eid/person", FIND],

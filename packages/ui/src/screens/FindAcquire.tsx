@@ -1918,6 +1918,9 @@ function ProjectQueue(props: {
       case "retry":
         void run(e, "retry", () => api.retry(projectId, e.id));
         return;
+      case "get-copy":
+        void run(e, "get-copy", () => api.getCopy(projectId, e.id));
+        return;
       case "remove":
         void remove(e);
         return;

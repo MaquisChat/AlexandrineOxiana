@@ -52,7 +52,15 @@ export function readerHref(projectId: string, sourceId: string, opts: { assetId?
 interface ReaderFile {
   id: string;
   name: string;
+  /** R480 e: the service could not find this linked file now (`linked.missing`); absent when there or not said. */
+  missing?: true;
 }
+
+/** R480 e: whether the service said this file is a linked one it cannot find now (no path is read from it). */
+const missingNow = (a: Asset): boolean => {
+  const l = a.linked as { missing?: unknown } | undefined;
+  return typeof l === "object" && l !== null && l.missing === true;
+};
 
 type Loaded =
   | { kind: "loading" }
@@ -183,7 +191,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
     Promise.all([library.sources.get(projectId, sourceId), library.libraries.list()])
       .then(([file, libs]) => {
         if (!live) return;
-        const files = file.assets.filter((a) => isReadablePdf(a)).map((a) => ({ id: a.id, name: fileName(a) }));
+        const files: ReaderFile[] = file.assets.filter((a) => isReadablePdf(a)).map((a) => ({ id: a.id, name: fileName(a), ...(missingNow(a) ? { missing: true as const } : {}) }));
         // Task R12: the words are taken only when there is a file to open; with none they are dropped at
         // once, so that nothing holds them while "No PDF" is shown. An idempotent take (a second read of
         // the source keeps what the first took).
@@ -371,7 +379,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
       </main>
     );
   }
-  const assetId = pdfs.find((f) => f.id === asked)?.id ?? (located?.key === key ? pdfs.find((f) => f.id === located.assetId)?.id : undefined) ?? pdfs[0]?.id;
+  const assetId = pdfs.find((f) => f.id === asked)?.id ?? (located?.key === key ? pdfs.find((f) => f.id === located.assetId)?.id : undefined) ?? (pdfs.find((f) => !f.missing) ?? pdfs[0])?.id;
   return (
     <main className="ao-page ao-reader-page" aria-labelledby="ao-reader-title">
       <h1 id="ao-reader-title">

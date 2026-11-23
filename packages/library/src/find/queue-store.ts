@@ -226,6 +226,7 @@ export function sanitizeEntry(x: unknown): FindEntry | null {
     if (e.removed !== undefined && e.removed !== true) throw new Bad();
     if (e.morePeople !== undefined && e.morePeople !== true) throw new Bad();
     if (e.moreWorks !== undefined && e.moreWorks !== true) throw new Bad();
+    if (e.copyDespiteLink !== undefined && e.copyDespiteLink !== true) throw new Bad();
     let out: Record<string, unknown> = { id: id(e.id), projectId: str(e.projectId, 64, 1) };
     out = put(out, "collectionId", opt(e.collectionId, id));
     out.typed = str(e.typed, FIND_TYPED_MAX);
@@ -266,6 +267,8 @@ export function sanitizeEntry(x: unknown): FindEntry | null {
     // that is not of its shape is not kept either (the entry stays readable; the runner then says honestly that what it
     // was could not be read back, "library-unfinished").
     if (state === "waiting-sign-in") out = put(out, "returnTo", returnToOf(e.returnTo));
+    // R470 a: the researcher's "Get a copy for this source" (kept across a restart).
+    out = put(out, "copyDespiteLink", e.copyDespiteLink);
     out = put(out, "removed", e.removed);
     return out as unknown as FindEntry;
   } catch (err) {
