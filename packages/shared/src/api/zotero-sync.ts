@@ -349,6 +349,10 @@ export function zoteroSyncStatusLine(run: ZoteroSyncRun | undefined, now: Date):
       return `Synced with Zotero ${at}, with problems: ${known.join(" ")}${tail}`;
     }
     case "stopped":
+      // FR-477: a record with no end is the started record (any finished one has an end): the app may have been
+      // closed during the run, or the run's end could not be saved (R252 c). Not said as the app's closing alone.
+      if (run.reason === "app-closed" && run.finishedAt === undefined)
+        return `The sync started with Zotero ${at} has no recorded end: the app may have been closed during it, or its end could not be saved. It continues next time. ${leftBehind(run)}`;
       return `Stopped syncing with Zotero ${at}: ${reason()} ${leftBehind(run)}`;
     case "failed":
       return `Could not sync with Zotero ${at}: ${reason()} ${leftBehind(run)}`;
