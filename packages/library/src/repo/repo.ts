@@ -632,13 +632,13 @@ export async function openRepoInternal(
         if (r.projectId === "*" || folder === null) unattributed = true;
         if (r.paths) noteUnfinished(r.projectId, r.paths);
       }
-      // Files the roll-back found changed outside the app meanwhile: put back all the same, and said (R473 I1 3).
+      // Files the roll-back found changed outside the app meanwhile: put back all the same, and said (R473 I1 3). An
+      // annotations file too gets this kind (R484 b): the roll-back overwrote it, so it is not "shown as it is now".
       for (const file of r.changedOutside ?? []) {
-        const notes = /\/annotations\.json(\.enc)?$/u.test(file);
         core.integrityWarnings.push({
           projectId: r.projectId,
-          kind: notes ? "annotations-hash-mismatch" : "changed-outside-before-rollback",
-          detail: `${notes ? "The annotations file of a source" : "A file"} was changed outside the app while an interrupted change waited to be undone; the state before that change was put back (transaction ${r.txn})`,
+          kind: "changed-outside-before-rollback",
+          detail: `A file was changed outside the app while an interrupted change waited to be undone; the state before that change was put back (transaction ${r.txn})`,
           file,
         });
       }

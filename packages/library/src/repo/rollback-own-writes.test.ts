@@ -278,3 +278,44 @@ describe("R484 a: the app's own writes are never recorded as changed outside the
     });
   });
 });
+
+describe("R484 b, R479 a: a file the unfinished change named, changed by hand before the reopen, is recorded as changed-outside-before-rollback", () => {
+  it("a hand-edited source record", async () => {
+    const before = await sourceJson();
+    await writtenTwiceThenFailed();
+    await editSourceByHand();
+    await reopen();
+    expect(repo.integrityWarnings.filter((w) => w.kind === "changed-outside-before-rollback")).toEqual([
+      { projectId: pid, kind: "changed-outside-before-rollback", file: `${folder}/source.json`, detail: expect.any(String) },
+    ]);
+    await earlierStateBack(before);
+  });
+
+  it("a hand-edited annotations file: the same kind, not the warning that says annotations are shown as they are now", async () => {
+    const before = await sourceJson();
+    await writtenTwiceThenFailed();
+    await writeFile(join(lib.root, folder, "annotations.json"), JSON.stringify([note(sid, "edited by someone")]));
+    await reopen();
+    expect(outside()).toEqual([["changed-outside-before-rollback", `${folder}/annotations.json`]]);
+    await earlierStateBack(before);
+  });
+
+  it("a trashed path filled again by hand while its trash copy waits", async () => {
+    const before = await sourceJson();
+    seams.failUndo = "trashed";
+    await expect(
+      importChange(repo, pid, STORE, async (ops) => {
+        const cur = await ops.readSource(sid);
+        await ops.trashAssetFile(cur.assets[0]!);
+        throw new Error("the change failed");
+      }, { op: "test.trash" }),
+    ).rejects.toThrow("the change failed");
+    seams.failUndo = undefined;
+    await writeFile(join(lib.root, original), "a different file put there by hand\n");
+    await reopen();
+    expect(outside()).toEqual([["changed-outside-before-rollback", original]]);
+    expect(await sourceJson()).toBe(before);
+    // Not asserted here: the stored original itself. Today's roll-back leaves the file put there by hand and the
+    // original in the trash, which is then cleared; reported for a ruling (task RE-1d report, point 2).
+  });
+});

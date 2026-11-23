@@ -314,7 +314,9 @@ describe("R473 I1: while a roll-back waits, only the sources its marker names ar
     expect(sf.annotations.map((a) => a.body)).toEqual(["first", "second"]);
     await consistentOnDisk(sf, folder);
     expect(warnings("rolled-back-incomplete-write")).toHaveLength(1);
-    expect(warnings("annotations-hash-mismatch")).toMatchObject([{ projectId: pid, file: `${folder}/annotations.json` }]);
+    // R484 b: the roll-back overwrote the hand edit, so the annotations are not "shown as they are now".
+    expect(warnings("annotations-hash-mismatch")).toEqual([]);
+    expect(warnings("changed-outside-before-rollback")).toMatchObject([{ projectId: pid, file: `${folder}/annotations.json` }]);
   });
 });
 

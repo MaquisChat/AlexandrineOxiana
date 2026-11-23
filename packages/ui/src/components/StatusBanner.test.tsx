@@ -181,6 +181,20 @@ describe("R473 I1: a source whose change did not finish and could not be undone"
   });
 });
 
+describe("R479 a, R484 b: a file changed outside the app while an unfinished change waited to be undone", () => {
+  const SENTENCE =
+    "A file in Dissertation <b>2</b> was changed outside the app while a change the app had not finished was waiting to be undone. When the library opened, the app undid its unfinished change, and the outside change to that file was not kept.";
+  it("says the ruled sentence on the banner, the project's name shown as text, never the file or the detail", () => {
+    const detail = "transaction 7f3a: /Users/rana/Thesis library/Sources/x/source.json";
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: "Dissertation <b>2</b>", kind: "changed-outside-before-rollback", detail }] });
+    render(<StatusBanner variant={b!} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe(SENTENCE);
+    expect(status.querySelector("b")).toBeNull();
+    expect(status.textContent).not.toContain("7f3a");
+  });
+});
+
 describe("R409 d: old copies of the library still holding destroyed data", () => {
   const BY_HAND =
     "Old copies of this library, left by a move, still hold data that was destroyed here. Delete the folder named below by hand to complete the destruction; the app will notice when it is gone.";
