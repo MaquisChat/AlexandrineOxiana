@@ -114,6 +114,13 @@ describe("status lines (plan Z8 Accept 1)", () => {
     );
   });
 
+  it("R474 M8: a record with no end that another process on this computer is still running reads as running", () => {
+    const { finishedAt: _f, ...started } = run({ outcome: "stopped", reason: "app-closed" });
+    expect(zoteroSyncStatusLine({ ...started, runningElsewhere: true }, NOW)).toBe(
+      "A sync with Zotero started at 14:32 today is still running elsewhere on this computer, in the command line or in another copy of the app.",
+    );
+  });
+
   it("a failure's status line never says up to date, and 'nothing has changed' only for an up-to-date run", () => {
     const outcomes: ZoteroSyncRun["outcome"][] = ["finished", "finished-with-problems", "stopped", "failed"];
     for (const outcome of outcomes) {

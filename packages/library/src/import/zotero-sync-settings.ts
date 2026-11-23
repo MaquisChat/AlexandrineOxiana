@@ -174,6 +174,8 @@ export interface ZoteroSyncRun {
   note?: string;
   /** Only on a returned record, never saved: false when the history file could not take it (R244 M3). */
   recordSaved?: false;
+  /** Only on a read record, never saved (R474 M8): no end yet, and another process of this computer is running it. */
+  runningElsewhere?: true;
 }
 
 /** The sentence for a sync file written by a newer version of the app (R244 M7). */
@@ -685,20 +687,27 @@ export async function setZoteroSyncUnfinished(dir: string, libraryId: string, re
 /** Runs going on in this process (their records have no `finishedAt` yet and are not "closed during"). */
 export const runningZoteroSyncRuns = new Set<string>();
 
-/** A record without an end, not running in this process: the app closed during it (it continues next time). */
-function settled(r: ZoteroSyncRun): ZoteroSyncRun {
+/**
+ * A record without an end, not running in this process: the app closed during it (it continues next time) — unless
+ * it started while another live process of this computer held the library (`heldElsewhereSince`, ms), which alone
+ * can run a sync of it: then it is still running there (R474 M8), `runningElsewhere`.
+ */
+function settled(r: ZoteroSyncRun, heldElsewhereSince?: number): ZoteroSyncRun {
   if (r.finishedAt !== undefined || runningZoteroSyncRuns.has(r.id)) return r;
+  if (heldElsewhereSince !== undefined && Date.parse(r.startedAt) >= heldElsewhereSince) return { ...r, runningElsewhere: true };
   return { ...r, outcome: "stopped", reason: "app-closed" };
 }
 
 /**
  * This library's sync runs on this computer, newest first (at most ZOTERO_SYNC_HISTORY_MAX). A record started by an
- * earlier process and never finished reads as `stopped` / `app-closed`. A damaged file is set aside and the history
+ * earlier process and never finished reads as `stopped` / `app-closed` (or, with `heldElsewhereSince`, the time another
+ * live process of this computer opened the library, as `runningElsewhere` when it started since). A damaged file is set aside and the history
  * starts empty; a file that cannot be read throws ZoteroSyncFileUnreadableError.
  */
-export async function readZoteroSyncHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<ZoteroSyncRun[]> {
+export async function readZoteroSyncHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions & { heldElsewhereSince?: string } = {}): Promise<ZoteroSyncRun[]> {
   const f = await readFileStrict(dir, ZOTERO_SYNC_HISTORY_FILE, isHistoryFile, o);
-  return (own(f?.libraries, libraryId) ?? []).map((r) => settled(structuredClone(r)));
+  const since = o.heldElsewhereSince !== undefined ? Date.parse(o.heldElsewhereSince) : NaN;
+  return (own(f?.libraries, libraryId) ?? []).map((r) => settled(structuredClone(r), Number.isNaN(since) ? undefined : since));
 }
 
 /**
@@ -727,7 +736,7 @@ export async function putZoteroSyncRun(dir: string, libraryId: string, run: Zote
     ZOTERO_SYNC_HISTORY_FILE,
     isHistoryFile,
     (cur) => {
-      const list = (own(cur?.libraries, libraryId) ?? []).filter((r) => r.id !== run.id).map(settled);
+      const list = (own(cur?.libraries, libraryId) ?? []).filter((r) => r.id !== run.id).map((r) => settled(r));
       const at = (own(cur?.libraries, libraryId) ?? []).findIndex((r) => r.id === run.id);
       if (at >= 0 && at <= list.length) list.splice(at, 0, run);
       else list.unshift(run);

@@ -86,6 +86,8 @@ export interface ZoteroSyncRun {
   backoffUntil?: string;
   note?: string;
   recordSaved?: false;
+  /** R474 M8: no end yet, and another process of this computer (the command line, another copy of the app) is running it. */
+  runningElsewhere?: true;
 }
 
 /** What the saved key may read (the key itself is never in it). */
@@ -366,6 +368,9 @@ export function zoteroSyncStatusLine(run: ZoteroSyncRun | undefined, now: Date):
       return `Synced with Zotero ${at}, with problems: ${known.join(" ")}${tail}`;
     }
     case "stopped":
+      // R474 M8: a run another process of this computer is still running is said as running, not as without an end.
+      if (run.runningElsewhere && run.finishedAt === undefined)
+        return `A sync with Zotero started ${at} is still running elsewhere on this computer, in the command line or in another copy of the app.`;
       // FR-477: a record with no end is the started record (any finished one has an end): the app may have been
       // closed during the run, or the run's end could not be saved (R252 c). Not said as the app's closing alone.
       if (run.reason === "app-closed" && run.finishedAt === undefined)
