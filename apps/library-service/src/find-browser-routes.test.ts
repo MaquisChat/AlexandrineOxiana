@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "../../../packages/library/node_modules/undici/index.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deviceDeps, type Deps, type FindEntry } from "@ao/library";
 import {
   FIND_BROWSER_FILE_TEXT,
@@ -388,13 +388,21 @@ describe("R348 d: the app's start — POST /projects/:id/find/:eid/browser/start
 
   it("the pause after a hand-over from the browser holds every start, and the limit of waiting files refuses it", async () => {
     const { pid, e, ticket } = await ready({ started: true });
-    expect((await sendFile(ticket!, await goodPdf())).json.outcome).toBe("held");
-    const f = await resting(pid, { state: "no-open-copy" }, await record(pid, { doi: "10.5555/ao.f20a.next" }));
-    const paused = await browserStart(pid, f.id);
-    expect([paused.status, paused.json.error.reason, paused.json.error.message]).toEqual([409, "library-pause", "Ready in 20 seconds."]);
-    expect((await windowStart(pid, f.id)).json.error.reason).toBe("library-pause");
+    const pdf = await goodPdf();
+    // The pause is counted on the clock: the clock (Date only) stands still from the hand-over to the start, so the
+    // whole pause is left, whatever the file's check and the writes cost on a busy machine.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
+    try {
+      expect((await sendFile(ticket!, pdf)).json.outcome).toBe("held");
+      const f = await resting(pid, { state: "no-open-copy" }, await record(pid, { doi: "10.5555/ao.f20a.next" }));
+      const paused = await browserStart(pid, f.id);
+      expect([paused.status, paused.json.error.reason, paused.json.error.message]).toEqual([409, "library-pause", `Ready in ${LIBRARY_PAUSE_MS / 1000} seconds.`]);
+      expect(paused.json.error.message).toBe("Ready in 20 seconds.");
+      expect((await windowStart(pid, f.id)).json.error.reason).toBe("library-pause");
+    } finally {
+      vi.useRealTimers();
+    }
     expect((await view(pid, e.id)).state).toBe("needs-check");
-    void LIBRARY_PAUSE_MS;
   });
 });
 
