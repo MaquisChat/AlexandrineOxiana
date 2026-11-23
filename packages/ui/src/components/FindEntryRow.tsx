@@ -18,7 +18,9 @@
  * The copy part (Task F11; R282, R296, R301, R303): "Try again" where the engine takes it (a record whose copy the
  * rules or the waiting files' limit stopped; no open copy because some services could not be reached; a copy wait);
  * "Needs your check" offers the link "Check the file" to that record's entry in the review queue — the app never
- * attaches a found file by itself; a record removed from the library offers only "Remove from the queue".
+ * attaches a found file by itself; a record removed from the library offers only "Remove from the queue". R470 a: a
+ * record whose only original is a linked file that cannot be found says so (the service's sentence) and offers "Get a
+ * copy for this source"; a copy found then waits for the researcher's check like any other.
  *
  * The states of later slices are said in words, with "Remove from the queue" (and "Open" when the entry has a
  * record), and no control of a later slice.
@@ -62,6 +64,8 @@ export type FindActKind =
   | "same"
   | "different"
   | "retry"
+  // R470 a: "Get a copy for this source" (a record whose only original is a linked file that cannot be found).
+  | "get-copy"
   | "remove"
   // Task F18b (R340): through the researcher's library.
   | "library"
@@ -350,6 +354,8 @@ export function actionsOf(e: FindEntryView, place?: FindPlace): FindActKind[] {
     case "record-complete":
       // R326: also an entry the "Search sources" settings switched off (they are looked at again).
       if (COPY_RETRY_REASONS.has(String(e.reason?.code)) || (e.reason?.code === "switched-off" && e.reason.by === "settings")) out.push("retry");
+      // R470 a: its linked file cannot be found; a copy is looked for only when the researcher asks.
+      if (e.reason?.code === "linked-file-missing" && e.sourceId) out.push("get-copy");
       if (e.sourceId) out.push("open");
       break;
     case "looking-for-copy":
@@ -402,6 +408,7 @@ const ACT_TEXT: Record<FindActKind, string> = {
   same: "It is the same work",
   different: "It is a different work",
   retry: "Try again",
+  "get-copy": "Get a copy for this source",
   remove: "Remove from the queue",
   library: "Get through my library",
   "library-take": "Add the PDF showing in the sign-in window",
@@ -415,6 +422,7 @@ const BUSY_TEXT: Partial<Record<FindActKind, string>> = {
   same: "Saving…",
   different: "Saving…",
   retry: "Trying again…",
+  "get-copy": "Asking for a copy…",
   remove: "Removing…",
   "open-there": "Opening…",
   library: "Opening the sign-in window…",
