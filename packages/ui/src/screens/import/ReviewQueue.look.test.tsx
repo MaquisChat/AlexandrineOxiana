@@ -14,6 +14,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReviewItem } from "../../api/import";
+import { LOOK_NO_TEXT_SENTENCE, NO_TEXT_SENTENCE } from "../../reader/PdfPages";
 import type { PdfHandle } from "../../reader/pdfjs";
 import { BASE as SERVICE, mockService, P1, server, type ServiceSetup } from "../../test/importService";
 import { NO_PREVIEW } from "./FilePreview";
@@ -154,6 +155,16 @@ describe("R470 b: looking at a held file before deciding", () => {
     fireEvent.keyDown(area, { key: "n" });
     expect(within(dialog).queryByRole("region", { name: /note/iu })).toBeNull();
     expect(requests.filter((r) => r.method !== "GET")).toEqual([]);
+  });
+
+  it("R487 b: a page without text says so without offering a note (none can be added in a look)", async () => {
+    const { user, look } = await openLook();
+    await user.click(look);
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(within(dialog).getAllByText(LOOK_NO_TEXT_SENTENCE).length).toBeGreaterThan(0));
+    expect(LOOK_NO_TEXT_SENTENCE).toBe("This page has no text to select. It is probably a scanned image.");
+    expect(within(dialog).queryByText(NO_TEXT_SENTENCE)).toBeNull();
+    expect(dialog.textContent).not.toMatch(/add a note/u);
   });
 
   it("focus goes into the dialog; Close returns it to the control that opened it", async () => {

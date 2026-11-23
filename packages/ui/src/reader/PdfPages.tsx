@@ -66,6 +66,8 @@ export const RENDER_BUDGET_BYTES = 268_435_456;
 export const MAX_CANVAS_PIXELS = 16_777_216;
 /** Said on a drawn page that has no text. */
 export const NO_TEXT_SENTENCE = "This page has no text to select. It is probably a scanned image; you can still add a note to it.";
+/** The same in a look (R487 b): nothing can be added there, so no note is offered. */
+export const LOOK_NO_TEXT_SENTENCE = "This page has no text to select. It is probably a scanned image.";
 /** The space above, between and below pages, in CSS pixels (Reader.css uses the same). */
 const GAP = 16;
 
@@ -88,6 +90,8 @@ export interface PdfPagesProps {
    * handle's failure, A7); never after the handle failed, a drawing was dropped or the screen left.
    */
   onPageText?(pageIndex: number, text: TextContent): void;
+  /** R487 b: the pages of a look (R470 b), where no note can be added: a page without text says so without offering one. */
+  look?: boolean;
 }
 
 /** A page's size at 100%, turned by its own /Rotate only. */
@@ -166,7 +170,7 @@ function quietly<T>(call: () => T): T | undefined {
   }
 }
 
-export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, renderOverlay, onPageText }: PdfPagesProps) {
+export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, renderOverlay, onPageText, look = false }: PdfPagesProps) {
   const count = handle.pageCount;
   const [sizes, setSizes] = useState<ReadonlyMap<number, Size>>(() => new Map());
   const [drawn, setDrawn] = useState<ReadonlyMap<number, Drawn>>(() => new Map());
@@ -599,7 +603,7 @@ export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, r
               <div className="ao-reader-canvas" ref={refs.canvas} />
               <div className="ao-reader-text-layer" ref={refs.text} />
               {d && <div className="ao-reader-overlay">{renderOverlay(i, d.viewport)}</div>}
-              {d?.hasText === false && <p className="ao-reader-no-text">{NO_TEXT_SENTENCE}</p>}
+              {d?.hasText === false && <p className="ao-reader-no-text">{look ? LOOK_NO_TEXT_SENTENCE : NO_TEXT_SENTENCE}</p>}
             </div>
           );
         })}

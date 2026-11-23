@@ -996,7 +996,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId: storedAssetId,
       {!look && keyboard.help}
       <div className="ao-reader-body">
         <div className={keyboard.placing ? "ao-reader-area ao-reader-area--placing" : "ao-reader-area"} ref={area} onKeyDown={onAreaKey} onScrollCapture={making.onScroll}>
-          <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={renderOverlay} onPageText={onPageText} />
+          <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={renderOverlay} onPageText={onPageText} look={look !== undefined} />
           {!look && making.floating}
           {!look && making.notices}
           {!look && keyboard.notices}
