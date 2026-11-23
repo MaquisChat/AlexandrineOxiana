@@ -50,8 +50,36 @@ describe("governance routes (R113, R118)", () => {
     expect((screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement).value).toBe("");
   });
 
+  it.each(["/governance", "/audit", "/fieldwork"])("FR-163: on %s a locked project is marked in the picker, and the screen offers to unlock it in the library", async (path) => {
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: false }, { id: "p2", name: "Coastal kinship", encrypted: true, unlocked: true }] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
+      // What the screen itself reads of a locked project is refused as the service refuses it.
+      http.get(url("/projects/p1/*"), () => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "This project is locked." } }, { status: 423 })),
+    );
+    window.history.replaceState(null, "", `${path}?project=p1`);
+    render(<Host />);
+    const picker = await screen.findByRole("combobox", { name: "Project" });
+    await waitFor(() => expect([...picker.querySelectorAll("option")].map((o) => o.textContent)).toEqual(["Clinic (locked)", "Coastal kinship"]));
+    const link = await screen.findByRole("link", { name: "Unlock it in the library" });
+    expect(link.getAttribute("href")).toBe("/?project=p1");
+    expect(link.closest("p")?.textContent).toBe("This project is locked. Unlock it in the library to see and change everything in it here.");
+  });
+
+  it("FR-163: an unlocked project is not marked and nothing offers to unlock it", async () => {
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p2", name: "Coastal kinship", encrypted: true, unlocked: true }] })),
+      http.get(url("/projects/p2/audit"), () => HttpResponse.json({ events: [], total: 0 })),
+    );
+    window.history.replaceState(null, "", "/audit?project=p2");
+    render(<Host />);
+    expect(await screen.findByRole("heading", { name: "Audit log", level: 1 })).toBeTruthy();
+    expect([...screen.getByRole("combobox", { name: "Project" }).querySelectorAll("option")].map((o) => o.textContent)).toEqual(["Coastal kinship"]);
+    expect(screen.queryByRole("link", { name: "Unlock it in the library" })).toBeNull();
+  });
+
   it.each([
-    ["a locked project", { projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: false }] }, { mode: "read-write" }, "This project is locked. Unlock it in the library to change its rules."],
+    ["a locked project", { projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: false }] }, { mode: "read-write" }, "This project is locked, so its rules cannot be changed until it is unlocked."],
     ["a read-only library", { projects: [{ id: "p1", name: "Clinic", encrypted: false, unlocked: true }] }, { mode: "read-only", readOnlyReason: "locked-by-other-device" }, "This library is open read-only here, so its rules cannot be changed."],
   ])("the Governance form of %s shows the rules, capture methods included, but cannot change them, and says why (D11)", async (_what, projects, current, why) => {
     server.use(

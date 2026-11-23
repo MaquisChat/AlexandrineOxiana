@@ -7,7 +7,7 @@ import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import type { ApiClient } from "../api/client";
 import { governanceApi, type GovernanceApi, type ProjectSummary } from "../api/governance";
 import { errorText } from "../api/library";
-import { inAppLink, navigate, normalisePath, PATHS, type AppLocation } from "../navigation";
+import { inAppLink, libraryHref, navigate, normalisePath, PATHS, type AppLocation } from "../navigation";
 import { AuditLog } from "../screens/AuditLog";
 import { Fieldwork } from "../screens/Fieldwork";
 import { GovernanceSettings } from "../screens/GovernanceSettings";
@@ -80,11 +80,13 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
   const projectId = asked ? (unknown ? "" : asked) : (list[0]?.id ?? "");
   const route = governanceRoutes.find((r) => r.path === path);
   const project = list.find((p) => p.id === projectId);
+  /** FR-163: an encrypted project not unlocked: marked in the picker, and each screen of it offers to unlock it in the library. */
+  const isLocked = (p: ProjectSummary | undefined) => !!p?.encrypted && p.unlocked === false;
   const readOnlyReason =
     libraryMode === "read-only"
       ? "This library is open read-only here, so its rules cannot be changed."
-      : project?.encrypted && project.unlocked === false
-        ? "This project is locked. Unlock it in the library to change its rules."
+      : isLocked(project)
+        ? "This project is locked, so its rules cannot be changed until it is unlocked."
         : undefined;
   return (
     <div>
@@ -102,7 +104,7 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
           {!projectId && <option value="">Choose a project</option>}
           {list.map((p) => (
             <option key={p.id} value={p.id}>
-              {p.name}
+              {isLocked(p) ? `${p.name} (locked)` : p.name}
             </option>
           ))}
         </select>
@@ -115,6 +117,15 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
       {unknown && (
         <p role="alert" className="ao-screen ao-error">
           The project named in the address is not in this library. Choose a project from the list.
+        </p>
+      )}
+      {route?.needsProject && isLocked(project) && (
+        <p className="ao-screen ao-warning">
+          This project is locked.{" "}
+          <a href={libraryHref(projectId)} onClick={inAppLink}>
+            Unlock it in the library
+          </a>{" "}
+          to see and change everything in it here.
         </p>
       )}
       {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId, { readOnlyReason, encrypted: project?.encrypted === true }) : null}
