@@ -102,6 +102,10 @@ export function reportLabel(key: string, secret: string | null | undefined): str
 const droppedNote = (n: number): string[] =>
   n ? [`${n.toLocaleString("en-US")} ${n === 1 ? "annotation" : "annotations"} over the per-source limit (10,000 annotations or 16 MB of text) ${n === 1 ? "was" : "were"} not imported.`] : [];
 
+/** FR-463: sources back in Zotero that were also updated are counted in both rows (R224 a), and this says so. */
+const backUpdatedNote = (n: number): string[] =>
+  n ? [`${n.toLocaleString("en-US")} ${n === 1 ? "source back in Zotero was" : "sources back in Zotero were"} also updated, so ${n === 1 ? "it is" : "they are"} counted twice: as back in Zotero and as updated.`] : [];
+
 /** R393: failures by reason, in the order each reason first occurs, with their items in order. */
 export function failureGroups(failures: ImportReport["failures"]): Array<{ reason: string; items: string[] }> {
   const groups = new Map<string, string[]>();
@@ -225,7 +229,7 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     annotationsDeletedHere: [...latest.values()].reduce((n, e) => n + (e.annotationsDeletedHere ?? 0), 0),
     governance: rec.governance,
     // R413 b, c: a stop whose record could not be saved still says why.
-    notes: [...rec.notes, ...unsavedNote(rec.notes, batchId), ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
+    notes: [...rec.notes, ...unsavedNote(rec.notes, batchId), ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0)), ...backUpdatedNote(c.backInZoteroUpdated)],
     created: { collectionIds: [...rec.createdCollectionIds], tagIds: [...rec.createdTagIds] },
   };
   return report;

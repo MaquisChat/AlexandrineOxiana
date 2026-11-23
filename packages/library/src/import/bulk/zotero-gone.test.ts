@@ -487,6 +487,9 @@ describe("gone from Zotero, and back (Z5)", () => {
     expect(backReport.counts).toMatchObject({ backInZotero: 1, backInZoteroUpdated: 1, updated: 1, merged: 0 });
     expect((await recCounts(3)).counts.merged).toBe(backReport.counts.merged + backReport.counts.updated);
     expect(await readFile(join(lib.root, p.folder, "imports", "batch-0003", "report.md"), "utf8")).toContain("- Updated from a newer version: 1");
+    // FR-463: the overlap is said, so that the rows adding up to more than the items is not a puzzle.
+    expect(backReport.notes).toContain("1 source back in Zotero was also updated, so it is counted twice: as back in Zotero and as updated.");
+    expect(await readFile(join(lib.root, p.folder, "imports", "batch-0003", "report.md"), "utf8")).toContain("- 1 source back in Zotero was also updated, so it is counted twice: as back in Zotero and as updated.");
     // A bare back: back only.
     z.trash(U, key);
     await run(p);
@@ -494,6 +497,7 @@ describe("gone from Zotero, and back (Z5)", () => {
     const bare = await run(p);
     expect(bare.r.counts).toMatchObject({ backInZotero: 1, backInZoteroUpdated: 0, updated: 0 });
     const bareReport = await bulk().batchReport(p.id, bare.batchId);
+    expect(bareReport.notes.some((n) => /counted twice/u.test(n))).toBe(false);
     expect((await recCounts(5)).counts.merged).toBe(bareReport.counts.merged + bareReport.counts.updated);
   });
 });
