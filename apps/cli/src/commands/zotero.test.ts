@@ -317,6 +317,23 @@ describe("ao zotero check-key", () => {
     for (const out of [r, bad]) expect(out.stdout + out.stderr).not.toContain(config);
   });
 
+  it("FR-507 (R482 a): a settings file written by a newer version is left as it is by check-key, and the app's sentence for it is said; nothing says syncing is on again", async () => {
+    const file = join(config, ZOTERO_SYNC_FILE);
+    const text = JSON.stringify({ v: 2, libraries: { [libraryId]: { automatic: true, everyMinutes: 60, links: [link(U, { paused: "key-refused" })] } } });
+    await writeFile(file, text);
+    const r = await ao(["zotero", "check-key"]);
+    expect(r.code, r.stderr).toBe(0);
+    expect(await readFile(file, "utf8")).toBe(text);
+    expect(r.stdout.trim()).toBe("This key can read your library.");
+    expect(r.stderr.trim()).toBe(ZOTERO_SYNC_SENTENCES.settingsNewer);
+    expect(ZOTERO_SYNC_SENTENCES.settingsNewer).toBe("These sync settings were written by a newer version of the app. Update the app to change them.");
+    const j = await ao(["--json", "zotero", "check-key"]);
+    expect(j.code, j.stderr).toBe(0);
+    expect(json(j)).toMatchObject({ syncsAgain: 0, notes: [ZOTERO_SYNC_SENTENCES.settingsNewer] });
+    expect(r.stdout + r.stderr).not.toContain("Syncing is on again");
+    expect(await readFile(file, "utf8")).toBe(text);
+  });
+
   it("R299 a: check-key obeys a back-off an earlier run recorded: it asks Zotero nothing, says the sentence with its time, exits 1; with the wait in the past it checks as before", async () => {
     articles(2);
     await linked(link(U));
