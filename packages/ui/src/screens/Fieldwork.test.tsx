@@ -328,6 +328,28 @@ describe("Fieldwork", () => {
       expect(screen.queryByRole("dialog")).toBeNull();
     });
 
+    it("R463 M2: a form detached meanwhile elsewhere: the screen says nothing was changed and shows the record as it is", async () => {
+      const cid = withForm();
+      server.use(
+        http.patch(P("/consents/:fid"), async ({ request }) => {
+          db.calls.push({ method: "PATCH", path: `/consents/${cid}`, body: await request.json() });
+          return HttpResponse.json({ error: { code: "VALIDATION", message: "That form was no longer attached. Nothing was changed." } }, { status: 400 });
+        }),
+      );
+      render(<Fieldwork api={makeApi()} projectId={PID} />);
+      const c = await screen.findByRole("region", { name: "Consent records" });
+      const user = userEvent.setup();
+      await user.click(await within(c).findByRole("button", { name: "Detach the signed form of P-001…" }));
+      // Detached from another window meanwhile.
+      delete db.consents[0].documentAssetId;
+      const dialog = screen.getByRole("dialog", { name: "Detach the signed form" });
+      await user.type(within(dialog).getByRole("textbox", { name: /Reason/ }), "Wrong form");
+      await user.click(within(dialog).getByRole("button", { name: "Detach the form" }));
+      expect(await screen.findByText("That form was no longer attached. Nothing was changed.")).toBeTruthy();
+      expect(await within(c).findByText(/Drop the signed consent form here/)).toBeTruthy();
+      expect(screen.queryByText(/The signed form was detached/)).toBeNull();
+    });
+
     it("cancelled: nothing is sent, the form stays attached, focus is back on the button", async () => {
       withForm();
       render(<Fieldwork api={makeApi()} projectId={PID} />);
