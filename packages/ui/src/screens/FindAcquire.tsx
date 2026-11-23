@@ -1616,7 +1616,10 @@ function ProjectQueue(props: {
         if (libTicket.current?.ticket === ticket) libTicket.current = null;
         p.then(
           (late) => {
-            if (late === true) void shellWithin(shell.closeLibraryWindow());
+            // FR-561: the window this late answer opened is closed — unless the page has started a newer window since
+            // (it holds that ticket): the one window open is then the newer one, or the newer open will find this one
+            // and close it itself (R342 b), so closing here could end the newer wait.
+            if (late === true && !libTicket.current) void shellWithin(shell.closeLibraryWindow());
           },
           () => {},
         );

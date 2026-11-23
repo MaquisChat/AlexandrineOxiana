@@ -3756,6 +3756,38 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       expect(note("late shell")).toBe(NOT_OPENED);
     });
 
+    it("FR-561: an open given up on that the shell carries out only after a newer start opened its window does not close the newer window", async () => {
+      serveOne("late then newer");
+      let answer!: (v: boolean) => void;
+      fake.shell!.openLibraryWindow.mockReturnValueOnce(new Promise<boolean>((r) => (answer = r)));
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        fireEvent.click(btn("late then newer", "Get through my library"));
+        await vi.advanceTimersByTimeAsync(50);
+        await vi.waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(LIBRARY_SHELL_TIMEOUT_MS + 500);
+      } finally {
+        vi.useRealTimers();
+      }
+      await waitFor(() => expect(posts("/library/cancel")).toHaveLength(1));
+      await waitFor(() => expect(note("late then newer")).toBe(NOT_OPENED));
+      // A newer start: its window opens for its own ticket, and the row waits.
+      await waitFor(() => expect(btn("late then newer", "Get through my library").getAttribute("aria-busy")).toBeNull());
+      fireEvent.click(btn("late then newer", "Get through my library"));
+      await waitFor(() => expect(stateOf("late then newer")).toBe("Waiting for you in the sign-in window"));
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(2);
+      expect(fake.shell!.openLibraryWindow.mock.calls[1]![0]).toBe(SECOND);
+      // The first open is answered only now: the newer window is not closed, and its wait goes on.
+      act(() => answer(true));
+      await quiet();
+      expect(fake.shell!.closeLibraryWindow).not.toHaveBeenCalled();
+      expect(posts("/library/cancel")).toHaveLength(1);
+      expect(stateOf("late then newer")).toBe("Waiting for you in the sign-in window");
+    });
+
     it("R342 a: no close when the row leaves the wait by the hand-over", async () => {
       const { e } = await started("handed on");
       await say({ ticket: TICKET, state: "handed-over" });
