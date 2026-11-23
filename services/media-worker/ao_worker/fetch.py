@@ -15,6 +15,7 @@ import http.client
 import logging
 import os
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -189,9 +190,40 @@ class _WatchedHTTP(urllib.request.HTTPHandler):
         return self.do_open(_watched(http.client.HTTPConnection, self._sockets), req)
 
 
+def _ca_file() -> str | None:
+    """The app's own list of certificate authorities (certifi's file, inside the bundle)."""
+    try:
+        import certifi
+    except ImportError:
+        return None
+    return certifi.where()
+
+
+def tls_context() -> ssl.SSLContext:
+    """The TLS context of every download the worker makes itself (R476).
+
+    The standard library's default context trusts only the OpenSSL default paths compiled into the
+    Python of the BUILD machine, which do not exist on another Mac. So the app's own list (certifi's
+    file) is loaded, and the machine's default store IN ADDITION (`load_default_certs` honours
+    SSL_CERT_FILE / SSL_CERT_DIR and skips paths that do not exist), so whatever works today still
+    works. Certificates and host names are verified as by the default context. Without the app's
+    list (it cannot be found or read) the default context is used, with one warning; the packaged
+    worker's self-check fails the build in that case."""
+    path = _ca_file()
+    try:
+        if path is None:
+            raise FileNotFoundError("certifi is not installed")
+        ctx = ssl.create_default_context(cafile=path)
+    except (OSError, ssl.SSLError) as e:
+        log.warning("the app's own list of certificate authorities could not be read (%s); using the system's only", type(e).__name__)
+        return ssl.create_default_context()
+    ctx.load_default_certs()
+    return ctx
+
+
 class _WatchedHTTPS(urllib.request.HTTPSHandler):
     def __init__(self, sockets: Sockets):
-        super().__init__()  # the default context: certificates and host names verified
+        super().__init__(context=tls_context())  # certificates and host names verified (R476)
         self._sockets = sockets
 
     def https_open(self, req):
