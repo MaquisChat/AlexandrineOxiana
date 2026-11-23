@@ -17,7 +17,10 @@ let pdfjs: Promise<PdfJs> | undefined;
 const loadPdfJs = () => (pdfjs ??= import("pdfjs-dist/legacy/build/pdf.mjs"));
 
 const TEXT_PAGES = 3;
-/** FR-577: pdf.js asks for the file in ranges of at least this size (see `extractPdf` for when it asks for all of it). */
+/**
+ * FR-577: pdf.js asks for the file in ranges of this size, or a multiple of it, each cut at the file's end (so the last
+ * range, and the whole of a file smaller than this, is shorter). See `extractPdf` for when it asks for all of it.
+ */
 const RANGE_CHUNK = 64 * 1024;
 /**
  * A larger PDF is not read at all (`{}`). This bounds what a damaged or crafted file can cost: read whole, it takes
