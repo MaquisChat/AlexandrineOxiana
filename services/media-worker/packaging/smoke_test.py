@@ -553,6 +553,9 @@ def main() -> int:
     except ValueError:
         sc = {"ok": False, "stdout": r.stdout[-500:], "stderr": r.stderr[-500:]}
     res.check("self-check imports every native library (incl. pikepdf, rawpy, onnxruntime, cryptography, Silero VAD)", sc.get("ok"), sc.get("failed") or None)
+    tls = (sc.get("versions") or {}).get("tls")
+    res.check("the downloads trust the app's own certificate authorities, with the machine's default paths absent (R476)",
+              bool(tls) and "tls" not in (sc.get("failed") or {}), tls or (sc.get("failed") or {}).get("tls") or "no tls item in the self-check")
     res.info["selfCheck"] = sc.get("versions")
     r = subprocess.run([str(exe), "-m", "gallery_dl", "--version"], capture_output=True, text=True, env={"PATH": os.devnull}, timeout=60)
     res.check("gallery-dl is not inside the bundle (GPL-2.0-only; a first-use download)", r.returncode != 0, r.stdout.strip() or r.stderr[-300:])

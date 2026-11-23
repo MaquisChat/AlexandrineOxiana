@@ -15,6 +15,7 @@ import http.client
 import logging
 import os
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -98,6 +99,34 @@ class _Watchdog:
 
 class ToolInstallError(JobError):
     pass
+
+
+UNTRUSTED_MESSAGE = "the download was refused: the server's certificate could not be verified"
+
+
+def _inner(e: BaseException) -> BaseException | None:
+    reason = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else None
+    return reason if isinstance(reason, BaseException) else None
+
+
+def failure_detail(e: BaseException) -> str:
+    """Class names only, never an address: `URLError/gaierror`, `URLError/SSLCertVerificationError`."""
+    inner = _inner(e)
+    return f"{type(e).__name__}/{type(inner).__name__}" if inner is not None else type(e).__name__
+
+
+def untrusted(e: BaseException) -> bool:
+    """Whether a failure is a certificate that could not be verified (directly or as a URLError's reason)."""
+    return isinstance(e, ssl.SSLCertVerificationError) or isinstance(_inner(e), ssl.SSLCertVerificationError)
+
+
+def opening_error(e: BaseException) -> "ToolInstallError":
+    """The error for a connection that could not be opened (R476 b): TOOL_DOWNLOAD_UNTRUSTED for a
+    certificate that could not be verified, else TOOL_DOWNLOAD_FAILED "no connection"; the detail
+    names the classes so that a log tells a name lookup, a timeout and a refusal apart."""
+    if untrusted(e):
+        return ToolInstallError("TOOL_DOWNLOAD_UNTRUSTED", UNTRUSTED_MESSAGE, failure_detail(e))
+    return ToolInstallError("TOOL_DOWNLOAD_FAILED", "the download failed (no connection)", failure_detail(e))
 
 
 def host_allowed(host: str, hosts: tuple[str, ...]) -> bool:
@@ -189,9 +218,40 @@ class _WatchedHTTP(urllib.request.HTTPHandler):
         return self.do_open(_watched(http.client.HTTPConnection, self._sockets), req)
 
 
+def _ca_file() -> str | None:
+    """The app's own list of certificate authorities (certifi's file, inside the bundle)."""
+    try:
+        import certifi
+    except ImportError:
+        return None
+    return certifi.where()
+
+
+def tls_context() -> ssl.SSLContext:
+    """The TLS context of every download the worker makes itself (R476).
+
+    The standard library's default context trusts only the OpenSSL default paths compiled into the
+    Python of the BUILD machine, which do not exist on another Mac. So the app's own list (certifi's
+    file) is loaded, and the machine's default store IN ADDITION (`load_default_certs` honours
+    SSL_CERT_FILE / SSL_CERT_DIR and skips paths that do not exist), so whatever works today still
+    works. Certificates and host names are verified as by the default context. Without the app's
+    list (it cannot be found or read) the default context is used, with one warning; the packaged
+    worker's self-check fails the build in that case."""
+    path = _ca_file()
+    try:
+        if path is None:
+            raise FileNotFoundError("certifi is not installed")
+        ctx = ssl.create_default_context(cafile=path)
+    except (OSError, ssl.SSLError) as e:
+        log.warning("the app's own list of certificate authorities could not be read (%s); using the system's only", type(e).__name__)
+        return ssl.create_default_context()
+    ctx.load_default_certs()
+    return ctx
+
+
 class _WatchedHTTPS(urllib.request.HTTPSHandler):
     def __init__(self, sockets: Sockets):
-        super().__init__()  # the default context: certificates and host names verified
+        super().__init__(context=tls_context())  # certificates and host names verified (R476)
         self._sockets = sockets
 
     def https_open(self, req):
@@ -264,7 +324,8 @@ def download(
     """Fetches `url` into `dest` (a new file) and verifies it. Returns the number of bytes.
 
     `sha256` None: the caller verifies (yt-dlp, whose checksum comes from its release's list).
-    Raises ToolInstallError (TOOL_DOWNLOAD_FAILED, TOOL_CHECKSUM_MISMATCH, TOOL_WRITE_FAILED) or
+    Raises ToolInstallError (TOOL_DOWNLOAD_FAILED, TOOL_DOWNLOAD_UNTRUSTED, TOOL_CHECKSUM_MISMATCH,
+    TOOL_WRITE_FAILED) or
     JobCancelled; `dest` never remains after a failure.
     """
     first = urlsplit(url)
@@ -284,8 +345,8 @@ def download(
             raise
         except urllib.error.HTTPError as e:
             raise ToolInstallError("TOOL_DOWNLOAD_FAILED", f"the download failed (the server answered {e.code})") from e
-        except (OSError, ValueError) as e:  # URLError, timeouts, refused connections
-            raise ToolInstallError("TOOL_DOWNLOAD_FAILED", "the download failed (no connection)", type(e).__name__) from e
+        except (OSError, ValueError) as e:  # URLError, timeouts, refused connections, untrusted certificates
+            raise opening_error(e) from e
         with resp:
             try:
                 f = _open_for_write(dest)
@@ -302,6 +363,8 @@ def download(
                         chunk = resp.read1(CHUNK)
                     except Exception as e:  # noqa: BLE001 - OSError, timeouts, http.client.IncompleteRead
                         watch.check()
+                        if untrusted(e):
+                            raise ToolInstallError("TOOL_DOWNLOAD_UNTRUSTED", UNTRUSTED_MESSAGE, failure_detail(e)) from e
                         raise ToolInstallError("TOOL_DOWNLOAD_FAILED", "the download was cut off", type(e).__name__) from e
                     watch.check()
                     if not chunk:

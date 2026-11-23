@@ -191,6 +191,13 @@ describe("capture: reasons in plain words", () => {
     expect(outcomeText(undefined)).toBe(UNKNOWN_OUTCOME_TEXT);
   });
 
+  it("a tool download refused for an unverifiable certificate has its own sentence (R476 b)", () => {
+    expect(outcomeText("TOOL_DOWNLOAD_UNTRUSTED")).toBe(
+      "A tool could not be downloaded because the secure connection to its publisher could not be verified. A VPN, a security program or a network that inspects secure connections can cause this: try again without it, or on another network, from the Optional tools screen.",
+    );
+    expect(KNOWN_OUTCOME_CODES).toContain("TOOL_DOWNLOAD_UNTRUSTED");
+  });
+
   it("an unknown code keeps the service's own sentence when it sent one", () => {
     expect(outcomeText("SOMETHING_NEW", "The platform asked for a puzzle.")).toBe("The platform asked for a puzzle.");
   });

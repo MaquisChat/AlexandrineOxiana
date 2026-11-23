@@ -106,6 +106,7 @@ export interface ToolInfo {
 /** Codes a failed tool job carries in `error.code`. */
 export type ToolErrorCode =
   | "TOOL_DOWNLOAD_FAILED"
+  | "TOOL_DOWNLOAD_UNTRUSTED"
   | "TOOL_CHECKSUM_MISMATCH"
   | "TOOL_ARCHIVE_UNSAFE"
   | "TOOL_WRITE_FAILED"
