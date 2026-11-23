@@ -659,6 +659,36 @@ describe("capture methods, smaller points (Task 64 review)", () => {
     expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  // R468 (I2): the draft goes back WITHOUT the field being remounted, so focus comes back to the
+  // same element the dialog was opened from (Enter) or that Tab had moved to (the next field).
+  it("a cancelled reason puts the list back and focus on the same field it was opened from, by Enter (FR-390, R468)", async () => {
+    serve({ yaml: "protocol:\n  platforms: [youtube]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = within(card("Protocol record")).getByRole("textbox", { name: "Platforms" }) as HTMLInputElement;
+    await user.type(field, ", vimeo{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe("youtube"));
+    expect(within(card("Protocol record")).getByRole("textbox", { name: "Platforms" })).toBe(field);
+    expect(document.activeElement).toBe(field);
+  });
+
+  it("a cancelled reason puts the list back and focus on the field Tab had moved to (FR-390, R468)", async () => {
+    serve({ yaml: "protocol:\n  platforms: [youtube]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = within(card("Protocol record")).getByRole("textbox", { name: "Platforms" }) as HTMLInputElement;
+    const next = within(card("Protocol record")).getByRole("textbox", { name: "Populations" });
+    await user.type(field, ", vimeo");
+    await user.tab();
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe("youtube"));
+    expect(within(card("Protocol record")).getByRole("textbox", { name: "Platforms" })).toBe(field);
+    expect(document.activeElement).toBe(next);
+  });
+
   it("the reason dialog shows the typed legal basis as the person's own text, with its own direction (M7)", async () => {
     serve();
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);
