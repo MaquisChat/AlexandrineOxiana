@@ -153,15 +153,22 @@ const DESTROYED_NOTE: Record<DestroyedBasis, (n: number) => string> = {
  * as one the project destroyed, is counted as the project's own (listed, FR-724). A file a restore
  * named as left out on unverified records keeps that mark. Any other destroyed file of a restored
  * copy was left out by a restore: on a verified record, unless a restore made before the files were
- * named (a count of unverified ones, no list; R473 M1) is in the log — those cannot be told apart,
- * so none of them is stated as resting on a verified record.
+ * named (a count of unverified ones, no list; R473 M1) may have left it out. Such an entry holds only
+ * its counts and its time, so the files it may have left out are told by time (R484 k): a restore
+ * leaves a file out only on a destruction recorded before it, and the file's `destroyedAt` is that
+ * destruction's time; so a file whose `destroyedAt` is at or before the latest such entry's time (or
+ * that has none) may be one of them and gets the unverified sentence; a file destroyed after it can
+ * only have been left out by a later restore, which names its unverified files, and keeps the
+ * verified one. (A later restore's verified files are not named by it, so one of them destroyed at or
+ * before the earlier entry's time still gets the unverified sentence: never stated as fact.)
  */
 function destroyedBasis(events: AuditEvent[]): (a: Asset) => DestroyedBasis {
   const namedUnverified = new Set<string>();
   const recordedIds = new Set<string>();
   const recordedAt = new Set<string>();
   let restored = false;
-  let countOnly = false;
+  /** The latest time of a restore entry that counted files left out on unverified records without naming them. */
+  let countOnlyUntil = Number.NEGATIVE_INFINITY;
   for (const e of events) {
     const d = (e.details ?? {}) as { op?: unknown; destroyedAssets?: unknown; destroyedUnverifiedAssetIds?: unknown; leftOutUnverified?: unknown };
     if (e.action === "delete" && d.op === "retention.destroy") {
@@ -173,13 +180,18 @@ function destroyedBasis(events: AuditEvent[]): (a: Asset) => DestroyedBasis {
     restored = true;
     if (Array.isArray(d.destroyedUnverifiedAssetIds)) {
       for (const id of d.destroyedUnverifiedAssetIds) if (typeof id === "string") namedUnverified.add(id);
-    } else if (typeof d.leftOutUnverified === "number" && d.leftOutUnverified > 0) countOnly = true;
+    } else if (typeof d.leftOutUnverified === "number" && d.leftOutUnverified > 0) {
+      const t = Date.parse(e.at);
+      countOnlyUntil = Math.max(countOnlyUntil, Number.isNaN(t) ? Number.POSITIVE_INFINITY : t);
+    }
   }
   return (a) => {
     if (namedUnverified.has(a.id)) return "restoredUnverified";
     if (recordedIds.has(a.id) || (a.destroyedAt !== undefined && recordedAt.has(a.destroyedAt))) return "own";
     if (!restored) return "own";
-    return countOnly ? "restoredUnverified" : "restoredVerified";
+    if (countOnlyUntil === Number.NEGATIVE_INFINITY) return "restoredVerified";
+    const t = a.destroyedAt === undefined ? Number.NaN : Date.parse(a.destroyedAt);
+    return Number.isNaN(t) || t <= countOnlyUntil ? "restoredUnverified" : "restoredVerified";
   };
 }
 

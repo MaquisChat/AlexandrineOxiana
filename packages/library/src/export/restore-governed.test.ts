@@ -1502,6 +1502,50 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([OWN_RULE]);
   });
 
+  it("S-M2 (R484 k): after a restore recorded before the files were named, a later restore's file left out on a verified record keeps the verified sentence", async () => {
+    const z = await makeProject(kit, RETAIN_EXPORTABLE, false, "Bystander");
+    const zRaw = await rawSource(z);
+    await addSource(kit, z, { title: "something else" });
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    await rawSource(p);
+    const second = await rawSource(p, "RAW second interview bytes");
+    await rawSource(p, "RAW third interview bytes");
+    await keptSource(p);
+    at("2026-12-02T09:59:00.000Z");
+    const offline = join(kit.tmp, "Origin offline copy.zip");
+    await writeFile(offline, await readFile((await backupProject(kit.repo, p.id)).path));
+    at("2026-12-02T10:00:00.000Z");
+    backupSeams.failBackup = true;
+    await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+    await destroyRaw(kit.repo, p.id, [second.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    await breakAudit(z, (l) => l.includes('"op":"retention.destroy"'));
+    const first = await restore(offline);
+    expect(first.leftOut).toHaveLength(2);
+    const copy = kit.repo.getProject(first.projectId);
+    // The first restore's entry as a restore made before FR-410 wrote it: counts, no list.
+    await rewriteAudit(copy, (e) => {
+      if (e.action === "project.restored") delete (e.details as Details).destroyedUnverifiedAssetIds;
+    });
+    await reanchor(copy);
+    await kit.reopen();
+
+    // A backup of the copy; then the copy destroys its third file; the backup restored leaves that file out on a verified record.
+    later(HOUR);
+    const copyOffline = join(kit.tmp, "Copy offline copy.zip");
+    await writeFile(copyOffline, await readFile((await backupProject(kit.repo, first.projectId)).path));
+    later(HOUR);
+    const third = (await Promise.all(kit.repo.listSourceIds(first.projectId).map((id) => kit.repo.getSource(first.projectId, id)))).find(
+      (sf) => sf.assets[0]!.status !== "destroyed" && sf.source.type === "interview",
+    )!;
+    backupSeams.failBackup = true;
+    await destroyRaw(kit.repo, first.projectId, [third.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    const again = await restore(copyOffline);
+    expect(again.leftOut).toEqual([expect.not.objectContaining({ unverified: true })]);
+    expect(destroyedNotes(await notesOf((await exported(again.projectId)).path)).sort()).toEqual([TWO_UNVERIFIED, RESTORED_VERIFIED].sort());
+  });
+
   it("M1: a copy restored before the files were named (a count only): its export and a restore of its backup state none of that restore's destructions as fact", async () => {
     const { offline } = await mixed();
     const r = await restore(offline);
