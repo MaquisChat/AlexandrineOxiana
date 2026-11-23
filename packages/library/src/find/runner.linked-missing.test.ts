@@ -524,6 +524,31 @@ describe("R483 a: entries already at rest are judged when the queue is opened", 
   });
 });
 
+describe("R488 a: the pass leaves at rest only an entry whose source still has a linked original that cannot be found", () => {
+  it("probe A (no file at all): resting for its link, its source now without any original, it goes on as any record without a file does at opening", async () => {
+    const w = await world("none", { state: "record-complete", reason: { code: "linked-file-missing" } });
+    runner().resume(w.p.id);
+    const e = await restsAt(w, "needs-check", "file-looks-right");
+    expect(e.copyDespiteLink).toBeUndefined();
+    // The same end as a record without a file whose entry rests with no reason.
+    const plain = await world("none");
+    runner().resume(plain.p.id);
+    await restsAt(plain, "needs-check", "file-looks-right");
+    // It was looked for: the copy's lookup and its file were asked for (the lookup's answer may be shared by the two).
+    expect(copyRequests.length).toBeGreaterThan(0);
+    expect(fileRequests).toContain(COPY_URL);
+  });
+
+  it("probe A (deleted source): resting for its link, its source deleted, it says the record was removed at opening", async () => {
+    const w = await world("linked-missing", { state: "record-complete", reason: { code: "linked-file-missing" } });
+    await repo.deleteSource(w.p.id, w.sid);
+    runner().resume(w.p.id);
+    await restsAt(w, "no-open-copy", "record-removed");
+    expect(copyRequests).toEqual([]);
+    expect(fileRequests).toEqual([]);
+  });
+});
+
 describe("R483 c: \"Not this file\" drops the pick", () => {
   it("after the press and \"Not this file\", the entry rests as any record's does after that answer, without the pick on its line", async () => {
     const w = await world("linked-missing");

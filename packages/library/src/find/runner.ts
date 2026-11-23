@@ -2628,9 +2628,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
    *  - resting `linked-file-missing`, whose record has a file that can be reached now: "in your library" again.
    * It MOVES ENTRIES BETWEEN RESTING STATES ONLY: no copy part, nothing asked or fetched, no pick set, nothing woken
    * (R303). An entry with the pick, and every other state, is left as it is; so is one whose record cannot be read
-   * (deleted, or the project locked meanwhile). The records are read outside the store turn; the moves are written in
-   * one change, each only on the version judged. One pass per opening: no timer, nothing at a read of the queue.
+   * (the project locked meanwhile, say). The records are read outside the store turn; the moves are written in one
+   * change, each only on the version judged. One pass per opening: no timer, nothing at a read of the queue.
+   * R488 a: only an entry whose record STILL HAS a linked original that cannot be found is left resting for its link.
+   * One resting so whose record has no original any more, or was deleted, goes through the ordinary resume, as it did
+   * before R483 a: queued in the copy part like any record without a file (which then looks for a copy, or says the
+   * record was removed). An "in your library" entry whose record has no file any more is left as it is (never woken).
    */
+  /** The copy part's ordinary resume of an entry (as `resume` queues it). */
+  function ordinary(pid: string, e: FindEntry): void {
+    if (e.nextTryAt && Date.parse(e.nextTryAt) > now().getTime()) later(pid, e.id, e.nextTryAt);
+    else enqueue(pid, e.id);
+  }
+
   async function judgeResting(pid: string, gen: number, q: ReadonlyMap<string, FindEntry>): Promise<void> {
     const r = runOf(pid);
     const live = () => alive(pid, gen);
@@ -2645,9 +2655,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         reach = await guard(r, repo.getSource(pid, e.sourceId).then((sf) => originalsReach(root, sf)));
       } catch (err) {
         if (err instanceof Abandoned) throw err;
-        continue; // its record cannot be read now: left as it is
+        // R488 a: a deleted record's entry resting for its link goes on as at any resume (it says the record was removed).
+        if (!inLibrary && err instanceof NotFoundError) ordinary(pid, e);
+        continue; // otherwise its record cannot be read now: left as it is
       }
-      if (inLibrary && reach === "linked-missing") moves.push({ from: e, to: { state: "record-complete", reason: LINKED_MISSING }, drop: ["nextTryAt", "offers"] });
+      if (!inLibrary && reach === "none") ordinary(pid, e); // R488 a: no original any more: the ordinary resume
+      else if (inLibrary && reach === "linked-missing") moves.push({ from: e, to: { state: "record-complete", reason: LINKED_MISSING }, drop: ["nextTryAt", "offers"] });
       else if (!inLibrary && reach === "reachable") moves.push({ from: e, to: { state: "in-library" }, drop: ["nextTryAt", "reason", "offers"] });
     }
     if (!moves.length || !live()) return;
