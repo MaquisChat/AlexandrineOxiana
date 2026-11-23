@@ -143,27 +143,27 @@ export function FirstUseTools({ api, memory = localFirstUseMemory, hidden = fals
     focusToolsLink();
   };
 
-  const banner = visible ? (
-    <div className="ao-first-use-banner">
-      <p>{FIRST_USE_QUESTION}</p>
-      <div className="ao-actions">
-        <button type="button" onClick={() => setOpen(true)}>
-          Choose tools…
-        </button>
-        <button type="button" onClick={notNow}>
-          Not now
-        </button>
-      </div>
-    </div>
-  ) : null;
+  const sentence = visible ? <p>{FIRST_USE_QUESTION}</p> : null;
 
   return (
     <>
-      {/* Always present on the library screen, so the banner put in it is announced (politely, once). */}
-      <div role="status" className="ao-first-use-live">
-        {announced ? null : banner}
+      {/* Always present on the library screen, so the sentence put in its live region is announced
+          (politely, once). The buttons sit outside the live region, so their labels are not read
+          with the sentence (FR-316). */}
+      <div className={visible ? "ao-first-use-live ao-first-use-banner" : "ao-first-use-live"}>
+        <div role="status">{announced ? null : sentence}</div>
+        {announced ? sentence : null}
+        {visible ? (
+          <div className="ao-actions">
+            <button type="button" onClick={() => setOpen(true)}>
+              Choose tools…
+            </button>
+            <button type="button" onClick={notNow}>
+              Not now
+            </button>
+          </div>
+        ) : null}
       </div>
-      {announced && banner ? <div className="ao-first-use-live">{banner}</div> : null}
       {open && visible && tools ? (
         <FirstUseDialog
           api={api}

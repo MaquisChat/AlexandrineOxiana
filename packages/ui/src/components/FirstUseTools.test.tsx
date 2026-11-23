@@ -89,6 +89,20 @@ describe("the first-use question's banner (R164)", () => {
     expect(screen.getAllByText(FIRST_USE_QUESTION)).toHaveLength(1);
   });
 
+  it("its live region holds the sentence only: the buttons are outside it, so a screen reader does not read their labels with it (FR-316)", async () => {
+    const svc = toolsService();
+    let release!: () => void;
+    svc.state.holdCatalogue = new Promise((r) => (release = r));
+    render(<Page memory={memoryStore()} svc={svc} />);
+    const live = screen.getByRole("status");
+    release();
+    await screen.findByText(FIRST_USE_QUESTION);
+    expect(screen.getByRole("status")).toBe(live);
+    expect(live.textContent).toBe(FIRST_USE_QUESTION);
+    expect(live.contains(screen.getByRole("button", { name: "Choose tools…" }))).toBe(false);
+    expect(live.contains(screen.getByRole("button", { name: "Not now" }))).toBe(false);
+  });
+
   it("is hidden while the unlock screen is shown, and comes back without being announced again", async () => {
     const memory = memoryStore();
     const svc = toolsService();
