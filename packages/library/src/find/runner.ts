@@ -632,6 +632,14 @@ export interface FindRunner {
    * "choose-works". Refused after `stop` or `stopAll` (R245).
    */
   asAuthor(projectId: string, entryId: string): Promise<FindEntry>;
+  /**
+   * R470 a: the researcher's "Get a copy for this source", on an entry resting "record-complete" with "linked-file-missing"
+   * only (else FindEntryStateError, nothing changed; refused after `stop` or `stopAll`, like every act). In one write the
+   * entry becomes "looking-for-copy" and keeps the pick (`copyDespiteLink`, remembered across a restart); its copy part
+   * then looks for a copy despite the linked original, under the project's rules and the Search sources settings as for
+   * every copy. A copy found waits for the researcher's check (R301); "Use this file" adds it beside the link.
+   */
+  getCopy(projectId: string, entryId: string): Promise<FindEntry>;
   /** Removes the entry; a file held for it is destroyed and its review entry closed in the same change (F11, R277 c). */
   remove(projectId: string, entryId: string): Promise<void>;
   /**
@@ -2321,7 +2329,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         }
         const said = await copyEnded(pid, err, prov);
         if (!said) throw err;
-        const [w] = await write(pid, [evolve(cur, said, ["nextTryAt", "reason", "offers"], stamp())], "update");
+        // R470 a: once in the library, the researcher's "Get a copy for this source" is not kept.
+        const [w] = await write(pid, [evolve(cur, said, ["nextTryAt", "reason", "offers", ...(said.state === "in-library" ? (["copyDespiteLink"] as const) : [])], stamp())], "update");
         if (w) version.set(w);
         return;
       }
@@ -2480,6 +2489,21 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       // F8b: otherwise it starts afresh — people stored for an author offer are not kept (R279 c).
       const drop: Array<keyof FindEntry> = ["reason", "nextTryAt", "duplicateOf", "elsewhere", "match", ...(keepCandidates ? [] : (["candidates"] as const)), ...(keepChosen ? [] : (["chosen", "people", "morePeople"] as const))];
       const [next] = await write(projectId, [evolve(cur, { state: "looking-up", attempts: 0 }, drop, stamp())], "update");
+      return next!;
+    });
+    enqueue(projectId, entryId);
+    return w;
+  }
+
+  async function getCopy(projectId: string, entryId: string): Promise<FindEntry> {
+    assertOpen();
+    assertId(entryId);
+    const w = await act(projectId, async () => {
+      const cur = await current(projectId, entryId);
+      if (!cur) throw new NotFoundError("Queue entry", entryId);
+      if (!cur.sourceId || cur.state !== "record-complete" || cur.reason?.code !== LINKED_MISSING.code) throw new FindEntryStateError();
+      cancelLater(projectId, entryId);
+      const [next] = await write(projectId, [evolve(cur, { state: "looking-for-copy", attempts: 0, copyDespiteLink: true }, ["reason", "nextTryAt", "offers"], stamp())], "update");
       return next!;
     });
     enqueue(projectId, entryId);
@@ -3309,6 +3333,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     confirmDuplicate,
     addHereAsWell,
     retry,
+    getCopy,
     remove,
     resolveHeld,
     wakeHeldFull,

@@ -733,7 +733,8 @@ export async function resolveHeldFile(core: RepoCore, projectId: string, reviewI
         });
         await tx.trash(rel);
         await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: "file-attached" });
-        const next = await entryLine(core, projectId, e.cause.findEntryId, { state: "in-library" }, ["reason", "nextTryAt"], tx.at);
+        // R470 a: in the library now, the researcher's "Get a copy for this source" is not kept.
+        const next = await entryLine(core, projectId, e.cause.findEntryId, { state: "in-library" }, ["reason", "nextTryAt", "copyDespiteLink"], tx.at);
         line = next ? ((await appendFindLinesInTx(core, tx, "update", [next]))[0] ?? null) : null;
       },
       {

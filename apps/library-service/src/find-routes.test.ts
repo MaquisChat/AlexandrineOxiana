@@ -6,7 +6,7 @@
  * lock, a close, a move or an index rebuild with it. Every log line, error answer and event of this file is kept and
  * searched for the typed words.
  */
-import { mkdtemp, readFile, readdir, rm, stat, writeFile, appendFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -1561,3 +1561,65 @@ describe("F8b: a name that is also a title", () => {
     expect((await entry(p2, e2))!).toMatchObject({ state: "choose", authorOffer: { peopleCount: 2 } });
   });
 });
+
+describe("R470 a: Get a copy for this source (a source whose linked file cannot be found)", () => {
+  /** A record whose only original is a linked file, now missing, and its entry resting for that reason. */
+  async function linkedMissing(): Promise<{ pid: string; eid: string; sid: string }> {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc!.state.session!.repo;
+    const file = join(tmp, "Drive", "zorblatt.pdf");
+    await mkdir(join(tmp, "Drive"), { recursive: true });
+    await writeFile(file, await buildPdf({ title: ZORBLATT.title, lines: [ZORBLATT.title] }));
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [], type: "article-journal", title: { variants: [{ lang: "en", kind: "original", value: ZORBLATT.title }] }, creators: [{ role: "author", family: ZORBLATT.family }], identifiers: { doi: ZORBLATT.doi }, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: file, role: "original", handling: "link" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "drag-and-drop", version: "0" }, fileHashes: {}, legal: { status: "unknown" }, identifiable: false } },
+    );
+    await rm(file);
+    const at = new Date().toISOString();
+    const eid = newId();
+    await appendFindEntriesIn(repo, pid, [{ id: eid, projectId: pid, typed: LINE, state: "record-complete", reason: { code: "linked-file-missing" }, sourceId: sf.source.id, createdAt: at, updatedAt: at, attempts: 0 }], "add");
+    return { pid, eid, sid: sf.source.id };
+  }
+
+  it("the queue says why, in the shared sentence; the press makes the entry look for a copy, and its pick is never sent", async () => {
+    const { pid, eid } = await linkedMissing();
+    expect(await entry(pid, eid)).toMatchObject({ state: "record-complete", reason: { code: "linked-file-missing" } });
+    expect(FIND_REASON_CODES).toContain("linked-file-missing");
+    expect(FIND_REASON_TEXT["linked-file-missing"]).toBe("Its linked file cannot be found at the moment; the drive it is on may not be connected.");
+    const r = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/get-copy` });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toMatchObject({ id: eid, state: "looking-for-copy" });
+    expect(r.json.copyDespiteLink).toBeUndefined();
+    expect(r.json.reason).toBeUndefined();
+    // The made-up services offer no copy: the copy part ends "no open copy", the pick kept on the line, never in a view.
+    const done = await until(async () => ((x) => (x?.state === "no-open-copy" ? x : undefined))(await entry(pid, eid)), "the copy part to end");
+    expect(done.copyDespiteLink).toBeUndefined();
+    expect((await readFindQueueOfService(pid)).get(eid)?.copyDespiteLink).toBe(true);
+    expect(gated.sent.some((s) => s.path.startsWith("/works/doi:"))).toBe(true);
+  });
+
+  it("refused in words on an entry not resting for that reason (409), on an unknown entry (404), with a body (400), and for the extension (403); nothing changed", async () => {
+    const { pid, eid } = await linkedMissing();
+    const [other] = await add(pid, [AMBIGUOUS]);
+    await settled(pid, other!.id);
+    const wrong = await call({ method: "POST", url: `/projects/${pid}/find/${other!.id}/get-copy` });
+    expect(wrong.status).toBe(409);
+    expect(wrong.json.error).toMatchObject({ code: "CONFLICT", message: FIND_ROUTE_TEXT.entryState, reason: "entry-state" });
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${newId()}/get-copy` })).status).toBe(404);
+    expect((await call({ method: "POST", url: `/projects/${pid}/find/${eid}/get-copy`, body: { x: 1 } })).status).toBe(400);
+    const ext = await pairExtension();
+    const refused = await svc!.app.inject({ method: "POST", url: `/projects/${pid}/find/${eid}/get-copy`, headers: { authorization: `Bearer ${ext}`, origin: EXT } });
+    expect(refused.statusCode).toBe(403);
+    expect(await entry(pid, eid)).toMatchObject({ state: "record-complete", reason: { code: "linked-file-missing" } });
+  });
+});
+
+/** The queue as the library keeps it (the entry's whole line, beyond its view). */
+async function readFindQueueOfService(pid: string): Promise<Map<string, FindEntry>> {
+  const { readFindQueueIn } = await import("../../../packages/library/src/repo/repo.js");
+  return readFindQueueIn(svc!.state.session!.repo, pid);
+}

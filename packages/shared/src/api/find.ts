@@ -9,6 +9,8 @@
  *   POST   /projects/:id/find/:eid/duplicate     FindDuplicateRequest → FindEntryView
  *   POST   /projects/:id/find/:eid/add-here      → FindEntryView
  *   POST   /projects/:id/find/:eid/retry         → FindEntryView
+ *   POST   /projects/:id/find/:eid/get-copy      → FindEntryView (R470 a: "Get a copy for this source", on an entry
+ *                                                "record-complete" with "linked-file-missing" only; else 409 "entry-state")
  *   DELETE /projects/:id/find/:eid               → FindRemoveResponse
  *   GET    /projects/:id/find/:eid/elsewhere     → FindElsewhereResponse (null: not known, or that project is locked now)
  *   GET    /projects/:id/find/:eid/options       → FindOptionsResponse (F8: the entry's lists, for its dialog)

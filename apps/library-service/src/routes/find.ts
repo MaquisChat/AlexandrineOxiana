@@ -143,7 +143,8 @@ true satisfies Same<typeof REFERENCE_MIN_CHARS, typeof FIND_LINE_MIN_CHARS>;
  */
 export function entryView(e: FindEntry, added?: ReadonlySet<string>, library?: LibraryParts): FindEntryView {
   // F15: what a waiting entry returns to stays in the library (`returnTo` is never sent).
-  const { people, works, removed: _removed, candidates, morePeople, returnTo: _returnTo, offers: stored, ...rest } = e;
+  // R470 a: the researcher's pick "Get a copy for this source" stays in the library too (`copyDespiteLink`).
+  const { people, works, removed: _removed, candidates, morePeople, returnTo: _returnTo, copyDespiteLink: _pick, offers: stored, ...rest } = e;
   // F15: on an entry with library parts, its offers are the joined list (none: no offers); on an entry waiting in the
   // sign-in window none (its stored links are kept for its return); otherwise as stored.
   const offers = e.state === "waiting-sign-in" ? undefined : library ? library.offers : stored;
@@ -426,6 +427,18 @@ export function registerFind(app: FastifyInstance, ctx: Ctx): void {
     bodyOf(req);
     await entryOf(s, projectId, entryId);
     return entryView(await pressed(s, projectId, () => runner.retry(projectId, entryId)));
+  });
+
+  // R470 a: "Get a copy for this source" — on an entry resting because its record's only original is a linked file that
+  // cannot be found now (409 "entry-state" otherwise). The copy part then looks for a copy under the project's rules and
+  // the Search sources settings, as for every copy; a copy found waits for the researcher's check.
+  app.post("/projects/:id/find/:eid/get-copy", limit, async (req): Promise<FindEntryView> => {
+    const { s, projectId, entryId } = addressed(req, true);
+    const runner = runnerOf(s);
+    // R285 b: it takes no body.
+    if (Object.keys(bodyOf(req)).length > 0) throw badRequest(FIND_ROUTE_TEXT.noBody);
+    await entryOf(s, projectId, entryId);
+    return entryView(await pressed(s, projectId, () => runner.getCopy(projectId, entryId)));
   });
 
   app.delete("/projects/:id/find/:eid", limit, async (req): Promise<FindRemoveResponse> => {

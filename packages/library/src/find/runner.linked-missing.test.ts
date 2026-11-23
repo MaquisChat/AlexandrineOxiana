@@ -242,3 +242,79 @@ describe("R470 a: the copy part tells a linked original it cannot reach", () => 
     expect(copyRequests).toEqual([]);
   });
 });
+
+describe("R470 a: Get a copy for this source", () => {
+  it("only after the press is a copy looked for; it waits for the researcher's check, and Use this file adds it beside the link", async () => {
+    const w = await world("linked-missing");
+    const r = runner();
+    r.resume(w.p.id);
+    await restsAt(w, "record-complete", "linked-file-missing");
+    const [link] = (await repo.getSource(w.p.id, w.sid)).assets;
+    const pressed = await r.getCopy(w.p.id, w.eid);
+    expect(pressed).toMatchObject({ state: "looking-for-copy", copyDespiteLink: true });
+    expect(pressed.reason).toBeUndefined();
+    const e = await restsAt(w, "needs-check", "file-looks-right");
+    expect(e.copyDespiteLink).toBe(true);
+    expect(copyRequests).toHaveLength(1);
+    expect(fileRequests).toEqual([COPY_URL]);
+    // Nothing is attached without the researcher's confirmation (R301).
+    expect((await repo.getSource(w.p.id, w.sid)).assets).toEqual([link]);
+    const [rev, ...more] = await pendingReviews(w);
+    expect(more).toEqual([]);
+    expect((await r.resolveHeld(w.p.id, rev!.id, "attach"))?.state).toBe("in-library");
+    const assets = (await repo.getSource(w.p.id, w.sid)).assets;
+    expect(assets).toHaveLength(2);
+    expect(assets[0]).toEqual(link);
+    expect(assets[1]).toMatchObject({ role: "original", acquired: { method: "free_copy", service: "openalex" } });
+    // The Missing files check still lists the linked file.
+    expect((await checkIntegrity(lib, "full", { keyRing: ring })).missing.map((m) => m.assetId)).toEqual([link!.id]);
+    // In the library now: the pick is not kept.
+    expect((await entryOf(w))!.copyDespiteLink).toBeUndefined();
+  });
+
+  it("the pick is remembered across a restart: the next opening looks for a copy instead of resting", async () => {
+    const w = await world("linked-missing");
+    const r = runner();
+    r.resume(w.p.id);
+    await restsAt(w, "record-complete", "linked-file-missing");
+    // The settings never answer for this runner: its copy part waits right after the press is written.
+    let asked!: () => void;
+    const seen = new Promise<void>((res) => (asked = res));
+    settingsFn = () => {
+      asked();
+      return new Promise<SearchSettings>(() => {});
+    };
+    await r.getCopy(w.p.id, w.eid);
+    await seen;
+    for (const x of runners) await x.stopAll();
+    expect(await entryOf(w)).toMatchObject({ state: "looking-for-copy", copyDespiteLink: true });
+    expect(copyRequests).toEqual([]);
+    settingsFn = async () => COPY_ONLY_OPENALEX();
+    runner().resume(w.p.id);
+    await restsAt(w, "needs-check", "file-looks-right");
+    expect(fileRequests).toEqual([COPY_URL]);
+  });
+
+  it("the press is refused on any entry not resting for that reason; nothing is changed", async () => {
+    const w = await world("linked");
+    const r = runner();
+    r.resume(w.p.id);
+    const before = await restsAt(w, "in-library");
+    await expect(r.getCopy(w.p.id, w.eid)).rejects.toBeInstanceOf(FindEntryStateError);
+    expect(await entryOf(w)).toEqual(before);
+    expect(copyRequests).toEqual([]);
+  });
+
+  it("the rules still decide: a project whose rules do not allow free copies asks nothing after the press", async () => {
+    const w = await world("linked-missing");
+    const r = runner();
+    r.resume(w.p.id);
+    await restsAt(w, "record-complete", "linked-file-missing");
+    const yaml = (await repo.getGovernance(w.p.id));
+    await repo.setGovernance(w.p.id, `${GOV}acquireMethods: [reference_lookup]\n`, { baseSha256: yaml.sha256 });
+    await r.getCopy(w.p.id, w.eid);
+    await restsAt(w, "record-complete", "copy-not-allowed");
+    expect(copyRequests).toEqual([]);
+    expect(fileRequests).toEqual([]);
+  });
+});
