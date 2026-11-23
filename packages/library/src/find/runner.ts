@@ -3281,7 +3281,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           } catch (err) {
             if (err instanceof HeldFileEntryGoneError || err instanceof NotFoundError) return;
             if (err instanceof HeldFileSourceHasFileError) {
-              await write(projectId, [evolve(cur, { state: "in-library" }, ["returnTo", "reason", "nextTryAt", "offers"], stamp())], "update");
+              // R483 b: once in the library, the researcher's "Get a copy for this source" is not kept.
+              await write(projectId, [evolve(cur, { state: "in-library" }, ["returnTo", "reason", "nextTryAt", "offers", "copyDespiteLink"], stamp())], "update");
               written = true;
               return;
             }

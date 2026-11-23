@@ -8,6 +8,7 @@
  * Kept in a file of its own, apart from runner.test.ts; every wait here is for the entry's true resting state (its
  * line written, its event sent, its download folder gone).
  */
+import { copyFileSync } from "node:fs";
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,11 +26,14 @@ import { HttpClient } from "../lookup/http.js";
 import { activeTemp } from "../tmp-registry.js";
 import { checkIntegrity } from "../reconnect.js";
 import { readReviewEntries } from "../repo/review.js";
+import { addCapturedOriginal } from "../repo/repo.js";
 import type { Repo } from "../repo/repo.js";
 import type { RepoCore } from "../repo/state.js";
 import { openTestRepo } from "../repo/testing.js";
 import { appendFindEntries, readFindQueue } from "./queue-store.js";
 import { FindEntryStateError, createFindRunner, type FindRunner } from "./runner.js";
+import type { HandedFile } from "./runner.js";
+import type { LibraryAccess } from "./where.js";
 import { DEFAULT_SEARCH_SETTINGS, type FindEntry, type FindState, type SearchSettings } from "./types.js";
 
 const NOW = Date.parse("2026-11-23T10:00:00.000Z");
@@ -66,6 +70,8 @@ let changes: Array<{ projectId: string; entryId: string; state: FindState }>;
 let copyRequests: string[];
 let fileRequests: string[];
 let settingsFn: () => Promise<SearchSettings>;
+/** Called as a file is asked for (before its bytes are answered). */
+let onFileRequest: (() => void) | undefined;
 
 const COPY_ONLY_OPENALEX = (): SearchSettings => ({ ...DEFAULT_SEARCH_SETTINGS, copies: DEFAULT_SEARCH_SETTINGS.copies!.map((c) => ({ ...c, on: c.id === "openalex" })) });
 const coreOf = (r: Repo = repo) => (r as unknown as { core: RepoCore }).core;
@@ -93,6 +99,7 @@ beforeEach(async () => {
   copyRequests = [];
   fileRequests = [];
   settingsFn = async () => COPY_ONLY_OPENALEX();
+  onFileRequest = undefined;
   agent = new MockAgent();
   agent.disableNetConnect();
   agent
@@ -112,6 +119,7 @@ beforeEach(async () => {
     .intercept({ path: () => true, method: "GET" })
     .reply((o) => {
       fileRequests.push(`https://arxiv.org${String(o.path)}`);
+      onFileRequest?.();
       return { statusCode: 200, data: pdf };
     })
     .persist();
@@ -158,17 +166,17 @@ type World = { p: Project; sid: string; eid: string };
  * A project with a record and its entry, resting "record-complete" as the record part leaves it. `file`: the record's
  * original — linked from outside the library (then removed when `missing`), stored (copied in), or none.
  */
-async function world(file: "linked" | "linked-missing" | "stored"): Promise<World> {
+async function world(file: "linked" | "linked-missing" | "stored" | "none", rest: Partial<FindEntry> = {}): Promise<World> {
   const p = (await repo.createProject({ name: `P${Math.random().toString(36).slice(2, 7)}`, governanceYaml: GOV, encryption: { enabled: false } })).project;
   await mkdir(join(tmp, "Drive", "Papers"), { recursive: true });
   await writeFile(outside(), await buildPdf({ title: TITLE, lines: [TITLE, ...PAGE] }));
-  const sf = await repo.createSource(p.id, draft(), [{ path: outside(), role: "original", handling: file === "stored" ? "copy" : "link" }], {
+  const sf = await repo.createSource(p.id, draft(), file === "none" ? [] : [{ path: outside(), role: "original", handling: file === "stored" ? "copy" : "link" }], {
     provenance: { captureMethod: "manual_upload", capturedAt: new Date(NOW).toISOString(), tool: { name: "drag-and-drop", version: "0" }, fileHashes: {}, legal: { status: "unknown" }, identifiable: false },
   });
   if (file === "linked-missing") await rm(outside());
   const at = new Date(NOW).toISOString();
   const eid = newId();
-  const e: FindEntry = { id: eid, projectId: p.id, typed: "Quillfeather, Zorblatt Grammar of Habitus, 1999", state: "record-complete", sourceId: sf.source.id, createdAt: at, updatedAt: at, attempts: 0 };
+  const e: FindEntry = { id: eid, projectId: p.id, typed: "Quillfeather, Zorblatt Grammar of Habitus, 1999", state: "record-complete", sourceId: sf.source.id, createdAt: at, updatedAt: at, attempts: 0, ...rest };
   await appendFindEntries(coreOf(), p.id, [e], "add");
   return { p, sid: sf.source.id, eid };
 }
@@ -316,5 +324,72 @@ describe("R470 a: Get a copy for this source", () => {
     await restsAt(w, "record-complete", "copy-not-allowed");
     expect(copyRequests).toEqual([]);
     expect(fileRequests).toEqual([]);
+  });
+});
+
+describe("R483 b: every way to \"in your library\" drops the pick", () => {
+  it("the copy part: the linked file is back when the picked entry is looked at again — in the library, the pick gone", async () => {
+    const w = await world("linked-missing");
+    const r = runner();
+    r.resume(w.p.id);
+    await restsAt(w, "record-complete", "linked-file-missing");
+    let asked!: () => void;
+    const seen = new Promise<void>((res) => (asked = res));
+    settingsFn = () => {
+      asked();
+      return new Promise<SearchSettings>(() => {});
+    };
+    await r.getCopy(w.p.id, w.eid);
+    await seen;
+    for (const x of runners) await x.stopAll();
+    expect(await entryOf(w)).toMatchObject({ state: "looking-for-copy", copyDespiteLink: true });
+    await writeFile(outside(), await buildPdf({ title: TITLE, lines: [TITLE, ...PAGE] }));
+    settingsFn = async () => COPY_ONLY_OPENALEX();
+    runner().resume(w.p.id);
+    const e = await restsAt(w, "in-library");
+    expect(e.copyDespiteLink).toBeUndefined();
+    expect(copyRequests).toEqual([]);
+    expect(fileRequests).toEqual([]);
+  });
+
+  it("the copy's end: the linked file came back while the copy was fetched — nothing held, in the library, the pick gone", async () => {
+    const w = await world("linked-missing");
+    const back = join(tmp, "back.pdf");
+    await writeFile(back, await buildPdf({ title: TITLE, lines: [TITLE, ...PAGE] }));
+    const r = runner();
+    r.resume(w.p.id);
+    await restsAt(w, "record-complete", "linked-file-missing");
+    onFileRequest = () => copyFileSync(back, outside());
+    await r.getCopy(w.p.id, w.eid);
+    const e = await restsAt(w, "in-library");
+    expect(fileRequests).toEqual([COPY_URL]);
+    expect(await pendingReviews(w)).toEqual([]);
+    expect(e.copyDespiteLink).toBeUndefined();
+  });
+
+  it("a file handed over through the sign-in window, its record having gained a file meanwhile — in the library, the pick gone", async () => {
+    const EZ: LibraryAccess = { kind: "ezproxy-login", base: "https://ezproxy.lib-re7f.example.edu/login?url=" };
+    const w = await world("none", { state: "no-open-copy", copyDespiteLink: true });
+    const r = runner();
+    const { ticket } = await r.libraryStart(w.p.id, w.eid, EZ);
+    expect(r.libraryHandedOver(ticket, "window")).toEqual({ projectId: w.p.id, entryId: w.eid });
+    expect(await entryOf(w)).toMatchObject({ state: "waiting-sign-in", copyDespiteLink: true });
+    const mine = join(tmp, "mine.pdf");
+    await writeFile(mine, await buildPdf({ title: "Mine", lines: ["Mine"] }));
+    await addCapturedOriginal(repo, w.p.id, w.sid, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+    const bytes = await goodPdf();
+    const file: HandedFile = {
+      async take(_path, to) {
+        await writeFile(to, bytes, { flag: "wx", mode: 0o600 });
+        return { ok: true, bytes: bytes.length };
+      },
+      async discard() {},
+    };
+    await r.acceptLibraryFile(w.p.id, w.eid, "/inbox-of-the-shell/0123456789abcdef0123456789abcdef.pdf", "sign-in-window", "https://ezproxy.lib-re7f.example.edu/login", file);
+    const e = (await entryOf(w))!;
+    expect(e.state).toBe("in-library");
+    expect(e.copyDespiteLink).toBeUndefined();
+    expect(await pendingReviews(w)).toEqual([]);
+    expect(copyRequests).toEqual([]);
   });
 });
