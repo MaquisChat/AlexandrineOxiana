@@ -631,7 +631,7 @@ function CaptureMethods({
           )}
         </div>
         <CommitInput
-          key={cancelled}
+          reset={cancelled}
           label="Default legal basis for captures from the web (recorded with each capture that gives none)"
           hint="For example: Public task, GDPR Art. 6(1)(e). Setting or changing it loosens the rules, so it asks for a reason."
           disabled={disabled}
@@ -859,7 +859,7 @@ function FindAcquireWays({
         ) : null}
       </fieldset>
       <CommitInput
-        key={cancelled}
+        reset={cancelled}
         label="Default legal basis for records made from typed references (recorded with each such record)"
         hint="For records made from references you type into Find and acquire. For example: Legitimate interest, GDPR Art. 6(1)(f). Setting or changing it loosens the rules, so it asks for a reason."
         disabled={disabled}
@@ -881,10 +881,12 @@ function FindAcquireWays({
 }
 
 /** One line of text, committed when the field loses focus or on Enter (a loosening asks for a reason once, not per keystroke). */
-function CommitInput({ label, hint, value, onCommit, disabled }: { label: string; hint: string; value: string; onCommit: (v: string) => void; disabled?: boolean }) {
+function CommitInput({ label, hint, value, onCommit, disabled, reset }: { label: string; hint: string; value: string; onCommit: (v: string) => void; disabled?: boolean; reset: number }) {
   const id = useId();
   const [draft, setDraft] = useState(value);
-  useEffect(() => setDraft(value), [value]);
+  // `reset` (the count of cancelled reason dialogs): the draft goes back to the rules in place, not
+  // by a remount, so focus stays on the field (R468).
+  useEffect(() => setDraft(value), [value, reset]);
   const commit = () => {
     const next = draft.trim();
     if (next !== value.trim()) onCommit(next);

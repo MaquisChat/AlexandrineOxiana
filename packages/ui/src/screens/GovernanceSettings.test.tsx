@@ -645,6 +645,34 @@ describe("capture methods, smaller points (Task 64 review)", () => {
     expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  // R468 (I2, by its reason): the legal-basis fields go back WITHOUT a remount, so focus stays on the same element.
+  it("a cancelled reason puts the web legal basis back, and focus on the same field (R468)", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = within(card("Capture methods")).getByRole("textbox", { name: /Default legal basis for captures from the web/ }) as HTMLInputElement;
+    await user.type(field, "Public task{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe(""));
+    expect(within(card("Capture methods")).getByRole("textbox", { name: /Default legal basis for captures from the web/ })).toBe(field);
+    expect(document.activeElement).toBe(field);
+  });
+
+  it("a cancelled reason puts the typed-references legal basis back, and focus on the same field (R468)", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const find = () => within(card("How Find and acquire may get works")).getByRole("textbox", { name: /Default legal basis for records made from typed references/ }) as HTMLInputElement;
+    const field = find();
+    await user.type(field, "Legitimate interest{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe(""));
+    expect(find()).toBe(field);
+    expect(document.activeElement).toBe(field);
+  });
+
   it("a comma-separated list whose reason is cancelled goes back to the saved value (FR-390)", async () => {
     serve({ yaml: "protocol:\n  platforms: [youtube]\n" });
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);
