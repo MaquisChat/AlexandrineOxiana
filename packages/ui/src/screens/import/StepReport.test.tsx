@@ -127,6 +127,9 @@ describe("gone from Zotero, and back (Z5, R224)", () => {
     const { undoneText } = await import("./StepReport");
     expect(undoneText({ removedSources: 5, revertedMerges: 1, reverted: { merged: 0, updated: 1, unmarked: 0, remarked: 0 }, kept: [] })).toBe("Removed 5 imported sources and reverted 1 updated source.");
     expect(undoneText({ removedSources: 0, revertedMerges: 0, reverted: { merged: 0, updated: 0, unmarked: 0, remarked: 0 }, kept: [] })).toBe("No source needed to be changed.");
+    // FR-467: an undone deletion mark that gave back the earlier bin mark did not take the mark off.
+    expect(undoneText({ removedSources: 0, revertedMerges: 1, reverted: { merged: 0, updated: 0, unmarked: 0, remarked: 0, restoredMarks: 1 }, kept: [] })).toBe("Put back the Zotero mark 1 source had before.");
+    expect(undoneText({ removedSources: 0, revertedMerges: 3, reverted: { merged: 0, updated: 0, unmarked: 1, remarked: 0, restoredMarks: 2 }, kept: [] })).toBe("Took the Zotero mark off 1 source and put back the Zotero mark 2 sources had before.");
     // An older service, without the detail: the sentence as before.
     expect(undoneText({ removedSources: 1284, revertedMerges: 3, kept: [] })).toBe("Removed 1,284 sources and restored 3 sources that had been merged or updated.");
   });

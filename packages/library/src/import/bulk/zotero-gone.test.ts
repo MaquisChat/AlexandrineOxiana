@@ -375,9 +375,10 @@ describe("gone from Zotero, and back (Z5)", () => {
     expect(deletedMark).toEqual({ status: "unavailable-on-platform", zotero: "deleted", firstNoticedAt: expect.any(String) });
     expect(deletedMark.firstNoticedAt).not.toBe(binMark.firstNoticedAt);
     expect((await marks(p)).map((e) => (e.details as { marked: string }).marked)).toEqual(["bin", "deleted"]);
-    await bulk().undoBatch(p.id, b3.batchId);
+    // FR-467: the undo of the deletion mark put the bin mark back; it did not take the mark off.
+    expect((await bulk().undoBatch(p.id, b3.batchId)).reverted).toEqual({ merged: 0, updated: 0, unmarked: 0, remarked: 0, restoredMarks: 1 });
     expect(await folderBytes(sf.source.folder)).toEqual(binBytes);
-    await bulk().undoBatch(p.id, b2.batchId);
+    expect((await bulk().undoBatch(p.id, b2.batchId)).reverted).toEqual({ merged: 0, updated: 0, unmarked: 1, remarked: 0 });
     expect(await folderBytes(sf.source.folder)).toEqual(original);
   });
 
@@ -636,7 +637,7 @@ describe("undoing marks and backs in any order (R224 b)", () => {
     const r2 = await bulk().undoBatch(p.id, b2.batchId);
     expect(r2.kept.map((k) => k.kind)).toEqual(["availability"]);
     expect(await avail(p, id)).toEqual(deletedMark);
-    await bulk().undoBatch(p.id, b3.batchId);
+    expect((await bulk().undoBatch(p.id, b3.batchId)).reverted).toEqual({ merged: 0, updated: 0, unmarked: 1, remarked: 0 });
     expect(await avail(p, id)).toEqual(INCOMPLETE);
     // Zotero still has it deleted: the next (full) sync marks it so again, and nothing comes back.
     const { r } = await run(p);

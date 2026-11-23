@@ -75,6 +75,8 @@ export function undoneText(u: UndoResult): string {
   if (r.merged > 0) parts.push(`restored ${count(r.merged, "merged source")}`);
   if (r.updated > 0) parts.push(`reverted ${count(r.updated, "updated source")}`);
   if (r.unmarked > 0) parts.push(`took the Zotero mark off ${count(r.unmarked, "source")}`);
+  // FR-467: a deletion mark undone over an earlier bin mark gave that mark back; it did not take the mark off.
+  if ((r.restoredMarks ?? 0) > 0) parts.push(`put back the Zotero mark ${count(r.restoredMarks!, "source")} had before`);
   if (r.remarked > 0) parts.push(`marked ${count(r.remarked, "source")} as gone from Zotero again`);
   if ((r.conflicts ?? 0) > 0) parts.push(`took the waiting Zotero values off ${count(r.conflicts!, "source")}`);
   return parts.length ? `${sentence(parts)}.` : "No source needed to be changed.";
