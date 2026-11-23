@@ -89,6 +89,9 @@ function ConsentEditor({ c, onSave, onCancel, encrypted, busy }: { c: ConsentRec
 }
 
 /** `encrypted`: the project is encrypted (R362 h: a consent's scope typed here says it can be read without the passphrase). */
+/** The last part of a dropped file's path: its name, never the folders it is in (FR-168). */
+const fileName = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+
 export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; projectId: string; encrypted?: boolean | undefined }) {
   const readableScope = useReadableNote(encrypted, READABLE_SCOPE_TEXT);
   const [participants, setParticipants] = useState<Participant[] | null>(null);
@@ -111,6 +114,11 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
   const [withdrawing, setWithdrawing] = useState<ConsentRecord | null>(null);
   /** A dropped form the service refused because it was detached from this record before (R119): offered for an explicit re-attach. */
   const [reattach, setReattach] = useState<{ consentId: string; path: string } | null>(null);
+  /** FR-168: the re-attach offer takes focus when it appears, so that it is not missed (a screen reader reads it). */
+  const reattachOffer = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (reattach) reattachOffer.current?.focus();
+  }, [reattach]);
   const [session, setSession] = useState({ date: "", place: "", notes: "", participantIds: [] as string[] });
   const [consent, setConsent] = useState({ participantId: "", scope: "", date: "", expires: "" });
   const ids = useId();
@@ -386,9 +394,9 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
                 />
               ) : null}
               {reattach?.consentId === c.id && !c.documentAssetId && (
-                <div role="group" aria-label={`Re-attach the signed form of ${codeOf(c.participantId)}?`} className="ao-field">
+                <div ref={reattachOffer} tabIndex={-1} role="group" aria-label={`Re-attach the signed form of ${codeOf(c.participantId)}?`} className="ao-field">
                   <span>
-                    This form was detached from this consent record before. Re-attach it? Re-attaching is recorded in the project&apos;s audit log.
+                    “<UserText>{fileName(reattach.path)}</UserText>” was detached from this consent record before. Re-attach it? Re-attaching is recorded in the project&apos;s audit log.
                   </span>
                   <button
                     type="button"

@@ -271,6 +271,11 @@ describe("Fieldwork", () => {
     const offer = await within(c).findByRole("group", { name: "Re-attach the signed form of P-001?" });
     expect(offer.textContent).toMatch(/detached from this consent record before/);
     expect(db.calls.filter((x) => x.body?.reattach)).toHaveLength(0);
+    // FR-168: the offer takes focus (once the request has ended), and names the file it would re-attach, as the person's text.
+    await waitFor(() => expect(document.activeElement).toBe(offer));
+    expect(offer.textContent).toMatch(/^“consent P-001\.pdf” was detached from this consent record before\./);
+    expect(offer.querySelector("[dir=auto]")?.textContent).toBe("consent P-001.pdf");
+    expect(offer.textContent).not.toContain("/Users");
     const user = userEvent.setup();
     await user.click(within(offer).getByRole("button", { name: "Re-attach the form" }));
     await waitFor(() => expect(db.calls.at(-1)).toMatchObject({ method: "POST", body: { path: "/Users/ana/consent P-001.pdf", reattach: true } }));
