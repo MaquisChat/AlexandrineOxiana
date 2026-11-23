@@ -99,7 +99,10 @@ export type FindReasonCode =
   | "copy-store-not-allowed"
   | "copy-no-legal-basis"
   // Task F15 (R324 b): found "waiting-sign-in" at start-up with nothing kept to return to ("no-open-copy").
-  | "library-unfinished";
+  | "library-unfinished"
+  // R470 a (FR-504, FR-527): the record's only original is a linked file that cannot be found now ("record-complete";
+  // nothing is looked for until the researcher's "Get a copy for this source").
+  | "linked-file-missing";
 
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
 
@@ -148,6 +151,12 @@ export interface FindEntry {
    * start-up, a lock or a close). Never sent to the screen. A build before F15 drops it on reading (an unknown field).
    */
   returnTo?: FindReturnTo;
+  /**
+   * R470 a: the researcher pressed "Get a copy for this source" on an entry whose record's only originals are linked
+   * files that cannot be found now: its copy part looks for a copy despite them. Kept on the line (so a restart
+   * remembers it) until the entry is in the library.
+   */
+  copyDespiteLink?: true;
   /** Only ever on the line that takes an entry out of the queue (written by the "remove" operation). */
   removed?: true;
 }

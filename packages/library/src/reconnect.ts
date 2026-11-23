@@ -46,6 +46,8 @@ import {
   type Repo,
 } from "./repo/repo.js";
 import { SimulatedCrash } from "./repo/seams.js";
+// The Missing files rule (what "missing" means for a file of the library), shared with Find and acquire (R470 a).
+import { absIn, isGone } from "./repo/linked-file.js";
 import { LinkedContentChangedError } from "./repo/sources.js";
 import { LockNotWritableError } from "./lock.js";
 import type { Manifest } from "./repo/state.js";
@@ -57,8 +59,6 @@ type StatFn = (p: string) => Promise<Stats>;
 type OpenReadFn = (p: string) => Readable;
 
 const msg = (err: unknown) => (err instanceof Error ? err.message : String(err));
-const isGone = (err: unknown) => ["ENOENT", "ENOTDIR"].includes((err as NodeJS.ErrnoException).code ?? "");
-const absIn = (root: string, rel: string) => join(root, ...rel.split("/"));
 
 async function pathExists(p: string): Promise<boolean> {
   try {

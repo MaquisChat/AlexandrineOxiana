@@ -78,6 +78,7 @@ import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { AcquiredFrom, SourceFile } from "@ao/core";
 import { heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
+import { originalsReach } from "../repo/linked-file.js";
 import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, HeldFileSourceHasFileError, sourceHasFile, type HeldFileFacts } from "../repo/review.js";
 import type { WorkCandidate } from "./candidates.js";
 import { FETCH_FILE_DEADLINE_MS, FetchFileError, downloadFailurePasses, fetchFile, fileTypeByBytes, holdFindTemp } from "./fetch-file.js";
@@ -1941,6 +1942,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
   const RECORD_REMOVED: FindReason = { code: "record-removed" };
   /** R296 d: FIND_HELD_MAX files already wait for the researcher: the entry waits, "record-complete", asking nothing. */
   const HELD_FULL: FindReason = { code: "held-full" };
+  /** R470 a: the record's only originals are linked files that cannot be found now: the entry rests, asking nothing. */
+  const LINKED_MISSING: FindReason = { code: "linked-file-missing" };
   /**
    * Why the rules refused a free copy's file at its hold (M8): the capture of `free_copy`, or its store. (At "Use this
    * file" the same rules are evaluated again by `resolveHeldFile`, and a refusal is the service's usual sentence.)
@@ -2068,9 +2071,20 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     }
     if (!live()) return;
     if (sourceHasFile(sf)) {
-      // Its source has a readable file already (the researcher's own: added by hand, or a held file used).
-      await finish({ state: "in-library" }, ["nextTryAt", "reason"]);
-      return;
+      // R470 a: a record whose only originals are LINKED files that cannot be found now (the Missing files rule) is not
+      // "in your library": the entry rests with its own reason and nothing is asked or fetched for it — unless the
+      // researcher pressed "Get a copy for this source" (`copyDespiteLink`). Looked at again at every opening and unlock.
+      const reach = await guard(r, originalsReach(repoLibrary(repo).root, sf));
+      if (!live()) return;
+      if (reach !== "linked-missing") {
+        // Its source has a readable file already (the researcher's own: added by hand, or a held file used).
+        await finish({ state: "in-library" }, ["nextTryAt", "reason", "copyDespiteLink"]);
+        return;
+      }
+      if (!entry.copyDespiteLink) {
+        if (!(entry.state === "record-complete" && entry.reason?.code === LINKED_MISSING.code)) await finish({ state: "record-complete", reason: LINKED_MISSING }, ["nextTryAt", "offers"]);
+        return;
+      }
     }
     const ctx = await guard(r, lookupContextFor(repo, pid, http, deps.debug ? { debug } : {}));
     if (!live()) return;

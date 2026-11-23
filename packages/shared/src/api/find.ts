@@ -98,6 +98,9 @@ export const FIND_REASON_CODES = [
   // Task F15 (R324 b): an entry found "waiting-sign-in" at start-up with nothing kept to return to (a line written by
   // an older build, or damaged): "no-open-copy" with this reason, never a claim that no free copy exists.
   "library-unfinished",
+  // R470 a (FR-504, FR-527): the record's only original is a LINKED file that cannot be found now; the entry rests
+  // "record-complete" with this reason and nothing is looked for until the researcher's "Get a copy for this source".
+  "linked-file-missing",
 ] as const;
 export type FindReasonCode = (typeof FIND_REASON_CODES)[number];
 export type FindReason = { code: FindReasonCode; by?: "rules" | "settings" };
@@ -137,6 +140,7 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
   "copy-store-not-allowed": "This project's rules do not allow storing the file found for this record.",
   "copy-no-legal-basis": "This project's rules need a legal basis to store the file found for this record, and the record has none.",
   "library-unfinished": "A fetch in the app's window was not finished, and what this entry said before could not be read back. Nothing was added.",
+  "linked-file-missing": "Its linked file cannot be found at the moment; the drive it is on may not be connected.",
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */
