@@ -106,7 +106,27 @@ def test_unreadable_models_folder_is_reported_and_not_downloaded(worker_env, tmp
         transcribe.model_path("tiny")
     assert e.value.code == "MODEL_UNAVAILABLE"
     assert "could not be read" in e.value.message
+    # A next step the researcher can take (FR-254).
+    assert e.value.message.endswith("; remove it and install it again from the Optional tools screen")
     assert nn.attempts == []
+
+
+def test_model_that_cannot_be_loaded_says_what_to_do(worker_env, tmp_path, monkeypatch):
+    import faster_whisper
+
+    from ao_worker import transcribe
+    from ao_worker.jobs import JobError
+
+    def unreadable(*_a, **_k):
+        raise OSError("bad weights")
+
+    monkeypatch.setattr(transcribe, "model_path", lambda name: str(tmp_path))
+    monkeypatch.setattr(faster_whisper, "WhisperModel", unreadable)
+    transcribe._model_cache.clear()
+    with pytest.raises(JobError) as e:
+        transcribe._load_model("tiny", "int8")
+    assert e.value.code == "MODEL_UNAVAILABLE"
+    assert e.value.message == "the tiny model on disk could not be loaded; remove it and install it again from the Optional tools screen"
 
 
 def test_absent_model_is_never_downloaded(worker_env, tmp_path, monkeypatch):

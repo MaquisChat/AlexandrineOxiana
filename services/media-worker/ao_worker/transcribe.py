@@ -49,6 +49,10 @@ def models_dir() -> Path:
     return base / "ao-worker" / "models"
 
 
+# What the researcher can do about a model on disk that cannot be read or loaded (FR-254).
+_REINSTALL = "remove it and install it again from the Optional tools screen"
+
+
 def model_path(name: str) -> str:
     """The model's folder in `models_dir()`. A model already on disk is used with no network contact
     at all (R144). An absent model is never downloaded here: the job fails with TOOL_NOT_INSTALLED
@@ -73,7 +77,7 @@ def model_path(name: str) -> str:
         raise JobError(
             "MODEL_UNAVAILABLE",
             f"the {name} model on disk is incomplete or damaged; install it again from the Optional tools screen"
-            if damaged else f"the {name} model on disk could not be read",
+            if damaged else f"the {name} model on disk could not be read; {_REINSTALL}",
             type(e).__name__,
             tool=f"speech-{name}",
         ) from e
@@ -100,7 +104,7 @@ def _load_model(name: str, compute_type: str):
             except ValueError as e:  # e.g. float16 on a CPU without support
                 raise JobError("INVALID_PARAMS", f"compute type {compute_type} is not supported on this device") from e
             except (OSError, RuntimeError) as e:  # damaged or incomplete model files
-                raise JobError("MODEL_UNAVAILABLE", f"the {name} model on disk could not be loaded", type(e).__name__) from e
+                raise JobError("MODEL_UNAVAILABLE", f"the {name} model on disk could not be loaded; {_REINSTALL}", type(e).__name__) from e
         return _model_cache[key]
 
 
