@@ -22,6 +22,9 @@ const SHOWN = /^image\/(png|jpeg|gif|webp|avif|bmp|apng)$/;
 const mimeOf = (a: AssetRef): string => (a.mime ?? a.mediaType ?? "").toLowerCase();
 
 /** The name a file is shown under: the last part of its path, else its recorded file name, else its id. */
+/** Said where a file cannot be shown (here, and on a found EPUB's card, R470 b). */
+export const NO_PREVIEW = "No preview of this file can be shown here.";
+
 export function assetName(a: AssetRef): string {
   const fromPath = a.path?.split(/[\\/]/).pop();
   return fromPath || a.fileName || a.id;
@@ -72,7 +75,7 @@ export function FilePreview({ api, projectId, source }: { api: ImportApi; projec
 
   return (
     <Section title="File preview" level={3} className="ao-review__preview">
-      {view.state === "none" && <p className="ao-import__hint">No preview of this file can be shown here. Its details are above; open the source after review to read it.</p>}
+      {view.state === "none" && <p className="ao-import__hint">{`${NO_PREVIEW} Its details are above; open the source after review to read it.`}</p>}
       {view.state === "loading" && <p className="ao-import__hint">Loading the picture…</p>}
       {view.state === "shown" && (
         <figure className="ao-review__figure">

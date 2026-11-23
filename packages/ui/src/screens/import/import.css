@@ -621,3 +621,25 @@ span.ao-import__hint {
 .ao-review__file-note > p {
   margin: 0;
 }
+
+/* R470 b (FR-490): looking at a held file — its card's line, and the look-only reader in a dialog of its own. */
+.ao-review__file-look > p {
+  margin: var(--space-2) 0 0;
+}
+
+.ao-dialog.ao-review__look {
+  max-width: 64rem;
+}
+
+.ao-review__look-note {
+  margin: var(--space-1) 0 var(--space-2);
+}
+
+/* No annotation list beside the pages in a look: the pages take the whole width. */
+.ao-review__look-reader .ao-reader-body {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ao-review__look-reader .ao-reader-scroll {
+  height: 60vh;
+}

@@ -68,13 +68,15 @@ import { isProjectLocked, libraryApi } from "../../api/library";
 import { verificationApi, type FieldReview } from "../../api/verification";
 import { yearOf } from "../../api/find";
 import { CodeSwatch } from "../../components/CodeSwatch";
+import { readerApi, heldFileRanges, type ReaderApi } from "../../api/reader";
 import { DialogShell } from "../../components/ReasonDialog";
 import { UserText } from "../../components/UserText";
 import { FieldCheck } from "../../components/VerificationBadge";
 import { inAppLink, PATHS } from "../../navigation";
+import { ReaderScreen, type LookOnly } from "../Reader";
 import { FIELD_LABELS } from "../SourceDetail";
 import { UnlockProject } from "../UnlockProject";
-import { assetName, FilePreview } from "./FilePreview";
+import { assetName, FilePreview, NO_PREVIEW } from "./FilePreview";
 import { count, ErrorNote, errorText, fmt, reportHref, Section, SOURCE_TYPES, typeLabel } from "./shared";
 import {
   PRESS_SHOWN_TEXT,
@@ -163,6 +165,17 @@ export const HELD_DECISION_TIMEOUT_MS = 60_000;
 /** R313 e: said on the card when a decision was given up. */
 export const HELD_NO_ANSWER_TEXT = "The service did not answer. Look at the queue again before deciding.";
 /** A waiting file's two controls: their words at rest, and while that decision is out (R318 a). */
+/**
+ * R470 b (FR-490): looking at a held file before deciding — the card's control, the line the look-only reader shows, and
+ * what it says when the file is no longer held.
+ */
+export const LOOK_TEXT = "Look at the file";
+export const LOOK_ONLY_NOTICE = "This file has not been added to your library. Use this file, or Not this file, in the review queue.";
+export const LOOK_GONE = "This file is no longer waiting for your decision, so it cannot be shown.";
+
+/** What a look at held file `reviewId` reads with: the reader's calls (none made in a look) and the file's own ranges. */
+type LookFor = (reviewId: string) => { api: ReaderApi; range: LookOnly["range"] };
+
 export const HELD_DECIDE_WORDS: Readonly<Record<HeldFileDecision, { idle: string; working: string }>> = {
   attach: { idle: "Use this file", working: "Using this file…" },
   discard: { idle: "Not this file", working: "Removing this file…" },
@@ -242,6 +255,11 @@ function groupsOf(items: ReviewItem[], batches: BatchSummary[]): Group[] {
 
 export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = PROJECT_PAGE }: ReviewQueueProps) {
   const api = useMemo(() => importApi(client), [client]);
+  /** R470 b: a look at a held file reads the file's own ranges (the reader's other calls are never made in a look). */
+  const lookFor = useMemo<LookFor>(() => {
+    const reader = readerApi(client);
+    return (rid) => ({ api: reader, range: heldFileRanges(client, projectId, rid) });
+  }, [client, projectId]);
   const projectWide = !batchId;
   const [items, setItems] = useState<ReviewItem[] | null>(null);
   const [store, setStore] = useState(recordStore);
@@ -1071,6 +1089,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           onPointedAt={(id) => notice(id, null)}
           onDecide={(i, d, how) => void decideHeld(i, d, how)}
           onShowArrived={layOutAgain}
+          lookFor={lookFor}
+          projectId={projectId}
         />
       )}
     </main>
@@ -1265,6 +1285,9 @@ interface FoundFilesProps {
   onPointedAt(id: string): void;
   onDecide(item: HeldItem, decision: HeldFileDecision, how: PressCheck): void;
   onShowArrived(): void;
+  /** R470 b: what a look at a held file reads with. */
+  lookFor: LookFor;
+  projectId: string;
 }
 
 /** What the app's check says of a file, in the app's own words; nothing for a `why` it does not have (R313 f). */
@@ -1293,7 +1316,7 @@ function describeRecord(item: HeldItem, record: SourceFile | undefined): string 
  * and stays). Files that arrive are only counted, on a line in a place kept for it above the groups (laid out whether
  * or not it says anything, so its appearing moves nothing); "Show them" lays the section out afresh.
  */
-function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, failed, notices, pointing, onPointedAt, headRef, cardRef, onDecide, onShowArrived }: FoundFilesProps) {
+function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, failed, notices, pointing, onPointedAt, headRef, cardRef, onDecide, onShowArrived, lookFor, projectId }: FoundFilesProps) {
   // Re-rendered when a record is read: the names depend on every waiting file's record.
   useSyncExternalStore(store.subscribe, store.version);
   const right = items.filter(looksRight);
@@ -1337,6 +1360,8 @@ function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, secti
               headRef={headRef}
               cardRef={cardRef}
               onDecide={onDecide}
+              lookFor={lookFor}
+              projectId={projectId}
             />
           ))}
         </ul>
@@ -1397,6 +1422,9 @@ interface FileCardProps {
   headRef(id: string, el: HTMLHeadingElement | null): void;
   cardRef(id: string, el: HTMLElement | null): void;
   onDecide(item: HeldItem, decision: HeldFileDecision, how: PressCheck): void;
+  /** R470 b: what a look at the file reads with. */
+  lookFor: LookFor;
+  projectId: string;
 }
 
 /** R322 b: the Creators and Year rows before the record is read, when it has none, and when it could not be read. */
@@ -1411,7 +1439,9 @@ export const RECORD_ROW_TEXT = { reading: "…", none: "—", unread: "This sour
  * "Removing this file…" and looks busy, the other looks unavailable; R318 b: the press renews the quiet); R313 b — a key held down never decides: a repeated keydown
  * (Enter or Space) is cancelled, and so is the click a browser makes of it.
  */
-const FileCard = memo(function FileCard({ item, store, named, end, unread, notice, pointing, onPointedAt, epoch, busy, error, headRef, cardRef, onDecide }: FileCardProps) {
+const FileCard = memo(function FileCard({ item, store, named, end, unread, notice, pointing, onPointedAt, epoch, busy, error, headRef, cardRef, onDecide, lookFor, projectId }: FileCardProps) {
+  /** R470 b: the file is being looked at (the look-only reader open over the screen). */
+  const [looking, setLooking] = useState(false);
   const h = item.heldFile;
   const record = useRecord(store, item.sourceId);
   const s = record?.source;
@@ -1543,6 +1573,31 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
         </>
       )}
       {/*
+       * R470 b (FR-490): a found PDF can be looked at before the decision (its control after the two deciding ones, so that Tab from the card's heading still reaches “Use this file” first, R303 b), in the reader's look-only mode; an EPUB (the
+       * reader shows PDFs only) says no preview can be shown. The line keeps its place once the file no longer waits (a
+       * stand-in of the control, never seen), so nothing below it moves (R319).
+       */}
+      {h && (
+        <div className="ao-review__file-look">
+          {h.kind !== "pdf" ? (
+            <p className="ao-import__hint">{NO_PREVIEW}</p>
+          ) : end ? (
+            <p className="ao-review__ghost" aria-hidden="true" inert>
+              <button type="button" tabIndex={-1}>
+                {LOOK_TEXT}
+              </button>
+            </p>
+          ) : (
+            <p>
+              <button type="button" aria-label={`${LOOK_TEXT} for ${named}`} onClick={() => setLooking(true)}>
+                {LOOK_TEXT}
+              </button>
+            </p>
+          )}
+        </div>
+      )}
+      {looking && <LookDialog title={recordTitle || "Untitled"} projectId={projectId} sourceId={item.sourceId ?? ""} lookFor={lookFor} reviewId={item.id} onClose={() => setLooking(false)} />}
+      {/*
        * R322 b, R323 c: the line under the two controls — a refusal's or a give-up's sentence, and a press not taken
        * (R323 b: not an alert; the control is described by it while it is shown). Its place is kept on every card from
        * its first showing (two lines of the theme's text), so a sentence shown there moves nothing; a longer one may
@@ -1569,6 +1624,38 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
     </li>
   );
 });
+
+/**
+ * R470 b (FR-490): the held file in the app's reader, LOOK-ONLY, over the screen (the shared dialog shell: focus moves in
+ * — to its heading, so the key that opened it decides nothing — is kept inside, and goes back to "Look at the file" when
+ * it closes; the rest of the screen is inert). The reader reads the held file's own ranges and nothing else: no
+ * highlight, no note, no annotation list, nothing remembered, nothing attached. Its line says what the file is.
+ */
+function LookDialog({ title, projectId, sourceId, lookFor, reviewId, onClose }: { title: string; projectId: string; sourceId: string; lookFor: LookFor; reviewId: string; onClose(): void }) {
+  const id = useId();
+  const heading = useRef<HTMLHeadingElement>(null);
+  const look = useMemo(() => lookFor(reviewId), [lookFor, reviewId]);
+  const lookOnly = useMemo<LookOnly>(() => ({ range: look.range, goneSentence: LOOK_GONE }), [look]);
+  return (
+    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onClose} className="ao-review__look" initialFocus={heading}>
+      <h2 id={`${id}-t`} ref={heading} tabIndex={-1}>
+        {`${LOOK_TEXT}: `}
+        <UserText>{title}</UserText>
+      </h2>
+      <p id={`${id}-d`} className="ao-review__look-note">
+        {LOOK_ONLY_NOTICE}
+      </p>
+      <div className="ao-review__look-reader">
+        <ReaderScreen api={look.api} projectId={projectId} sourceId={sourceId} readOnly look={lookOnly} />
+      </div>
+      <div className="ao-actions">
+        <button type="button" onClick={onClose}>
+          Close
+        </button>
+      </div>
+    </DialogShell>
+  );
+}
 
 /**
  * The reason for "Reviewed after the withdrawal" (R176 2) on the shared dialog shell (R145: focus in,
