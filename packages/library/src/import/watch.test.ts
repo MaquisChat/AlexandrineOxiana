@@ -1804,6 +1804,24 @@ describe("the register: where a source came from, and what happened to its file 
     expect(await registerWrites(p)).toBe(writes);
   }, 40_000);
 
+  it("FR-475: a source's origin is told from memory before its register line is written", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, registerFlushMs: 60_000, watchId: wid, attach: realishAttach() });
+    await w.ready;
+    await writeFile(join(inbox, "early.pdf"), "early");
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "early.pdf"));
+    const sid = events.find((e) => e.kind === "imported")!.sourceId!;
+    // The line waits for its timer: nothing is on disk yet, and the watch says where the source came from.
+    expect((await regOf(p, wid)).size).toBe(0);
+    expect(w.origins(sid)).toEqual([expect.objectContaining({ sourceId: sid, file: "early.pdf", state: "in-library" })]);
+    expect(w.origins(newId())).toEqual([]);
+    await w.stop();
+    // Written at stop(); a stopped watch tells nothing (the register on disk is then the answer).
+    expect([...(await regOf(p, wid)).values()]).toEqual([expect.objectContaining({ sourceId: sid, file: "early.pdf", state: "in-library" })]);
+    expect(w.origins(sid)).toBeUndefined();
+  });
+
   it("entries are written in batches of at most 50, and at stop()", async () => {
     const p = await project();
     const wid = newId();

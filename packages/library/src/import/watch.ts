@@ -422,6 +422,12 @@ export interface FolderWatch {
    * is in another state, it has not been judged yet, or the check could not tell.
    */
   presence(key: string): ContentPresence;
+  /**
+   * FR-475: the register entries of `sourceId` as this watch holds them in memory — lines not yet written included (the
+   * register is written in batches, WATCH_REGISTER_FLUSH_MS). Undefined when the watch cannot say: stopped, or its
+   * register not read (yet, or while the project is locked); the register on disk is then the answer. Reads nothing.
+   */
+  origins(sourceId: string): WatchRegisterEntry[] | undefined;
 }
 
 /** A call on the folder did not answer in time (or the folder is waiting for one that did not). */
@@ -2648,6 +2654,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       if (!stopped) void checkCollection().catch(() => {});
     },
     presence: (key) => (stateNow() === "watching" && regReady ? (judgedPresence.get(key) ?? "unknown") : "unknown"),
+    origins: (sourceId) => (stopped || !regReady || !reg ? undefined : [...reg.values()].filter((e) => e.sourceId === sourceId).map((e) => ({ ...e }))),
   };
 }
 
