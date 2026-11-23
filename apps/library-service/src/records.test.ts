@@ -154,6 +154,35 @@ describe("evidence and verification on source records (Task 34a d)", () => {
   });
 });
 
+describe("R480 e: the source record the reader reads says which linked file cannot be reached, per file, without a path", () => {
+  it("GET of one source: a linked asset whose file is gone carries linked.missing; one that is there, and a stored one, do not", async () => {
+    const pid = await project();
+    const gone = await file("gone.pdf", await buildPdf({ title: "Gone", author: "A B", lines: ["x"] }));
+    const there = await file("there.pdf", await buildPdf({ title: "There", author: "A B", lines: ["y"] }));
+    const stored = await file("stored.pdf", await buildPdf({ title: "Stored", author: "A B", lines: ["z"] }));
+    const repo = svc.state.session!.repo;
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "report", title: { variants: [{ lang: "en", kind: "original", value: "Linked" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [
+        { path: gone, role: "original", handling: "link" },
+        { path: there, role: "original", handling: "link" },
+        { path: stored, role: "original", handling: "copy" },
+      ],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+    await rm(gone);
+    const r = await call({ url: `/projects/${pid}/sources/${sf.source.id}` });
+    expect(r.status, r.body).toBe(200);
+    expect(r.body).not.toContain(tmp);
+    const [a, b, c] = r.json.assets;
+    expect(a.linked).toEqual({ libraryRelativePath: sf.assets[0]!.linked!.libraryRelativePath, missing: true });
+    expect(b.linked).toEqual({ libraryRelativePath: sf.assets[1]!.linked!.libraryRelativePath });
+    expect(c.linked).toBeUndefined();
+    expect(c.missing).toBeUndefined();
+  });
+});
+
 describe("confirming an identifier through the field route (R149)", () => {
   async function source(pid: string) {
     const repo = svc.state.session!.repo;

@@ -177,6 +177,56 @@ describe("reader route (Task R7)", () => {
     expect((await screen.findByTestId("reader-screen")).textContent).toBe("p1|s1|a1|-|read-write");
   });
 
+  // R480 e: the service marks a linked file it cannot find now (`linked.missing`, no path); the reader opens the first
+  // PDF that can be reached and still lists every PDF of the source.
+  const missingLink = (id: string, name: string) => pdf(id, name, { path: `../Drive/${name}`, linked: { libraryRelativePath: `../Drive/${name}`, missing: true } });
+  const reachableLink = (id: string, name: string) => pdf(id, name, { path: `../Drive/${name}`, linked: { libraryRelativePath: `../Drive/${name}` } });
+
+  it("R480 e: a source with its missing linked PDF and the copy added beside it opens the copy, and lists both", async () => {
+    serve({ assets: [missingLink("a1", "linked.pdf"), pdf("a2", "free copy.pdf")] });
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    expect((await screen.findByTestId("reader-screen")).textContent).toBe("p1|s1|a2|-|read-write");
+    const radios = within(screen.getByRole("group", { name: "File" })).getAllByRole("radio");
+    expect(radios.map((r) => r.closest("label")?.textContent)).toEqual(["linked.pdf", "free copy.pdf"]);
+    expect(radios.map((r) => (r as HTMLInputElement).checked)).toEqual([false, true]);
+    // Choosing the missing one opens it as asked (the screen then says what it says today).
+    await userEvent.setup().click(radios[0]!);
+    expect(window.location.search).toBe("?project=p1&source=s1&asset=a1");
+    await waitFor(() => expect(screen.getByTestId("reader-screen").textContent).toBe("p1|s1|a1|-|read-write"));
+  });
+
+  it("R480 e: a linked PDF that can be reached is opened first, as before", async () => {
+    serve({ assets: [reachableLink("a1", "linked.pdf"), pdf("a2", "free copy.pdf")] });
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    expect((await screen.findByTestId("reader-screen")).textContent).toBe("p1|s1|a1|-|read-write");
+  });
+
+  it("R480 e: a missing PDF asked for in the address is opened as asked", async () => {
+    serve({ assets: [missingLink("a1", "linked.pdf"), pdf("a2", "free copy.pdf")] });
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1&asset=a1");
+    render(<Host />);
+    expect((await screen.findByTestId("reader-screen")).textContent).toBe("p1|s1|a1|-|read-write");
+  });
+
+  it("R480 e: when no PDF of the source can be reached, the first is opened as today; without the flag, too", async () => {
+    serve({ assets: [missingLink("a1", "linked.pdf")] });
+    window.history.replaceState(null, "", "/reader?project=p1&source=s1");
+    render(<Host />);
+    expect((await screen.findByTestId("reader-screen")).textContent).toBe("p1|s1|a1|-|read-write");
+    expect(screen.queryByRole("group", { name: "File" })).toBeNull();
+    cleanup();
+    serve({ assets: [missingLink("a1", "one.pdf"), missingLink("a2", "two.pdf")] });
+    render(<Host />);
+    expect((await screen.findByTestId("reader-screen")).textContent).toBe("p1|s1|a1|-|read-write");
+    cleanup();
+    // An older service sends no flag: the first PDF, as today.
+    serve({ assets: [pdf("a1", "linked.pdf", { path: "../Drive/linked.pdf", linked: { libraryRelativePath: "../Drive/linked.pdf" } }), pdf("a2", "free copy.pdf")] });
+    render(<Host />);
+    expect((await screen.findByTestId("reader-screen")).textContent).toBe("p1|s1|a1|-|read-write");
+  });
+
   it("an address without a source says what to do", () => {
     window.history.replaceState(null, "", "/reader?project=p1");
     render(<Host />);

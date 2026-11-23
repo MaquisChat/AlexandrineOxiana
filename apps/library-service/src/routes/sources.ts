@@ -12,6 +12,7 @@ import {
   confirmField,
   createAttach,
   ocrQueueFor,
+  missingAt,
   ProjectLockedError,
   proxyQueueFor,
   readTranscript,
@@ -84,6 +85,18 @@ export function sourceRecord(sf: SourceFile, roots: Iterable<string>): SourceFil
     assets: sf.assets.map((a) => (a.linked ? ({ ...a, linked: { libraryRelativePath: a.linked.libraryRelativePath } } as typeof a) : a)),
     fields: fieldReviews(sf, roots),
   };
+}
+
+/**
+ * R480 e: each linked file of ONE source record marked `linked.missing: true` when nothing is at its path now (the
+ * Missing files rule, `missingAt`; an error other than "nothing is there" counts as there). Only where one source is
+ * read (`GET /projects/:id/sources/:sid`), never on a list route. No path is added: the flag only.
+ */
+async function withReach<T extends { assets: Asset[] }>(root: string, rec: T): Promise<T> {
+  const assets = await Promise.all(
+    rec.assets.map(async (a) => (a.linked && (await missingAt(root, a.path).catch(() => false)) ? ({ ...a, linked: { ...a.linked, missing: true } } as typeof a) : a)),
+  );
+  return { ...rec, assets };
 }
 
 /**
@@ -197,7 +210,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
 
   app.get("/projects/:id/sources/:sid", async (req) => {
     const projectId = projectParam(ctx, req);
-    return record(await sourceOf(ctx, projectId, paramsOf(req).sid ?? ""));
+    const sf = await sourceOf(ctx, projectId, paramsOf(req).sid ?? "");
+    return withReach(state.requireSession().lib.root, record(sf));
   });
 
   app.patch("/projects/:id/sources/:sid", async (req) => {

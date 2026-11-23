@@ -106,6 +106,8 @@ export type {
   RelinkSkipReason,
   WatchOptions,
 } from "./reconnect.js";
+// R480 e: the Missing files rule for one linked file, for the reader's source record.
+export { missingAt } from "./repo/linked-file.js";
 export { addKnownPath, forgetLastOpenLibrary, forgetLibrary, lastOpenLibrary, listLibraries, recordLocation, registerLibrary, rememberLastOpenLibrary, settleDamagedRegistry } from "./registry.js";
 export type { RegistryEntry } from "./registry.js";
 
