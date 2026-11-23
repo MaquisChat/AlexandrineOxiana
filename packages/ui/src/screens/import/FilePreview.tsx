@@ -21,10 +21,10 @@ const SHOWN = /^image\/(png|jpeg|gif|webp|avif|bmp|apng)$/;
 
 const mimeOf = (a: AssetRef): string => (a.mime ?? a.mediaType ?? "").toLowerCase();
 
-/** The name a file is shown under: the last part of its path, else its recorded file name, else its id. */
 /** Said where a file cannot be shown (here, and on a found EPUB's card, R470 b). */
 export const NO_PREVIEW = "No preview of this file can be shown here.";
 
+/** The name a file is shown under: the last part of its path, else its recorded file name, else its id. */
 export function assetName(a: AssetRef): string {
   const fromPath = a.path?.split(/[\\/]/).pop();
   return fromPath || a.fileName || a.id;

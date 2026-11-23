@@ -164,7 +164,6 @@ export const SOURCE_POOL = 6;
 export const HELD_DECISION_TIMEOUT_MS = 60_000;
 /** R313 e: said on the card when a decision was given up. */
 export const HELD_NO_ANSWER_TEXT = "The service did not answer. Look at the queue again before deciding.";
-/** A waiting file's two controls: their words at rest, and while that decision is out (R318 a). */
 /**
  * R470 b (FR-490): looking at a held file before deciding — the card's control, the line the look-only reader shows, and
  * what it says when the file is no longer held.
@@ -176,6 +175,7 @@ export const LOOK_GONE = "This file is no longer waiting for your decision, so i
 /** What a look at held file `reviewId` reads with: the reader's calls (none made in a look) and the file's own ranges. */
 type LookFor = (reviewId: string) => { api: ReaderApi; range: LookOnly["range"] };
 
+/** A waiting file's two controls: their words at rest, and while that decision is out (R318 a). */
 export const HELD_DECIDE_WORDS: Readonly<Record<HeldFileDecision, { idle: string; working: string }>> = {
   attach: { idle: "Use this file", working: "Using this file…" },
   discard: { idle: "Not this file", working: "Removing this file…" },
