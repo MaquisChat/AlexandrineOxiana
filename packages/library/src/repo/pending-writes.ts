@@ -34,6 +34,7 @@ import {
   finishCommittedSteps,
   inspectMarker,
   inspectMarkers,
+  markerPaths,
   recordResolve,
   removeMarker,
   undoEntries,
@@ -214,7 +215,17 @@ export async function resolvePendingWrite(core: RepoCore, txn: string, choice: P
       });
     }
     // Writes resume unless something else still holds the project.
-    const others = (await inspectMarkers(core.root, () => undefined)).some((x) => namesProject(x, st));
+    const left = (await inspectMarkers(core.root, () => undefined)).filter((x) => namesProject(x, st));
+    const others = left.length > 0;
+    // Only what the markers still pending name stays half changed; the rest is said no more (R473 I1).
+    st.unfinished = new Set(left.flatMap((x) => (x.marker ? markerPaths(x.marker) : [])));
+    for (let k = core.integrityWarnings.length - 1; k >= 0; k--) {
+      const w = core.integrityWarnings[k]!;
+      const folder = w.file;
+      if (w.projectId === st.project.id && w.kind.startsWith("source-change-unfinished") && folder !== undefined && ![...st.unfinished].some((p) => p === folder || p.startsWith(`${folder}/`))) {
+        core.integrityWarnings.splice(k, 1);
+      }
+    }
     const otherBlocks = core.integrityWarnings.some(
       (w) => w.projectId === st.project.id && (w.kind === "incomplete-audit-line-pending" || w.kind === "audit-append-failed-at-open"),
     );

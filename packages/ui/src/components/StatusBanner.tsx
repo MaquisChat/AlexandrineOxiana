@@ -5,7 +5,7 @@
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
 import { useRef, useState } from "react";
-import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, isDeviceNoticeKind, oldCopiesPendingText, type DeviceNoticeKind } from "@ao/shared";
+import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, SOURCE_CHANGE_UNFINISHED, SOURCE_CHANGE_UNFINISHED_READ_ONLY, isDeviceNoticeKind, oldCopiesPendingText, type DeviceNoticeKind } from "@ao/shared";
 import { errorText, type IntegrityWarning, type LibraryState } from "../api/library";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
@@ -89,6 +89,11 @@ const WARNINGS: Record<string, (p: string) => string> = {
     `The record of deleted items in ${p} could not be read. It was set aside; deleting still works, but re-importing from Zotero is paused until the record is reset.`,
   "annotations-unreadable": (p) => `Some annotations in ${p} could not be read. The sources still open; the annotations that could not be read are not shown.`,
   "annotations-hash-mismatch": (p) => `Some annotations in ${p} were changed outside the app. They are shown as they are now.`,
+  // R473 I1: a source whose change did not finish and whose roll-back failed, for as long as the roll-back waits.
+  "source-change-unfinished": () => SOURCE_CHANGE_UNFINISHED,
+  "source-change-unfinished-read-only": () => SOURCE_CHANGE_UNFINISHED_READ_ONLY,
+  "changed-outside-before-rollback": (p) =>
+    `A file in ${p} was changed outside the app while an interrupted change waited to be undone. The state before that change was put back when the library opened.`,
   "destroy-incomplete": (p) =>
     `A destruction of raw data in ${p} did not finish: some files could not be overwritten yet. They are kept out of the project and overwriting is tried again each time the library opens.`,
   "protocol-manifest-unreadable": (p) => `The sealed list of protocol document names in ${p} could not be read. The documents themselves are unchanged; check the verification report.`,

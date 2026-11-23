@@ -36,6 +36,7 @@ import { appendReviewEntry, queueUnlistedConflicts, resolveCaptureEntriesAfterEd
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
 import { isClosed } from "../library.js";
+import { SOURCE_CHANGE_UNFINISHED, SOURCE_CHANGE_UNFINISHED_READ_ONLY } from "@ao/shared";
 
 
 export interface SourceInputFile {
@@ -146,6 +147,9 @@ type AnnotationProblem = { file: string; kind: "annotations-unreadable" | "annot
 
 export async function readSourceFile(core: RepoCore, st: ProjectState, id: string): Promise<SourceFile> {
   const read = await readSourcePair(core, st, id);
+  // A source whose change did not finish and could not be undone (its folder named by a pending marker) is read as
+  // it is, with the true thing said, never as changed outside the app; nothing there to confirm (R473 I1).
+  if (unfinishedHere(core, st, sourceFolderOf(st, id))) return read.sf;
   if (!read.problem) return read.sf;
   // Inside a turn no write is in progress: the problem is recorded as found.
   if (core.holdsTurn()) {
@@ -190,7 +194,7 @@ function confirmProblem(core: RepoCore, st: ProjectState, id: string): Promise<{
       if (confirmationSeams.onRun && process.env.NODE_ENV === "test") confirmationSeams.onRun(id);
       if (isClosed(core.library) || core.projects.get(st.project.id) !== st || (core.lockAsks.get(st.project.id) ?? 0) !== asks) return undefined;
       const again = await readSourcePair(core, st, id);
-      if (again.problem) recordProblem(core, st, again.problem);
+      if (!unfinishedHere(core, st, sourceFolderOf(st, id)) && again.problem) recordProblem(core, st, again.problem);
       return again;
     })
     .catch((err: unknown) => {
@@ -220,12 +224,26 @@ async function withinConfirmWait<T>(p: Promise<T>): Promise<T | undefined> {
   }
 }
 
-/**
- * Records a confirmed problem. A change of this project whose roll-back failed is finished at the next open (R26),
- * and until then its own leftover files may be on disk: they are not reported as changed outside the app (FR-425).
- */
+/** Records a confirmed problem of a source no pending marker names (those are said by `unfinishedHere`). */
 function recordProblem(core: RepoCore, st: ProjectState, problem: AnnotationProblem): void {
-  if (!st.recoveryPending) annotationWarning(core, st, problem.file, problem.kind, problem.detail);
+  annotationWarning(core, st, problem.file, problem.kind, problem.detail);
+}
+
+/**
+ * R473 I1 (replacing FR-425's project-wide silence): whether a marker of this project that is not finished or rolled
+ * back yet names a path in this source folder. Those files may be the change's own leftovers, so they are not called
+ * changed outside the app; instead the true thing is said, once per source, for as long as the roll-back waits: it
+ * is done at the next open for changes (R26), which also records a file someone changed meanwhile. Every other
+ * source of the project keeps its outside-change warning.
+ */
+function unfinishedHere(core: RepoCore, st: ProjectState, folder: string): boolean {
+  if (![...(st.unfinished ?? [])].some((p) => p === folder || p.startsWith(`${folder}/`))) return false;
+  const readOnly = core.library.mode !== "read-write" || core.noHeal;
+  const kind = readOnly ? "source-change-unfinished-read-only" : "source-change-unfinished";
+  if (!core.integrityWarnings.some((w) => w.kind === kind && w.file === folder)) {
+    core.integrityWarnings.push({ projectId: st.project.id, kind, detail: readOnly ? SOURCE_CHANGE_UNFINISHED_READ_ONLY : SOURCE_CHANGE_UNFINISHED, file: folder });
+  }
+  return true;
 }
 
 /** Reads source.json and its annotations file; a problem with the pair is returned, not recorded. */

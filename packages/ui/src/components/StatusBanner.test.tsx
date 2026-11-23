@@ -158,6 +158,7 @@ describe("StatusBanner", () => {
       "recovery-code-unshown", "recovery-staging-discarded", "recovery-staging-unverifiable",
       "audit-unrecorded", "permissions-not-set", "audit-recorded-late", "refusal-unrecorded",
       "audit-unrecorded-blocked", "attention-unreadable", "audit-waiting",
+      "source-change-unfinished", "source-change-unfinished-read-only", "changed-outside-before-rollback",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();
@@ -169,6 +170,15 @@ describe("StatusBanner", () => {
     expect(seen.size).toBe(kinds.length);
   });
 
+});
+
+describe("R473 I1: a source whose change did not finish and could not be undone", () => {
+  it("says the ruled sentence, for a library open for changes and for one opened without them", () => {
+    expect(warningText("source-change-unfinished", "P")).toBe("A change to this source did not finish and could not be undone. Close the library and open it again to put it back.");
+    expect(warningText("source-change-unfinished-read-only", "P")).toBe(
+      "A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.",
+    );
+  });
 });
 
 describe("R409 d: old copies of the library still holding destroyed data", () => {
