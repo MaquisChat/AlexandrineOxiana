@@ -430,13 +430,38 @@ export class ServiceState {
       this.captureAborts.get(queueId)?.abort();
       this.events.publish("capture.progress", { queueId, projectId, finished: true, error } satisfies CaptureQueueProgressEvent);
     };
+    let cut = 0;
     for (const [id, q] of this.captures) {
       if (q.projectId !== projectId) continue;
       if (q.finished) this.captures.delete(id);
-      else end(id);
+      else {
+        // The links not captured (the one in flight too: what it brings back is discarded), counted
+        // from the queue's counters before it is ended; no address is read (R464 b).
+        if (why === "lock" && !this.endedCaptures.has(id)) cut += Math.max(0, q.total - q.done);
+        end(id);
+      }
     }
+    if (cut > 0) this.cutByLock.set(projectId, (this.cutByLock.get(projectId) ?? 0) + cut);
     for (const [id, pid] of this.profileRuns) if (pid === projectId) end(id);
     this.captureQueues.forgetProject(projectId);
+  }
+
+  /**
+   * How many links a lock cut from each project's capture queues before they were captured (FR-370,
+   * FR-371; R464 b): a COUNT only, never an address (an encrypted project's addresses leave memory at
+   * its lock: R30, R50, R435), in memory only, until the desktop app's "Got it" or the service ends.
+   * Told with the project's queues, which a locked project does not answer (423).
+   */
+  private readonly cutByLock = new Map<string, number>();
+
+  /** The links a lock cut from `projectId`'s queues and not yet acknowledged, if any. */
+  capturesCutByLock(projectId: string): number | undefined {
+    return this.cutByLock.get(projectId);
+  }
+
+  /** The desktop app's "Got it": the count is forgotten. */
+  acknowledgeCapturesCutByLock(projectId: string): void {
+    this.cutByLock.delete(projectId);
   }
 
   /** Whether the queue or profile run was ended from outside (it then stores, records and publishes nothing). */

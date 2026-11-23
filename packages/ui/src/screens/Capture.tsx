@@ -85,6 +85,12 @@ function hasCredentials(u: string): boolean {
  * internal (a read-only reason word, the media helper's start-up text, which can name shell commands
  * or paths) and is left out. A media helper that is not running gets one sentence of what to do.
  */
+/** What a lock cut from this project's capture queues: only the count is known (R464 b). */
+const cutByLockText = (n: number): string =>
+  n === 1
+    ? "A lock stopped the capture of 1 link in this project before it was tried. The link was not kept while the project was locked: add it again to capture it."
+    : `A lock stopped the capture of ${n} links in this project before they were tried. The links were not kept while the project was locked: add them again to capture them.`;
+
 function plainError(err: unknown, fallback: string): string {
   if (!(err instanceof ApiClientError)) return fallback;
   if (err.code === "WORKER_UNAVAILABLE") return `${fallback} The media helper is not running. Restart the app and try again.`;
@@ -363,6 +369,28 @@ export function Capture({ client, projectId }: CaptureProps) {
   const [ackError, setAckError] = useState<string | null>(null);
   const [lost, setLost] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  /** Links a lock of this project cut before they were captured, as the service counts them (R464 b). */
+  const [cutByLock, setCutByLock] = useState(0);
+  const [cutAckError, setCutAckError] = useState<string | null>(null);
+  const cutAcking = useRef(false);
+  const linksRef = useRef<HTMLTextAreaElement>(null);
+
+  /** "Got it": one request; the reminder goes once the service has forgotten the count. */
+  const acknowledgeCut = async () => {
+    if (cutAcking.current) return;
+    cutAcking.current = true;
+    setCutAckError(null);
+    try {
+      await api.acknowledgeCutByLock(projectId);
+      if (!live.current) return;
+      setCutByLock(0);
+      linksRef.current?.focus(); // where the links are added again
+    } catch (err) {
+      if (live.current) setCutAckError(plainError(err, "This could not be recorded."));
+    } finally {
+      cutAcking.current = false;
+    }
+  };
 
   useEffect(() => {
     live.current = true;
@@ -431,8 +459,11 @@ export function Capture({ client, projectId }: CaptureProps) {
     const gen = conn.current;
     const seq = ++readSeq.current;
     try {
-      const list = await api.queues(projectId);
+      const answer = await api.queues(projectId);
       if (!current(gen, seq)) return;
+      const list = answer.queues;
+      const cut = answer.cutByLock;
+      setCutByLock(typeof cut === "number" && Number.isInteger(cut) && cut > 0 ? cut : 0);
       const listed = new Set(list.map((q) => q.queueId));
       const missed = queuesNow.current.filter((q) => q.gap && !listed.has(q.queueId)).map((q) => q.queueId);
       const ids = [...listed, ...missed].filter((id) => looked.current.get(id) !== gen);
@@ -739,6 +770,16 @@ export function Capture({ client, projectId }: CaptureProps) {
           This project is locked. <a href={libraryHref(projectId)} onClick={inAppLink}>Unlock it in the library</a>, then capture.
         </p>
       )}
+      {/* Always mounted, so the reminder that arrives with the queues' read is announced (R464 b). */}
+      <div className={cutByLock > 0 ? "ao-capture__note" : undefined}>
+        <p role="status">{cutByLock > 0 ? cutByLockText(cutByLock) : ""}</p>
+        {cutByLock > 0 && (
+          <button type="button" onClick={() => void acknowledgeCut()}>
+            Got it
+          </button>
+        )}
+        {cutByLock > 0 && cutAckError && <p role="alert">{cutAckError}</p>}
+      </div>
       {/* Rules the engine cannot read: every capture is refused; say why (R379 FR-A18). A failed read is said above. */}
       {policy && !policy.readable && !loadError && <p className="ao-capture__note">{CAPTURE_RULES_UNREADABLE_TEXT}</p>}
       {policy?.readable && !policy.downloaderAllowed && (
@@ -776,6 +817,7 @@ export function Capture({ client, projectId }: CaptureProps) {
         </label>
         <textarea
           id={ids.links}
+          ref={linksRef}
           rows={5}
           value={text}
           spellCheck={false}
