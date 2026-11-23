@@ -110,6 +110,22 @@ function requirementText(p: Profile): string {
   return `Requires ${listOf(all)}.${tail}`;
 }
 
+/**
+ * FR-187, FR-188: what a new project's profiles ask for that only the researcher can give (a value to be present, as the
+ * Funder DMP's repository, formats and raw-data destruction date), in plain words; the rules themselves are not changed.
+ */
+export function stillToFillIn(profiles: readonly string[] | undefined): string[] {
+  const out: string[] = [];
+  for (const { id } of PROFILES) {
+    if (!profiles?.includes(id)) continue;
+    for (const r of PROFILE_REQUIREMENTS[id]) if (r.kind === "present") out.push(CONTROL_WORDS[r.control] ?? r.control);
+  }
+  return [...new Set(out)];
+}
+
+/** "a, b and c" (for the library's hint). */
+export const listInWords = (items: string[]) => listOf(items);
+
 /** The service refused because the rules need encryption (GovernanceViolationError in createProject). */
 const needsEncryption = (err: unknown) => err instanceof ApiClientError && err.code === "VALIDATION" && /enable encryption/i.test(err.message);
 

@@ -30,7 +30,7 @@ import "../components/library.css";
 import { navigate as goTo, PATHS } from "../navigation";
 import { clearPendingFind, guardPendingFind, setPendingFind } from "../reader/readerHandoff";
 import { readerHref } from "../routes/reader";
-import { madeSince, NewProject, type UnresolvedCreate } from "./NewProject";
+import { listInWords, madeSince, NewProject, stillToFillIn, type UnresolvedCreate } from "./NewProject";
 import { NewRecoveryCode } from "./NewRecoveryCode";
 import { SourceDetail } from "./SourceDetail";
 import { UnlockProject } from "./UnlockProject";
@@ -139,6 +139,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [closedUnder, setClosedUnder] = useState(false);
   /** A create whose answer was lost and could not be checked when the dialog closed (fix round 2). */
   const [unresolved, setUnresolved] = useState<{ create: UnresolvedCreate; state: "unknown" | "still-unknown" | "checking" | "not-created" | { found: ProjectSummary } | { many: number } } | null>(null);
+  /** FR-187, FR-188: a project just made whose rules ask for what only the researcher can give: a hint, until dismissed. */
+  const [toFillIn, setToFillIn] = useState<{ project: ProjectSummary; words: string[] } | null>(null);
   /** Counts library.state events: an open "Resolve…" dialog reads its list again on each. */
   const [stateSeq, setStateSeq] = useState(0);
   /** What the Zotero sync's events said (Task Z12: the lines under the header read again after a finished one), and whether the library is still open. */
@@ -695,12 +697,29 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                 return;
               }
               dialogClosed(undefined, made);
+              const words = stillToFillIn(made.profiles);
+              setToFillIn(words.length ? { project: made, words } : null);
               setProjects((list) => [...(list ?? []).filter((p) => p.id !== made.id), made]);
               setProfiles((all) => ({ ...all, [made.id]: knownProfiles(made.profiles) }));
               // Selected like any other project: the address names it (41b2 I1).
               selectProject(made.id);
             }}
           />
+        )}
+        {toFillIn && (
+          <section aria-label="What the new project still needs" className="ao-newproject-notice">
+            <p role="status">
+              “<UserText>{toFillIn.project.name}</UserText>” follows rules that ask for what only you can give: {listInWords(toFillIn.words)}. Fill them in under Governance; until then, Governance lists them as not met.
+            </p>
+            <div className="ao-row">
+              <a href={governanceHref(toFillIn.project.id)} onClick={(e) => follow(e, governanceHref(toFillIn.project.id))}>
+                Open Governance
+              </a>
+              <button type="button" onClick={() => setToFillIn(null)}>
+                Dismiss
+              </button>
+            </div>
+          </section>
         )}
         {unresolved && (
           <section aria-label="A project that may have been created" className="ao-newproject-notice">

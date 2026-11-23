@@ -553,3 +553,49 @@ describe("New project dialog: an unknown outcome is never left behind (fix round
     expect(svc.posted).toHaveLength(1);
   });
 });
+
+describe("FR-187, FR-188: a first-run hint for rules that ask for what only the researcher can fill in", () => {
+  function serveCreate(project: typeof NEW_OPEN) {
+    let made = false;
+    server.use(
+      http.post(url("/projects"), () => {
+        made = true;
+        return HttpResponse.json({ project });
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, ...(made ? [project] : [])] })),
+      ...libraryHandlers(),
+    );
+  }
+  const hint = () => screen.queryByRole("region", { name: "What the new project still needs" });
+
+  it("a project made with the Funder DMP profile: the library says what is to be filled in under Governance, with a link; Dismiss removes it", async () => {
+    serveCreate({ ...NEW_OPEN, id: "p8", profiles: ["dmp"] });
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    const dialog = await openDialog(user);
+    await fillOpen(dialog, user);
+    await user.click(within(dialog).getByRole("checkbox", { name: "Funder DMP" }));
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const region = await screen.findByRole("region", { name: "What the new project still needs" });
+    expect(region.textContent).toMatch(
+      /^“Tide-line interviews” follows rules that ask for what only you can give: the repository the data will be deposited in, the file formats it will be deposited in and a date for destroying raw data\. Fill them in under Governance; until then, Governance lists them as not met\./,
+    );
+    expect(within(region).getByRole("link", { name: "Open Governance" }).getAttribute("href")).toBe("/governance?project=p8");
+    await user.click(within(region).getByRole("button", { name: "Dismiss" }));
+    expect(hint()).toBeNull();
+  });
+
+  it("a project whose rules ask for nothing of the kind: no hint", async () => {
+    serveCreate({ ...NEW_OPEN, id: "p9", profiles: ["gdpr"] });
+    const user = userEvent.setup();
+    const selected = vi.fn();
+    render(<Routed onSelected={selected} />);
+    const dialog = await openDialog(user);
+    await fillOpen(dialog, user);
+    await user.click(within(dialog).getByRole("checkbox", { name: "GDPR" }));
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(selected).toHaveBeenLastCalledWith("p9"));
+    expect(hint()).toBeNull();
+  });
+});
