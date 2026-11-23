@@ -48,9 +48,12 @@ async function load(deps: RegDeps): Promise<{ entries: RegistryEntry[]; damaged:
   return { entries, damaged: entries.length !== v.length };
 }
 
-/** Most recently opened first. */
+/**
+ * Most recently opened first. Read in this process's turn (R473 M3): a read never falls between a
+ * writer's setting a damaged list aside and its save, where the list would look empty.
+ */
 export async function listLibraries(deps: RegDeps): Promise<RegistryEntry[]> {
-  const { entries } = await load(deps);
+  const { entries } = await inTurn(deps, () => load(deps));
   return entries
     .map((e, i) => ({ e, i }))
     .sort((a, b) => (a.e.lastOpenedAt < b.e.lastOpenedAt ? 1 : a.e.lastOpenedAt > b.e.lastOpenedAt ? -1 : a.i - b.i))
@@ -79,9 +82,13 @@ async function save(deps: RegDeps, entries: RegistryEntry[]): Promise<void> {
 }
 
 /**
- * One change of the libraries list at a time (FR-411): each read-modify-write (and the setting aside
- * of a damaged list) waits for the one before it, per settings folder. Without this, the chooser
- * setting a damaged list aside while a library is opened or created made one of the two renames fail.
+ * One change of the libraries list at a time within this process (FR-411): each read-modify-write
+ * (and the setting aside of a damaged list), and each read, waits for the one before it, per
+ * settings folder. Without this, the chooser setting a damaged list aside while a library is opened
+ * or created made one of the two renames fail. The service is not the list's only writer: the
+ * command line opens and creates libraries too, in a process of its own, and no lock is held
+ * between processes (listed, FR-721); `update` narrows that race by reading the list again just
+ * before it saves.
  */
 const turns = new Map<string, Promise<unknown>>();
 function inTurn<T>(deps: RegDeps, work: () => Promise<T>): Promise<T> {
@@ -98,10 +105,26 @@ function inTurn<T>(deps: RegDeps, work: () => Promise<T>): Promise<T> {
   return run;
 }
 
-async function loadForUpdate(deps: RegDeps): Promise<RegistryEntry[]> {
-  const { entries, damaged } = await load(deps);
-  await backupIfDamaged(deps, damaged);
-  return entries;
+/**
+ * One change of the list, in this process's turn. `apply` changes the entries in place and says
+ * whether anything changed (it is also told whether the list was damaged). When a damaged list was
+ * set aside, the list is read again after that, just before the save, and the change is applied to
+ * what it holds then merged with what was usable of the damaged one (R473 M3): a list another
+ * writer saved in the meantime is not lost.
+ */
+function update(deps: RegDeps, apply: (entries: RegistryEntry[], damaged: boolean) => boolean): Promise<void> {
+  return inTurn(deps, async () => {
+    const first = await load(deps);
+    let entries = first.entries;
+    if (first.damaged) {
+      await backupIfDamaged(deps, true);
+      const latest = await load(deps);
+      await backupIfDamaged(deps, latest.damaged);
+      const known = new Set(latest.entries.map((e) => e.libraryId));
+      entries = [...latest.entries, ...first.entries.filter((e) => !known.has(e.libraryId))];
+    }
+    if (apply(entries, first.damaged)) await save(deps, entries);
+  });
 }
 
 function withPath(paths: string[], path: string): string[] {
@@ -112,8 +135,7 @@ export async function registerLibrary(
   lib: { libraryId: string; name: string; path: string },
   deps: RegDeps,
 ): Promise<void> {
-  return inTurn(deps, async () => {
-    const entries = await loadForUpdate(deps);
+  return update(deps, (entries) => {
     const at = deps.clock().toISOString();
     const i = entries.findIndex((e) => e.libraryId === lib.libraryId);
     const prev = i >= 0 ? entries[i]! : undefined;
@@ -125,19 +147,18 @@ export async function registerLibrary(
     };
     if (i >= 0) entries[i] = entry;
     else entries.push(entry);
-    await save(deps, entries);
+    return true;
   });
 }
 
 /** Moves `path` to the front of the library's known paths. No-op if unknown. */
 export async function recordLocation(libraryId: string, path: string, deps: RegDeps): Promise<void> {
-  return inTurn(deps, async () => {
-    const entries = await loadForUpdate(deps);
+  return update(deps, (entries, damaged) => {
     const e = entries.find((x) => x.libraryId === libraryId);
-    if (!e) return;
+    if (!e) return damaged;
     e.lastKnownPaths = withPath(e.lastKnownPaths, path);
     e.lastOpenedAt = deps.clock().toISOString();
-    await save(deps, entries);
+    return true;
   });
 }
 
@@ -147,12 +168,11 @@ export async function recordLocation(libraryId: string, path: string, deps: RegD
  * make a move's destination findable before it becomes the library's location.
  */
 export async function addKnownPath(libraryId: string, path: string, deps: RegDeps): Promise<void> {
-  return inTurn(deps, async () => {
-    const entries = await loadForUpdate(deps);
+  return update(deps, (entries, damaged) => {
     const e = entries.find((x) => x.libraryId === libraryId);
-    if (!e || e.lastKnownPaths.includes(path)) return;
+    if (!e || e.lastKnownPaths.includes(path)) return damaged;
     e.lastKnownPaths = [...e.lastKnownPaths.slice(0, 1), path, ...e.lastKnownPaths.slice(1)].slice(0, MAX_PATHS);
-    await save(deps, entries);
+    return true;
   });
 }
 
@@ -162,19 +182,15 @@ export async function addKnownPath(libraryId: string, path: string, deps: RegDep
  * error other than "missing" throws, as every other registry read does.
  */
 export async function settleDamagedRegistry(deps: RegDeps): Promise<void> {
-  return inTurn(deps, async () => {
-    const { entries, damaged } = await load(deps);
-    if (!damaged) return;
-    await backupIfDamaged(deps, true);
-    await save(deps, entries);
-  });
+  return update(deps, (_entries, damaged) => damaged);
 }
 
 export async function forgetLibrary(libraryId: string, deps: RegDeps): Promise<void> {
-  return inTurn(deps, async () => {
-    const entries = await loadForUpdate(deps);
-    const rest = entries.filter((e) => e.libraryId !== libraryId);
-    if (rest.length !== entries.length) await save(deps, rest);
+  return update(deps, (entries, damaged) => {
+    const i = entries.findIndex((e) => e.libraryId === libraryId);
+    if (i < 0) return damaged;
+    entries.splice(i, 1);
+    return true;
   });
 }
 
