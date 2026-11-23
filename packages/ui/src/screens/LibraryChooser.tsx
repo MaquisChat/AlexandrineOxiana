@@ -5,13 +5,14 @@
  * folder picker fills that field too (PathField). A chosen folder is only put in the field:
  * it reaches the service when Open or Create is used, and the service decides.
  */
-import { useEffect, useId, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type RefObject } from "react";
 import { ApiClientError } from "../api/client";
 import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry, type LibraryState } from "../api/library";
 import { PathField } from "../components/PathField";
 import { DeviceNoticeBanners, useNoticeDismiss } from "../components/StatusBanner";
 import { UserText } from "../components/UserText";
 import { navigate, PATHS } from "../navigation";
+import { dismissLostCreate, useLostCreates, type LostCreate } from "./lostCreates";
 import "../components/library.css";
 
 export interface LibraryChooserProps {
@@ -47,6 +48,42 @@ const roomFigure = (bytes: number): string => {
 };
 export const roomSentence = (bytes: number) =>
   `Free space on that disk: ${roomFigure(bytes)}.${bytes < LITTLE_ROOM ? " That is little room: an import copies its files into the library." : ""}`;
+
+/**
+ * FR-194 (R461 b): one notice per project whose creation could not be told made or not when its library closed. Only
+ * the names are isolated (UserText, dir=auto), so a right-to-left name does not turn the sentence (as FR-158). Each is a
+ * polite status, read once; focus is not moved to it. "Got it" removes it and moves focus to the next notice's
+ * "Got it", or to the page's heading when none is left.
+ */
+function LostCreateNotices({ heading }: { heading: RefObject<HTMLHeadingElement | null> }) {
+  const lost = useLostCreates();
+  const box = useRef<HTMLDivElement>(null);
+  const id = useId();
+  if (!lost.length) return null;
+  const gotIt = (x: LostCreate, i: number) => {
+    const next = lost[i + 1] ?? lost[i - 1];
+    dismissLostCreate(x.key);
+    setTimeout(() => {
+      const button = next ? box.current?.querySelector<HTMLButtonElement>(`[data-lost="${CSS.escape(next.key)}"]`) : null;
+      (button ?? heading.current)?.focus();
+    });
+  };
+  return (
+    <div className="ao-library__banners" ref={box}>
+      {lost.map((x, i) => (
+        <div key={x.key} role="status" className="ao-banner ao-banner--warn">
+          <span id={`${id}-${i}`}>
+            When “<UserText>{x.project}</UserText>” was being created in “<UserText>{x.library}</UserText>”, the app could not tell whether it was made. When you open that library again, look for “
+            <UserText>{x.project}</UserText>” in its list of projects before creating it again.
+          </span>{" "}
+          <button type="button" className="ao-small" data-lost={x.key} aria-describedby={`${id}-${i}`} onClick={() => gotIt(x, i)}>
+            Got it
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProps) {
   const [libraries, setLibraries] = useState<LibraryEntry[] | undefined>();
@@ -201,6 +238,7 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
         Choose a library
       </h1>
       <DeviceNoticeBanners notices={notices} onDismiss={notice.onDismiss} error={notice.error} />
+      <LostCreateNotices heading={heading} />
       {libraries === undefined ? (
         <p aria-live="polite">Loading libraries…</p>
       ) : libraries.length === 0 ? (

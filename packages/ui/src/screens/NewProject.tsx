@@ -150,6 +150,11 @@ export interface NewProjectProps {
   onRecoveryPending?: (pending: boolean) => void;
   /** The library was closed while the recovery code (or an encrypted project's "found" panel) was on screen. */
   libraryClosed?: boolean;
+  /**
+   * FR-194 (R461 b): the create whose outcome is being checked or cannot be told, or null once it is settled or the
+   * dialog closes; a library closed meanwhile leaves the chooser a notice about it.
+   */
+  onUncertain?: (create: UnresolvedCreate | null) => void;
 }
 
 type Field = "name" | "pass" | "again";
@@ -178,7 +183,7 @@ type Uncertain = "checking" | "cannot-tell";
 
 export { LEAVE_REFUSED } from "../components/RecoveryCodeStep";
 
-export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecoveryPending, libraryClosed }: NewProjectProps) {
+export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecoveryPending, libraryClosed, onUncertain }: NewProjectProps) {
   const id = useId();
   const [name, setName] = useState("");
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -249,6 +254,12 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   // shown and the passphrase is the only way in, so a library closed underneath waits for it, as at the recovery code.
   const holdRef = useRef(onRecoveryPending);
   holdRef.current = onRecoveryPending;
+  const uncertainRef = useRef(onUncertain);
+  uncertainRef.current = onUncertain;
+  useEffect(() => {
+    uncertainRef.current?.(uncertain ? pendingCheck.current : null);
+  }, [uncertain]);
+  useEffect(() => () => uncertainRef.current?.(null), []);
   const foundEncrypted = !!found?.encrypted;
   useEffect(() => {
     if (!foundEncrypted) return;

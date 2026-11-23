@@ -35,6 +35,7 @@ import { NewRecoveryCode } from "./NewRecoveryCode";
 import { SourceDetail } from "./SourceDetail";
 import { UnlockProject } from "./UnlockProject";
 import { LibraryZotero, type ZoteroEvents } from "./LibraryZotero";
+import { noteLostCreate } from "./lostCreates";
 
 /** Where "needs review" outcomes send the researcher (the import review queue, Task 35). */
 export const REVIEW_QUEUE_PATH = PATHS.reviewQueue;
@@ -168,6 +169,18 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
 
   const closedRef = useRef(onClosed);
   closedRef.current = onClosed;
+  /** The new-project dialog's create whose outcome is being checked or cannot be told (FR-194). */
+  const dialogUncertain = useRef<UnresolvedCreate | null>(null);
+  const libraryNameRef = useRef(current.name);
+  /**
+   * FR-194 (R461 b): as the library closes, each create whose outcome is not known (in the dialog, or this screen's
+   * notice) is left for the chooser, which asks the researcher to look for it when the library is open again.
+   */
+  const noteUnknownCreates = useCallback(() => {
+    const u = unresolvedRef.current;
+    const creates = [u && (u.state === "unknown" || u.state === "still-unknown" || u.state === "checking") ? u.create : null, dialogUncertain.current];
+    for (const c of creates) if (c) noteLostCreate(current.libraryId, libraryNameRef.current, c.name);
+  }, [current.libraryId]);
 
   /**
    * Forgets everything read from a project that is now locked (R114): its collections, tags,
@@ -230,6 +243,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             const d = e.data as LibraryState;
             if (d.open === false) {
               setLibraryOpen(false);
+              noteUnknownCreates();
               clearPendingFind();
               // A new project's recovery code on screen is never taken away (R134 I2): the dialog
               // says the library closed, and the library is left once the code is confirmed.
@@ -275,7 +289,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       ac.abort();
       clearTimeout(retry);
     };
-  }, [api]);
+  }, [api, noteUnknownCreates]);
 
   // ---- projects and their profile badges ----
   const showProjects = useCallback((list: ProjectSummary[]) => {
@@ -532,6 +546,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   };
 
   const projectNames = useMemo(() => Object.fromEntries((projects ?? []).map((p) => [p.id, p.name])), [projects]);
+  libraryNameRef.current = state.name ?? current.name;
   const banners = bannersFor(state, { projectNames, index, ...(libraryPath ? { volume: volumeOf(libraryPath) } : {}), ...(state.lockedBy ? { hostname: state.lockedBy } : {}) });
   const readOnlyReason = state.readOnlyReason === "offline" ? "The library is offline; attaching waits until it is back." : "This library is read-only.";
 
@@ -603,7 +618,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           {project && <a href={watchedFoldersHref(project.id)} onClick={(e) => follow(e, watchedFoldersHref(project.id))}>Watched folders</a>}
           <a href={PATHS.about} onClick={(e) => follow(e, PATHS.about)}>About and third-party notices</a>
           {onSwitchLibrary && (
-            <button type="button" onClick={onSwitchLibrary}>
+            <button
+              type="button"
+              onClick={() => {
+                noteUnknownCreates();
+                onSwitchLibrary();
+              }}
+            >
               Switch library
             </button>
           )}
@@ -686,6 +707,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               holdClose.current = pending;
             }}
             libraryClosed={closedUnder}
+            onUncertain={(c) => {
+              dialogUncertain.current = c;
+            }}
             onCancel={dialogClosed}
             onCreated={(made) => {
               // FR-180: a project this dialog made is known, so a notice still unsettled never takes it for the lost create.
