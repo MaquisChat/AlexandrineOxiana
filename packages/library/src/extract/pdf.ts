@@ -17,9 +17,13 @@ let pdfjs: Promise<PdfJs> | undefined;
 const loadPdfJs = () => (pdfjs ??= import("pdfjs-dist/legacy/build/pdf.mjs"));
 
 const TEXT_PAGES = 3;
-/** FR-577: the file is read in ranges of this size, as pdf.js asks for them, never whole. */
+/** FR-577: pdf.js asks for the file in ranges of at least this size (see `extractPdf` for when it asks for all of it). */
 const RANGE_CHUNK = 64 * 1024;
-/** Larger PDFs are not read into memory for metadata. */
+/**
+ * A larger PDF is not read at all (`{}`). This bounds what a damaged or crafted file can cost: read whole, it takes
+ * about twice its size in memory (see `extractPdf`). Find's file check reads only files already refused above
+ * 100 MB (a download, FREE_COPY_MAX_BYTES) or 200 MB (a handed-over file, LIBRARY_FILE_MAX_BYTES) before it runs.
+ */
 const MAX_PDF_BYTES = 512 * 1024 * 1024;
 
 /** Test seam (R47: honoured only under NODE_ENV=test): told the size of each read of the file. */
@@ -31,8 +35,11 @@ export async function extractPdf(path: string): Promise<RawExtract> {
   const stat = await fsp.stat(path);
   if (stat.size > MAX_PDF_BYTES) return {};
   const { getDocument, PDFDataRangeTransport } = await loadPdfJs();
-  // FR-577: pdf.js reads the file by ranges, as it needs them (the cross-reference table, the metadata, the first
-  // pages), through this transport — never the whole file into memory. A range that cannot be read ends the document
+  // FR-577: pdf.js reads the file by ranges, as it needs them, through this transport. For a well-formed file that is
+  // the cross-reference table, the metadata and the first pages: a small part of a large file. When the cross-reference
+  // cannot be used (a damaged or crafted file) pdf.js rebuilds it by scanning, and asks for the rest of the file as one
+  // range: the whole file is then read into one buffer, and pdf.js copies it — about twice the file's size in memory,
+  // as when the file was always read whole. MAX_PDF_BYTES bounds that. A range that cannot be read ends the document
   // (pdf.js has no way to fail a range, so its reads would otherwise wait for ever): the file counts as unreadable.
   const fh = await fsp.open(path, "r");
   const size = stat.size;
