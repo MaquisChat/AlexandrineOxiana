@@ -182,6 +182,10 @@ describe("TagList", () => {
     expect(onRenameWorkspace).not.toHaveBeenCalled();
     const ask = screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" });
     expect(ask.textContent).toMatch(/every project/);
+    // The explanation is tied to the dialog, so a screen reader reads why the question is asked (FR-165, N1).
+    const describedBy = ask.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy ?? "")?.textContent).toBe("A workspace tag is shared by every project, so it is renamed in every project.");
     await user.click(within(ask).getByRole("button", { name: "Rename" }));
     expect(onRenameWorkspace).toHaveBeenCalledWith("w1", "method");
     await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));

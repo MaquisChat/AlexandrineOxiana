@@ -49,6 +49,7 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
   const [name, setName] = useState(tag.name);
   const fieldId = useId();
   const askId = useId();
+  const askWhyId = useId();
   // R468 (FR-165): the rename's confirmation is a dialog whose first focus is its heading (R376 c: the
   // Enter that opened it, held or pressed again, confirms nothing). When it closes — confirmed,
   // cancelled or Escape — focus goes back to this tag's Rename button: the name field is closed by
@@ -122,11 +123,11 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
         </form>
       )}
       {mode === "confirm-rename" && !readOnly && (
-        <DialogShell labelledBy={askId} onCancel={closeAsk} initialFocus={heading}>
+        <DialogShell labelledBy={askId} describedBy={askWhyId} onCancel={closeAsk} initialFocus={heading}>
           <h2 id={askId} ref={heading} tabIndex={-1}>
             Rename the workspace tag <UserText>{tag.name}</UserText> to <UserText>{name}</UserText>?
           </h2>
-          <p>A workspace tag is shared by every project, so it is renamed in every project.</p>
+          <p id={askWhyId}>A workspace tag is shared by every project, so it is renamed in every project.</p>
           <div className="ao-actions">
             <button
               type="button"
