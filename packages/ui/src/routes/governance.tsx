@@ -3,10 +3,10 @@
  * route table (R118) shows them on their paths; the project is in the query (`?project=<id>`), so
  * a link names it. Links and the project picker use the shared pushState navigation (navigation.tsx).
  */
-import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import type { ApiClient } from "../api/client";
 import { governanceApi, type GovernanceApi, type ProjectSummary } from "../api/governance";
-import { errorText } from "../api/library";
+import { errorText, type LibraryState } from "../api/library";
 import { inAppLink, navigate, normalisePath, PATHS, type AppLocation } from "../navigation";
 import { AuditLog } from "../screens/AuditLog";
 import { Fieldwork } from "../screens/Fieldwork";
@@ -44,15 +44,30 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
   const [listError, setListError] = useState<string | undefined>();
   const onGovernance = path === PATHS.governance;
   // On the Governance form, each change of the library's state (a project locked or unlocked in
-  // another window, the library turning read-only) reads the projects and the library's mode again,
-  // so the reason the rules cannot be changed follows it while the form is open (FR-389).
+  // another window, the library turning read-only) is followed while the form is open, so the reason
+  // the rules cannot be changed follows it (FR-389). The stream opens with the state as it is, which
+  // the opening reads already hold: it reads nothing more. Each later one reads the projects once
+  // and takes the library's mode from the event itself (R468).
   const [stateSeq, setStateSeq] = useState(0);
+  const [libraryMode, setLibraryMode] = useState<string | undefined>();
+  /** Set once an event has said the mode: the opening read's answer, if later, is then older. */
+  const modeFromEvent = useRef(false);
   useEffect(() => {
     if (!onGovernance) return;
     const ac = new AbortController();
     void (async () => {
+      let first = true;
       try {
-        for await (const e of client.events({ signal: ac.signal })) if (e.type === "library.state") setStateSeq((n) => n + 1);
+        for await (const e of client.events({ signal: ac.signal })) {
+          if (e.type !== "library.state") continue;
+          const mode = e.data && typeof e.data === "object" ? (e.data as LibraryState).mode : undefined;
+          if (typeof mode === "string") {
+            modeFromEvent.current = true;
+            setLibraryMode(mode);
+          }
+          if (first) first = false;
+          else setStateSeq((n) => n + 1);
+        }
       } catch {
         // No event stream: the reason stays as read when the form opened; the service still refuses a change it may not make.
       }
@@ -80,18 +95,18 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
   // Whether the library may be changed here, read for the Governance form only: it then says why its
   // rules cannot be changed instead of letting a change be refused on save. Unknown: not said (the
   // service refuses a change it may not make either way).
-  const [libraryMode, setLibraryMode] = useState<string | undefined>();
   useEffect(() => {
     if (!onGovernance) return;
     let live = true;
+    modeFromEvent.current = false;
     api.libraryMode().then(
-      (m) => live && setLibraryMode(m),
-      () => live && setLibraryMode(undefined),
+      (m) => live && !modeFromEvent.current && setLibraryMode(m),
+      () => live && !modeFromEvent.current && setLibraryMode(undefined),
     );
     return () => {
       live = false;
     };
-  }, [api, onGovernance, stateSeq]);
+  }, [api, onGovernance]);
 
   const list = projects ?? [];
   // The project named in the address when it is one of the library's. A name that is not selects

@@ -76,6 +76,8 @@ describe("governance routes (R113, R118)", () => {
     const stream = new ReadableStream<Uint8Array>({
       start: (c) => {
         push = (type) => c.enqueue(new TextEncoder().encode(`event: ${type}\ndata: {}\n\n`));
+        // The real service opens every stream with the state as it is (routes/libraries.ts).
+        push("library.state");
       },
     });
     let connected = false;
@@ -105,6 +107,56 @@ describe("governance routes (R113, R118)", () => {
     push("library.state");
     await waitFor(() => expect(browser().disabled).toBe(false));
     expect(screen.queryByText(/Unlock it in the library/)).toBeNull();
+  });
+
+  // R468 (M1): the form reads the projects and the library's mode once on opening; the stream's
+  // opening snapshot reads nothing more; each later library.state reads the projects once and takes
+  // the mode from the event itself.
+  it("the Governance form reads the projects and the library's mode once on opening, and once per later change (FR-389, R468)", async () => {
+    let projectReads = 0;
+    let libraryReads = 0;
+    let push!: (data: Record<string, unknown>) => void;
+    const stream = new ReadableStream<Uint8Array>({
+      start: (c) => {
+        push = (data) => c.enqueue(new TextEncoder().encode(`event: library.state\ndata: ${JSON.stringify(data)}\n\n`));
+        push({ open: true, mode: "read-write" });
+      },
+    });
+    let connected = false;
+    server.use(
+      http.get(url("/events"), () => {
+        connected = true;
+        return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
+      }),
+      http.get(url("/projects"), () => {
+        projectReads++;
+        return HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted: false, unlocked: true }] });
+      }),
+      http.get(url("/libraries"), () => {
+        libraryReads++;
+        return HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } });
+      }),
+      http.get(url("/projects/p1/governance"), () => HttpResponse.json({ yaml: "captureMethods: [manual_upload, browser_capture]\n", sha256: "a".repeat(64), violations: [] })),
+      http.get(url("/projects/p1/protocol/documents"), () => HttpResponse.json({ documents: [] })),
+      http.get(url("/projects/p1/retention"), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+    );
+    window.history.replaceState(null, "", "/governance?project=p1");
+    render(<Host />);
+    const capture = await screen.findByRole("region", { name: "Capture methods" });
+    const browser = () => within(capture).getByRole("checkbox", { name: /Browser capture/ }) as HTMLInputElement;
+    await waitFor(() => expect(browser().disabled).toBe(false));
+    await waitFor(() => expect(connected).toBe(true));
+    // A later change that turns the library read-only: shown from the event, with one read of the projects.
+    push({ open: true, mode: "read-only" });
+    expect(await screen.findByText("This library is open read-only here, so its rules cannot be changed.")).toBeTruthy();
+    await waitFor(() => expect(projectReads).toBe(2));
+    expect(libraryReads).toBe(1);
+    expect(browser().disabled).toBe(true);
+    // One more later change: one more read of the projects, none of the libraries.
+    push({ open: true, mode: "read-write" });
+    await waitFor(() => expect(browser().disabled).toBe(false));
+    await waitFor(() => expect(projectReads).toBe(3));
+    expect(libraryReads).toBe(1);
   });
 
   it("a writable library and an unlocked project leave the form editable", async () => {
