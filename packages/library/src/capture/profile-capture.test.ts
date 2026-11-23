@@ -372,8 +372,7 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect((await byPost(p.id, target)).assets.filter((a) => a.kind === "platform-metadata")).toHaveLength(1);
 
     const text = await readFile(join(dir, (await walk(dir)).find((f) => f.startsWith("reports/") && !firstReports.includes(f))!), "utf8");
-    expect(text).toContain("- Captions that look edited but could not be checked: 1");
-    expect(text).toContain("Run the capture again later to check them.");
+    expect(text).toContain("- 1 possible edit could not be checked. Capture the profile again later to check it.\n");
     const runs = (await auditEvents(p.folder)).filter((e) => e.action === "capture.profile");
     expect(runs.at(-1)!.details).toMatchObject({ edited: 0, editsNotChecked: 1 });
   });

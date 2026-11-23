@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES, reviewGroup, HELD_FILE_WHY_TEXT, HELD_FILE_REVIEW_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, heldFileReviewText, FIND_REASON_TEXT, HELD_FILE_DECISIONS, DEVICE_NOTICE_KINDS, isDeviceNoticeKind } from "./index.js";
+import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES, reviewGroup, HELD_FILE_WHY_TEXT, HELD_FILE_REVIEW_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, heldFileReviewText, FIND_REASON_TEXT, HELD_FILE_DECISIONS, DEVICE_NOTICE_KINDS, isDeviceNoticeKind, editsNotCheckedText } from "./index.js";
 
 describe("@ao/shared", () => {
+  it("FR-106 (R473 M6): the count of possible edits that could not be checked, said one way", () => {
+    expect(editsNotCheckedText(1)).toBe("1 possible edit could not be checked. Capture the profile again later to check it.");
+    expect(editsNotCheckedText(2)).toBe("2 possible edits could not be checked. Capture the profile again later to check them.");
+  });
+
   it("credential query keys (R96/R98), any case", () => {
     expect([...CREDENTIAL_QUERY_KEYS].sort()).toEqual(["access_token", "api_key", "apikey", "auth", "authorization", "bearer", "code", "key", "passphrase", "password", "secret", "token"]);
     expect(isCredentialQueryKey("Access_Token")).toBe(true);

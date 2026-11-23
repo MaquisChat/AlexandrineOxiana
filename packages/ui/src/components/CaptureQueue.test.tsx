@@ -101,7 +101,7 @@ describe("CaptureQueue", () => {
       report: { status: "completed", listComplete: true, created: 0, duplicates: 0, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, editsNotChecked: 2, items: [] },
     });
     render(<CaptureQueue queues={[q]} />);
-    expect(screen.getByText(/2 possible edits not checked \(capture the profile again later to check them\)/)).toBeTruthy();
+    expect(screen.getByText(/2 possible edits could not be checked\. Capture the profile again later to check them\./)).toBeTruthy();
   });
 
   it("a profile run refused for want of a legal basis explains it", () => {

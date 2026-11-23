@@ -27,7 +27,7 @@ describe("an address of another scheme is printed without its user information (
 describe("a profile run's possible edits that could not be checked are counted (FR-106)", () => {
   const base = { status: "completed" as const, listComplete: true, created: 0, duplicates: 0, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, items: [] };
   it("said when there are some, with what to do; nothing when there are none", () => {
-    expect(profileLines({ ...base, editsNotChecked: 2 })).toContain("  2 possible edit(s) not checked: run the same command later to check them.");
+    expect(profileLines({ ...base, editsNotChecked: 2 })).toContain("  2 possible edits could not be checked. Capture the profile again later to check them.");
     expect(profileLines({ ...base, editsNotChecked: 0 }).join("\n")).not.toContain("not checked");
   });
 });

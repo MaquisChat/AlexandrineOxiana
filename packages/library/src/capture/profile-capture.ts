@@ -37,6 +37,7 @@
  */
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
+import { editsNotCheckedText } from "@ao/shared";
 import {
   ImportBatch,
   ImportOptions,
@@ -1007,7 +1008,7 @@ function reportText(platform: Platform, label: string, r: ProfileCaptureReport, 
     `- No longer available on the platform (newly noticed): ${r.newlyUnavailable}`,
     `- Available again: ${r.reappeared}`,
     `- Captions edited since the last capture: ${r.edited}`,
-    ...(r.editsNotChecked ? [`- Captions that look edited but could not be checked: ${r.editsNotChecked}. Run the capture again later to check them.`] : []),
+    ...(r.editsNotChecked ? [`- ${editsNotCheckedText(r.editsNotChecked)}`] : []),
     "",
     r.listComplete
       ? "The whole profile was listed, so posts missing from it were checked."
