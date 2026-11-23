@@ -255,7 +255,8 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
         }
       }
       if (!live || halted) return;
-      if (changed) halt({ kind: "failed", message: MEDIA_FILE_CHANGED_SENTENCE, retry: true });
+      // R467 M5: trying again cannot help a changed file, so no "Try again" is offered.
+      if (changed) halt({ kind: "failed", message: MEDIA_FILE_CHANGED_SENTENCE, retry: false });
       else await attach(true);
     };
     const onTimeUpdate = (e: Event) => {

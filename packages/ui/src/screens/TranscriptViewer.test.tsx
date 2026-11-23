@@ -614,7 +614,8 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(svc.log.tickets).toHaveLength(1);
     expect(svc.log.revoked).toEqual([svc.log.tickets[0]!.path]);
     expect(el.getAttribute("src")).toBeNull();
-    expect(screen.getByRole("button", { name: "Try the recording again" })).toBeTruthy();
+    // R467 M5: a retry cannot help, so none is offered: the sentence and the controls agree.
+    expect(screen.queryByRole("button", { name: "Try the recording again" })).toBeNull();
   });
 
   it("too many recordings open at once is said in one plain sentence (review M3)", async () => {
