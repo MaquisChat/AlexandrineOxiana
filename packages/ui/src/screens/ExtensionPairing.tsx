@@ -41,6 +41,15 @@ const CODE_FORMAT = /^\d{6}$/;
 /** Reads of the list after a use, waiting for the paired browser to appear in it (review round 1, I1). */
 const LIST_TRIES_AFTER_USE = 5;
 
+/** How long a code may be "being saved" before the screen says it is taking long (FR-335, R464 a). */
+const SAVING_SLOW_MS = 60_000;
+
+/** What the screen says while the service saves the pairing (a polite status; FR-335, R464 a). */
+const SAVING: Record<"saving" | "slow", string> = {
+  saving: "The right code was typed. The pairing is being saved…",
+  slow: "The pairing is taking longer than it should to be saved. The browser is paired once it appears in the list of paired browsers.",
+};
+
 /** The status answer, if it has the shape it should (review round 1, M2); anything else is ignored. */
 function statusOf(s: unknown): PairingCodeStatus | undefined {
   if (typeof s !== "object" || s === null) return undefined;
@@ -124,6 +133,12 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
   const [pairedMissing, setPairedMissing] = useState<false | "missing" | "unread">(false);
   /** Whether the newest list read failed (FR-337). */
   const lastReadFailed = useRef(false);
+  /**
+   * The service says the right code was typed and the pairing is being saved (`confirming`; FR-335,
+   * R464 a): the countdown stops, and after SAVING_SLOW_MS more the screen says it is taking long.
+   */
+  const [saving, setSaving] = useState<false | "saving" | "slow">(false);
+  const savingRef = useRef<false | "saving" | "slow">(false);
 
   const alive = useRef(true);
   const aborts = useRef(new Set<AbortController>());
@@ -191,12 +206,16 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
     setAnnouncement("");
     setStatusRefused(false);
     setPairedMissing(false);
+    savingRef.current = false;
+    setSaving(false);
   };
 
   // The countdown: the visible clock changes every second; the announcement only at sensible moments.
+  // A code being saved is no longer counted down: it is spent, and never "expired" (FR-335).
   const deadline = code?.deadline;
+  const counting = saving === false;
   useEffect(() => {
-    if (deadline === undefined) return;
+    if (deadline === undefined || !counting) return;
     const left = () => Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
     setRemaining(left());
     const check = () => {
@@ -221,7 +240,20 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
       document.removeEventListener("visibilitychange", check);
       window.removeEventListener("focus", check);
     };
-  }, [deadline]);
+  }, [deadline, counting]);
+
+  // Still being saved SAVING_SLOW_MS after the service first said so: the screen says it is taking
+  // long, and reads the list once by itself (the browser is paired once it is in it; R464 a).
+  useEffect(() => {
+    if (saving !== "saving") return;
+    const t = setTimeout(() => {
+      if (!alive.current || savingRef.current !== "saving") return;
+      savingRef.current = "slow";
+      setSaving("slow");
+      void refresh();
+    }, SAVING_SLOW_MS);
+    return () => clearTimeout(t);
+  }, [saving, refresh]);
 
   // While a code is shown, the service says what became of it. One request at a time; the asking ends
   // with the code (expiry, use, replacement, too many wrong tries) or with the screen, and an answer
@@ -244,6 +276,8 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
         if (s.state === "used" || s.state === "expired" || s.state === "invalidated" || s.state === "replaced" || s.state === "none") {
           stopped = true;
           clearInterval(t);
+          // After "taking longer" the list is read again when the status changes; a use reads it below.
+          if (savingRef.current === "slow" && s.state !== "used") void refresh();
         }
         switch (s.state) {
           case "used":
@@ -259,6 +293,12 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
             break;
           case "none":
             clearCode({ kind: "unknown" });
+            break;
+          case "confirming":
+            if (savingRef.current === false) {
+              savingRef.current = "saving";
+              setSaving("saving");
+            }
             break;
           default:
             break; // still active
@@ -282,7 +322,7 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
       clearInterval(t);
       ac.abort();
     };
-  }, [code, pollMs, api]);
+  }, [code, pollMs, api, refresh]);
 
   // After a use, the list is read until the paired browser is in it: at once, then every `pollMs`, at
   // most LIST_TRIES_AFTER_USE times; if it never appears, the screen says so instead of looking empty.
@@ -481,6 +521,10 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
             This page cannot tell what became of the code: the library service refused to say. The code stays here until it expires. If the extension says it is paired, it is; otherwise show a new code.
           </p>
         ) : null}
+        {/* Always mounted, so the change to "being saved" is announced (FR-335). */}
+        <p role="status" aria-label="Pairing being saved" className={saving ? "ao-hint" : "ao-visually-hidden"}>
+          {saving ? SAVING[saving] : ""}
+        </p>
         {code ? (
           <div className="ao-pairing-code-box">
             <p className="ao-pairing-label" aria-hidden="true">
@@ -490,7 +534,7 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
               <span>{code.digits.slice(0, 3)}</span>
               <span>{code.digits.slice(3)}</span>
             </p>
-            <p className="ao-hint">Valid for {clock(remaining)}</p>
+            {saving ? null : <p className="ao-hint">Valid for {clock(remaining)}</p>}
             <p className="ao-hint">If the extension says “That code is not valid”, choose “Show a new code”: it replaces this one.</p>
           </div>
         ) : null}

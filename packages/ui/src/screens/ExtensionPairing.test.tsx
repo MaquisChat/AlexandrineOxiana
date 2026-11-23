@@ -510,6 +510,54 @@ describe("used only once written (review round 1: I1, M1, M2, M3)", () => {
     expect(screen.getByRole("status", { name: "Pairing result" }).textContent).toContain(BROWSER_B.origin);
   });
 
+  it("FR-335: while the pairing is being saved the countdown stops and the screen says so; it never calls the code expired", async () => {
+    const svc = pairingService({ codes: [{ code: "482916", ttlMs: 30_000 }] });
+    server.use(...svc.handlers);
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={2000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    svc.end(0, { state: "confirming", codeId: codeIdOf(0) });
+    await tick(2500);
+    const saving = screen.getByRole("status", { name: "Pairing being saved" });
+    expect(saving.textContent).toBe("The right code was typed. The pairing is being saved…");
+    expect(screen.queryByText(/Valid for/)).toBeNull();
+    // Well past the code's own expiry on this page's clock: still being saved, never "expired".
+    await tick(40_000);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(document.body.textContent).not.toMatch(/expired/i);
+    expect(screen.queryByText(/Valid for/)).toBeNull();
+    expect(screen.getByRole("status", { name: "Pairing being saved" }).textContent).toBe("The right code was typed. The pairing is being saved…");
+  });
+
+  it("FR-335: still being saved 60 seconds later, the screen says it is taking long and reads the list again once, then again when the status changes", async () => {
+    const svc = pairingService();
+    server.use(...svc.handlers);
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={2000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    svc.end(0, { state: "confirming", codeId: codeIdOf(0) });
+    await tick(2500); // the poll at 2 s sees "confirming"
+    const before = svc.state.listReads;
+    await tick(59_000); // 59.5 s after it was seen
+    expect(screen.getByRole("status", { name: "Pairing being saved" }).textContent).toBe("The right code was typed. The pairing is being saved…");
+    expect(svc.state.listReads).toBe(before);
+    await tick(1000);
+    expect(screen.getByRole("status", { name: "Pairing being saved" }).textContent).toBe(
+      "The pairing is taking longer than it should to be saved. The browser is paired once it appears in the list of paired browsers.",
+    );
+    expect(svc.state.listReads).toBe(before + 1);
+    await tick(20_000);
+    expect(svc.state.listReads).toBe(before + 1); // once then, not on every poll
+    expect(document.body.textContent).not.toMatch(/expired/i);
+    svc.end(0, { state: "invalidated", codeId: codeIdOf(0), invalidatedAt: new Date().toISOString(), reason: "not-saved" });
+    await tick(2500);
+    expect(screen.getByRole("alert").textContent).toMatch(/did not complete/i);
+    expect(svc.state.listReads).toBe(before + 2);
+    expect(screen.getByRole("status", { name: "Pairing being saved" }).textContent).toBe("");
+  });
+
   it("a pairing that could not be saved: the code is removed and the screen says the pairing did not complete", async () => {
     const svc = pairingService();
     server.use(...svc.handlers);
