@@ -33,7 +33,7 @@ import { PATHS } from "../navigation";
 import type { LibraryWindowEvent } from "../desktopShell";
 import { fakeShell, type FakeShell } from "../test/desktopShell";
 import { SOURCE_FILE, server, testClient, url, useMockService } from "../test/service";
-import { ACT_SAID_MS, FindAcquire, LIBRARY_CLOSE_WAIT_MS, LIBRARY_SHELL_TIMEOUT_MS, SWITCH_TIMEOUT_MS } from "./FindAcquire";
+import { ACT_SAID_MS, FindAcquire, LIBRARY_CLOSE_WAIT_MS, LIBRARY_SHELL_TIMEOUT_MS, QUEUE_READ_WAIT_MS, SWITCH_TIMEOUT_MS } from "./FindAcquire";
 
 useMockService();
 
@@ -4130,6 +4130,42 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       gate = undefined;
       g.release();
       await waitFor(() => expect(stateOf("one read")).toBe("Waiting for you in the sign-in window"));
+      expect(posts("/library/start")).toHaveLength(1);
+    });
+
+    it("FR-558: a read of the queue that never answers keeps no control busy and stops no later read: each is waited for at most QUEUE_READ_WAIT_MS", async () => {
+      serveOne("hung read");
+      let hang = false;
+      server.use(http.get(url(`/projects/${PID}/find`), () => (hang ? new Promise<Response>(() => {}) : HttpResponse.json(queue(current)))));
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await waitFor(() => expect(events.open()).toBe(true));
+      const control = () => row("hung read").querySelector<HTMLElement>('button[data-act="library"]');
+      hang = true;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        // A read asked for by an event never answers…
+        progress(current[0]!, "no-open-copy");
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(reads()).toBe(2);
+        // …and the start's own read after the window opened never answers either.
+        fireEvent.click(control()!);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+        expect(reads()).toBe(3);
+        await vi.advanceTimersByTimeAsync(QUEUE_READ_WAIT_MS - 1_500);
+        expect(control()!.getAttribute("aria-busy")).toBe("true");
+        await vi.advanceTimersByTimeAsync(1_500);
+      } finally {
+        vi.useRealTimers();
+      }
+      // The start's control is no longer busy.
+      await waitFor(() => expect(control()?.getAttribute("aria-busy") ?? null).toBeNull());
+      // A new ask reads again (the read that never answered holds no later one back).
+      hang = false;
+      progress(current[0]!, "waiting-sign-in");
+      await waitFor(() => expect(stateOf("hung read")).toBe("Waiting for you in the sign-in window"));
       expect(posts("/library/start")).toHaveLength(1);
     });
 

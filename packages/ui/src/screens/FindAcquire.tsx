@@ -165,6 +165,12 @@ export const SWITCH_TIMEOUT_MS = 60_000;
 export const LIBRARY_SHELL_TIMEOUT_MS = 60_000;
 /** R342 b: how long a start waits for the shell to report a leftover window closed before it asks the shell once more. */
 export const LIBRARY_CLOSE_WAIT_MS = 5_000;
+/**
+ * FR-558: a read of the queue is waited for at most this long by what waits on it (a row's control, the next read asked
+ * for); a read that never answers then keeps no control busy and holds no later read back. Its answer, if it comes, is
+ * still taken in its order.
+ */
+export const QUEUE_READ_WAIT_MS = 60_000;
 
 /**
  * F15's start and cancel (apps/library-service/src/routes/your-library.ts), as their handlers take them: no body. Ids
@@ -1352,6 +1358,15 @@ function ProjectQueue(props: {
   }, [api, projectId, applyQueue, markLocked]);
 
   readOnceRef.current = readOnce;
+  /** One read, waited for at most QUEUE_READ_WAIT_MS (FR-558): the read itself goes on, and its answer is still taken. */
+  const readWaited = useCallback(async (): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([readOnce(), new Promise<void>((r) => (timer = setTimeout(r, QUEUE_READ_WAIT_MS)))]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }, [readOnce]);
   const readNow = useCallback(() => void readOnce(), [readOnce]);
   /**
    * A read asked for by an event (or after an act), coalesced: it starts EVENT_COALESCE_MS after the first ask (asks
@@ -1374,13 +1389,13 @@ function ProjectQueue(props: {
           if (!alive.current || g !== gen.current || soon.current !== mark) return;
           mark.again = false;
           lastSoon.current = Date.now();
-          await readOnce();
+          await readWaited();
         } while (mark.again && alive.current && g === gen.current && soon.current === mark);
       } finally {
         if (soon.current === mark) soon.current = null;
       }
     })();
-  }, [readOnce]);
+  }, [readWaited]);
 
   // ---- at load, and when the switch changed: read now (where matches elsewhere are is asked again) ----
   const firstSwitch = useRef(true);
@@ -1677,7 +1692,7 @@ function ProjectQueue(props: {
         // press of a double click finds the row waiting and sends nothing.
         // The row's change that read shows is said as any row's change is.
         acting.current.delete(e.id);
-        if (live()) await readOnce();
+        if (live()) await readWaited();
         return;
       }
       // Not opened (refused twice, failed, or no answer in time): the page forgets the ticket, and the entry goes back.
