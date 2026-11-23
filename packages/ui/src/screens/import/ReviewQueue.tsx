@@ -282,6 +282,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   /** Waiting files (F11, R303): the decision under way on each, the service's sentence for a refused one, where focus goes after one. */
   const [heldBusy, setHeldBusy] = useState<Readonly<Record<string, HeldFileDecision>>>({});
   const heldBusyRef = useRef(new Set<string>());
+  /**
+   * R478: each card's decision request given up at HELD_DECISION_TIMEOUT_MS and still open (FR-529 leaves it open for
+   * its late answer). A card holds at most one: its next decision cancels it first; leaving the queue cancels them all.
+   */
+  const givenUp = useRef(new Map<string, AbortController>());
   const [heldErrors, setHeldErrors] = useState<Readonly<Record<string, string>>>({});
   const [fileFocus, setFileFocus] = useState<{ to: string } | null>(null);
   /**
@@ -516,6 +521,14 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   }, [api, projectId, batchId, sourceId, pageSize, pump, locked, readKey, forget, holdQuiet, putLayout, panelQuiet]);
   // Unmounting moves the generation on: a decision answered after the screen closed changes nothing.
   useEffect(() => () => void gen.current++, []);
+  // R478: leaving the queue (unmount, or another project shown) cancels every given-up decision's request still open.
+  useEffect(() => {
+    const open = givenUp.current;
+    return () => {
+      for (const c of open.values()) c.abort();
+      open.clear();
+    };
+  }, [projectId]);
 
   // The project's name, for the unlock form.
   useEffect(() => {
@@ -800,19 +813,25 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     }
     heldBusyRef.current.add(item.id);
     notice(item.id, null);
+    // R478: this card's earlier given-up request is cancelled first; its late answer then changes nothing.
+    givenUp.current.get(item.id)?.abort();
+    givenUp.current.delete(item.id);
+    const cancel = new AbortController();
     const g = gen.current;
     setHeldBusy((cur) => ({ ...cur, [item.id]: decision }));
     setHeldErrors((cur) => withoutKey(cur, item.id));
     // R313 e: no answer in HELD_DECISION_TIMEOUT_MS: the decision is given up — the card usable again and saying so, and
     // the queue read again (the decision may or may not have been recorded). The request is left to finish: its late
     // answer decides nothing here, but the queue is read once more then, so a late record by the service shows at once
-    // (FR-529) — while the file is still listed here (not after a lock, or once another project is shown).
+    // (FR-529) — while the file is still listed here (not after a lock, or once another project is shown). It is kept
+    // as the card's given-up request until it answers (R478).
     let late = false;
     const readLate = () => {
       if ((itemsRef.current ?? []).some((x) => x.id === item.id)) setReadKey((k) => k + 1);
     };
     const timer = setTimeout(() => {
       late = true;
+      givenUp.current.set(item.id, cancel);
       heldBusyRef.current.delete(item.id);
       setHeldBusy((cur) => withoutKey(cur, item.id));
       setHeldErrors((cur) => ({ ...cur, [item.id]: HELD_NO_ANSWER_TEXT }));
@@ -823,11 +842,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     }, HELD_DECISION_TIMEOUT_MS);
     try {
       const body: HeldFileDecisionRequest = { projectId, decision };
-      await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body });
+      await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body, signal: cancel.signal });
+      if (cancel.signal.aborted) return;
       if (late) readLate();
       if (late || g !== gen.current) return;
       fileLeft(item, decision, (n) => `${FOUND_FILES_TEXT.result[decision]}: ${titleFor(item, n)}`);
     } catch (e) {
+      if (cancel.signal.aborted) return;
       if (late) readLate();
       if (late || g !== gen.current) return;
       if (isProjectLocked(e)) {
@@ -843,6 +864,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       setHeldErrors((cur) => ({ ...cur, [item.id]: e instanceof ApiClientError && e.message ? e.message : errorText(e) }));
     } finally {
       clearTimeout(timer);
+      if (givenUp.current.get(item.id) === cancel) givenUp.current.delete(item.id);
       if (!late) {
         heldBusyRef.current.delete(item.id);
         if (g === gen.current) setHeldBusy((cur) => withoutKey(cur, item.id));

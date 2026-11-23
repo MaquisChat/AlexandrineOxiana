@@ -7,7 +7,7 @@ import { BASE as SERVICE, mockService, PSEUDONYMISING_GOVERNANCE, server, type S
 import { renderToStaticMarkup } from "react-dom/server";
 import { HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_WHY_TEXT } from "@ao/shared";
 import { FilePreview } from "./FilePreview";
-import { DECIDE_SETTLE_MS, HELD_DECISION_TIMEOUT_MS, ReviewQueue } from "./ReviewQueue";
+import { DECIDE_SETTLE_MS, HELD_DECISION_TIMEOUT_MS, HELD_NO_ANSWER_TEXT, ReviewQueue } from "./ReviewQueue";
 import { SCROLL_SETTLE_MS } from "./pressGuard";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -1199,6 +1199,86 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     expect(reads()).toBe(readsAfterGiveUp + 1);
     expect(noUse(RECORD)).toBeNull();
     expect(heldCalls).toHaveLength(1);
+  });
+
+  /** R478: the held-file decisions' requests, each open until it answers or its signal aborts. */
+  const openDecisions = () => {
+    const st = { open: 0, most: 0, aborted: 0, gates: [] as Array<() => void> };
+    const handler = http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+      heldCalls.push({ id: params.itemId as string, body: await request.json() });
+      st.open++;
+      st.most = Math.max(st.most, st.open);
+      request.signal.addEventListener(
+        "abort",
+        () => {
+          st.open--;
+          st.aborted++;
+        },
+        { once: true },
+      );
+      await new Promise<void>((r) => st.gates.push(r));
+      return HttpResponse.json({ decided: true });
+    });
+    return { st, handler };
+  };
+  const giveUp = async (title: string) => {
+    refake(["setTimeout", "clearTimeout", "Date"]);
+    try {
+      fireEvent.click(use(title));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+    } finally {
+      vi.useRealTimers();
+      vi.useFakeTimers({ toFake: ["Date"] });
+    }
+    await waitFor(() => expect(within(card(title)).getByText(HELD_NO_ANSWER_TEXT)).toBeTruthy());
+  };
+
+  it("R478: a card holds at most one given-up decision: a new press on it cancels the earlier request first, whose late answer then changes nothing", async () => {
+    const o = project();
+    let listReads = 0;
+    const list = o.projectReview![P1]!;
+    const { st, handler } = openDecisions();
+    o.extra = [
+      http.get(`${SERVICE}/projects/:id/review`, () => {
+        listReads++;
+        return HttpResponse.json({ items: list, total: list.length, offset: 0, limit: 500 });
+      }),
+      handler,
+    ];
+    open(o);
+    await ready(RECORD);
+    await giveUp(RECORD);
+    // FR-529: the given-up request stays open.
+    expect(st.open).toBe(1);
+    await waitFor(() => expect(listReads).toBeGreaterThan(1));
+    const readsAfterGiveUp = listReads;
+    passGuard();
+    fireEvent.click(use(RECORD));
+    await waitFor(() => expect(heldCalls).toHaveLength(2));
+    // The first request was cancelled before the second was sent: never two open for the card.
+    await waitFor(() => expect(st.aborted).toBe(1));
+    expect(st.open).toBe(1);
+    expect(st.most).toBe(1);
+    // The first's late answer (the service lets it go) changes nothing: no read, no alert, the card still waits.
+    st.gates[0]!();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(listReads).toBe(readsAfterGiveUp);
+    expect(screen.queryAllByRole("alert")).toEqual([]);
+    // The card still waits for its second decision (its control busy).
+    expect(card(RECORD).querySelector('button[aria-busy="true"]')).not.toBeNull();
+  });
+
+  it("R478: leaving the review queue cancels every given-up decision's request", async () => {
+    const o = project();
+    const { st, handler } = openDecisions();
+    o.extra = [handler];
+    const { unmount } = render(<ReviewQueue client={mockService(o).client} projectId={P1} />);
+    await ready(RECORD);
+    await giveUp(RECORD);
+    expect(st.open).toBe(1);
+    unmount();
+    expect(st.aborted).toBe(1);
+    expect(st.open).toBe(0);
   });
 
   it("R313 f: a why of __proto__, toString or constructor shows no advice and breaks nothing", async () => {
