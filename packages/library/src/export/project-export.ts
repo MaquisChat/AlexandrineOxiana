@@ -147,7 +147,10 @@ const DESTROYED_NOTE: Record<DestroyedBasis, (n: number) => string> = {
  * From the project's verified audit log: what each destroyed file rests on. A destruction the log
  * records is the change's `delete` event (op `retention.destroy`) naming the file's id, or, for a
  * file destroyed in the project a copy was restored from before its backup was made (the log keeps
- * that project's ids), the same moment (`destroyedAt` is that change's time). A file a restore
+ * that project's ids), the same moment (`destroyedAt` is that change's time) — also for an entry of
+ * the earlier form, which lists no files (R484 j). The match is by moment: a file left out at a restore
+ * because another project destroyed the same bytes at the same moment, or a file with the same bytes
+ * as one the project destroyed, is counted as the project's own (listed, FR-724). A file a restore
  * named as left out on unverified records keeps that mark. Any other destroyed file of a restored
  * copy was left out by a restore: on a verified record, unless a restore made before the files were
  * named (a count of unverified ones, no list; R473 M1) is in the log — those cannot be told apart,
@@ -161,8 +164,9 @@ function destroyedBasis(events: AuditEvent[]): (a: Asset) => DestroyedBasis {
   let countOnly = false;
   for (const e of events) {
     const d = (e.details ?? {}) as { op?: unknown; destroyedAssets?: unknown; destroyedUnverifiedAssetIds?: unknown; leftOutUnverified?: unknown };
-    if (e.action === "delete" && d.op === "retention.destroy" && Array.isArray(d.destroyedAssets)) {
-      for (const id of d.destroyedAssets) if (typeof id === "string") recordedIds.add(id);
+    if (e.action === "delete" && d.op === "retention.destroy") {
+      if (Array.isArray(d.destroyedAssets)) for (const id of d.destroyedAssets) if (typeof id === "string") recordedIds.add(id);
+      // Its moment counts whatever the entry's form: one of the earlier form names no files (R484 j).
       recordedAt.add(e.at);
     }
     if (e.action !== "project.restored") continue;

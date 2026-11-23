@@ -1483,6 +1483,25 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([LOG_NOT_INTACT]);
   });
 
+  it("S-M1 (R484 j), probe P1: a file destroyed before the backup, by an entry of the earlier form (no list of files): its copy's export says the project's retention rule destroyed it", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    // The entry as an earlier version of the app wrote it: no list of the files destroyed.
+    await rewriteAudit(p, (e) => {
+      if (e.action === "delete" && detailsOf(e).op === "retention.destroy") delete (e.details as Details).destroyedAssets;
+    });
+    await reanchor(p);
+    await kit.reopen();
+    expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
+    later(HOUR);
+    const r = await restore((await backupProject(kit.repo, p.id)).path);
+    expect(r.leftOut).toEqual([]);
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([OWN_RULE]);
+  });
+
   it("M1: a copy restored before the files were named (a count only): its export and a restore of its backup state none of that restore's destructions as fact", async () => {
     const { offline } = await mixed();
     const r = await restore(offline);
