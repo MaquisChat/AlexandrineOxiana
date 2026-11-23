@@ -222,7 +222,8 @@ describe("the browser's fallback against the real service (R348 f): the list and
     expect(entry.state).toBe("needs-check");
     // Every request carried the paired Origin (both routes need it); the token never in an address.
     expect(sent.filter((s) => s.path.startsWith("/find/")).every((s) => s.method === "POST" && s.origin === EXT)).toBe(true);
-  });
+    // A real service, a library opened, a record written, three files sent and one checked: 3.3 s on one busy core.
+  }, 15_000);
 });
 
 describe("a paired browser across a relaunch of the real service (R171, defect D13)", () => {
