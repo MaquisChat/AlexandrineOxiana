@@ -5093,3 +5093,19 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
     });
   });
 });
+
+describe("FindAcquire: rough edges (R460)", () => {
+  it("FR-576: when the service cannot be reached, its sentence is said once, not once for the projects and once for the settings", async () => {
+    useService();
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.error()),
+      http.get(url("/find/screen"), () => HttpResponse.error()),
+    );
+    show();
+    await waitFor(() => expect(calls.filter((c) => c.method === "GET" && (c.path === "/projects" || c.path === "/find/screen"))).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByRole("alert").some((a) => a.textContent === "The library service could not be reached.")).toBe(true));
+    // Both reads have settled: the settings' failure puts the switch back to what is confirmed, and the projects' gives an empty list.
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Project" })).toBeTruthy());
+    expect(screen.getAllByText("The library service could not be reached.")).toHaveLength(1);
+  });
+});

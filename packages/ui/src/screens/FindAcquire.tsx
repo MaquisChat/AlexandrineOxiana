@@ -865,7 +865,8 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
           <UserText>{settingsError}</UserText>
         </p>
       )}
-      {projectsError && (
+      {/* The same sentence (the service cannot be reached) is said once, not for the settings and again for the projects. */}
+      {projectsError && projectsError !== screenError && (
         <p role="alert" className="ao-error">
           <UserText>{projectsError}</UserText>
         </p>
