@@ -217,7 +217,7 @@ async function withinConfirmWait<T>(p: Promise<T>): Promise<T | undefined> {
   waitingReaders.set(p, (waitingReaders.get(p) ?? 0) + 1);
   let timer: NodeJS.Timeout | undefined;
   try {
-    return await Promise.race([p, new Promise<undefined>((r) => (timer = setTimeout(r, CONFIRM_WAIT_MS)))]);
+    return await Promise.race([p, new Promise<undefined>((r) => (timer = setTimeout(() => r(undefined), CONFIRM_WAIT_MS)))]);
   } finally {
     clearTimeout(timer);
     waitingReaders.set(p, (waitingReaders.get(p) ?? 1) - 1);
