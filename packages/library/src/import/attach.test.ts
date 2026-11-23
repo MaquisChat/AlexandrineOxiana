@@ -878,6 +878,32 @@ describe("review round 2 (R57)", () => {
     expect(r.confidence).toBeLessThanOrEqual(0.6);
   });
 
+  it("FR-124 (R473 I3): a sidecar bringing the item's own title takes the cited work's details out of the draft; they stay a candidate", async () => {
+    const p = await project();
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    openalex().intercept({ path: searchPath, method: "GET" }).reply(200, JSON.stringify({ results: [] }), JSON_HEADERS).persist();
+    const lookup = await lookupContextFor(repo, p.id, http);
+    const pdf = await put("scan0008.pdf", await scan0008());
+    const ris = await put("scan0008.ris", "TY  - RPRT\nTI  - Minutes of the reading group\nAU  - Doe, Jane\nPY  - 2024\nER  - \n");
+    const r = await resolveItem({ path: pdf, mime: "application/pdf", sidecarPaths: [ris] }, { projectId: p.id, patterns: [], lookup });
+    expect(r.draft.title.variants[0]!.value).toBe("Minutes of the reading group");
+    expect(r.draft.creators).toEqual([expect.objectContaining({ family: "Doe", given: "Jane" })]);
+    expect(r.draft.issued).toBe("2024");
+    // Nothing that only the cited work's lookup gave is left in the item's own record.
+    expect(r.draft.container).toBeUndefined();
+    expect(r.draft.publisher).toBeUndefined();
+    expect(r.draft).not.toHaveProperty("volume");
+    expect(r.draft).not.toHaveProperty("issue");
+    expect(r.draft).not.toHaveProperty("pages");
+    expect(r.draft).not.toHaveProperty("edition");
+    expect(r.fieldEvidence.filter((e) => e.source.kind === "lookup").map((e) => e.field)).toEqual(["/title"]);
+    expect(r.candidates[0]).toMatchObject({ provider: "crossref", title: "Rivers and Memory in Upland Villages" });
+    expect(r.identifierHints).toEqual([`doi:${FIXTURE_DOI}`]);
+    expect(r.verification.overall).toBe("needs-review");
+    // No value of the lookup is in the draft, so its sentence is not said.
+    expect(r.verification.reasons).not.toContain(LOOKED_UP_FROM_TEXT);
+  });
+
   it("C1: scan0008 in a project already holding doi-article.pdf is never its duplicate", async () => {
     const p = await project();
     crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);

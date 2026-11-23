@@ -326,6 +326,23 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   let cap = 1;
   /** The title offered from a lookup of an identifier found only in the text (R57; FR-123), if any. */
   let textLookupTitle: string | undefined;
+  /** The evidence source of that lookup's values (FR-124). */
+  let textLookupSource: EvidenceSource | undefined;
+  /**
+   * FR-124 (R473 I3): once a later step brings the item's own title, every field whose value only
+   * that lookup gave (journal, volume, publisher...) is taken out of the draft: two works are never
+   * mixed in one record. The lookup stays a candidate; its title stays evidence (R49e).
+   */
+  const dropTextLookup = () => {
+    if (!textLookupSource || values.title === textLookupTitle) return;
+    for (const k of KEYS) {
+      if (k === "title") continue;
+      const ev = evidence.get(k);
+      if (!ev?.length || !ev.every((e) => e.source === textLookupSource)) continue;
+      delete (values as Record<string, unknown>)[k];
+      evidence.delete(k);
+    }
+  };
   const done = () => confidence >= AUTO_ACCEPT_THRESHOLD;
 
   const record = (k: keyof Fields, value: unknown, source: EvidenceSource) => {
@@ -500,8 +517,12 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       const mixed = !ungrounded.id.trusted && ids.some((i) => i.trusted);
       if (!mixed) {
         const { doi: _d, isbn: _i, issn: _s, ...rest } = fromLookup(ungrounded.r);
-        offer(ungrounded.id.trusted ? idFields(ungrounded, rest) : rest, { kind: "lookup", provider: ungrounded.r.provider }, true);
-        if (!ungrounded.id.trusted) textLookupTitle = values.title;
+        const source: EvidenceSource = { kind: "lookup", provider: ungrounded.r.provider };
+        offer(ungrounded.id.trusted ? idFields(ungrounded, rest) : rest, source, true);
+        if (!ungrounded.id.trusted) {
+          textLookupTitle = values.title;
+          textLookupSource = source;
+        }
       }
       confidence = CONFLICT_CONFIDENCE;
       method = { method: "identifier+lookup" };
@@ -555,6 +576,8 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       }
     }
   }
+
+  dropTextLookup();
 
   // 6. Title search with the best title known so far; not with a title looked up from a text
   //    identifier, which would only find the cited work again (FR-123).
