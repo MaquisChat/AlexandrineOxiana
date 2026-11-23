@@ -166,11 +166,12 @@ export const HELD_DECISION_TIMEOUT_MS = 60_000;
 export const HELD_NO_ANSWER_TEXT = "The service did not answer. Look at the queue again before deciding.";
 /**
  * R470 b (FR-490): looking at a held file before deciding — the card's control, the line the look-only reader shows, and
- * what it says when the file is no longer held.
+ * what it says when the held file cannot be shown (R487 c: one sentence true of a file no longer waiting and of one gone
+ * from disk while its entry still waits — the route's one "not found" answers both).
  */
 export const LOOK_TEXT = "Look at the file";
 export const LOOK_ONLY_NOTICE = "This file has not been added to your library. Use this file, or Not this file, in the review queue.";
-export const LOOK_GONE = "This file is no longer waiting for your decision, so it cannot be shown.";
+export const LOOK_GONE = "This file can no longer be shown. It is no longer waiting for your decision, or it can no longer be found on this computer.";
 
 /** What a look at held file `reviewId` reads with: the reader's calls (none made in a look) and the file's own ranges. */
 type LookFor = (reviewId: string) => { api: ReaderApi; range: LookOnly["range"] };

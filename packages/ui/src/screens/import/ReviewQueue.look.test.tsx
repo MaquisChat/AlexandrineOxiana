@@ -209,7 +209,8 @@ describe("R470 b: looking at a held file before deciding", () => {
       expect(within(dialog).queryByRole("link")).toBeNull();
       cleanup();
     }
-    expect(LOOK_GONE).toBe("This file is no longer waiting for your decision, so it cannot be shown.");
+    // R487 c: one sentence true of both a file no longer waiting and a file gone from disk whose entry still waits.
+    expect(LOOK_GONE).toBe("This file can no longer be shown. It is no longer waiting for your decision, or it can no longer be found on this computer.");
   });
 
   it("a found EPUB says no preview can be shown, and offers no look", async () => {
