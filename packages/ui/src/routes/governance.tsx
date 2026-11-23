@@ -7,6 +7,7 @@ import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import type { ApiClient } from "../api/client";
 import { governanceApi, type GovernanceApi, type ProjectSummary } from "../api/governance";
 import { errorText } from "../api/library";
+import { isolated } from "../components/UserText";
 import { inAppLink, libraryHref, navigate, normalisePath, PATHS, type AppLocation } from "../navigation";
 import { AuditLog } from "../screens/AuditLog";
 import { Fieldwork } from "../screens/Fieldwork";
@@ -105,7 +106,7 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
           {!projectId && <option value="">Choose a project</option>}
           {list.map((p) => (
             <option key={p.id} value={p.id}>
-              {isLocked(p) ? `${p.name} (locked)` : p.name}
+              {isLocked(p) ? `${isolated(p.name)} (locked)` : isolated(p.name)}
             </option>
           ))}
         </select>

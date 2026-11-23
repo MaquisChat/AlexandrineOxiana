@@ -60,10 +60,23 @@ describe("governance routes (R113, R118)", () => {
     window.history.replaceState(null, "", `${path}?project=p1`);
     render(<Host />);
     const picker = await screen.findByRole("combobox", { name: "Project" });
-    await waitFor(() => expect([...picker.querySelectorAll("option")].map((o) => o.textContent)).toEqual(["Clinic (locked)", "Coastal kinship"]));
+    await waitFor(() => expect([...picker.querySelectorAll("option")].map((o) => o.textContent)).toEqual(["\u2068Clinic\u2069 (locked)", "\u2068Coastal kinship\u2069"]));
     const link = await screen.findByRole("link", { name: "Unlock it in the library" });
     expect(link.getAttribute("href")).toBe("/?project=p1");
     expect(link.closest("p")?.textContent).toBe("This project is locked. Unlock it in the library to see and change everything in it here.");
+  });
+
+  it("FR-158 (R463 M7): a right-to-left project name in the picker is isolated with the Unicode isolate marks, “(locked)” outside them", async () => {
+    const name = "مقابلات هرات 2";
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name, encrypted: true, unlocked: false }] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
+      http.get(url("/projects/p1/*"), () => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "This project is locked." } }, { status: 423 })),
+    );
+    window.history.replaceState(null, "", "/audit?project=p1");
+    render(<Host />);
+    const picker = await screen.findByRole("combobox", { name: "Project" });
+    await waitFor(() => expect([...picker.querySelectorAll("option")].map((o) => o.textContent)).toEqual([`\u2068${name}\u2069 (locked)`]));
   });
 
   it("FR-163: an unlocked project is not marked and nothing offers to unlock it", async () => {
@@ -74,7 +87,7 @@ describe("governance routes (R113, R118)", () => {
     window.history.replaceState(null, "", "/audit?project=p2");
     render(<Host />);
     expect(await screen.findByRole("heading", { name: "Audit log", level: 1 })).toBeTruthy();
-    expect([...screen.getByRole("combobox", { name: "Project" }).querySelectorAll("option")].map((o) => o.textContent)).toEqual(["Coastal kinship"]);
+    expect([...screen.getByRole("combobox", { name: "Project" }).querySelectorAll("option")].map((o) => o.textContent)).toEqual(["\u2068Coastal kinship\u2069"]);
     expect(screen.queryByRole("link", { name: "Unlock it in the library" })).toBeNull();
   });
 
