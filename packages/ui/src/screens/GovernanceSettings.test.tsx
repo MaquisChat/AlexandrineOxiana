@@ -106,6 +106,20 @@ describe("Governance settings", () => {
     expect(within(card("Audit log")).getByText(/Required by .*HIPAA/)).toBeTruthy();
   });
 
+  it("FR-156: a profile toggled at once after a raw edit works from the text as typed, not from the rules parsed before it", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: "View governance.yaml" }));
+    const raw = screen.getByRole("textbox", { name: "governance.yaml" }) as HTMLTextAreaElement;
+    // Typed in the editor, then HIPAA ticked before the editor's text is parsed again (300 ms).
+    fireEvent.change(raw, { target: { value: `profiles: [gdpr]\n${YAML}` } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "HIPAA" }));
+    const now = parse(raw.value);
+    expect(now.profiles).toEqual(["gdpr", "hipaa"]);
+    expect(now.encryption.atRest).toBe("required");
+  });
+
   it("setting encryption Optional under HIPAA asks for a reason, and the PUT carries the exception, the reason and the base version", async () => {
     const cap = serve();
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);
