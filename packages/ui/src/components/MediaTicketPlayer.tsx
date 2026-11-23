@@ -102,11 +102,12 @@ const RETRY = "Try the recording again";
 /**
  * How long the service lets this ticket go unused before it ends (R135 2), from its answer:
  * `expiresAt` is its issue time plus MEDIA_TICKET_LIFETIME_MS, `idleExpiresAt` its first idle end.
- * The shared constant when the answer does not say.
+ * The shared constant when the answer does not say, or says less than it (R481 c): a shorter one would
+ * make young failures look like expiries and renewal would never end; a longer one is more cautious.
  */
 function idleLifetime(t: Partial<MediaTicketResponse>): number {
   const ms = Date.parse(t.idleExpiresAt ?? "") - (Date.parse(t.expiresAt ?? "") - MEDIA_TICKET_LIFETIME_MS);
-  return Number.isFinite(ms) && ms > 0 ? ms : MEDIA_TICKET_IDLE_MS;
+  return Number.isFinite(ms) && ms >= MEDIA_TICKET_IDLE_MS ? ms : MEDIA_TICKET_IDLE_MS;
 }
 /**
  * The service found the file not as the app stored it (FR-218, FR-219): it cannot tell who or what

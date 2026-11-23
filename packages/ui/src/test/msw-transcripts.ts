@@ -111,7 +111,10 @@ export interface TranscriptServiceLog {
  * Handlers for one source `s1` in project `p1` (other ids answer with the same shapes, their own
  * title). `versions` and `transcripts` may be changed by a test between requests.
  */
-export function transcriptService(opts: { versions?: TranscriptVersionSummary[]; transcripts?: Record<string, TranscriptResponse>; media?: "video" | "audio" | "none"; job?: TranscriptionJob | null } = {}) {
+export function transcriptService(opts: { versions?: TranscriptVersionSummary[]; transcripts?: Record<string, TranscriptResponse>; media?: "video" | "audio" | "none"; job?: TranscriptionJob | null;
+  /** The idle end a ticket answer gives (the issue time is its `expiresAt` less 8 hours); the service's own ten minutes when not given. */
+  ticketIdleExpiresAt?: string;
+} = {}) {
   const log: TranscriptServiceLog = { tickets: [], revoked: [], saved: [], transcribed: [], reads: [], cancelled: [], jobReads: 0 };
   const state = {
     versions: [...(opts.versions ?? MACHINE_VERSIONS)],
@@ -155,7 +158,7 @@ export function transcriptService(opts: { versions?: TranscriptVersionSummary[];
     http.post(url("/projects/:id/sources/:sid/assets/:aid/media-ticket"), ({ params }) => {
       const path = ticketPath(++n);
       log.tickets.push({ sid: String(params.sid), aid: String(params.aid), path });
-      return HttpResponse.json({ path, mime: "video/mp4", size: 1000, idleExpiresAt: "2026-11-11T10:10:00.000Z", expiresAt: "2026-11-11T18:00:00.000Z" });
+      return HttpResponse.json({ path, mime: "video/mp4", size: 1000, idleExpiresAt: opts.ticketIdleExpiresAt ?? "2026-11-11T10:10:00.000Z", expiresAt: "2026-11-11T18:00:00.000Z" });
     }),
     http.post(url("/media-tickets/revoke"), async ({ request }) => {
       const body = (await request.json()) as { path: string };

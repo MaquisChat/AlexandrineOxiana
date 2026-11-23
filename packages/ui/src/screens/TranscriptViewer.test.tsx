@@ -76,6 +76,21 @@ function browserReset(el: HTMLMediaElement) {
   fireEvent(el, new Event("timeupdate"));
 }
 
+/**
+ * Makes the element's read fail and waits for where the player then rests: the next ticket asked
+ * for and put in the element ("renewed"), or the alert that it stopped ("stopped").
+ */
+async function failAndRest(el: HTMLMediaElement, tickets: Array<{ path: string }>): Promise<"renewed" | "stopped"> {
+  const before = tickets.length;
+  fireEvent(el, new Event("error"));
+  return waitFor(() => {
+    if (screen.queryByText(/The recording could not be played/)) return "stopped" as const;
+    expect(tickets.length).toBe(before + 1);
+    expect(el.getAttribute("src")).toBe(`${BASE}${tickets.at(-1)!.path}`);
+    return "renewed" as const;
+  });
+}
+
 /** Moves the player to `t` seconds as a browser would report it. */
 function playTo(el: HTMLMediaElement, t: number) {
   el.currentTime = t;
@@ -594,6 +609,33 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(await screen.findByText(/The recording could not be played/)).toBeTruthy();
     // Four tickets for the three pauses, one renewal of a young ticket, then it stops.
     expect(svc.log.tickets).toHaveLength(5);
+  });
+
+  it("a ticket answer whose idle end is far shorter than the shared ten minutes cannot make every failure an expiry: the player still stops after its strikes (FR-260, R481 c)", async () => {
+    const realNow = Date.now.bind(Date);
+    let skipped = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + skipped);
+    // The reviewer's probe B: every ticket's idle end is 1 s after its issue.
+    const { svc } = await open({ ticketIdleExpiresAt: "2026-11-11T10:00:01.000Z" });
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 50);
+    let cycles = 0;
+    while (cycles < 12) {
+      cycles++;
+      // Failures 2 s apart, at one place: older than the answer's 1 s, younger than MEDIA_TICKET_IDLE_MS.
+      skipped += 2_000;
+      const outcome = await failAndRest(el, svc.log.tickets);
+      if (outcome === "stopped") break;
+      browserReset(el);
+      fireEvent(el, new Event("loadedmetadata"));
+      fireEvent(el, new Event("seeked"));
+    }
+    expect(screen.getByRole("alert").textContent).toMatch(/^The recording could not be played: it stopped at the same place again\. Its file may be damaged/);
+    // The lifetime is taken as MEDIA_TICKET_IDLE_MS: two young failures renew (MAX_RENEWALS_WITHOUT_PROGRESS), the third stops.
+    expect(cycles).toBe(3);
+    expect(svc.log.tickets).toHaveLength(3);
   });
 
   it("a recording whose file the service found changed outside the app says so at once, never 'may be damaged' after retries (FR-218, FR-219)", async () => {
