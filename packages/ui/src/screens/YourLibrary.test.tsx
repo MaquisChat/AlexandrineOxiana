@@ -1139,6 +1139,119 @@ describe("Your library: Sign out of my library", () => {
   });
 });
 
+describe("Your library: a press on a control whose own request is out (FR-557)", () => {
+  it("Work out the address, the switch, Save, Test and Sign out each say to wait, and send nothing more", async () => {
+    const svc = useSvc(SET);
+    await show(svc);
+    const user = userEvent.setup();
+    const h = heard();
+    // Work out the address while it is being worked out.
+    const derive = held();
+    svc.onDerive = async () => {
+      await derive.p;
+      return undefined;
+    };
+    await user.click(linkField());
+    await user.paste(LINK);
+    await user.click(btn("Work out the address"));
+    await waitFor(() => expect(svc.count("POST", "/settings/your-library/derive")).toBe(1));
+    await user.click(btn("Work out the address"));
+    expect(liveText()).toBe(T.waitDerive);
+    expect(svc.count("POST", "/settings/your-library/derive")).toBe(1);
+    await act(async () => derive.release());
+    await waitFor(() => expect(liveText()).toBe(EZ_SENTENCE));
+    await user.click(btn("Discard changes"));
+    // The switch while its own change is out.
+    const shellStay = held<boolean>();
+    fake.shell!.setStaySignedIn.mockReturnValueOnce(shellStay.p);
+    await user.click(stay());
+    expect(fake.shell!.setStaySignedIn).toHaveBeenCalledTimes(1);
+    await user.click(stay());
+    expect(liveText()).toBe(T.waitStay);
+    expect(fake.shell!.setStaySignedIn).toHaveBeenCalledTimes(1);
+    await act(async () => shellStay.release(true));
+    await waitFor(() => expect(liveText()).toBe(T.saved));
+    // Save while a save is out.
+    const put = held();
+    svc.onPut = async () => {
+      await put.p;
+      return undefined;
+    };
+    await user.clear(nameField());
+    await user.type(nameField(), "Zorblatt College");
+    const puts = svc.count("PUT", "/settings/your-library");
+    await user.click(btn("Save"));
+    await waitFor(() => expect(svc.count("PUT", "/settings/your-library")).toBe(puts + 1));
+    await user.click(btn("Save"));
+    expect(liveText()).toBe(T.waitSave);
+    expect(svc.count("PUT", "/settings/your-library")).toBe(puts + 1);
+    await act(async () => put.release());
+    await waitFor(() => expect(liveText()).toBe(T.saved));
+    // Test while a test is out.
+    const test = held();
+    fake.shell!.openLibraryWindow.mockResolvedValueOnce(true);
+    svc.onTest = async () => {
+      await test.p;
+      return undefined;
+    };
+    await user.click(btn("Test"));
+    await waitFor(() => expect(svc.count("POST", "/settings/your-library/test")).toBe(1));
+    await user.click(btn("Test"));
+    expect(liveText()).toBe(T.waitTest);
+    expect(svc.count("POST", "/settings/your-library/test")).toBe(1);
+    await act(async () => test.release());
+    await waitFor(() => expect(liveText()).toBe(T.windowOpen));
+    // Sign out while signing out.
+    const out = held<boolean>();
+    fake.shell!.signOutOfLibrary.mockReturnValueOnce(out.p);
+    await user.click(btn("Sign out of my library"));
+    await user.click(btn("Signing out…"));
+    expect(liveText()).toBe(T.waitSignOut);
+    expect(fake.shell!.signOutOfLibrary).toHaveBeenCalledTimes(1);
+    await act(async () => out.release(true));
+    await waitFor(() => expect(liveText()).toBe(T.signedOut));
+    h.stop();
+    for (const t of [T.waitDerive, T.waitStay, T.waitSave, T.waitTest, T.waitSignOut]) expect(h.said).toContain(t);
+    expect([T.waitTest, T.waitSignOut]).toEqual(["Wait until the test has started.", "Wait until signing out is finished."]);
+  });
+
+  it("when the test then fails, or signing out then fails, the failure's own sentence is what shows, said once", async () => {
+    const svc = useSvc(SET);
+    await show(svc);
+    const user = userEvent.setup();
+    // Test: the second press says to wait; the test then cannot be started.
+    const test = held();
+    svc.onTest = async () => {
+      await test.p;
+      return HttpResponse.json({ error: { code: "CONFLICT", message: YOUR_LIBRARY_TEXT.unreadable } }, { status: 409 });
+    };
+    await user.click(btn("Test"));
+    await waitFor(() => expect(svc.count("POST", "/settings/your-library/test")).toBe(1));
+    await user.click(btn("Test"));
+    expect(liveText()).toBe(T.waitTest);
+    let h = heard();
+    await act(async () => test.release());
+    await waitFor(() => expect(screen.getByTestId("yl-test-result").textContent).toBe(YOUR_LIBRARY_TEXT.unreadable));
+    expect(liveText()).toBe(YOUR_LIBRARY_TEXT.unreadable);
+    h.stop();
+    expect(h.said).toEqual([YOUR_LIBRARY_TEXT.unreadable]);
+    expect(screen.queryByText(T.waitTest)).toBeNull();
+    // Sign out: the second press says to wait; signing out then fails.
+    const out = held<boolean>();
+    fake.shell!.signOutOfLibrary.mockReturnValueOnce(out.p);
+    await user.click(btn("Sign out of my library"));
+    await user.click(btn("Signing out…"));
+    expect(liveText()).toBe(T.waitSignOut);
+    h = heard();
+    await act(async () => out.release(false));
+    await waitFor(() => expect(screen.getByTestId("yl-signout-result").textContent).toBe(T.signOutFailed));
+    expect(liveText()).toBe(T.signOutFailed);
+    h.stop();
+    expect(h.said).toEqual([T.signOutFailed]);
+    expect(screen.queryByText(T.waitSignOut)).toBeNull();
+  });
+});
+
 describe("Your library: sentences (R334 d) and keyboard", () => {
   it("no sentence of the screen says the app adds a file by itself; the new sentences are word for word", () => {
     // The sentences that name adding say that nothing is (or was) added; no other sentence speaks of adding at all.

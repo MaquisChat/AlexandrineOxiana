@@ -33,7 +33,7 @@ import { PATHS } from "../navigation";
 import type { LibraryWindowEvent } from "../desktopShell";
 import { fakeShell, type FakeShell } from "../test/desktopShell";
 import { SOURCE_FILE, server, testClient, url, useMockService } from "../test/service";
-import { ACT_SAID_MS, FindAcquire, LIBRARY_CLOSE_WAIT_MS, LIBRARY_SHELL_TIMEOUT_MS, SWITCH_TIMEOUT_MS } from "./FindAcquire";
+import { ACT_SAID_MS, FindAcquire, LIBRARY_CLOSE_WAIT_MS, LIBRARY_SHELL_TIMEOUT_MS, QUEUE_READ_WAIT_MS, SWITCH_TIMEOUT_MS } from "./FindAcquire";
 
 useMockService();
 
@@ -1013,13 +1013,24 @@ describe("FindAcquire: round 3 (R258)", () => {
   it("M8: the project list is read again when the service says a project changed (an unlock)", async () => {
     useService();
     show();
-    await waitFor(() => expect(optionTexts()).toContain("Clinic interviews (locked)"));
+    await waitFor(() => expect(optionTexts()).toContain("\u2068Clinic interviews\u2069 (locked)"));
     await waitFor(() => expect(events.open()).toBe(true));
     events.push(libState("lib-1"));
     server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => ({ ...p, unlocked: true })) })));
     events.push(libState("lib-1"));
     await waitFor(() => expect(optionTexts()).toContain("Clinic interviews"));
-    expect(optionTexts()).not.toContain("Clinic interviews (locked)");
+    expect(optionTexts()).not.toContain("\u2068Clinic interviews\u2069 (locked)");
+  });
+
+  it("a locked project's name is isolated in the picker, so a right-to-left name does not flip \" (locked)\"", async () => {
+    useService();
+    const rtl = "مقابلات العيادة";
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => (p.id === PID_LOCKED ? { ...p, name: rtl } : p)) })));
+    show();
+    const project = (await screen.findByRole("combobox", { name: "Project" })) as HTMLSelectElement;
+    await waitFor(() => expect(within(project).getAllByRole("option").some((o) => o.getAttribute("value") === PID_LOCKED)).toBe(true));
+    const locked = within(project).getAllByRole("option").find((o) => o.getAttribute("value") === PID_LOCKED)!;
+    expect(locked.textContent).toBe(`\u2068${rtl}\u2069 (locked)`);
   });
 
   for (const outcome of ["success", "refusal"] as const) {
@@ -1379,7 +1390,7 @@ describe("FindAcquire: round 4 (R262)", () => {
     server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => (p.id === PID ? { ...p, encrypted: true, unlocked: false } : p)) })));
     queues[PID] = () => refusal(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
     events.push(libState("lib-1"));
-    await waitFor(() => expect(within(project).getAllByRole("option").map((o) => o.textContent)).toContain("Market study (locked)"));
+    await waitFor(() => expect(within(project).getAllByRole("option").map((o) => o.textContent)).toContain("\u2068Market study\u2069 (locked)"));
     expect(await screen.findByRole("heading", { name: /Market study is locked/ })).toBeTruthy();
     expect(project.value).toBe(PID);
   });
@@ -3756,6 +3767,38 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       expect(note("late shell")).toBe(NOT_OPENED);
     });
 
+    it("FR-561: an open given up on that the shell carries out only after a newer start opened its window does not close the newer window", async () => {
+      serveOne("late then newer");
+      let answer!: (v: boolean) => void;
+      fake.shell!.openLibraryWindow.mockReturnValueOnce(new Promise<boolean>((r) => (answer = r)));
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        fireEvent.click(btn("late then newer", "Get through my library"));
+        await vi.advanceTimersByTimeAsync(50);
+        await vi.waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(LIBRARY_SHELL_TIMEOUT_MS + 500);
+      } finally {
+        vi.useRealTimers();
+      }
+      await waitFor(() => expect(posts("/library/cancel")).toHaveLength(1));
+      await waitFor(() => expect(note("late then newer")).toBe(NOT_OPENED));
+      // A newer start: its window opens for its own ticket, and the row waits.
+      await waitFor(() => expect(btn("late then newer", "Get through my library").getAttribute("aria-busy")).toBeNull());
+      fireEvent.click(btn("late then newer", "Get through my library"));
+      await waitFor(() => expect(stateOf("late then newer")).toBe("Waiting for you in the sign-in window"));
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(2);
+      expect(fake.shell!.openLibraryWindow.mock.calls[1]![0]).toBe(SECOND);
+      // The first open is answered only now: the newer window is not closed, and its wait goes on.
+      act(() => answer(true));
+      await quiet();
+      expect(fake.shell!.closeLibraryWindow).not.toHaveBeenCalled();
+      expect(posts("/library/cancel")).toHaveLength(1);
+      expect(stateOf("late then newer")).toBe("Waiting for you in the sign-in window");
+    });
+
     it("R342 a: no close when the row leaves the wait by the hand-over", async () => {
       const { e } = await started("handed on");
       await say({ ticket: TICKET, state: "handed-over" });
@@ -4131,6 +4174,81 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       g.release();
       await waitFor(() => expect(stateOf("one read")).toBe("Waiting for you in the sign-in window"));
       expect(posts("/library/start")).toHaveLength(1);
+    });
+
+    it("FR-558: a read of the queue that never answers keeps no control busy and stops no later read: each is waited for at most QUEUE_READ_WAIT_MS", async () => {
+      serveOne("hung read");
+      let hang = false;
+      server.use(http.get(url(`/projects/${PID}/find`), () => (hang ? new Promise<Response>(() => {}) : HttpResponse.json(queue(current)))));
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await waitFor(() => expect(events.open()).toBe(true));
+      const control = () => row("hung read").querySelector<HTMLElement>('button[data-act="library"]');
+      hang = true;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        // A read asked for by an event never answers…
+        progress(current[0]!, "no-open-copy");
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(reads()).toBe(2);
+        // …and the start's own read after the window opened never answers either.
+        fireEvent.click(control()!);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+        expect(reads()).toBe(3);
+        await vi.advanceTimersByTimeAsync(QUEUE_READ_WAIT_MS - 1_500);
+        expect(control()!.getAttribute("aria-busy")).toBe("true");
+        await vi.advanceTimersByTimeAsync(1_500);
+      } finally {
+        vi.useRealTimers();
+      }
+      // The start's control is no longer busy.
+      await waitFor(() => expect(control()?.getAttribute("aria-busy") ?? null).toBeNull());
+      // A new ask reads again (the read that never answered holds no later one back).
+      hang = false;
+      progress(current[0]!, "waiting-sign-in");
+      await waitFor(() => expect(stateOf("hung read")).toBe("Waiting for you in the sign-in window"));
+      expect(posts("/library/start")).toHaveLength(1);
+    });
+
+    it("FR-558: a read of the queue given up as never answering is cancelled: across many give-ups no more than one read is open, and the cancel changes nothing on the screen", async () => {
+      serveOne("hung reads");
+      let hang = false;
+      let open = 0;
+      let most = 0;
+      server.use(
+        http.get(url(`/projects/${PID}/find`), ({ request }) => {
+          if (!hang) return HttpResponse.json(queue(current));
+          open++;
+          most = Math.max(most, open);
+          request.signal.addEventListener("abort", () => open--, { once: true });
+          return new Promise<Response>(() => {});
+        }),
+      );
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await waitFor(() => expect(events.open()).toBe(true));
+      const before = reads();
+      hang = true;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        for (let k = 1; k <= 8; k++) {
+          // A read asked for by an event never answers, and is given up after QUEUE_READ_WAIT_MS.
+          progress(current[0]!, "no-open-copy");
+          await vi.advanceTimersByTimeAsync(1_000);
+          expect(reads()).toBe(before + k);
+          expect(open).toBe(1);
+          await vi.advanceTimersByTimeAsync(QUEUE_READ_WAIT_MS);
+          expect(open).toBe(0);
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(most).toBe(1);
+      // The cancelled reads changed nothing: the row as it was, and nothing said in alert.
+      expect(stateOf("hung reads")).toBe("No open copy");
+      expect(screen.queryAllByRole("alert")).toEqual([]);
     });
 
     it("R342 j: two presses in the same moment (before the row shows itself busy) send ONE start", async () => {
@@ -5091,5 +5209,46 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
         });
       }
     });
+  });
+});
+
+describe("FindAcquire: rough edges (R460)", () => {
+  it("FR-576: when the service cannot be reached, its sentence is said once, not once for the projects and once for the settings", async () => {
+    useService();
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.error()),
+      http.get(url("/find/screen"), () => HttpResponse.error()),
+    );
+    show();
+    await waitFor(() => expect(calls.filter((c) => c.method === "GET" && (c.path === "/projects" || c.path === "/find/screen"))).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByRole("alert").some((a) => a.textContent === "The library service could not be reached.")).toBe(true));
+    // Both reads have settled: the settings' failure puts the switch back to what is confirmed, and the projects' gives an empty list.
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Project" })).toBeTruthy());
+    expect(screen.getAllByText("The library service could not be reached.")).toHaveLength(1);
+  });
+
+  it("FR-576: when the settings' read and the queue's read both cannot reach the service, its sentence is said once", async () => {
+    useService();
+    let queueFailed!: () => void;
+    const queueRead = new Promise<void>((r) => (queueFailed = r));
+    server.use(
+      http.get(url("/find/screen"), () => HttpResponse.error()),
+      http.get(url("/projects/:id/find"), () => {
+        queueFailed();
+        return HttpResponse.error();
+      }),
+    );
+    show(`?project=${PID}`);
+    await queueRead;
+    // Both failures have been taken: the queue no longer says it is reading (its failure was taken), and the screen's
+    // own alert — the settings', above the queue's heading — says the sentence.
+    await waitFor(() => expect(screen.queryByText("Reading the queue…")).toBeNull());
+    const heading = screen.getByRole("heading", { name: "Queue" });
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("alert").some((a) => a.textContent === "The library service could not be reached." && !!(a.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING)),
+      ).toBe(true),
+    );
+    expect(screen.getAllByText("The library service could not be reached.")).toHaveLength(1);
   });
 });
