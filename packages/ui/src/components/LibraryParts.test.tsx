@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
@@ -85,6 +88,26 @@ describe("CollectionTree expand, collapse, rename, delete", () => {
     expect(ch1.getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByRole("treeitem", { name: "Interviews" })).toBeTruthy();
     expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  // R468 (M7): WCAG 2.2's 24 by 24 CSS pixel target. jsdom does no layout, so the stylesheet is read:
+  // the twisty keeps its 1em box (the row does not move) and an absolutely placed ::before, centred
+  // on it, gives the clickable area its size (a click on it is a click on the twisty).
+  it("the twisty's clickable area is at least 24 by 24 CSS pixels, and its own box is unchanged (FR-162, R468)", () => {
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "library.css"), "utf8");
+    const rule = (selector: string) => {
+      const at = css.indexOf(`${selector} {`);
+      expect(at).toBeGreaterThanOrEqual(0);
+      return css.slice(at, css.indexOf("}", at));
+    };
+    const own = rule(".ao-tree__twisty");
+    expect(own).toMatch(/width: 1em;/);
+    expect(own).toMatch(/position: relative;/);
+    const area = rule(".ao-tree__twisty::before");
+    expect(area).toMatch(/position: absolute;/);
+    expect(area).toMatch(/content: "";/);
+    expect(area).toMatch(/inline-size: 24px;/);
+    expect(area).toMatch(/block-size: 24px;/);
   });
 
   it("the selected collection can be renamed and deleted (with a confirmation); read-only turns both off", async () => {

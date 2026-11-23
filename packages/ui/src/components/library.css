@@ -443,10 +443,24 @@ button:disabled,
 }
 
 .ao-tree__twisty {
+  position: relative;
   display: inline-block;
   width: 1em;
   margin-inline-end: var(--space-1);
   cursor: pointer;
+}
+
+/* The clickable area is at least 24 by 24 CSS pixels (WCAG 2.2, 2.5.8; FR-162), centred on the
+   glyph; it is placed absolutely, so the twisty's own box and the row's layout do not change.
+   `left` with the translate centres it whatever the text direction. */
+.ao-tree__twisty::before {
+  content: "";
+  position: absolute;
+  inset-block-start: 50%;
+  left: 50%;
+  inline-size: 24px;
+  block-size: 24px;
+  transform: translate(-50%, -50%);
 }
 
 /* ---- interrupted changes (R27) ---- */
