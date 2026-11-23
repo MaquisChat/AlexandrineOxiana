@@ -731,6 +731,52 @@ describe("cloud-drive folders: the engine reads nothing it may not (Task W2)", (
     expect(most).toBe(1);
   });
 
+  it("FR-472: while the watch's first call on the folder is in flight, the folder is said to be being looked through", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let asked!: () => void;
+    const inFlight = new Promise<void>((r) => (asked = r));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const realpathS = async (q: string) => {
+      if (q === inbox || q === real) {
+        asked();
+        await held;
+      }
+      return fsp.realpath(q);
+    };
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 60_000, fs: { realpath: realpathS } });
+    await inFlight;
+    expect(w.status()).toMatchObject({ state: "watching", scanning: true });
+    release();
+    await until(() => !w.status().scanning);
+    expect(w.status()).toMatchObject({ state: "watching", scanning: false });
+  });
+
+  it("FR-472: the same while the folder's first listing is in flight", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let asked!: () => void;
+    const inFlight = new Promise<void>((r) => (asked = r));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let first = true;
+    const readdirS = async (d: string) => {
+      if (first && d === real) {
+        first = false;
+        asked();
+        await held;
+      }
+      return fsp.readdir(d, { withFileTypes: true });
+    };
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 60_000, fs: { readdir: readdirS } });
+    await inFlight;
+    expect(w.status()).toMatchObject({ state: "watching", scanning: true });
+    release();
+    await until(() => !w.status().scanning);
+    expect(w.status()).toMatchObject({ state: "watching", scanning: false });
+  });
+
   it("after a call that never answers, no further call is issued on that folder until it settles", async () => {
     const p = await project();
     const real = await realpath(inbox);
