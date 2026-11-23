@@ -127,6 +127,8 @@ function checkToken(token: string): void {
 }
 
 const unreachable = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: "The library service could not be reached." });
+/** An answer that began and then broke off: the service was reached, so it is not said to be out of reach (FR-350). */
+const cutOff = (): ApiClientError => new ApiClientError(0, { code: "INTERNAL", message: "The library service's answer was cut off before it finished." });
 const unexpected = (status: number): ApiClientError =>
   new ApiClientError(status, { code: "INTERNAL", message: `The library service answered with something unexpected (HTTP ${status}).` });
 
@@ -367,7 +369,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       }
       buf += decoder.decode();
       if (buf.trim()) {
-        throw new ApiClientError(0, { code: "INTERNAL", message: "The library service's answer was cut off before it finished." });
+        throw cutOff();
       }
     } finally {
       if (onAbort) o.signal?.removeEventListener("abort", onAbort);
@@ -445,7 +447,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
           blob = await res.blob();
         } catch (err) {
           if (o.signal?.aborted) throw err;
-          throw unreachable();
+          throw cutOff();
         }
         if (o.maxBytes !== undefined && blob.size > o.maxBytes) throw tooLarge();
         return blob;
@@ -468,7 +470,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
         }
       } catch (err) {
         if (err instanceof ApiClientError || o.signal?.aborted) throw err;
-        throw unreachable();
+        throw cutOff();
       }
       return new Blob(parts as BlobPart[], { type });
     })();
