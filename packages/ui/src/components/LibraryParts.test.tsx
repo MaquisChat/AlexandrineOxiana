@@ -72,6 +72,21 @@ describe("CollectionTree expand, collapse, rename, delete", () => {
     expect(document.activeElement).toBe(ch1);
   });
 
+  it("a mouse click on a parent's twisty collapses and expands it without selecting it (FR-162)", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(<CollectionTree collections={COLLECTIONS.collections} selectedId={undefined} onSelect={onSelect} />);
+    const ch1 = screen.getByRole("treeitem", { name: "Chapter 1" });
+    const twisty = ch1.querySelector(".ao-tree__twisty") as HTMLElement;
+    await user.click(twisty);
+    expect(ch1.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("treeitem", { name: "Interviews" })).toBeNull();
+    await user.click(twisty);
+    expect(ch1.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("treeitem", { name: "Interviews" })).toBeTruthy();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it("the selected collection can be renamed and deleted (with a confirmation); read-only turns both off", async () => {
     const onRename = vi.fn();
     const onDelete = vi.fn();
