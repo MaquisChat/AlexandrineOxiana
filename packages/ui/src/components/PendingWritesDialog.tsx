@@ -145,11 +145,17 @@ function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean;
   );
 }
 
-/** A refused choice in plain words; the service's machine text ("allowed: …") is not shown. */
-function refusalText(err: unknown): string {
-  if (err instanceof ApiClientError && err.code === "CONFLICT")
-    return "That choice is no longer possible for this change: something changed in the meantime (it may have been resolved elsewhere). The list now shows what can be done.";
-  return errorText(err, "The change could not be resolved.");
+/**
+ * A refused choice in plain words; the service's machine text ("allowed: …") is not shown.
+ * `relisted` false: the list could not be read again, so no choice is offered (FR-153).
+ */
+function refusalText(err: unknown, relisted = true): string {
+  const conflict = err instanceof ApiClientError && err.code === "CONFLICT";
+  const what = conflict
+    ? "That choice is no longer possible for this change: something changed in the meantime (it may have been resolved elsewhere)."
+    : errorText(err, "The change could not be resolved.");
+  if (!relisted) return `${what} The interrupted changes could not be listed again, so no choice is offered now. Close this and open it again to see what can be done.`;
+  return conflict ? `${what} The list now shows what can be done.` : what;
 }
 
 export function PendingWritesDialog({ api, readOnly, onClose, onResolved, changed }: PendingWritesDialogProps) {
@@ -201,8 +207,16 @@ export function PendingWritesDialog({ api, readOnly, onClose, onResolved, change
       heading.current?.focus();
     } catch (err) {
       setError(refusalText(err));
-      // What the service allows may have changed: offer only that (41b2 I2).
-      void load();
+      // What the service allows may have changed: offer only that (41b2 I2). If it cannot be read
+      // again, the old list's choices are taken away rather than left on offer (FR-153).
+      void api.pendingWrites.list().then(
+        (l) => live.current && setList(l),
+        () => {
+          if (!live.current) return;
+          setList(null);
+          setError(refusalText(err, false));
+        },
+      );
       setTimeout(() => alert.current?.focus());
     }
   };

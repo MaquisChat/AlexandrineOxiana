@@ -47,6 +47,30 @@ describe("PendingWritesDialog", () => {
     expect(dialog.contains(document.activeElement)).toBe(true);
   });
 
+  it("if the list cannot be read again after a refusal, the old choices are taken away and the alert says so (FR-153)", async () => {
+    let calls = 0;
+    server.use(
+      http.get(url("/libraries/pending-writes"), () =>
+        calls++ === 0 ? HttpResponse.json({ pendingWrites: [pw({})] }) : HttpResponse.json({ error: { code: "UNAVAILABLE", message: "The library service is not answering." } }, { status: 503 }),
+      ),
+      http.post(url("/libraries/pending-writes/:txn/resolve"), () =>
+        HttpResponse.json({ error: { code: "CONFLICT", message: "That choice is not allowed for this change.", reason: "allowed: none" } }, { status: 409 }),
+      ),
+    );
+    const user = userEvent.setup();
+    show();
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    await user.click(await within(dialog).findByRole("button", { name: "Roll it back" }));
+    await user.click(within(dialog).getByRole("button", { name: "Yes, roll it back" }));
+    await waitFor(() => expect(within(dialog).getByRole("alert").textContent).toMatch(/could not be listed again/));
+    const alert = within(dialog).getByRole("alert");
+    expect(alert.textContent).toMatch(/no longer possible/);
+    expect(alert.textContent).not.toMatch(/The list now shows/);
+    expect(within(dialog).queryByRole("button", { name: "Roll it back" })).toBeNull();
+    expect(within(dialog).queryByRole("group", { name: /Interrupted change in/ })).toBeNull();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
   it("a held or repeated Enter on \"Roll it back\" opens the question and rolls nothing back; Tab then Enter rolls back once (R376 c)", async () => {
     const svc = serve([[pw({})], []]);
     const user = userEvent.setup();
