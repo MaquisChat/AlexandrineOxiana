@@ -296,6 +296,19 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$mnt/Alexandrine Oxiana.app"
           node apps/desktop/scripts/launch-check.mjs --release-app "$mnt/Alexandrine Oxiana.app"
 
+      # Task MAC5: the system's crash reports (the launch checks print the app's own in the log; this
+      # keeps every report whole, whatever crashed, also when a check failed; not after a
+      # cancellation, like every step here).
+      - name: Upload the crash reports (~/Library/Logs/DiagnosticReports)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        timeout-minutes: 5
+        with:
+          name: mac-crash-reports
+          path: ~/Library/Logs/DiagnosticReports/*
+          if-no-files-found: ignore
+          retention-days: 30
+
       - name: Sizes and checksums in the run summary
         if: ${{ !cancelled() }}
         timeout-minutes: 2

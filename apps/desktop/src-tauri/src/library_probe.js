@@ -17,16 +17,31 @@
 // The launch check requires every one to be refused (`EXPECTED_LIBRARY_WINDOW_IPC`), and that the
 // raw attempts changed nothing (the shell said nothing for them). The probe sends no cookie, address
 // or ticket of the researcher's anywhere: it holds none.
+//
+// Task MAC7: it also says how far it got through a channel that does not depend on its navigation:
+// a request to `<progress>/<step>` (the check's own server, `http://127.0.0.1:<port>/progress`; only
+// reaching it counts, nothing is read back) when its script runs (`script-<scheme>`), when it leaves
+// an error page (`error-page`), when it starts (`start`), after each attempt (`<n>-<outcome>`), after
+// the raw attempts (`raw`), just before it navigates (`report-<length of the address>`), and when
+// that navigation has not left the page 3 s later (`report-still-here`). Each step is a word of
+// letters, digits and hyphens: nothing of a page or of the researcher's.
 (function () {
   "use strict";
   if (window.top !== window) return;
   var cfg = __LIBRARY_PROBE_CONFIG__;
   var here = String(window.location.href);
   if (here.indexOf(cfg.report) === 0) return;
+  var ping = function (step) {
+    try {
+      fetch(cfg.progress + "/" + step, { mode: "no-cors", cache: "no-store", keepalive: true }).catch(function () {});
+    } catch (e) {}
+  };
   var proto = window.location.protocol;
+  ping("script-" + (String(proto).replace(/[^a-z]/g, "").slice(0, 16) || "none"));
   if (proto !== "http:" && proto !== "https:") {
     // An error page in place of the address the window was opened at (an https address this machine
     // does not trust, as in the launch check): go on to the check's own outside page and probe there.
+    ping("error-page");
     setTimeout(function () {
       window.location.replace(cfg.page);
     }, 100);
@@ -63,8 +78,11 @@
       }
     });
   };
+  var attempt = 0;
   var try_ = async function (name, cmd, args) {
     out.ipc[name] = hasIpc ? await ask(cmd, args) : "no IPC";
+    attempt += 1;
+    ping(attempt + "-" + String(out.ipc[name]).split(":")[0].replace(/ /g, "-"));
   };
   var handler = function () {
     try {
@@ -137,12 +155,19 @@
     } catch (e) {
       out.raw["fetch.ipc"] = "unreachable";
     }
+    ping("raw");
   };
 
   var report = function () {
-    window.location.replace(cfg.report + "?r=" + encodeURIComponent(JSON.stringify(out)));
+    var to = cfg.report + "?r=" + encodeURIComponent(JSON.stringify(out));
+    ping("report-" + to.length);
+    window.location.replace(to);
+    setTimeout(function () {
+      ping("report-still-here");
+    }, 3000);
   };
   var start = function () {
+    ping("start");
     run().then(report, function (e) {
       out.error = String(e).slice(0, 200);
       report();

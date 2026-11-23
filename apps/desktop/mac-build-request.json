@@ -1,5 +1,5 @@
 {
-  "request": 5,
+  "request": 8,
   "architectures": "apple-silicon",
-  "note": "Build 5 (the owner's app is build 4, Phase 1 only): the first Mac build with the PDF reader and highlights, Zotero account sync, cloud-drive folders, Find and acquire, the final review's fixes (the import's total, the import stopped by a full disk, the title conflicts), the suggested library folder with the free space shown, and the copy fault found by GitHub's run 269 (a copy whose source fails at once could hang). Requested with the merge to main, after GitHub's run 271 of this code was green and the verification FR5/FR5b passed."
+  "note": "Build 7's content (build 5's, with the start-up crash mended: R457) plus the launch check's evidence and fallback for the sign-in window's probe (R458): build 7 started and passed every check but that one, whose probe had no page to run in on a Mac. If every check passes, this is the owner's build: the first with the PDF reader, Zotero account sync, cloud folders, Find and acquire and every fix since build 4."
 }

@@ -1978,8 +1978,22 @@ impl Host for TauriHost {
             .inner_size(WIDTH, HEIGHT)
             .min_inner_size(600.0, 400.0)
             .user_agent(USER_AGENT)
-            .initialization_script(SCRIPT)
-            .on_navigation(navigation_allowed)
+            .initialization_script(SCRIPT);
+        // The launch check's probe (debug builds, test mode, its switch set; R343 b), and with it the
+        // window's trace (Task MAC7): its navigations, page loads and fallback printed.
+        #[cfg(debug_assertions)]
+        let probe = library_probe::from_env(self.test_mode());
+        #[cfg(debug_assertions)]
+        let (traced, traced_loads) = (probe.clone(), probe.clone());
+        #[cfg(debug_assertions)]
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(debug_assertions)]
+        let started_seen = started.clone();
+        #[cfg(debug_assertions)]
+        let builder = builder.on_navigation(move |u| library_probe::decided(u, traced.as_ref()));
+        #[cfg(not(debug_assertions))]
+        let builder = builder.on_navigation(navigation_allowed);
+        let builder = builder
             // The web view itself never saves a file: a download it would start is refused (the
             // shell's own fetch is the only way a file is kept; WebKitGTK shows no PDF and would
             // otherwise save it to the Downloads folder). Its address is taken as the PDF's address
@@ -2008,6 +2022,11 @@ impl Host for TauriHost {
             // COMMITTED, WKWebView's `didCommitNavigation`) and its load finished, never a frame's. Each
             // sets the title to the host shown (R347 b).
             .on_page_load(move |_w, p| {
+                #[cfg(debug_assertions)]
+                if let Some(report) = &traced_loads {
+                    started_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    println!("{}", library_probe::page_load_line(p.event() == PageLoadEvent::Finished, p.url(), report));
+                }
                 loaded.library.page_shown(&loaded, p.url());
                 if p.event() == PageLoadEvent::Finished {
                     loaded.library.page_loaded(&loaded, p.url(), Instant::now());
@@ -2021,13 +2040,16 @@ impl Host for TauriHost {
                 retitled.library.page_retitled(&retitled);
             })
             .devtools(cfg!(debug_assertions));
-        // The launch check's probe (debug builds, test mode, its switch set; R343 b).
         #[cfg(debug_assertions)]
-        let builder = match library_probe::from_env(self.test_mode()) {
-            Some(report) => builder.initialization_script(library_probe::script(&report)),
+        let builder = match &probe {
+            Some(report) => builder.initialization_script(library_probe::script(report)),
             None => builder,
         };
         let Ok(w) = window_store(builder, store).build() else { return false };
+        #[cfg(debug_assertions)]
+        if let Some(report) = &probe {
+            library_probe::watch(w.clone(), report, started);
+        }
         let closed = self.clone();
         w.on_window_event(move |e| {
             if let tauri::WindowEvent::Destroyed = e {
@@ -2147,12 +2169,104 @@ pub mod library_probe {
         report_address(&std::env::var(SWITCH).ok()?)
     }
 
-    /// The probe with its configuration: the report address and the check's own page beside it.
+    /// The probe with its configuration: the report address and the check's own page beside it, and
+    /// (Task MAC7) where it says how far it got (`/progress/<step>`, the same server).
     pub fn script(report: &Url) -> String {
         let mut page = report.clone();
         page.set_path("/page");
-        let cfg = serde_json::json!({ "report": report.as_str(), "page": page.as_str() });
+        let mut progress = report.clone();
+        progress.set_path("/progress");
+        let cfg = serde_json::json!({ "report": report.as_str(), "page": page.as_str(), "progress": progress.as_str() });
         SCRIPT.replace("__LIBRARY_PROBE_CONFIG__", &cfg.to_string())
+    }
+
+    /// Task MAC7: the sign-in window's own trace, printed in test mode with the probe asked for (and
+    /// so never in a release build): each navigation the window asked the shell to decide and the
+    /// decision, each page load started (committed) and finished, the window's address
+    /// FALLBACK_AFTER after it was made, and the fallback. R325 (no address in any line the shell
+    /// prints): only the check's OWN addresses are printed, by scheme, host, port and path (never a
+    /// query or fragment) — those on 127.0.0.1 at the report address's port, which the check serves
+    /// (`https://…/sign-in` included) — and `about:` documents; any other address by its scheme alone
+    /// (`shown`). Neither tauri 2.12.5 nor wry
+    /// 0.57.2 reports a load that FAILED on any platform (wry's WKWebView navigation delegate answers
+    /// no `didFail…Navigation`, its WebKitGTK side connects no `load-failed`): a navigation allowed
+    /// with no page load after it is how a failed load shows here, with the address the web view
+    /// then holds (`url()`; on a Mac none after a failed first load, wry's `url_from_webview`).
+    pub const TRACE: &str = "AO_SHELL_LIBRARY_TRACE";
+    /// How long after the window is made the shell looks at what it holds, and opens the check's
+    /// page itself when no page load has started (Task MAC7: the probe's way there is the error page
+    /// of the first address, which a Mac's web view may never show).
+    pub const FALLBACK_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// An address as the trace prints it (`report`: the check's report address): one of the check's
+    /// own by scheme, host, port and path; `about:` with its path; any other by its scheme alone.
+    /// Visible ASCII only, the path at most 100 characters.
+    pub fn shown(url: &Url, report: &Url) -> String {
+        let clean = |s: &str, max: usize| -> String {
+            let t: String = s.chars().map(|c| if c.is_ascii_graphic() { c } else { '?' }).collect();
+            if t.chars().count() > max {
+                format!("{}…", t.chars().take(max).collect::<String>())
+            } else {
+                t
+            }
+        };
+        let checks_own = matches!(url.scheme(), "http" | "https") && url.host_str() == Some("127.0.0.1") && url.port().is_some() && url.port() == report.port();
+        match url.scheme() {
+            "about" => format!("about:{}", clean(url.path(), 20)),
+            scheme if checks_own => format!("{scheme}://127.0.0.1:{}{}", url.port().unwrap_or(0), clean(url.path(), 100)),
+            scheme => format!("{} (an address not the check's)", clean(scheme, 16)),
+        }
+    }
+
+    pub fn navigation_line(url: &Url, allowed: bool, report: &Url) -> String {
+        format!("{TRACE} navigation {} {}", shown(url, report), if allowed { "allowed" } else { "refused" })
+    }
+
+    pub fn page_load_line(finished: bool, url: &Url, report: &Url) -> String {
+        format!("{TRACE} page-load {} {}", if finished { "finished" } else { "started" }, shown(url, report))
+    }
+
+    /// The address the window holds FALLBACK_AFTER after it was made, or why there is none.
+    pub fn address_line(url: Result<Url, String>, report: &Url) -> String {
+        let secs = FALLBACK_AFTER.as_secs();
+        match url {
+            Ok(u) => format!("{TRACE} address after {secs} s: {}", shown(&u, report)),
+            Err(e) => {
+                let e: String = e.chars().take(200).map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' }).collect();
+                format!("{TRACE} address after {secs} s: none ({e})")
+            }
+        }
+    }
+
+    pub fn fallback_line() -> String {
+        format!("{TRACE} fallback: no page started in {} s; the shell opens the check's page", FALLBACK_AFTER.as_secs())
+    }
+
+    /// The navigation rule, with its decision printed when the probe is asked for (`report`).
+    pub fn decided(url: &Url, report: Option<&Url>) -> bool {
+        let allowed = super::navigation_allowed(url);
+        if let Some(report) = report {
+            println!("{}", navigation_line(url, allowed, report));
+        }
+        allowed
+    }
+
+    /// FALLBACK_AFTER after the window was made: prints the address it holds and, when no page load
+    /// has started (`started`), opens the check's own page (beside the report address) in it, so
+    /// that the probe runs there all the same; the check counts that as a failure of the item and
+    /// prints why (launch-check.mjs).
+    pub fn watch(window: tauri::WebviewWindow, report: &Url, started: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let report = report.clone();
+        let mut page = report.clone();
+        page.set_path("/page");
+        std::thread::spawn(move || {
+            std::thread::sleep(FALLBACK_AFTER);
+            println!("{}", address_line(window.url().map_err(|e| e.to_string()), &report));
+            if !started.load(std::sync::atomic::Ordering::SeqCst) {
+                println!("{}", fallback_line());
+                let _ = window.navigate(page);
+            }
+        });
     }
 
     /// Where the main window's probe opens the sign-in window: an https address on the check's port,
@@ -2195,6 +2309,11 @@ fn store_can_stay() -> bool {
 /// tried again a few times.
 #[cfg(target_os = "macos")]
 fn remove_data_stores(app: &tauri::AppHandle) -> bool {
+    // R457: WebKit first (`start_webkit`); where it could not be started, nothing is asked of it and
+    // the emptying counts as failed, as any other failure of it does.
+    if !start_webkit(app) {
+        return false;
+    }
     tauri::async_runtime::block_on(async {
         let Ok(ids) = app.fetch_data_store_identifiers().await else { return false };
         let mut all = true;
@@ -2211,6 +2330,44 @@ fn remove_data_stores(app: &tauri::AppHandle) -> bool {
         }
         all
     })
+}
+
+/// Starts WebKit in this process, once, before `WKWebsiteDataStore`'s class methods are used (R457):
+/// obtains the default data store on the main thread and waits for that (at most 10 s). True when
+/// WebKit has been started. Never on the main thread (it waits for it).
+///
+/// Without it the first start crashed (Mac build 6): EXC_BAD_ACCESS at 0x30 on the queue
+/// com.apple.WebKit.WebsiteDataStoreIO, in WTF::RunLoop::dispatch <- WebsiteDataStore::fetchAllDataStoreIdentifiers.
+/// The store is emptied at start-up before the service and the main window exist (so that a sign-in
+/// never outlives a forced quit), so no web view has started WebKit yet and its answer went to a
+/// main run loop that did not exist; `+defaultDataStore` runs WebKit's initialisation.
+#[cfg(target_os = "macos")]
+fn start_webkit(app: &tauri::AppHandle) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.load(Ordering::SeqCst) {
+        return true;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let posted = app.run_on_main_thread(move || {
+        let started = if let Some(mtm) = objc2::MainThreadMarker::new() {
+            // SAFETY: on the main thread, as the marker proves; the method takes nothing and returns
+            // the shared default store, retained, released again here on the same thread.
+            let _store = unsafe { objc2_web_kit::WKWebsiteDataStore::defaultDataStore(mtm) };
+            true
+        } else {
+            false
+        };
+        let _ = tx.send(started);
+    });
+    if posted.is_err() {
+        return false;
+    }
+    let started = rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false);
+    if started {
+        STARTED.store(true, Ordering::SeqCst);
+    }
+    started
 }
 
 /// Elsewhere the window's store is ephemeral: there is nothing to remove.
@@ -4588,7 +4745,28 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
     #[test]
     fn nothing_of_a_cookie_address_ticket_or_path_is_printed() {
         let src = include_str!("library_window.rs");
-        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        let all_prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        // Task MAC7: the launch check's probe module (debug builds only: the release test above) prints
+        // the sign-in window's trace in test mode, each line made by one of its own functions, which
+        // print only the check's own addresses (`the_sign_in_windows_trace_…`). Judged apart; the
+        // rest of the module as before.
+        let at = all_prod.find("pub mod library_probe {").unwrap();
+        let end = block_end(all_prod, at + all_prod[at..].find('{').unwrap());
+        let probe = &all_prod[at..end];
+        let probe_prints: Vec<&str> = probe.lines().filter(|l| l.contains("println!")).map(str::trim).collect();
+        assert_eq!(
+            probe_prints,
+            vec![
+                "println!(\"{}\", navigation_line(url, allowed, report));",
+                "println!(\"{}\", address_line(window.url().map_err(|e| e.to_string()), &report));",
+                "println!(\"{}\", fallback_line());",
+            ]
+        );
+        let traced_prints: Vec<&str> = all_prod.lines().filter(|l| l.contains("println!(\"{}\", library_probe::")).map(str::trim).collect();
+        assert_eq!(traced_prints, vec!["println!(\"{}\", library_probe::page_load_line(p.event() == PageLoadEvent::Finished, p.url(), report));"]);
+        let prod_owned = format!("{}{}", &all_prod[..at], &all_prod[end..]);
+        let prod_owned = prod_owned.lines().filter(|l| !l.contains("println!(\"{}\", library_probe::page_load_line(")).collect::<Vec<_>>().join("\n");
+        let prod = prod_owned.as_str();
         for forbidden in ["eprintln!", "eprint!", "dbg!", "panic!", "unreachable!", "todo!", "unimplemented!", "log::", "tracing::", ".expect(", ".unwrap()", "assert!", "print!("] {
             assert!(!prod.contains(forbidden), "{forbidden}");
         }
@@ -4728,19 +4906,26 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
     #[test]
     fn a_release_build_has_neither_the_sign_in_windows_probe_nor_its_switch() {
         let files = [("library_window.rs", include_str!("library_window.rs")), ("lib.rs", include_str!("lib.rs"))];
-        let mut seen_in_debug = (false, false);
+        let mut seen_in_debug = (false, false, false);
         for (name, src) in files {
             seen_in_debug.0 |= src.contains("library_probe.js");
             seen_in_debug.1 |= src.contains("AO_SHELL_LIBRARY_PROBE");
+            seen_in_debug.2 |= src.contains("AO_SHELL_LIBRARY_TRACE");
             // Comment lines compile to nothing (a doc comment goes with its item).
             let released: String = as_released(src).lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
             assert!(!released.contains("library_probe"), "{name}: a release build would hold the sign-in window's probe");
             assert!(!released.contains("AO_SHELL_LIBRARY_PROBE"), "{name}: a release build would read the probe's switch");
+            // Task MAC7: nor the sign-in window's trace, its fallback or its traced navigation rule.
+            assert!(!released.contains("AO_SHELL_LIBRARY_TRACE"), "{name}: a release build would print the sign-in window's trace");
+            assert!(!released.contains("traced"), "{name}: a release build would trace the sign-in window");
             // The main window's probe module is debug-only as well (it reads the same switch).
             assert!(!released.contains("probe::"), "{name}: a release build would call a probe");
         }
         // The control: the debug build has both (so the stripping above is what removed them).
-        assert_eq!(seen_in_debug, (true, true));
+        assert_eq!(seen_in_debug, (true, true, true));
+        // The release build's navigation rule is the plain one, given as it is.
+        let released = as_released(include_str!("library_window.rs"));
+        assert!(released.contains(".on_navigation(navigation_allowed)"));
         // And the stripping itself: a gated block, a gated statement and a gated item with its doc go; the rest stays.
         let s = "a();\n#[cfg(debug_assertions)]\n{ b({}); }\nc();\n#[cfg(debug_assertions)]\nlet x = 1;\n#[cfg(test)]\n/// doc\n#[allow(x)]\nmod t { fn y() {} }\nd();\n#[cfg(test)]\nmod u { const S: &str = \"}{\\\"}\"; const C: char = '}'; const R: &str = r#\"}\"#; // }\n }\ne();";
         assert_eq!(as_released(s).split_whitespace().collect::<String>(), "a();c();d();e();");
@@ -4754,7 +4939,8 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         assert_eq!(r.as_str(), "http://127.0.0.1:40125/report");
         let s = script(&r);
         assert!(!s.contains("__LIBRARY_PROBE_CONFIG__"));
-        assert!(s.contains(r#"{"page":"http://127.0.0.1:40125/page","report":"http://127.0.0.1:40125/report"}"#), "{s}");
+        // Task MAC7: and where it says how far it got (`/progress/<step>`), on the same server.
+        assert!(s.contains(r#"{"page":"http://127.0.0.1:40125/page","progress":"http://127.0.0.1:40125/progress","report":"http://127.0.0.1:40125/report"}"#), "{s}");
         // The main window's probe opens the sign-in window at an https address of the same port.
         assert_eq!(open_address(&r), "https://127.0.0.1:40125/sign-in");
         assert!(window_address(&open_address(&r)).is_some());
@@ -4773,5 +4959,32 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         ] {
             assert!(report_address(bad).is_none(), "{bad}");
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_sign_in_windows_trace_names_scheme_host_port_and_path_never_the_query() {
+        use super::library_probe::{address_line, fallback_line, navigation_line, page_load_line, shown, FALLBACK_AFTER};
+        let u = |s: &str| Url::parse(s).unwrap();
+        let r = u("http://127.0.0.1:40125/report");
+        // The check's own addresses: scheme, host, port and path, never the query or fragment.
+        assert_eq!(shown(&u("http://127.0.0.1:40125/report?r=%7B%22secret%22%7D#x"), &r), "http://127.0.0.1:40125/report");
+        assert_eq!(shown(&u("https://127.0.0.1:40125/sign-in"), &r), "https://127.0.0.1:40125/sign-in");
+        assert_eq!(shown(&u("about:blank"), &r), "about:blank");
+        let long = format!("http://127.0.0.1:40125/{}", "p".repeat(300));
+        assert!(shown(&u(&long), &r).chars().count() <= 130, "{}", shown(&u(&long), &r));
+        // Any other address (R325): its scheme alone.
+        for other in ["https://user:pw@library.example.org/sign-in?ticket=abc", "https://127.0.0.1:40126/page", "http://127.0.0.1/page", "http://127.0.0.2:40125/page", "data:text/html,<p>secret</p>", "file:///home/someone/x.pdf", "tauri://localhost/index.html"] {
+            let s = shown(&u(other), &r);
+            assert!(s.ends_with(" (an address not the check's)") && !s.contains('/') && !s.contains("example") && !s.contains("secret"), "{other}: {s}");
+        }
+        assert_eq!(navigation_line(&u("http://127.0.0.1:40125/report?r=x"), true, &r), "AO_SHELL_LIBRARY_TRACE navigation http://127.0.0.1:40125/report allowed");
+        assert_eq!(navigation_line(&u("file:///etc/passwd"), false, &r), "AO_SHELL_LIBRARY_TRACE navigation file (an address not the check's) refused");
+        assert_eq!(page_load_line(false, &u("http://127.0.0.1:40125/page?q=1"), &r), "AO_SHELL_LIBRARY_TRACE page-load started http://127.0.0.1:40125/page");
+        assert_eq!(page_load_line(true, &u("http://127.0.0.1:40125/page"), &r), "AO_SHELL_LIBRARY_TRACE page-load finished http://127.0.0.1:40125/page");
+        assert_eq!(address_line(Ok(u("https://127.0.0.1:40125/sign-in?x")), &r), "AO_SHELL_LIBRARY_TRACE address after 10 s: https://127.0.0.1:40125/sign-in");
+        assert_eq!(address_line(Err("WKWebView URL is nil\n".to_string()), &r), "AO_SHELL_LIBRARY_TRACE address after 10 s: none (WKWebView URL is nil?)");
+        assert_eq!(fallback_line(), "AO_SHELL_LIBRARY_TRACE fallback: no page started in 10 s; the shell opens the check's page");
+        assert_eq!(FALLBACK_AFTER, std::time::Duration::from_secs(10));
     }
 }

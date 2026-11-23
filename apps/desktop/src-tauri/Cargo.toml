@@ -35,6 +35,13 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["native-t
 [target.'cfg(unix)'.dependencies]
 libc = { version = "=0.2.177" }
 
+# R457: WebKit is started on the main thread before the sign-in window's stores are listed or removed
+# (library_window.rs, `start_webkit`). Both crates are already in the build through wry (the same
+# versions and features); named here because the shell calls `+[WKWebsiteDataStore defaultDataStore]`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "=0.6.5" }
+objc2-web-kit = { version = "=0.3.2", default-features = false, features = ["std", "WKWebsiteDataStore"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { appProcesses, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, libraryProbeProblems, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
+import { appProcesses, capLines, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -334,5 +334,355 @@ describe("process listing on a Mac (ps)", () => {
     const text = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 202 runner 21u IPv4 0x1 0t0 TCP 127.0.0.1:53817 (LISTEN)\nnode 202 runner 22u IPv6 0x2 0t0 TCP [::1]:53818 (LISTEN)\n";
     assert.deepEqual(parseLsofListen(text), [{ host: "127.0.0.1", port: 53817 }, { host: "::1", port: 53818 }]);
     assert.deepEqual(parseLsofListen(""), []);
+  });
+});
+
+// ---------- a Mac crash at start-up: where (Task MAC5) ----------
+// The sample follows the .ips layout as Apple describes it (one header line of JSON, then the body
+// as one JSON document); it was written for this test, not captured on a Mac.
+const IPS_HEADER = { app_name: "alexandrine-oxiana", timestamp: "2026-11-18 06:23:51.00 +0000", bug_type: "309", name: "alexandrine-oxiana" };
+const ipsBody = (over = {}) => ({
+  procName: "alexandrine-oxiana",
+  exception: { type: "EXC_BAD_ACCESS", signal: "SIGSEGV", codes: "0x0000000000000001, 0x0000000000000010", subtype: "KERN_INVALID_ADDRESS at 0x0000000000000010" },
+  termination: { namespace: "SIGNAL", code: 11, indicator: "Segmentation fault: 11", byProc: "exc handler" },
+  faultingThread: 1,
+  threads: [
+    { id: 1, frames: [{ imageIndex: 2, imageOffset: 4096, symbol: "mach_msg2_trap", symbolLocation: 8 }] },
+    {
+      id: 2,
+      triggered: true,
+      frames: [
+        { imageIndex: 1, imageOffset: 28672, symbol: "objc_msgSend", symbolLocation: 32 },
+        { imageIndex: 0, imageOffset: 1193046, symbol: "alexandrine_oxiana::grant::restore", symbolLocation: 120 },
+        { imageIndex: 0, imageOffset: 2000 },
+      ],
+    },
+  ],
+  usedImages: [
+    { name: "alexandrine-oxiana", path: "/x/Alexandrine Oxiana.app/Contents/MacOS/alexandrine-oxiana" },
+    { name: "libobjc.A.dylib", path: "/usr/lib/libobjc.A.dylib" },
+    { path: "/usr/lib/system/libsystem_kernel.dylib" },
+  ],
+  ...over,
+});
+const ipsText = (body) => `${JSON.stringify(IPS_HEADER)}\n${JSON.stringify(body, null, 2)}\n`;
+
+describe("Mac crash diagnostics: the pure parts (Task MAC5)", () => {
+  it("caps a text at a number of lines and says how many were left out", () => {
+    assert.equal(capLines("a\nb\nc\n", 5), "a\nb\nc");
+    assert.equal(capLines("a\nb\nc\nd", 2), "a\nb\n… (2 more lines not shown)");
+    assert.equal(capLines("", 3), "");
+    assert.equal(capLines(undefined, 3), "");
+    const long = Array.from({ length: 1000 }, (_, i) => `line ${i}`).join("\n");
+    assert.equal(capLines(long, 400).split("\n").length, 401);
+  });
+
+  it("picks the newest crash report of the app that was not there before the start", () => {
+    const before = ["alexandrine-oxiana-2026-11-18-062000.ips", "Safari-2026-11-18-061000.ips"];
+    const now = [...before, "alexandrine-oxiana-2026-11-18-062351.ips", "alexandrine-oxiana-2026-11-18-062352.ips", "node-2026-11-18-062353.ips", "alexandrine-oxiana-2026-11-18-062354.diag", "Retired"];
+    assert.equal(newCrashReport(before, now), "alexandrine-oxiana-2026-11-18-062352.ips");
+    assert.equal(newCrashReport(before, before), null);
+    assert.equal(newCrashReport([], ["alexandrine-oxiana_2026-11-10-101010_host.crash"]), "alexandrine-oxiana_2026-11-10-101010_host.crash");
+    assert.equal(isCrashReportOf("alexandrine-oxiana-1.ips"), true);
+    assert.equal(isCrashReportOf("ao-worker-1.ips"), false);
+  });
+
+  it("reads an .ips report: the exception, the termination, the crashed thread's frames and the loaded images", () => {
+    const p = parseIps(ipsText(ipsBody()));
+    assert.equal(p.exception, "EXC_BAD_ACCESS (SIGSEGV), codes 0x0000000000000001, 0x0000000000000010, KERN_INVALID_ADDRESS at 0x0000000000000010");
+    assert.equal(p.termination, "SIGNAL 11, Segmentation fault: 11, by exc handler");
+    assert.equal(p.thread, 1);
+    assert.deepEqual(p.frames, [
+      { image: "libobjc.A.dylib", symbol: "objc_msgSend", offset: "+32 (image offset 0x7000)" },
+      { image: "alexandrine-oxiana", symbol: "alexandrine_oxiana::grant::restore", offset: "+120 (image offset 0x123456)" },
+      { image: "alexandrine-oxiana", symbol: "?", offset: "image offset 0x7d0" },
+    ]);
+    assert.deepEqual(p.images, ["alexandrine-oxiana", "libobjc.A.dylib", "libsystem_kernel.dylib"]);
+    // Without faultingThread, the thread marked as triggered.
+    assert.equal(parseIps(ipsText(ipsBody({ faultingThread: undefined }))).thread, 1);
+    const text = formatCrashReport(p);
+    assert.match(text, /exception: EXC_BAD_ACCESS \(SIGSEGV\)/);
+    assert.match(text, /termination: SIGNAL 11/);
+    assert.match(text, /crashed thread 1:/);
+    assert.match(text, /#1 +alexandrine-oxiana +alexandrine_oxiana::grant::restore \+120/);
+    assert.match(text, /loaded images \(3\): alexandrine-oxiana, libobjc\.A\.dylib, libsystem_kernel\.dylib/);
+  });
+
+  it("shows at most 60 frames and 40 image names", () => {
+    const images = Array.from({ length: 100 }, (_, i) => ({ name: `lib${i}.dylib` }));
+    const frames = Array.from({ length: 100 }, (_, i) => ({ imageIndex: i, imageOffset: i, symbol: `f${i}`, symbolLocation: 0 }));
+    const text = formatCrashReport(parseIps(ipsText(ipsBody({ faultingThread: 0, threads: [{ frames }], usedImages: images }))));
+    assert.match(text, /#59 /);
+    assert.doesNotMatch(text, /#60 /);
+    assert.match(text, /40 more frames not shown/);
+    const imagesLine = text.split("\n").at(-1);
+    assert.match(imagesLine, /lib39\.dylib, … \(60 more\)$/);
+    assert.doesNotMatch(imagesLine, /lib40\.dylib/);
+    assert.match(imagesLine, /^loaded images \(100\)/);
+  });
+
+  it("says null for what it cannot read (the caller then shows the file as it is)", () => {
+    assert.equal(parseIps("not json\nnot json either"), null);
+    assert.equal(parseIps(""), null);
+    assert.deepEqual(parseIps(ipsText(ipsBody({ threads: [] }))).frames, []);
+    // A report that is one JSON document without a header is still read.
+    assert.equal(parseIps(JSON.stringify(ipsBody())).thread, 1);
+  });
+});
+
+/** Fakes for the diagnostics: a crash-report folder, commands and a clock. */
+function fakeMac({ reports = [[], ["alexandrine-oxiana-2026-11-18-062351.ips"]], files = {}, results = {}, throws = false } = {}) {
+  const calls = { run: [], print: [], list: 0, stopped: 0 };
+  let t = 0;
+  let listed = 0;
+  return {
+    calls,
+    out: () => calls.print.join(""),
+    deps: {
+      platform: "darwin",
+      app: "/x/Alexandrine Oxiana.app",
+      binary: "/x/Alexandrine Oxiana.app/Contents/MacOS/alexandrine-oxiana",
+      env: { PATH: "/usr/bin:/bin", HOME: "/tmp/ao/home", NODE_ENV: "test", AO_SHELL_PROBE_DIR: "/tmp/ao/probe" },
+      baseline: reports[0],
+      reportDir: "/Users/runner/Library/Logs/DiagnosticReports",
+      print: (s) => calls.print.push(s),
+      listDir: () => {
+        calls.list++;
+        if (throws) throw new Error("listing failed");
+        return reports[Math.min(++listed, reports.length - 1)];
+      },
+      readText: (p) => {
+        if (!(p in files)) throw new Error(`no file ${p}`);
+        return files[p];
+      },
+      run: (cmd, args, opts) => {
+        calls.run.push({ cmd, args, opts });
+        if (throws) throw new Error("spawn failed");
+        return results[cmd] ?? { ok: true, out: `${cmd} output\n` };
+      },
+      sleep: async (ms) => {
+        t += ms;
+      },
+      now: () => t,
+      stopApp: () => {
+        calls.stopped++;
+        return [];
+      },
+      state: { contextShown: false },
+    },
+  };
+}
+
+describe("Mac crash diagnostics: when and what (Task MAC5)", () => {
+  const REPORT = "/Users/runner/Library/Logs/DiagnosticReports/alexandrine-oxiana-2026-11-18-062351.ips";
+
+  it("does nothing at all when the system is not macOS", async () => {
+    for (const platform of ["linux", "win32"]) {
+      const m = fakeMac();
+      assert.equal(await macCrashDiagnostics({ ...m.deps, platform, debug: true }), false);
+      assert.deepEqual(m.calls, { run: [], print: [], list: 0, stopped: 0 });
+    }
+  });
+
+  it("prints the new crash report, the debugger's backtrace with the shell's own environment, and the context once", async () => {
+    const m = fakeMac({ files: { [REPORT]: ipsText(ipsBody()) }, results: { lldb: { ok: true, out: Array.from({ length: 900 }, (_, i) => `bt ${i}`).join("\n") } } });
+    assert.equal(await macCrashDiagnostics({ ...m.deps, debug: true }), true);
+    const out = m.out();
+    assert.match(out, new RegExp(`--- crash report: ${REPORT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ---`));
+    assert.match(out, /alexandrine_oxiana::grant::restore/);
+    const lldb = m.calls.run.find((c) => c.cmd === "lldb");
+    assert.deepEqual(lldb.args, ["--batch", "-o", "run", "-k", "thread backtrace all", "-k", "image list -b", "-k", "quit", "--", m.deps.binary]);
+    assert.deepEqual(lldb.opts.env, m.deps.env);
+    assert.equal(lldb.opts.timeout, 90_000);
+    assert.match(out, /bt 399\n… \(500 more lines not shown\)/);
+    assert.equal(m.calls.stopped, 1);
+    const cmds = m.calls.run.map((c) => c.cmd);
+    for (const c of ["sw_vers", "plutil", "codesign", "otool", "ls"]) assert.ok(cmds.includes(c), c);
+    for (const c of m.calls.run) assert.ok(c.opts.timeout > 0 && c.opts.timeout <= 90_000, c.cmd);
+    // A second failure in the same run: the context is not printed again.
+    const runs = m.calls.run.length;
+    await macCrashDiagnostics({ ...m.deps, debug: true });
+    assert.equal(m.calls.run.filter((c) => c.cmd === "sw_vers").length, 1);
+    assert.ok(m.calls.run.length > runs);
+  });
+
+  it("prints the first 250 lines of a report it cannot read, or one without frames", async () => {
+    const raw = Array.from({ length: 300 }, (_, i) => `raw ${i}`).join("\n");
+    const m = fakeMac({ files: { [REPORT]: raw } });
+    await macCrashDiagnostics({ ...m.deps, debug: false });
+    assert.match(m.out(), /raw 249\n… \(50 more lines not shown\)/);
+    assert.doesNotMatch(m.out(), /raw 250\n/);
+    const n = fakeMac({ files: { [REPORT]: ipsText(ipsBody({ threads: [] })) } });
+    await macCrashDiagnostics({ ...n.deps, debug: false });
+    assert.match(n.out(), /"app_name":"alexandrine-oxiana"/);
+  });
+
+  it("waits up to 40 s for a report and says so when none came; the release app then gets the debugger too", async () => {
+    const m = fakeMac({ reports: [[]] });
+    await macCrashDiagnostics({ ...m.deps, debug: false });
+    assert.match(m.out(), /no new crash report .* within 40 s/);
+    assert.ok(m.calls.list >= 30, `listed ${m.calls.list} times`);
+    assert.ok(m.calls.run.some((c) => c.cmd === "lldb"));
+    // With a report, the release app (no symbols) is not run under the debugger.
+    const r = fakeMac({ files: { [REPORT]: ipsText(ipsBody()) } });
+    await macCrashDiagnostics({ ...r.deps, debug: false });
+    assert.ok(!r.calls.run.some((c) => c.cmd === "lldb"));
+  });
+
+  it("says in one line that lldb is missing, timed out or could not launch, and goes on", async () => {
+    for (const [result, said] of [
+      [{ ok: false, out: "", reason: "not found (spawnSync lldb ENOENT)" }, /lldb: not found/],
+      [{ ok: false, out: "(lldb) run\n", reason: "timed out after 90 s" }, /lldb: timed out after 90 s/],
+      [{ ok: true, out: "(lldb) run\nerror: process launch failed: no such file\n" }, /lldb could not launch the program: error: process launch failed/],
+    ]) {
+      const m = fakeMac({ files: { [REPORT]: ipsText(ipsBody()) }, results: { lldb: result } });
+      await macCrashDiagnostics({ ...m.deps, debug: true });
+      assert.match(m.out(), said);
+      assert.equal(m.calls.stopped, 1);
+      assert.ok(m.calls.run.some((c) => c.cmd === "otool"));
+    }
+  });
+
+  it("never throws, whatever fails", async () => {
+    const m = fakeMac({ throws: true });
+    assert.equal(await macCrashDiagnostics({ ...m.deps, debug: true, readText: () => { throw new Error("x"); }, stopApp: () => { throw new Error("y"); } }), true);
+    assert.match(m.out(), /launch-check: note/);
+  });
+});
+
+describe("the report server tells what it saw (Task MAC7)", () => {
+  it("logs every connection and request by method and path, the query by its length only, and a greeting it cannot read", async () => {
+    const { connect } = await import("node:net");
+    const server = await startReportServer();
+    try {
+      assert.match(server.address, /^http:\/\/127\.0\.0\.1:\d+\/report$/);
+      const base = server.address.replace(/\/report$/, "");
+      assert.equal((await fetch(`${base}/page`)).status, 200);
+      assert.equal((await fetch(`${base}/progress/start`)).status, 204);
+      const r = encodeURIComponent(JSON.stringify(LIBRARY_GOOD));
+      assert.equal((await fetch(`${base}/report?r=${r}`)).status, 200);
+      // A TLS greeting (as a web view's first https address on this port sends): not HTTP.
+      await new Promise((done) => {
+        const s = connect(Number(new URL(base).port), "127.0.0.1", () => s.write(Buffer.from([0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00])));
+        s.on("data", () => {});
+        s.on("close", done);
+        s.on("error", done);
+      });
+      const seen = server.requests();
+      const requests = seen.filter((e) => e.kind === "request").map((e) => `${e.method} ${e.path} ${e.query}`);
+      assert.deepEqual(requests, ["GET /page 0", "GET /progress/start 0", `GET /report ${`r=${r}`.length}`]);
+      assert.ok(seen.some((e) => e.kind === "connection"));
+      assert.ok(seen.some((e) => e.kind === "unreadable" && /^HPE_/.test(e.code)), JSON.stringify(seen));
+      for (const e of seen) assert.equal(typeof e.ms, "number");
+      // The query's content is never kept, only its length.
+      assert.ok(!JSON.stringify(seen).includes("library"));
+      assert.deepEqual(server.report(), LIBRARY_GOOD);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("says what it saw, or that it saw nothing", () => {
+    assert.deepEqual(describeReportServer([]), ["the report server saw nothing (no connection at all)"]);
+    const lines = describeReportServer([
+      { ms: 12, kind: "connection" },
+      { ms: 15, kind: "unreadable", code: "HPE_INVALID_METHOD" },
+      { ms: 230, kind: "request", method: "GET", path: "/page", query: 0 },
+      { ms: 1234, kind: "request", method: "GET", path: "/report", query: 2048 },
+    ]);
+    assert.deepEqual(lines, [
+      "the report server saw 4 things:",
+      "  +0.012 s a connection",
+      "  +0.015 s a request it could not read as HTTP (HPE_INVALID_METHOD; a TLS greeting reads so)",
+      "  +0.230 s GET /page",
+      "  +1.234 s GET /report (query of 2048 characters)",
+    ]);
+  });
+});
+
+describe("the sign-in window's probe says how far it got, not only by navigating (Task MAC7)", () => {
+  const CFG = { report: "http://127.0.0.1:40125/report", page: "http://127.0.0.1:40125/page", progress: "http://127.0.0.1:40125/progress" };
+  /** Runs the probe in a stand-in page; resolves with what it fetched and where it navigated. */
+  const runProbe = async (href, { invoke = () => Promise.reject(new Error("command not allowed")) } = {}) => {
+    const vm = await import("node:vm");
+    const events = [];
+    let navigated;
+    const done = new Promise((r) => (navigated = r));
+    const u = new URL(href);
+    const location = { href, protocol: u.protocol, origin: u.origin, replace: (to) => (events.push(`navigate ${to.split("?")[0]}`), navigated()) };
+    const window = { location, __TAURI_INTERNALS__: { invoke, transformCallback: () => 1 } };
+    window.top = window;
+    // The probe's own timers, cleared when it is done (its limits would otherwise hold the test).
+    const timers = [];
+    const later = (fn, ms) => {
+      const t = setTimeout(fn, ms);
+      timers.push(t);
+      return t;
+    };
+    const fetch = (to, opts) => {
+      if (String(to).startsWith(CFG.progress)) events.push(`progress ${String(to).slice(CFG.progress.length)}${opts?.mode === "no-cors" ? "" : " (not no-cors)"}`);
+      return Promise.reject(new Error("unreachable"));
+    };
+    assert.ok(LIBRARY_PROBE_JS.includes("__LIBRARY_PROBE_CONFIG__"));
+    vm.runInNewContext(LIBRARY_PROBE_JS.replace("__LIBRARY_PROBE_CONFIG__", JSON.stringify(CFG)), { window, document: { readyState: "complete", addEventListener() {} }, fetch, setTimeout: later, clearTimeout, navigator: {} });
+    await Promise.race([done, new Promise((r) => later(r, 5000))]);
+    for (const t of timers) clearTimeout(t);
+    return events;
+  };
+
+  it("in an outside page: when its script runs, when it starts, after each attempt, after the raw attempts and just before it navigates", async () => {
+    const events = await runProbe("http://127.0.0.1:40125/page");
+    const n = Object.keys(EXPECTED_LIBRARY_WINDOW_IPC).length;
+    assert.deepEqual(events.slice(0, 2), ["progress /script-http", "progress /start"]);
+    assert.deepEqual(events.slice(2, 2 + n), Array.from({ length: n }, (_, i) => `progress /${i + 1}-denied`));
+    assert.equal(events[2 + n], "progress /raw");
+    assert.match(events[3 + n], /^progress \/report-\d+$/);
+    assert.equal(events[4 + n], `navigate ${CFG.report}`);
+    assert.equal(events.length, 5 + n);
+  });
+
+  it("in an error page: that it ran there, and that it goes on to the check's page", async () => {
+    const events = await runProbe("about:blank");
+    assert.deepEqual(events, ["progress /script-about", "progress /error-page", `navigate ${CFG.page}`]);
+  });
+
+  it("names each attempt by its outcome (allowed, denied, error; 'no answer' for one that waited out its limit)", async () => {
+    const events = await runProbe("http://127.0.0.1:40125/page", { invoke: (cmd) => (cmd === "open_library_window" ? Promise.resolve(true) : Promise.reject(new Error("boom"))) });
+    assert.equal(events[2], "progress /1-allowed");
+    assert.equal(events[3], "progress /2-error");
+  });
+});
+
+describe("the shell's trace of the sign-in window (Task MAC7)", () => {
+  const LINES = [
+    "AO_SHELL_SERVICE pid=12 port=4000 shell=11",
+    "AO_SHELL_LIBRARY opened",
+    "AO_SHELL_LIBRARY_TRACE navigation https://127.0.0.1:40125/sign-in allowed",
+    "something else",
+    "AO_SHELL_LIBRARY_TRACE address after 10 s: none (WKWebView URL is nil)",
+    "AO_SHELL_LIBRARY_TRACE fallback: no page started in 10 s; the shell opens the check's page",
+  ];
+
+  it("is not read as a state of the window (the 'changed nothing' item counts those)", () => {
+    for (const l of LINES.filter((l) => l.startsWith("AO_SHELL_LIBRARY_TRACE"))) assert.equal(parseShellLine(l), null, l);
+  });
+
+  it("is picked out of the shell's output, and the fallback is told", () => {
+    const t = libraryTrace(LINES);
+    assert.deepEqual(t.lines, [
+      "navigation https://127.0.0.1:40125/sign-in allowed",
+      "address after 10 s: none (WKWebView URL is nil)",
+      "fallback: no page started in 10 s; the shell opens the check's page",
+    ]);
+    assert.equal(t.fallback, true);
+    assert.deepEqual(libraryTrace(["AO_SHELL_LIBRARY_TRACE page-load started http://127.0.0.1:40125/page"]), { lines: ["page-load started http://127.0.0.1:40125/page"], fallback: false });
+    assert.deepEqual(libraryTrace([]), { lines: [], fallback: false });
+  });
+
+  it("after the shell's fallback the probe's report decides, as without it (R458 a); no report still fails", () => {
+    assert.deepEqual(libraryProbeProblems(LIBRARY_GOOD, { fallback: true }), []);
+    assert.match(libraryProbeProblems({ ...LIBRARY_GOOD, ipc: { ...EXPECTED_LIBRARY_WINDOW_IPC, "library.take": "allowed" } }, { fallback: true }).join("\n"), /library\.take is allowed, expected denied/);
+    assert.deepEqual(libraryProbeProblems(LIBRARY_GOOD, { fallback: false }), []);
+    assert.deepEqual(libraryProbeProblems(null, { fallback: true }), ["the sign-in window's probe reported nothing", "no page started in the sign-in window: the shell opened the check's page itself (its fallback), and the probe reported nothing even there"]);
   });
 });
