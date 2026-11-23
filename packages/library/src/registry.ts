@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { writeFileAtomic } from "./fs/atomic.js";
 import type { Deps } from "./deps.js";
@@ -65,14 +65,30 @@ function stamp(d: Date): string {
 }
 
 /**
- * Keeps a damaged registry as libraries.json.corrupt-<stamp> before it is overwritten, and then,
+ * `libraries.json.corrupt-<stamp>`, with `-n` when that name is taken (as the other set-aside files
+ * of this package are named): a second damaged list set aside within the same second never
+ * overwrites the first (R484 l).
+ */
+async function corruptName(deps: RegDeps, now: Date): Promise<string> {
+  for (let n = 0; ; n++) {
+    const name = `${file(deps)}.corrupt-${stamp(now)}${n === 0 ? "" : `-${n}`}`;
+    try {
+      await lstat(name);
+    } catch {
+      return name;
+    }
+  }
+}
+
+/**
+ * Keeps a damaged registry as libraries.json.corrupt-<stamp>[-n] before it is overwritten, and then,
  * only once that rename has succeeded, raises a device-level notice (Task 68 fix round 2, R181 a):
  * nothing in the settings folder is set aside in silence.
  */
 async function backupIfDamaged(deps: RegDeps, damaged: boolean): Promise<void> {
   if (!damaged) return;
   const now = deps.clock();
-  await rename(file(deps), `${file(deps)}.corrupt-${stamp(now)}`);
+  await rename(file(deps), await corruptName(deps, now));
   await raiseDeviceNotice(deps.appConfigDir, "libraries-list-set-aside", now);
 }
 

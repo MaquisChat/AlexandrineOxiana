@@ -109,6 +109,20 @@ describe("libraries.json set aside (R181 a)", () => {
     expect((await listLibraries(deps())).map((e) => e.libraryId).sort()).toEqual(["L0", "L1", "L9"]);
   });
 
+  it("R484 l: a second damaged list set aside in the same second (another process wrote it meanwhile) does not overwrite the first", async () => {
+    const firstDamaged = JSON.stringify([{ libraryId: "L0", name: "Zero", lastKnownPaths: ["/a/Zero"], lastOpenedAt: "2026-01-01T00:00:00Z" }, 7]);
+    await writeFile(join(dir, "libraries.json"), firstDamaged);
+    window.during = async () => {
+      window.during = undefined;
+      await writeFile(join(dir, "libraries.json"), "{damaged by another process");
+    };
+    await registerLibrary({ libraryId: "L1", name: "One", path: "/a/One" }, deps());
+    const setAside = (await readdir(dir)).filter((n) => n.startsWith("libraries.json.corrupt-")).sort();
+    expect(setAside).toHaveLength(2);
+    expect((await Promise.all(setAside.map((n) => readFile(join(dir, n), "utf8")))).sort()).toEqual([firstDamaged, "{damaged by another process"].sort());
+    expect((await listLibraries(deps())).map((e) => e.libraryId).sort()).toEqual(["L0", "L1"]);
+  });
+
   it("a list that is fine, or missing: no notice", async () => {
     await registerLibrary({ libraryId: "L1", name: "One", path: "/a/One" }, deps());
     await registerLibrary({ libraryId: "L2", name: "Two", path: "/a/Two" }, deps());

@@ -50,9 +50,9 @@ function reportSummary(r: ProfileReport): string {
   if (r.newlyUnavailable) parts.push(`${plural(r.newlyUnavailable, "post")} no longer on the platform`);
   if (r.reappeared) parts.push(`${plural(r.reappeared, "post")} back on the platform`);
   if (r.edited) parts.push(`${plural(r.edited, "post")} edited since the last capture`);
-  // Known posts whose caption looks edited but whose own data could not be fetched (FR-106).
   const lead = r.status === "completed" ? "Finished:" : r.status === "paused-rate-limited" ? "Paused:" : "Stopped:";
-  // Said as the command line and the report file say it (R473 M6).
+  // Known posts whose caption looks edited but whose own data could not be fetched (FR-106), said as
+  // the command line and the report file say it (R473 M6).
   return `${lead} ${parts.join(", ")}.${r.editsNotChecked ? ` ${editsNotCheckedText(r.editsNotChecked)}` : ""}`;
 }
 

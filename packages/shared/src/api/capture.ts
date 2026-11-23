@@ -21,7 +21,6 @@
  * same project is refused: 409 CONFLICT with reason CAPTURE_RUNNING (R146; Task 63).
  */
 
-/** How long a finished queue stays readable (1 hour). */
 /**
  * The count of a profile run's possible caption edits that could not be checked (FR-106), said one
  * way wherever it is shown: the command line, the capture queue and the run's report file (R473 M6).
@@ -32,6 +31,7 @@ export function editsNotCheckedText(n: number): string {
     : `${n} possible edits could not be checked. Capture the profile again later to check them.`;
 }
 
+/** How long a finished queue stays readable (1 hour). */
 export const CAPTURE_QUEUE_KEEP_MS = 60 * 60_000;
 /** Finished queues kept by the service at most (all projects together). */
 export const CAPTURE_QUEUES_KEPT = 50;
