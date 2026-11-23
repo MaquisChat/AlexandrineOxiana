@@ -88,6 +88,9 @@ type Phase = { kind: "loading" } | { kind: "ready" } | { kind: "renewing" } | { 
 
 const isVideo = (asset: { mime: string; kind?: string }) => /^video\//i.test(asset.mime) || (!/^audio\//i.test(asset.mime) && asset.kind === "video");
 
+/** How long a renewal waits for the ended ticket's revoke to answer before it goes on without its code (R467 M4). */
+export const REVOKE_WAIT_MS = 10_000;
+
 const RETRY = "Try the recording again";
 
 /**
@@ -248,10 +251,17 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       ticket = null;
       let changed = false;
       if (old) {
+        // R467 M4: waited for no longer than REVOKE_WAIT_MS; no answer by then is no code.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const limit = new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), REVOKE_WAIT_MS);
+        });
         try {
-          changed = (await api.revokeTicket(old))?.ended === MEDIA_FILE_CHANGED;
+          changed = (await Promise.race([api.revokeTicket(old), limit]))?.ended === MEDIA_FILE_CHANGED;
         } catch {
           /* not known: renewed as before */
+        } finally {
+          clearTimeout(timer);
         }
       }
       if (!live || halted) return;

@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MEDIA_TICKET_IDLE_MS } from "@ao/shared";
-import { MEDIA_FILE_CHANGED_SENTENCE } from "../components/MediaTicketPlayer";
+import { MEDIA_FILE_CHANGED_SENTENCE, REVOKE_WAIT_MS } from "../components/MediaTicketPlayer";
 import { transcriptApi } from "../api/transcripts";
 import { setMedia } from "../test/media";
 import { navigate } from "../navigation";
@@ -616,6 +616,35 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(el.getAttribute("src")).toBeNull();
     // R467 M5: a retry cannot help, so none is offered: the sentence and the controls agree.
     expect(screen.queryByRole("button", { name: "Try the recording again" })).toBeNull();
+  });
+
+  it("a revoke that never answers is waited for no longer than REVOKE_WAIT_MS; then the player renews as if no code came, never 'Reconnecting' for ever (R467 M4)", async () => {
+    const realSetTimeout = globalThis.setTimeout;
+    const limits: Array<() => void> = [];
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      if (ms === REVOKE_WAIT_MS) {
+        limits.push(fn);
+        return 0 as unknown as ReturnType<typeof setTimeout>;
+      }
+      return realSetTimeout(fn, ms, ...(rest as []));
+    }) as typeof setTimeout);
+    const { svc } = await open();
+    let hang = true;
+    server.use(http.post(url("/media-tickets/revoke"), async () => (hang ? new Promise<Response>(() => {}) : HttpResponse.json({ revoked: true }))));
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4);
+    fireEvent(el, new Event("error"));
+    expect(await screen.findByText("Reconnecting the recording…")).toBeTruthy();
+    await waitFor(() => expect(limits).toHaveLength(1));
+    expect(svc.log.tickets).toHaveLength(1);
+    hang = false;
+    act(() => limits[0]!());
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    expect(screen.queryByText("Reconnecting the recording…")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("too many recordings open at once is said in one plain sentence (review M3)", async () => {
