@@ -556,6 +556,45 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(svc.log.tickets).toHaveLength(5);
   });
 
+  it("after a long pause the researcher presses play (or seeks) and only then the expired ticket fails: a renewal, never 'may be damaged'; a young ticket's failure still counts (FR-260, R467 I1)", async () => {
+    const realNow = Date.now.bind(Date);
+    let skipped = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + skipped);
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    // The reviewer's probe: pause, 11 minutes, play (or a seek), then the element's read fails.
+    for (const [i, at] of [50, 50.8, 51.5].entries()) {
+      playTo(el, at);
+      fireEvent(el, new Event("pause"));
+      skipped += MEDIA_TICKET_IDLE_MS + 60_000;
+      if (i === 1) {
+        el.currentTime = at;
+        fireEvent(el, new Event("seeking"));
+      } else fireEvent(el, new Event("play"));
+      fireEvent(el, new Event("error"));
+      await waitFor(() => expect(svc.log.tickets).toHaveLength(i + 2));
+      await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[i + 1]!.path}`));
+      browserReset(el);
+      fireEvent(el, new Event("loadedmetadata"));
+      expect(el.currentTime).toBe(at);
+      fireEvent(el, new Event("seeked"));
+    }
+    expect(screen.queryByText(/The recording could not be played/)).toBeNull();
+    // A ticket that fails while young counts: it cannot renew for ever.
+    for (let cycle = 0; cycle < 4; cycle++) {
+      fireEvent(el, new Event("error"));
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 30));
+      });
+      fireEvent(el, new Event("loadedmetadata"));
+      playTo(el, 51.6);
+    }
+    expect(await screen.findByText(/The recording could not be played/)).toBeTruthy();
+    // Four tickets for the three pauses, one renewal of a young ticket, then it stops.
+    expect(svc.log.tickets).toHaveLength(5);
+  });
+
   it("a recording whose file the service found changed outside the app says so at once, never 'may be damaged' after retries (FR-218, FR-219)", async () => {
     const { svc } = await open();
     await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
