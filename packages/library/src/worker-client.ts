@@ -222,6 +222,11 @@ const POLL_RETRIES = 3;
 /** Job ids being run by any client of this process (a fast path; the journal claim is what guarantees one run). */
 const claimed = new Set<string>();
 
+/** Whether a job is being run by a worker client of this process now (R466 M6: running, not "waiting to run again"). */
+export function jobRunningHere(id: string): boolean {
+  return claimed.has(id);
+}
+
 /** Another resubmission claimed the job first (or it has finished): nothing to do. */
 class NotClaimed extends Error {}
 

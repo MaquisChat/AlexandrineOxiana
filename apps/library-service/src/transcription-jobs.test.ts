@@ -51,6 +51,8 @@ interface StubWorker {
   release(): void;
   instant: boolean;
   postDelayMs: number;
+  /** The progress each poll adds (default 0.25, up to 0.75; with a step set, up to 0.99). */
+  progressStep?: number;
   failWith?: { code: string; message: string; tool?: string };
   onPost?: (run: WorkerRun) => void;
   close(): Promise<void>;
@@ -94,7 +96,7 @@ async function stubWorker(): Promise<StubWorker> {
     run.polls++;
     if (run.cancelled) return send(200, { id: run.id, status: "cancelled", progress: 0.5 });
     if (w.failWith) return send(200, { id: run.id, status: "failed", error: w.failWith });
-    if (!w.instant && (!released || run.polls < 3)) return send(200, { id: run.id, status: "running", progress: Math.min(0.75, run.polls * 0.25) });
+    if (!w.instant && (!released || run.polls < 3)) return send(200, { id: run.id, status: "running", progress: w.progressStep ? Math.min(0.99, run.polls * w.progressStep) : Math.min(0.75, run.polls * 0.25) });
     if (run.type === "audio.transcribe") {
       await mkdir(run.output, { recursive: true });
       await writeFile(join(run.output, "segments.json"), JSON.stringify([{ start: 0, end: 2, text: "Welcome.", lang: "en", flags: ["outside-speech"] }]));
@@ -663,6 +665,33 @@ describe("fix round 1", () => {
     await start();
     await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } });
     expect(await stateOf(pid, sid)).toMatchObject({ status: "queued", waiting: true });
+  });
+
+  it("R466 M6 (FR-392): a run that goes on after a lock and an unlock is shown as running, and the jobs indicator follows it again", async () => {
+    const { pid, sid, versions, unlock } = await encryptedRun();
+    worker!.progressStep = 0.01;
+    const seen: Array<Record<string, unknown>> = [];
+    svc!.state.events.subscribe((e) => {
+      if (e.type === "job.progress" && (e.data as { kind?: string }).kind === "transcription") seen.push(e.data as Record<string, unknown>);
+    });
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(async () => (await stateOf(pid, sid))?.status === "running");
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    await unlock();
+    // The worker's run went on through the lock (its own copy of the key): it is running, not waiting.
+    expect(worker!.runs).toHaveLength(1);
+    expect(worker!.runs[0]!.cancelled).toBe(false);
+    const job = await stateOf(pid, sid);
+    expect(job?.status).toBe("running");
+    expect(job?.waiting).toBeUndefined();
+    // The next progress it reports reaches the jobs indicator with the job again.
+    const from = seen.length;
+    await until(() => seen.slice(from).some((e) => (e.job as { status?: string } | undefined)?.status === "running"));
+    worker!.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker!.runs).toHaveLength(1);
+    expect(await versions()).toBe(2);
   });
 
   it("M10: while the project is locked, events carry nothing of its job", async () => {

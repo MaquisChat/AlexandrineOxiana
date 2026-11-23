@@ -65,8 +65,11 @@ interface Live {
   forgotten?: boolean;
 }
 
-/** The state recorded in the journal, for a job this run of the service does not hold. */
-export function fromRecord(rec: JobRecord): TranscriptionJob {
+/**
+ * The state recorded in the journal, for a job this run of the service does not hold. `runningHere`: a worker
+ * client of this process is running it now (a run that went on through a lock and an unlock, R466 M6).
+ */
+export function fromRecord(rec: JobRecord, runningHere = false): TranscriptionJob {
   const model = rec.about?.model;
   const job: TranscriptionJob = {
     jobId: rec.id,
@@ -74,8 +77,8 @@ export function fromRecord(rec: JobRecord): TranscriptionJob {
     sourceId: rec.about?.sourceId ?? "",
     ...(model ? { model } : {}),
     // Pending in the journal and run by no one now (M2): waiting to run again, not "running".
-    status: rec.status === "running" ? "queued" : rec.status,
-    ...(rec.status === "running" || rec.status === "queued" ? { waiting: true } : {}),
+    status: rec.status === "running" ? (runningHere ? "running" : "queued") : rec.status,
+    ...((rec.status === "running" || rec.status === "queued") && !runningHere ? { waiting: true } : {}),
     startedAt: rec.createdAt,
     updatedAt: rec.updatedAt,
   };
@@ -259,7 +262,7 @@ export class Transcriptions {
   }
 
   private progress(l: Live, p: number): void {
-    if (l.forgotten) return;
+    if (l.forgotten && !this.readopt(l)) return;
     if (!this.active(l) || l.ac.signal.aborted) return;
     const percent = Math.max(0, Math.min(100, Math.floor(p * 100)));
     const changed = l.job.status !== "running" || percent > l.percent;
@@ -269,6 +272,25 @@ export class Transcriptions {
     l.job.updatedAt = new Date().toISOString();
     l.percent = percent;
     this.publish(l);
+  }
+
+  /**
+   * A run forgotten at its project's lock that goes on after the unlock (its worker run kept its own copy of the
+   * key, R142) is followed again from its next progress (R466 M6): nothing of it was held while the project was
+   * locked. Only in the library it was started in, and only while its project is unlocked.
+   */
+  private readopt(l: Live): boolean {
+    let unlocked = false;
+    try {
+      unlocked = l.unlocked();
+    } catch {
+      // the project is gone
+    }
+    if (!unlocked || this.state.session?.lib !== l.lib || this.live.has(l.job.jobId)) return false;
+    l.forgotten = false;
+    this.live.set(l.job.jobId, l);
+    this.bySource.set(this.key(l.job.projectId, l.job.sourceId), l.job.jobId);
+    return true;
   }
 
   private stored(l: Live, st: StoredTranscript): void {

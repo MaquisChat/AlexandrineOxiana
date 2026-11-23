@@ -122,6 +122,7 @@ export {
   WorkerToolsClient,
   WorkerUnavailableError,
   devWorkerPython,
+  jobRunningHere,
   startWorker,
 } from "./worker-client.js";
 export type {
