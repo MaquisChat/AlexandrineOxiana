@@ -547,44 +547,85 @@ async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySam
       else flag(report.mismatched, entry, f, st); // unreadable or fails to decrypt
     }
   }
-  if (opts.confirm && flagged.size) await confirmFindings(lib.root, report, flagged, opts.keyRing ?? new KeyRing(), stat, opts.confirm);
+  if (opts.confirm && flagged.size) await confirmFindings(lib, report, flagged, opts.keyRing ?? new KeyRing(), stat, opts.confirm, opts.signal);
   return report;
 }
 
+/** At most this many flagged sources are confirmed in one turn of the write queue (R484 e). */
+export const CONFIRM_BATCH_SOURCES = 200;
+
+/** A flagged entry's record as it is in the queue's turn: its source read again, or its locked project's manifest. */
+type FreshRecord = { sf: Awaited<ReturnType<typeof readSource>> } | { manifest: Manifest } | { error: string };
+
 /**
- * FR-420 (R469 b): the flagged entries read again in ONE turn of the write queue, each against a fresh read of its
- * source (or of its locked project's manifest), and only what is still wrong is kept in the report. Only flagged
- * entries are read, and no file is hashed again in the turn: a hash finding stands when the record and the file are
- * both as they were when it was hashed, and is dropped otherwise (unconfirmed, it is not reported). A project locked
- * before the turn throws its locked refusal, so checkIntegrity checks again with that project locked (R404).
+ * R484 e: the library was closed (as a move closes the old handle) since the check began: the check ends with the
+ * error such a library gives, as a change asked of it does, never with its findings dropped as unconfirmed.
+ */
+async function endIfClosed(lib: Pick<Library, "id" | "root">): Promise<void> {
+  if (!isClosed(lib as Library)) return;
+  const moved = await fsp.lstat(join(lib.root, MOVED_MARKER)).then(
+    (st) => st.isFile(),
+    () => false,
+  );
+  throw new ReadOnlyLibraryError(moved ? "moved" : (lib as Partial<Library>).readOnlyReason);
+}
+
+/**
+ * FR-420 (R469 b, R484 e): the flagged entries read again in the write queue's turn, each against a fresh read of its
+ * source (or of its locked project's manifest), and only what is still wrong is kept in the report. Each source is
+ * read once, however many of its files were flagged; at most CONFIRM_BATCH_SOURCES sources are confirmed per turn,
+ * and the queue is left between batches, so a lock or a write asked meanwhile waits for one batch only. The request's
+ * `signal` is honoured between batches; a library closed or moved meanwhile ends the check (endIfClosed). Only
+ * flagged entries are read, and no file is hashed again in the turn: a hash finding stands when the record and the
+ * file are both as they were when it was hashed, and is dropped otherwise (unconfirmed, it is not reported). A project
+ * locked before the turn throws its locked refusal, so checkIntegrity checks again with that project locked (R404).
  */
 async function confirmFindings(
-  root: string,
+  lib: Pick<Library, "id" | "root">,
   report: IntegrityReport,
   flagged: ReadonlyMap<IntegrityEntry, { f: ExpectedFile; hashed?: Stats }>,
   keyRing: KeyRing,
   stat: StatFn,
   confirm: <T>(fn: () => Promise<T>) => Promise<T>,
+  signal: AbortSignal | undefined,
 ): Promise<void> {
   type Still = "missing" | "mismatched" | "placeholder" | { error: string } | undefined;
-  const verdicts = await confirm(async () => {
-    const out = new Map<IntegrityEntry, Still>();
-    for (const [entry, x] of flagged) out.set(entry, await stillWrong(root, x.f, x.hashed, keyRing, stat));
-    return out;
-  });
+  /** The flagged entries of each source (by folder), or of each locked project (by its manifest). */
+  const bySource = new Map<string, Array<[IntegrityEntry, { f: ExpectedFile; hashed?: Stats }]>>();
+  for (const [entry, x] of flagged) {
+    const key = x.f.asset ? `source\0${x.f.folder}` : `manifest\0${x.f.projectRel}`;
+    bySource.set(key, [...(bySource.get(key) ?? []), [entry, x]]);
+  }
+  const groups = [...bySource.values()];
+  const verdicts = new Map<IntegrityEntry, Still>();
+  for (let i = 0; i < groups.length; i += CONFIRM_BATCH_SOURCES) {
+    signal?.throwIfAborted();
+    await endIfClosed(lib);
+    const batch = groups.slice(i, i + CONFIRM_BATCH_SOURCES);
+    const got = await confirm(async () => {
+      await endIfClosed(lib);
+      const out = new Map<IntegrityEntry, Still>();
+      for (const list of batch) {
+        const fresh = await freshRecord(lib.root, list[0]![1].f, keyRing);
+        for (const [entry, x] of list) out.set(entry, await stillWrong(lib.root, x.f, x.hashed, fresh, stat));
+      }
+      return out;
+    });
+    for (const [entry, v] of got) verdicts.set(entry, v);
+  }
   // Every missing or mismatched entry was flagged; each now goes where its confirmation puts it, in check order.
-  report.missing = [...verdicts.keys()].filter((e) => verdicts.get(e) === "missing");
-  report.mismatched = [...verdicts.keys()].filter((e) => verdicts.get(e) === "mismatched");
-  for (const [entry, v] of verdicts) {
+  const order = [...flagged.keys()];
+  report.missing = order.filter((e) => verdicts.get(e) === "missing");
+  report.mismatched = order.filter((e) => verdicts.get(e) === "mismatched");
+  for (const entry of order) {
+    const v = verdicts.get(entry);
     if (v === "placeholder") report.placeholders.push(entry);
     else if (typeof v === "object") report.errors.push({ path: entry.path, message: v.error });
   }
 }
 
-/** One flagged entry, as it is in the queue's turn (see confirmFindings). */
-async function stillWrong(root: string, f: ExpectedFile, hashed: Stats | undefined, keyRing: KeyRing, stat: StatFn): Promise<"missing" | "mismatched" | "placeholder" | { error: string } | undefined> {
-  let path = f.path;
-  let fresh: Asset | undefined;
+/** A flagged entry's source read again (once for all its flagged files), or its locked project's manifest. */
+async function freshRecord(root: string, f: ExpectedFile, keyRing: KeyRing): Promise<FreshRecord> {
   if (f.asset) {
     let k: { key: Uint8Array; keyId: string } | null = null;
     if (f.keyId) {
@@ -592,24 +633,36 @@ async function stillWrong(root: string, f: ExpectedFile, hashed: Stats | undefin
       if (!key) throw new ProjectLockedError(f.projectId);
       k = { key, keyId: f.keyId };
     }
-    let sf: Awaited<ReturnType<typeof readSource>>;
     try {
-      sf = await readSource(absIn(root, f.folder!), k, { annotations: false });
+      return { sf: await readSource(absIn(root, f.folder!), k, { annotations: false }) };
     } catch (err) {
       if (isLockedRefusal(err)) throw err;
       return { error: msg(err) };
     }
-    fresh = sf?.assets.find((a) => a.id === f.asset!.id && a.status !== "destroyed");
+  }
+  try {
+    return { manifest: JSON.parse(await fsp.readFile(absIn(root, `${f.projectRel}/manifest.json`), "utf8")) as Manifest };
+  } catch (err) {
+    return { error: msg(err) };
+  }
+}
+
+/** One flagged entry, as it is in the queue's turn, against its fresh record (see confirmFindings). */
+async function stillWrong(
+  root: string,
+  f: ExpectedFile,
+  hashed: Stats | undefined,
+  record: FreshRecord,
+  stat: StatFn,
+): Promise<"missing" | "mismatched" | "placeholder" | { error: string } | undefined> {
+  if ("error" in record) return { error: record.error };
+  let path = f.path;
+  let fresh: Asset | undefined;
+  if ("sf" in record) {
+    fresh = record.sf?.assets.find((a) => a.id === f.asset!.id && a.status !== "destroyed");
     if (!fresh) return undefined; // the source or the asset is gone, or it was destroyed: nothing is expected there now
     path = fresh.path;
-  } else {
-    try {
-      const manifest = JSON.parse(await fsp.readFile(absIn(root, `${f.projectRel}/manifest.json`), "utf8")) as Manifest;
-      if (!(manifest.sources ?? []).some((m) => (m.files ?? []).includes(f.path))) return undefined;
-    } catch (err) {
-      return { error: msg(err) };
-    }
-  }
+  } else if (!(record.manifest.sources ?? []).some((m) => (m.files ?? []).includes(f.path))) return undefined;
   let st: Stats;
   try {
     st = await stat(absIn(root, path));
