@@ -86,6 +86,8 @@ export interface ZoteroSyncRun {
   backoffUntil?: string;
   note?: string;
   recordSaved?: false;
+  /** R474 M8: no end yet, and another process of this computer (the command line, another copy of the app) is running it. */
+  runningElsewhere?: true;
 }
 
 /** What the saved key may read (the key itself is never in it). */
@@ -242,9 +244,26 @@ export const ZOTERO_SYNC_SENTENCES = {
   belongsToSync: "This import belongs to a Zotero sync. Stop it or run it again from the Zotero screen.",
   keyNotChecked: "Only the saved key can be checked. Save the key first, then check it.",
   settingsUnreadable: "This computer's Zotero sync settings could not be read, so nothing was changed. Try again in a moment.",
+  /** FR-508: the device notice `zotero-sync-settings-set-aside`, in the app's banner and the command line alike. */
+  settingsSetAside: "This computer's Zotero sync settings could not be read and were set aside. Automatic sync is off until you set it up again. Nothing in your library has changed.",
   /** The library module's own sentence for a settings file of a newer version (the service checks they are one). */
   settingsNewer: "These sync settings were written by a newer version of the app. Update the app to change them.",
+  /** FR-507 (R474): a key check that worked, but the pauses its refusals set could not be cleared (`ao zotero check-key`). */
+  keyPausesNotCleared: "This computer's Zotero sync settings could not be read or changed, so a Zotero library paused because of the key stays paused. Run the check again in a moment.",
 } as const;
+
+/**
+ * FR-463 (R474 M4): the Zotero rows of an import's report that count items also counted in another row (an item
+ * waiting for you that took other changes is also updated; a field cleared in Zotero and kept here belongs to an item
+ * counted under its own outcome). The screen's table and the report file say the same words.
+ */
+export const ZOTERO_REPORT_ROWS = {
+  conflicts: "Changed in Zotero and here — waiting for you (also counted in another row when other changes came in too)",
+  clearedInZoteroKept: "Cleared in Zotero, kept here (also counted in another row)",
+} as const;
+
+/** FR-507 (R474): how many links a key check that worked turned on again (said only when at least one was). */
+export const zoteroSyncsAgainLine = (n: number): string => `Syncing is on again for ${n} linked Zotero ${n === 1 ? "library" : "libraries"}.`;
 
 const timeOf = (d: Date) => new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(d);
 const dateOf = (d: Date) => new Intl.DateTimeFormat("en-GB", { dateStyle: "long" }).format(d);
@@ -349,6 +368,13 @@ export function zoteroSyncStatusLine(run: ZoteroSyncRun | undefined, now: Date):
       return `Synced with Zotero ${at}, with problems: ${known.join(" ")}${tail}`;
     }
     case "stopped":
+      // R474 M8: a run another process of this computer is still running is said as running, not as without an end.
+      if (run.runningElsewhere && run.finishedAt === undefined)
+        return `A sync with Zotero started ${at} is still running elsewhere on this computer, in the command line or in another copy of the app.`;
+      // FR-477: a record with no end is the started record (any finished one has an end): the app may have been
+      // closed during the run, or the run's end could not be saved (R252 c). Not said as the app's closing alone.
+      if (run.reason === "app-closed" && run.finishedAt === undefined)
+        return `The sync started with Zotero ${at} has no recorded end: the app may have been closed during it, or its end could not be saved. It continues next time. ${leftBehind(run)}`;
       return `Stopped syncing with Zotero ${at}: ${reason()} ${leftBehind(run)}`;
     case "failed":
       return `Could not sync with Zotero ${at}: ${reason()} ${leftBehind(run)}`;

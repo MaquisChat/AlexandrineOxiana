@@ -44,7 +44,7 @@ export {
   openLibrary,
 } from "./library.js";
 export type { Library, LibraryJson, OpenOptions } from "./library.js";
-export { HEARTBEAT_MS, STALE_MS, LockNotWritableError, acquireLock, readLock, releaseLock, startHeartbeat } from "./lock.js";
+export { HEARTBEAT_MS, STALE_MS, LockNotWritableError, acquireLock, peekLock, readLock, releaseLock, startHeartbeat } from "./lock.js";
 export type { LockInfo } from "./lock.js";
 export { classifyLocation, defaultLocationEnv, parseMacMount, parseProcMounts, parseWindowsDrives } from "./location.js";
 export type { Location, LocationEnv, MountInfo } from "./location.js";
@@ -234,6 +234,8 @@ export {
   ZoteroSyncFileBusyError,
   ZoteroSyncFileNewerError,
   ZoteroSyncFileUnreadableError,
+  clearZoteroKeyPauses,
+  clearZoteroKeyPausesEverywhere,
   pauseAllZoteroSyncLinks,
   pauseLink,
   readZoteroSyncHistory,

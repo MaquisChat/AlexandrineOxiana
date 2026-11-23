@@ -99,6 +99,8 @@ export interface BatchCounts {
   backInZotero?: number;
   backInZoteroUpdated?: number;
   goneNotMarked?: number;
+  /** R474 M7 (only when not 0): of `goneInZotero`, the sources whose undo puts back the mark they had before. */
+  goneInZoteroMarkBefore?: number;
   /**
    * Zotero account sync (Task Z6, R236; absent from older reports): sources with a field changed in Zotero and here,
    * Zotero's value waiting for the researcher's decision (an updated one is in `updated` too); sources with a field
@@ -160,7 +162,7 @@ export interface UndoResult {
   removedSources: number;
   revertedMerges: number;
   /** Of revertedMerges, by what the import had done (Z5; absent from an older service). */
-  reverted?: { merged: number; updated: number; unmarked: number; remarked: number; /** Z6: sources whose waiting Zotero values were taken off (absent when none). */ conflicts?: number };
+  reverted?: { merged: number; updated: number; unmarked: number; remarked: number; /** Z6: sources whose waiting Zotero values were taken off (absent when none). */ conflicts?: number; /** FR-467: sources given back the Zotero mark they had before (absent when none). */ restoredMarks?: number };
   kept: Array<{ kind: string; id: string; sourceId?: string; reason: string }>;
   /** Z8: the undo of a Zotero sync's batch paused its link (or could not), in the service's words. */
   zoteroSync?: ZoteroSyncUndoNote;

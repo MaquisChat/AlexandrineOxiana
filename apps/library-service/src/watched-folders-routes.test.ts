@@ -28,12 +28,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { WATCH_REASONS, createLibrary, deviceDeps, type Deps, type FolderWatch, type LocationEnv, type WatchStatus } from "@ao/library";
+import { WATCH_REASONS, createLibrary, deviceDeps, type Deps, type FolderWatch, type LocationEnv, type WatchRegisterEntry, type WatchStatus } from "@ao/library";
 import type { WatchedFolderSummary } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { FolderGrants } from "./folder-grants.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
-import { WatchStatusCoalescer, bringInDone, coalescerOf, fileItemOf, placeOf } from "./routes/watched-folders.js";
+import { WatchStatusCoalescer, bringInDone, coalescerOf, fileItemOf, originsInRegisterOrder, placeOf } from "./routes/watched-folders.js";
 import type { Session } from "./state.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -551,7 +551,7 @@ describe("set again, retry, remove", () => {
     const reason = WATCH_REASONS.notResponding.replace("{provider}", "the system");
     const stuckStatus: WatchStatus = { watchId: wid, state: "unreachable", reason, provider: null, scanning: false, counts: { cameIn: 0, alreadyInLibrary: 0, notDownloaded: 0, notDownloadedBytes: 0, waiting: 0, didNotComeIn: 0, changed: 0, gone: 0 } };
     const stop = vi.fn(async () => {});
-    const stuck: FolderWatch = { ready: Promise.resolve(), stopped: false, stop, status: () => stuckStatus, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {}, presence: () => "unknown" };
+    const stuck: FolderWatch = { ready: Promise.resolve(), stopped: false, stop, status: () => stuckStatus, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {}, presence: () => "unknown", origins: () => undefined };
     s.watches.set(pid, [stuck]);
     const r = await call({ method: "POST", url: `/projects/${pid}/watched-folders/${wid}/retry` });
     expect(r.status, r.body).toBe(200);
@@ -775,6 +775,45 @@ describe("files and origins", () => {
     expect([filtered.json.total, filtered.json.items.length]).toEqual([250, 5]);
     expect((await call({ url: `${base}?kind=changed` })).json).toEqual({ total: 0, items: [] });
   }, 60_000);
+
+  it("FR-475: a source with no register line yet is answered from the running watch's memory; a line on disk is the answer otherwise", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await folder("Early");
+    await pdf(join(dir, "early.pdf"), "A File Opened Soon After It Came In");
+    const wid = (await add(pid, dir, { label: "Team drive" })).json.id as string;
+    const wid2 = (await add(pid, await folder("Second"), { label: "Second drive" })).json.id as string;
+    const sid = await until(async () => (await sourceIds(pid))[0], 30_000, "the source");
+    const s = svc!.state.session!;
+    const entry = await until(async () => [...(await s.repo.watchRegister(pid, wid)).values()][0], 20_000, "the register");
+    for (const w of s.watches.get(pid)!) await w.stop();
+    // The second folder's watch holds a line for the source that its register on disk does not have yet; the first
+    // folder's (here noted changed in memory) has its line on disk, which is the answer.
+    const st = (id: string): WatchStatus => ({ watchId: id, state: "watching", provider: null, scanning: false, counts: { cameIn: 1, alreadyInLibrary: 0, notDownloaded: 0, notDownloadedBytes: 0, waiting: 0, didNotComeIn: 0, changed: 0, gone: 0 } });
+    let memory: WatchRegisterEntry[] | undefined = [{ ...entry, file: "early copy.pdf" }];
+    const stub = (id: string, origins: FolderWatch["origins"]): FolderWatch => ({ ready: Promise.resolve(), stopped: false, stop: async () => {}, status: () => st(id), problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {}, presence: () => "unknown", origins });
+    s.watches.set(pid, [stub(wid, (id) => (id === sid ? [{ ...entry, state: "changed" }] : [])), stub(wid2, (id) => (id === sid ? memory : []))]);
+    const told = await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` });
+    const first = { watchId: wid, folderLabel: "Team drive", folderRemoved: false, file: "early.pdf", state: "in-library", presence: "unknown" };
+    const second = { watchId: wid2, folderLabel: "Second drive", folderRemoved: false, file: "early copy.pdf", state: "in-library", presence: "unknown" };
+    expect(told.json.origins).toEqual([first, second].sort((a, b) => (a.watchId < b.watchId ? -1 : 1)));
+    // A watch that cannot say (its register not read): only the register on disk answers.
+    memory = undefined;
+    expect((await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` })).json.origins).toEqual([first]);
+  }, 60_000);
+
+  it("R474 M9: the origins keep the register's order (its files' names, as the library reads them), each folder's lines in their own order", () => {
+    // "ab-c.jsonl" comes before "ab.jsonl" ("-" before "."), although "ab" comes before "ab-c".
+    const byWatch = new Map([
+      ["ab", ["x", "y"]],
+      ["ab-c", ["z"]],
+    ]);
+    expect(originsInRegisterOrder(byWatch)).toEqual([
+      { watchId: "ab-c", entry: "z" },
+      { watchId: "ab", entry: "x" },
+      { watchId: "ab", entry: "y" },
+    ]);
+  });
 
   it("bring in the new version says \"already-there\" when the library already held that content, and \"attached\" when a file was added (R239 d)", () => {
     expect([bringInDone("duplicate"), bringInDone("attached")]).toEqual(["already-there", "attached"]);
@@ -1108,7 +1147,7 @@ describe("fix round 1 (R233)", () => {
     const s = svc!.state.session!;
     await s.watches.get(pid)![0]!.stop();
     const st: WatchStatus = { watchId: wid, state: "watching", provider: null, scanning: false, counts: { cameIn: 0, alreadyInLibrary: 0, notDownloaded: 0, notDownloadedBytes: 0, waiting: 0, didNotComeIn: 0, changed: 0, gone: 0 } };
-    const hung: FolderWatch = { ready: Promise.resolve(), stopped: false, stop: () => new Promise(() => {}), status: () => st, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {}, presence: () => "unknown" };
+    const hung: FolderWatch = { ready: Promise.resolve(), stopped: false, stop: () => new Promise(() => {}), status: () => st, problems: () => ({ total: 0, items: [] }), refreshChoices: async () => {}, setCollection: () => {}, presence: () => "unknown", origins: () => undefined };
     s.watches.set(pid, [hung]);
     expect(await answersWithin(call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${wid}` }), 2000)).toBe(200);
     expect((await call({ url: `/projects/${pid}/watched-folders` })).json.folders).toEqual([]);

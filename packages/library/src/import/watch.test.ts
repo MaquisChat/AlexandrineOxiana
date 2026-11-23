@@ -731,6 +731,52 @@ describe("cloud-drive folders: the engine reads nothing it may not (Task W2)", (
     expect(most).toBe(1);
   });
 
+  it("FR-472: while the watch's first call on the folder is in flight, the folder is said to be being looked through", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let asked!: () => void;
+    const inFlight = new Promise<void>((r) => (asked = r));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const realpathS = async (q: string) => {
+      if (q === inbox || q === real) {
+        asked();
+        await held;
+      }
+      return fsp.realpath(q);
+    };
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 60_000, fs: { realpath: realpathS } });
+    await inFlight;
+    expect(w.status()).toMatchObject({ state: "watching", scanning: true });
+    release();
+    await until(() => !w.status().scanning);
+    expect(w.status()).toMatchObject({ state: "watching", scanning: false });
+  });
+
+  it("FR-472: the same while the folder's first listing is in flight", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let asked!: () => void;
+    const inFlight = new Promise<void>((r) => (asked = r));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let first = true;
+    const readdirS = async (d: string) => {
+      if (first && d === real) {
+        first = false;
+        asked();
+        await held;
+      }
+      return fsp.readdir(d, { withFileTypes: true });
+    };
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 60_000, fs: { readdir: readdirS } });
+    await inFlight;
+    expect(w.status()).toMatchObject({ state: "watching", scanning: true });
+    release();
+    await until(() => !w.status().scanning);
+    expect(w.status()).toMatchObject({ state: "watching", scanning: false });
+  });
+
   it("after a call that never answers, no further call is issued on that folder until it settles", async () => {
     const p = await project();
     const real = await realpath(inbox);
@@ -1757,6 +1803,24 @@ describe("the register: where a source came from, and what happened to its file 
     expect(opened(join(inbox, "a.pdf"))).toEqual([]);
     expect(await registerWrites(p)).toBe(writes);
   }, 40_000);
+
+  it("FR-475: a source's origin is told from memory before its register line is written", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, registerFlushMs: 60_000, watchId: wid, attach: realishAttach() });
+    await w.ready;
+    await writeFile(join(inbox, "early.pdf"), "early");
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "early.pdf"));
+    const sid = events.find((e) => e.kind === "imported")!.sourceId!;
+    // The line waits for its timer: nothing is on disk yet, and the watch says where the source came from.
+    expect((await regOf(p, wid)).size).toBe(0);
+    expect(w.origins(sid)).toEqual([expect.objectContaining({ sourceId: sid, file: "early.pdf", state: "in-library" })]);
+    expect(w.origins(newId())).toEqual([]);
+    await w.stop();
+    // Written at stop(); a stopped watch tells nothing (the register on disk is then the answer).
+    expect([...(await regOf(p, wid)).values()]).toEqual([expect.objectContaining({ sourceId: sid, file: "early.pdf", state: "in-library" })]);
+    expect(w.origins(sid)).toBeUndefined();
+  });
 
   it("entries are written in batches of at most 50, and at stop()", async () => {
     const p = await project();

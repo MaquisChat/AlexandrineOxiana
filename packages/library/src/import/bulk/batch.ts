@@ -435,3 +435,17 @@ export function countOutcomes(latest: Iterable<JournalEntry>): {
   c.collectionsRenamed = renamed.size;
   return c;
 }
+
+/** The ids of the project's batches whose record says undone (an unreadable record is taken as standing). */
+export async function undoneBatchIds(repo: Repo, projectId: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const d of await batchDirs(repo, projectId)) {
+    try {
+      const r = await readBatchAt(repo, projectId, d.name);
+      if (r?.state === "undone") out.add(r.id);
+    } catch {
+      // unreadable: not known to be undone
+    }
+  }
+  return out;
+}

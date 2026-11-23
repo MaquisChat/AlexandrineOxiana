@@ -1,6 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
+import { ZOTERO_REPORT_ROWS } from "@ao/shared";
 import type { ImportApi, ImportReport } from "../../api/import";
 import { REPORT } from "../../test/importService";
 import { StepReport, undoQuestion } from "./StepReport";
@@ -77,8 +78,10 @@ describe("changed in Zotero and here (Z6, R236 e)", () => {
     show(report({}, { conflicts: 2, clearedInZoteroKept: 1 }));
     const table = await screen.findByRole("table", { name: "Items by outcome" });
     const row = (name: string) => within(table).getByRole("rowheader", { name }).closest("tr")!.textContent;
-    expect(row("Changed in Zotero and here — waiting for you")).toContain("2");
-    expect(row("Cleared in Zotero, kept here")).toContain("1");
+    // R474 M4: the same words as the report file, saying that the rows overlap others.
+    expect(row(ZOTERO_REPORT_ROWS.conflicts)).toContain("2");
+    expect(row(ZOTERO_REPORT_ROWS.clearedInZoteroKept)).toContain("1");
+    expect(ZOTERO_REPORT_ROWS.clearedInZoteroKept).toContain("also counted in another row");
   });
 
   it("no such rows when zero", async () => {
@@ -112,6 +115,11 @@ describe("gone from Zotero, and back (Z5, R224)", () => {
     }
   });
 
+  it("R474 M7: the undo question says that undoing a mark made over an earlier one puts that mark back", () => {
+    expect(undoQuestion(report({}, { goneInZotero: 1, goneInZoteroMarkBefore: 1 }))).toBe("Put back the Zotero mark 1 source had before?");
+    expect(undoQuestion(report({}, { goneInZotero: 3, goneInZoteroMarkBefore: 2 }))).toBe("Take the Zotero mark off 1 source and put back the Zotero mark 2 sources had before?");
+  });
+
   it("the undo's result line says what was done in the question's terms, leaving out zeros", async () => {
     const r = report({}, { goneInZotero: 1, backInZotero: 1 });
     const api = { report: async () => r, undo: async () => ({ removedSources: 0, revertedMerges: 2, reverted: { merged: 0, updated: 0, unmarked: 1, remarked: 1 }, kept: [] }) } as unknown as ImportApi;
@@ -127,6 +135,9 @@ describe("gone from Zotero, and back (Z5, R224)", () => {
     const { undoneText } = await import("./StepReport");
     expect(undoneText({ removedSources: 5, revertedMerges: 1, reverted: { merged: 0, updated: 1, unmarked: 0, remarked: 0 }, kept: [] })).toBe("Removed 5 imported sources and reverted 1 updated source.");
     expect(undoneText({ removedSources: 0, revertedMerges: 0, reverted: { merged: 0, updated: 0, unmarked: 0, remarked: 0 }, kept: [] })).toBe("No source needed to be changed.");
+    // FR-467: an undone deletion mark that gave back the earlier bin mark did not take the mark off.
+    expect(undoneText({ removedSources: 0, revertedMerges: 1, reverted: { merged: 0, updated: 0, unmarked: 0, remarked: 0, restoredMarks: 1 }, kept: [] })).toBe("Put back the Zotero mark 1 source had before.");
+    expect(undoneText({ removedSources: 0, revertedMerges: 3, reverted: { merged: 0, updated: 0, unmarked: 1, remarked: 0, restoredMarks: 2 }, kept: [] })).toBe("Took the Zotero mark off 1 source and put back the Zotero mark 2 sources had before.");
     // An older service, without the detail: the sentence as before.
     expect(undoneText({ removedSources: 1284, revertedMerges: 3, kept: [] })).toBe("Removed 1,284 sources and restored 3 sources that had been merged or updated.");
   });

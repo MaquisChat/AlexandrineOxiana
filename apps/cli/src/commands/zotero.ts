@@ -8,6 +8,7 @@ import {
   ZoteroSyncFileBusyError,
   ZoteroSyncFileUnreadableError,
   checkZoteroKey,
+  clearZoteroKeyPausesEverywhere,
   readZoteroSyncHistory,
   readZoteroSyncSettings,
   syncZoteroLibrary,
@@ -24,6 +25,7 @@ import {
   zoteroKeySummary,
   zoteroSyncReasonText,
   zoteroSyncStatusLine,
+  zoteroSyncsAgainLine,
   type ZoteroKeyAccess,
   type ZoteroSyncReason,
   type ZoteroSyncRun as SharedRun,
@@ -148,14 +150,32 @@ export function registerZotero(program: Command): void {
       } catch (err) {
         keyCheckFailure(err);
       }
+      // FR-507 (R248, R474): a key that works again clears the pauses Zotero's refusals set, as the app's key check does.
+      // This command opens no library, so it does so for every library this computer's settings file lists (the key is
+      // this computer's), in one write under the file's lock. The check's answer stands whatever happens to the file;
+      // a file set aside, or written by a newer version (left as it is), is said in the app's words; one that cannot be
+      // read or changed is said and exits 1.
+      let syncsAgain = 0;
+      let setAside = false;
+      let newer = false;
+      let notCleared = false;
+      try {
+        syncsAgain = await clearZoteroKeyPausesEverywhere(appConfigDir(), access, { onSetAside: () => (setAside = true), onNewer: () => (newer = true) });
+      } catch {
+        notCleared = true;
+      }
+      const notes = [...(setAside ? [ZOTERO_SYNC_SENTENCES.settingsSetAside] : []), ...(newer ? [ZOTERO_SYNC_SENTENCES.settingsNewer] : []), ...(notCleared ? [ZOTERO_SYNC_SENTENCES.keyPausesNotCleared] : [])];
       const view: ZoteroKeyAccess = {
         userId: access.userId,
         personal: { library: access.personal.library, files: access.personal.files, notes: access.personal.notes, write: access.personal.write },
         groups: access.groups.map((g) => ({ ref: g.ref, name: g.name, write: g.write })),
       };
       const summary = zoteroKeySummary(view);
-      out.data({ ...view, summary });
+      out.data({ ...view, summary, syncsAgain, ...(notes.length ? { notes } : {}) });
       out.line(summary);
+      if (syncsAgain > 0) out.line(zoteroSyncsAgainLine(syncsAgain));
+      if (!out.json) for (const n of notes) out.progress(n);
+      if (notCleared) process.exitCode = EXIT.failure;
     });
 
   zotero
@@ -182,7 +202,8 @@ export function registerZotero(program: Command): void {
         }
         if (newer) throw new ExitError(ZOTERO_SYNC_NEWER_SENTENCE, EXIT.failure);
         if (aside) {
-          throw new ExitError("This computer's Zotero sync settings were damaged, so they were set aside and no library is linked. Nothing was synced.", EXIT.failure, "The app shows a notice about it. Link your libraries again on its Zotero screen.");
+          // FR-508: the app's own words for it (its notice), then what the app says of a library with nothing linked.
+          throw new ExitError(ZOTERO_SYNC_SENTENCES.settingsSetAside, EXIT.failure, ZOTERO_SYNC_SENTENCES.nothingLinked);
         }
         // R295 a: a back-off any earlier run recorded (the app's or this command's) is obeyed before Zotero is asked anything:
         // nothing requested, nothing recorded, the sentence with its time (as the service refuses, before it looks at the links).

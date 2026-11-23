@@ -822,6 +822,40 @@ describe("running (Accept 3–5)", () => {
   });
 });
 
+describe("a sync running in another process (R474 M8, FR-477)", () => {
+  it("a record with no end, started while another live process on this computer holds the library, reads as running there; an older one does not", async () => {
+    const libPath = await openLibrary();
+    const pid = await newProject();
+    addItems(U, 2);
+    await saveSettings([linkOf(U, pid)]);
+    const [first] = await runAndWait();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    // The command line (another live process of this computer) holds the library since a minute ago and is syncing.
+    const opened = new Date(Date.now() - 60_000);
+    const beat = new Date().toISOString();
+    await writeFile(join(libPath, ".lock"), JSON.stringify({ deviceId: deps.deviceId, hostname: deps.hostname, pid: process.ppid, openedAt: opened.toISOString(), heartbeatAt: beat }));
+    const hist = await historyFile();
+    const key = Object.keys(hist.libraries)[0]!;
+    const { finishedAt: _f, counts: _c, batchId: _b, ...bare } = first;
+    const going = { ...bare, outcome: "stopped", reason: "app-closed", id: "00000000-0000-4000-8000-000000000002", startedAt: new Date(opened.getTime() + 5_000).toISOString() };
+    const older = { ...bare, outcome: "stopped", reason: "app-closed", id: "00000000-0000-4000-8000-000000000001", startedAt: new Date(opened.getTime() - 3_600_000).toISOString() };
+    hist.libraries[key] = [going, older, ...hist.libraries[key]];
+    await writeFile(join(deps.appConfigDir, "zotero-sync-history.json"), JSON.stringify(hist));
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).json.mode).toBe("read-only");
+    const runs = (await call({ url: "/zotero/sync/history" })).json.runs as Array<{ id: string; runningElsewhere?: true }>;
+    expect(runs.find((r) => r.id === going.id)?.runningElsewhere).toBe(true);
+    expect(runs.find((r) => r.id === older.id)?.runningElsewhere).toBeUndefined();
+    const line = (await state()).links[0].status as string;
+    expect(line).toMatch(/^A sync with Zotero started at \d\d:\d\d today is still running elsewhere on this computer, in the command line or in another copy of the app\.$/u);
+    expect(line).not.toContain("no recorded end");
+    // Once that process has let go of the library, the same record has no end (nothing is still running it).
+    await rm(join(libPath, ".lock"));
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: libPath } })).json.mode).toBe("read-write");
+    expect((await state()).links[0].status).toContain("has no recorded end");
+  });
+});
+
 describe("a manual import and a sync of one Zotero library never run together (A10)", () => {
   it("a manual import is refused while a sync runs, and the other way round", async () => {
     await openLibrary();

@@ -34,6 +34,7 @@ import { raiseDeviceNotice } from "../device-notices.js";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { FileLockBusyError, FileLockUnavailableError, withFileLock } from "../fs/file-lock.js";
 import { InvalidInputError } from "../repo/errors.js";
+import type { ZoteroKeyAccess } from "./zotero-web-account.js";
 
 export const ZOTERO_SYNC_FILE = "zotero-sync.json";
 export const ZOTERO_SYNC_HISTORY_FILE = "zotero-sync-history.json";
@@ -173,6 +174,8 @@ export interface ZoteroSyncRun {
   note?: string;
   /** Only on a returned record, never saved: false when the history file could not take it (R244 M3). */
   recordSaved?: false;
+  /** Only on a read record, never saved (R474 M8): no end yet, and another process of this computer is running it. */
+  runningElsewhere?: true;
 }
 
 /** The sentence for a sync file written by a newer version of the app (R244 M7). */
@@ -541,6 +544,80 @@ export async function updateZoteroSyncSettings(
   return copySettings(out!);
 }
 
+/**
+ * R248: a key check that worked clears the pauses Zotero's refusals set, for every link of the library in one settings
+ * write: `key-refused` everywhere, `library-gone` where the key now reads the library. `undone` is the researcher's own
+ * (only a settings save that resumes the link clears it, R265). Nothing is written when no link is cleared. The one rule
+ * for the service's key check and `ao zotero check-key` (FR-507). Throws as updateZoteroSyncSettings does.
+ */
+export async function clearZoteroKeyPauses(dir: string, libraryId: string, access: Pick<ZoteroKeyAccess, "userId" | "personal" | "groups">, o: ZoteroSyncFileOptions = {}): Promise<void> {
+  const clears = keyPauseCleared(access);
+  if (!(await readZoteroSyncSettings(dir, libraryId, o)).links.some(clears)) return;
+  await updateZoteroSyncSettings(
+    dir,
+    libraryId,
+    (cur) => ({
+      ...cur,
+      links: cur.links.map((l) => {
+        if (!clears(l)) return l;
+        const { paused: _p, ...rest } = l;
+        return rest;
+      }),
+    }),
+    o,
+  );
+}
+
+/** R248: whether a key check that worked (`access`) clears a link's pause: `key-refused`, or `library-gone` where the key reads the library. */
+function keyPauseCleared(access: Pick<ZoteroKeyAccess, "userId" | "personal" | "groups">): (l: ZoteroSyncLink) => boolean {
+  const reads = (ref: string) => {
+    const [type, id] = ref.split(":");
+    return type === "user" ? access.personal.library && access.userId === id : access.groups.some((g) => g.ref === ref);
+  };
+  return (l) => l.paused === "key-refused" || (l.paused === "library-gone" && reads(l.ref));
+}
+
+/**
+ * FR-507 (R474): `ao zotero check-key`, which opens no library: the rule of clearZoteroKeyPauses for EVERY library this
+ * computer's settings file lists (not the libraries list, which may be damaged or miss a library), in one write under
+ * the file's lock; `undone` is kept. Returns how many links were cleared (0: nothing written). A damaged file is set
+ * aside as on any read (`o.onSetAside` is told); a file of a newer version is left as it is (0). Throws as
+ * updateZoteroSyncSettings does.
+ */
+export async function clearZoteroKeyPausesEverywhere(dir: string, access: Pick<ZoteroKeyAccess, "userId" | "personal" | "groups">, o: ZoteroSyncFileOptions = {}): Promise<number> {
+  const clears = keyPauseCleared(access);
+  const file = await readFileStrict(dir, ZOTERO_SYNC_FILE, isSettingsFile, o);
+  if (!file || !Object.values(file.libraries).some((s) => s.links.some(clears))) return 0;
+  let cleared = 0;
+  await updateFile(
+    dir,
+    ZOTERO_SYNC_FILE,
+    isSettingsFile,
+    (cur) => {
+      cleared = 0;
+      if (!cur) return { v: 1 as const, libraries: {} };
+      const libraries = Object.fromEntries(
+        Object.entries(cur.libraries).map(([id, s]) => [
+          id,
+          {
+            ...s,
+            links: s.links.map((l) => {
+              const kept = copyLink(l);
+              if (!clears(kept)) return kept;
+              cleared++;
+              const { paused: _p, ...rest } = kept;
+              return rest;
+            }),
+          },
+        ]),
+      );
+      return { v: 1 as const, libraries };
+    },
+    o,
+  );
+  return cleared;
+}
+
 /** Changes the stored links of a library in one turn (nothing is written when the library has none or nothing changes). */
 async function editLinks(dir: string, libraryId: string, fn: (l: ZoteroSyncLink) => ZoteroSyncLink, o: ZoteroSyncFileOptions): Promise<void> {
   await updateFile(
@@ -610,20 +687,27 @@ export async function setZoteroSyncUnfinished(dir: string, libraryId: string, re
 /** Runs going on in this process (their records have no `finishedAt` yet and are not "closed during"). */
 export const runningZoteroSyncRuns = new Set<string>();
 
-/** A record without an end, not running in this process: the app closed during it (it continues next time). */
-function settled(r: ZoteroSyncRun): ZoteroSyncRun {
+/**
+ * A record without an end, not running in this process: the app closed during it (it continues next time) — unless
+ * it started while another live process of this computer held the library (`heldElsewhereSince`, ms), which alone
+ * can run a sync of it: then it is still running there (R474 M8), `runningElsewhere`.
+ */
+function settled(r: ZoteroSyncRun, heldElsewhereSince?: number): ZoteroSyncRun {
   if (r.finishedAt !== undefined || runningZoteroSyncRuns.has(r.id)) return r;
+  if (heldElsewhereSince !== undefined && Date.parse(r.startedAt) >= heldElsewhereSince) return { ...r, runningElsewhere: true };
   return { ...r, outcome: "stopped", reason: "app-closed" };
 }
 
 /**
  * This library's sync runs on this computer, newest first (at most ZOTERO_SYNC_HISTORY_MAX). A record started by an
- * earlier process and never finished reads as `stopped` / `app-closed`. A damaged file is set aside and the history
+ * earlier process and never finished reads as `stopped` / `app-closed` (or, with `heldElsewhereSince`, the time another
+ * live process of this computer opened the library, as `runningElsewhere` when it started since). A damaged file is set aside and the history
  * starts empty; a file that cannot be read throws ZoteroSyncFileUnreadableError.
  */
-export async function readZoteroSyncHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<ZoteroSyncRun[]> {
+export async function readZoteroSyncHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions & { heldElsewhereSince?: string } = {}): Promise<ZoteroSyncRun[]> {
   const f = await readFileStrict(dir, ZOTERO_SYNC_HISTORY_FILE, isHistoryFile, o);
-  return (own(f?.libraries, libraryId) ?? []).map((r) => settled(structuredClone(r)));
+  const since = o.heldElsewhereSince !== undefined ? Date.parse(o.heldElsewhereSince) : NaN;
+  return (own(f?.libraries, libraryId) ?? []).map((r) => settled(structuredClone(r), Number.isNaN(since) ? undefined : since));
 }
 
 /**
@@ -652,7 +736,7 @@ export async function putZoteroSyncRun(dir: string, libraryId: string, run: Zote
     ZOTERO_SYNC_HISTORY_FILE,
     isHistoryFile,
     (cur) => {
-      const list = (own(cur?.libraries, libraryId) ?? []).filter((r) => r.id !== run.id).map(settled);
+      const list = (own(cur?.libraries, libraryId) ?? []).filter((r) => r.id !== run.id).map((r) => settled(r));
       const at = (own(cur?.libraries, libraryId) ?? []).findIndex((r) => r.id === run.id);
       if (at >= 0 && at <= list.length) list.splice(at, 0, run);
       else list.unshift(run);

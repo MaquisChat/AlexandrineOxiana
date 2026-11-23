@@ -7,18 +7,19 @@
  * Zotero back-off is obeyed; a library held by the app is read-only for the command line and nothing runs.
  */
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { ZOTERO_SYNC_REASON_TEXT, ZOTERO_SYNC_SENTENCES, zoteroSyncStatusLine, type ZoteroSyncRun as SharedRun } from "@ao/shared";
+import { ZOTERO_SYNC_REASON_TEXT, ZOTERO_SYNC_SENTENCES, zoteroSyncStatusLine, zoteroSyncsAgainLine, type ZoteroSyncRun as SharedRun } from "@ao/shared";
 import {
   ZOTERO_SYNC_FILE,
   ZOTERO_SYNC_HISTORY_FILE,
   deviceDeps,
   openLibrary,
   readZoteroSyncHistory,
+  readZoteroSyncSettings,
   writeZoteroSyncSettings,
   type ZoteroSyncLink,
 } from "@ao/library";
@@ -235,6 +236,102 @@ describe("ao zotero check-key", () => {
       secrets = useMemorySecrets();
       await setSecret("zotero-api-key", z.key);
     }
+  });
+
+  it("FR-507: a key check that works clears the pauses Zotero's refusals set, as the app's does; an undo's pause stays", async () => {
+    z.addGroup(9, "Fieldwork group");
+    const other = "group:10";
+    const gone = "group:11";
+    await linked(link(U, { paused: "key-refused" }), link(G, { paused: "library-gone" }), link(other, { paused: "undone" }), link(gone, { paused: "library-gone" }));
+    const r = await ao(["zotero", "check-key"]);
+    expect(r.code, r.stderr).toBe(0);
+    const after = (await readZoteroSyncSettings(config, libraryId)).links.map((l) => [l.ref, l.paused]);
+    // key-refused everywhere; library-gone where the key now reads the library; the researcher's own undo is theirs.
+    expect(after).toEqual([
+      [U, undefined],
+      [G, undefined],
+      [other, "undone"],
+      [gone, "library-gone"],
+    ]);
+    // A check that fails clears nothing.
+    await linked(link(U, { paused: "key-refused" }));
+    z.revokeKey();
+    expect((await ao(["zotero", "check-key"])).code).toBe(1);
+    expect((await readZoteroSyncSettings(config, libraryId)).links[0]!.paused).toBe("key-refused");
+  });
+
+  it("FR-507 (R474): check-key clears the key's pauses for every library the settings file lists, in one write, keeps an undo's pause, and says how many links sync again", async () => {
+    z.addGroup(9, "Fieldwork group");
+    const other = "group:10";
+    const gone = "group:11";
+    // A library this computer's settings file lists but the libraries list does not (forgotten, or on a drive that is away).
+    const away = "AwayLibrary01";
+    await linked(link(U, { paused: "key-refused" }), link(G, { paused: "library-gone" }), link(other, { paused: "undone" }));
+    await writeZoteroSyncSettings(config, away, { automatic: true, everyMinutes: 60, links: [link(U, { paused: "key-refused" }), link(G, { paused: "library-gone" }), link(gone, { paused: "library-gone" })] });
+    const r = await ao(["zotero", "check-key"]);
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stdout.trim().split("\n")).toEqual(["This key can read your library and 1 group library.", zoteroSyncsAgainLine(4)]);
+    expect(zoteroSyncsAgainLine(1)).toBe("Syncing is on again for 1 linked Zotero library.");
+    expect(zoteroSyncsAgainLine(4)).toBe("Syncing is on again for 4 linked Zotero libraries.");
+    expect((await readZoteroSyncSettings(config, libraryId)).links.map((l) => [l.ref, l.paused])).toEqual([
+      [U, undefined],
+      [G, undefined],
+      [other, "undone"],
+    ]);
+    const there = await readZoteroSyncSettings(config, away);
+    expect(there.links.map((l) => [l.ref, l.paused])).toEqual([
+      [U, undefined],
+      [G, undefined],
+      [gone, "library-gone"],
+    ]);
+    expect(there.automatic).toBe(true);
+    // Nothing paused by the key any more: nothing of the kind is said; in JSON, the count.
+    const again = await ao(["--json", "zotero", "check-key"]);
+    expect(again.code, again.stderr).toBe(0);
+    expect(json(again)).toMatchObject({ summary: "This key can read your library and 1 group library.", syncsAgain: 0 });
+    const plain = await ao(["zotero", "check-key"]);
+    expect(plain.stdout.trim()).toBe("This key can read your library and 1 group library.");
+    expect(plain.stderr).toBe("");
+  });
+
+  it("FR-507 (R474): a damaged settings file set aside by check-key is said, as the app says it; a file that cannot be read or changed is said and exits 1", async () => {
+    await writeFile(join(config, ZOTERO_SYNC_FILE), "{ not json");
+    const r = await ao(["zotero", "check-key"]);
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stdout.trim()).toBe("This key can read your library.");
+    expect(r.stderr.trim()).toBe(ZOTERO_SYNC_SENTENCES.settingsSetAside);
+    expect((await readdir(config)).some((f) => f.startsWith(`${ZOTERO_SYNC_FILE}.unreadable-`))).toBe(true);
+    const j = await ao(["--json", "zotero", "check-key"]);
+    expect(json(j).notes ?? []).toEqual([]);
+    await writeFile(join(config, ZOTERO_SYNC_FILE), "{ not json");
+    const k = await ao(["--json", "zotero", "check-key"]);
+    expect(json(k)).toMatchObject({ syncsAgain: 0, notes: [ZOTERO_SYNC_SENTENCES.settingsSetAside] });
+    // Not readable at all (here: a folder where the file should be): said, exit 1; no path is printed.
+    await rm(join(config, ZOTERO_SYNC_FILE), { force: true });
+    await mkdir(join(config, ZOTERO_SYNC_FILE));
+    const bad = await ao(["zotero", "check-key"]);
+    expect(bad.code).toBe(1);
+    expect(bad.stdout.trim()).toBe("This key can read your library.");
+    expect(bad.stderr.trim()).toBe(ZOTERO_SYNC_SENTENCES.keyPausesNotCleared);
+    expect(ZOTERO_SYNC_SENTENCES.keyPausesNotCleared).toBe("This computer's Zotero sync settings could not be read or changed, so a Zotero library paused because of the key stays paused. Run the check again in a moment.");
+    for (const out of [r, bad]) expect(out.stdout + out.stderr).not.toContain(config);
+  });
+
+  it("FR-507 (R482 a): a settings file written by a newer version is left as it is by check-key, and the app's sentence for it is said; nothing says syncing is on again", async () => {
+    const file = join(config, ZOTERO_SYNC_FILE);
+    const text = JSON.stringify({ v: 2, libraries: { [libraryId]: { automatic: true, everyMinutes: 60, links: [link(U, { paused: "key-refused" })] } } });
+    await writeFile(file, text);
+    const r = await ao(["zotero", "check-key"]);
+    expect(r.code, r.stderr).toBe(0);
+    expect(await readFile(file, "utf8")).toBe(text);
+    expect(r.stdout.trim()).toBe("This key can read your library.");
+    expect(r.stderr.trim()).toBe(ZOTERO_SYNC_SENTENCES.settingsNewer);
+    expect(ZOTERO_SYNC_SENTENCES.settingsNewer).toBe("These sync settings were written by a newer version of the app. Update the app to change them.");
+    const j = await ao(["--json", "zotero", "check-key"]);
+    expect(j.code, j.stderr).toBe(0);
+    expect(json(j)).toMatchObject({ syncsAgain: 0, notes: [ZOTERO_SYNC_SENTENCES.settingsNewer] });
+    expect(r.stdout + r.stderr).not.toContain("Syncing is on again");
+    expect(await readFile(file, "utf8")).toBe(text);
   });
 
   it("R299 a: check-key obeys a back-off an earlier run recorded: it asks Zotero nothing, says the sentence with its time, exits 1; with the wait in the past it checks as before", async () => {
@@ -510,6 +607,9 @@ describe("ao zotero sync", () => {
     const damaged = await ao(["zotero", "sync"]);
     expect(damaged.code).not.toBe(0);
     expect(damaged.stderr).toMatch(/damaged|set aside/u);
+    // FR-508: in the app's own words (its notice), then what the app says of a library with nothing linked.
+    expect(damaged.stderr).toContain(ZOTERO_SYNC_SENTENCES.settingsSetAside);
+    expect(damaged.stderr).toContain(ZOTERO_SYNC_SENTENCES.nothingLinked);
     expect(z.requests).toEqual([]);
   });
 
