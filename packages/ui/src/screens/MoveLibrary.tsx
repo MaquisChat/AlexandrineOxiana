@@ -40,6 +40,11 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
   const ids = useId();
   const [dest, setDest] = useState("");
   const [stage, setStage] = useState<Stage>("pick");
+  /** After the old copy is deleted its button is gone: focus goes to the Progress heading, under which the result is said (R467 I2). */
+  const progressHeading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (stage === "deleted") progressHeading.current?.focus();
+  }, [stage]);
   const [plan, setPlan] = useState<MovePlan | null>(null);
   const [progress, setProgress] = useState<MoveProgress | null>(null);
   const [verified, setVerified] = useState<{ token: string; newRoot: string; message: string; warnings: string[] } | null>(null);
@@ -314,7 +319,9 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
 
       {stage === "moving" || stage === "verified" || stage === "failed" || stage === "deleted" ? (
         <section className="ao-card" aria-labelledby={`${ids}-prog`}>
-          <h2 id={`${ids}-prog`}>Progress</h2>
+          <h2 id={`${ids}-prog`} ref={progressHeading} tabIndex={-1}>
+            Progress
+          </h2>
           {progress && stage === "moving" ? (
             <>
               <progress aria-label="Move progress" max={progress.fileCount || 1} value={progress.filesDone} />

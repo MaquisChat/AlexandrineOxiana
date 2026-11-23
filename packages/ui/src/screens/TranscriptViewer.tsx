@@ -30,7 +30,7 @@ import { TRANSCRIPTION_RUNNING } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { errorText, isProjectLocked, type SourceFile } from "../api/library";
 import { TRANSCRIPTION_MODELS, transcriptionJobOf, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
-import { MediaTicketPlayer, type PlayerControl } from "../components/MediaTicketPlayer";
+import { MediaTicketPlayer, NO_RECORDING_SENTENCE, type PlayerControl } from "../components/MediaTicketPlayer";
 import { isPlayableRecording } from "../components/TranscriptLink";
 import { MissingToolNotice, modelOptionLabel, SpeechModelNotice, useSpeechModels } from "../components/MissingToolNotice";
 import { DEFAULT_SPEECH_MODEL, type ToolsApi } from "../api/tools";
@@ -638,7 +638,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
               control={player}
             />
           ) : (
-            <p className="ao-muted">This source has no recording to play. Its transcript is shown below.</p>
+            <p className="ao-muted">{NO_RECORDING_SENTENCE}</p>
           )}
         </section>
       )}

@@ -49,6 +49,10 @@ def models_dir() -> Path:
     return base / "ao-worker" / "models"
 
 
+# What the researcher can do about a model on disk that cannot be read or loaded (FR-254).
+_REINSTALL = "remove it and install it again from the Optional tools screen"
+
+
 def model_path(name: str) -> str:
     """The model's folder in `models_dir()`. A model already on disk is used with no network contact
     at all (R144). An absent model is never downloaded here: the job fails with TOOL_NOT_INSTALLED
@@ -61,10 +65,36 @@ def model_path(name: str) -> str:
     cache = str(folder)
     # Hugging Face cache layout: <models dir>/models--<owner>--<repo>/snapshots/<revision>/
     repo = folder / ("models--" + _MODELS[name].replace("/", "--"))
-    absent = (not folder.exists() or folder.is_dir()) and not os.path.lexists(repo)
-    if absent:
+
+    def unreadable() -> JobError:
+        # The FOLDER cannot be read: installing the model again would not help (FR-254, R467 M8). No path.
+        log.warning("the speech models folder cannot be read; not downloading")
+        return JobError(
+            "MODEL_UNAVAILABLE",
+            f"the folder that holds the speech models could not be read, so the {name} model could not be used; "
+            "check that the folder can be read, then try again",
+            tool=f"speech-{name}",
+        )
+
+    # Asked of the system, so that a folder that exists but cannot be listed or searched is told apart
+    # from one that is not there (R481 b): only "no such file" is "not installed".
+    try:
+        with os.scandir(folder):
+            pass
+    except FileNotFoundError:
         log.info("the %s speech model is not installed", name)
-        raise not_installed(f"speech-{name}")
+        raise not_installed(f"speech-{name}") from None
+    except OSError:  # not a folder, or no permission to list it
+        raise unreadable() from None
+    try:
+        os.lstat(repo)
+    except FileNotFoundError:
+        log.info("the %s speech model is not installed", name)
+        raise not_installed(f"speech-{name}") from None
+    except OSError:  # the folder cannot be searched
+        raise unreadable() from None
+    if not os.access(folder, os.R_OK | os.X_OK):
+        raise unreadable()
     try:
         path = download_model(name, cache_dir=cache, local_files_only=True)
     except Exception as e:  # noqa: BLE001 - reported, never answered with a download
@@ -73,7 +103,7 @@ def model_path(name: str) -> str:
         raise JobError(
             "MODEL_UNAVAILABLE",
             f"the {name} model on disk is incomplete or damaged; install it again from the Optional tools screen"
-            if damaged else f"the {name} model on disk could not be read",
+            if damaged else f"the {name} model on disk could not be read; {_REINSTALL}",
             type(e).__name__,
             tool=f"speech-{name}",
         ) from e
@@ -100,7 +130,7 @@ def _load_model(name: str, compute_type: str):
             except ValueError as e:  # e.g. float16 on a CPU without support
                 raise JobError("INVALID_PARAMS", f"compute type {compute_type} is not supported on this device") from e
             except (OSError, RuntimeError) as e:  # damaged or incomplete model files
-                raise JobError("MODEL_UNAVAILABLE", f"the {name} model on disk could not be loaded", type(e).__name__) from e
+                raise JobError("MODEL_UNAVAILABLE", f"the {name} model on disk could not be loaded; {_REINSTALL}", type(e).__name__) from e
         return _model_cache[key]
 
 

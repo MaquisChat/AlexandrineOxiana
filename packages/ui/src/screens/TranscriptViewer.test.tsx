@@ -2,6 +2,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MEDIA_TICKET_IDLE_MS } from "@ao/shared";
+import { MEDIA_FILE_CHANGED_SENTENCE, NO_RECORDING_SENTENCE, REVOKE_WAIT_MS } from "../components/MediaTicketPlayer";
 import { transcriptApi } from "../api/transcripts";
 import { setMedia } from "../test/media";
 import { navigate } from "../navigation";
@@ -72,6 +74,21 @@ function layOut(): HTMLElement {
 function browserReset(el: HTMLMediaElement) {
   el.currentTime = 0;
   fireEvent(el, new Event("timeupdate"));
+}
+
+/**
+ * Makes the element's read fail and waits for where the player then rests: the next ticket asked
+ * for and put in the element ("renewed"), or the alert that it stopped ("stopped").
+ */
+async function failAndRest(el: HTMLMediaElement, tickets: Array<{ path: string }>): Promise<"renewed" | "stopped"> {
+  const before = tickets.length;
+  fireEvent(el, new Event("error"));
+  return waitFor(() => {
+    if (screen.queryByText(/The recording could not be played/)) return "stopped" as const;
+    expect(tickets.length).toBe(before + 1);
+    expect(el.getAttribute("src")).toBe(`${BASE}${tickets.at(-1)!.path}`);
+    return "renewed" as const;
+  });
 }
 
 /** Moves the player to `t` seconds as a browser would report it. */
@@ -510,6 +527,186 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     }
     expect(svc.log.tickets).toHaveLength(5);
     expect(screen.queryByText(/The recording could not be played/)).toBeNull();
+  });
+
+  it("a resume seek that never lands: once the element is playing again its time is taken, so the playing segment follows (FR-259)", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 1);
+    fireEvent(el, new Event("error"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    browserReset(el);
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(1);
+    // No `seeked` ever comes, and the element plays on from elsewhere.
+    fireEvent(el, new Event("playing"));
+    playTo(el, 5.2);
+    playTo(el, 6);
+    expect(segmentItems()[2]!.getAttribute("aria-current")).toBe("true");
+    expect(segmentItems()[0]!.getAttribute("aria-current")).toBeNull();
+  });
+
+  it("three ticket expiries after long pauses near one spot are renewals, never 'may be damaged' (FR-260)", async () => {
+    const realNow = Date.now.bind(Date);
+    let skipped = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + skipped);
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    for (const [i, at] of [50, 50.8, 51.5, 50.2].entries()) {
+      playTo(el, at);
+      // Paused here longer than a ticket lives without reads: the ticket ended on its own.
+      skipped += MEDIA_TICKET_IDLE_MS + 60_000;
+      fireEvent(el, new Event("error"));
+      await waitFor(() => expect(svc.log.tickets).toHaveLength(i + 2));
+      await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[i + 1]!.path}`));
+      browserReset(el);
+      fireEvent(el, new Event("loadedmetadata"));
+      expect(el.currentTime).toBe(at);
+      fireEvent(el, new Event("seeked"));
+    }
+    expect(screen.queryByText(/The recording could not be played/)).toBeNull();
+    expect(svc.log.tickets).toHaveLength(5);
+  });
+
+  it("after a long pause the researcher presses play (or seeks) and only then the expired ticket fails: a renewal, never 'may be damaged'; a young ticket's failure still counts (FR-260, R467 I1)", async () => {
+    const realNow = Date.now.bind(Date);
+    let skipped = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + skipped);
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    // The reviewer's probe: pause, 11 minutes, play (or a seek), then the element's read fails.
+    for (const [i, at] of [50, 50.8, 51.5].entries()) {
+      playTo(el, at);
+      fireEvent(el, new Event("pause"));
+      skipped += MEDIA_TICKET_IDLE_MS + 60_000;
+      if (i === 1) {
+        el.currentTime = at;
+        fireEvent(el, new Event("seeking"));
+      } else fireEvent(el, new Event("play"));
+      fireEvent(el, new Event("error"));
+      await waitFor(() => expect(svc.log.tickets).toHaveLength(i + 2));
+      await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[i + 1]!.path}`));
+      browserReset(el);
+      fireEvent(el, new Event("loadedmetadata"));
+      expect(el.currentTime).toBe(at);
+      fireEvent(el, new Event("seeked"));
+    }
+    expect(screen.queryByText(/The recording could not be played/)).toBeNull();
+    // A ticket that fails while young counts: it cannot renew for ever. Each failure is followed to
+    // where the player rests: a new ticket in the element, or the alert.
+    let cycles = 0;
+    while (cycles < 4 && !screen.queryByText(/The recording could not be played/)) {
+      cycles++;
+      const outcome = await failAndRest(el, svc.log.tickets);
+      if (outcome === "stopped") break;
+      browserReset(el);
+      fireEvent(el, new Event("loadedmetadata"));
+      fireEvent(el, new Event("seeked"));
+      playTo(el, 51.6);
+    }
+    expect(screen.getByText(/The recording could not be played/)).toBeTruthy();
+    // Four tickets for the three pauses, one renewal of a young ticket, then it stops at the second.
+    expect(cycles).toBe(2);
+    expect(svc.log.tickets).toHaveLength(5);
+  });
+
+  it("a ticket answer whose idle end is far shorter than the shared ten minutes cannot make every failure an expiry: the player still stops after its strikes (FR-260, R481 c)", async () => {
+    const realNow = Date.now.bind(Date);
+    let skipped = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + skipped);
+    // The reviewer's probe B: every ticket's idle end is 1 s after its issue.
+    const { svc } = await open({ ticketIdleExpiresAt: "2026-11-11T10:00:01.000Z" });
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 50);
+    let cycles = 0;
+    while (cycles < 12) {
+      cycles++;
+      // Failures 2 s apart, at one place: older than the answer's 1 s, younger than MEDIA_TICKET_IDLE_MS.
+      skipped += 2_000;
+      const outcome = await failAndRest(el, svc.log.tickets);
+      if (outcome === "stopped") break;
+      browserReset(el);
+      fireEvent(el, new Event("loadedmetadata"));
+      fireEvent(el, new Event("seeked"));
+    }
+    expect(screen.getByRole("alert").textContent).toMatch(/^The recording could not be played: it stopped at the same place again\. Its file may be damaged/);
+    // The lifetime is taken as MEDIA_TICKET_IDLE_MS: two young failures renew (MAX_RENEWALS_WITHOUT_PROGRESS), the third stops.
+    expect(cycles).toBe(3);
+    expect(svc.log.tickets).toHaveLength(3);
+  });
+
+  it("a recording whose file the service found changed outside the app says so at once, never 'may be damaged' after retries (FR-218, FR-219)", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4);
+    // The stream was cut where the service found the file changed.
+    svc.state.fileChanged = true;
+    fireEvent(el, new Event("error"));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(MEDIA_FILE_CHANGED_SENTENCE);
+    // R462 a: the ruled sentence, word for word.
+    expect(MEDIA_FILE_CHANGED_SENTENCE).toBe("The recording stopped: its file is no longer as the app stored it — it was changed outside the app, or it is damaged — so it cannot be played from here. Check the verification report.");
+    expect(alert.textContent).not.toMatch(/may be damaged|\//);
+    // No new ticket was asked for, and the ended one was let go.
+    expect(svc.log.tickets).toHaveLength(1);
+    expect(svc.log.revoked).toEqual([svc.log.tickets[0]!.path]);
+    expect(el.getAttribute("src")).toBeNull();
+    // R467 M5: a retry cannot help, so none is offered: the sentence and the controls agree.
+    expect(screen.queryByRole("button", { name: "Try the recording again" })).toBeNull();
+  });
+
+  it("a recording whose raw data the app destroyed while it played says what the app says of a destroyed recording, not 'changed outside the app', and offers no Try again (R467 M3)", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4);
+    svc.state.fileDestroyed = true;
+    fireEvent(el, new Event("error"));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(NO_RECORDING_SENTENCE);
+    expect(NO_RECORDING_SENTENCE).toBe("This source has no recording to play. Its transcript is shown below.");
+    expect(svc.log.tickets).toHaveLength(1);
+    expect(el.getAttribute("src")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Try the recording again" })).toBeNull();
+  });
+
+  it("a revoke that never answers is waited for no longer than REVOKE_WAIT_MS; then the player renews as if no code came, never 'Reconnecting' for ever (R467 M4)", async () => {
+    const realSetTimeout = globalThis.setTimeout;
+    const limits: Array<() => void> = [];
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      if (ms === REVOKE_WAIT_MS) {
+        limits.push(fn);
+        return 0 as unknown as ReturnType<typeof setTimeout>;
+      }
+      return realSetTimeout(fn, ms, ...(rest as []));
+    }) as typeof setTimeout);
+    const { svc } = await open();
+    let hang = true;
+    server.use(http.post(url("/media-tickets/revoke"), async () => (hang ? new Promise<Response>(() => {}) : HttpResponse.json({ revoked: true }))));
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4);
+    fireEvent(el, new Event("error"));
+    expect(await screen.findByText("Reconnecting the recording…")).toBeTruthy();
+    await waitFor(() => expect(limits).toHaveLength(1));
+    expect(svc.log.tickets).toHaveLength(1);
+    hang = false;
+    act(() => limits[0]!());
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
+    expect(screen.queryByText("Reconnecting the recording…")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("too many recordings open at once is said in one plain sentence (review M3)", async () => {

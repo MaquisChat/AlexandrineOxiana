@@ -8,8 +8,8 @@
  *   is not listed, unless the app installed it earlier, when it can only be removed.
  * - A tool the catalogue marks unavailable on this computer (OCR today) is shown with its reason and
  *   cannot be installed. The video downloader and the JavaScript runtime it needs are one choice.
- * - Downloading contacts only the tool's publisher (the hosts come from the catalogue, when it lists
- *   them) and sends nothing about projects or the researcher (R7).
+ * - Downloading contacts only the servers that host each tool (the hosts come from the catalogue, when
+ *   it lists them) and sends nothing about projects or the researcher (R7).
  * - Without ffmpeg, media that carries a location stays "proxy pending" and is left out of exports
  *   (R83, R90 c): said once, by the catalogue's text or else by this screen.
  * - Jobs (R99): progress is visible; the live region speaks at the start, half way and the end only;
@@ -508,7 +508,8 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
       <h1>Optional tools</h1>
       <p>The app does not include these tools, so that its own download stays small. Install only the ones you need; you can remove them again here.</p>
       <p>
-        Each download contacts only the tool's publisher{allListed ? ", at the addresses listed with the tool," : ""} and sends nothing about your projects or about you. Each file is checked against its
+        {/* The servers that host a tool are not always its publisher's (a speech model is hosted by a third party) (FR-291). */}
+        Each download contacts only {allListed ? "the addresses listed with the tool" : "the servers that host the tool"} and sends nothing about your projects or about you. Each file is checked against its
         published checksum before it is used.
       </p>
       <p role="status" aria-label="Tool progress" className="ao-visually-hidden">

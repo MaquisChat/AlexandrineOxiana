@@ -19,6 +19,7 @@ import type { ToolId, ToolInfo } from "@ao/shared";
 import { useEffect, useId, useRef, useState } from "react";
 import { DEFAULT_SPEECH_MODEL, describeHosts, formatSize, hostsOf, PUBLISHER_SERVERS, remainingOf, speechTool, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
 import { navigate, PATHS } from "../navigation";
+import { toolsHref } from "./MissingToolNotice";
 import { DialogShell } from "./ReasonDialog";
 import { UserText } from "./UserText";
 import "../screens/GovernanceScreens.css";
@@ -142,38 +143,40 @@ export function FirstUseTools({ api, memory = localFirstUseMemory, hidden = fals
     focusToolsLink();
   };
 
-  const banner = visible ? (
-    <div className="ao-first-use-banner">
-      <p>{FIRST_USE_QUESTION}</p>
-      <div className="ao-actions">
-        <button type="button" onClick={() => setOpen(true)}>
-          Choose tools…
-        </button>
-        <button type="button" onClick={notNow}>
-          Not now
-        </button>
-      </div>
-    </div>
-  ) : null;
+  const sentence = visible ? <p>{FIRST_USE_QUESTION}</p> : null;
 
   return (
     <>
-      {/* Always present on the library screen, so the banner put in it is announced (politely, once). */}
-      <div role="status" className="ao-first-use-live">
-        {announced ? null : banner}
+      {/* Always present on the library screen, so the sentence put in its live region is announced
+          (politely, once). The buttons sit outside the live region, so their labels are not read
+          with the sentence (FR-316). */}
+      <div className={visible ? "ao-first-use-live ao-first-use-banner" : "ao-first-use-live"}>
+        <div role="status">{announced ? null : sentence}</div>
+        {announced ? sentence : null}
+        {visible ? (
+          <div className="ao-actions">
+            <button type="button" onClick={() => setOpen(true)}>
+              Choose tools…
+            </button>
+            <button type="button" onClick={notNow}>
+              Not now
+            </button>
+          </div>
+        ) : null}
       </div>
-      {announced && banner ? <div className="ao-first-use-live">{banner}</div> : null}
       {open && visible && tools ? (
         <FirstUseDialog
           api={api}
           tools={tools}
           onCancel={() => setOpen(false)}
           onNotNow={notNow}
-          onStarted={() => {
+          onStarted={(first) => {
             memory.set("chosen");
             setOpen(false);
             setClosed(true);
-            navigate(PATHS.tools);
+            // The banner and its "Choose tools…" are gone, so focus is not given back there: the tools
+            // screen brings the first started tool's heading into focus (FR-315).
+            navigate(toolsHref(first));
           }}
         />
       ) : null}
@@ -181,7 +184,7 @@ export function FirstUseTools({ api, memory = localFirstUseMemory, hidden = fals
   );
 }
 
-function FirstUseDialog({ api, tools, onCancel, onNotNow, onStarted }: { api: ToolsApi; tools: ToolInfo[]; onCancel: () => void; onNotNow: () => void; onStarted: () => void }) {
+function FirstUseDialog({ api, tools, onCancel, onNotNow, onStarted }: { api: ToolsApi; tools: ToolInfo[]; onCancel: () => void; onNotNow: () => void; onStarted: (first: ToolId) => void }) {
   const id = useId();
   const [chosen, setChosen] = useState<ReadonlySet<string>>(new Set());
   const [unticked, setUnticked] = useState<ReadonlySet<ToolId>>(new Set());
@@ -248,7 +251,7 @@ function FirstUseDialog({ api, tools, onCancel, onNotNow, onStarted }: { api: To
     setBusy(false);
     setStarted(ok);
     if (failed.length === 0) {
-      onStarted();
+      onStarted(ticked[0]!.id);
       return;
     }
     setError(`${failed.join(", ")} could not be started. ${toolsErrorText(firstError, "The library service did not answer.")} Try again, or choose Not now and install later from the Optional tools screen.`);
@@ -323,7 +326,8 @@ function FirstUseDialog({ api, tools, onCancel, onNotNow, onStarted }: { api: To
             <UserText>{ticked.map((t) => `${t.name}: ${hostsOf(t, { missingOnly: true }).length > 0 ? describeHosts(hostsOf(t, { missingOnly: true })) : PUBLISHER_SERVERS}`).join("; ")}</UserText>.{" "}
           </>
         ) : (
-          `Downloading contacts each tool's publisher's servers (the catalogue does not name them). `
+          // FR-291, R467 M7: the servers that host a tool are not always its publisher's (a speech model is hosted by a third party).
+          `Downloading contacts the servers that host each tool (the catalogue does not name them). `
         )}
         Nothing about your projects or about you is sent.
       </p>

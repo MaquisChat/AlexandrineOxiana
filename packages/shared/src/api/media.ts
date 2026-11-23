@@ -45,9 +45,23 @@ export interface MediaTicketResponse {
 export interface MediaTicketRevokeRequest {
   path: string;
 }
+/**
+ * Why a ticket's stream stopped, when the service found the stored file not as the app stored it
+ * (its header or a chunk fails its check: changed outside the app, or damaged) (FR-217, FR-219, R467 M1).
+ * A code, never a sentence: the player says it in its own words.
+ */
+export const MEDIA_FILE_CHANGED = "FILE_CHANGED";
+/**
+ * Why a ticket's stream stopped, when the app itself destroyed the recording's raw data (under the
+ * retention rule) while it played: not a change outside the app (R467 M3). A code, never a sentence.
+ */
+export const MEDIA_FILE_DESTROYED = "FILE_DESTROYED";
+
 export interface MediaTicketRevokeResponse {
   /** False when it had already ended (or never existed). */
   revoked: boolean;
+  /** Set when a read for this ticket found the stored file changed, or the app destroyed it. */
+  ended?: typeof MEDIA_FILE_CHANGED | typeof MEDIA_FILE_DESTROYED;
 }
 
 // Refusals a ticket request names: another token than the UI's (403), a locked project (423), too

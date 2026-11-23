@@ -114,6 +114,17 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
   useEffect(() => {
     if (sessionGone) sessionsHeading.current?.focus();
   }, [sessionGone]);
+  /** The same after a participant was deleted, and after a consent was withdrawn (its button goes) (R467 I2). */
+  const participantsHeading = useRef<HTMLHeadingElement>(null);
+  const [participantGone, setParticipantGone] = useState(0);
+  useEffect(() => {
+    if (participantGone) participantsHeading.current?.focus();
+  }, [participantGone]);
+  const consentsHeading = useRef<HTMLHeadingElement>(null);
+  const [consentWithdrawn, setConsentWithdrawn] = useState(0);
+  useEffect(() => {
+    if (consentWithdrawn) consentsHeading.current?.focus();
+  }, [consentWithdrawn]);
   const [busy, setBusy] = useState(false);
   const [withdrawing, setWithdrawing] = useState<ConsentRecord | null>(null);
   /** FR-160: the consent record whose signed form the researcher asked to detach (asked in a dialog, with a reason). */
@@ -246,7 +257,7 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
         </p>
       ) : null}
 
-      <Section title="Participants">
+      <Section title="Participants" headingRef={participantsHeading}>
         <ul className="ao-list">
           {participants.map((p) => (
             <li key={p.id} className="ao-field">
@@ -346,7 +357,7 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
         </form>
       </Section>
 
-      <Section title="Consent records">
+      <Section title="Consent records" headingRef={consentsHeading}>
         <ul className="ao-list">
           {consents.map((c) => (
             <li key={c.id}>
@@ -505,9 +516,14 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
           onCancel={() => setDeleting(null)}
           onConfirm={() => {
             const p = deleting;
+            let gone = false;
             void run(async () => {
               await api.deleteParticipant(projectId, p.id);
-            }).finally(() => setDeleting(null));
+              gone = true;
+            }).finally(() => {
+              setDeleting(null);
+              if (gone) setParticipantGone((n) => n + 1);
+            });
           }}
         >
           <p>
@@ -598,11 +614,15 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
           onConfirm={(reason) => {
             const c = withdrawing;
             setWithdrawing(null);
+            let done = false;
             void run(async () => {
               const r = await api.withdrawConsent(projectId, c.id, reason || undefined);
               const n = r.flaggedSourceIds.length;
               setFlagged(n > 0);
+              done = true;
               return `Consent withdrawn. ${n === 1 ? "1 source was" : `${n} sources were`} flagged for review; nothing was deleted.`;
+            }).finally(() => {
+              if (done) setConsentWithdrawn((n) => n + 1);
             });
           }}
         >

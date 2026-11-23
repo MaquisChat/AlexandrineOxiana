@@ -11,7 +11,14 @@
  * position moving RENEWAL_PROGRESS_S beyond where it failed; loading alone does not count — and a
  * place that fails a third time (within SAME_PLACE_S) ends it however much was played in between.
  * Then the player stops, says so, and offers "Try the recording again". Every ticket is revoked
- * once it is replaced or given up.
+ * once it is replaced or given up. A failure of a ticket older than the idle lifetime the service
+ * gave it may be that ticket ending on its own: it is renewed and counts toward none of these. This
+ * is told from the ticket's own age, never from the researcher's last press, so a long pause followed
+ * by play or a seek and then the failure is a renewal (FR-260, R467 I1). A ticket that fails while
+ * younger than that counts, so renewal cannot go on for ever.
+ * Before a renewal the ended ticket is revoked, and its answer says whether the service found the
+ * stored file no longer as the app stored it (FILE_CHANGED): then the player stops at once and says so,
+ * instead of retrying into "may be damaged" (FR-218, FR-219).
  *
  * The position is kept by the player, not read back from the element while a new `src` loads: a
  * browser reports 0 then, and a resume seeks to the kept position before any report counts.
@@ -26,6 +33,7 @@
  * logged, stored, or put in the page address. No `crossorigin` attribute: the service expects the
  * element's plain (no-cors) range reads.
  */
+import { MEDIA_FILE_CHANGED, MEDIA_FILE_DESTROYED, MEDIA_TICKET_IDLE_MS, MEDIA_TICKET_LIFETIME_MS, type MediaTicketResponse } from "@ao/shared";
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import { ApiClientError } from "../api/client";
 import { errorText, isProjectLocked } from "../api/library";
@@ -80,7 +88,33 @@ type Phase = { kind: "loading" } | { kind: "ready" } | { kind: "renewing" } | { 
 
 const isVideo = (asset: { mime: string; kind?: string }) => /^video\//i.test(asset.mime) || (!/^audio\//i.test(asset.mime) && asset.kind === "video");
 
+/**
+ * What the app says of a source whose recording was destroyed (the transcript viewer shows it when
+ * it opens one): the player says it too when the app destroys the recording while it plays (R467 M3).
+ */
+export const NO_RECORDING_SENTENCE = "This source has no recording to play. Its transcript is shown below.";
+
+/** How long a renewal waits for the ended ticket's revoke to answer before it goes on without its code (R467 M4). */
+export const REVOKE_WAIT_MS = 10_000;
+
 const RETRY = "Try the recording again";
+
+/**
+ * How long the service lets this ticket go unused before it ends (R135 2), from its answer:
+ * `expiresAt` is its issue time plus MEDIA_TICKET_LIFETIME_MS, `idleExpiresAt` its first idle end.
+ * The shared constant when the answer does not say, or says less than it (R481 c): a shorter one would
+ * make young failures look like expiries and renewal would never end; a longer one is more cautious.
+ */
+function idleLifetime(t: Partial<MediaTicketResponse>): number {
+  const ms = Date.parse(t.idleExpiresAt ?? "") - (Date.parse(t.expiresAt ?? "") - MEDIA_TICKET_LIFETIME_MS);
+  return Number.isFinite(ms) && ms >= MEDIA_TICKET_IDLE_MS ? ms : MEDIA_TICKET_IDLE_MS;
+}
+/**
+ * The service found the file not as the app stored it (FR-218, FR-219): it cannot tell who or what
+ * changed it, so the sentence asserts no one's act (R462 a). The player's one sentence for it.
+ */
+export const MEDIA_FILE_CHANGED_SENTENCE =
+  "The recording stopped: its file is no longer as the app stored it — it was changed outside the app, or it is damaged — so it cannot be played from here. Check the verification report.";
 
 function refusal(err: unknown, renewing: boolean): string {
   if (isProjectLocked(err)) return renewing ? "The project was locked, so the recording stopped. Unlock the project to play it again." : "The recording cannot be played while the project is locked.";
@@ -130,6 +164,13 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     let failedAt = 0;
     /** Every failure position since the player opened (or Try again): a damaged place is bounded. */
     let failures: number[] = [];
+    /**
+     * When the ticket in use was received, and how long the service lets it go unused (FR-260, R467
+     * I1). A failure of a ticket at least that old may be the ticket ending on its own: renewed
+     * without counting as a strike. A new ticket is young, so this cannot loop.
+     */
+    let ticketAt = 0;
+    let ticketIdleMs = MEDIA_TICKET_IDLE_MS;
 
     const revoke = (path: string) => {
       void api.revokeTicket(path).catch(() => {});
@@ -156,15 +197,16 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     };
 
     const attach = async (renewing: boolean) => {
-      let path: string;
+      let answer: MediaTicketResponse;
       try {
-        path = (await api.ticket(projectId, sourceId, asset.id)).path;
+        answer = await api.ticket(projectId, sourceId, asset.id);
       } catch (err) {
         if (!live) return;
         if (isProjectLocked(err)) lockedRef.current?.();
         halt({ kind: "failed", message: refusal(err, renewing), retry: !isProjectLocked(err) });
         return;
       }
+      const path = answer.path;
       if (!live || halted) {
         revoke(path);
         return;
@@ -181,6 +223,8 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       ticket = path;
       if (old && old !== path) revoke(old);
       el.src = address;
+      ticketAt = Date.now();
+      ticketIdleMs = idleLifetime(answer);
       if (pending) pending.srcSet = true;
       setPhase({ kind: "ready" });
     };
@@ -189,8 +233,10 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       if (!ticket || !live || halted) return;
       const at = pending ? pending.at : position;
       const play = pending ? pending.play : wantPlay;
-      const samePlace = failures.filter((f) => Math.abs(f - at) <= SAME_PLACE_S).length;
-      failures.push(at);
+      const idleExpiry = Date.now() - ticketAt >= ticketIdleMs;
+      if (idleExpiry) renewals = 0;
+      const samePlace = idleExpiry ? 0 : failures.filter((f) => Math.abs(f - at) <= SAME_PLACE_S).length;
+      if (!idleExpiry) failures.push(at);
       if (renewals >= MAX_RENEWALS_WITHOUT_PROGRESS || samePlace >= MAX_RENEWALS_WITHOUT_PROGRESS) {
         pending = { at, play, seekIssued: false, srcSet: false, playedSince: false };
         halt({ kind: "failed", message: `The recording could not be played: it stopped at the same place again. Its file may be damaged or in a format this app cannot play. You can choose ${RETRY}.`, retry: true });
@@ -201,12 +247,42 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       position = at;
       pending = { at, play, seekIssued: false, srcSet: false, playedSince: false };
       setPhase({ kind: "renewing" });
-      void attach(true);
+      void renew();
+    };
+    /**
+     * The ended ticket is let go first: its answer says whether the service found the file changed
+     * outside the app (a code, FR-219). Then that is said at once; otherwise a new ticket is asked for.
+     */
+    const renew = async () => {
+      const old = ticket;
+      ticket = null;
+      let ended: string | undefined;
+      if (old) {
+        // R467 M4: waited for no longer than REVOKE_WAIT_MS; no answer by then is no code.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const limit = new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), REVOKE_WAIT_MS);
+        });
+        try {
+          ended = (await Promise.race([api.revokeTicket(old), limit]))?.ended;
+        } catch {
+          /* not known: renewed as before */
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      if (!live || halted) return;
+      // R467 M5: trying again cannot help a changed or destroyed file, so no "Try again" is offered.
+      if (ended === MEDIA_FILE_CHANGED) halt({ kind: "failed", message: MEDIA_FILE_CHANGED_SENTENCE, retry: false });
+      else if (ended === MEDIA_FILE_DESTROYED) halt({ kind: "failed", message: NO_RECORDING_SENTENCE, retry: false });
+      else await attach(true);
     };
     const onTimeUpdate = (e: Event) => {
       if (halted) return;
       if (pending) {
-        const done = pending.seekIssued && (e.type === "seeked" || Math.abs(el.currentTime - pending.at) < SEEK_TOLERANCE_S);
+        // FR-259: `playing` after the resume seek was issued also ends the wait, so a seek that never
+        // reports landing does not leave the player ignoring the element's time for good.
+        const done = pending.seekIssued && (e.type === "seeked" || e.type === "playing" || Math.abs(el.currentTime - pending.at) < SEEK_TOLERANCE_S);
         if (!done) return;
         // R371 b: a pause or a play pressed after the metadata, before the seek landed, is what the next renewal resumes with.
         wantPlay = pending.play;
@@ -258,6 +334,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     el.addEventListener("error", onError);
     el.addEventListener("timeupdate", onTimeUpdate);
     el.addEventListener("seeked", onTimeUpdate);
+    el.addEventListener("playing", onTimeUpdate);
     el.addEventListener("play", onPlay);
     el.addEventListener("pause", onPause);
     el.addEventListener("seeking", onSeeking);
@@ -296,6 +373,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       el.removeEventListener("error", onError);
       el.removeEventListener("timeupdate", onTimeUpdate);
       el.removeEventListener("seeked", onTimeUpdate);
+      el.removeEventListener("playing", onTimeUpdate);
       el.removeEventListener("play", onPlay);
       el.removeEventListener("pause", onPause);
       el.removeEventListener("seeking", onSeeking);

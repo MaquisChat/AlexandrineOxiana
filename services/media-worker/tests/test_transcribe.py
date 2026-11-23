@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 
 import pytest
@@ -105,8 +106,93 @@ def test_unreadable_models_folder_is_reported_and_not_downloaded(worker_env, tmp
     with pytest.raises(JobError) as e:
         transcribe.model_path("tiny")
     assert e.value.code == "MODEL_UNAVAILABLE"
-    assert "could not be read" in e.value.message
+    # A next step that fits the case (FR-254, R467 M8): the FOLDER cannot be read, so installing the
+    # model again would not help; no path in it.
+    assert e.value.message == "the folder that holds the speech models could not be read, so the tiny model could not be used; check that the folder can be read, then try again"
+    assert str(not_a_folder) not in e.value.message
     assert nn.attempts == []
+
+
+FOLDER_UNREADABLE = "the folder that holds the speech models could not be read, so the tiny model could not be used; check that the folder can be read, then try again"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions; the monkeypatched tests below prove the logic")
+@pytest.mark.parametrize("mode", [0o000, 0o600])
+def test_models_folder_that_cannot_be_searched_is_not_called_not_installed(worker_env, tmp_path, monkeypatch, mode):
+    """FR-254, R481 b: a real models folder without search (or read) permission is "could not be read"."""
+    from ao_worker import transcribe
+    from ao_worker.jobs import JobError
+
+    folder = tmp_path / "models"
+    (folder / "models--Systran--faster-whisper-tiny").mkdir(parents=True)
+    monkeypatch.setenv("AO_MODELS_DIR", str(folder))
+    folder.chmod(mode)
+    try:
+        with pytest.raises(JobError) as e:
+            transcribe.model_path("tiny")
+    finally:
+        folder.chmod(0o700)
+    assert e.value.code == "MODEL_UNAVAILABLE" and e.value.message == FOLDER_UNREADABLE
+    assert str(folder) not in e.value.message
+
+
+@pytest.mark.parametrize("refused", ["the folder cannot be listed", "the model's folder inside cannot be looked up"])
+def test_models_folder_refusing_access_is_could_not_be_read(worker_env, tmp_path, monkeypatch, refused):
+    """The same condition as above made by refusing the call itself (this machine runs as root)."""
+    from ao_worker import transcribe
+    from ao_worker.jobs import JobError
+
+    folder = tmp_path / "models"
+    folder.mkdir()
+    monkeypatch.setenv("AO_MODELS_DIR", str(folder))
+    repo = folder / "models--Systran--faster-whisper-tiny"
+    real_scandir, real_lstat = os.scandir, os.lstat
+
+    def scandir(p=".", *a, **k):
+        if refused.startswith("the folder") and os.fspath(p) == str(folder):
+            raise PermissionError(13, "Permission denied")
+        return real_scandir(p, *a, **k)
+
+    def lstat(p, *a, **k):
+        if refused.startswith("the model's") and os.fspath(p) == str(repo):
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(p, *a, **k)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr(os, "lstat", lstat)
+    with pytest.raises(JobError) as e:
+        transcribe.model_path("tiny")
+    assert e.value.code == "MODEL_UNAVAILABLE" and e.value.message == FOLDER_UNREADABLE
+    assert str(folder) not in e.value.message
+
+
+def test_model_absent_from_a_readable_models_folder_is_not_installed(worker_env, tmp_path, monkeypatch):
+    from ao_worker import transcribe
+    from ao_worker.jobs import JobError
+
+    (tmp_path / "models").mkdir()
+    monkeypatch.setenv("AO_MODELS_DIR", str(tmp_path / "models"))
+    with pytest.raises(JobError) as e:
+        transcribe.model_path("tiny")
+    assert e.value.code == "TOOL_NOT_INSTALLED" and e.value.tool == "speech-tiny"
+
+
+def test_model_that_cannot_be_loaded_says_what_to_do(worker_env, tmp_path, monkeypatch):
+    import faster_whisper
+
+    from ao_worker import transcribe
+    from ao_worker.jobs import JobError
+
+    def unreadable(*_a, **_k):
+        raise OSError("bad weights")
+
+    monkeypatch.setattr(transcribe, "model_path", lambda name: str(tmp_path))
+    monkeypatch.setattr(faster_whisper, "WhisperModel", unreadable)
+    transcribe._model_cache.clear()
+    with pytest.raises(JobError) as e:
+        transcribe._load_model("tiny", "int8")
+    assert e.value.code == "MODEL_UNAVAILABLE"
+    assert e.value.message == "the tiny model on disk could not be loaded; remove it and install it again from the Optional tools screen"
 
 
 def test_absent_model_is_never_downloaded(worker_env, tmp_path, monkeypatch):
