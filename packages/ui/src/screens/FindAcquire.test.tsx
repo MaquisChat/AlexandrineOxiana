@@ -1013,13 +1013,24 @@ describe("FindAcquire: round 3 (R258)", () => {
   it("M8: the project list is read again when the service says a project changed (an unlock)", async () => {
     useService();
     show();
-    await waitFor(() => expect(optionTexts()).toContain("Clinic interviews (locked)"));
+    await waitFor(() => expect(optionTexts()).toContain("\u2068Clinic interviews\u2069 (locked)"));
     await waitFor(() => expect(events.open()).toBe(true));
     events.push(libState("lib-1"));
     server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => ({ ...p, unlocked: true })) })));
     events.push(libState("lib-1"));
     await waitFor(() => expect(optionTexts()).toContain("Clinic interviews"));
-    expect(optionTexts()).not.toContain("Clinic interviews (locked)");
+    expect(optionTexts()).not.toContain("\u2068Clinic interviews\u2069 (locked)");
+  });
+
+  it("a locked project's name is isolated in the picker, so a right-to-left name does not flip \" (locked)\"", async () => {
+    useService();
+    const rtl = "مقابلات العيادة";
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => (p.id === PID_LOCKED ? { ...p, name: rtl } : p)) })));
+    show();
+    const project = (await screen.findByRole("combobox", { name: "Project" })) as HTMLSelectElement;
+    await waitFor(() => expect(within(project).getAllByRole("option").some((o) => o.getAttribute("value") === PID_LOCKED)).toBe(true));
+    const locked = within(project).getAllByRole("option").find((o) => o.getAttribute("value") === PID_LOCKED)!;
+    expect(locked.textContent).toBe(`\u2068${rtl}\u2069 (locked)`);
   });
 
   for (const outcome of ["success", "refusal"] as const) {
@@ -1379,7 +1390,7 @@ describe("FindAcquire: round 4 (R262)", () => {
     server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => (p.id === PID ? { ...p, encrypted: true, unlocked: false } : p)) })));
     queues[PID] = () => refusal(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
     events.push(libState("lib-1"));
-    await waitFor(() => expect(within(project).getAllByRole("option").map((o) => o.textContent)).toContain("Market study (locked)"));
+    await waitFor(() => expect(within(project).getAllByRole("option").map((o) => o.textContent)).toContain("\u2068Market study\u2069 (locked)"));
     expect(await screen.findByRole("heading", { name: /Market study is locked/ })).toBeTruthy();
     expect(project.value).toBe(PID);
   });

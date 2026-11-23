@@ -821,7 +821,9 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
             {!projectId && <option value="">{projects ? "No project" : "Reading the projects…"}</option>}
             {list.map((p) => (
               <option key={p.id} value={p.id} dir="auto">
-                {p.unlocked ? p.name : `${p.name} (locked)`}
+                {/* An <option> holds no element: the name is isolated with U+2068 FIRST STRONG ISOLATE and U+2069 POP
+                    DIRECTIONAL ISOLATE, so a right-to-left name does not flip " (locked)" (as R463 M7 does elsewhere). */}
+                {p.unlocked ? p.name : `\u2068${p.name}\u2069 (locked)`}
               </option>
             ))}
           </select>
