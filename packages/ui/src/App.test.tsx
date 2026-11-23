@@ -197,6 +197,18 @@ describe("the app's one router (R118)", () => {
       expect(window.location.search).toBe("?project=p3");
     });
 
+    it("a later change of the address's project is followed while the library stays open (FR-151)", async () => {
+      server.use(...handlers());
+      at("/?project=p3");
+      render(<App service={service} />);
+      expect(await selected()).toMatch(/Second/);
+      await screen.findByRole("region", { name: "Attach files to Second" });
+      await act(async () => navigate("/?project=p1"));
+      expect(await screen.findByRole("region", { name: "Attach files to Dissertation" })).toBeTruthy();
+      expect(await selected()).toMatch(/Dissertation/);
+      expect(window.location.search).toBe("?project=p1");
+    });
+
     it("a locked project named in the address is selected and asks to be unlocked", async () => {
       server.use(...handlers());
       at("/library?project=p2");

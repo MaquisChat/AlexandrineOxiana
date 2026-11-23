@@ -484,6 +484,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     }
     if (projects.some((p) => p.id === projectFromAddress)) {
       selectProject(projectFromAddress);
+      // The address already names it, so nothing waits for the address to catch up: a later change
+      // of the address (browser Back or Forward) is followed (FR-151).
+      written.current = undefined;
       return;
     }
     // Not one of this library's projects: select none, so nothing is dropped into the wrong one.
