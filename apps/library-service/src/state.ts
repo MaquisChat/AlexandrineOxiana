@@ -234,7 +234,12 @@ export interface WorkControl {
    * and leaves its job pending, to run again at the next open.
    */
   interrupt?: () => void;
+  /** A rerun of pending jobs (`worker-resume`) whose job in hand is a transcription (R466 I1): a move stops it as it stops one. */
+  transcribing?: boolean;
 }
+
+/** A transcription running now, whatever started it: one asked for here, or a rerun of a pending one (R466 I1). */
+const isTranscribing = (w: { kind: string; ctl: WorkControl }): boolean => w.kind === "transcription" || (w.kind === "worker-resume" && w.ctl.transcribing === true);
 
 /** How long a close waits for registered work before abandoning what can be (default; Task 62). */
 export const CLOSE_GRACE_MS = 30_000;
@@ -338,9 +343,9 @@ export class ServiceState {
     return [...this.work.values()].map((w) => w.kind);
   }
 
-  /** Asks every registered item to stop between items and waits for all to end; false if one did not in time. */
-  async drainWork(timeoutMs: number): Promise<boolean> {
-    const items = [...this.work.values()];
+  /** Asks every registered item (those `which` selects) to stop between items and waits for all to end; false if one did not in time. */
+  async drainWork(timeoutMs: number, which: (w: { kind: string; ctl: WorkControl }) => boolean = () => true): Promise<boolean> {
+    const items = [...this.work.values()].filter(which);
     for (const w of items) w.ctl.stopping = true;
     const all = Promise.allSettled(items.map((w) => w.done)).then(() => true);
     const ok = (await withTimeout(all, timeoutMs).catch(() => undefined)) === true;
@@ -354,7 +359,7 @@ export class ServiceState {
    * open (not awaited by the refusal).
    */
   resumeStoppedTranscriptions(s: Session): void {
-    const stopped = [...this.work.values()].filter((w) => w.kind === "transcription").map((w) => w.done);
+    const stopped = [...this.work.values()].filter(isTranscribing).map((w) => w.done);
     this.track(
       Promise.allSettled(stopped).then(() => {
         if (this.session === s && !this.moving) this.resumeWorkerJobs(s);
@@ -1070,13 +1075,9 @@ export class ServiceState {
     await this.zoteroSync.stopScheduler();
     await this.zoteroSync.stop("library-closed");
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
-    // A running transcription is stopped at once, as at a close (N-5): it stays pending in its
-    // project's journal, which moves with the library, and runs again once the library is open at
-    // its new place (FR-385), rather than holding the move up until it is refused.
-    // Only a transcription started here: a rerun of pending jobs is waited for, as before (Task 51 N-2).
-    for (const w of this.work.values()) if (w.kind === "transcription") w.ctl.interrupt?.();
     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
-    if (!(await this.drainWork(ms))) {
+    // A running transcription is not waited for here: it is stopped below, once nothing else refuses the move.
+    if (!(await this.drainWork(ms, (w) => !isTranscribing(w)))) {
       this.zoteroSync.startScheduler(this, s);
       this.restartStoppedWork();
       throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
@@ -1100,6 +1101,17 @@ export class ServiceState {
       this.zoteroSync.startScheduler(this, s);
       this.restartStoppedWork();
       throw new ApiError(409, "CONFLICT", "An import could not be paused in time, so the library was not moved; try again in a moment.");
+    }
+    // The move goes ahead: every transcription running in the library is stopped at once, as at a close
+    // (N-5), whatever started it (FR-385; R466 I1, M1) — one asked for here, or a rerun of a pending one
+    // (after an unlock, a launch, or a move that carried it on). It stays pending in its project's journal;
+    // a write already under way finishes first (the worker client's guarded write). Then it is waited for.
+    for (const w of this.work.values()) if (isTranscribing(w)) w.ctl.interrupt?.();
+    if (!(await this.drainWork(ms))) {
+      this.resumeBatches(paused);
+      this.zoteroSync.startScheduler(this, s);
+      this.restartStoppedWork();
+      throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
     }
     try {
       this.stopBackupScheduler();
@@ -1568,14 +1580,24 @@ export class ServiceState {
     void this.startWork("worker-resume", async (ctl) => {
       // A close abandons the job in hand once its grace period ends (N-5): it stays pending.
       const ac = new AbortController();
-      ctl.interrupt = () => ac.abort(new JobInterruptedError());
+      let interrupted = false;
+      ctl.interrupt = () => {
+        interrupted = true;
+        ac.abort(new JobInterruptedError());
+      };
       await client.resumePending(projectId, {
         shouldStop: () => ctl.stopping,
         signal: ac.signal,
         // A pending transcription runs again with its finish step and is followed like a new one (Task 62).
-        prepare: (rec) => this.transcriptions.rerun(s, rec),
+        prepare: (rec) => {
+          ctl.transcribing = rec.kind === "audio.transcribe"; // the job in hand (R466 I1)
+          return this.transcriptions.rerun(s, rec);
+        },
       });
-      if (ctl.stopping) return (next: Session) => this.resumeWorkerJobs(next, projectId);
+      // Stopped between jobs: carried on in the library open next. Abandoned part-way (a close, a move: R466 I1):
+      // not carried on from here, since the library open next reruns every pending job when its worker is
+      // attached (or, after a refused move, resumeStoppedTranscriptions does), and two reruns at once would race.
+      if (ctl.stopping && !interrupted) return (next: Session) => this.resumeWorkerJobs(next, projectId);
     });
   }
 

@@ -558,7 +558,32 @@ describe("fix round 1", () => {
     expect(versions).toBe(2); // one run: its WebVTT and its segments file
   });
 
-  it("FR-385: a move refused because other work could not pause: the transcription it stopped runs again at once in the library still open", async () => {
+  it("R466 I1: a second move while the run the first move carried on is going stops it too, at once: the move goes through, and the run is carried on again: stored once", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true, suspendTimeoutMs: 1_500 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } })).body).toContain('"done":true');
+    // The run carried on in the moved library (a rerun of pending jobs) is going.
+    await until(() => worker!.runs.length === 2 && worker!.runs[1]!.polls > 0);
+    expect(svc!.state.workKinds()).toContain("worker-resume");
+    const second = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved2") } });
+    expect(second.status, second.body).toBe(200);
+    expect(second.body).toContain('"done":true');
+    expect(worker.runs[1]!.cancelled).toBe(true);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker.runs.filter((r) => r.type === "audio.transcribe" && !r.cancelled)).toHaveLength(1);
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2);
+  });
+
+  it("R466 M1: a move refused because other work could not pause does not stop the transcription: it carries on, one run, stored once", async () => {
     worker = await stubWorker();
     await start({ worker: provider(worker), autoStartWorker: true, suspendTimeoutMs: 300 });
     const { pid } = await library();
@@ -576,10 +601,39 @@ describe("fix round 1", () => {
       free();
       await stuck;
     }
+    expect(worker.runs[0]!.cancelled).toBe(false);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker.runs).toHaveLength(1);
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2);
+  });
+
+  it("FR-385 (R466 M1): a move that fails after it stopped the transcription starts the run again in the library still open: stored once", async () => {
+    worker = await stubWorker();
+    await start({
+      worker: provider(worker),
+      autoStartWorker: true,
+      suspendTimeoutMs: 2_000,
+      beforeExecuteMove: async () => {
+        throw new Error("the copy could not start");
+      },
+    });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    const failed = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(failed.body).toContain('"error"');
+    expect(worker.runs[0]!.cancelled).toBe(true);
     await until(() => worker!.runs.length === 2);
     worker.release();
     await until(async () => (await stateOf(pid, sid))?.status === "done");
     await svc!.state.idle();
+    expect(worker.runs.filter((r) => r.type === "audio.transcribe" && !r.cancelled)).toHaveLength(1);
     const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
     expect(versions).toBe(2);
   });
