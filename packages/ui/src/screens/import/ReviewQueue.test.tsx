@@ -1281,6 +1281,46 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     expect(st.open).toBe(0);
   });
 
+  for (const how of ["unmounted", "shown another project"] as const) {
+    it(`R486 e: a decision still inside its 60 seconds is cancelled when the review queue is ${how}, and no give-up timer is left`, async () => {
+      const P2 = "0190a000-0000-7000-8000-0000000000f2";
+      const o = project();
+      o.projectReview = { ...o.projectReview, [P2]: [] };
+      const { st, handler } = openDecisions();
+      o.extra = [handler];
+      const client = mockService(o).client;
+      const view = render(<ReviewQueue client={client} projectId={P1} />);
+      await ready(RECORD);
+      const rejected: unknown[] = [];
+      const onRejection = (r: unknown) => rejected.push(r);
+      process.on("unhandledRejection", onRejection);
+      refake(["setTimeout", "clearTimeout", "Date"]);
+      try {
+        fireEvent.click(use(RECORD));
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(st.open).toBe(1);
+        if (how === "unmounted") view.unmount();
+        else view.rerender(<ReviewQueue client={client} projectId={P2} />);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(st.aborted).toBe(1);
+        expect(st.open).toBe(0);
+        // No give-up timer is left: past the 60 seconds nothing more happens.
+        if (how === "unmounted") expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS * 11);
+        expect(st.open).toBe(0);
+        expect(st.aborted).toBe(1);
+        if (how === "unmounted") expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        vi.useFakeTimers({ toFake: ["Date"] });
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      process.off("unhandledRejection", onRejection);
+      expect(rejected).toEqual([]);
+      if (how === "shown another project") expect(screen.queryByText(HELD_NO_ANSWER_TEXT)).toBeNull();
+    });
+  }
+
   it("R313 f: a why of __proto__, toString or constructor shows no advice and breaks nothing", async () => {
     const o = project();
     o.projectReview = {

@@ -287,6 +287,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
    * its late answer). A card holds at most one: its next decision cancels it first; leaving the queue cancels them all.
    */
   const givenUp = useRef(new Map<string, AbortController>());
+  /** R486 e: every decision request still open (inside its 60 seconds or given up), with its give-up timer. */
+  const outstanding = useRef(new Map<AbortController, ReturnType<typeof setTimeout>>());
   const [heldErrors, setHeldErrors] = useState<Readonly<Record<string, string>>>({});
   const [fileFocus, setFileFocus] = useState<{ to: string } | null>(null);
   /**
@@ -521,12 +523,19 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   }, [api, projectId, batchId, sourceId, pageSize, pump, locked, readKey, forget, holdQuiet, putLayout, panelQuiet]);
   // Unmounting moves the generation on: a decision answered after the screen closed changes nothing.
   useEffect(() => () => void gen.current++, []);
-  // R478: leaving the queue (unmount, or another project shown) cancels every given-up decision's request still open.
+  // R478, R486 e: leaving the queue (unmount, or another project shown) cancels every decision request still open —
+  // given up or still inside its 60 seconds — and clears its give-up timer. The service has the decision already; its
+  // record shows at the next read. A cancelled request's answer or failure changes nothing.
   useEffect(() => {
-    const open = givenUp.current;
+    const open = outstanding.current;
+    const up = givenUp.current;
     return () => {
-      for (const c of open.values()) c.abort();
+      for (const [c, t] of open) {
+        clearTimeout(t);
+        c.abort();
+      }
       open.clear();
+      up.clear();
     };
   }, [projectId]);
 
@@ -840,6 +849,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       if (!active || active === document.body || (!!card && card.contains(active))) refocusAfterRead.current = item.id;
       setReadKey((k) => k + 1);
     }, HELD_DECISION_TIMEOUT_MS);
+    outstanding.current.set(cancel, timer);
     try {
       const body: HeldFileDecisionRequest = { projectId, decision };
       await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body, signal: cancel.signal });
@@ -864,6 +874,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       setHeldErrors((cur) => ({ ...cur, [item.id]: e instanceof ApiClientError && e.message ? e.message : errorText(e) }));
     } finally {
       clearTimeout(timer);
+      outstanding.current.delete(cancel);
       if (givenUp.current.get(item.id) === cancel) givenUp.current.delete(item.id);
       if (!late) {
         heldBusyRef.current.delete(item.id);
