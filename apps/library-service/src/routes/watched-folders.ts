@@ -460,6 +460,18 @@ async function summaryById(ctx: Ctx, s: Session, projectId: string, wid: string,
 const listOrder = (k: WatchedFileListKind) => WATCHED_FILE_LIST_KINDS.indexOf(k);
 const byName = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
+/**
+ * R474 M9: a source's origins in the order the register gives them (the library reads the registers by their files'
+ * names, `<watchId>.jsonl`, sorted: `readWatchOrigins`), each folder's lines in their own order; a folder answered
+ * from a running watch's memory takes the place its register will have.
+ */
+export function originsInRegisterOrder<T>(byWatch: ReadonlyMap<string, readonly T[]>): Array<{ watchId: string; entry: T }> {
+  const file = (watchId: string) => `${watchId}.jsonl`;
+  return [...byWatch]
+    .sort(([a], [b]) => (file(a) < file(b) ? -1 : file(a) > file(b) ? 1 : 0))
+    .flatMap(([watchId, entries]) => entries.map((entry) => ({ watchId, entry })));
+}
+
 /** A file the engine lists as not come in, as answered: its reason scrubbed; no size when the size is not known (W4). */
 export function fileItemOf(p: WatchFileProblem, roots: Iterable<string>): WatchedFolderFileItem {
   const known = p.bytes !== undefined && p.reason !== WATCH_REASONS.sizeUnknown;
@@ -816,7 +828,7 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
       const mine = held && !held.stopped && !byWatch.has(rec.id) ? held.origins(sid) : undefined;
       if (mine?.length) byWatch.set(rec.id, mine);
     }
-    const found = [...byWatch].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).flatMap(([watchId, entries]) => entries.map((entry) => ({ watchId, entry })));
+    const found = originsInRegisterOrder(byWatch);
     for (const { watchId, entry } of found) {
       const rec = recs.find((w) => w.id === watchId);
       const watch = rec?.dir ? watchOf(s, projectId, watchId) : undefined;

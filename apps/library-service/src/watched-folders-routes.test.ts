@@ -33,7 +33,7 @@ import type { WatchedFolderSummary } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { FolderGrants } from "./folder-grants.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
-import { WatchStatusCoalescer, bringInDone, coalescerOf, fileItemOf, placeOf } from "./routes/watched-folders.js";
+import { WatchStatusCoalescer, bringInDone, coalescerOf, fileItemOf, originsInRegisterOrder, placeOf } from "./routes/watched-folders.js";
 import type { Session } from "./state.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -801,6 +801,19 @@ describe("files and origins", () => {
     memory = undefined;
     expect((await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` })).json.origins).toEqual([first]);
   }, 60_000);
+
+  it("R474 M9: the origins keep the register's order (its files' names, as the library reads them), each folder's lines in their own order", () => {
+    // "ab-c.jsonl" comes before "ab.jsonl" ("-" before "."), although "ab" comes before "ab-c".
+    const byWatch = new Map([
+      ["ab", ["x", "y"]],
+      ["ab-c", ["z"]],
+    ]);
+    expect(originsInRegisterOrder(byWatch)).toEqual([
+      { watchId: "ab-c", entry: "z" },
+      { watchId: "ab", entry: "x" },
+      { watchId: "ab", entry: "y" },
+    ]);
+  });
 
   it("bring in the new version says \"already-there\" when the library already held that content, and \"attached\" when a file was added (R239 d)", () => {
     expect([bringInDone("duplicate"), bringInDone("attached")]).toEqual(["already-there", "attached"]);
