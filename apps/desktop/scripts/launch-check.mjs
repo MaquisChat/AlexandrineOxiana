@@ -14,13 +14,19 @@
 //  C. the shell killed with SIGKILL: the service sees its standard input close and stops, and the
 //     worker sees the same from the service (R155 rule 3); no process left.
 //  D. a service that refuses to start: the shell reports the failure in the service's own plain
-//     words, opens no app window, leaves no process, and exits non-zero.
+//     words, opens no app window (and no closing window), leaves no process, and exits non-zero.
+//  E. opened again during a slowed quit (see the scenario).
+//  F. a slowed quit (FR-297, R470 c): two seconds after the window was closed, the helpers still
+//     running, the shell opens its closing window ("Closing Alexandrine Oxiana", the interface's
+//     closing page); closing that window changes nothing: the helpers stop cleanly, the shell exits
+//     0 and no process is left. In A and B, where the helpers normally go within two seconds, whether
+//     the closing window was shown is printed as a note.
 //
 //   pnpm --filter @ao/desktop run launch-check            (node apps/desktop/scripts/launch-check.mjs)
 //
 // On a Mac (Task 37f; no virtual display: GitHub's Mac runners have a logged-in desktop session):
 //
-//   node apps/desktop/scripts/launch-check.mjs --app <the DEBUG .app>       scenarios A-E
+//   node apps/desktop/scripts/launch-check.mjs --app <the DEBUG .app>       scenarios A-F
 //   node apps/desktop/scripts/launch-check.mjs --release-app <the .app>     scenario R only
 //
 // With --app the shell runs from inside the bundle and finds Node, the service folder and the worker
@@ -80,7 +86,62 @@ export function parseShellLine(line) {
   m = /^AO_SHELL_LIBRARY (opened|fetching|handed-over|not-a-pdf|failed|closed)$/.exec(line);
   if (m) return { kind: "library", state: m[1] };
   if (line === "AO_SHELL_BROWSER_OPENED") return { kind: "browser-opened" };
+  m = /^AO_SHELL_CLOSING_WINDOW title=(.*) visible=(true|false)$/.exec(line);
+  if (m) return { kind: "closing-window", title: m[1], visible: m[2] === "true" };
+  m = /^AO_SHELL_CLOSING_PAGE (.+)$/.exec(line);
+  if (m) return { kind: "closing-page", title: m[1] };
+  if (line === "AO_SHELL_CLOSING_WINDOW_CLOSED") return { kind: "closing-window-closed" };
+  if (line === "AO_SHELL_CLOSING_WINDOW_FAILED") return { kind: "closing-window-failed" };
   return null;
+}
+
+/** The closing window's title (apps/desktop/src-tauri/src/closing.rs, packages/ui/closing.html; FR-297, R470 c). */
+export const CLOSING_WINDOW_TITLE = "Closing Alexandrine Oxiana";
+/** It is shown only when the helpers have not gone this long after the close began (closing.rs, AFTER). */
+const CLOSING_WINDOW_AFTER_MS = 2_000;
+
+/**
+ * What is wrong with the closing window in a run's events (in the order the shell printed them, each
+ * with `at`, when this check read it). `expect: "none"`: no closing window may have been tried.
+ * `expect: "shown"`: opened once, with its title, visible, no sooner than two seconds after the
+ * check asked for the close (`closeAt`), after the close began and before the helpers had gone, its
+ * page loaded; with `closedByButton`, closed (as by its close button) before the helpers had gone.
+ */
+export function closingWindowProblems(events, { expect, closeAt, closedByButton = false }) {
+  const at = (kind) => events.findIndex((e) => e.kind === kind);
+  const shown = events.filter((e) => e.kind === "closing-window");
+  const pages = events.filter((e) => e.kind === "closing-page");
+  if (expect === "none") {
+    return [
+      ...shown.map((w) => `a closing window was opened (${w.title})`),
+      ...(pages.length ? ["a closing page was loaded"] : []),
+      ...(at("closing-window-failed") !== -1 && !shown.length ? ["a closing window was tried"] : []),
+    ];
+  }
+  const p = [];
+  const failed = at("closing-window-failed") !== -1;
+  if (failed) p.push("the closing window could not be opened");
+  if (shown.length !== 1) {
+    if (!failed || shown.length) p.push(`the closing window was opened ${shown.length} times`);
+  } else {
+    const w = shown[0];
+    if (w.title !== CLOSING_WINDOW_TITLE) p.push(`its title is "${w.title}"`);
+    if (!w.visible) p.push("it is not visible");
+    if (closeAt !== undefined && w.at - closeAt < CLOSING_WINDOW_AFTER_MS) p.push(`it was opened ${Math.round(w.at - closeAt)} ms after the close, before two seconds`);
+    const iw = events.indexOf(w);
+    const ic = at("closing");
+    const is = at("stopped");
+    if (ic === -1 || ic > iw) p.push("it was opened before the close began");
+    if (is !== -1 && is < iw) p.push("it was opened after the helpers had gone");
+  }
+  if (!failed && !pages.some((e) => e.title === CLOSING_WINDOW_TITLE)) p.push(`its page did not load (${pages.length ? `page title "${pages[0].title}"` : "no page title"})`);
+  if (closedByButton && shown.length) {
+    const ix = at("closing-window-closed");
+    const is = at("stopped");
+    if (ix === -1) p.push("closing it by its close button did not close it");
+    else if (is !== -1 && is < ix) p.push("it was closed only once the helpers had gone");
+  }
+  return p;
 }
 
 /** The commands the page may call: exactly these are allowed, the rest are denied (capabilities/main-window.json). */
@@ -724,7 +785,8 @@ function startShell(env, label, { direct = MAC, shell = SHELL } = {}) {
       buf = buf.slice(i + 1);
       lines.push(line);
       const ev = parseShellLine(line);
-      if (ev) events.push(ev);
+      // `at`: when this check read the line (the closing window's two seconds, FR-297).
+      if (ev) events.push({ ...ev, at: performance.now() });
     }
   });
   child.stderr.on("data", (d) => {
@@ -797,6 +859,12 @@ function killTree(pid) {
       process.kill(p, "SIGKILL");
     } catch {}
   }
+}
+
+/** A and B (FR-297): the helpers normally go within two seconds, so the closing window is not shown; on a loaded machine it may be. Said as a note. */
+function closingWindowNote(run) {
+  const shown = run.find("closing-window");
+  process.stdout.write(`launch-check: note ${run.label}: ${shown ? `the helpers took more than two seconds to stop: the closing window was shown (${shown.title})` : "the helpers stopped within two seconds: no closing window was shown"}\n`);
 }
 
 function report(label, ok, detail = "") {
@@ -1016,7 +1084,7 @@ async function main() {
       await releaseCheck(realpathSync(args.releaseApp), problems);
       return finish(problems);
     }
-    if (!args.app) throw new Error("On a Mac the launch check runs an app bundle: --app <the debug .app> (scenarios A-E) or --release-app <the .app> (scenario R).");
+    if (!args.app) throw new Error("On a Mac the launch check runs an app bundle: --app <the debug .app> (scenarios A-F) or --release-app <the .app> (scenario R).");
     // The real path: tauri-utils refuses a program path with a symbolic link in it on macOS.
     SHELL = shellOf(realpathSync(args.app));
     PACKAGED = true;
@@ -1104,6 +1172,7 @@ async function main() {
         const { code } = await Promise.race([run.exit, sleep(120_000).then(() => ({ code: "timeout" }))]);
         const stopped = run.find("stopped");
         report(`${run.label}: closing the window stops the helpers cleanly and the shell exits 0`, code === 0 && stopped?.how === "clean", `exit ${code}, stop ${stopped?.how ?? "not reported"}`) || problems.push("normal close");
+        closingWindowNote(run);
         await assertGone(run.label, helpers, dir, problems, 10_000);
       } finally {
         if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
@@ -1122,6 +1191,7 @@ async function main() {
         if (signal === "SIGTERM") {
           const stopped = run.find("stopped");
           report(`${label}: an orderly stop`, stopped?.how === "clean", `xvfb-run exit ${code ?? sig}, stop ${stopped?.how ?? "not reported"}`) || problems.push(`${label}: not orderly`);
+          closingWindowNote(run);
         } else {
           report(`${label}: the shell is gone`, !running(svc.shell), `xvfb-run exit ${code ?? sig}`);
         }
@@ -1145,6 +1215,8 @@ async function main() {
         // Nobody closes the error window: in test mode the shell exits by itself after a few seconds, non-zero.
         const { code } = await Promise.race([run.exit, sleep(30_000).then(() => ({ code: "timeout" }))]);
         report(`${run.label}: no app window was opened`, !run.find("window") && !run.find("service")) || problems.push("window on failure");
+        const cw = closingWindowProblems(run.events, { expect: "none" });
+        report(`${run.label}: no closing window was opened (FR-297)`, cw.length === 0, cw.join("; ")) || problems.push("closing window on failure");
         // (xvfb-run passes the shell's standard error on its standard output.)
         report(`${run.label}: the failure is also on standard error`, /could not start: The library service will not start/.test(`${run.log()}\n${run.lines.join("\n")}`)) || problems.push("failure not on standard error");
         report(`${run.label}: the shell exits non-zero by itself when the error window is not answered`, typeof code === "number" && code !== 0, `exit ${code}`) || problems.push("failure exit code");
@@ -1189,6 +1261,10 @@ async function main() {
         report(`${run.label}: the first instance notes the relaunch and keeps closing`, !!run.find("relaunch-requested")) || problems.push("E: relaunch not noted");
         await until("the first instance's helpers to stop", 120_000, async () => run.find("stopped"));
         const stillUp = firstHelpers.filter(running);
+        // Its quit is slowed past two seconds: the closing window was shown before the helpers stopped (FR-297).
+        const firstRun = run.events.slice(0, run.events.indexOf(run.find("stopped")) + 1);
+        const cwE = closingWindowProblems(firstRun, { expect: "shown" });
+        report(`${run.label}: the first instance showed its closing window while it closed`, cwE.length === 0, cwE.join("; ")) || problems.push(...cwE.map((x) => `E: ${x}`));
         report(`${run.label}: the first helpers stop cleanly before anything starts again`, run.find("stopped").how === "clean" && stillUp.length === 0 && run.all("service").length === 1, stillUp.join(", ")) || problems.push("E: helpers not stopped first");
         const again = await until("the app to start again", 120_000, async () => run.all("service")[1]);
         shells.push(again.shell);
@@ -1208,6 +1284,32 @@ async function main() {
         for (const pid of shells) if (running(pid)) killTree(pid);
         if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
         xvfb?.kill("SIGTERM");
+      }
+    }
+
+    // F. A slowed quit (FR-297, R470 c): the closing window two seconds after the close, its own close
+    //    button changing nothing, then the same clean stop and exit as A, and nothing left.
+    {
+      const { dir, env } = scenario("f");
+      env.AO_SHELL_TEST_SLOW_STOP_MS = "10000";
+      const run = startShell(env, "F (closed during a slowed quit)");
+      try {
+        const { helpers } = await upAndProbed(run, media, problems);
+        const closeAt = performance.now();
+        run.child.stdin.write("close\n");
+        await until("the closing window", 60_000, async () => run.find("closing-window") ?? run.find("closing-window-failed") ?? run.find("stopped")).catch(() => null);
+        await until("the closing page", 20_000, async () => run.find("closing-page") ?? run.find("stopped")).catch(() => null);
+        // Its close button (the shell's test command does what the button does): nothing changes.
+        if (run.find("closing-window") && !run.find("stopped")) run.child.stdin.write("close-closing-window\n");
+        await until("the closing window to close", 20_000, async () => run.find("closing-window-closed") ?? run.find("stopped")).catch(() => null);
+        const { code } = await Promise.race([run.exit, sleep(120_000).then(() => ({ code: "timeout" }))]);
+        const cw = closingWindowProblems(run.events, { expect: "shown", closeAt, closedByButton: true });
+        report(`${run.label}: the closing window "${CLOSING_WINDOW_TITLE}" was shown two seconds after the close, while the helpers ran, and closing it changed nothing`, cw.length === 0, cw.join("; ")) || problems.push(...cw.map((x) => `F: ${x}`));
+        const stopped = run.find("stopped");
+        report(`${run.label}: the helpers stop cleanly and the shell exits 0`, code === 0 && stopped?.how === "clean" && run.all("stopped").length === 1 && !run.find("relaunching"), `exit ${code}, stop ${stopped?.how ?? "not reported"}`) || problems.push("F: close");
+        await assertGone(run.label, helpers, dir, problems, 10_000);
+      } finally {
+        if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
       }
     }
   } finally {
