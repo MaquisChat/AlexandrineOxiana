@@ -121,7 +121,7 @@ describe("FR-194: “cannot tell” and a library's close", () => {
 
     // Opening the library again (the service answers again) does not remove them: the researcher still has to look.
     svc.ctl.listFails = false;
-    await user.click(screen.getByRole("button", { name: "Open Thesis library" }));
+    await user.click(await screen.findByRole("button", { name: "Open Thesis library" }));
     await screen.findByRole("navigation", { name: "Projects" });
     await user.click(screen.getByRole("button", { name: "Switch library" }));
     await screen.findByRole("heading", { name: "Choose a library" });

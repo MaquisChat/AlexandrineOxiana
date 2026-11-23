@@ -176,15 +176,20 @@ export const folderName = (folder: string) => folder.split(/[\\/]/).filter(Boole
  * FR-204, FR-205 (R461 d): new projects with the same name, told apart by their folder's own name, each with its own
  * "Open this one" (named for its folder).
  */
-export function SameNamedProjects({ projects, onOpen }: { projects: ProjectSummary[]; onOpen: (project: ProjectSummary) => void }) {
+export function SameNamedProjects({ projects, onOpen }: { projects: ProjectSummary[]; onOpen?: ((project: ProjectSummary) => void) | undefined }) {
   return (
     <ul aria-label="Projects with this name" className="ao-plain-list">
       {projects.map((p) => (
         <li key={p.id}>
-          The project in the folder “<UserText>{folderName(p.folder)}</UserText>”{" "}
-          <button type="button" className="ao-small" aria-label={`Open the project in the folder “${folderName(p.folder)}”`} onClick={() => onOpen(p)}>
-            Open this one
-          </button>
+          The project in the folder “<UserText>{folderName(p.folder)}</UserText>”
+          {onOpen && (
+            <>
+              {" "}
+              <button type="button" className="ao-small" aria-label={`Open the project in the folder “${folderName(p.folder)}”`} onClick={() => onOpen(p)}>
+                Open this one
+              </button>
+            </>
+          )}
         </li>
       ))}
     </ul>
@@ -282,7 +287,8 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
     uncertainRef.current?.(uncertain ? pendingCheck.current : null);
   }, [uncertain]);
   useEffect(() => () => uncertainRef.current?.(null), []);
-  const foundEncrypted = !!found?.encrypted;
+  // The "more than one" panel of an encrypted create says the same, so it is held as well.
+  const foundEncrypted = !!found?.encrypted || !!foundMany?.encrypted;
   useEffect(() => {
     if (!foundEncrypted) return;
     holdRef.current?.(true);
@@ -484,15 +490,21 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
               {foundMany.projects.length} projects named “<UserText>{foundMany.name}</UserText>” appeared in the library while the answer was lost, so the app cannot tell which one was made here: another
               may have been made elsewhere, in another window.
             </p>
-            <SameNamedProjects projects={foundMany.projects} onOpen={onCreated} />
+            {/* Once the library is closed (an encrypted create is held, FR-194), no project can be opened here. */}
+            <SameNamedProjects projects={foundMany.projects} onOpen={foundMany.encrypted && libraryClosed ? undefined : onCreated} />
             {foundMany.encrypted && (
               <p className="ao-newproject__warning">
                 The one made here opens with the passphrase you just chose; its recovery code could not be shown and cannot be shown again. Once it is open, choose “New recovery code…” on the library screen to get a recovery code you can save.
               </p>
             )}
+            {foundMany.encrypted && libraryClosed && (
+              <p role="status" className="ao-newproject__warning">
+                The library was closed while this was open. The project was created; once you have read this, you return to choosing a library.
+              </p>
+            )}
             <div className="ao-row ao-newproject__actions">
               <button type="button" onClick={() => onCancel()}>
-                Close
+                {foundMany.encrypted && libraryClosed ? "Back to choosing a library" : "Close"}
               </button>
             </div>
           </>

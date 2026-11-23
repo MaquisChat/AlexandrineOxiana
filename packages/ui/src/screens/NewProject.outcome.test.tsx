@@ -391,6 +391,46 @@ describe("New project dialog: the recovery code cannot be left unsaved (R134 I2)
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
+  it("FR-194: the “more than one” panel of an encrypted create holds a library's close too, without “Open this one”; not encrypted, it is not held", async () => {
+    for (const encrypted of [true, false]) {
+      const made = encrypted ? NEW_ENC : NEW_OPEN;
+      const twin = { ...made, id: "p5", folder: `${made.folder} 2` };
+      let posted = 0;
+      server.use(
+        http.post(url("/projects"), () => {
+          posted++;
+          return HttpResponse.error();
+        }),
+        http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, ...(posted ? [made, twin] : [])] })),
+        ...libraryHandlers(),
+      );
+      const events = controllableEvents();
+      server.use(events.handler);
+      const onClosed = vi.fn();
+      const user = userEvent.setup();
+      const view = render(<Library api={testApi()} current={CURRENT_RW as never} onClosed={onClosed} />);
+      const dialog = await openDialog(user);
+      await (encrypted ? fillEncrypted : fillOpen)(dialog, user);
+      await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+      const many = await screen.findByRole("dialog", { name: "More than one project with this name was found" });
+      act(() => events.send("library.state", { open: false }));
+      if (!encrypted) {
+        await waitFor(() => expect(onClosed).toHaveBeenCalledTimes(1));
+        view.unmount();
+        continue;
+      }
+      expect(await within(many).findByText("The library was closed while this was open. The project was created; once you have read this, you return to choosing a library.")).toBeTruthy();
+      expect(onClosed).not.toHaveBeenCalled();
+      expect(many.textContent).toMatch(/opens with the passphrase you just chose/);
+      expect(within(many).queryByRole("button", { name: /Open this one|Open the project in the folder/ })).toBeNull();
+      expect(within(many).queryByRole("button", { name: "Close" })).toBeNull();
+      await user.click(within(many).getByRole("button", { name: "Back to choosing a library" }));
+      await waitFor(() => expect(onClosed).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      view.unmount();
+    }
+  });
+
   it("FR-194: the “found” panel of a project that is not encrypted does not hold a library's close", async () => {
     serveLost(NEW_OPEN);
     const events = controllableEvents();

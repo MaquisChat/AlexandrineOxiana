@@ -718,7 +718,15 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             onUncertain={(c) => {
               dialogUncertain.current = c;
             }}
-            onCancel={dialogClosed}
+            onCancel={(u) => {
+              if (closedUnder) {
+                // The library went away while a held panel was on screen (FR-194): now leave it.
+                setCreating(false);
+                closedRef.current?.();
+                return;
+              }
+              dialogClosed(u);
+            }}
             onCreated={(made) => {
               // FR-180: a project this dialog made is known, so a notice still unsettled never takes it for the lost create.
               setUnresolved((u) => (u ? { ...u, create: { ...u.create, before: new Set([...u.create.before, made.id]) } } : u));
