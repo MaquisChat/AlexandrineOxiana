@@ -185,13 +185,25 @@ export const PROJECT_PAGE = 500;
  * nothing of what it created (an older service), has every collection and tag flagged. Until the list is known (still
  * being read, or refused, as in a read-only library) nothing is flagged, never every entry (R463 M1).
  */
-function madeByBatch(id: string, batchId: string | undefined, batch: BatchSummary | undefined, known: boolean): boolean {
+function madeByBatch(id: string, batchId: string | undefined, batch: BatchSummary | undefined, known: boolean): FolderFlag {
   if (!batchId || !known) return false;
-  if (!batch) return true;
+  if (!batch) return "unrecorded";
   if (!FOLDER_KINDS.has(batch.kind)) return false;
-  if (!batch.created) return true;
-  return batch.created.collectionIds.includes(id) || batch.created.tagIds.includes(id);
+  if (!batch.created) return "unrecorded";
+  return batch.created.collectionIds.includes(id) || batch.created.tagIds.includes(id) ? "made" : false;
 }
+
+/**
+ * Why a collection or tag is flagged (R465 a): "made", the import reports it made it from a folder name; "unrecorded",
+ * the app has no record of what the import made (an older import, or one the screen cannot find), so it may have.
+ */
+type FolderFlag = "made" | "unrecorded" | false;
+
+/** The strongest flag among these ids: "made" is said for those; otherwise the hedged sentence. */
+const folderFlagOf = (ids: readonly string[], flag: (id: string) => FolderFlag): FolderFlag => {
+  const flags = ids.map(flag);
+  return flags.includes("made") ? "made" : flags.includes("unrecorded") ? "unrecorded" : false;
+};
 
 /** The group an entry is listed under in the project's queue. */
 /** The group an entry is listed under: the service's, from the library's cause (R176 3); never guessed here from fields. */
@@ -1037,7 +1049,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               collections={collections}
               tags={tags}
               flagTitle={flagging && titleFromFileName(item, shownSource)}
-              flagFolderNames={flagging ? (id: string) => madeByBatch(id, batchId ?? item.batchId, itemBatch(item), batchesKnown) : () => false}
+              flagFolderNames={flagging ? (id: string) => madeByBatch(id, batchId ?? item.batchId, itemBatch(item), batchesKnown) : () => false as const}
               busy={busy}
               onDecide={(d, done) => void decide(item, d, done)}
               onConfirm={(field, value) => confirmField(item, field, value)}
@@ -1749,7 +1761,7 @@ interface ItemPanelProps {
   tags: Tag[];
   flagTitle: boolean;
   /** True for a collection or tag id the batch made from a folder name (R64). */
-  flagFolderNames(id: string): boolean;
+  flagFolderNames(id: string): FolderFlag;
   busy: boolean;
   onDecide(d: ReviewDecision, done: string): void;
   /** A conflicting field's value chosen through the source screen's confirm (R149). */
@@ -1802,8 +1814,8 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
   const title = titleOf(source);
   const inCollections = (s?.collectionIds ?? []).map((id) => collections.find((c) => c.id === id)?.name ?? id);
   const itsTags = (s?.tagIds ?? []).map((id) => ({ id, index: tags.findIndex((t) => t.id === id) + 1, tag: tags.find((t) => t.id === id) }));
-  const folderCollections = (s?.collectionIds ?? []).some(flagFolderNames);
-  const folderTags = (s?.tagIds ?? []).some(flagFolderNames);
+  const folderCollections = folderFlagOf(s?.collectionIds ?? [], flagFolderNames);
+  const folderTags = folderFlagOf(s?.tagIds ?? [], flagFolderNames);
 
   return (
     <div className="ao-review__panel" onPointerMove={(e) => notice && pointing.moved.has(e.nativeEvent) && onPointedAt()}>
@@ -1897,14 +1909,26 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
                   </>
                 )}
               </dl>
-              {folderCollections && (
+              {folderCollections === "made" && (
                 <p className="ao-import__warning">
                   These collection names come from folder names, which can carry participants' names. Check them, and rename the collection or move the item if one names someone.
                 </p>
               )}
-              {folderTags && (
+              {folderCollections === "unrecorded" && (
+                <p className="ao-import__warning">
+                  The app has no record of which collections this import made, so these collection names may come from folder names, which can carry participants' names. Check them, and rename the
+                  collection or move the item if one names someone.
+                </p>
+              )}
+              {folderTags === "made" && (
                 <p className="ao-import__warning">
                   These tag names come from folder names, which can carry participants' names. Check them, and rename or remove a tag that names someone.
+                </p>
+              )}
+              {folderTags === "unrecorded" && (
+                <p className="ao-import__warning">
+                  The app has no record of which tags this import made, so these tag names may come from folder names, which can carry participants' names. Check them, and rename or remove a tag that
+                  names someone.
                 </p>
               )}
               <FilePreview api={api} projectId={projectId} source={source} />
