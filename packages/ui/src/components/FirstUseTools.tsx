@@ -326,7 +326,8 @@ function FirstUseDialog({ api, tools, onCancel, onNotNow, onStarted }: { api: To
             <UserText>{ticked.map((t) => `${t.name}: ${hostsOf(t, { missingOnly: true }).length > 0 ? describeHosts(hostsOf(t, { missingOnly: true })) : PUBLISHER_SERVERS}`).join("; ")}</UserText>.{" "}
           </>
         ) : (
-          `Downloading contacts each tool's publisher's servers (the catalogue does not name them). `
+          // FR-291, R467 M7: the servers that host a tool are not always its publisher's (a speech model is hosted by a third party).
+          `Downloading contacts the servers that host each tool (the catalogue does not name them). `
         )}
         Nothing about your projects or about you is sent.
       </p>

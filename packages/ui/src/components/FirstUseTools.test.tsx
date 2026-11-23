@@ -259,11 +259,11 @@ describe("the first-use tools dialogue", () => {
     expect(line.textContent).toMatch(/Image downloader: its publisher's servers \(the catalogue does not name them\)/);
   });
 
-  it("without hosts in the catalogue it names none and says only 'each tool's publisher'", async () => {
+  it("without hosts in the catalogue it names none and says the servers that host each tool, not its publisher (FR-291, R467 M7)", async () => {
     const { user } = await opened(memoryStore(), toolsService({ tools: catalogueWithoutHosts() }));
     await user.click(activity(/save videos/i));
     const line = screen.getByText(/nothing about your projects or about you/i);
-    expect(line.textContent).toMatch(/each tool's publisher/);
+    expect(line.textContent).toBe("Downloading contacts the servers that host each tool (the catalogue does not name them). Nothing about your projects or about you is sent.");
     expect(line.textContent).not.toMatch(/github|deno\.land/);
   });
 
