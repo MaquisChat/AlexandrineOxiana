@@ -285,10 +285,8 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       try {
         paused = await state.quiesce(s); // 409 before the stream starts when work cannot pause
       } catch (err) {
-        // Refused before anything was copied: a transcription the move stopped (FR-385) runs again
-        // now, in the library still open, rather than at its next open.
+        // Refused before anything was copied; no transcription was stopped (that waits for the plan).
         state.moving = false;
-        state.resumeStoppedTranscriptions(s);
         throw err;
       }
       state.roots.add(dest);
@@ -306,6 +304,12 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
           ...(s.index ? { index: s.index } : {}),
           tz: state.tz,
           onProgress: (p) => write({ progress: p }),
+          // Only a move whose plan is accepted stops the running transcriptions (R466 M1, R486 b): a move
+          // refused at its plan leaves them running. `moving` (set above) lets nothing start meanwhile.
+          onPlanAccepted: async () => {
+            await state.stopTranscriptionsForMove(s);
+            await ctx.afterMoveStop?.();
+          },
         });
       } catch (err) {
         // Not moved: the old library carries on as before.

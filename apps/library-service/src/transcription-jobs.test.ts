@@ -612,13 +612,41 @@ describe("fix round 1", () => {
     expect(versions).toBe(2);
   });
 
+  it("R466 M1 (R486 b): a move refused at its own plan (a destination that is not empty) does not stop the transcription: one run, stored once", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true, suspendTimeoutMs: 2_000 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    const dest = join(tmp, "Full");
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, "notes.txt"), "someone else's file");
+    const refused = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    // The move's usual answer for a destination it may not use.
+    expect(refused.body).toContain('"code":"POLICY_DENIED"');
+    expect(refused.body).toContain("The library cannot be moved there.");
+    expect(refused.body).not.toContain('"done":true');
+    expect(worker.runs[0]!.cancelled).toBe(false);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker.runs).toHaveLength(1);
+    expect(worker.runs[0]!.cancelled).toBe(false);
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2); // one run: its WebVTT and its segments file
+  });
+
   it("FR-385 (R466 M1): a move that fails after it stopped the transcription starts the run again in the library still open: stored once", async () => {
     worker = await stubWorker();
     await start({
       worker: provider(worker),
       autoStartWorker: true,
       suspendTimeoutMs: 2_000,
-      beforeExecuteMove: async () => {
+      // Once the plan is accepted and the transcription stopped (R486 b), the copy fails.
+      afterMoveStop: async () => {
         throw new Error("the copy could not start");
       },
     });

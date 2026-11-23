@@ -354,7 +354,7 @@ export class ServiceState {
   }
 
   /**
-   * After a move refused before anything was copied (FR-385): the transcriptions its quiesce stopped
+   * After a move refused before anything was copied (FR-385): the transcriptions it stopped
    * stay pending in their journals; once they have ended here, they run again in the library still
    * open (not awaited by the refusal).
    */
@@ -1065,7 +1065,8 @@ export class ServiceState {
   /**
    * Before a library move (R99 I5): running batches paused (refused if one cannot be), watches
    * stopped, viewing-proxy and OCR queues disposed of and the backup scheduler stopped, so nothing
-   * writes to the library while it is copied. Returns the batches to resume afterwards.
+   * writes to the library while it is copied. A running transcription is left running: it is stopped
+   * only once the move's plan is accepted (`stopTranscriptionsForMove`). Returns the batches to resume afterwards.
    */
   async quiesce(s: Session): Promise<Array<{ projectId: string; batchId: string }>> {
     // A ticket never outlives the library where it was issued (R135 2): ended as the move starts.
@@ -1076,7 +1077,8 @@ export class ServiceState {
     await this.zoteroSync.stop("library-closed");
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
-    // A running transcription is not waited for here: it is stopped below, once nothing else refuses the move.
+    // A running transcription is not waited for here: it is stopped once the move's plan is accepted
+    // (`stopTranscriptionsForMove`, R466 M1, R486 b).
     if (!(await this.drainWork(ms, (w) => !isTranscribing(w)))) {
       this.zoteroSync.startScheduler(this, s);
       this.restartStoppedWork();
@@ -1102,17 +1104,6 @@ export class ServiceState {
       this.restartStoppedWork();
       throw new ApiError(409, "CONFLICT", "An import could not be paused in time, so the library was not moved; try again in a moment.");
     }
-    // The move goes ahead: every transcription running in the library is stopped at once, as at a close
-    // (N-5), whatever started it (FR-385; R466 I1, M1) — one asked for here, or a rerun of a pending one
-    // (after an unlock, a launch, or a move that carried it on). It stays pending in its project's journal;
-    // a write already under way finishes first (the worker client's guarded write). Then it is waited for.
-    for (const w of this.work.values()) if (isTranscribing(w)) w.ctl.interrupt?.();
-    if (!(await this.drainWork(ms))) {
-      this.resumeBatches(paused);
-      this.zoteroSync.startScheduler(this, s);
-      this.restartStoppedWork();
-      throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
-    }
     try {
       this.stopBackupScheduler();
       await this.stopWatches(s);
@@ -1129,6 +1120,24 @@ export class ServiceState {
       throw err;
     }
     return paused;
+  }
+
+  /**
+   * The move's plan is accepted (executeMove's `onPlanAccepted`; R466 M1, R486 b): every transcription
+   * running in the library is stopped at once, as at a close (N-5), whatever started it (FR-385; R466
+   * I1) — one asked for here, or a rerun of a pending one (after an unlock, a launch, or a move that
+   * carried it on). It stays pending in its project's journal; a write already under way finishes first
+   * (the worker client's guarded write). Then all registered work is waited for. Nothing new starts
+   * between the plan's check and this stop: `moving` refuses every change and every rerun, and `quiesce`
+   * has drained all other work. Refused (409) when the work does not end in time; the move's failure
+   * path then starts everything again, and the stopped transcriptions run again once they have ended.
+   */
+  async stopTranscriptionsForMove(s: Session): Promise<void> {
+    for (const w of this.work.values()) if (isTranscribing(w)) w.ctl.interrupt?.();
+    if (!(await this.drainWork(this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS))) {
+      this.resumeStoppedTranscriptions(s);
+      throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
+    }
   }
 
   /**
