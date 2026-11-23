@@ -778,8 +778,110 @@ describe("the expiry follows the service's time (item 4)", () => {
     await screen.findByRole("img", { name: /Pairing code/ });
     vi.setSystemTime(Date.now() + 10 * 60_000); // the timers did not run while asleep
     act(() => void document.dispatchEvent(new Event("visibilitychange")));
+    // The screen asks the service once before it says "expired" (S1, R486 a); the answer is "expired".
+    await tick(0);
+    expect(svc.state.statusReads).toHaveLength(1);
     expect(screen.queryByRole("img", { name: /Pairing code/ })).toBeNull();
     expect(screen.getByRole("alert").textContent).toMatch(/expired/i);
+  });
+});
+
+describe("at its expiry the screen asks the service once before it says 'expired' (FR-335, S1, R486 a)", () => {
+  const SAVING_NOW = "The right code was typed. The pairing is being saved…";
+
+  it("the service began to save the pairing after the last status read: the screen says it is being saved, never 'expired', and then says used", async () => {
+    // The reviewer's V1: a 28 s code, a status read every 5 s, the service saving from 26 s.
+    const svc = pairingService({ codes: [{ code: "482916", ttlMs: 28_000 }] });
+    server.use(...svc.handlers);
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={5000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    await tick(26_000);
+    expect(svc.state.statusReads).toHaveLength(5); // at 5, 10, 15, 20 and 25 s
+    const lists = svc.state.listReads;
+    svc.end(0, { state: "confirming", codeId: codeIdOf(0) });
+    await tick(3000); // 29 s: past the code's expiry on this page's clock, before the next read at 30 s
+    expect(svc.state.statusReads).toHaveLength(6); // the one read at the expiry
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(document.body.textContent).not.toMatch(/expired/i);
+    expect(screen.getByRole("status", { name: "Pairing being saved" }).textContent).toBe(SAVING_NOW);
+    expect(screen.getByRole("img", { name: /Pairing code/ })).toBeTruthy();
+    expect(screen.queryByText(/Valid for/)).toBeNull();
+    // The screen goes on asking, and learns of the pairing.
+    svc.pairWith(BROWSER_B);
+    await tick(5000);
+    expect(screen.getByRole("status", { name: "Pairing result" }).textContent).toContain(BROWSER_B.origin);
+    expect(document.body.textContent).not.toMatch(/expired/i);
+    expect(svc.state.listReads).toBeGreaterThan(lists);
+  });
+
+  it("the pairing was saved after the last status read: at the expiry the screen says it was used and reads the list", async () => {
+    const svc = pairingService({ codes: [{ code: "482916", ttlMs: 28_000 }] });
+    server.use(...svc.handlers);
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={5000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    await tick(26_000);
+    const lists = svc.state.listReads;
+    svc.pairWith(BROWSER_B);
+    await tick(3000);
+    expect(svc.state.statusReads).toHaveLength(6);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status", { name: "Pairing result" }).textContent).toContain(BROWSER_B.origin);
+    expect(svc.state.listReads).toBeGreaterThan(lists);
+    expect(screen.queryByRole("img", { name: /Pairing code/ })).toBeNull();
+  });
+
+  it("not used at the expiry: the screen says 'expired' as before, after exactly one more status read, however often the page is looked at again", async () => {
+    const svc = pairingService({ codes: [{ code: "482916", ttlMs: 10_000 }] });
+    // Each status answer takes half a second, so the page's own "look again" events arrive while the one read is under way.
+    server.use(
+      http.get(url("/extension/pair/status/:codeId"), async () => {
+        await new Promise((r) => setTimeout(r, 500));
+        return undefined; // passes on to the stand-in service
+      }),
+      ...svc.handlers,
+    );
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={1_000_000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    expect(svc.state.statusReads).toHaveLength(0);
+    await tick(10_000);
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    await tick(1000);
+    expect(svc.state.statusReads).toHaveLength(1);
+    expect(screen.queryByRole("img", { name: /Pairing code/ })).toBeNull();
+    expect(screen.getByRole("alert").textContent).toBe("The code expired and was removed from this page. Show a new code to pair.");
+    await tick(10_000);
+    expect(svc.state.statusReads).toHaveLength(1);
+  });
+
+  it("a status read that fails at the expiry: the screen says what it says today, 'expired'", async () => {
+    const svc = pairingService({ codes: [{ code: "482916", ttlMs: 10_000 }] });
+    let reads = 0;
+    server.use(
+      http.get(url("/extension/pair/status/:codeId"), () => {
+        reads++;
+        return HttpResponse.error();
+      }),
+      ...svc.handlers,
+    );
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={1_000_000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    await tick(11_000);
+    expect(reads).toBe(1);
+    expect(screen.queryByRole("img", { name: /Pairing code/ })).toBeNull();
+    expect(screen.getByRole("alert").textContent).toBe("The code expired and was removed from this page. Show a new code to pair.");
+    await tick(10_000);
+    expect(reads).toBe(1);
   });
 });
 

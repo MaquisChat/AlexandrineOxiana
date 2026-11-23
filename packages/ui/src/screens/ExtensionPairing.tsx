@@ -139,6 +139,8 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
    */
   const [saving, setSaving] = useState<false | "saving" | "slow">(false);
   const savingRef = useRef<false | "saving" | "slow">(false);
+  /** The id of the code shown now, so an answer about a code no longer shown is dropped. */
+  const shownCodeId = useRef<string | null>(null);
 
   const alive = useRef(true);
   const aborts = useRef(new Set<AbortController>());
@@ -203,6 +205,7 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
 
   /** The code leaves the page and the state. */
   const clearCode = (next: Outcome | null) => {
+    shownCodeId.current = null;
     setCode(null);
     setOutcome(next);
     setAnnouncement("");
@@ -212,19 +215,67 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
     setSaving(false);
   };
 
+  /**
+   * At the code's expiry on this page's clock the service is asked ONCE what became of it before the
+   * screen says "expired" (FR-335, S1, R486 a): the service may have begun to save the pairing after the
+   * last status read. "Being saved" and "used" are followed as the status reads follow them (R464 a);
+   * any other ending is said as it is; "still active" (the service's clock) or a read that fails lets
+   * "expired" be said, as before this check.
+   */
+  const askAtExpiry = async (codeId: string) => {
+    const ac = signal();
+    let s: PairingCodeStatus | undefined;
+    try {
+      s = statusOf(await api.codeStatus(codeId, ac.signal));
+    } catch {
+      s = undefined;
+    } finally {
+      done(ac);
+    }
+    if (!alive.current || shownCodeId.current !== codeId) return; // the code already left the page
+    switch (s?.state) {
+      case "confirming":
+        if (savingRef.current === false) {
+          savingRef.current = "saving";
+          setSaving("saving");
+        }
+        return;
+      case "used":
+        clearCode({ kind: "used", origin: s.browser.origin, browserId: s.browser.id });
+        return;
+      case "invalidated":
+        clearCode({ kind: s.reason === "not-saved" ? "not-saved" : "invalidated" });
+        return;
+      case "replaced":
+        clearCode({ kind: "replaced" });
+        return;
+      case "none":
+        clearCode({ kind: "unknown" });
+        return;
+      default:
+        if (savingRef.current === false) clearCode({ kind: "expired" }); // a status read may have seen "being saved" meanwhile
+    }
+  };
+
   // The countdown: the visible clock changes every second; the announcement only at sensible moments.
   // A code being saved is no longer counted down: it is spent, and never "expired" (FR-335).
   const deadline = code?.deadline;
+  const codeId = code?.codeId;
   const counting = saving === false;
   useEffect(() => {
-    if (deadline === undefined || !counting) return;
+    if (deadline === undefined || codeId === undefined || !counting) return;
     const left = () => Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
     setRemaining(left());
+    let asked = false;
     const check = () => {
+      if (asked) return;
       const s = left();
       if (s <= 0) {
+        // One request, not a loop: the page's "look again" events while it is under way ask nothing more.
+        asked = true;
         clearInterval(t);
-        clearCode({ kind: "expired" });
+        setRemaining(0);
+        void askAtExpiry(codeId);
         return;
       }
       setRemaining(s);
@@ -242,7 +293,8 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
       document.removeEventListener("visibilitychange", check);
       window.removeEventListener("focus", check);
     };
-  }, [deadline, counting]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- askAtExpiry reads only refs, `api` and state setters
+  }, [deadline, codeId, counting]);
 
   // Still being saved SAVING_SLOW_MS after the service first said so: the screen says it is taking
   // long, and reads the list once by itself (the browser is paired once it is in it; R464 a).
@@ -400,6 +452,7 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
       const at = Date.now();
       warned.current = false;
       setRemaining(Math.ceil(validFor / 1000));
+      shownCodeId.current = r.codeId;
       setCode({ digits: r.code, codeId: r.codeId, deadline: at + validFor });
       setAnnouncement(`A pairing code is showing. It is valid for ${Math.max(1, Math.round(validFor / 60000))} minutes.`);
     } catch (err) {
