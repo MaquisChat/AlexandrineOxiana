@@ -1733,6 +1733,8 @@ processing:
   it("FR-132 (R474 I1): the Zotero (web) wizard's summary says that what was taken away in Zotero stays here, once items came in before", async () => {
     const p = await project(ZGOV);
     for (const t of ["One", "Two"]) await addWithFile(t);
+    // R474 M5: not before a first import, where no item can come in again.
+    expect((await createBulkImport(deps()).dryRun(p.id, zoteroWebAdapter(web()))).notes).not.toContain(ZOTERO_NOTES.removalsKept("zotero-web"));
     await (await startZoteroWebImport(deps(), p.id, web())).done;
     const dry = await createBulkImport(deps()).dryRun(p.id, zoteroWebAdapter(web()));
     expect(ZOTERO_NOTES.removalsKept("zotero-web")).toBe(

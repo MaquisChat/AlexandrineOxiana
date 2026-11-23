@@ -222,8 +222,6 @@ async function libraryFileTest(repo: Repo, work: string, kind: string): Promise<
 
 /** The run's note on files removed here and not brought back (Z4), counted over the batch's lines. */
 const removedNote = (n: number) => (n === 1 ? "An attached file you removed here was not brought in again." : `${n} attached files you removed here were not brought in again.`);
-/** FR-132: the outcomes of an item a Zotero run had imported before. */
-const SEEN_AGAIN: ReadonlySet<string> = new Set(["updated", "unchanged", "zotero-back", "zotero-conflict"]);
 const REMOVED_NOTE = /^(?:An attached file you removed here was|\d+ attached files you removed here were) not brought in again\.$/u;
 
 /** A stored file's parts as journaled (Z4). */
@@ -1122,9 +1120,6 @@ class Run {
     const removed = [...this.latest.values()].reduce((n, e) => n + (e.notes?.filter((x) => x === ENGINE_FILE_NOTES.removedHere).length ?? 0), 0);
     this.rec.notes = this.rec.notes.filter((n) => !REMOVED_NOTE.test(n));
     if (removed) this.note(removedNote(removed));
-    // FR-132: a Zotero run that saw items again says that what was taken away in Zotero stays here.
-    const kind = this.rec.source.kind;
-    if ((kind === "zotero-local" || kind === "zotero-web") && [...this.latest.values()].some((e) => SEEN_AGAIN.has(e.outcome))) this.note(ZOTERO_NOTES.removalsKept(kind));
     for (const id of watchdog.disabled) {
       this.note(`The file-name pattern "${id}" took too long on a file name and was switched off for the rest of this import.`);
     }
@@ -1174,6 +1169,9 @@ class Run {
             return (await this.backfillOnly(item, k.sourceId, target)) ?? this.queue({ key: item.key, outcome: "unchanged", sourceId: k.sourceId }, target?.assets);
           }
           await this.flush(); // the source may be in the current group
+          // FR-132 (R474 M5): an item changed in Zotero comes in again, so what was taken away there may not be here.
+          const kind = this.rec.source.kind;
+          if (kind === "zotero-local" || kind === "zotero-web") this.note(ZOTERO_NOTES.removalsKept(kind));
           return await this.update(item, k.sourceId);
         }
         // Deleted here after an earlier import: stays deleted unless the options say otherwise (R73).
@@ -2765,10 +2763,13 @@ export async function dryRun(
     const secret = randomBytes(32).toString("hex");
     const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))], secret, await approvalHashes(secret, opts.approveOutside));
     const inLibrary = await libraryFileTest(repo, dir, adapter.kind);
+    const known = adapter.kind === "zotero-local" || adapter.kind === "zotero-web" ? await knownVersions(repo, projectId, adapter.kind) : undefined;
+    let seenAgain = false;
     for await (const scanned of scan) {
       let item = scanned;
       if (item.gone) continue; // gone at its source: nothing to import
       summary.items++;
+      if (item.version && known?.has(item.version.id)) seenAgain = true;
       if (item.unreadable) {
         summary.unreadable.push({ path: item.key, reason: item.unreadable });
         continue;
@@ -2849,8 +2850,9 @@ export async function dryRun(
       else if (seenSha.has(sha)) summary.likelyDuplicates++;
       seenSha.add(sha);
     }
-    // FR-132 (R474 I1): the wizard's summary of either Zotero import says what an import does not take away.
-    if (adapter.kind === "zotero-local" || adapter.kind === "zotero-web") summary.notes.push(ZOTERO_NOTES.removalsKept(adapter.kind));
+    // FR-132 (R474 I1, M5): the wizard's summary of either Zotero import says what an import does not take away,
+    // when an item would come in again (not before a first import).
+    if (seenAgain && (adapter.kind === "zotero-local" || adapter.kind === "zotero-web")) summary.notes.push(ZOTERO_NOTES.removalsKept(adapter.kind));
     await spaceOfScan(repo, projectId, adapter, summary, linkedBytes, opts.approveOutside);
   } finally {
     if (made) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});

@@ -1050,21 +1050,28 @@ processing:
     expect((await bulk.batchReport(p.id, h.batchId)).notes).toContain(DEFERRED_NOTE);
   });
 
-  it("FR-132: the dry run and a run that sees items again say that what was taken away in Zotero stays here; a first run does not", async () => {
+  it("FR-132 (R474 M5): the note that what was taken away in Zotero stays here is said only where it can matter: a dry run once items came in before, a run that took an item changed in Zotero", async () => {
     const p = await project();
     const bulk = bulkImport();
     const said = (notes: string[]) => notes.includes(ZOTERO_NOTES.removalsKept("zotero-local"));
     expect(ZOTERO_NOTES.removalsKept("zotero-local")).toBe(
       "When an item comes in from Zotero again, what was taken away there is not taken away here: a tag taken off, an annotation deleted or a collection the item was taken out of stays as it is here. An item put into another collection in Zotero is not put into it here.",
     );
-    expect(said((await bulk.dryRun(p.id, zoteroLocalAdapter(dataDir))).notes)).toBe(true);
+    // A first import: no item can come in again.
+    expect(said((await bulk.dryRun(p.id, zoteroLocalAdapter(dataDir))).notes)).toBe(false);
     const first = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
     await first.done;
     expect(said((await bulk.batchReport(p.id, first.batchId)).notes)).toBe(false);
+    expect(said((await bulk.dryRun(p.id, zoteroLocalAdapter(dataDir))).notes)).toBe(true);
+    // Nothing changed in Zotero: nothing there could have been taken away.
+    const same = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    await same.done;
+    expect(said((await bulk.batchReport(p.id, same.batchId)).notes)).toBe(false);
+    zoteroEdit((db) => db.prepare("UPDATE items SET version = 9, clientDateModified = '2024-06-01 08:00:00' WHERE itemID = 1").run());
     const again = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
     await again.done;
     expect(said((await bulk.batchReport(p.id, again.batchId)).notes)).toBe(true);
-    expect(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "report.md"), "utf8")).toContain(`- ${ZOTERO_NOTES.removalsKept("zotero-local")}`);
+    expect(await readFile(join(lib.root, p.folder, "imports", "batch-0003", "report.md"), "utf8")).toContain(`- ${ZOTERO_NOTES.removalsKept("zotero-local")}`);
   });
 
   it("R73: a source deleted here is not re-imported (report note); includeDeleted brings it back and clears the tombstone", async () => {
