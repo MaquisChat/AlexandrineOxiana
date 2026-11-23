@@ -392,6 +392,15 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
     allowed.push({ sf, mode: loc && loc.type === "location" ? loc.mode : "keep" });
   }
 
+  /** Destroyed files by what the project's records say of them (FR-410, R365 a, R473 I2/M1/M5). */
+  const omitted: Record<DestroyedBasis, number> = { own: 0, restoredVerified: 0, restoredUnverified: 0, logNotIntact: 0 };
+  /** Read only when there is a destroyed original; before the export folder is made, so a read that fails leaves none (R473 M2). */
+  let basisOf: (a: Asset) => DestroyedBasis = () => "own";
+  if (allowed.some(({ sf }) => sf.assets.some((a) => a.role === "original" && a.status === "destroyed"))) {
+    const log = await verifiedAuditEvents(repo, projectId);
+    basisOf = log.ok ? destroyedBasis(log.events) : () => "logNotIntact";
+  }
+
   // 2. The export folder (new; never an existing one), written as "<folder>.partial" and renamed
   // at the end: a crash leaves decrypted files only in a .partial folder, removed next time (R92 I1).
   await fsp.mkdir(dest, { recursive: true });
@@ -437,14 +446,6 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
   const getKey = (id: string) => (key && id === key.keyId ? key.key : undefined);
   const notes: string[] = [];
   let omittedLocated = 0;
-  /** Destroyed files by what the project's records say of them (FR-410, R365 a, R473 I2/M1/M5). */
-  const omitted: Record<DestroyedBasis, number> = { own: 0, restoredVerified: 0, restoredUnverified: 0, logNotIntact: 0 };
-  /** Read only when there is a destroyed original. */
-  let basisOf: (a: Asset) => DestroyedBasis = () => "own";
-  if (allowed.some(({ sf }) => sf.assets.some((a) => a.role === "original" && a.status === "destroyed"))) {
-    const log = await verifiedAuditEvents(repo, projectId);
-    basisOf = log.ok ? destroyedBasis(log.events) : () => "logNotIntact";
-  }
   let filesWritten = 0;
   const work = `worker-export-${randomUUID()}`;
   const workDir = join(lib.root, ".tmp", work);

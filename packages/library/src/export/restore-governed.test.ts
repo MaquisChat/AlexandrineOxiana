@@ -14,7 +14,7 @@ import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { strToU8, unzipSync, zipSync } from "fflate";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sealEvent, verifyChain, type AuditEvent, type Project, type SourceFile } from "@ao/core";
 import { shredSeams } from "../fs/shred.js";
 import type { LocationEnv } from "../location.js";
@@ -1370,6 +1370,23 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([OWN_RULE]);
     await breakAudit(p, (l) => l.includes('"op":"retention.destroy"'));
     expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([LOG_NOT_INTACT]);
+  });
+
+  it("M2: a read of the log that fails leaves no half-made export folder in the destination", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    const dest = join(kit.tmp, "out-m2");
+    await mkdir(dest);
+    const read = vi.spyOn(AuditStore, "read").mockRejectedValue(Object.assign(new Error("I/O error"), { code: "EIO" }));
+    try {
+      await expect(exportProjectOpenFormats(kit.repo, p.id, dest)).rejects.toThrow("The export could not be completed (EIO)");
+    } finally {
+      read.mockRestore();
+    }
+    expect(await readdir(dest)).toEqual([]);
   });
 
   it("a file destroyed before the backup was made: its copy's export still says the project's retention rule destroyed it", async () => {
