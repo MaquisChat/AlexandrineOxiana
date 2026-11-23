@@ -142,6 +142,8 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
       setConsents(c.consents);
       setComplete(p.complete && s.complete && c.complete);
     } catch (err) {
+      // A pending focus target must never fire later, by surprise (n2).
+      setDetachedFrom(null);
       setError(err instanceof Error ? err.message : "The fieldwork records could not be loaded.");
     }
   }, [api, projectId]);
@@ -568,7 +570,13 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
             setDetaching(null);
             // A governed, audited change in the library (updateConsent: `consent.document-detach`, R117 I3); the form stays a source of the project.
             void run(async () => {
-              await api.updateConsent(projectId, c.id, { documentAssetId: null, detachReason: reason });
+              try {
+                await api.updateConsent(projectId, c.id, { documentAssetId: null, detachReason: reason });
+              } catch (err) {
+                // n1: the form was already detached elsewhere: the reload shows the attach control, so focus goes there too.
+                if (err instanceof Error && /no longer attached/.test(err.message)) setDetachedFrom(c.id);
+                throw err;
+              }
               setDetachedFrom(c.id);
               return "The signed form was detached. It stays in the project; you can now attach the right form to this consent record.";
             });

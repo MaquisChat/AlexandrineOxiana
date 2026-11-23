@@ -350,6 +350,42 @@ describe("Fieldwork", () => {
       expect(await screen.findByText("That form was no longer attached. Nothing was changed.")).toBeTruthy();
       expect(await within(c).findByText(/Drop the signed consent form here/)).toBeTruthy();
       expect(screen.queryByText(/The signed form was detached/)).toBeNull();
+      // n1: focus goes to the control that attaches a form to this record, not to the page.
+      await waitFor(() => expect(document.activeElement).toBe(within(c).getByRole("textbox", { name: "Or add the form by its full path" })));
+    });
+
+    it("n2: a detach whose reload fails leaves no pending focus: a later reload does not move focus by itself", async () => {
+      withForm();
+      let failNext = false;
+      server.use(
+        http.get(P("/consents"), () => {
+          if (failNext) {
+            failNext = false;
+            return HttpResponse.json({ error: { code: "INTERNAL", message: "The fieldwork records could not be loaded." } }, { status: 500 });
+          }
+          return HttpResponse.json({ consents: db.consents, complete: true });
+        }),
+      );
+      render(<Fieldwork api={makeApi()} projectId={PID} />);
+      const c = await screen.findByRole("region", { name: "Consent records" });
+      const user = userEvent.setup();
+      await user.click(await within(c).findByRole("button", { name: "Detach the signed form of P-001…" }));
+      const dialog = screen.getByRole("dialog", { name: "Detach the signed form" });
+      await user.type(within(dialog).getByRole("textbox", { name: /Reason/ }), "Wrong form");
+      failNext = true;
+      await user.click(within(dialog).getByRole("button", { name: "Detach the form" }));
+      await waitFor(() => expect(db.calls.some((x) => x.method === "PATCH")).toBe(true));
+      await waitFor(() => expect(failNext).toBe(false));
+      await screen.findByRole("alert");
+      expect(within(c).queryByText(/Drop the signed consent form here/)).toBeNull();
+      const addP = within(section("Participants")).getByRole("button", { name: "Add participant" }) as HTMLButtonElement;
+      await waitFor(() => expect(addP.disabled).toBe(false));
+      await user.click(addP);
+      await within(section("Participants")).findByText("P-001");
+      expect(await within(c).findByText(/Drop the signed consent form here/)).toBeTruthy();
+      await waitFor(() => expect(addP.disabled).toBe(false));
+      expect(document.activeElement).not.toBe(within(c).getByRole("textbox", { name: "Or add the form by its full path" }));
+      expect(document.activeElement).toBe(addP);
     });
 
     it("cancelled: nothing is sent, the form stays attached, focus is back on the button", async () => {
