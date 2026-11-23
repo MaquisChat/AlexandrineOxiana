@@ -337,3 +337,29 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 <!-- coverage, part 7: FR-664, FR-677, FR-686, FR-698, FR-699, FR-702, FR-706; defect D31; tasks FR-A21, FR-D31, FR-A22 -->
 
 <!-- coverage: FR-591, FR-138, FR-238, FR-197, FR-198, FR-199, FR-369, FR-403, FR-171, FR-356, FR-372, FR-388, FR-575, FR-595, FR-436, FR-506, FR-520, FR-511, FR-522, FR-532, FR-536, FR-551, FR-458, FR-568, FR-607, FR-609, FR-610, FR-446, FR-447, FR-299, FR-326, FR-288, FR-324, FR-289, FR-320, FR-543, FR-236, FR-343, FR-272, FR-334, FR-344, FR-345, FR-346, FR-347, FR-302, FR-310, FR-323, FR-237, FR-353, FR-354, FR-437, FR-455, FR-471, FR-438, FR-439, FR-441, FR-448, FR-479, FR-481, FR-487, FR-444, FR-450, FR-470, FR-480, FR-501, FR-516, FR-608, FR-478, FR-502, FR-505, FR-482, FR-483, FR-492, FR-533, FR-538, FR-541, FR-559, FR-589, FR-590, FR-535, FR-569, FR-585, FR-597 (plus FR-053 from the problems list, in decision 2). FR-543 is a test-set-up choice of the coordinator's and is not on the page. -->
+
+## 8. Added on 18 November: merged to `main`, and Mac build 5
+
+**It is merged.** You asked me to check and merge. `main` now holds everything built so far, and its files are identical to the branch that was verified.
+
+**Your new Mac build exists: build 8.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. It passed every start-up check on GitHub's Mac, in both the debug app and the release app from the disk image.
+
+- **Where:** GitHub → Actions → "Desktop (macOS)" → run 10 → Artifacts → `alexandrine-oxiana-macos-apple-silicon` (209 MB). The browser extension is beside it. GitHub keeps both until 18 December 2026. Direct link to the run: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/44271123395
+- **Use only run 10.** Runs 6, 8 and 9 also show a download of the same name, but those builds failed their checks: two crash at start-up, and the third lacks the last check's proof.
+- **What it took.** Build 5 crashed within two seconds of starting on a Mac: at every start the app asked Apple's web engine to clear the sign-in window's saved data before the web engine had been started. That is mended. One check then could not complete on a Mac, the one proving that a web page shown in the sign-in window cannot reach anything of the app; its method relied on an error page that only Linux shows. With the method mended the check passed: on a Mac too, every attempt by such a page was refused.
+- **The checklist in part 4 is for this build.**
+- **These Mac fixes are on the working branch, not yet on `main`.** They go to `main` when you say so.
+- **One thing to know when you try "Get through my library" (FR-715):** on a Mac, if your library's site cannot be loaded (no network, a wrong address, the site down), the sign-in window stays blank with no message. Deciding what it should say is on the list.
+
+**Before you import again:** undo the import that stopped when the disk filled, then import again with enough free space, or choose "leave the files where they are".
+
+**What GitHub's check found before I merged.** It took several rounds, because GitHub's machines are slower and run at other times of day than this one:
+
+- Seven tests that failed only by timing. Five read an entry before the app had finished writing it, one failed only in the last ten minutes of a day, and one read a status line a moment early. All seven were faults of the tests, not the app, and all are mended.
+- GitHub's own package server stalled three runs. The check now falls back to a second server.
+- **One real fault in the app, now mended.** The function every file copy goes through could, in a window of a few milliseconds, be left waiting for ever if the file being copied failed to read. An export or import would then never finish, and the app's background service would stop. It could happen when an encrypted project was locked mid-export, or with a damaged or missing file. It was rare, which is why earlier tests never met it. The same mistake was in backup and restore. All three places are mended, reviewed twice, and covered by tests that fail without the fix.
+
+**One more decision for you (27).** The app's background service has no last-resort handler: if any unhandled error ever happens there, the service stops without a word and the screens fail one by one. I recommend deciding this together with decision 26 (the log file): record the error where you can find it, and have the app start the service again. (FR-711)
+
+**Listed, not built:** when both a setting and the project's rules forbid a step in Find and acquire, the app names one in one place and the other in another (FR-709); a sweep for other tests that depend on the clock (FR-710); a rare false alarm in the desktop test harness (FR-712).
+
