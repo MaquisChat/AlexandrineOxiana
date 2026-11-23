@@ -17,7 +17,8 @@ export interface PolicyRequest {
   /** `provider` is 'local' (on-device) or a vendor id. */
   process?: { op: ProcessingOp; provider: string };
   store?: { identifiable: boolean; hasLocation: boolean; legalBasis?: string };
-  move?: { destination: ResidencyKind; cloudFolderId?: string };
+  /** `uncertain`: the destination's kind could not be determined; this is one it may be (R473 M4). */
+  move?: { destination: ResidencyKind; cloudFolderId?: string; uncertain?: boolean };
   export?: { identifiable: boolean; hasLocation: boolean };
   /**
    * A full copy of the project written to `<Library>/Backups/`, i.e. where the library itself lives
@@ -270,14 +271,17 @@ function residencyProblem(p: GovernanceConfig, destination: string, cloudFolderI
 }
 
 function move(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
-  const { destination, cloudFolderId } = need(req.move, "move");
+  const { destination, cloudFolderId, uncertain } = need(req.move, "move");
   str(destination, "move.destination");
   if (cloudFolderId !== undefined) str(cloudFolderId, "move.cloudFolderId");
+  const guessed = uncertain === undefined ? false : bool(uncertain, "move.uncertain");
   const problem = residencyProblem(p, destination, cloudFolderId);
   // The move screen shows the project's name beside the reason, so it names neither the
-  // project's id nor an internal kind of storage (FR-030).
+  // project's id, nor an internal kind of storage, nor a cloud folder's id (FR-030); a kind
+  // that was only guessed is said as one the new place may be (R473 M4).
+  if (problem !== null && guessed) return deny(`The library's new place may be ${storageWords(destination)}; this project's rules do not allow its data there.`, warnings);
   if (problem === "kind") return deny(`The library would be moved to ${storageWords(destination)}; this project's rules do not allow its data there.`, warnings);
-  if (problem === "folder") return deny(`Cloud folder ${cloudFolderId ?? "(unspecified)"} is not on this project's approved list`, warnings);
+  if (problem === "folder") return deny("The library would be moved to a cloud-synced folder that is not on this project's list of approved cloud folders.", warnings);
   return allow(warnings);
 }
 
