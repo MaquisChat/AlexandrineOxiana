@@ -69,6 +69,7 @@ import {
   searchContactEmail,
   type SearchSettings,
   type SearchSettingsRead,
+  writeQueueTurn,
 } from "@ao/library";
 import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent } from "@ao/shared";
 import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, oldCopiesPendingText } from "@ao/shared";
@@ -1621,6 +1622,11 @@ export class ServiceState {
     }));
     const unchecked = behind.unchecked;
     return { message: oldCopiesPendingText({ oldCopies, ...(unchecked ? { unchecked: true } : {}) }), destructions: behind.destructions, oldCopies, ...(unchecked ? { unchecked: true as const } : {}) };
+  }
+
+  /** The open library's way into its write queue, for a check that confirms a finding there (FR-420, R469 b). */
+  writeQueueTurn(s: Session): <T>(fn: () => Promise<T>) => Promise<T> {
+    return writeQueueTurn(s.repo);
   }
 
   integrityWarnings(s: Session, names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]))): Array<{ projectId: string; project: string; kind: string; detail: string }> {

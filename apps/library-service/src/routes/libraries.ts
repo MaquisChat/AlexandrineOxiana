@@ -385,7 +385,8 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       if (!(n > 0 && n <= 1)) throw badRequest('"sample" must be a fraction above 0 and at most 1, or "full".');
       sample = n;
     }
-    const report = await checkIntegrity(s.lib, sample, { keyRing: s.ring });
+    // A finding is read again in the write queue's turn: a change in progress is not reported (FR-420).
+    const report = await checkIntegrity(s.lib, sample, { keyRing: s.ring, confirm: state.writeQueueTurn(s) });
     const projectWarnings = await state.projectWarnings(s);
     return {
       report: { ...report, errors: report.errors.map((e) => ({ path: e.path, message: scrubPaths(e.message, state.roots) })) },

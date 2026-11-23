@@ -31,7 +31,7 @@ import {
 import type { LocationEnv } from "./location.js";
 import { listUnfinishedMoves, movedToFor } from "./old-copies.js";
 import { recordLocation } from "./registry.js";
-import { ReadOnlyLibraryError, isLockedRefusal } from "./repo/errors.js";
+import { ProjectLockedError, ReadOnlyLibraryError, isLockedRefusal } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
 import { holdsLock, newAttentionId, projectFolders, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
 import {
@@ -343,6 +343,13 @@ export interface IntegrityOptions {
   stat?: StatFn;
   openRead?: OpenReadFn;
   signal?: AbortSignal;
+  /**
+   * A way into the library's write queue (FR-420, R469 b): `fn` runs in the queue's turn. Given, each entry the check
+   * found missing or mismatched is read again there, against a fresh read of its source, and only what is still wrong
+   * is reported: a change in progress (an import, a destruction) can make a file look missing for a moment. Without
+   * it (reconnect's own check, where nothing else writes) the findings stand as found.
+   */
+  confirm?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
 
 export type IntegritySample = number | "full";
@@ -367,6 +374,8 @@ interface ExpectedFile {
   /** Full asset record; absent for files from a locked project's manifest. */
   asset?: Asset;
   sourceId?: string;
+  /** Library-relative folder of the source (asset entries). */
+  folder?: string;
   identifiable?: boolean;
   /** Unlocked project key (encrypted projects only). */
   key?: { key: Uint8Array; keyId: string };
@@ -436,6 +445,7 @@ async function expectedFiles(
             path: a.path,
             asset: a,
             sourceId: sf.source.id,
+            folder,
             identifiable: sf.source.provenance.identifiable,
             ...(k ? { key: k, keyId: k.keyId } : {}),
           });
@@ -489,6 +499,12 @@ async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySam
   const report = emptyReport();
   const files = await expectedFiles(lib.root, opts.keyRing ?? new KeyRing(), report.errors);
   const chosen = new Set(pickSample(files.flatMap((f) => (f.asset ? [f.asset.id] : [])), lib.id, sample));
+  /** What was found missing or mismatched, to be confirmed in the queue's turn (FR-420); `hashed`: the file's status when it was hashed. */
+  const flagged = new Map<IntegrityEntry, { f: ExpectedFile; hashed?: Stats }>();
+  const flag = (list: IntegrityEntry[], entry: IntegrityEntry, f: ExpectedFile, hashed?: Stats) => {
+    list.push(entry);
+    flagged.set(entry, { f, ...(hashed ? { hashed } : {}) });
+  };
 
   for (const f of files) {
     opts.signal?.throwIfAborted();
@@ -499,12 +515,12 @@ async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySam
     try {
       st = await stat(abs);
     } catch (err) {
-      if (isGone(err)) report.missing.push(entry);
+      if (isGone(err)) flag(report.missing, entry, f);
       else report.errors.push({ path: f.path, message: msg(err) });
       continue;
     }
     if (!st.isFile()) {
-      report.mismatched.push(entry);
+      flag(report.mismatched, entry, f);
       continue;
     }
     if (await isPlaceholder(abs, { stat: async () => st })) {
@@ -517,21 +533,98 @@ async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySam
       continue;
     }
     if (st.size !== (a.encrypted ? encryptedSize(a.bytes) : a.bytes)) {
-      report.mismatched.push(entry);
+      flag(report.mismatched, entry, f);
       continue;
     }
     if (!chosen.has(a.id)) continue;
     report.hashed++;
     report.hashedAssetIds.push(a.id);
     try {
-      if ((await hashStream(abs, openRead, a.encrypted ? f.key : undefined)) !== a.sha256) report.mismatched.push(entry);
+      if ((await hashStream(abs, openRead, a.encrypted ? f.key : undefined)) !== a.sha256) flag(report.mismatched, entry, f, st);
     } catch (err) {
       if (isLockedRefusal(err)) throw err; // locked meanwhile: checked again (see checkIntegrity)
-      if (isGone(err)) report.missing.push(entry);
-      else report.mismatched.push(entry); // unreadable or fails to decrypt
+      if (isGone(err)) flag(report.missing, entry, f, st);
+      else flag(report.mismatched, entry, f, st); // unreadable or fails to decrypt
     }
   }
+  if (opts.confirm && flagged.size) await confirmFindings(lib.root, report, flagged, opts.keyRing ?? new KeyRing(), stat, opts.confirm);
   return report;
+}
+
+/**
+ * FR-420 (R469 b): the flagged entries read again in ONE turn of the write queue, each against a fresh read of its
+ * source (or of its locked project's manifest), and only what is still wrong is kept in the report. Only flagged
+ * entries are read, and no file is hashed again in the turn: a hash finding stands when the record and the file are
+ * both as they were when it was hashed, and is dropped otherwise (unconfirmed, it is not reported). A project locked
+ * before the turn throws its locked refusal, so checkIntegrity checks again with that project locked (R404).
+ */
+async function confirmFindings(
+  root: string,
+  report: IntegrityReport,
+  flagged: ReadonlyMap<IntegrityEntry, { f: ExpectedFile; hashed?: Stats }>,
+  keyRing: KeyRing,
+  stat: StatFn,
+  confirm: <T>(fn: () => Promise<T>) => Promise<T>,
+): Promise<void> {
+  type Still = "missing" | "mismatched" | "placeholder" | { error: string } | undefined;
+  const verdicts = await confirm(async () => {
+    const out = new Map<IntegrityEntry, Still>();
+    for (const [entry, x] of flagged) out.set(entry, await stillWrong(root, x.f, x.hashed, keyRing, stat));
+    return out;
+  });
+  // Every missing or mismatched entry was flagged; each now goes where its confirmation puts it, in check order.
+  report.missing = [...verdicts.keys()].filter((e) => verdicts.get(e) === "missing");
+  report.mismatched = [...verdicts.keys()].filter((e) => verdicts.get(e) === "mismatched");
+  for (const [entry, v] of verdicts) {
+    if (v === "placeholder") report.placeholders.push(entry);
+    else if (typeof v === "object") report.errors.push({ path: entry.path, message: v.error });
+  }
+}
+
+/** One flagged entry, as it is in the queue's turn (see confirmFindings). */
+async function stillWrong(root: string, f: ExpectedFile, hashed: Stats | undefined, keyRing: KeyRing, stat: StatFn): Promise<"missing" | "mismatched" | "placeholder" | { error: string } | undefined> {
+  let path = f.path;
+  let fresh: Asset | undefined;
+  if (f.asset) {
+    let k: { key: Uint8Array; keyId: string } | null = null;
+    if (f.keyId) {
+      const key = keyRing.get(f.keyId);
+      if (!key) throw new ProjectLockedError(f.projectId);
+      k = { key, keyId: f.keyId };
+    }
+    let sf: Awaited<ReturnType<typeof readSource>>;
+    try {
+      sf = await readSource(absIn(root, f.folder!), k, { annotations: false });
+    } catch (err) {
+      if (isLockedRefusal(err)) throw err;
+      return { error: msg(err) };
+    }
+    fresh = sf?.assets.find((a) => a.id === f.asset!.id && a.status !== "destroyed");
+    if (!fresh) return undefined; // the source or the asset is gone, or it was destroyed: nothing is expected there now
+    path = fresh.path;
+  } else {
+    try {
+      const manifest = JSON.parse(await fsp.readFile(absIn(root, `${f.projectRel}/manifest.json`), "utf8")) as Manifest;
+      if (!(manifest.sources ?? []).some((m) => (m.files ?? []).includes(f.path))) return undefined;
+    } catch (err) {
+      return { error: msg(err) };
+    }
+  }
+  let st: Stats;
+  try {
+    st = await stat(absIn(root, path));
+  } catch (err) {
+    return isGone(err) ? "missing" : { error: msg(err) };
+  }
+  if (!st.isFile()) return "mismatched";
+  if (await isPlaceholder(absIn(root, path), { stat: async () => st })) return "placeholder";
+  if (!fresh) return undefined; // a locked project's file, present
+  if (st.size !== (fresh.encrypted ? encryptedSize(fresh.bytes) : fresh.bytes)) return "mismatched";
+  if (!hashed) return undefined; // flagged for its presence, type or size, which are now as recorded
+  // A hash finding: still so only when neither the record nor the file changed since it was hashed.
+  const sameRecord = path === f.path && fresh.sha256 === f.asset!.sha256 && fresh.bytes === f.asset!.bytes && fresh.encrypted === f.asset!.encrypted;
+  const sameFile = st.ino === hashed.ino && st.size === hashed.size && st.mtimeMs === hashed.mtimeMs;
+  return sameRecord && sameFile ? "mismatched" : undefined;
 }
 
 // ---------------------------------------------------------------------------------------------

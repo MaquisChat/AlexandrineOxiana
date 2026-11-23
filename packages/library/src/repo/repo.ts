@@ -1473,6 +1473,16 @@ export function withProjectQueue<T>(repo: Repo, projectId: string, fn: (ctx: Pro
   });
 }
 
+/**
+ * A way into the repository's write queue for a read that confirms what it found (FR-420, R469 b): `fn` runs in
+ * a turn of the queue, after any change in progress, so nothing is half written while it reads. Called from inside
+ * a turn, `fn` runs there and then (the queue is not re-entrant: a second turn would wait for the first forever).
+ */
+export function writeQueueTurn(repo: Repo): <T>(fn: () => Promise<T>) => Promise<T> {
+  const core = cores.get(repo)!;
+  return <T>(fn: () => Promise<T>) => (core.holdsTurn() ? fn() : core.serial(fn));
+}
+
 /** Package-internal (restore): a key in the repo's key ring, if unlocked. */
 export function keyFromRing(repo: Repo, keyId: string): Uint8Array | undefined {
   return cores.get(repo)!.keyRing.get(keyId);
@@ -1534,6 +1544,20 @@ export async function auditEventsMentioning(repo: Repo, projectId: string, needl
     if (endsAt(first.last, st.audit.head)) return { events: first.events, headMatches: true };
     const { events, last } = await AuditStore.readMatching(st.audit.dir, needles);
     return { events, headMatches: endsAt(last, st.audit.head) };
+  });
+}
+
+/**
+ * Package-internal (retention, FR-420): `fn` runs in a turn of the write queue, given the project's audit events whose
+ * line contains one of `needles`, read in that turn (nothing is appended meanwhile), so what `fn` reads from disk is
+ * taken together with them. A locked project is refused (ProjectLockedError) before anything is read.
+ */
+export function inTurnWithAuditEventsMentioning<T>(repo: Repo, projectId: string, needles: readonly string[], fn: (events: AuditEvent[]) => Promise<T>): Promise<T> {
+  const core = cores.get(repo)!;
+  return writeQueueTurn(repo)(async () => {
+    const st = core.state(projectId);
+    core.assertUnlocked(st);
+    return fn((await AuditStore.readMatching(st.audit.dir, needles)).events);
   });
 }
 

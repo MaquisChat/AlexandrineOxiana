@@ -4,7 +4,7 @@
  * service's entry point.
  */
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -30,6 +30,7 @@ import {
   type JobResult,
   type WorkerClient,
   type WorkerJob,
+  writeQueueTurn,
 } from "@ao/library";
 import { existsSync } from "node:fs";
 import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
@@ -521,6 +522,49 @@ describe("background work (R96 carry-overs)", () => {
     expect(r.json.report).toMatchObject({ missing: [], mismatched: [] });
     const state = svc.state.libraryState();
     expect(state).toMatchObject({ open: true, integrityWarnings: [], projectWarnings: { [pid]: [] } });
+  });
+
+  it("FR-420: GET /libraries/integrity confirms a finding in the write queue's turn: a change in progress gives none", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc.state.session!.repo;
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "report", title: { variants: [{ lang: "en", kind: "original", value: "Paper" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: await fixturePdf(), role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+    const file = join(svc.state.session!.lib.root, ...sf.assets[0]!.path.split("/"));
+    // A change holds the write queue and has the file out of its place for the moment (as a change moves a file
+    // aside before it writes the record): read outside the queue, it looks missing.
+    let release!: () => void;
+    let holding!: () => void;
+    const held = new Promise<void>((r) => (holding = r));
+    const change = writeQueueTurn(repo)(async () => {
+      await rename(file, `${file}.aside`);
+      holding();
+      await new Promise<void>((r) => (release = r));
+      await rename(`${file}.aside`, file);
+    });
+    await held;
+    // The route's way into the queue, observed: the check asks for a turn once it has found the file missing.
+    const state = svc.state as unknown as { writeQueueTurn(s: unknown): <T>(fn: () => Promise<T>) => Promise<T> };
+    const own = state.writeQueueTurn.bind(state);
+    let asked!: () => void;
+    const askedTurn = new Promise<void>((r) => (asked = r));
+    state.writeQueueTurn = (s) => {
+      const turn = own(s);
+      return (fn) => (asked(), turn(fn));
+    };
+    const answer = call({ url: "/libraries/integrity?sample=full" });
+    // Without the queue the answer comes while the change is still in progress, and says the file is missing.
+    await Promise.race([askedTurn, answer]);
+    release();
+    await change;
+    const r = await answer;
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.report).toMatchObject({ missing: [], mismatched: [] });
   });
 
   it("closing the library cancels running work, disposes of its queues and releases the lock", async () => {
