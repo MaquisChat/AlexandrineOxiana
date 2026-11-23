@@ -169,7 +169,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 
 ## 4. Things only you can check
 
-*These need a Mac build that contains the newest work. I can request one only once GitHub's runs are available again (the repository made public, or its billing settled). Until then this list can wait; note your findings beside each box when you get to it.*
+*Use Mac build 8 for these (part 8 says where to download it). Note your findings beside each box.*
 
 ### Installing and opening the app on your Mac
 
@@ -254,11 +254,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 
 ## 5. What happens next without waiting for you
 
-- The seven problems are being fixed and each fix is re-reviewed.
-- The missing tests are being added.
-- Then comes a last review of the whole working branch, package by package, against the project's rules.
-- Nothing is merged into the approved version (`main`) without your word.
-- A Mac build can be requested once GitHub's runs are available again (the repository made public, or its billing settled).
+Nothing, as of 23 November: everything that could be done without you is done, verified and on `main`. Part 9 lists what I need from you.
 
 ## 6. Added on 17 November: the last review of the whole branch
 
@@ -348,7 +344,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 - **Use only run 10.** Runs 6, 8 and 9 also show a download of the same name, but those builds failed their checks: two crash at start-up, and the third lacks the last check's proof.
 - **What it took.** Build 5 crashed within two seconds of starting on a Mac: at every start the app asked Apple's web engine to clear the sign-in window's saved data before the web engine had been started. That is mended. One check then could not complete on a Mac, the one proving that a web page shown in the sign-in window cannot reach anything of the app; its method relied on an error page that only Linux shows. With the method mended the check passed: on a Mac too, every attempt by such a page was refused.
 - **The checklist in part 4 is for this build.**
-- **These Mac fixes are on the working branch, not yet on `main`.** They go to `main` when you say so.
+- **These Mac fixes are on `main`** since 23 November, on your word.
 - **One thing to know when you try "Get through my library" (FR-715):** on a Mac, if your library's site cannot be loaded (no network, a wrong address, the site down), the sign-in window stays blank with no message. Deciding what it should say is on the list.
 
 **Before you import again:** undo the import that stopped when the disk filled, then import again with enough free space, or choose "leave the files where they are".
@@ -362,4 +358,23 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 **One more decision for you (27).** The app's background service has no last-resort handler: if any unhandled error ever happens there, the service stops without a word and the screens fail one by one. I recommend deciding this together with decision 26 (the log file): record the error where you can find it, and have the app start the service again. (FR-711)
 
 **Listed, not built:** when both a setting and the project's rules forbid a step in Find and acquire, the app names one in one place and the other in another (FR-709); a sweep for other tests that depend on the clock (FR-710); a rare false alarm in the desktop test harness (FR-712).
+
+## 9. Added on 23 November: what I need from you
+
+Everything built so far is on `main`, checked by GitHub and on a Mac. What is left is yours. In the order I would do it:
+
+- [ ] **1. Install Mac build 8** (part 8 says where). Use only run 10's download.
+- [ ] **2. Undo the import that stopped when the disk filled, then import again** with enough free space, or with "leave the files where they are".
+- [ ] **3. Work through the hands-on checklist in part 4** (51 boxes, about ten areas). Tell me what you find, in any form; a sentence per problem is enough. Three areas matter most because nothing but your Mac can test them: "Get through my library" (the sign-in window), watched cloud folders, and the macOS prompts.
+- [ ] **4. Answer the decisions.** There are 27; two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26) and part 8 (27).
+- [ ] **5. Say whether the 94 small rough edges should be fixed** (part 3). My recommendation: yes, in four or five batches.
+- [ ] **6. Tell me how much usage I may spend**, and remind me to stop at any usage warning. As a guide from the last round: a small reviewed fix costs about 1% of a week, a fix with two review rounds 2–3%, a hard one 5% or more.
+
+Not urgent, when you have time:
+
+- [ ] **7. Look at the two older review pages**, `docs/review/citations.html` (8 citation entries are flagged for you) and `docs/review/code-colours.html`, and tell me what to change.
+- [ ] **8. Decide about an Apple Developer account.** Without it the app is not signed by Apple: macOS warns when you open it and you must choose "Open Anyway". It is needed only before the app is given to anyone else.
+- [ ] **9. Optional: on GitHub, make `main` the default branch** (Settings, then Branches). Today the default is an old frozen branch.
+
+What I do once I have your answers: fix what your tests find, apply the decisions, fix the rough edges if you say so, then close the project out (a last check of the guide and the notes).
 
