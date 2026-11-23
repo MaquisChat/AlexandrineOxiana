@@ -21,10 +21,13 @@
  * library still open, before and after it is read: a lock before the first byte answers 423 in the
  * service's error shape; a lock after it cuts the connection. Reading audits nothing and changes
  * nothing, so it works in a read-only library.
+ *
+ * R470 b (FR-490): `GET /projects/:id/review/:itemId/held-file/document` serves, the same way, the file Find and acquire
+ * holds for one pending entry, to be looked at before the researcher decides (its own handler below).
  */
 import { Readable } from "node:stream";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { InvalidInputError, KeyNotAvailableError, NotFoundError, PathEscapeError, ProjectLockedError, isPdfMime, openAssetContent, type AssetContent } from "@ao/library";
+import { InvalidInputError, KeyNotAvailableError, NotFoundError, PathEscapeError, ProjectLockedError, isPdfMime, openAssetContent, openHeldFileContent, type AssetContent, type HeldFileContent, type StoredContent } from "@ao/library";
 import { DOCUMENT_RANGE_MAX_BYTES, READER_PDF_MAX_BYTES } from "@ao/shared";
 import { SHELL_ORIGINS } from "../auth.js";
 import { ApiError, badRequest, notFound, toApiError } from "../errors.js";
@@ -41,10 +44,14 @@ const unreadable = (): ApiError => new ApiError(409, "CONFLICT", "This file coul
 const unsafe = (): ApiError => badRequest("This file could not be opened safely.");
 const tooLarge = (): ApiError => new ApiError(413, "PAYLOAD_TOO_LARGE", "This PDF is larger than 512 MB, too large to open in the app.");
 const closedMeanwhile = (): ApiError => new ApiError(409, "CONFLICT", "The library was closed while this file was being read.");
+/** R470 b: the one answer for "no held file here", whatever the reason (it tells nothing more). */
+const noHeldFile = (): ApiError => notFound("That file");
 const locked = (): ApiError => new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
 
 /** The document route's path, exactly (its preflight is judged by it: no route matches an OPTIONS). */
 const DOCUMENT_PATH = /^\/projects\/[^/?#]+\/sources\/[^/?#]+\/assets\/[^/?#]+\/document$/;
+/** R470 b: the held file's route (looked at before the researcher decides), its preflight judged the same way. */
+const HELD_DOCUMENT_PATH = /^\/projects\/[^/?#]+\/review\/[^/?#]+\/held-file\/document$/;
 
 /**
  * Whether an OPTIONS request is the preflight of a GET of the document route (Task R5 review I1):
@@ -54,7 +61,8 @@ const DOCUMENT_PATH = /^\/projects\/[^/?#]+\/sources\/[^/?#]+\/assets\/[^/?#]+\/
 export function isDocumentPreflight(req: FastifyRequest): boolean {
   if (req.method !== "OPTIONS") return false;
   if (String(req.headers["access-control-request-method"] ?? "").toUpperCase() !== "GET") return false;
-  return DOCUMENT_PATH.test(req.url.split("?")[0] ?? "");
+  const path = req.url.split("?")[0] ?? "";
+  return DOCUMENT_PATH.test(path) || HELD_DOCUMENT_PATH.test(path);
 }
 
 /**
@@ -88,7 +96,7 @@ export function openFailure(err: unknown): ApiError {
  * `c` with every read checked by `ok` before and after it (so no byte read after a lock leaves),
  * and its range stream made of those checked reads.
  */
-export function guarded(c: AssetContent, ok: () => void): AssetContent {
+export function guarded<T extends StoredContent>(c: T, ok: () => void): T {
   const read = async (position: number, length: number): Promise<Buffer> => {
     ok();
     const b = await c.read(position, length);
@@ -96,9 +104,7 @@ export function guarded(c: AssetContent, ok: () => void): AssetContent {
     return b;
   };
   return {
-    asset: c.asset,
-    mime: c.mime,
-    size: c.size,
+    ...c,
     read,
     range(start, end) {
       if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= c.size) throw new RangeError("range outside the file");
@@ -153,6 +159,15 @@ export function registerDocuments(app: FastifyInstance, ctx: Ctx): void {
     } catch (err) {
       throw openFailure(err);
     }
+    return serve(req, reply, s, projectId, opened, range);
+  };
+
+  /**
+   * The bytes of an opened file for one range (the reader's route and the held file's alike): every read guarded (the
+   * project still unlocked, the same library still open), the file's actual size checked against the limit, the range
+   * against it (416), then one answer of at most DOCUMENT_RANGE_MAX_BYTES. Closes the file on every refusal.
+   */
+  const serve = async (req: FastifyRequest, reply: FastifyReply, s: ReturnType<Ctx["state"]["requireSession"]>, projectId: string, opened: StoredContent, range: string): Promise<FastifyReply> => {
     const c = guarded(opened, () => {
       if (state.session !== s) throw closedMeanwhile();
       if (!s.repo.isUnlocked(projectId)) throw new ProjectLockedError(projectId);
@@ -183,5 +198,41 @@ export function registerDocuments(app: FastifyInstance, ctx: Ctx): void {
     return sendContent(req, reply, c, { start: r.start, end }, 206, {});
   };
 
+  /**
+   * R470 b (FR-490): the file Find and acquire holds for pending review entry `itemId` of the project, to be LOOKED at
+   * before "Use this file" / "Not this file": the app's own route (the desktop app's token; never among the extension's
+   * routes), checked as the reader's route — the caller, the session, the project (404), its lock (423, before anything
+   * about its entries is looked at), one byte range (400) — then the held file opened by the library's reading code
+   * (openHeldFileContent: decrypted range by range in an encrypted project). No held file — an unknown entry, one of
+   * another project, one that holds none or is decided, a file gone — is one plain 404 that names nothing; an EPUB
+   * "cannot be shown here" (the reader shows PDFs only). Reading records nothing, audits nothing and writes nothing.
+   */
+  const heldHandler = async (req: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> => {
+    if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Only the desktop app can do this.");
+    const origin = req.headers.origin;
+    if (origin !== undefined && SHELL_ORIGINS.has(origin)) reply.header("Access-Control-Expose-Headers", EXPOSED);
+    const s = state.requireSession();
+    const projectId = projectParam(ctx, req);
+    if (!s.repo.isUnlocked(projectId)) throw locked();
+    const range = header(req, "range");
+    const ifRange = header(req, "if-range");
+    if (range === undefined || ifRange !== undefined || parseRange(range, undefined, Number.MAX_SAFE_INTEGER) === undefined) throw askForRange();
+    let opened: HeldFileContent;
+    try {
+      opened = await openHeldFileContent(s.repo, projectId, paramsOf(req).itemId ?? "");
+    } catch (err) {
+      if (err instanceof NotFoundError) throw noHeldFile();
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT" || code === "ENOTDIR") throw noHeldFile();
+      throw openFailure(err);
+    }
+    if (opened.kind !== "pdf") {
+      await opened.close();
+      throw cannotShow();
+    }
+    return serve(req, reply, s, projectId, opened, range);
+  };
+
   app.route({ method: "GET", url: "/projects/:id/sources/:sid/assets/:aid/document", exposeHeadRoute: false, handler });
+  app.route({ method: "GET", url: "/projects/:id/review/:itemId/held-file/document", exposeHeadRoute: false, handler: heldHandler });
 }

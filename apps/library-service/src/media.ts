@@ -38,7 +38,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Transform } from "node:stream";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { DecryptionError, EncryptionFormatError, KeyNotAvailableError, ProjectLockedError, isMediaMime, isPictureMime, openAssetContent, type AssetContent } from "@ao/library";
+import { DecryptionError, EncryptionFormatError, KeyNotAvailableError, ProjectLockedError, isMediaMime, isPictureMime, openAssetContent, type AssetContent, type StoredContent } from "@ao/library";
 import {
   MEDIA_TICKETS_MAX,
   MEDIA_TICKET_IDLE_MS,
@@ -433,7 +433,7 @@ export interface SendHooks {
  * fire, and a connection the client closed before this was called (while the caller looked the
  * file up and opened it) releases the file at once (Task R5 review I2).
  */
-export async function sendContent(req: FastifyRequest, reply: FastifyReply, c: AssetContent, range: { start: number; end: number } | undefined, status: number, hooks: SendHooks): Promise<FastifyReply> {
+export async function sendContent(req: FastifyRequest, reply: FastifyReply, c: StoredContent, range: { start: number; end: number } | undefined, status: number, hooks: SendHooks): Promise<FastifyReply> {
   let released = false;
   /** What else ends with the response once it is streaming (set below). */
   let alsoOnRelease = () => {};

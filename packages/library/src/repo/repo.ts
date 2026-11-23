@@ -84,7 +84,7 @@ import {
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
-import { hasSettledCaptureEntries, hasUnlistedConflicts, heldWaitingCount, holdMismatchedFile, readReviewEntries, removeFindEntryWithHeld, resolveHeldFile, reviewedAfterWithdrawal, type HoldInput, type ReviewEntry } from "./review.js";
+import { hasSettledCaptureEntries, hasUnlistedConflicts, heldFileToLook, heldWaitingCount, holdMismatchedFile, readReviewEntries, removeFindEntryWithHeld, resolveHeldFile, reviewedAfterWithdrawal, type HoldInput, type ReviewEntry } from "./review.js";
 import { readWatchOrigins, readWatchRegister, recordWatchedFiles, type WatchRegisterEntry } from "./watch-register.js";
 import { appendFindEntries, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
 import type { FindEntry } from "../find/types.js";
@@ -1371,6 +1371,11 @@ export function holdMismatchedFileIn(repo: Repo, projectId: string, input: HoldI
 /** Package-internal (F11, R296 d): how many files wait for the researcher's check in the project (one read; review.ts). */
 export function heldWaitingCountIn(repo: Repo, projectId: string): Promise<number> {
   return heldWaitingCount(cores.get(repo)!, projectId);
+}
+
+/** Package-internal (R470 b): where a held file is, to be looked at; one read, nothing written (review.ts). */
+export function heldFileToLookIn(repo: Repo, projectId: string, reviewId: string): Promise<{ rel: string; kind: "pdf" | "epub"; encrypted: boolean }> {
+  return heldFileToLook(cores.get(repo)!, projectId, reviewId);
 }
 
 /** Package-internal (F11): "Use this file" / "Not this file" on a held file, one change each (review.ts). */

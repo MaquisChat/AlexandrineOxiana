@@ -669,6 +669,22 @@ async function heldEntry(core: RepoCore, st: ProjectState, reviewId: string): Pr
   return e as HeldReview;
 }
 
+/**
+ * R470 b (FR-490): where the file held for pending entry `reviewId` of the project is, so that the researcher can LOOK at
+ * it before deciding: its library-relative place, its kind and whether it is sealed. One read of the review file, no
+ * change: nothing is written, nothing audited. A locked project is refused (ProjectLockedError) before the file is read.
+ * Whatever else — an unknown entry (another project's included), one that holds no file, one already decided — is the
+ * same NotFoundError, naming nothing but the id asked for.
+ */
+export async function heldFileToLook(core: RepoCore, projectId: string, reviewId: string): Promise<{ rel: string; kind: "pdf" | "epub"; encrypted: boolean }> {
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  const e = (await readReviewEntries(core, st)).find((x) => x.id === reviewId);
+  if (!e || e.status !== "pending" || !isHeldEntry(e) || !e.heldFile) throw new NotFoundError("Held file", reviewId);
+  const kind = /\.epub(?:\.enc)?$/u.test(e.cause.held) ? "epub" : "pdf";
+  return { rel: `${st.rel}/${e.cause.held}`, kind, encrypted: e.cause.held.endsWith(".enc") };
+}
+
 /** The find entry `entryId` with `patch` (or null when it is no longer in the queue). */
 async function entryLine(core: RepoCore, projectId: string, entryId: string, patch: Partial<FindEntry>, drop: Array<keyof FindEntry>, at: string): Promise<FindEntry | null> {
   const cur = (await readFindQueue(core, projectId)).get(entryId);

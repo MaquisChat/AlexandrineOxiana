@@ -52,6 +52,7 @@ const UI_ONLY: ReadonlyArray<readonly [method: "GET" | "POST" | "PUT" | "PATCH" 
   ["PATCH", "/projects/:id/sources/:sid/annotations/:anid", DESKTOP],
   ["GET", "/projects/:id/sources/:sid/assets/:aid/content", DESKTOP],
   ["GET", "/projects/:id/sources/:sid/assets/:aid/document", DESKTOP],
+  ["GET", "/projects/:id/review/:itemId/held-file/document", DESKTOP],
   ["POST", "/projects/:id/sources/:sid/assets/:aid/media-ticket", DESKTOP],
   ["DELETE", "/secrets/zotero-api-key", DESKTOP],
   ["GET", "/secrets/zotero-api-key", DESKTOP],
