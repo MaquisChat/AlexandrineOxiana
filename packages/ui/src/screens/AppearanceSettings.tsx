@@ -288,7 +288,7 @@ function RadioGroup<T extends string>({ legend, name, value, options, onChange }
 }
 
 export function AppearanceSettingsScreen() {
-  const { settings, theme, accentApplied, update, retrySave, saveError, saveErrorReason, fonts, fontError } = useAppearance();
+  const { settings, theme, accentApplied, update, retrySave, retryLoad, loadError, saveError, saveErrorReason, fonts, fontError } = useAppearance();
   const id = useId();
   const [userFonts, setUserFonts] = useState<UserFont[]>([]);
   /** The list of added fonts cannot be read (Task 68): its reset is offered. */
@@ -496,6 +496,14 @@ export function AppearanceSettingsScreen() {
         />
       </section>
 
+      {loadError && (
+        <div role="alert" className="ao-warning">
+          <p>{loadError}</p>
+          <button type="button" onClick={retryLoad}>
+            Try loading again
+          </button>
+        </div>
+      )}
       {saveError && (
         <div role="alert" className="ao-warning">
           <p>{saveError}</p>

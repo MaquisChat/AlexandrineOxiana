@@ -208,6 +208,31 @@ describe("Appearance settings screen", () => {
     await waitFor(() => expect(get).toHaveBeenCalled());
     await act(async () => {});
   });
+
+  it("a failed load offers to load again, not to save again, and loading again clears it (FR-155)", async () => {
+    let fail = true;
+    const saved = { ...DEFAULT_APPEARANCE, theme: "dark" as const };
+    const get = vi.fn(async () => {
+      if (fail) throw new ApiClientError(503, { code: "UNAVAILABLE", message: "The library service is not answering." });
+      return structuredClone(saved);
+    });
+    const put = vi.fn(async () => structuredClone(saved));
+    const client = { appearance: { get, put } } as unknown as ApiClient;
+    render(
+      <AppearanceProvider client={client}>
+        <AppearanceSettingsScreen />
+      </AppearanceProvider>,
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Couldn't load your appearance settings");
+    expect(within(alert).queryByRole("button", { name: "Try saving again" })).toBeNull();
+    fail = false;
+    await userEvent.setup().click(within(alert).getByRole("button", { name: "Try loading again" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(put).not.toHaveBeenCalled();
+    expect(root().dataset.theme).toBe("dark");
+  });
 });
 
 describe("a typeface from the researcher's own file (R100, Task 57)", () => {
