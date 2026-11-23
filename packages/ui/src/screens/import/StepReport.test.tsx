@@ -152,6 +152,21 @@ describe("gone from Zotero, and back (Z5, R224)", () => {
     expect(within(table).queryByText(/Zotero/)).toBeNull();
   });
 
+  it("the table has rows for the collections and tags the import created, only when not zero (FR-170)", async () => {
+    show(report({ created: { collectionIds: ["c1", "c2"], tagIds: ["t1"] } }));
+    const table = await screen.findByRole("table", { name: "Items by outcome" });
+    const row = (name: string) => within(table).getByRole("rowheader", { name }).closest("tr")!.textContent;
+    expect(row("Collections created")).toContain("2");
+    expect(row("Tags created")).toContain("1");
+  });
+
+  it("no such rows when the import created none, or for an older report without them (FR-170)", async () => {
+    show(report({ created: { collectionIds: [], tagIds: [] } }));
+    const table = await screen.findByRole("table", { name: "Items by outcome" });
+    expect(within(table).queryByRole("rowheader", { name: "Collections created" })).toBeNull();
+    expect(within(table).queryByRole("rowheader", { name: "Tags created" })).toBeNull();
+  });
+
   it("an availability kept by the undo is said once, with the number", async () => {
     const r = report({}, { goneInZotero: 2 });
     const kept = [

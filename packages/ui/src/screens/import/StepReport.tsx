@@ -94,6 +94,15 @@ const ROWS: Array<[CountKey, string]> = [
 ];
 
 /** Z5 (R224 a): the Zotero rows of the report table, each only when not zero (absent from an older report). */
+/** The collections and tags the import created (R118), each only when not zero; an older report has none. */
+function createdRows(r: ImportReport): Array<[string, number]> {
+  const rows: Array<[string, number]> = [
+    ["Collections created", r.created?.collectionIds.length ?? 0],
+    ["Tags created", r.created?.tagIds.length ?? 0],
+  ];
+  return rows.filter(([, n]) => n > 0);
+}
+
 function zoteroRows(r: ImportReport): Array<[string, number]> {
   const c = r.counts;
   const bin = c.goneInZoteroBin ?? 0;
@@ -205,6 +214,13 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
                 </tr>
               ))}
               {zoteroRows(report).map(([label, n]) => (
+                <tr key={label}>
+                  <th scope="row">{label}</th>
+                  <td>{fmt(n)}</td>
+                </tr>
+              ))}
+              {/* What the import created besides sources (R118, FR-170): the service reports their ids. */}
+              {createdRows(report).map(([label, n]) => (
                 <tr key={label}>
                   <th scope="row">{label}</th>
                   <td>{fmt(n)}</td>
