@@ -717,8 +717,8 @@ test("two found files are each decided by their own act (by keyboard)", async ({
 
 /**
  * "Save changes" on the Governance screen, then what the screen shows once the save is answered: the button disabled
- * (nothing left to save). "Saved." is shown too, but the screen's re-read of the rules after the save clears it, so on a
- * loaded machine it can come and go between two looks (seen once in WebKit). What the service holds is then read as
+ * (nothing left to save). "Saved." is shown too and stays: nothing re-reads the rules after a save (checked in Chromium
+ * and WebKit, still there a second after each save; R463 M5). What the service holds is then read as
  * data (R332 d): the project's rules parsed by the product's own parser (`parseGovernance`, @ao/core), whose
  * `acquireMethods` holds `free_copy` or lacks it. Each save flips it from what it was (the set-up's rules name no list,
  * which is every way), so the poll is answered only by the save itself.
