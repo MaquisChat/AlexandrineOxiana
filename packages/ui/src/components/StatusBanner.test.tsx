@@ -1,6 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import { SOURCE_CHANGE_UNFINISHED, SOURCE_CHANGE_UNFINISHED_READ_ONLY } from "@ao/shared";
 import { StatusBanner, bannersFor, volumeOf, warningText } from "./StatusBanner";
 
 describe("device-level notices (Task 68)", () => {
@@ -172,12 +173,50 @@ describe("StatusBanner", () => {
 
 });
 
-describe("R473 I1: a source whose change did not finish and could not be undone", () => {
-  it("says the ruled sentence, for a library open for changes and for one opened without them", () => {
-    expect(warningText("source-change-unfinished", "P")).toBe("A change to this source did not finish and could not be undone. Close the library and open it again to put it back.");
-    expect(warningText("source-change-unfinished-read-only", "P")).toBe(
-      "A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.",
-    );
+describe("R484 f: changes to sources that did not finish and could not be undone: one banner per project and kind", () => {
+  const ONE = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. Close the library and open it again to put it back.";
+  const SEVERAL = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. Close the library and open it again to put them back.`;
+  const ONE_RO = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. It can be put back only when the library is opened for changes.";
+  const SEVERAL_RO = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. They can be put back only when the library is opened for changes.`;
+  const w = (projectId: string, project: string, kind: string, n: number) =>
+    Array.from({ length: n }, (_, i) => ({ projectId, project, kind, detail: `Sources/folder ${i}: the library's own sentence` }));
+  /** What the researcher reads on each banner, rendered (the project's name as text). */
+  const shown = (warnings: ReturnType<typeof w>) =>
+    bannersFor({ integrityWarnings: warnings }).map((b) => {
+      const { container, unmount } = render(<StatusBanner variant={b} />);
+      const t = container.textContent ?? "";
+      expect(container.querySelector("i")).toBeNull();
+      unmount();
+      return t;
+    });
+
+  it("one source: one banner, a source in the project", () => {
+    expect(shown(w("p1", "Dissertation <i>1</i>", "source-change-unfinished", 1))).toEqual([ONE]);
+    expect(shown(w("p1", "Dissertation <i>1</i>", "source-change-unfinished-read-only", 1))).toEqual([ONE_RO]);
+  });
+
+  it("several sources: one banner with their number", () => {
+    expect(shown(w("p1", "Dissertation <i>1</i>", "source-change-unfinished", 3))).toEqual([SEVERAL(3, "Dissertation <i>1</i>")]);
+    expect(shown(w("p1", "Dissertation <i>1</i>", "source-change-unfinished-read-only", 2))).toEqual([SEVERAL_RO(2, "Dissertation <i>1</i>")]);
+  });
+
+  it("both kinds in one project: one banner for each", () => {
+    expect(shown([...w("p1", "Dissertation <i>1</i>", "source-change-unfinished", 2), ...w("p1", "Dissertation <i>1</i>", "source-change-unfinished-read-only", 1)])).toEqual([
+      SEVERAL(2, "Dissertation <i>1</i>"),
+      ONE_RO,
+    ]);
+  });
+
+  it("two projects: one banner for each, beside the other warnings in their place", () => {
+    const other = { projectId: "p2", project: "Fieldwork", kind: "rolled-back-incomplete-write", detail: "x" };
+    expect(
+      shown([...w("p1", "Dissertation <i>1</i>", "source-change-unfinished", 1), other, ...w("p2", "Fieldwork", "source-change-unfinished", 4), ...w("p1", "Dissertation <i>1</i>", "source-change-unfinished", 1)]),
+    ).toEqual([SEVERAL(2, "Dissertation <i>1</i>"), "An interrupted change in Fieldwork was undone when the library opened, so nothing half-saved was kept.", SEVERAL(4, "Fieldwork")]);
+  });
+
+  it("the sentence with \"this source\" stays the library's own, for the source itself", () => {
+    expect(SOURCE_CHANGE_UNFINISHED).toBe("A change to this source did not finish and could not be undone. Close the library and open it again to put it back.");
+    expect(SOURCE_CHANGE_UNFINISHED_READ_ONLY).toBe("A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.");
   });
 });
 
