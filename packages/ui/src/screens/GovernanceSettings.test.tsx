@@ -528,7 +528,7 @@ describe("capture methods (D11)", () => {
 
   it("a locked or read-only project shows the methods but cannot change them, and says why", async () => {
     const cap = serve({ yaml: "captureMethods: [manual_upload, browser_capture]\n" });
-    const why = "This project is locked. Unlock it in the library to change its rules.";
+    const why = "This project is locked, so its rules cannot be changed until it is unlocked.";
     render(<GovernanceSettings api={makeApi()} projectId={PID} readOnlyReason={why} />);
     await loaded();
     expect(box(CAPTURE_LABEL.browser_capture).checked).toBe(true);
@@ -545,7 +545,7 @@ describe("capture methods (D11)", () => {
 });
 
 describe("a locked project or a read-only library: nothing on the screen offers a change (Task 64 review M1)", () => {
-  const REASONS = ["This project is locked. Unlock it in the library to change its rules.", "This library is open read-only here, so its rules cannot be changed."];
+  const REASONS = ["This project is locked, so its rules cannot be changed until it is unlocked.", "This library is open read-only here, so its rules cannot be changed."];
   it.each(REASONS)("“%s”: approval documents, time zone and destruction are off, the reason is shown once, and no request is sent", async (why) => {
     const sent: string[] = [];
     serve();
@@ -815,7 +815,7 @@ describe("How Find and acquire may get works (Find and acquire Task F13; R301, R
 
   it("a locked project shows the boxes but cannot change them", async () => {
     serve();
-    render(<GovernanceSettings api={makeApi()} projectId={PID} readOnlyReason="This project is locked. Unlock it in the library to change its rules." />);
+    render(<GovernanceSettings api={makeApi()} projectId={PID} readOnlyReason="This project is locked, so its rules cannot be changed until it is unlocked." />);
     await loaded();
     for (const b of findCard().getAllByRole("checkbox") as HTMLInputElement[]) expect(b.disabled).toBe(true);
     expect((findCard().getByRole("textbox", { name: /Default legal basis/ }) as HTMLInputElement).disabled).toBe(true);
