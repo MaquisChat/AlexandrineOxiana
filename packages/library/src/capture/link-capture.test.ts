@@ -707,8 +707,11 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
   it("I5/M3: storing captions or the transcript can fail after the source exists; the outcome says what was saved", async () => {
     const p = await project();
     const spy = vi.spyOn(repo, "addDerivedAsset").mockRejectedValue(new Error("disk full"));
+    // The transcript's two files are stored in one change (FR-393): that store fails too.
+    const spyBoth = vi.spyOn(repo, "addDerivedAssets").mockRejectedValue(new Error("disk full"));
     const out = await capture.captureUrl(p.id, YT_CONFLICT, { transcribe: true, transcribeModel: "tiny" });
     spy.mockRestore();
+    spyBoth.mockRestore();
     expect(out.status).toBe("needs-review");
     expect(out.reason).toContain("Some details could not be confirmed, so the source is in the review queue.");
     expect(out.reason).toContain("The source was saved, but some captions could not be stored.");
