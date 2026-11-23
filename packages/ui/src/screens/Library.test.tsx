@@ -725,6 +725,40 @@ describe("Library screen", () => {
       expect((screen.getByRole("button", { name: "Load more sources" }) as HTMLButtonElement).disabled).toBe(false);
     });
 
+    // R468 (M5): the guard inside the handler, apart from the button's `disabled` (a click on a
+    // disabled button never reaches the handler, so the handler is called here as React holds it:
+    // a click that arrives before the button is turned off, as one can in a real browser).
+    it("Load more's handler itself asks nothing between a new search and its first page (FR-152, R468)", async () => {
+      const asked: string[] = [];
+      let release!: () => void;
+      const released = new Promise<void>((r) => (release = r));
+      server.use(
+        http.get(url("/projects/:id/sources"), async ({ request }) => {
+          const q = new URL(request.url).searchParams;
+          asked.push(`${q.get("text") ?? ""}@${q.get("offset") ?? "0"}`);
+          if (q.get("text") === "zebra") {
+            await released;
+            return HttpResponse.json({ total: 4, items: [row(9, "Zebra one"), row(10, "Zebra two")] });
+          }
+          return HttpResponse.json({ total: 3, items: [row(1), row(2)] });
+        }),
+        ...libraryHandlers(),
+      );
+      const user = userEvent.setup();
+      renderLibrary();
+      await screen.findByText("Source 2");
+      await user.type(screen.getByRole("searchbox", { name: "Search sources" }), "zebra");
+      await waitFor(() => expect(asked).toContain("zebra@0"));
+      const more = screen.getByRole("button", { name: "Load more sources" });
+      const propsKey = Object.keys(more).find((k) => k.startsWith("__reactProps$"))!;
+      const onClick = (more as unknown as Record<string, { onClick: () => void }>)[propsKey]!.onClick;
+      await act(async () => onClick());
+      expect(asked.filter((a) => a.startsWith("zebra@") && a !== "zebra@0")).toEqual([]);
+      await act(async () => release());
+      expect(await screen.findByText("Zebra one")).toBeTruthy();
+      expect(asked.filter((a) => a.startsWith("zebra@") && a !== "zebra@0")).toEqual([]);
+    });
+
     it("after the project was locked: no decrypted rows come back", async () => {
       slowPages();
       const user = userEvent.setup();
