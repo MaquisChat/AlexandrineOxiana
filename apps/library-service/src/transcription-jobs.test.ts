@@ -203,9 +203,12 @@ describe("transcription as a job (Task 62)", () => {
     const job = r.json.job as TranscriptionJob;
     expect(job).toMatchObject({ projectId: pid, sourceId: sid, model: "small", status: "queued" });
     expect(job.jobId).toMatch(/^[0-9a-f-]{36}$/);
-    await until(async () => (await stateOf(pid, sid))?.progress === 0.5);
-    expect(await stateOf(pid, sid)).toMatchObject({ jobId: job.jobId, status: "running", progress: 0.5 });
+    // The stand-in answers 0.25, 0.5, then 0.75 on every later poll until released: 0.5 is only passed through, so the
+    // wait is for the rest at 0.75; the 50 of 100 on the way is asserted among the events.
+    await until(async () => (await stateOf(pid, sid))?.progress === 0.75);
+    expect(await stateOf(pid, sid)).toMatchObject({ jobId: job.jobId, status: "running", progress: 0.75 });
     expect(events.some((e) => e.job.status === "running" && e.done === 50 && e.total === 100 && e.jobId === job.jobId)).toBe(true);
+    expect(events.some((e) => e.job.status === "running" && e.done === 75 && e.total === 100 && e.jobId === job.jobId)).toBe(true);
     worker.release();
     await until(async () => (await stateOf(pid, sid))?.status === "done");
     const done = (await stateOf(pid, sid))!;
