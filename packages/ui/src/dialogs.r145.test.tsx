@@ -302,6 +302,30 @@ function watchedFolders() {
   return screen.findByRole("region", { name: "Fieldwork scans" });
 }
 
+/** The recovery code step (shown once, R134): inside, Tab and Shift+Tab stay; Escape does not close it; Done, once saved, gives focus back. */
+async function checkRecoveryStep(user: User, opener: HTMLElement) {
+  const step = await screen.findByRole("dialog", { name: "Save the recovery code" });
+  inDocumentOrder(step);
+  expect(step.contains(document.activeElement)).toBe(true);
+  for (let i = 0; i < stops(step) + 2; i++) {
+    await user.tab();
+    expect(step.contains(document.activeElement)).toBe(true);
+  }
+  for (let i = 0; i < stops(step) + 2; i++) {
+    await user.tab({ shift: true });
+    expect(step.contains(document.activeElement)).toBe(true);
+  }
+  // Shown once: Escape does not close it (R134); "Done", after "I have saved", does, and focus goes back.
+  await user.keyboard("{Escape}");
+  expect(screen.getByRole("dialog", { name: "Save the recovery code" })).toBe(step);
+  await user.click(within(step).getByRole("checkbox", { name: "I have saved the recovery code" }));
+  await user.click(within(step).getByRole("button", { name: "Done" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(opener));
+  expect(document.querySelector("[inert]")).toBeNull();
+  expect(refused).toEqual([]);
+}
+
 const ENC = { id: "p4", name: "Clinic follow-up", folder: "Projects/Clinic follow-up", encrypted: true, unlocked: true, profiles: ["hipaa"] };
 const OPEN = { id: "p1", name: "Dissertation", folder: "Dissertation", encrypted: false, unlocked: true, profiles: [] as string[] };
 
@@ -419,26 +443,25 @@ const rows: Row[] = [
       await user.click(opener);
       await screen.findByRole("dialog", { name: "New recovery code" });
       await user.keyboard("correct horse battery{Enter}");
-      const step = await screen.findByRole("dialog", { name: "Save the recovery code" });
-      inDocumentOrder(step);
-      expect(step.contains(document.activeElement)).toBe(true);
-      for (let i = 0; i < stops(step) + 2; i++) {
-        await user.tab();
-        expect(step.contains(document.activeElement)).toBe(true);
-      }
-      for (let i = 0; i < stops(step) + 2; i++) {
-        await user.tab({ shift: true });
-        expect(step.contains(document.activeElement)).toBe(true);
-      }
-      // Shown once: Escape does not close it (R134); "Done", after "I have saved", does, and focus goes back.
-      await user.keyboard("{Escape}");
-      expect(screen.getByRole("dialog", { name: "Save the recovery code" })).toBe(step);
-      await user.click(within(step).getByRole("checkbox", { name: "I have saved the recovery code" }));
-      await user.click(within(step).getByRole("button", { name: "Done" }));
-      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-      await waitFor(() => expect(document.activeElement).toBe(opener));
-      expect(document.querySelector("[inert]")).toBeNull();
-      expect(refused).toEqual([]);
+      await checkRecoveryStep(user, opener);
+    },
+  },
+  {
+    name: "Save the recovery code, the step after creating an encrypted project (Library → NewProject)",
+    kind: "custom",
+    check: async (user) => {
+      const NEW_ENC = { id: "p4", name: "Clinic follow-up", folder: "Projects/Clinic follow-up", encrypted: true, unlocked: true, profiles: ["hipaa"] };
+      server.use(http.post(url("/projects"), () => HttpResponse.json({ project: NEW_ENC, recoveryCode: "R7QX-2M9P-KD4T-8HWN-C3VB-Y6FJ" })), ...libraryHandlers());
+      render(<Library api={testApi()} current={{ libraryId: "lib-1", name: "Thesis library", mode: "read-write" } as never} />);
+      const opener = await screen.findByRole("button", { name: "New project" });
+      await user.click(opener);
+      const dialog = await screen.findByRole("dialog", { name: "New project" });
+      await user.type(within(dialog).getByRole("textbox", { name: "Project name" }), "Clinic follow-up");
+      await user.click(within(dialog).getByRole("checkbox", { name: "HIPAA" }));
+      await user.type(within(dialog).getByLabelText("Passphrase"), "correct horse battery");
+      await user.type(within(dialog).getByLabelText("Passphrase again"), "correct horse battery");
+      await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+      await checkRecoveryStep(user, opener);
     },
   },
   {
