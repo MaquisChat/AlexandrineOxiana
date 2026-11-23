@@ -11,6 +11,7 @@ import { FIND_HELD_MAX as SHARED_FIND_HELD_MAX, FIND_REASON_TEXT, HELD_FILE_REVI
 import { appendFindLinesInTx, findStateCounts, readFindQueue } from "../find/queue-store.js";
 import { FIND_QUEUE_OPS, type FindEntry } from "../find/types.js";
 import { addOriginalInTx } from "./assets.js";
+import { originalsReach } from "./linked-file.js";
 import { kindFor, mimeFor, openLine, readMaybe, sealLine } from "./io.js";
 import { InvalidInputError, NotFoundError, ReviewEntryDecidedError } from "./errors.js";
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
@@ -597,7 +598,8 @@ function heldMethodOf(h: HeldFileFacts): "free_copy" | "library_access" {
  * what the check found) and the queue entry's new line, in ONE governed change (capture of the file's own method —
  * `free_copy`, or `library_access` for a file the library gave (R329 e) — and `store` evaluated and audited, `project.find.hold` with ids and counts only): a crash leaves all of it or none.
  * Refuses, writing nothing: FIND_HELD_MAX files already waiting (HeldFileLimitError); the source already has a
- * readable original (HeldFileSourceHasFileError, R305 c); the entry no longer in the
+ * readable original (HeldFileSourceHasFileError, R305 c; R470 a: a stored one, or a linked one whose file is there —
+ * a source whose only originals are linked files that cannot be found is held for); the entry no longer in the
  * queue (HeldFileEntryGoneError); the entry already holding a file (InvalidInputError: one per entry).
  */
 export async function holdMismatchedFile(core: RepoCore, projectId: string, input: HoldInput): Promise<{ reviewId: string; held: string }> {
@@ -619,8 +621,9 @@ export async function holdMismatchedFile(core: RepoCore, projectId: string, inpu
       if (pending.some((e) => e.cause.findEntryId === eid)) throw new InvalidInputError("This entry already holds a file for your check.");
       if (pending.length >= FIND_HELD_MAX && input.handedOver !== true) throw new HeldFileLimitError();
       // R305 c: a source that has a readable original (as this change sees it, so a file added at the same moment is
-      // either before it — refused here — or after it) gets no waiting file.
-      if (sourceHasFile(await readSourceFile(core, tx.state, input.sourceId))) throw new HeldFileSourceHasFileError();
+      // either before it — refused here — or after it) gets no waiting file. R470 a: a source whose only originals are
+      // linked files that cannot be found now (the Missing files rule) has none that can be read: its copy is held.
+      if ((await originalsReach(core.root, await readSourceFile(core, tx.state, input.sourceId))) === "reachable") throw new HeldFileSourceHasFileError();
       const rel = `${tx.state.rel}/${held}`;
       await tx.mkdir(`${tx.state.rel}/${FIND_HELD_DIR}`);
       await tx.copyFile(input.fromPath, rel, { encrypt: tx.encrypted, mode: CHANGE_LOG_MODE });
