@@ -46,6 +46,10 @@ pub fn open(app: &AppHandle, test_mode: bool) {
         .maximizable(false)
         .minimizable(false)
         .center()
+        // R486 i: shown without taking the keyboard's focus — it appears two seconds after the close,
+        // perhaps while the researcher types elsewhere. (Still shown: tao shows a window built unfocused;
+        // on macOS it orders it to the front without making it the key window.)
+        .focused(false)
         .on_navigation(|url| crate::connection::navigation_allowed(url))
         .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
         .devtools(false);
@@ -143,5 +147,9 @@ mod tests {
         for forbidden in ["initialization_script", "init_script", "connection::init", "probe", "token", "WebviewUrl::External"] {
             assert!(!open_fn.contains(forbidden), "{forbidden}");
         }
+        // R486 i: it is built without taking the keyboard's focus (it may appear while the researcher types
+        // elsewhere), and still shown (`visible` is left at its default, true).
+        assert!(open_fn.contains(".focused(false)"), "the closing window takes the keyboard's focus");
+        assert!(!open_fn.contains(".visible("), "the closing window's visibility is changed");
     }
 }
