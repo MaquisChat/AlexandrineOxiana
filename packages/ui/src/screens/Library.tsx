@@ -138,7 +138,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /** The library closed while that code was on screen. */
   const [closedUnder, setClosedUnder] = useState(false);
   /** A create whose answer was lost and could not be checked when the dialog closed (fix round 2). */
-  const [unresolved, setUnresolved] = useState<{ create: UnresolvedCreate; state: "unknown" | "still-unknown" | "checking" | "not-created" | { found: ProjectSummary } } | null>(null);
+  const [unresolved, setUnresolved] = useState<{ create: UnresolvedCreate; state: "unknown" | "still-unknown" | "checking" | "not-created" | { found: ProjectSummary } | { many: number } } | null>(null);
   /** Counts library.state events: an open "Resolve…" dialog reads its list again on each. */
   const [stateSeq, setStateSeq] = useState(0);
   /** What the Zotero sync's events said (Task Z12: the lines under the header read again after a finished one), and whether the library is still open. */
@@ -316,7 +316,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       setUnresolved({ create, state: "checking" });
       try {
         const fresh = madeSince(await reloadProjects(), create);
-        if (mounted.current) setUnresolved({ create, state: fresh.length ? { found: fresh[fresh.length - 1]! } : "not-created" });
+        // FR-204, FR-205: more than one new project with that name is said, and none is taken for the one made then.
+        if (mounted.current) setUnresolved({ create, state: fresh.length > 1 ? { many: fresh.length } : fresh.length ? { found: fresh[0]! } : "not-created" });
       } catch {
         if (mounted.current) setUnresolved({ create, state: auto ? "unknown" : "still-unknown" });
       }
@@ -703,7 +704,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         )}
         {unresolved && (
           <section aria-label="A project that may have been created" className="ao-newproject-notice">
-            {typeof unresolved.state === "object" ? (
+            {typeof unresolved.state === "object" && "many" in unresolved.state ? (
+              <p role="status">
+                {unresolved.state.many} projects named “<UserText>{unresolved.create.name}</UserText>” were found that were not there before, so the app cannot tell which one was made then. Each is in the list of projects.
+                {unresolved.create.encrypted &&
+                  " The one made then opens with the passphrase you chose; its recovery code was not shown and cannot be shown again. Once it is unlocked, choose “New recovery code…” to get a recovery code you can save."}
+              </p>
+            ) : typeof unresolved.state === "object" ? (
               <p role="status">
                 “<UserText>{unresolved.create.name}</UserText>” was created.
                 {unresolved.create.encrypted &&
@@ -722,7 +729,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               </p>
             )}
             <div className="ao-row">
-              {typeof unresolved.state === "object" ? (
+              {typeof unresolved.state === "object" && "found" in unresolved.state ? (
                 <button
                   type="button"
                   onClick={() => {
@@ -733,7 +740,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                 >
                   Open the project
                 </button>
-              ) : unresolved.state === "not-created" ? (
+              ) : unresolved.state === "not-created" || typeof unresolved.state === "object" ? (
                 <button type="button" onClick={() => setUnresolved(null)}>
                   Dismiss
                 </button>

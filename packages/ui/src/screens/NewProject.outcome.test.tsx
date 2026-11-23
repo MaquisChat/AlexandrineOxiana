@@ -113,6 +113,34 @@ describe("New project dialog: the answer is lost (R134 I1)", () => {
     await waitFor(() => expect(within(nav).getByRole("button", { name: /Clinic follow-up/ }).getAttribute("aria-current")).toBe("true"));
   });
 
+  it("FR-204, FR-205: two new projects with the name sent: the dialog says so and chooses neither", async () => {
+    const twin = { ...NEW_ENC, id: "p5", folder: "Projects/Clinic follow-up 2" };
+    const posted: Posted[] = [];
+    server.use(
+      http.post(url("/projects"), async ({ request }) => {
+        posted.push((await request.json()) as Posted);
+        return HttpResponse.error();
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, ...(posted.length ? [NEW_ENC, twin] : [])] })),
+      ...libraryHandlers(),
+    );
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    const dialog = await openDialog(user);
+    await fillEncrypted(dialog, user);
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    const many = await screen.findByRole("dialog", { name: "More than one project with this name was found" });
+    await waitFor(() => expect(document.activeElement).toBe(within(many).getByRole("heading", { name: "More than one project with this name was found" })));
+    expect(many.textContent).toMatch(/2 projects named “Clinic follow-up” appeared in the library while the answer was lost, so the app cannot tell which one was made here/);
+    expect(many.textContent).toMatch(/opens with the passphrase you just chose/);
+    expect(within(many).queryByRole("button", { name: "Open the project" })).toBeNull();
+    await user.click(within(many).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(selected.mock.calls.flat().filter((x) => x === "p4" || x === "p5")).toEqual([]);
+    expect(posted).toHaveLength(1);
+  });
+
   it("an unencrypted project that was created is said to be created, and selected", async () => {
     const svc = serveLost(NEW_OPEN);
     const selected = vi.fn();
@@ -485,6 +513,24 @@ describe("New project dialog: an unknown outcome is never left behind (fix round
     await waitFor(() => expect(notice().textContent).toMatch(/“Clinic follow-up” was created/));
     expect(svc.posted).toHaveLength(1);
     server.events.removeAllListeners();
+  });
+
+  it("FR-204, FR-205: two new projects with the name: the notice says so and opens neither", async () => {
+    const svc = serveLost(null);
+    svc.listFails = true;
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    await toCannotTell(user, fillOpen);
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, NEW_OPEN, { ...NEW_OPEN, id: "p6", folder: "Projects/Tide-line interviews 2" }] })));
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(notice().textContent).toMatch(/2 projects named “Tide-line interviews” were found that were not there before, so the app cannot tell which one was made then\. Each is in the list of projects\./));
+    expect(within(notice()).queryByRole("button", { name: "Open the project" })).toBeNull();
+    await user.click(within(notice()).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("region", { name: "A project that may have been created" })).toBeNull();
+    expect(selected.mock.calls.flat().filter((x) => x === "p3" || x === "p6")).toEqual([]);
   });
 
   it("an unencrypted project: the notice says nothing of a recovery code, and reports one that was not created", async () => {

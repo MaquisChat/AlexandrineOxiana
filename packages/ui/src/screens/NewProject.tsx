@@ -179,6 +179,11 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   const [uncertain, setUncertain] = useState<Uncertain | null>(null);
   /** A project found after a lost answer: created, but its recovery code was never shown. */
   const [found, setFound] = useState<ProjectSummary | null>(null);
+  /**
+   * FR-204, FR-205: more than one new project with the name sent appeared (one may have been made elsewhere): said, and
+   * none is chosen as the one made here.
+   */
+  const [foundMany, setFoundMany] = useState<{ name: string; encrypted: boolean; count: number } | null>(null);
   /** What a lost answer is checked against: the name sent and the projects listed before sending. */
   const pendingCheck = useRef<UnresolvedCreate | null>(null);
   /** A name already in use, waiting for "Create another" or "Change the name". */
@@ -220,8 +225,8 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   }, [host]);
 
   useEffect(() => {
-    if (found) foundHeading.current?.focus();
-  }, [found]);
+    if (found || foundMany) foundHeading.current?.focus();
+  }, [found, foundMany]);
 
   const requirement = encryptionRequirement({ profiles, identifiable });
   const mandatory = requirement.required || serviceNeedsEncryption;
@@ -260,7 +265,8 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
       const fresh = madeSince(now, p);
       pendingCheck.current = null;
       setUncertain(null);
-      if (fresh.length) setFound(fresh[fresh.length - 1]!);
+      if (fresh.length > 1) setFoundMany({ name: p.name, encrypted: p.encrypted, count: fresh.length });
+      else if (fresh.length) setFound(fresh[0]!);
       else show("The library service did not answer, and the project was not created, so nothing was changed. You can create it again.", encrypt ? "pass" : undefined);
     } catch {
       setUncertain("cannot-tell");
@@ -408,6 +414,26 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
             </p>
             <p className="ao-newproject__warning">Without the passphrase or this recovery code, no one can open this project — not you, and not anyone who helps you.</p>
           </RecoveryCodeStep>
+        ) : foundMany ? (
+          <>
+            <h2 id={titleId} ref={foundHeading} tabIndex={-1}>
+              More than one project with this name was found
+            </h2>
+            <p>
+              {foundMany.count} projects named “<UserText>{foundMany.name}</UserText>” appeared in the library while the answer was lost, so the app cannot tell which one was made here: another may have been
+              made elsewhere, in another window. Each is in the list of projects.
+            </p>
+            {foundMany.encrypted && (
+              <p className="ao-newproject__warning">
+                The one made here opens with the passphrase you just chose; its recovery code could not be shown and cannot be shown again. Once it is open, choose “New recovery code…” on the library screen to get a recovery code you can save.
+              </p>
+            )}
+            <div className="ao-row ao-newproject__actions">
+              <button type="button" onClick={() => onCancel()}>
+                Close
+              </button>
+            </div>
+          </>
         ) : found ? (
           <>
             <h2 id={titleId} ref={foundHeading} tabIndex={-1}>
