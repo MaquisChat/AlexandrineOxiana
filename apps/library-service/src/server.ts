@@ -298,7 +298,10 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return;
     if (state.moving) {
       if (`${req.method} ${req.routeOptions.url ?? ""}` === "POST /libraries/move") return fail(reply, new ApiError(409, "CONFLICT", "A move of this library is already running."));
-      return fail(reply, new ApiError(503, "MOVE_IN_PROGRESS", "The library is being moved. Try again when the move has finished."));
+      // A change to this app's own settings, secrets or pairings is refused too (R102 N2), in words
+      // that do not suggest the change belongs to the library being moved (FR-329).
+      const deviceOnly = /^\/(settings|secrets|extension)\//.test(req.routeOptions.url ?? "");
+      return fail(reply, new ApiError(503, "MOVE_IN_PROGRESS", deviceOnly ? "While the library is being moved, this app changes nothing, not even its own settings or its list of paired browsers. Try again when the move has finished." : "The library is being moved. Try again when the move has finished."));
     }
     inFlightMutating++;
     reply.raw.once("close", () => inFlightMutating--);

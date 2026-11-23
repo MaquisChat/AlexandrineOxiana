@@ -1972,6 +1972,28 @@ describe("review round 2: library move (R102 N1–N3)", () => {
     expect((await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [pdfs[0]] } })).status).toBe(200);
   });
 
+  it("while a move runs: a change to this app's own settings or pairings is refused in words that say so, not as if it were in the library (FR-329)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inMove = new Promise<void>((r) => (entered = r));
+    await start({ beforeExecuteMove: async () => (entered(), gate) });
+    await openNewLibrary();
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    await inMove;
+    const DEVICE = "While the library is being moved, this app changes nothing, not even its own settings or its list of paired browsers. Try again when the move has finished.";
+    try {
+      for (const [method, url] of [["DELETE", "/settings/fonts/f1"], ["DELETE", "/secrets/zotero-api-key"], ["DELETE", "/extension/pairings/p1"]] as const) {
+        const r = await call({ method, url });
+        expect(r.status).toBe(503);
+        expect(r.json.error).toEqual({ code: "MOVE_IN_PROGRESS", message: DEVICE });
+      }
+    } finally {
+      release();
+    }
+    expect((await moving).body).toContain('"done":true');
+  });
+
   it("quiesce fails (an import cannot pause): what it paused resumes, the library carries on, 409", async () => {
     await start({ suspendTimeoutMs: 300 });
     await openNewLibrary();
