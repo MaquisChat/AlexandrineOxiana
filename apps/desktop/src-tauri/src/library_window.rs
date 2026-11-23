@@ -1599,10 +1599,17 @@ impl Library {
         // FR-561 (R472): another open took the window while this one was being shown (the page had given
         // this one up and closed what was there): this open answers false and says nothing, so that
         // nothing closes the newer window on its behalf.
+        // R489: a window that stands owned by nobody (a close while it was built ended this open and cleared
+        // the owner) is this open's, so that the page's ticketed close for it is honoured. A window another
+        // open has taken keeps that owner, and this open answers false as above.
+        let stands = host.window_exists();
         let still_its_own = {
             let mut g = self.lock();
             if g.building.as_deref() == Some(ticket) {
                 g.building = None;
+            }
+            if stands && g.window_owner.is_none() {
+                g.window_owner = Some(ticket.to_string());
             }
             open_still_its_own(g.window_owner.as_deref(), ticket)
         };
@@ -3630,6 +3637,26 @@ process.stdout.write(JSON.stringify({{
         // The older open's ticketed close closes its window.
         lib.close_for(&host, "main", Some(TICKET));
         assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1, "the older open's close was refused");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// R489: an open is building its window; the page's close (no ticket) finds no window yet, ends the open and
+    /// clears the owner; the window is then built and the open answers true. The window stands owned by nobody
+    /// no more: it is that open's, so the page's ticketed close for it closes it.
+    #[test]
+    fn a_window_built_after_its_open_was_closed_is_that_open_s_and_its_ticketed_close_closes_it() {
+        let (lib, host, d) = started("fr561-built-after-close");
+        let lib = Arc::new(lib);
+        let inner = lib.clone();
+        *host.on_create.lock().unwrap() = Some(Box::new(move |h: &FakeHost| inner.close(h, "main")));
+        assert!(lib.open(&host, "main", TICKET, START, Start::Library), "the open answers true");
+        assert_eq!(host.events().iter().filter(|e| e.state == State::Closed).count(), 1, "the close ended the open");
+        assert!(host.window_exists());
+        let asked = host.close_asked.load(Ordering::SeqCst);
+        lib.close_for(&host, "main", Some(TICKET2));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked, "another ticket's close closed the window");
+        lib.close_for(&host, "main", Some(TICKET));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1, "the open's ticketed close was refused");
         fs::remove_dir_all(d).unwrap();
     }
 
