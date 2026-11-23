@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, IndexStatus, ProjectSummary, SourcePage, Tag } from "../api/library";
 import { errorText, isProjectLocked, knownProfiles } from "../api/library";
+import { ApiClientError } from "../api/client";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
 import { JobsIndicator, type Job } from "../components/JobsIndicator";
@@ -510,6 +511,23 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       .catch((err: unknown) => fail(err, `${what} could not be done.`));
   };
 
+  /**
+   * A workspace tag's change (R118): it can be refused because some other project is locked (a 409
+   * whose words say so, shown after what could not be done rather than under "Something changed"),
+   * and an interrupted one may have changed some projects, so the tags and sources are read again
+   * whether it worked or not (FR-165).
+   */
+  const editWorkspace = (what: string, run: () => Promise<unknown>) => {
+    setError(undefined);
+    run()
+      .then(refresh)
+      .catch((err: unknown) => {
+        refresh();
+        if (err instanceof ApiClientError && err.code === "CONFLICT" && err.message) setError(`${what} could not be done. ${err.message}`);
+        else fail(err, `${what} could not be done.`);
+      });
+  };
+
   const attach = async (paths: string[]) => {
     if (!projectId || readOnly || locked) return;
     setAttaching(true);
@@ -771,9 +789,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               encrypted={project.encrypted}
               onCreate={(name, scope) => edit("Creating the tag", () => api.tags.create(project.id, name, scope))}
               onRename={(tid, name) => edit("Renaming the tag", () => api.tags.rename(project.id, tid, name))}
-              onRenameWorkspace={(tid, name) => edit("Renaming the workspace tag", () => api.tags.renameWorkspace(tid, name))}
+              onRenameWorkspace={(tid, name) => editWorkspace("Renaming the workspace tag", () => api.tags.renameWorkspace(tid, name))}
               onDeleteWorkspace={(tid) =>
-                edit("Deleting the workspace tag", async () => {
+                editWorkspace("Deleting the workspace tag", async () => {
                   await api.tags.removeWorkspace(tid);
                   setFilter((f) => (f.tag === tid ? { ...f, tag: undefined } : f));
                 })

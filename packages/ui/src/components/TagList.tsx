@@ -1,7 +1,7 @@
 /**
  * The project's tags and the workspace tags shared by every project. A tag filters the sources
- * (toggle). Both can be renamed and deleted (with a confirmation); a workspace tag's change reaches
- * every project (R118), and its buttons and confirmation say so.
+ * (toggle). Both can be renamed and deleted (a delete is confirmed); a workspace tag's change reaches
+ * every project (R118), so its rename is confirmed too (FR-165), and its buttons and confirmations say so.
  */
 import { useId, useState, type FormEvent } from "react";
 import type { Tag } from "../api/library";
@@ -44,12 +44,17 @@ interface TagRowProps {
 function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelete, workspace = false, encrypted }: TagRowProps) {
   const readable = useReadableNote(encrypted);
   const what = workspace ? "workspace tag" : "tag";
-  const [mode, setMode] = useState<"view" | "rename" | "delete">("view");
+  const [mode, setMode] = useState<"view" | "rename" | "confirm-rename" | "delete">("view");
   const [name, setName] = useState(tag.name);
   const fieldId = useId();
   const save = (e: FormEvent) => {
     e.preventDefault();
     const n = name.trim();
+    if (n && n !== tag.name && workspace) {
+      setName(n);
+      setMode("confirm-rename");
+      return;
+    }
     if (n && n !== tag.name) onRename?.(n);
     setMode("view");
   };
@@ -98,6 +103,25 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
           </button>
           {readable.note}
         </form>
+      )}
+      {mode === "confirm-rename" && !readOnly && (
+        <div role="group" aria-label={`Rename ${what} ${tag.name}?`} className="ao-inline-form">
+          <span>
+            Rename the workspace tag <UserText>{tag.name}</UserText> to <UserText>{name}</UserText> in every project?
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              setMode("view");
+              onRename?.(name);
+            }}
+          >
+            Rename
+          </button>
+          <button type="button" onClick={() => setMode("view")}>
+            Cancel
+          </button>
+        </div>
       )}
       {mode === "delete" && !readOnly && (
         <div role="group" aria-label={`Delete ${what} ${tag.name}?`} className="ao-inline-form">

@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
-import { CURRENT_RW, libraryHandlers, PROJECTS, server, SOURCES, serviceError, testApi, url, useMockService } from "../test/service";
+import { CURRENT_RW, libraryHandlers, PROJECTS, server, SOURCES, TAGS, serviceError, testApi, url, useMockService } from "../test/service";
 import { Library } from "./Library";
 
 useMockService();
@@ -479,10 +479,36 @@ describe("Library screen", () => {
     const field = screen.getByLabelText("New name for methods");
     await user.clear(field);
     await user.type(field, "method{Enter}");
+    await user.click(within(screen.getByRole("group", { name: "Rename workspace tag methods?" })).getByRole("button", { name: "Rename" }));
     await waitFor(() => expect(calls).toEqual(['PATCH w1 {"name":"method"}']));
     await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));
     await user.click(within(screen.getByRole("group", { name: "Delete workspace tag methods?" })).getByRole("button", { name: "Delete" }));
     await waitFor(() => expect(calls).toEqual(['PATCH w1 {"name":"method"}', "DELETE w1"]));
+  });
+
+  it("a workspace tag change refused because a project is locked says why in plain words, and the tags are read again (FR-165)", async () => {
+    let tagReads = 0;
+    server.use(
+      http.get(url("/projects/:id/tags"), () => {
+        tagReads++;
+        return HttpResponse.json(TAGS);
+      }),
+      http.delete(url("/workspace-tags/:tid"), () =>
+        HttpResponse.json({ error: { code: "CONFLICT", message: "Unlock every encrypted project first (Clinic interviews is locked): a workspace tag can be on sources in any project, so each one records the change." } }, { status: 409 }),
+      ),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    await screen.findByText("Ethnography at Work");
+    await waitFor(() => expect(tagReads).toBe(1));
+    await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));
+    await user.click(within(screen.getByRole("group", { name: "Delete workspace tag methods?" })).getByRole("button", { name: "Delete" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      "Deleting the workspace tag could not be done. Unlock every encrypted project first (Clinic interviews is locked): a workspace tag can be on sources in any project, so each one records the change.",
+    );
+    await waitFor(() => expect(tagReads).toBe(2));
   });
 
   it("Resolve… on an interrupted-change banner lists the changes and resolves one by the researcher's choice (R27)", async () => {

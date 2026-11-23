@@ -155,12 +155,31 @@ describe("TagList", () => {
     const field = screen.getByLabelText("New name for methods");
     await user.clear(field);
     await user.type(field, "method{Enter}");
+    // A workspace tag's rename reaches every project, so it is confirmed first (FR-165).
+    expect(onRenameWorkspace).not.toHaveBeenCalled();
+    const ask = screen.getByRole("group", { name: "Rename workspace tag methods?" });
+    expect(ask.textContent).toMatch(/every project/);
+    expect(ask.textContent).toContain("method");
+    await user.click(within(ask).getByRole("button", { name: "Rename" }));
     expect(onRenameWorkspace).toHaveBeenCalledWith("w1", "method");
     await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));
     const confirm = screen.getByRole("group", { name: "Delete workspace tag methods?" });
     expect(confirm.textContent).toMatch(/every project/);
     await user.click(within(confirm).getByRole("button", { name: "Delete" }));
     expect(onDeleteWorkspace).toHaveBeenCalledWith("w1");
+  });
+
+  it("cancelling a workspace tag's rename confirmation renames nothing (FR-165)", async () => {
+    const onRenameWorkspace = vi.fn();
+    const user = userEvent.setup();
+    render(<TagList tags={TAGS.tags} workspaceTags={TAGS.workspaceTags} onSelect={vi.fn()} onRename={vi.fn()} onDelete={vi.fn()} onRenameWorkspace={onRenameWorkspace} onDeleteWorkspace={vi.fn()} onCreate={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Rename workspace tag methods" }));
+    const field = screen.getByLabelText("New name for methods");
+    await user.clear(field);
+    await user.type(field, "method{Enter}");
+    await user.click(within(screen.getByRole("group", { name: "Rename workspace tag methods?" })).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("group", { name: "Rename workspace tag methods?" })).toBeNull();
+    expect(onRenameWorkspace).not.toHaveBeenCalled();
   });
 
   it("workspace tag buttons are off while read-only", () => {
