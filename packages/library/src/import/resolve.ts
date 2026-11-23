@@ -92,10 +92,11 @@ const CONFLICT_CONFIDENCE = 0.6;
 
 /**
  * The review's sentence for an item whose title and details were looked up from an identifier found
- * only in its text (R57): they may be a cited work's, so the review says where they came from (FR-123).
+ * in the file — its text or its metadata fields, never its reference metadata (R57): they may be a
+ * cited work's, so the review says where they came from (FR-123; "in the file", R473 M7).
  */
 export const LOOKED_UP_FROM_TEXT =
-  "The title and other details shown were looked up from an identifier found in the file's text, which may belong to a work the file cites rather than to the file itself. Check them against the document before accepting them; the identifier was not recorded.";
+  "The title and other details shown were looked up from an identifier found in the file, which may belong to a work the file cites rather than to the file itself. Check them against the document before accepting them; the identifier was not recorded.";
 const AGREE = 0.9;
 /** Small words: they do not count towards the three real words a running head or a cut-off title needs (R410 a iii). */
 const SMALL_WORDS = new Set(["a", "an", "the", "of", "in", "on", "at", "by", "for", "from", "to", "and", "or", "with", "de", "la", "le", "les", "du", "des", "el", "los", "las", "y", "e", "der", "die", "das", "und", "il", "lo", "di"]);

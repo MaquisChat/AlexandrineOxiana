@@ -855,6 +855,10 @@ describe("review round 2 (R57)", () => {
     expect(r.evidence.method).toBe("identifier+lookup");
     expect(r.confidence).toBeLessThanOrEqual(0.6);
     expect(r.verification.reasons[0]).toBe(LOOKED_UP_FROM_TEXT);
+    // "in the file", not "in the file's text": such an identifier may come from the file's metadata too (R473 M7).
+    expect(LOOKED_UP_FROM_TEXT).toBe(
+      "The title and other details shown were looked up from an identifier found in the file, which may belong to a work the file cites rather than to the file itself. Check them against the document before accepting them; the identifier was not recorded.",
+    );
     expect(r.verification.reasons).not.toContain("An identifier found in the file could not be confirmed as this item's own (it may belong to a cited work), so it was not recorded.");
   });
 
