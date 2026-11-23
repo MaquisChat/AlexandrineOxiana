@@ -6,7 +6,7 @@
  * writeSourceFile (R47); nothing here sleeps.
  */
 import { createReadStream } from "node:fs";
-import { lstat, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Project, SourceFile } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -185,5 +185,39 @@ describe("FR-420: a finding of the integrity check is confirmed in the write que
     // What a check of the project locked from the start gives: presence only.
     expect(report).toEqual(await checkIntegrity(kit.lib, "full", { keyRing: kit.ring }));
     expect(report.presenceOnly).toBeGreaterThan(0);
+  });
+});
+
+describe("R484 d: a hash finding is dropped when the file changed between its hashing and the confirmation", () => {
+  it("a file rewritten meanwhile is not reported; one that did not change is", async () => {
+    const p = await makeProject(kit, RETAIN);
+    const rewritten = await rawSource(p, "Rewritten meanwhile");
+    const unchanged = await rawSource(p, "Left as it is");
+    // Both changed in place outside the app (same size, other bytes): both fail their hash.
+    const originals = new Map<string, Buffer>();
+    for (const sf of [rewritten, unchanged]) {
+      const abs = join(kit.lib.root, sf.assets[0]!.path);
+      const bytes = await readFile(abs);
+      originals.set(abs, Buffer.from(bytes));
+      bytes[0] = bytes[0]! ^ 0xff;
+      await writeFile(abs, bytes);
+    }
+    // The queue is held, so the check's confirmation waits for its turn after hashing.
+    let release!: () => void;
+    const held = writeQueueTurn(kit.repo)(() => new Promise<void>((r) => (release = r)));
+    const c = confirmNoting();
+    const check = checkIntegrity(kit.lib, "full", { keyRing: kit.ring, confirm: c.confirm });
+    await Promise.race([c.askedOnce, check]);
+    expect(c.asks()).toBe(1);
+    // Rewritten between the hashing and the confirmation (a new file put in its place, as a save does).
+    const abs = join(kit.lib.root, rewritten.assets[0]!.path);
+    await writeFile(`${abs}.new`, originals.get(abs)!);
+    await rename(`${abs}.new`, abs);
+    release();
+    await held;
+    const report = await check;
+    expect(report.hashedAssetIds.sort()).toEqual([rewritten.assets[0]!.id, unchanged.assets[0]!.id].sort());
+    expect(ids(report.mismatched)).toEqual([unchanged.assets[0]!.id]);
+    expect(report.missing).toEqual([]);
   });
 });
