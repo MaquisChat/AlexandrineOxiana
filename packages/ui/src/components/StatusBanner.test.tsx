@@ -55,9 +55,10 @@ describe("device-level notices (Task 68)", () => {
 
   it("watched folders that could not be read at open: a plain warning for this session (review round 2, Rm4)", () => {
     const t = warningText("watched-folders-unreadable", "library");
-    expect(t).toMatch(/list of watched folders could not be read when this library was opened/);
-    expect(t).toMatch(/files put in them are not imported/);
-    expect(t).toMatch(/Open the library again/);
+    // R465 b (FR-413): a statement about the opening, which stays true when a folder is added or retried later.
+    expect(t).toBe(
+      "This computer's list of watched folders could not be read when this library was opened, so its watched folders were not started then. Files put in them are not imported until they run. Open the library again to start them all.",
+    );
     expect(t).not.toMatch(/needs attention/);
   });
 

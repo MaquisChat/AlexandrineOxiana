@@ -703,6 +703,38 @@ describe("Bulk Import wizard", () => {
       await waitFor(() => expect(document.activeElement).toBe(run));
     });
 
+    it("when the run ends, focus stays where the researcher moved it outside the wizard (FR-363)", async () => {
+      const m = mockService({ batches: [batch("running")] });
+      const user = userEvent.setup();
+      render(
+        <>
+          <button type="button">Elsewhere on the page</button>
+          <ImportWizard client={m.client} projectId={P1} batchId={B1} />
+        </>,
+      );
+      const run = await screen.findByRole("heading", { name: "Run" });
+      await waitFor(() => expect(document.activeElement).toBe(run));
+      await waitFor(() => expect(m.calls.some((c) => c.path === "/events")).toBe(true));
+      const elsewhere = screen.getByRole("button", { name: "Elsewhere on the page" });
+      await user.click(elsewhere);
+      expect(document.activeElement).toBe(elsewhere);
+      await act(async () => m.emit("import.progress", { batchId: B1, projectId: P1, state: "finished", counts: REPORT.counts }));
+      await screen.findByRole("heading", { name: "Report and undo" });
+      await screen.findByRole("button", { name: "Undo import" });
+      expect(document.activeElement).toBe(elsewhere);
+    });
+
+    it("when the run ends with focus on the run, focus goes to the report's heading (FR-363)", async () => {
+      const m = mockService({ batches: [batch("running")] });
+      render(<ImportWizard client={m.client} projectId={P1} batchId={B1} />);
+      const run = await screen.findByRole("heading", { name: "Run" });
+      await waitFor(() => expect(document.activeElement).toBe(run));
+      await waitFor(() => expect(m.calls.some((c) => c.path === "/events")).toBe(true));
+      await act(async () => m.emit("import.progress", { batchId: B1, projectId: P1, state: "finished", counts: REPORT.counts }));
+      const report = await screen.findByRole("heading", { name: "Report and undo" });
+      expect(document.activeElement).toBe(report);
+    });
+
     it("opened on a running import, it shows the run", async () => {
       open(B1, { batches: [batch("running")] });
       expect(await screen.findByRole("heading", { name: "Run" })).toBeTruthy();

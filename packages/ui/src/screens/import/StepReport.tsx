@@ -93,6 +93,18 @@ const ROWS: Array<[CountKey, string]> = [
   ["failed", "Failed"],
 ];
 
+/**
+ * The collections and tags the import created (R118), each only when not zero; an older report has
+ * none. They are not items, so they have a table of their own (FR-170, R468).
+ */
+function createdRows(r: ImportReport): Array<[string, number]> {
+  const rows: Array<[string, number]> = [
+    ["Collections created", r.created?.collectionIds.length ?? 0],
+    ["Tags created", r.created?.tagIds.length ?? 0],
+  ];
+  return rows.filter(([, n]) => n > 0);
+}
+
 /** Z5 (R224 a): the Zotero rows of the report table, each only when not zero (absent from an older report). */
 function zoteroRows(r: ImportReport): Array<[string, number]> {
   const c = r.counts;
@@ -224,6 +236,23 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
               )}
             </tbody>
           </table>
+
+          {/* What the import created besides sources (R118, FR-170): the service reports their ids. */}
+          {createdRows(report).length > 0 && (
+            <Section level={3} title="Collections and tags created">
+              <table className="ao-import__table">
+                <caption className="ao-visually-hidden">Collections and tags created</caption>
+                <tbody>
+                  {createdRows(report).map(([label, n]) => (
+                    <tr key={label}>
+                      <th scope="row">{label}</th>
+                      <td>{fmt(n)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Section>
+          )}
 
           {/* R393: the notes (where a stopped batch says why) right under the summary, so that they cannot be missed. */}
           {report.notes.length > 0 && (

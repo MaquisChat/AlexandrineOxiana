@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
@@ -72,6 +75,41 @@ describe("CollectionTree expand, collapse, rename, delete", () => {
     expect(document.activeElement).toBe(ch1);
   });
 
+  it("a mouse click on a parent's twisty collapses and expands it without selecting it (FR-162)", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(<CollectionTree collections={COLLECTIONS.collections} selectedId={undefined} onSelect={onSelect} />);
+    const ch1 = screen.getByRole("treeitem", { name: "Chapter 1" });
+    const twisty = ch1.querySelector(".ao-tree__twisty") as HTMLElement;
+    await user.click(twisty);
+    expect(ch1.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("treeitem", { name: "Interviews" })).toBeNull();
+    await user.click(twisty);
+    expect(ch1.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("treeitem", { name: "Interviews" })).toBeTruthy();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  // R468 (M7): WCAG 2.2's 24 by 24 CSS pixel target. jsdom does no layout, so the stylesheet is read:
+  // the twisty keeps its 1em box (the row does not move) and an absolutely placed ::before, centred
+  // on it, gives the clickable area its size (a click on it is a click on the twisty).
+  it("the twisty's clickable area is at least 24 by 24 CSS pixels, and its own box is unchanged (FR-162, R468)", () => {
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "library.css"), "utf8");
+    const rule = (selector: string) => {
+      const at = css.indexOf(`${selector} {`);
+      expect(at).toBeGreaterThanOrEqual(0);
+      return css.slice(at, css.indexOf("}", at));
+    };
+    const own = rule(".ao-tree__twisty");
+    expect(own).toMatch(/width: 1em;/);
+    expect(own).toMatch(/position: relative;/);
+    const area = rule(".ao-tree__twisty::before");
+    expect(area).toMatch(/position: absolute;/);
+    expect(area).toMatch(/content: "";/);
+    expect(area).toMatch(/inline-size: 24px;/);
+    expect(area).toMatch(/block-size: 24px;/);
+  });
+
   it("the selected collection can be renamed and deleted (with a confirmation); read-only turns both off", async () => {
     const onRename = vi.fn();
     const onDelete = vi.fn();
@@ -140,12 +178,86 @@ describe("TagList", () => {
     const field = screen.getByLabelText("New name for methods");
     await user.clear(field);
     await user.type(field, "method{Enter}");
+    // A workspace tag's rename reaches every project, so it is confirmed first (FR-165), in a dialog (R468).
+    expect(onRenameWorkspace).not.toHaveBeenCalled();
+    const ask = screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" });
+    expect(ask.textContent).toMatch(/every project/);
+    // The explanation is tied to the dialog, so a screen reader reads why the question is asked (FR-165, N1).
+    const describedBy = ask.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy ?? "")?.textContent).toBe("A workspace tag is shared by every project, so it is renamed in every project.");
+    await user.click(within(ask).getByRole("button", { name: "Rename" }));
     expect(onRenameWorkspace).toHaveBeenCalledWith("w1", "method");
     await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));
     const confirm = screen.getByRole("group", { name: "Delete workspace tag methods?" });
     expect(confirm.textContent).toMatch(/every project/);
     await user.click(within(confirm).getByRole("button", { name: "Delete" }));
     expect(onDeleteWorkspace).toHaveBeenCalledWith("w1");
+  });
+
+  it("cancelling a workspace tag's rename confirmation renames nothing (FR-165)", async () => {
+    const onRenameWorkspace = vi.fn();
+    const user = userEvent.setup();
+    render(<TagList tags={TAGS.tags} workspaceTags={TAGS.workspaceTags} onSelect={vi.fn()} onRename={vi.fn()} onDelete={vi.fn()} onRenameWorkspace={onRenameWorkspace} onDeleteWorkspace={vi.fn()} onCreate={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Rename workspace tag methods" }));
+    const field = screen.getByLabelText("New name for methods");
+    await user.clear(field);
+    await user.type(field, "method{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" })).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onRenameWorkspace).not.toHaveBeenCalled();
+  });
+
+  // R468 (I1): the rename's confirmation is one of the app's dialogs — focus goes in (to its heading,
+  // so the Enter that opened it, held or pressed again, confirms nothing: R376 c), Escape and Cancel
+  // close it, and afterwards focus is on the tag's Rename button (the name field is closed by then).
+  describe("the workspace tag rename confirmation's focus (FR-165, R468)", () => {
+    const open = async () => {
+      const onRenameWorkspace = vi.fn();
+      const user = userEvent.setup();
+      render(<TagList tags={TAGS.tags} workspaceTags={TAGS.workspaceTags} onSelect={vi.fn()} onRename={vi.fn()} onDelete={vi.fn()} onRenameWorkspace={onRenameWorkspace} onDeleteWorkspace={vi.fn()} onCreate={vi.fn()} />);
+      await user.click(screen.getByRole("button", { name: "Rename workspace tag methods" }));
+      const field = screen.getByLabelText("New name for methods");
+      await user.clear(field);
+      await user.type(field, "method{Enter}");
+      const dialog = screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" });
+      return { user, onRenameWorkspace, dialog };
+    };
+    const renameButton = () => screen.getByRole("button", { name: "Rename workspace tag methods" });
+
+    it("focus goes to the dialog's heading, and the Enter that opened it, pressed again, confirms nothing", async () => {
+      const { user, onRenameWorkspace, dialog } = await open();
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Rename the workspace tag methods to method?" }));
+      await user.keyboard("{Enter}{Enter}");
+      expect(onRenameWorkspace).not.toHaveBeenCalled();
+      expect(screen.getByRole("dialog")).toBe(dialog);
+    });
+
+    it("Tab then Enter confirms once, and focus is back on the tag's Rename button", async () => {
+      const { user, onRenameWorkspace, dialog } = await open();
+      await user.tab();
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Rename" }));
+      await user.keyboard("{Enter}");
+      expect(onRenameWorkspace).toHaveBeenCalledTimes(1);
+      expect(onRenameWorkspace).toHaveBeenCalledWith("w1", "method");
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(renameButton());
+    });
+
+    it("Escape closes it as Cancel does, and focus is back on the tag's Rename button", async () => {
+      const { user, onRenameWorkspace } = await open();
+      await user.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(onRenameWorkspace).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(renameButton());
+    });
+
+    it("Cancel closes it, and focus is back on the tag's Rename button", async () => {
+      const { user, onRenameWorkspace, dialog } = await open();
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(onRenameWorkspace).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(renameButton());
+    });
   });
 
   it("workspace tag buttons are off while read-only", () => {

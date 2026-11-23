@@ -334,7 +334,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
         <ControlCard violations={violations} title="Processing location" controls={["processing", "vendors"]}>
           <p className="ao-hint">Per operation: "local" (on this computer) or named vendors, separated by commas.</p>
           {PROCESSING_OPS.map((op) => (
-            <ListInput key={op} label={PROCESSING_LABEL[op]} disabled={off} value={cfg?.processing[op] ?? []} onCommit={(v) => change(`processing.${op}`, v)} />
+            <ListInput key={op} reset={cancelled} label={PROCESSING_LABEL[op]} disabled={off} value={cfg?.processing[op] ?? []} onCommit={(v) => change(`processing.${op}`, v)} />
           ))}
           <ProfileNotes cfg={cfg} rules={PROFILE_VENDOR_RULES} />
         </ControlCard>
@@ -433,9 +433,9 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
           <TextField type="date" label="Approved from" disabled={off} value={cfg?.protocol.approvedFrom ?? ""} onChange={(v) => change("protocol.approvedFrom", v || null)} />
           <TextField type="date" label="Approval expires" disabled={off} value={cfg?.protocol.expires ?? ""} onChange={(v) => change("protocol.expires", v || null)} />
           <p className="ao-hint">Approved scope, separated by commas (empty: not restricted).</p>
-          <ListInput label="Platforms" disabled={off} value={cfg?.protocol.platforms ?? []} onCommit={(v) => change("protocol.platforms", v)} />
-          <ListInput label="Populations" disabled={off} value={cfg?.protocol.populations ?? []} onCommit={(v) => change("protocol.populations", v)} />
-          <ListInput label="Languages" disabled={off} value={cfg?.protocol.languages ?? []} onCommit={(v) => change("protocol.languages", v)} />
+          <ListInput reset={cancelled} label="Platforms" disabled={off} value={cfg?.protocol.platforms ?? []} onCommit={(v) => change("protocol.platforms", v)} />
+          <ListInput reset={cancelled} label="Populations" disabled={off} value={cfg?.protocol.populations ?? []} onCommit={(v) => change("protocol.populations", v)} />
+          <ListInput reset={cancelled} label="Languages" disabled={off} value={cfg?.protocol.languages ?? []} onCommit={(v) => change("protocol.languages", v)} />
           <CheckControl cfg={cfg} disabled={off} onChange={change} control="protocol.requireBeforeCapture" label="A protocol record is required before capture" />
           <ProtocolDocuments api={api} projectId={projectId} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} />
         </ControlCard>
@@ -447,7 +447,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
             <Required cfg={cfg} control="dmp.repository" />
           </div>
           <div className="ao-field">
-            <ListInput label="Formats" disabled={off} value={cfg?.dmp.formats ?? []} onCommit={(v) => change("dmp.formats", v)} />
+            <ListInput reset={cancelled} label="Formats" disabled={off} value={cfg?.dmp.formats ?? []} onCommit={(v) => change("dmp.formats", v)} />
             <Required cfg={cfg} control="dmp.formats" />
           </div>
           <TextField label="Metadata standard" disabled={off} value={cfg?.dmp.metadataStandard ?? ""} onChange={(v) => change("dmp.metadataStandard", v || null)} />
@@ -639,7 +639,7 @@ function CaptureMethods({
           )}
         </div>
         <CommitInput
-          key={cancelled}
+          reset={cancelled}
           label="Default legal basis for captures from the web (recorded with each capture that gives none)"
           hint="For example: Public task, GDPR Art. 6(1)(e). Setting or changing it loosens the rules, so it asks for a reason."
           disabled={disabled}
@@ -867,7 +867,7 @@ function FindAcquireWays({
         ) : null}
       </fieldset>
       <CommitInput
-        key={cancelled}
+        reset={cancelled}
         label="Default legal basis for records made from typed references (recorded with each such record)"
         hint="For records made from references you type into Find and acquire. For example: Legitimate interest, GDPR Art. 6(1)(f). Setting or changing it loosens the rules, so it asks for a reason."
         disabled={disabled}
@@ -889,10 +889,12 @@ function FindAcquireWays({
 }
 
 /** One line of text, committed when the field loses focus or on Enter (a loosening asks for a reason once, not per keystroke). */
-function CommitInput({ label, hint, value, onCommit, disabled }: { label: string; hint: string; value: string; onCommit: (v: string) => void; disabled?: boolean }) {
+function CommitInput({ label, hint, value, onCommit, disabled, reset }: { label: string; hint: string; value: string; onCommit: (v: string) => void; disabled?: boolean; reset: number }) {
   const id = useId();
   const [draft, setDraft] = useState(value);
-  useEffect(() => setDraft(value), [value]);
+  // `reset` (the count of cancelled reason dialogs): the draft goes back to the rules in place, not
+  // by a remount, so focus stays on the field (R468).
+  useEffect(() => setDraft(value), [value, reset]);
   const commit = () => {
     const next = draft.trim();
     if (next !== value.trim()) onCommit(next);
@@ -943,12 +945,17 @@ function TextField({ label, value, onChange, disabled, type = "text" }: { label:
   );
 }
 
-/** A comma-separated list, committed when the field loses focus or on Enter. */
-function ListInput({ label, value, onCommit, disabled }: { label: string; value: string[]; onCommit: (v: string[]) => void; disabled?: boolean }) {
+/**
+ * A comma-separated list, committed when the field loses focus or on Enter. `reset` is the count of
+ * cancelled reason dialogs: when it changes the draft goes back to the rules as they are, so a list
+ * whose loosening was not recorded is not left showing it (FR-390). The field is not remounted for
+ * this, so focus stays where it was (R468).
+ */
+function ListInput({ label, value, onCommit, disabled, reset }: { label: string; value: string[]; onCommit: (v: string[]) => void; disabled?: boolean; reset: number }) {
   const id = useId();
   const joined = value.join(", ");
   const [draft, setDraft] = useState(joined);
-  useEffect(() => setDraft(joined), [joined]);
+  useEffect(() => setDraft(joined), [joined, reset]);
   const commit = () => {
     const next = draft
       .split(",")

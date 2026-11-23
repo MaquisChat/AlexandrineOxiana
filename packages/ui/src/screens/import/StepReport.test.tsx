@@ -152,6 +152,26 @@ describe("gone from Zotero, and back (Z5, R224)", () => {
     expect(within(table).queryByText(/Zotero/)).toBeNull();
   });
 
+  // R468 (M4): they are not items, so they stand in a table of their own under their own heading.
+  it("the collections and tags the import created stand under their own heading, not among the items by outcome; only when not zero (FR-170)", async () => {
+    show(report({ created: { collectionIds: ["c1", "c2"], tagIds: ["t1"] } }));
+    const items = await screen.findByRole("table", { name: "Items by outcome" });
+    expect(within(items).queryByRole("rowheader", { name: /created$/ })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Collections and tags created", level: 3 })).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Collections and tags created" });
+    const row = (name: string) => within(table).getByRole("rowheader", { name }).closest("tr")!.textContent;
+    expect(row("Collections created")).toContain("2");
+    expect(row("Tags created")).toContain("1");
+  });
+
+  it("no such rows, and no heading, when the import created none, or for an older report without them (FR-170)", async () => {
+    show(report({ created: { collectionIds: [], tagIds: [] } }));
+    await screen.findByRole("table", { name: "Items by outcome" });
+    expect(screen.queryByRole("heading", { name: "Collections and tags created" })).toBeNull();
+    expect(screen.queryByRole("rowheader", { name: "Collections created" })).toBeNull();
+    expect(screen.queryByRole("rowheader", { name: "Tags created" })).toBeNull();
+  });
+
   it("an availability kept by the undo is said once, with the number", async () => {
     const r = report({}, { goneInZotero: 2 });
     const kept = [

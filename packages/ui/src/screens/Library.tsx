@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, IndexStatus, ProjectSummary, SourcePage, Tag } from "../api/library";
 import { errorText, isProjectLocked, knownProfiles } from "../api/library";
+import { ApiClientError } from "../api/client";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
 import { JobsIndicator, type Job } from "../components/JobsIndicator";
@@ -111,6 +112,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [error, setError] = useState<string | undefined>();
   const [sourcesError, setSourcesError] = useState<string | undefined>();
   const [loadingMore, setLoadingMore] = useState(false);
+  /**
+   * The list on screen answers the current search: false from a new search (or reload) until its
+   * first page arrives, so "Load more" never asks at the old list's offset (FR-152).
+   */
+  const [listCurrent, setListCurrent] = useState(false);
   const [reload, setReload] = useState(0);
   /** The address named a project this library does not have (41b2 I1). */
   const [unknownProject, setUnknownProject] = useState(false);
@@ -381,6 +387,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   // ---- the sources for the current search and filters ----
   useEffect(() => {
     staleMore();
+    setListCurrent(false);
     if (!projectId || locked) return;
     const ac = new AbortController();
     const asked = filter.text;
@@ -389,6 +396,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       .then((r) => {
         if (ac.signal.aborted) return;
         setSources(r);
+        setListCurrent(true);
         setSearched(asked);
         setSourcesError(undefined); // only the sources' own error: other errors stay until dismissed or replaced
       })
@@ -453,7 +461,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const query = () => ({ text: filter.text, ...(filter.collection ? { collection: filter.collection } : {}), ...(filter.tag ? { tag: filter.tag } : {}) });
 
   const loadMore = async () => {
-    if (!projectId || !sources) return;
+    if (!projectId || !sources || !listCurrent) return;
     const pid = projectId;
     const gen = pageGen.current;
     const ac = new AbortController();
@@ -517,6 +525,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     }
     if (projects.some((p) => p.id === projectFromAddress)) {
       selectProject(projectFromAddress);
+      // The address already names it, so nothing waits for the address to catch up: a later change
+      // of the address (browser Back or Forward) is followed (FR-151).
+      written.current = undefined;
       return;
     }
     // Not one of this library's projects: select none, so nothing is dropped into the wrong one.
@@ -531,6 +542,23 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     run()
       .then(refresh)
       .catch((err: unknown) => fail(err, `${what} could not be done.`));
+  };
+
+  /**
+   * A workspace tag's change (R118): it can be refused because some other project is locked (a 409
+   * whose words say so, shown after what could not be done rather than under "Something changed"),
+   * and an interrupted one may have changed some projects, so the tags and sources are read again
+   * whether it worked or not (FR-165).
+   */
+  const editWorkspace = (what: string, run: () => Promise<unknown>) => {
+    setError(undefined);
+    run()
+      .then(refresh)
+      .catch((err: unknown) => {
+        refresh();
+        if (err instanceof ApiClientError && err.code === "CONFLICT" && err.message) setError(`${what} could not be done. ${err.message}`);
+        else fail(err, `${what} could not be done.`);
+      });
   };
 
   const attach = async (paths: string[]) => {
@@ -846,9 +874,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               encrypted={project.encrypted}
               onCreate={(name, scope) => edit("Creating the tag", () => api.tags.create(project.id, name, scope))}
               onRename={(tid, name) => edit("Renaming the tag", () => api.tags.rename(project.id, tid, name))}
-              onRenameWorkspace={(tid, name) => edit("Renaming the workspace tag", () => api.tags.renameWorkspace(tid, name))}
+              onRenameWorkspace={(tid, name) => editWorkspace("Renaming the workspace tag", () => api.tags.renameWorkspace(tid, name))}
               onDeleteWorkspace={(tid) =>
-                edit("Deleting the workspace tag", async () => {
+                editWorkspace("Deleting the workspace tag", async () => {
                   await api.tags.removeWorkspace(tid);
                   setFilter((f) => (f.tag === tid ? { ...f, tag: undefined } : f));
                 })
@@ -955,7 +983,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                   onShowInReader={showInReader}
                 />
                 {sources.items.length < sources.total && (
-                  <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
+                  <button type="button" disabled={loadingMore || !listCurrent} onClick={() => void loadMore()}>
                     Load more sources
                   </button>
                 )}

@@ -659,6 +659,78 @@ describe("capture methods, smaller points (Task 64 review)", () => {
     expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  // R468 (I2, by its reason): the legal-basis fields go back WITHOUT a remount, so focus stays on the same element.
+  it("a cancelled reason puts the web legal basis back, and focus on the same field (R468)", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = within(card("Capture methods")).getByRole("textbox", { name: /Default legal basis for captures from the web/ }) as HTMLInputElement;
+    await user.type(field, "Public task{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe(""));
+    expect(within(card("Capture methods")).getByRole("textbox", { name: /Default legal basis for captures from the web/ })).toBe(field);
+    expect(document.activeElement).toBe(field);
+  });
+
+  it("a cancelled reason puts the typed-references legal basis back, and focus on the same field (R468)", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const find = () => within(card("How Find and acquire may get works")).getByRole("textbox", { name: /Default legal basis for records made from typed references/ }) as HTMLInputElement;
+    const field = find();
+    await user.type(field, "Legitimate interest{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe(""));
+    expect(find()).toBe(field);
+    expect(document.activeElement).toBe(field);
+  });
+
+  it("a comma-separated list whose reason is cancelled goes back to the saved value (FR-390)", async () => {
+    serve({ yaml: "protocol:\n  platforms: [youtube]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = () => within(card("Protocol record")).getByRole("textbox", { name: "Platforms" }) as HTMLInputElement;
+    expect(field().value).toBe("youtube");
+    await user.type(field(), ", vimeo");
+    await user.tab();
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field().value).toBe("youtube"));
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // R468 (I2): the draft goes back WITHOUT the field being remounted, so focus comes back to the
+  // same element the dialog was opened from (Enter) or that Tab had moved to (the next field).
+  it("a cancelled reason puts the list back and focus on the same field it was opened from, by Enter (FR-390, R468)", async () => {
+    serve({ yaml: "protocol:\n  platforms: [youtube]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = within(card("Protocol record")).getByRole("textbox", { name: "Platforms" }) as HTMLInputElement;
+    await user.type(field, ", vimeo{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe("youtube"));
+    expect(within(card("Protocol record")).getByRole("textbox", { name: "Platforms" })).toBe(field);
+    expect(document.activeElement).toBe(field);
+  });
+
+  it("a cancelled reason puts the list back and focus on the field Tab had moved to (FR-390, R468)", async () => {
+    serve({ yaml: "protocol:\n  platforms: [youtube]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = within(card("Protocol record")).getByRole("textbox", { name: "Platforms" }) as HTMLInputElement;
+    const next = within(card("Protocol record")).getByRole("textbox", { name: "Populations" });
+    await user.type(field, ", vimeo");
+    await user.tab();
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe("youtube"));
+    expect(within(card("Protocol record")).getByRole("textbox", { name: "Platforms" })).toBe(field);
+    expect(document.activeElement).toBe(next);
+  });
+
   it("the reason dialog shows the typed legal basis as the person's own text, with its own direction (M7)", async () => {
     serve();
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);

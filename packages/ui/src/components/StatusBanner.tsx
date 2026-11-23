@@ -44,7 +44,7 @@ export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
   "watched-folders-list-set-aside":
     "This computer's list of watched folders was damaged and was set aside, so some watched folders on this computer may have stopped: files put in those folders are not imported. The damaged list is kept beside the app's settings.",
   "libraries-list-set-aside":
-    "This computer's list of libraries was damaged and was set aside. Your libraries themselves are untouched: open each one again from its folder with “Open library”. The damaged list is kept beside the app's settings.",
+    "This computer's list of libraries was damaged and was set aside. Any libraries it could still read are listed as before. Your libraries themselves are untouched. A library missing from the list can be opened again from its folder with “Open library”. The damaged list is kept beside the app's settings.",
   "approved-folders-list-set-aside":
     "This computer's list of folders approved for imports was damaged and was set aside. An import will ask again before it uses files from a folder outside the one you import from. The damaged list is kept beside the app's settings.",
   "watched-folder-choices-set-aside":
@@ -75,8 +75,9 @@ const WARNINGS: Record<string, (p: string) => string> = {
   "anchor-missing": (p) => `The audit log may have been changed outside the app (${p}): this computer has no record to check it against. It is checked from now on.`,
   "anchors-unreadable": () => "This computer's record of the audit logs could not be read, so they could not be checked this time. Nothing in the library was changed.",
   // For this session only (Task 68 round 2, Rm4): the service could not read this computer's watched folders at open.
+  // Said of the opening (R465 b), so it stays true when a folder added or retried later does run.
   "watched-folders-unreadable": () =>
-    "This computer's list of watched folders could not be read when this library was opened, so its watched folders are not running now: files put in them are not imported. Open the library again to try again.",
+    "This computer's list of watched folders could not be read when this library was opened, so its watched folders were not started then. Files put in them are not imported until they run. Open the library again to start them all.",
   "rolled-back-incomplete-write": (p) => `An interrupted change in ${p} was undone when the library opened, so nothing half-saved was kept.`,
   "invalid-txn-marker": (p) => `A note left by an interrupted change in ${p} could not be read. It was kept aside and nothing was changed.`,
   "incomplete-write-pending": (p) => `An interrupted change in ${p} could not be finished or undone yet. It is tried again when the library is next opened with write access.`,

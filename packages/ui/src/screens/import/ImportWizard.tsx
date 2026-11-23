@@ -13,7 +13,7 @@
  * from the service (GET /projects/:id/imports, /imports/:id/report), never from memory. The Source
  * step lists the project's recent imports, each linking to its report.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ApiClient } from "../../api/client";
 import { IMPORT_RULES_UNREADABLE_TEXT } from "@ao/shared";
 import { importApi, isValidId, type BatchState, type BatchSummary, type ImportPolicy, type ProjectInfo, type ScanSummary } from "../../api/import";
@@ -96,6 +96,9 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
   const [recent, setRecent] = useState<BatchSummary[] | null>(null);
   /** The import was opened from the address: its step's heading takes focus when shown (R145). */
   const [arrived, setArrived] = useState(false);
+  /** Set when a run ends here: whether the report's heading takes focus (FR-363). */
+  const [reportFocus, setReportFocus] = useState<boolean | undefined>(undefined);
+  const wizard = useRef<HTMLElement>(null);
   const [runError, setRunError] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -239,6 +242,10 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
   };
 
   const ended = (_state: BatchState, err?: string) => {
+    // The report's heading takes focus only if focus was in the wizard (or nowhere): a researcher
+    // who moved elsewhere on the page while the run went on keeps their place (FR-363).
+    const a = document.activeElement;
+    setReportFocus(!a || a === document.body || !!wizard.current?.contains(a));
     setRunError(err);
     setStep("report");
   };
@@ -247,7 +254,7 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
   const project = projects.find((p) => p.id === (runProject || projectId));
 
   return (
-    <main className="ao-import" aria-labelledby="ao-import-title">
+    <main ref={wizard} className="ao-import" aria-labelledby="ao-import-title">
       <h1 id="ao-import-title">Bulk import</h1>
       {project && step !== "source" && (
         <p className="ao-import__hint">
@@ -311,7 +318,7 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
         </>
       )}
       {step === "run" && batchId && runProject && <StepRun client={client} api={api} projectId={runProject} batchId={batchId} onEnded={ended} focusOnArrival={arrived} />}
-      {step === "report" && batchId && runProject && <StepReport api={api} projectId={runProject} batchId={batchId} focusOnArrival={arrived} {...(runError ? { error: runError } : {})} />}
+      {step === "report" && batchId && runProject && <StepReport api={api} projectId={runProject} batchId={batchId} focusOnArrival={reportFocus ?? arrived} {...(runError ? { error: runError } : {})} />}
     </main>
   );
 }

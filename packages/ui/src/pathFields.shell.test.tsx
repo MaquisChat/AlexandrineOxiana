@@ -106,6 +106,9 @@ describe("path fields outside the import wizard, in the desktop shell (D12)", ()
     const a = render(<MoveLibrary api={makeApi()} />);
     expect(screen.getByRole("textbox", { name: "Destination folder" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^Choose/ })).toBeNull();
+    // No dialog here, so the hint says only what the folder must be (FR-391).
+    expect(screen.getByText("The folder must be new or empty.")).toBeTruthy();
+    expect(screen.queryByText(/In the dialog/)).toBeNull();
     a.unmount();
     const b = render(<LibraryNotFound api={testApi()} library={LIBRARIES.libraries[0]!} onOpened={vi.fn()} onOpenDifferent={vi.fn()} />);
     await user.click(screen.getByRole("button", { name: "Locate library…" }));

@@ -24,7 +24,7 @@ export interface AppearanceContextValue {
   /** Applies a change at once and saves it; resolves when saved (or the save failed). */
   update(patch: AppearancePatch): Promise<void>;
   /**
-   * Plain-language message when loading or saving failed. A change that failed to save stays on
+   * Plain-language message when saving failed. A change that failed to save stays on
    * screen, and the message stays, until retrySave() saves it (R109).
    */
   saveError?: string;
@@ -35,6 +35,10 @@ export interface AppearanceContextValue {
   saveErrorReason?: string;
   /** Sends the changes that failed to save again. */
   retrySave(): Promise<void>;
+  /** Plain-language message when loading the saved settings failed (kept apart from saving, FR-155). */
+  loadError?: string;
+  /** Asks the service for the saved settings again after a failed load. */
+  retryLoad(): void;
   /** The researcher's own font files (R100), when the service is connected. */
   fonts?: FontsApi;
   /** Plain-language message when a chosen font file could not be loaded (its fallbacks are used). */
@@ -81,6 +85,9 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
   const [settings, setSettings] = useState<AppearanceSettings>(initial ?? DEFAULT_APPEARANCE);
   const [saveError, setSaveError] = useState<string | undefined>();
   const [saveErrorReason, setSaveErrorReason] = useState<string | undefined>();
+  const [loadError, setLoadError] = useState<string | undefined>();
+  // Bumped by retryLoad() to read the saved settings again.
+  const [loadTry, setLoadTry] = useState(0);
   const systemDark = useMedia("(prefers-color-scheme: dark)");
   const systemReduce = useMedia("(prefers-reduced-motion: reduce)");
   // Set once the user changes something, so a slow initial load never overwrites that change.
@@ -97,16 +104,19 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
     let live = true;
     client.appearance.get().then(
       (s) => {
-        if (live && !changed.current) setSettings((cur) => keepLocalGenerics(s, cur));
+        if (!live) return;
+        setLoadError(undefined);
+        if (!changed.current) setSettings((cur) => keepLocalGenerics(s, cur));
       },
       (err: unknown) => {
-        if (live) setSaveError(`Couldn't load your appearance settings: ${messageOf(err)}`);
+        if (live) setLoadError(`Couldn't load your appearance settings: ${messageOf(err)}`);
       },
     );
     return () => {
       live = false;
     };
-  }, [client]);
+  }, [client, loadTry]);
+  const retryLoad = useCallback(() => setLoadTry((n) => n + 1), []);
 
   const theme = resolveTheme(settings.theme, settings.highContrast, systemDark);
   const reducedMotion = settings.reducedMotion === "system" ? systemReduce : settings.reducedMotion === "on";
@@ -232,8 +242,8 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
   const fontError = Object.values(faceErrors)[0];
 
   const value = useMemo<AppearanceContextValue>(
-    () => ({ settings, theme, reducedMotion, accentApplied, update, retrySave, ...(saveError ? { saveError } : {}), ...(saveError && saveErrorReason ? { saveErrorReason } : {}), ...(fonts ? { fonts } : {}), ...(fontError ? { fontError } : {}) }),
-    [settings, theme, reducedMotion, accentApplied, update, retrySave, saveError, saveErrorReason, fonts, fontError],
+    () => ({ settings, theme, reducedMotion, accentApplied, update, retrySave, retryLoad, ...(loadError ? { loadError } : {}), ...(saveError ? { saveError } : {}), ...(saveError && saveErrorReason ? { saveErrorReason } : {}), ...(fonts ? { fonts } : {}), ...(fontError ? { fontError } : {}) }),
+    [settings, theme, reducedMotion, accentApplied, update, retrySave, retryLoad, loadError, saveError, saveErrorReason, fonts, fontError],
   );
   return <AppearanceContext.Provider value={value}>{children}</AppearanceContext.Provider>;
 }
