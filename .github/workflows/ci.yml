@@ -18,7 +18,10 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 by name, not "ubuntu-latest" (R459): the project is built, verified and documented on 24.04
+    # (the web view's packages, the WebDriver, the launch check). When GitHub moved "ubuntu-latest" to 26.04
+    # (seen 2026-11-23) the desktop job could not install its packages: webkit2gtk-driver is renamed there.
+    runs-on: ubuntu-24.04
     # A healthy run takes about 70 minutes on GitHub's machines (measured on 2026-11-17: the unit tests 19 minutes, the
     # steps before and after them about 11, the app's end-to-end scenarios about 40); a stuck one must not run for hours.
     timeout-minutes: 100
@@ -113,7 +116,7 @@ jobs:
   # changed files (only on its first page), so a push with 300 or more counts as touched too.
   desktop-scope:
     if: github.event_name == 'push' && github.ref != 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -156,7 +159,7 @@ jobs:
       !cancelled() && (github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && github.ref == 'refs/heads/main')
       || needs.desktop-scope.outputs.changed == 'true')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Estimated, not yet measured on GitHub (Task 37h report): about 15–20 minutes cold (a cold debug
     # build of the shell takes ~6–10 min on 2 vCPU) and 8–10 with a warm Rust cache, where the launch
     # check (~2.5 min) and the system packages (~2–3 min) dominate; the scenario takes ~15 s.
@@ -291,7 +294,7 @@ jobs:
   # test. Only on main and on manual runs: it costs build minutes and changes rarely.
   worker-bundle:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A healthy run takes about 6 minutes (install, build, smoke test).
     timeout-minutes: 25
     steps:
