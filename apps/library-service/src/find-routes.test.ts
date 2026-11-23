@@ -1597,7 +1597,7 @@ describe("R470 a: Get a copy for this source (a source whose linked file cannot 
     expect(r.json.reason).toBeUndefined();
     // The made-up services offer no copy: the copy part ends "no open copy", the pick kept on the line, never in a view.
     const done = await until(async () => ((x) => (x?.state === "no-open-copy" ? x : undefined))(await entry(pid, eid)), "the copy part to end");
-    expect(done.copyDespiteLink).toBeUndefined();
+    expect("copyDespiteLink" in done).toBe(false);
     expect((await readFindQueueOfService(pid)).get(eid)?.copyDespiteLink).toBe(true);
     expect(gated.sent.some((s) => s.path.startsWith("/works/doi:"))).toBe(true);
   });
