@@ -70,6 +70,43 @@ describe("governance routes (R113, R118)", () => {
     expect(browser.disabled).toBe(true);
   });
 
+  it("a project locked in another window while the Governance form is open: the form turns off and says why (FR-389)", async () => {
+    let locked = false;
+    let push!: (type: string) => void;
+    const stream = new ReadableStream<Uint8Array>({
+      start: (c) => {
+        push = (type) => c.enqueue(new TextEncoder().encode(`event: ${type}\ndata: {}\n\n`));
+      },
+    });
+    let connected = false;
+    server.use(
+      http.get(url("/events"), () => {
+        connected = true;
+        return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: !locked }] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
+      http.get(url("/projects/p1/governance"), () => HttpResponse.json({ yaml: "captureMethods: [manual_upload, browser_capture]\n", sha256: "a".repeat(64), violations: [] })),
+      http.get(url("/projects/p1/protocol/documents"), () => HttpResponse.json({ documents: [] })),
+      http.get(url("/projects/p1/retention"), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+    );
+    window.history.replaceState(null, "", "/governance?project=p1");
+    render(<Host />);
+    const capture = await screen.findByRole("region", { name: "Capture methods" });
+    const browser = () => within(capture).getByRole("checkbox", { name: /Browser capture/ }) as HTMLInputElement;
+    await waitFor(() => expect(browser().disabled).toBe(false));
+    await waitFor(() => expect(connected).toBe(true));
+    locked = true;
+    push("library.state");
+    expect(await screen.findByText("This project is locked. Unlock it in the library to change its rules.")).toBeTruthy();
+    expect(browser().disabled).toBe(true);
+    // Unlocked again elsewhere: the form can be changed again.
+    locked = false;
+    push("library.state");
+    await waitFor(() => expect(browser().disabled).toBe(false));
+    expect(screen.queryByText(/Unlock it in the library/)).toBeNull();
+  });
+
   it("a writable library and an unlocked project leave the form editable", async () => {
     server.use(
       http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: true }] })),

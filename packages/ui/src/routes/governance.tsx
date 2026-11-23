@@ -42,24 +42,44 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
   const id = useId();
   const [projects, setProjects] = useState<ProjectSummary[] | undefined>();
   const [listError, setListError] = useState<string | undefined>();
+  const onGovernance = path === PATHS.governance;
+  // On the Governance form, each change of the library's state (a project locked or unlocked in
+  // another window, the library turning read-only) reads the projects and the library's mode again,
+  // so the reason the rules cannot be changed follows it while the form is open (FR-389).
+  const [stateSeq, setStateSeq] = useState(0);
+  useEffect(() => {
+    if (!onGovernance) return;
+    const ac = new AbortController();
+    void (async () => {
+      try {
+        for await (const e of client.events({ signal: ac.signal })) if (e.type === "library.state") setStateSeq((n) => n + 1);
+      } catch {
+        // No event stream: the reason stays as read when the form opened; the service still refuses a change it may not make.
+      }
+    })();
+    return () => ac.abort();
+  }, [client, onGovernance]);
   useEffect(() => {
     let live = true;
     api.projects().then(
-      (r) => live && setProjects(r.projects),
+      (r) => {
+        if (!live) return;
+        setProjects(r.projects);
+        setListError(undefined);
+      },
       (err: unknown) => {
         if (!live) return;
-        setProjects([]);
+        setProjects((cur) => cur ?? []);
         setListError(errorText(err, "The projects could not be read."));
       },
     );
     return () => {
       live = false;
     };
-  }, [api]);
+  }, [api, stateSeq]);
   // Whether the library may be changed here, read for the Governance form only: it then says why its
   // rules cannot be changed instead of letting a change be refused on save. Unknown: not said (the
   // service refuses a change it may not make either way).
-  const onGovernance = path === PATHS.governance;
   const [libraryMode, setLibraryMode] = useState<string | undefined>();
   useEffect(() => {
     if (!onGovernance) return;
@@ -71,7 +91,7 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
     return () => {
       live = false;
     };
-  }, [api, onGovernance]);
+  }, [api, onGovernance, stateSeq]);
 
   const list = projects ?? [];
   // The project named in the address when it is one of the library's. A name that is not selects
