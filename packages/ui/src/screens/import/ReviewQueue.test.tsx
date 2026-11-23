@@ -285,6 +285,22 @@ describe("Review queue", () => {
       expect(within(preview).queryByText(/collection names come from folder names/i)).toBeNull();
     });
 
+    it("FR-157: a folder batch from an older service that reports nothing it created flags its collections and tags (fails closed)", async () => {
+      const { created: _c, ...olderBatch } = BATCH;
+      setup({ ...flagged, batches: [olderBatch], sources: { s1: source(1, "Interview 3", { collectionIds: [older], tagIds: [madeTag] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      expect(within(preview).getByText(/collection names come from folder names/i)).toBeTruthy();
+      expect(within(preview).getByText(/tag names come from folder names/i)).toBeTruthy();
+    });
+
+    it("FR-157: a batch the screen does not know (not in the list of imports it read) flags them too", async () => {
+      setup({ ...flagged, batches: [], sources: { s1: source(1, "Interview 3", { collectionIds: [older], tagIds: [] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      expect(within(preview).getByText(/collection names come from folder names/i)).toBeTruthy();
+    });
+
     it("does not flag them when names are not pseudonymised", async () => {
       setup({ ...flagged, governance: undefined });
       const preview = await screen.findByRole("region", { name: "Imported record" });

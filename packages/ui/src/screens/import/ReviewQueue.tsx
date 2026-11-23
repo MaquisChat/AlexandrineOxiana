@@ -179,9 +179,16 @@ interface FileLayout {
 /** Entries per page when the project's whole queue is read. */
 export const PROJECT_PAGE = 500;
 
-/** What the batch made from folder names (R64): the collections and tags it reports it created (R118). */
-function madeByBatch(id: string, batch: BatchSummary | undefined): boolean {
-  if (!batch?.created || !FOLDER_KINDS.has(batch.kind)) return false;
+/**
+ * What the batch made from folder names (R64): the collections and tags it reports it created (R118). The warning fails
+ * closed (FR-157): an entry from a batch the screen does not know (the list of imports unread, or without it), or from a
+ * folder batch that reports nothing of what it created (an older service), has every collection and tag flagged.
+ */
+function madeByBatch(id: string, batchId: string | undefined, batch: BatchSummary | undefined): boolean {
+  if (!batchId) return false;
+  if (!batch) return true;
+  if (!FOLDER_KINDS.has(batch.kind)) return false;
+  if (!batch.created) return true;
   return batch.created.collectionIds.includes(id) || batch.created.tagIds.includes(id);
 }
 
@@ -1019,7 +1026,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               collections={collections}
               tags={tags}
               flagTitle={flagging && titleFromFileName(item, shownSource)}
-              flagFolderNames={flagging ? (id: string) => madeByBatch(id, itemBatch(item)) : () => false}
+              flagFolderNames={flagging ? (id: string) => madeByBatch(id, batchId ?? item.batchId, itemBatch(item)) : () => false}
               busy={busy}
               onDecide={(d, done) => void decide(item, d, done)}
               onConfirm={(field, value) => confirmField(item, field, value)}
