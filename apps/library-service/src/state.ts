@@ -348,6 +348,21 @@ export class ServiceState {
     return ok;
   }
 
+  /**
+   * After a move refused before anything was copied (FR-385): the transcriptions its quiesce stopped
+   * stay pending in their journals; once they have ended here, they run again in the library still
+   * open (not awaited by the refusal).
+   */
+  resumeStoppedTranscriptions(s: Session): void {
+    const stopped = [...this.work.values()].filter((w) => w.kind === "transcription").map((w) => w.done);
+    this.track(
+      Promise.allSettled(stopped).then(() => {
+        if (this.session === s && !this.moving) this.resumeWorkerJobs(s);
+      }),
+      "resuming transcriptions after a refused move",
+    );
+  }
+
   /** Continues the work stopped for a move, when it belongs to the library open now (R108); the rest waits for its own. */
   restartStoppedWork(): void {
     const s = this.session;
@@ -1030,6 +1045,11 @@ export class ServiceState {
     await this.zoteroSync.stopScheduler();
     await this.zoteroSync.stop("library-closed");
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
+    // A running transcription is stopped at once, as at a close (N-5): it stays pending in its
+    // project's journal, which moves with the library, and runs again once the library is open at
+    // its new place (FR-385), rather than holding the move up until it is refused.
+    // Only a transcription started here: a rerun of pending jobs is waited for, as before (Task 51 N-2).
+    for (const w of this.work.values()) if (w.kind === "transcription") w.ctl.interrupt?.();
     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
     if (!(await this.drainWork(ms))) {
       this.zoteroSync.startScheduler(this, s);

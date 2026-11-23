@@ -538,6 +538,52 @@ describe("fix round 1", () => {
     expect((await stateOf(pid, sid))?.status).toBe("done"); // from the journal
   });
 
+  it("FR-385: a move during a running transcription stops it at once, moves the library, and carries the run on there: stored once", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true, suspendTimeoutMs: 2_000 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    expect(worker.runs[0]!.cancelled).toBe(true);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker.runs.filter((r) => r.type === "audio.transcribe" && !r.cancelled)).toHaveLength(1);
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2); // one run: its WebVTT and its segments file
+  });
+
+  it("FR-385: a move refused because other work could not pause: the transcription it stopped runs again at once in the library still open", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true, suspendTimeoutMs: 300 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    let free!: () => void;
+    const stuck = svc!.state.startWork("stuck", () => new Promise<void>((r) => (free = r)));
+    try {
+      const refused = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+      expect(refused.status).toBe(409);
+    } finally {
+      free();
+      await stuck;
+    }
+    await until(() => worker!.runs.length === 2);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2);
+  });
+
   it("M7: a close during a live transcription does not wait out the grace period", async () => {
     worker = await stubWorker();
     await start({ worker: provider(worker!), autoStartWorker: false });

@@ -281,7 +281,16 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         if (waited >= 60_000) throw new ApiError(409, "CONFLICT", "Some changes are still being made. Try the move again in a moment.");
         await new Promise((r) => setTimeout(r, 25));
       }
-      const paused = await state.quiesce(s); // 409 before the stream starts when work cannot pause
+      let paused: Awaited<ReturnType<typeof state.quiesce>>;
+      try {
+        paused = await state.quiesce(s); // 409 before the stream starts when work cannot pause
+      } catch (err) {
+        // Refused before anything was copied: a transcription the move stopped (FR-385) runs again
+        // now, in the library still open, rather than at its next open.
+        state.moving = false;
+        state.resumeStoppedTranscriptions(s);
+        throw err;
+      }
       state.roots.add(dest);
       // Lines are dropped once the client is gone: the move itself always runs to its end (R102 N1).
       const write = ndjson(reply);

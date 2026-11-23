@@ -3,9 +3,10 @@
  * transcription, over the job records of the project's journal.
  *
  * - A transcription is a worker job recorded in its project's job journal under the id the
- *   interface follows; it runs as registered work (`transcription`), so a move waits for it (or is
- *   refused, R106) and a close or shutdown abandons it after the grace period, leaving it pending to
- *   run again at the next open (Task 62, N-5).
+ *   interface follows; it runs as registered work (`transcription`). A move stops it at once and
+ *   it runs again once the library is open at its new place, or at once if the move is refused
+ *   (FR-385); a close or shutdown abandons it, leaving it pending to run again at the next open
+ *   (Task 62, N-5).
  * - At most one per source: `reserve` takes the source synchronously, before anything is awaited,
  *   so of two requests at once exactly one passes; the route then refuses a source whose journal
  *   still holds a pending transcription (from before a restart, or cancelled by a lock, R142).
