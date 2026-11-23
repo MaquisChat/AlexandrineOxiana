@@ -597,17 +597,21 @@ describe("TranscriptViewer — the player and its media ticket", () => {
       fireEvent(el, new Event("seeked"));
     }
     expect(screen.queryByText(/The recording could not be played/)).toBeNull();
-    // A ticket that fails while young counts: it cannot renew for ever.
-    for (let cycle = 0; cycle < 4; cycle++) {
-      fireEvent(el, new Event("error"));
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 30));
-      });
+    // A ticket that fails while young counts: it cannot renew for ever. Each failure is followed to
+    // where the player rests: a new ticket in the element, or the alert.
+    let cycles = 0;
+    while (cycles < 4 && !screen.queryByText(/The recording could not be played/)) {
+      cycles++;
+      const outcome = await failAndRest(el, svc.log.tickets);
+      if (outcome === "stopped") break;
+      browserReset(el);
       fireEvent(el, new Event("loadedmetadata"));
+      fireEvent(el, new Event("seeked"));
       playTo(el, 51.6);
     }
-    expect(await screen.findByText(/The recording could not be played/)).toBeTruthy();
-    // Four tickets for the three pauses, one renewal of a young ticket, then it stops.
+    expect(screen.getByText(/The recording could not be played/)).toBeTruthy();
+    // Four tickets for the three pauses, one renewal of a young ticket, then it stops at the second.
+    expect(cycles).toBe(2);
     expect(svc.log.tickets).toHaveLength(5);
   });
 
