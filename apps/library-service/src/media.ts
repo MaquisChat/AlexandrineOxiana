@@ -14,6 +14,9 @@
  * project is locked, when the library is closed or moved, and when the service stops; at most 16
  * are live (the 17th is refused, 429, until one ends: evicting one silently would stop a recording
  * that is playing). Ending a ticket also ends its streams in progress.
+ * A read that finds an encrypted chunk failing its check (the file changed outside the app) cuts the
+ * stream (after the first byte nothing else can be sent) and marks the ticket, so its revoke answers
+ * `ended: "FILE_CHANGED"` and the player can say why it stopped (FR-217, FR-219).
  *
  * Who may load `/media/<ticket>` (decided here, checked in server.ts before any token logic):
  *  - Host must be ours (as for every route).
@@ -41,6 +44,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { DecryptionError, EncryptionFormatError, KeyNotAvailableError, ProjectLockedError, isMediaMime, isPictureMime, openAssetContent, type AssetContent } from "@ao/library";
 import {
   MEDIA_TICKETS_MAX,
+  MEDIA_FILE_CHANGED,
   MEDIA_TICKET_IDLE_MS,
   MEDIA_TICKET_LIFETIME_MS,
   PICTURE_MAX_BYTES,
@@ -71,6 +75,8 @@ interface Ticket {
   lastUsed: number;
   /** Responses streaming now. */
   streams: Set<Stream>;
+  /** A read for it found the stored file changed outside the app (FR-217): said when it is revoked. */
+  fileChanged?: boolean;
 }
 
 const digest = (ticket: string) => createHash("sha256").update(ticket, "utf8").digest("hex");
@@ -335,7 +341,10 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
     if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Only the desktop app can do this.");
     const path = str(bodyAs<MediaTicketRevokeRequest>(req), "path", 128);
     if (!isMediaTicketPath(path)) throw badRequest('"path" must be a media address (/media/…).');
-    return { revoked: tickets.revoke(path.slice("/media/".length)) };
+    const ticket = path.slice("/media/".length);
+    // FR-219: the player learns by this code that its recording stopped because the file was changed outside the app.
+    const changed = tickets.use(ticket)?.fileChanged === true;
+    return { revoked: tickets.revoke(ticket), ...(changed ? { ended: MEDIA_FILE_CHANGED } : {}) };
   });
 
   // ---- the media route (no token: the ticket is the credential; checks in server.ts) ----
@@ -384,6 +393,10 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
     return sendContent(req, reply, c, range, r ? 206 : 200, {
       track: (stream) => tickets.track(t, stream),
       sent: (n) => tickets.sentBytes(t, n),
+      // An encrypted chunk that fails its check: the file was changed (or damaged) outside the app (FR-217).
+      failed: (cause) => {
+        if (cause instanceof DecryptionError || cause instanceof EncryptionFormatError) t.fileChanged = true;
+      },
       // Between the first read and the first byte: the ticket must still be live and its project unlocked.
       check: () => {
         if (!tickets.isLive(ticket) || state.session !== s) throw ended();
@@ -423,6 +436,8 @@ export interface SendHooks {
   sent?: (bytes: number) => void;
   check?: () => void;
   beforeSend?: () => Promise<void>;
+  /** A read of the file failed (before the first byte or while sending), with what it threw. */
+  failed?: (cause: unknown) => void;
 }
 
 /**
@@ -462,6 +477,7 @@ export async function sendContent(req: FastifyRequest, reply: FastifyReply, c: A
     hooks.check?.();
   } catch (err) {
     await c.close();
+    hooks.failed?.(err);
     if (released) return reply.send(); // the client left during the read: nobody to answer
     const e = readFailure(err);
     logFailure(req, e, "before the first byte");
@@ -500,6 +516,7 @@ export async function sendContent(req: FastifyRequest, reply: FastifyReply, c: A
   };
   rest?.once("error", (err) => {
     if (stopped) return;
+    hooks.failed?.(err);
     const e = readFailure(err);
     logFailure(req, e, reply.raw.headersSent ? "while sending" : "before the first byte");
     stop(e);

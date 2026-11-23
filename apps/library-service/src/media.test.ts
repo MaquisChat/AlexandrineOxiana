@@ -932,3 +932,63 @@ describe("fix round 1 (R140): an error before the first byte", () => {
     quietLogs();
   });
 });
+
+describe("a stored file found changed while it is played (FR-217, FR-219)", () => {
+  /** Flips a byte `fromEnd` bytes before the end of the stored (encrypted) file. */
+  async function tamperAt(pid: string, sid: string, aid: string, at: (size: number) => number): Promise<void> {
+    const sf = await svc.state.session!.repo.getSource(pid, sid);
+    const abs = join(tmp, "Lib", ...sf.assets.find((a) => a.id === aid)!.path.split("/"));
+    const raw = await readFile(abs);
+    const i = at(raw.length);
+    raw[i] = raw[i]! ^ 0xff;
+    await writeFile(abs, raw);
+  }
+  /** A whole-file GET on the real socket; resolves with the bytes received, however it ends. */
+  function getAll(port: number, path: string): Promise<number> {
+    return new Promise((resolve) => {
+      let got = 0;
+      const req = httpRequest({ host: "127.0.0.1", port, path, method: "GET", headers: { host: `127.0.0.1:${port}` } }, (res) => {
+        res.on("data", (d: Buffer) => (got += d.length));
+        res.on("end", () => resolve(got));
+        res.on("error", () => resolve(got));
+        res.on("aborted", () => resolve(got));
+      });
+      req.on("error", () => resolve(got));
+      req.end();
+    });
+  }
+  const revoke = (path: string) => call({ method: "POST", url: "/media-tickets/revoke", body: { path } });
+
+  it("a change found part-way through a stream: the cut ticket's revoke says FILE_CHANGED (a code, no sentence, no path)", async () => {
+    await start();
+    const port = await svc.listen(0);
+    hostHeader = { host: `127.0.0.1:${port}` };
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(3 * CHUNK)), "video");
+    const t = await ticket(pid, sid, aid);
+    await tamperAt(pid, sid, aid, (n) => n - 100); // in the last chunk: found after the first bytes were sent
+    const got = await getAll(port, t.path);
+    expect(got).toBeGreaterThan(0);
+    expect(got).toBeLessThan(3 * CHUNK);
+    for (let i = 0; i < 100 && svc.state.media.activeStreams() > 0; i++) await new Promise((res) => setTimeout(res, 20));
+    const r = await revoke(t.path);
+    expect(r.status).toBe(200);
+    expect(r.json).toEqual({ revoked: true, ended: "FILE_CHANGED" });
+    expect(r.body).not.toContain(tmp);
+  });
+
+  it("a change found before the first byte: the same code; a ticket that ended normally carries none", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(3 * CHUNK)), "video");
+    const good = await ticket(pid, sid, aid);
+    expect((await media(good.path, { range: "bytes=0-9" })).status).toBe(206);
+    expect((await revoke(good.path)).json).toEqual({ revoked: true });
+    const t = await ticket(pid, sid, aid);
+    await tamperAt(pid, sid, aid, () => 38 + 10);
+    expect((await media(t.path, { range: "bytes=10-20" })).status).toBe(409);
+    expect((await revoke(t.path)).json).toEqual({ revoked: true, ended: "FILE_CHANGED" });
+  });
+});

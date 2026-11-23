@@ -556,6 +556,25 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(svc.log.tickets).toHaveLength(5);
   });
 
+  it("a recording whose file the service found changed outside the app says so at once, never 'may be damaged' after retries (FR-218, FR-219)", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4);
+    // The stream was cut where the service found the file changed.
+    svc.state.fileChanged = true;
+    fireEvent(el, new Event("error"));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("The recording stopped: its file was changed outside the app, so it cannot be played from here. Check the verification report.");
+    expect(alert.textContent).not.toMatch(/may be damaged|\//);
+    // No new ticket was asked for, and the ended one was let go.
+    expect(svc.log.tickets).toHaveLength(1);
+    expect(svc.log.revoked).toEqual([svc.log.tickets[0]!.path]);
+    expect(el.getAttribute("src")).toBeNull();
+    expect(screen.getByRole("button", { name: "Try the recording again" })).toBeTruthy();
+  });
+
   it("too many recordings open at once is said in one plain sentence (review M3)", async () => {
     const svc = transcriptService();
     server.use(http.post(url("/projects/:id/sources/:sid/assets/:aid/media-ticket"), () => serviceErrorBody(429, "RATE_LIMITED", "Too many recordings are open at once. Close one, then try again.")), ...svc.handlers);
