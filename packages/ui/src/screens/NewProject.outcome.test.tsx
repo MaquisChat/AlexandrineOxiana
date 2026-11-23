@@ -135,10 +135,43 @@ describe("New project dialog: the answer is lost (R134 I1)", () => {
     expect(many.textContent).toMatch(/2 projects named “Clinic follow-up” appeared in the library while the answer was lost, so the app cannot tell which one was made here/);
     expect(many.textContent).toMatch(/opens with the passphrase you just chose/);
     expect(within(many).queryByRole("button", { name: "Open the project" })).toBeNull();
+    // R461 d: each is listed by its folder's own name (never a path), with its own "Open this one".
+    const listed = within(many).getByRole("list", { name: "Projects with this name" });
+    expect(within(listed).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "The project in the folder “Clinic follow-up” Open this one",
+      "The project in the folder “Clinic follow-up 2” Open this one",
+    ]);
+    expect([...listed.querySelectorAll("[dir=auto]")].map((el) => el.textContent)).toEqual(["Clinic follow-up", "Clinic follow-up 2"]);
+    expect(listed.textContent).not.toMatch(/Projects\//);
+    expect(within(many).getByRole("button", { name: "Open the project in the folder “Clinic follow-up 2”" }).textContent).toBe("Open this one");
     await user.click(within(many).getByRole("button", { name: "Close" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(selected.mock.calls.flat().filter((x) => x === "p4" || x === "p5")).toEqual([]);
     expect(posted).toHaveLength(1);
+  });
+
+  it("FR-204, FR-205: “Open this one” opens the project in that folder", async () => {
+    const twin = { ...NEW_OPEN, id: "p5", folder: "Projects/Tide-line interviews 2" };
+    let posted = 0;
+    server.use(
+      http.post(url("/projects"), () => {
+        posted++;
+        return HttpResponse.error();
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, ...(posted ? [NEW_OPEN, twin] : [])] })),
+      ...libraryHandlers(),
+    );
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    const dialog = await openDialog(user);
+    await fillOpen(dialog, user);
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    const many = await screen.findByRole("dialog", { name: "More than one project with this name was found" });
+    await user.click(within(many).getByRole("button", { name: "Open the project in the folder “Tide-line interviews 2”" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(selected).toHaveBeenLastCalledWith("p5"));
+    expect(posted).toBe(1);
   });
 
   it("an unencrypted project that was created is said to be created, and selected", async () => {
@@ -562,11 +595,34 @@ describe("New project dialog: an unknown outcome is never left behind (fix round
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, NEW_OPEN, { ...NEW_OPEN, id: "p6", folder: "Projects/Tide-line interviews 2" }] })));
     await user.click(within(notice()).getByRole("button", { name: "Check again" }));
-    await waitFor(() => expect(notice().textContent).toMatch(/2 projects named “Tide-line interviews” were found that were not there before, so the app cannot tell which one was made then\. Each is in the list of projects\./));
+    await waitFor(() => expect(notice().textContent).toMatch(/2 projects named “Tide-line interviews” were found that were not there before, so the app cannot tell which one was made then\./));
     expect(within(notice()).queryByRole("button", { name: "Open the project" })).toBeNull();
+    // R461 d: listed by folder name only, each with its own "Open this one".
+    const listed = within(notice()).getByRole("list", { name: "Projects with this name" });
+    expect(within(listed).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "The project in the folder “Tide-line interviews” Open this one",
+      "The project in the folder “Tide-line interviews 2” Open this one",
+    ]);
+    expect(listed.textContent).not.toMatch(/Projects\//);
     await user.click(within(notice()).getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByRole("region", { name: "A project that may have been created" })).toBeNull();
     expect(selected.mock.calls.flat().filter((x) => x === "p3" || x === "p6")).toEqual([]);
+  });
+
+  it("FR-204, FR-205: the notice's “Open this one” opens the project in that folder and removes the notice", async () => {
+    const svc = serveLost(null);
+    svc.listFails = true;
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    await toCannotTell(user, fillOpen);
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, NEW_OPEN, { ...NEW_OPEN, id: "p6", folder: "Projects/Tide-line interviews 2" }] })));
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await user.click(await within(notice()).findByRole("button", { name: "Open the project in the folder “Tide-line interviews 2”" }));
+    await waitFor(() => expect(selected).toHaveBeenLastCalledWith("p6"));
+    expect(screen.queryByRole("region", { name: "A project that may have been created" })).toBeNull();
   });
 
   it("an unencrypted project: the notice says nothing of a recovery code, and reports one that was not created", async () => {

@@ -169,6 +169,28 @@ export interface UnresolvedCreate {
 /** New projects with that name since `before`: what a lost create may have made. */
 export const madeSince = (projects: ProjectSummary[], u: UnresolvedCreate): ProjectSummary[] => projects.filter((x) => !u.before.has(x.id) && x.name === u.name);
 
+/** The last part of a project's folder inside the library: its own name, never a path (R461 d). */
+export const folderName = (folder: string) => folder.split(/[\\/]/).filter(Boolean).at(-1) ?? folder;
+
+/**
+ * FR-204, FR-205 (R461 d): new projects with the same name, told apart by their folder's own name, each with its own
+ * "Open this one" (named for its folder).
+ */
+export function SameNamedProjects({ projects, onOpen }: { projects: ProjectSummary[]; onOpen: (project: ProjectSummary) => void }) {
+  return (
+    <ul aria-label="Projects with this name" className="ao-plain-list">
+      {projects.map((p) => (
+        <li key={p.id}>
+          The project in the folder “<UserText>{folderName(p.folder)}</UserText>”{" "}
+          <button type="button" className="ao-small" aria-label={`Open the project in the folder “${folderName(p.folder)}”`} onClick={() => onOpen(p)}>
+            Open this one
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 /** The service's limit on a passphrase (routes/projects.ts, UTF-16 units like maxLength). */
 const PASSPHRASE_MAX = 1024;
 
@@ -205,7 +227,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
    * FR-204, FR-205: more than one new project with the name sent appeared (one may have been made elsewhere): said, and
    * none is chosen as the one made here.
    */
-  const [foundMany, setFoundMany] = useState<{ name: string; encrypted: boolean; count: number } | null>(null);
+  const [foundMany, setFoundMany] = useState<{ name: string; encrypted: boolean; projects: ProjectSummary[] } | null>(null);
   /** What a lost answer is checked against: the name sent and the projects listed before sending. */
   const pendingCheck = useRef<UnresolvedCreate | null>(null);
   /** A name already in use, waiting for "Create another" or "Change the name". */
@@ -304,7 +326,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
       const fresh = madeSince(now, p);
       pendingCheck.current = null;
       setUncertain(null);
-      if (fresh.length > 1) setFoundMany({ name: p.name, encrypted: p.encrypted, count: fresh.length });
+      if (fresh.length > 1) setFoundMany({ name: p.name, encrypted: p.encrypted, projects: fresh });
       else if (fresh.length) setFound(fresh[0]!);
       else show("The library service did not answer, and the project was not created, so nothing was changed. You can create it again.", encrypt ? "pass" : undefined);
     } catch {
@@ -459,9 +481,10 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
               More than one project with this name was found
             </h2>
             <p>
-              {foundMany.count} projects named “<UserText>{foundMany.name}</UserText>” appeared in the library while the answer was lost, so the app cannot tell which one was made here: another may have been
-              made elsewhere, in another window. Each is in the list of projects.
+              {foundMany.projects.length} projects named “<UserText>{foundMany.name}</UserText>” appeared in the library while the answer was lost, so the app cannot tell which one was made here: another
+              may have been made elsewhere, in another window.
             </p>
+            <SameNamedProjects projects={foundMany.projects} onOpen={onCreated} />
             {foundMany.encrypted && (
               <p className="ao-newproject__warning">
                 The one made here opens with the passphrase you just chose; its recovery code could not be shown and cannot be shown again. Once it is open, choose “New recovery code…” on the library screen to get a recovery code you can save.
