@@ -95,6 +95,8 @@ function countLines(f: WatchedFolderSummary): string[] {
   const c = f.counts;
   const out: string[] = [];
   if (c.cameIn) out.push(`${files(c.cameIn)} came in`);
+  // FR-476: a file whose content is already in the project (a same-content conflict copy, say) is counted and said.
+  if (c.alreadyInLibrary) out.push(`${files(c.alreadyInLibrary)} ${c.alreadyInLibrary === 1 ? "was" : "were"} already in the library, so ${c.alreadyInLibrary === 1 ? "it was" : "they were"} not brought in again`);
   if (c.notDownloaded) out.push(`${files(c.notDownloaded)} here ${c.notDownloaded === 1 ? "is" : "are"} not downloaded to this Mac${c.notDownloadedBytes > 0 ? ` (${formatSize(c.notDownloadedBytes)})` : ""}`);
   if (c.didNotComeIn) out.push(`${files(c.didNotComeIn)} did not come in`);
   if (c.waiting) out.push(`${files(c.waiting)} ${c.waiting === 1 ? "is" : "are"} waiting to come in`);
