@@ -323,6 +323,14 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     },
     [reloadProjects],
   );
+  // FR-182: a notice that cannot tell yet checks again by itself each time the service reports the library's state (it
+  // is answering again); a check that fails leaves the notice as it was, and "Check again" stays.
+  const unresolvedRef = useRef(unresolved);
+  unresolvedRef.current = unresolved;
+  useEffect(() => {
+    const u = unresolvedRef.current;
+    if (stateSeq && u && (u.state === "unknown" || u.state === "still-unknown")) void checkUnresolved(u.create, u.state === "unknown");
+  }, [stateSeq, checkUnresolved]);
   const dialogClosed = (unresolvedCreate?: UnresolvedCreate, made?: ProjectSummary) => {
     setCreating(false);
     if (unresolvedCreate) void checkUnresolved(unresolvedCreate, true);

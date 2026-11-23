@@ -454,6 +454,39 @@ describe("New project dialog: an unknown outcome is never left behind (fix round
     await waitFor(() => expect(notice().textContent).toMatch(/“Tide-line interviews” was not created/));
   });
 
+  it("FR-182: the notice checks again by itself when the service next reports the library's state; one that still fails leaves it as it was", async () => {
+    const svc = serveLost(NEW_ENC);
+    svc.listFails = true;
+    const events = controllableEvents();
+    server.use(events.handler);
+    let lists = 0;
+    server.events.on("request:start", ({ request }) => {
+      if (request.method === "GET" && new URL(request.url).pathname === "/projects") lists++;
+    });
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    await toCannotTell(user, fillEncrypted);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(notice().textContent).toMatch(/“Clinic follow-up” may have been created/));
+    expect(within(notice()).getByRole("button", { name: "Check again" })).toBeTruthy();
+
+    // A state report while the list still cannot be read: checked once, and the notice stays as it was.
+    const before = lists;
+    act(() => events.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} }));
+    await waitFor(() => expect(lists).toBe(before + 1));
+    await waitFor(() => expect(within(notice()).getByRole("button", { name: "Check again" }).hasAttribute("disabled")).toBe(false));
+    expect(notice().textContent).toMatch(/may have been created/);
+    expect(notice().textContent).not.toMatch(/still cannot tell/i);
+
+    // The service answers again: the next report settles it, with no press.
+    svc.listFails = false;
+    act(() => events.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} }));
+    await waitFor(() => expect(notice().textContent).toMatch(/“Clinic follow-up” was created/));
+    expect(svc.posted).toHaveLength(1);
+    server.events.removeAllListeners();
+  });
+
   it("an unencrypted project: the notice says nothing of a recovery code, and reports one that was not created", async () => {
     const svc = serveLost(null);
     svc.listFails = true;
