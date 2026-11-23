@@ -329,6 +329,16 @@ export function AppearanceSettingsScreen() {
   useEffect(() => {
     if (focusTitle > 0) heading.current?.focus();
   }, [focusTitle]);
+  // "Try loading again" goes away with its alert once the settings are read: focus, which was on
+  // it, goes to the screen's heading rather than to the page (FR-155, R468). A failed try keeps
+  // the alert and its button, and focus on it.
+  const retriedLoad = useRef(false);
+  useEffect(() => {
+    if (loadError || !retriedLoad.current) return;
+    retriedLoad.current = false;
+    const at = document.activeElement;
+    if (!at || at === document.body) heading.current?.focus();
+  }, [loadError]);
   const resetAppearance = async () => {
     if (appearanceResetNow.current || !fonts) return;
     appearanceResetNow.current = true;
@@ -499,7 +509,13 @@ export function AppearanceSettingsScreen() {
       {loadError && (
         <div role="alert" className="ao-warning">
           <p>{loadError}</p>
-          <button type="button" onClick={retryLoad}>
+          <button
+            type="button"
+            onClick={() => {
+              retriedLoad.current = true;
+              retryLoad();
+            }}
+          >
             Try loading again
           </button>
         </div>

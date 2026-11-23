@@ -233,6 +233,32 @@ describe("Appearance settings screen", () => {
     expect(put).not.toHaveBeenCalled();
     expect(root().dataset.theme).toBe("dark");
   });
+
+  // R468 (M6): focus is not lost to the page when "Try loading again" goes away with its alert.
+  it("after loading again succeeds, focus is on the screen's heading; after it fails again, it stays on the button (FR-155, R468)", async () => {
+    let fail = true;
+    const get = vi.fn(async () => {
+      if (fail) throw new ApiClientError(503, { code: "UNAVAILABLE", message: "The library service is not answering." });
+      return structuredClone({ ...DEFAULT_APPEARANCE, theme: "dark" as const });
+    });
+    const client = { appearance: { get, put: vi.fn() } } as unknown as ApiClient;
+    render(
+      <AppearanceProvider client={client}>
+        <AppearanceSettingsScreen />
+      </AppearanceProvider>,
+    );
+    const user = userEvent.setup();
+    const retry = within(await screen.findByRole("alert")).getByRole("button", { name: "Try loading again" });
+    await user.click(retry);
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(document.activeElement).toBe(retry);
+    fail = false;
+    await user.click(retry);
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Appearance", level: 1 }));
+  });
 });
 
 describe("a typeface from the researcher's own file (R100, Task 57)", () => {
