@@ -374,7 +374,7 @@ Not urgent, when you have time:
 
 - [ ] **7. Look at the two older review pages**, `docs/review/citations.html` (8 citation entries are flagged for you) and `docs/review/code-colours.html`, and tell me what to change.
 - [ ] **8. Decide about an Apple Developer account.** Without it the app is not signed by Apple: macOS warns when you open it and you must choose "Open Anyway". It is needed only before the app is given to anyone else.
-- [ ] **9. Optional: on GitHub, make `main` the default branch** (Settings, then Branches). Today the default is an old frozen branch.
+- [x] **9. On GitHub, make `main` the default branch.** Done by you on 23 November.
 
 What I do once I have your answers: fix what your tests find, apply the decisions, fix the rough edges if you say so, then close the project out (a last check of the guide and the notes).
 

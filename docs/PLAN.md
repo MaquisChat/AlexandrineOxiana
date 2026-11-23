@@ -666,7 +666,7 @@ Update after every task; commit and push.
 6. Review the citation and colour pages (Task 52).
 7. Run the hands-on checklist on the Mac, and the Zotero, password-store, Firefox and live-capture tests (Task 55).
 8. Choose the project's own licence before anything is published (Task 56). Facts that bear on it, found by Task 37d: the packaged worker contains a GPL-2.0-only program (gallery-dl) and GPL video-codec libraries inside two of its Python packages, besides LGPL and MPL parts. What may be shipped together, and under which licence, is a question for the owner and, ideally, a lawyer; the plan's default until then is to move gallery-dl out of the bundle into the first-use downloads, like the video downloader.
-9. Optional: on GitHub, make `main` the default branch (Settings, then Branches).
+9. Done by the owner on 2026-11-23: `main` is the repository's default branch.
 
 ## 10. After Phase 1 (outline only)
 
