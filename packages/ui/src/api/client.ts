@@ -351,7 +351,8 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
           chunk = await Promise.race([reader.read(), aborted]);
         } catch (err) {
           if (o.signal?.aborted) return;
-          throw err instanceof ApiClientError ? err : unreachable();
+          // The answer had begun (R467 M6): a read that breaks off is a cut-off, as in bytes().
+          throw err instanceof ApiClientError ? err : cutOff();
         }
         if (chunk === "aborted" || o.signal?.aborted) return;
         if (chunk.done) break;
@@ -530,7 +531,8 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
         }
       } catch (err) {
         if (err instanceof ApiClientError || o.signal?.aborted) throw err;
-        throw unreachable();
+        // The 206 had begun (R467 M6): a body that breaks off is a cut-off, as in bytes().
+        throw cutOff();
       }
     }
     if (got !== length) throw mismatch();
