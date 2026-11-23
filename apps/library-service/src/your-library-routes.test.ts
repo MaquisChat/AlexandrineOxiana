@@ -509,6 +509,9 @@ describe("the start (R324 a–c)", () => {
     expect(waiting.offers).toBeUndefined();
     expect(waiting.library).toBeUndefined();
     expect(waiting.reason).toBeUndefined();
+    // The pause is counted on the clock: Date alone stands still from the hand-over, so the whole pause is left at the
+    // start below, however long the machine takes, and its sentence is exact.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
     // The hand-over (Task F17's seam): the ticket ends, the pause starts.
     expect(svc!.state.session!.find!.libraryHandedOver(ok.json.ticket, "window")).toEqual({ projectId: startedP, entryId: startedE });
     const paused = await startFetch(p2, c.id);
@@ -516,7 +519,7 @@ describe("the start (R324 a–c)", () => {
     expect(paused.json.error).toMatchObject({ code: "CONFLICT", message: "Ready in 20 seconds.", reason: "library-pause" });
     expect((await view(p2, c.id)).state).toBe("record-complete");
     // After the pause, allowed (only the clock is moved).
-    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + LIBRARY_PAUSE_MS });
+    vi.setSystemTime(Date.now() + LIBRARY_PAUSE_MS);
     const after = await startFetch(p2, c.id);
     expect(after.status, after.body).toBe(200);
     expect((await view(p2, c.id)).state).toBe("waiting-sign-in");
@@ -547,13 +550,16 @@ describe("the start (R324 a–c)", () => {
     const b = await resting(pid, { state: "no-open-copy" });
     const r = await startFetch(pid, a.id);
     expect(r.status).toBe(200);
+    // The pause is counted on the clock: Date alone stands still from the hand-over, so the whole pause is left at the
+    // start below, however long the machine takes, and its sentence is exact.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
     expect(svc!.state.session!.find!.libraryHandedOver(r.json.ticket, "window")).toEqual({ projectId: pid, entryId: a.id });
     expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
     expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
     const paused = await startFetch(pid, b.id);
     expect(paused.status).toBe(409);
     expect(paused.json.error.reason).toBe("library-pause");
-    expect(paused.json.error.message).toMatch(/^Ready in (1\d|20) seconds\.$/u);
+    expect(paused.json.error.message).toBe("Ready in 20 seconds.");
     expect((await view(pid, b.id)).state).toBe("no-open-copy");
   });
 
@@ -1011,10 +1017,13 @@ describe("F17 (R329): the file the shell hands over waits in the review queue", 
       const f = await resting(pid, { state: "no-open-copy" });
       // The pause after a hand-over.
       const first = await linkStart(pid, e.id, { url: PUBLISHER });
+      // The pause is counted on the clock: Date alone stands still from the hand-over, so the whole pause is left at the
+      // start below, however long the machine takes, and its sentence is exact.
+      vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
       expect(svc!.state.session!.find!.libraryHandedOver(first.json.ticket, "window")).not.toBeNull();
       const paused = await linkStart(pid, f.id, { url: PUBLISHER });
       expect(paused.json.error).toMatchObject({ message: "Ready in 20 seconds.", reason: "library-pause" });
-      vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + LIBRARY_PAUSE_MS });
+      vi.setSystemTime(Date.now() + LIBRARY_PAUSE_MS);
       // The limit of waiting files.
       const otherSid = await record(pid, { doi: "10.5555/ao.f18c.held" });
       const pdf = join(tmp, "held.pdf");
