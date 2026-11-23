@@ -564,30 +564,56 @@ const sha256File = async (abs: string): Promise<string | null> => {
 };
 
 /**
- * R473 I1 3: the files a marker names that are, before it is rolled back, neither as they were before its change
- * nor as the change left them: changed outside the app meanwhile. Only what the marker can tell is judged: a file
- * the change wrote itself (its hash recorded), and a path it moved to the trash (something is there again). The
- * roll-back puts the earlier state back all the same; the caller records these. Reads only.
+ * R473 I1 3, R484 a: the files a marker names that are, before it is rolled back, neither as they were before its
+ * change nor as the change itself left them: changed outside the app meanwhile. A path is judged as a whole, never
+ * line by line: against the state before its FIRST line (absent before a "created", the backup copy of a "replaced")
+ * and the bytes the change wrote there, its LAST write's above all; an earlier write of the change counts as its own
+ * too, since a roll-back cut off half-way (in the running app, or a crash during the reopen's) leaves one there. A
+ * trashed path whose trash copy is gone was put back by the app's own roll-back; one whose copy is still in the trash
+ * is changed outside when something is there again that no later step of the change put there. Only what the marker
+ * can tell is judged: a path whose last write the change recorded no hash for (a copied file) is not. The roll-back
+ * puts the earlier state back all the same; the caller records these. Reads only.
  */
 export async function changedSinceMarker(root: string, m: TxnMarker): Promise<string[]> {
+  /** Each path the change wrote or trashed, with the indices of its lines in order. */
+  const lines = new Map<string, number[]>();
+  m.entries.forEach((e, k) => {
+    const p = e.kind === "trashed" ? e.from : e.kind === "created" || e.kind === "replaced" ? e.path : null;
+    if (p !== null) lines.set(p, [...(lines.get(p) ?? []), k]);
+  });
   const out: string[] = [];
-  for (const [k, e] of m.entries.entries()) {
+  for (const [p, ks] of lines) {
     try {
-      if (e.kind === "trashed") {
-        // Something there again is the change's own when a later step of it wrote at or under that path.
-        const rewritten = m.entries.slice(k + 1).some((x) => x.kind !== "trashed" && (x.path === e.from || x.path.startsWith(`${e.from}/`)));
-        if (!rewritten && (await exists(fromRel(root, e.from)))) out.push(e.from);
-      } else if ((e.kind === "created" || e.kind === "replaced") && e.sha256) {
-        const now = await sha256File(fromRel(root, e.path));
-        if (now === null || now === e.sha256) continue; // as before (created) or as the change left it
-        if (e.kind === "replaced" && now === (await sha256File(fromRel(root, e.backup)))) continue; // put back already
-        out.push(e.path);
+      const own = ks.map((k) => m.entries[k]!);
+      const trashes = own.filter((e): e is Extract<MarkerEntry, { kind: "trashed" }> => e.kind === "trashed");
+      let putBack = false;
+      for (const t of trashes) if (!(await exists(fromRel(root, t.to)))) putBack = true;
+      if (putBack) continue; // the app's own roll-back moved it back (R484 a)
+      const lastTrash = ks.filter((k) => m.entries[k]!.kind === "trashed").at(-1);
+      const writes = own.filter((e): e is Extract<MarkerEntry, { kind: "created" | "replaced" }> => e.kind === "created" || e.kind === "replaced");
+      const lastWrite = ks.filter((k) => m.entries[k]!.kind !== "trashed").at(-1);
+      if (lastTrash !== undefined) {
+        // Something there again is the change's own only when a later step of it wrote at or under that path.
+        const refilled = m.entries.slice(lastTrash + 1).some((x) => x.kind !== "trashed" && (x.path === p || x.path.startsWith(`${p}/`)));
+        if (!refilled) {
+          if (await exists(fromRel(root, p))) out.push(p);
+          continue;
+        }
+        if (lastWrite === undefined || lastWrite < lastTrash) continue; // refilled by a step that records no hash
       }
+      if (!writes.at(-1)?.sha256) continue;
+      const now = await sha256File(fromRel(root, p));
+      if (now === null) continue; // absent: as before a "created", or in the trash; nothing is claimed
+      if (writes.some((w) => w.sha256 === now)) continue; // as the change wrote it
+      let before = false;
+      for (const w of writes) if (w.kind === "replaced" && now === (await sha256File(fromRel(root, w.backup)))) before = true;
+      if (before) continue; // as before the change (or a write of it a later line kept aside): put back already
+      out.push(p);
     } catch {
       // Unreadable now: the roll-back says what it can; nothing is claimed here.
     }
   }
-  return [...new Set(out)];
+  return out;
 }
 
 /**
