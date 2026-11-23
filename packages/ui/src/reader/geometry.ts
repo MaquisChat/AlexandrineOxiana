@@ -115,20 +115,31 @@ function sameLine(a: PdfRectDto, b: PdfRectDto): boolean {
 }
 
 /**
- * A character of Chinese or Japanese text: Han, kana, and their punctuation and full-width forms
- * (FR-454). Such text is written without spaces, so a line break between two of them is no space.
- * Korean is written with spaces and is not among them.
+ * A character of Chinese or Japanese text: Han, kana, Bopomofo, and their punctuation and full-width
+ * forms (FR-454, R474 M6). Such text is written without spaces, so a line break between two of them is
+ * no space; nor is one between such a character and a digit ("第" / "3章"). Korean is written with
+ * spaces and is not among them (nor are the half-width Hangul forms, U+FFA0–FFDC).
  */
-const CJK = "\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}\\u3000-\\u303F\\u30A0-\\u30FF\\uFF00-\\uFFEF";
-const CJK_LINE_BREAK = new RegExp(`(?<=[${CJK}])[^\\S\\n]*\\n\\s*(?=[${CJK}])`, "gu");
-const CJK_END = new RegExp(`[${CJK}]$`, "u");
-const CJK_START = new RegExp(`^[${CJK}]`, "u");
+const CJK = "\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}\\p{Script=Bopomofo}\\u3000-\\u303F\\u30A0-\\u30FF\\uFF00-\\uFF9F\\uFFE0-\\uFFEF";
+/** R474 M6: direction marks and zero-width characters, which do not block the join (they are kept). */
+const MARKS = "\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u2064\\u2066-\\u2069";
+/** A side of a break: Chinese or Japanese, or a digit (which joins only with Chinese or Japanese on the other side). */
+const CJK_OR_DIGIT = `${CJK}\\p{Nd}`;
+/**
+ * The white space of a line break between Chinese or Japanese text and Chinese, Japanese or a digit. A
+ * full-width space after the break (a paragraph's first-line indent) is not part of it: it is kept.
+ */
+const CJK_LINE_BREAK = new RegExp(
+  `(?<=[${CJK}][${MARKS}]*)[^\\S\\n]*\\n[^\\S\\u3000]*(?=[${MARKS}]*[${CJK_OR_DIGIT}])|(?<=[${CJK_OR_DIGIT}][${MARKS}]*)[^\\S\\n]*\\n[^\\S\\u3000]*(?=[${MARKS}]*[${CJK}])`,
+  "gu",
+);
 
 /**
  * A quote as stored: the selection's text with a word hyphenated at a line's end joined again
  * ("self-" and "evident" on the next line → "selfevident"), a line break between two characters of
  * Chinese or Japanese text dropped (FR-454), control characters dropped, and every other run of
- * white space (line breaks included) made one space, trimmed.
+ * white space (line breaks included) made one space, trimmed; a full-width space alone is kept
+ * as it is (R474 M6: a paragraph's indent).
  */
 export function normaliseQuote(text: string): string {
   return text
@@ -136,18 +147,22 @@ export function normaliseQuote(text: string): string {
     .replace(CJK_LINE_BREAK, "")
     .replace(/­/gu, "")
     .replace(/\p{Cc}/gu, (c) => (/\s/u.test(c) ? c : " "))
-    .replace(/\s+/gu, " ")
+    .replace(/\s+/gu, (w) => (/^\u3000+$/u.test(w) ? w : " "))
     .trim();
 }
 
 /**
  * The quotes of a selection's pages as one quote, joined as its lines are: with nothing between
- * Chinese or Japanese text on both sides of a page break, with a space otherwise (FR-454).
+ * Chinese or Japanese text and Chinese, Japanese or a digit on both sides of a page break, with a
+ * space otherwise (FR-454).
  */
 export function joinQuotes(quotes: readonly string[]): string {
   let out = "";
   for (const q of quotes) {
-    if (out !== "" && !(CJK_END.test(out) && CJK_START.test(q))) out += " ";
+    if (out !== "") {
+      CJK_LINE_BREAK.lastIndex = 0;
+      if (!CJK_LINE_BREAK.test(`${out.slice(-64)}\n${q.slice(0, 64)}`)) out += " ";
+    }
     out += q;
   }
   return out;

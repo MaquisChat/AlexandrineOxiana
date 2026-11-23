@@ -431,6 +431,28 @@ describe("normaliseQuote (Task R10)", () => {
     expect(normaliseQuote("東京 大学")).toBe("東京 大学");
     expect(normaliseQuote("사회 과학\n연구")).toBe("사회 과학 연구");
   });
+
+  it("R474 M6: a digit meeting Chinese or Japanese across the break, direction and zero-width marks, Bopomofo, and a full-width indent", () => {
+    // A digit beside Chinese or Japanese text: nothing between, either way round.
+    expect(normaliseQuote("第\n3章")).toBe("第3章");
+    expect(normaliseQuote("2024\n年に")).toBe("2024年に");
+    expect(normaliseQuote("第３\n章")).toBe("第３章");
+    // Marks at the break do not block the join (they stay where they were).
+    expect(normaliseQuote("日本‏\n語")).toBe("日本‏語");
+    expect(normaliseQuote("日本​\n​語")).toBe("日本​​語");
+    expect(normaliseQuote("日本\n⁠語")).toBe("日本⁠語");
+    // Bopomofo is Chinese text.
+    expect(normaliseQuote("ㄅ\nㄆ")).toBe("ㄅㄆ");
+    // A full-width space indenting a paragraph's first line is kept.
+    expect(normaliseQuote("終わり。\n　次の段落")).toBe("終わり。　次の段落");
+    // As before: English, Korean, Arabic and Hebrew keep their space; digits beside Latin text too.
+    expect(normaliseQuote("The quick\nbrown  fox")).toBe("The quick brown fox");
+    expect(normaliseQuote("page\n3")).toBe("page 3");
+    expect(normaliseQuote("2024\n2025")).toBe("2024 2025");
+    expect(normaliseQuote("사회\n3장")).toBe("사회 3장");
+    expect(normaliseQuote("البحث\nالعلمي")).toBe("البحث العلمي");
+    expect(normaliseQuote("מחקר\nחברתי")).toBe("מחקר חברתי");
+  });
 });
 
 describe("joinQuotes (FR-454)", () => {
@@ -439,5 +461,13 @@ describe("joinQuotes (FR-454)", () => {
     expect(joinQuotes(["the end of one page", "and the next"])).toBe("the end of one page and the next");
     expect(joinQuotes(["研究", "means"])).toBe("研究 means");
     expect(joinQuotes(["only one"])).toBe("only one");
+  });
+
+  it("R474 M6: pages join as lines do: a digit beside Chinese or Japanese, marks at the break, Bopomofo", () => {
+    expect(joinQuotes(["第", "3章"])).toBe("第3章");
+    expect(joinQuotes(["日本‏", "語"])).toBe("日本‏語");
+    expect(joinQuotes(["ㄅ", "ㄆ"])).toBe("ㄅㄆ");
+    expect(joinQuotes(["page", "3"])).toBe("page 3");
+    expect(joinQuotes(["البحث", "العلمي"])).toBe("البحث العلمي");
   });
 });
