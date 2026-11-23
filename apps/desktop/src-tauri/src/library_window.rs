@@ -1435,6 +1435,10 @@ struct Inner {
     /// The ticket whose open made (or re-used) the window open now (FR-561, R472): set with `ticket` by
     /// `open`, kept after a hand-over ends `ticket` (the window stays), cleared when the window is gone.
     window_owner: Option<String>,
+    /// The ticket of the open whose window is being built (set by `open` before it builds, cleared when that
+    /// build answers). A close while it is built ends its ticket and clears `window_owner`, yet its window then
+    /// stands: a newer open that fails meanwhile gives the window back to it (R486 g).
+    building: Option<String>,
     /// The kind of start of the open ticket (R347 a). Every ticket starts by `open`, which sets it (for
     /// the window it builds or re-uses, and puts it back when that fails), so no kind outlives its
     /// ticket into another; after a hand-over the window may stay without a ticket, its title still in
@@ -1539,6 +1543,10 @@ impl Library {
             }
             g.ticket = Some(ticket.to_string());
             g.window_owner = Some(ticket.to_string());
+            // R486 g: the first of the builds still under way is the one whose window stands.
+            if !reuse && g.building.is_none() {
+                g.building = Some(ticket.to_string());
+            }
             g.start = start;
             g.previous = None;
             g.current = None;
@@ -1568,10 +1576,19 @@ impl Library {
         if !shown {
             // Nothing was opened: the ticket is cleared, and the kind, the sign-in hosts and the title
             // are put back to what they were, so that the page still shown keeps its words (R360 b).
+            // R486 g: the window, if one stands, is given back to the open whose window it is — the one it
+            // served before, or else the open whose window was being built (a close meanwhile had cleared its
+            // owner) — and to none when no window stands, so that no window is left that its own open's
+            // ticketed close cannot close.
+            let stands = host.window_exists();
             let mut g = self.lock();
+            if g.building.as_deref() == Some(ticket) {
+                g.building = None;
+            }
             if g.ticket.as_deref() == Some(ticket) {
                 g.ticket = None;
                 let (start, title, shown_host, previous, current, hosts, owner) = before;
+                let owner = if stands { owner.or_else(|| g.building.clone()) } else { None };
                 (g.start, g.title, g.shown_host, g.previous, g.current, g.window_owner) = (start, title, shown_host, previous, current, owner);
                 if let (Some(d), Some(hosts)) = (g.device.as_mut(), hosts) {
                     d.sign_in_hosts = hosts;
@@ -1582,7 +1599,14 @@ impl Library {
         // FR-561 (R472): another open took the window while this one was being shown (the page had given
         // this one up and closed what was there): this open answers false and says nothing, so that
         // nothing closes the newer window on its behalf.
-        if !open_still_its_own(self.lock().window_owner.as_deref(), ticket) {
+        let still_its_own = {
+            let mut g = self.lock();
+            if g.building.as_deref() == Some(ticket) {
+                g.building = None;
+            }
+            open_still_its_own(g.window_owner.as_deref(), ticket)
+        };
+        if !still_its_own {
             return false;
         }
         host.emit(&LibraryEvent::new(Some(ticket), State::Opened));
@@ -3580,6 +3604,64 @@ process.stdout.write(JSON.stringify({{
         // A late close for the older ticket leaves the newer window.
         lib.close_for(&host, "main", Some(TICKET));
         assert_eq!(host.close_asked.load(Ordering::SeqCst), asked);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// The reviewer's sequence (R486 g, A-M1): the page gave up on an open (TICKET) and closed what was there
+    /// before its window stood (no window yet: the ticket ends); the older open's window then stands, and a newer
+    /// open (TICKET2) re-uses it and fails. The window is still the older open's: its ticketed close closes it.
+    #[test]
+    fn a_newer_open_failing_while_an_older_window_is_built_leaves_that_window_to_the_older_open() {
+        let (lib, host, d) = started("fr561-failed-newer");
+        let lib = Arc::new(lib);
+        let inner = lib.clone();
+        *host.on_create.lock().unwrap() = Some(Box::new(move |h: &FakeHost| {
+            inner.close(h, "main");
+            h.exists.store(true, Ordering::SeqCst);
+            h.navigate_ok.store(false, Ordering::SeqCst);
+            assert!(!inner.open(h, "main", TICKET2, START, Start::Library), "the newer open fails");
+        }));
+        assert!(lib.open(&host, "main", TICKET, START, Start::Library), "the older open's window stands");
+        assert!(host.window_exists());
+        let asked = host.close_asked.load(Ordering::SeqCst);
+        // The failed open's ticket owns nothing.
+        lib.close_for(&host, "main", Some(TICKET2));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked);
+        // The older open's ticketed close closes its window.
+        lib.close_for(&host, "main", Some(TICKET));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1, "the older open's close was refused");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// R486 g (A-M2): a failed open puts the window back to the open whose window it is — the window a hand-over
+    /// left stays its open's, so that open's close still closes it — and to none when no window stands.
+    #[test]
+    fn a_failed_open_leaves_the_window_to_the_open_whose_window_it_is_and_none_when_none_stands() {
+        let (lib, mut host, d) = started("fr561-failed-reuse");
+        let t0 = Instant::now();
+        assert!(lib.open(&host, "main", TICKET, START, Start::Library));
+        lib.page_loaded(&host, &u(PDF), t0);
+        let job = host.jobs.lock().unwrap().remove(0);
+        assert_eq!(lib.send_if_current(&host, job.generation, TICKET, t0, &mut || true), Some(true));
+        // The hand-over ended the ticket; the window stays. A newer open re-uses it and fails.
+        host.navigate_ok.store(false, Ordering::SeqCst);
+        assert!(!lib.open(&host, "main", TICKET2, START, Start::Library));
+        let asked = host.close_asked.load(Ordering::SeqCst);
+        lib.close_for(&host, "main", Some(TICKET2));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked, "the failed open's close closed the window");
+        lib.close_for(&host, "main", Some(TICKET));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1, "the window's own open could not close it");
+        // The window is gone (its end not yet heard) and a newer open fails to build one: no window stands, so
+        // the window belongs to no open, and no ticketed close does anything.
+        host.exists.store(false, Ordering::SeqCst);
+        host.create_ok = false;
+        assert!(!lib.open(&host, "main", TICKET2, START, Start::Library));
+        let n = host.events().len();
+        for t in [TICKET, TICKET2] {
+            lib.close_for(&host, "main", Some(t));
+        }
+        assert_eq!(host.events().len(), n, "a ticketed close acted for a window that does not stand");
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1);
         fs::remove_dir_all(d).unwrap();
     }
 
