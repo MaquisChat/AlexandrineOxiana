@@ -92,7 +92,7 @@ export const ZOTERO_NOTES = {
   },
   /**
    * FR-132: an update adds what is new in Zotero and takes nothing away (run.ts `updateInner`); the local import adds
-   * no new collection either (the account sync does, Z6). Said in the dry run, and in a run that saw items again.
+   * no new collection either (the account sync does, Z6). Said in the dry run (bulk `dryRun`), and in a run that saw items again.
    */
   removalsKept: (kind: "zotero-local" | "zotero-web"): string =>
     "When an item comes in from Zotero again, what was taken away there is not taken away here: a tag taken off, an annotation deleted or a collection the item was taken out of stays as it is here." +
@@ -611,7 +611,6 @@ async function* scanZotero(dataDir: string, o: Required<Pick<ZoteroLocalOptions,
     }
     const left = ZOTERO_NOTES.notImported(counts);
     if (left) ctx.note?.(left);
-    if (ctx.dryRun) ctx.note?.(ZOTERO_NOTES.removalsKept("zotero-local"));
   } finally {
     bbtDb?.close();
     db?.close();

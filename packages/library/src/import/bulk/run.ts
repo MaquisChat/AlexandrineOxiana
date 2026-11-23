@@ -2849,6 +2849,8 @@ export async function dryRun(
       else if (seenSha.has(sha)) summary.likelyDuplicates++;
       seenSha.add(sha);
     }
+    // FR-132 (R474 I1): the wizard's summary of either Zotero import says what an import does not take away.
+    if (adapter.kind === "zotero-local" || adapter.kind === "zotero-web") summary.notes.push(ZOTERO_NOTES.removalsKept(adapter.kind));
     await spaceOfScan(repo, projectId, adapter, summary, linkedBytes, opts.approveOutside);
   } finally {
     if (made) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
