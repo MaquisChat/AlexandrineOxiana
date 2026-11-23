@@ -50,7 +50,14 @@ describe("fitCaptureBody (POST /capture/browser takes at most 32 MB)", () => {
 
   it("refuses locally, with a clear message, when even the screenshot and fields are too big", () => {
     const body = { ...base, screenshotPng: "A".repeat(33 * MB) };
-    expect(() => fitCaptureBody(body)).toThrow(CaptureTooLargeError);
-    expect(() => fitCaptureBody(body)).toThrow(/too large/);
+    // One fitting, its error read whole (each fitting of 33 MB is the test's whole cost).
+    let thrown: unknown;
+    try {
+      fitCaptureBody(body);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(CaptureTooLargeError);
+    expect((thrown as Error).message).toMatch(/too large/);
   });
 });
