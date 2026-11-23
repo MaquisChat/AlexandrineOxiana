@@ -112,6 +112,8 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
   }, [sessionGone]);
   const [busy, setBusy] = useState(false);
   const [withdrawing, setWithdrawing] = useState<ConsentRecord | null>(null);
+  /** FR-160: the consent record whose signed form the researcher asked to detach (asked in a dialog, with a reason). */
+  const [detaching, setDetaching] = useState<ConsentRecord | null>(null);
   /** A dropped form the service refused because it was detached from this record before (R119): offered for an explicit re-attach. */
   const [reattach, setReattach] = useState<{ consentId: string; path: string } | null>(null);
   /** FR-168: the re-attach offer takes focus when it appears, so that it is not missed (a screen reader reads it). */
@@ -369,7 +371,17 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
                 </div>
               )}
               {c.documentAssetId ? (
-                <p className="ao-hint">Signed form attached.</p>
+                <p className="ao-hint">
+                  Signed form attached.
+                  {!c.withdrawn ? (
+                    <>
+                      {" "}
+                      <button type="button" aria-label={`Detach the signed form of ${codeOf(c.participantId)}…`} disabled={busy} onClick={() => setDetaching(c)}>
+                        Detach the form…
+                      </button>
+                    </>
+                  ) : null}
+                </p>
               ) : !c.withdrawn ? (
                 <FileDrop
                   prompt="Drop the signed consent form here (a PDF or an image, up to 100 MB)."
@@ -515,6 +527,30 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
             will be deleted, with its date, place and notes. A session that sources refer to cannot be deleted.
           </p>
         </ChoiceDialog>
+      ) : null}
+
+      {detaching ? (
+        <ReasonOptionalDialog
+          title="Detach the signed form"
+          label="Reason (kept in the project's audit log, sealed in encrypted projects)"
+          action="Detach the form"
+          required
+          onCancel={() => setDetaching(null)}
+          onConfirm={(reason) => {
+            const c = detaching;
+            setDetaching(null);
+            // A governed, audited change in the library (updateConsent: `consent.document-detach`, R117 I3); the form stays a source of the project.
+            void run(async () => {
+              await api.updateConsent(projectId, c.id, { documentAssetId: null, detachReason: reason });
+              return "The signed form was detached. It stays in the project; you can now attach the right form to this consent record.";
+            });
+          }}
+        >
+          <p>
+            The signed form attached to the consent record of <UserText>{codeOf(detaching.participantId)}</UserText> (“<UserText>{detaching.scope}</UserText>”, <UserText>{detaching.date}</UserText>) will be detached
+            from it. The form itself stays in the project; only its link to this record is removed. Detaching it needs a reason.
+          </p>
+        </ReasonOptionalDialog>
       ) : null}
 
       {withdrawing ? (
