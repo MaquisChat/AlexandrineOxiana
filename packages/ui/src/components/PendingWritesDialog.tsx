@@ -149,12 +149,14 @@ function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean;
  * A refused choice in plain words; the service's machine text ("allowed: …") is not shown.
  * `relisted` false: the list could not be read again, so no choice is offered (FR-153).
  */
+const NOT_RELISTED = "The interrupted changes could not be listed again, so no choice is offered now. Close this and open it again to see what can be done.";
+
 function refusalText(err: unknown, relisted = true): string {
   const conflict = err instanceof ApiClientError && err.code === "CONFLICT";
   const what = conflict
     ? "That choice is no longer possible for this change: something changed in the meantime (it may have been resolved elsewhere)."
     : errorText(err, "The change could not be resolved.");
-  if (!relisted) return `${what} The interrupted changes could not be listed again, so no choice is offered now. Close this and open it again to see what can be done.`;
+  if (!relisted) return `${what} ${NOT_RELISTED}`;
   return conflict ? `${what} The list now shows what can be done.` : what;
 }
 
@@ -185,11 +187,23 @@ export function PendingWritesDialog({ api, readOnly, onClose, onResolved, change
     };
   }, [host]);
 
+  /** Whether a list has been read: a later read that fails then takes the old list's choices away (FR-153, R468). */
+  const listed = useRef(false);
   const load = useCallback(
     () =>
       api.pendingWrites.list().then(
-        (l) => live.current && setList(l),
-        (err: unknown) => live.current && setError(errorText(err, "The interrupted changes could not be listed.")),
+        (l) => {
+          if (!live.current) return;
+          listed.current = true;
+          setList(l);
+        },
+        (err: unknown) => {
+          if (!live.current) return;
+          const why = errorText(err, "The interrupted changes could not be listed.");
+          if (!listed.current) return setError(why);
+          setList(null);
+          setError(`${why} ${NOT_RELISTED}`);
+        },
       ),
     [api],
   );
