@@ -609,7 +609,9 @@ describe("sending the tab's PDF: the whole way with the real tab script, a fake 
     await Promise.all(r.scripts);
     expect(pieces(r.tabPorts[0]!).length).toBe(200);
     expect(r.posts).toEqual([]);
-  }, 60_000);
+    // Its honest work is 200 pieces of 1 MiB, each turned to base64, copied and read back (the limit is the service's
+    // and the piece the protocol's, so neither can be smaller): 40 s on one busy core, so a limit of 120 s.
+  }, 120_000);
 
   it("a script that sends more than the limit anyway: the background stops reading past the limit (its own count)", async () => {
     const r = rig({ 7: { url: PAGE, contentType: "application/pdf", silent: true } });
