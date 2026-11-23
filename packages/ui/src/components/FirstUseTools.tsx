@@ -19,6 +19,7 @@ import type { ToolId, ToolInfo } from "@ao/shared";
 import { useEffect, useId, useRef, useState } from "react";
 import { DEFAULT_SPEECH_MODEL, describeHosts, formatSize, hostsOf, PUBLISHER_SERVERS, remainingOf, speechTool, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
 import { navigate, PATHS } from "../navigation";
+import { toolsHref } from "./MissingToolNotice";
 import { DialogShell } from "./ReasonDialog";
 import { UserText } from "./UserText";
 import "../screens/GovernanceScreens.css";
@@ -169,11 +170,13 @@ export function FirstUseTools({ api, memory = localFirstUseMemory, hidden = fals
           tools={tools}
           onCancel={() => setOpen(false)}
           onNotNow={notNow}
-          onStarted={() => {
+          onStarted={(first) => {
             memory.set("chosen");
             setOpen(false);
             setClosed(true);
-            navigate(PATHS.tools);
+            // The banner and its "Choose tools…" are gone, so focus is not given back there: the tools
+            // screen brings the first started tool's heading into focus (FR-315).
+            navigate(toolsHref(first));
           }}
         />
       ) : null}
@@ -181,7 +184,7 @@ export function FirstUseTools({ api, memory = localFirstUseMemory, hidden = fals
   );
 }
 
-function FirstUseDialog({ api, tools, onCancel, onNotNow, onStarted }: { api: ToolsApi; tools: ToolInfo[]; onCancel: () => void; onNotNow: () => void; onStarted: () => void }) {
+function FirstUseDialog({ api, tools, onCancel, onNotNow, onStarted }: { api: ToolsApi; tools: ToolInfo[]; onCancel: () => void; onNotNow: () => void; onStarted: (first: ToolId) => void }) {
   const id = useId();
   const [chosen, setChosen] = useState<ReadonlySet<string>>(new Set());
   const [unticked, setUnticked] = useState<ReadonlySet<ToolId>>(new Set());
@@ -248,7 +251,7 @@ function FirstUseDialog({ api, tools, onCancel, onNotNow, onStarted }: { api: To
     setBusy(false);
     setStarted(ok);
     if (failed.length === 0) {
-      onStarted();
+      onStarted(ticked[0]!.id);
       return;
     }
     setError(`${failed.join(", ")} could not be started. ${toolsErrorText(firstError, "The library service did not answer.")} Try again, or choose Not now and install later from the Optional tools screen.`);

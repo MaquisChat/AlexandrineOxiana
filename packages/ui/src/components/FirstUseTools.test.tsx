@@ -3,8 +3,9 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ToolsApi } from "../api/tools";
-import { PATHS } from "../navigation";
-import { catalogue, catalogueWithoutHosts, makeApi, memoryStore, onComputer, server, toolsService, useMsw, withoutHostsFor } from "../test/msw-tools";
+import { PATHS, useLocation } from "../navigation";
+import { ToolsSetupRoute } from "../screens/ToolsSetup";
+import { catalogue, catalogueWithoutHosts, makeApi, makeClient, memoryStore, onComputer, server, toolsService, useMsw, withoutHostsFor } from "../test/msw-tools";
 import { FIRST_USE_QUESTION, FirstUseTools, recordToolsScreenSeen } from "./FirstUseTools";
 
 useMsw();
@@ -285,6 +286,24 @@ describe("the first-use tools dialogue", () => {
     expect(memory.value).toBe("chosen");
     expect(window.location.pathname).toBe(PATHS.tools);
     expect(banner()).toBeNull(); // answered; the tools screen takes focus in the app
+  });
+
+  it("after the confirmation focus lands on a started tool on the Optional tools screen, never on the page body (FR-315)", async () => {
+    // The app's route table, reduced: the library screen with the question, or the tools screen.
+    function Routed({ memory, svc }: { memory: ReturnType<typeof memoryStore>; svc: ReturnType<typeof toolsService> }) {
+      const loc = useLocation();
+      return loc.pathname === PATHS.tools ? <ToolsSetupRoute client={makeClient()} loc={loc} memory={memory} /> : <Page memory={memory} svc={svc} />;
+    }
+    const memory = memoryStore();
+    const svc = toolsService();
+    const user = userEvent.setup();
+    render(<Routed memory={memory} svc={svc} />);
+    await user.click(await screen.findByRole("button", { name: "Choose tools…" }));
+    await screen.findByRole("dialog", { name: "Optional tools" });
+    await user.click(activity(/save picture posts/i));
+    await user.click(screen.getByRole("button", { name: /^Download 1 tool/ }));
+    const heading = await screen.findByRole("heading", { name: "Image downloader" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
   });
 
   it("a refused install keeps the dialogue open with a plain message (no start-up text) and a way to retry", async () => {
