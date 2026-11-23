@@ -424,6 +424,36 @@ describe("New project dialog: an unknown outcome is never left behind (fix round
     expect(svc.posted).toHaveLength(1);
   });
 
+  it("FR-180: a notice left unsettled does not take a project the dialog then created with the same name for the lost one", async () => {
+    const svc = serveLost(null);
+    svc.listFails = true;
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    await toCannotTell(user, fillOpen);
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(notice().textContent).toMatch(/“Tide-line interviews” may have been created/);
+
+    // The service is back; the notice is left as it is, and the project is created again through the dialog.
+    let made = false;
+    server.use(
+      http.post(url("/projects"), async ({ request }) => {
+        svc.posted.push((await request.json()) as Posted);
+        made = true;
+        return HttpResponse.json({ project: NEW_OPEN });
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, ...(made ? [NEW_OPEN] : [])] })),
+    );
+    const again = await openDialog(user);
+    await fillOpen(again, user);
+    await user.click(within(again).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(svc.posted).toHaveLength(2);
+
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(notice().textContent).toMatch(/“Tide-line interviews” was not created/));
+  });
+
   it("an unencrypted project: the notice says nothing of a recovery code, and reports one that was not created", async () => {
     const svc = serveLost(null);
     svc.listFails = true;

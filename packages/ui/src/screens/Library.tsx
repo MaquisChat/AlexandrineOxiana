@@ -677,6 +677,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             libraryClosed={closedUnder}
             onCancel={dialogClosed}
             onCreated={(made) => {
+              // FR-180: a project this dialog made is known, so a notice still unsettled never takes it for the lost create.
+              setUnresolved((u) => (u ? { ...u, create: { ...u.create, before: new Set([...u.create.before, made.id]) } } : u));
               if (closedUnder) {
                 // The library went away while the recovery code was on screen: now leave it.
                 setCreating(false);
