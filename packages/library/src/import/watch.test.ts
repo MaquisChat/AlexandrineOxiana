@@ -2451,7 +2451,10 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     await sparse(join(inbox, "flaky.pdf"), 64);
     let fail = true;
     const dl = downloader();
+    /** When each try began. */
+    const tries: number[] = [];
     const fetchContent = async (q: string) => {
+      tries.push(Date.now());
       if (!fail) return dl.fn(q);
       dl.calls.push(q);
       throw Object.assign(new Error("the service is offline"), { code: "EIO" });
@@ -2461,15 +2464,19 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     await until(() => w.status().counts.notDownloaded === 1);
     await choose(p, wid, { notDownloaded: "download", confirmedBytes: 1000 });
     await w.refreshChoices();
+    // The problem stays listed while the service fails; the tries go on every 700 ms meanwhile, so how many failed by
+    // the time the wait sees it depends on the machine: they are counted (`failed`), and exactly one try follows.
     await until(() => w.problems(page(10)).items[0]?.kind === "could-not-download");
     expect(w.problems(page(10)).items[0]).toEqual({ file: "flaky.pdf", kind: "could-not-download", reason: withService(WATCH_REASONS.couldNotDownload), bytes: 64 });
-    const t0 = Date.now();
     fail = false;
+    const failed = dl.calls.length;
+    expect(failed).toBeGreaterThanOrEqual(1);
     await until(() => events.some((e) => e.kind === "imported" && e.file === "flaky.pdf"));
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(400);
-    expect(dl.calls).toHaveLength(2);
+    expect(tries.at(-1)! - tries.at(-2)!).toBeGreaterThanOrEqual(400);
+    expect(dl.calls).toHaveLength(failed + 1);
+    expect(tries).toHaveLength(failed + 1);
     expect(w.problems(page(10)).total).toBe(0);
-    expect(await getWatchDownloadCount({ repo, lib }, p.id, wid)).toEqual({ confirmation: 1, fetchedBytes: 128 }); // both tries counted
+    expect(await getWatchDownloadCount({ repo, lib }, p.id, wid)).toEqual({ confirmation: 1, fetchedBytes: 64 * (failed + 1) }); // every try counted
   });
 
   it("a pointer file and a link are never fetched", async () => {
