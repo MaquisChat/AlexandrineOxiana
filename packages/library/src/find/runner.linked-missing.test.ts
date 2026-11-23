@@ -9,7 +9,7 @@
  * line written, its event sent, its download folder gone).
  */
 import { copyFileSync } from "node:fs";
-import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp } from "node:fs/promises";
@@ -158,22 +158,30 @@ const draft = (): SourceDraft => ({
 });
 
 /** A file outside the library (a drive of the researcher's), as a link points to it. */
-const outside = () => join(tmp, "Drive", "Papers", "zorblatt.pdf");
+const outsideOf = (name: string) => join(tmp, "Drive", "Papers", `${name}.pdf`);
+const outside = () => outsideOf("zorblatt");
 
 type World = { p: Project; sid: string; eid: string };
 
 /**
- * A project with a record and its entry, resting "record-complete" as the record part leaves it. `file`: the record's
- * original — linked from outside the library (then removed when `missing`), stored (copied in), or none.
+ * A project with a record and its entry, resting "record-complete" as the record part leaves it (or as `rest` says).
+ * `file`: the record's original — linked from outside the library (then removed when `missing`), stored (copied in),
+ * or none. `encrypted`: an encrypted project (passphrase "pw").
  */
-async function world(file: "linked" | "linked-missing" | "stored" | "none", rest: Partial<FindEntry> = {}): Promise<World> {
-  const p = (await repo.createProject({ name: `P${Math.random().toString(36).slice(2, 7)}`, governanceYaml: GOV, encryption: { enabled: false } })).project;
+async function world(file: "linked" | "linked-missing" | "stored" | "none", rest: Partial<FindEntry> = {}, o: { encrypted?: boolean } = {}): Promise<World> {
+  const p = (await repo.createProject({ name: `P${Math.random().toString(36).slice(2, 7)}`, governanceYaml: GOV, encryption: o.encrypted ? { enabled: true, passphrase: "pw" } : { enabled: false } })).project;
+  return another(p, file, rest);
+}
+
+/** A further record of `p` and its entry (as `world`); its linked file is `outsideOf(name)`. */
+async function another(p: Project, file: "linked" | "linked-missing" | "stored" | "none", rest: Partial<FindEntry> = {}, name = "zorblatt", more: string[] = []): Promise<World> {
   await mkdir(join(tmp, "Drive", "Papers"), { recursive: true });
-  await writeFile(outside(), await buildPdf({ title: TITLE, lines: [TITLE, ...PAGE] }));
-  const sf = await repo.createSource(p.id, draft(), file === "none" ? [] : [{ path: outside(), role: "original", handling: file === "stored" ? "copy" : "link" }], {
+  for (const n of [name, ...more]) await writeFile(outsideOf(n), await buildPdf({ title: TITLE, lines: [TITLE, ...PAGE] }));
+  const files = file === "none" ? [] : [name, ...more].map((n) => ({ path: outsideOf(n), role: "original" as const, handling: file === "stored" ? ("copy" as const) : ("link" as const) }));
+  const sf = await repo.createSource(p.id, draft(), files, {
     provenance: { captureMethod: "manual_upload", capturedAt: new Date(NOW).toISOString(), tool: { name: "drag-and-drop", version: "0" }, fileHashes: {}, legal: { status: "unknown" }, identifiable: false },
   });
-  if (file === "linked-missing") await rm(outside());
+  if (file === "linked-missing") await rm(outsideOf(name));
   const at = new Date(NOW).toISOString();
   const eid = newId();
   const e: FindEntry = { id: eid, projectId: p.id, typed: "Quillfeather, Zorblatt Grammar of Habitus, 1999", state: "record-complete", sourceId: sf.source.id, createdAt: at, updatedAt: at, attempts: 0, ...rest };
@@ -391,5 +399,127 @@ describe("R483 b: every way to \"in your library\" drops the pick", () => {
     expect(e.copyDespiteLink).toBeUndefined();
     expect(await pendingReviews(w)).toEqual([]);
     expect(copyRequests).toEqual([]);
+  });
+});
+
+describe("R483 a: entries already at rest are judged when the queue is opened", () => {
+  /** Opens the queue afresh: every runner closed, a new one resumes the project. */
+  async function reopen(w: World): Promise<FindRunner> {
+    for (const x of runners) await x.stopAll();
+    const r = runner();
+    r.resume(w.p.id);
+    return r;
+  }
+  /** A further entry of the project that the opening's pass moves: once it rests, the pass has ended (one write). */
+  const sentinel = (w: World) => another(w.p, "linked-missing", { state: "in-library" }, `sentinel-${Math.random().toString(36).slice(2, 7)}`);
+  const queueLines = async (w: World) => (await readFile(join(lib.root, w.p.folder, "find", "queue.jsonl"), "utf8")).split("\n").filter(Boolean).length;
+  const asked = () => ({ copies: copyRequests.length, files: fileRequests.length });
+
+  it("P4: an entry in your library whose linked file is then removed rests with the reason at the next opening, and nothing is asked or fetched", async () => {
+    const w = await world("linked");
+    runner().resume(w.p.id);
+    await restsAt(w, "in-library");
+    await rm(outside());
+    changes = [];
+    await reopen(w);
+    const e = await restsAt(w, "record-complete", "linked-file-missing");
+    expect(e.copyDespiteLink).toBeUndefined();
+    expect(asked()).toEqual({ copies: 0, files: 0 });
+    expect(await pendingReviews(w)).toEqual([]);
+  });
+
+  it("the reverse: the linked file is back, and the entry rests in your library again at the next opening", async () => {
+    const w = await world("linked-missing", { state: "record-complete", reason: { code: "linked-file-missing" } });
+    await writeFile(outside(), await buildPdf({ title: TITLE, lines: [TITLE, ...PAGE] }));
+    await reopen(w);
+    const e = await restsAt(w, "in-library");
+    expect(e.reason).toBeUndefined();
+    expect(asked()).toEqual({ copies: 0, files: 0 });
+  });
+
+  it("an entry with the pick is left alone, and nothing is fetched at the opening or the next", async () => {
+    const w = await world("linked-missing", { state: "in-library", copyDespiteLink: true });
+    const s = await sentinel(w);
+    await reopen(w);
+    await restsAt(s, "record-complete", "linked-file-missing");
+    const before = await entryOf(w);
+    expect(before).toMatchObject({ state: "in-library", copyDespiteLink: true });
+    const s2 = await another(w.p, "linked-missing", { state: "in-library" }, "sentinel-two");
+    await reopen(w);
+    await restsAt(s2, "record-complete", "linked-file-missing");
+    expect(await entryOf(w)).toEqual(before);
+    expect(asked()).toEqual({ copies: 0, files: 0 });
+  });
+
+  it("an entry resting on \"Not this file\" is left alone, whether its linked file is there or not", async () => {
+    const w = await world("linked-missing", { state: "no-open-copy", reason: { code: "not-this-file" } });
+    const there = await another(w.p, "linked", { state: "no-open-copy", reason: { code: "not-this-file" } }, "there");
+    const s = await sentinel(w);
+    const before = [await entryOf(w), await entryOf(there)];
+    await reopen(w);
+    await restsAt(s, "record-complete", "linked-file-missing");
+    expect([await entryOf(w), await entryOf(there)]).toEqual(before);
+    expect(asked()).toEqual({ copies: 0, files: 0 });
+  });
+
+  it("a stored original stays in your library", async () => {
+    const w = await world("stored", { state: "in-library" });
+    const s = await sentinel(w);
+    const before = await entryOf(w);
+    await reopen(w);
+    await restsAt(s, "record-complete", "linked-file-missing");
+    expect(await entryOf(w)).toEqual(before);
+  });
+
+  it("a source with two linked originals of which one can be found stays in your library", async () => {
+    const p = (await world("none")).p;
+    const w = await another(p, "linked-missing", { state: "in-library" }, "first", ["second"]);
+    expect((await repo.getSource(p.id, w.sid)).assets).toHaveLength(2);
+    const s = await sentinel(w);
+    const before = await entryOf(w);
+    await reopen(w);
+    await restsAt(s, "record-complete", "linked-file-missing");
+    expect(await entryOf(w)).toEqual(before);
+  });
+
+  it("an entry whose source was deleted is left as it is", async () => {
+    const w = await world("linked-missing", { state: "in-library" });
+    await repo.deleteSource(w.p.id, w.sid);
+    const s = await sentinel(w);
+    const before = await entryOf(w);
+    await reopen(w);
+    await restsAt(s, "record-complete", "linked-file-missing");
+    expect(await entryOf(w)).toEqual(before);
+    expect(asked()).toEqual({ copies: 0, files: 0 });
+  });
+
+  it("a locked encrypted project is judged at the unlock, not before", async () => {
+    // An encrypted project holds no linked file (its files are copied in): an entry resting for want of its link whose
+    // record now has a stored original is the move such a project can make.
+    const w = await world("stored", { state: "record-complete", reason: { code: "linked-file-missing" } }, { encrypted: true });
+    const before = await entryOf(w);
+    await repo.lockProject(w.p.id);
+    const r = await reopen(w);
+    await r.stopAll();
+    await repo.unlockProject(w.p.id, "pw");
+    expect(await entryOf(w)).toEqual(before);
+    await reopen(w);
+    await restsAt(w, "in-library");
+    expect(asked()).toEqual({ copies: 0, files: 0 });
+  });
+
+  it("the line is written once over two openings", async () => {
+    const w = await world("linked-missing", { state: "in-library" });
+    await reopen(w);
+    await restsAt(w, "record-complete", "linked-file-missing");
+    const lines = await queueLines(w);
+    const s = await sentinel(w);
+    const withSentinel = await queueLines(w);
+    expect(withSentinel).toBe(lines + 1);
+    await reopen(w);
+    await restsAt(s, "record-complete", "linked-file-missing");
+    // Only the sentinel's line was added by the second opening.
+    expect(await queueLines(w)).toBe(withSentinel + 1);
+    expect(changes.filter((c) => c.entryId === w.eid && c.state === "record-complete")).toHaveLength(1);
   });
 });
