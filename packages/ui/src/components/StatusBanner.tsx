@@ -5,7 +5,7 @@
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
 import { useRef, useState } from "react";
-import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, isDeviceNoticeKind, oldCopiesPendingText, type DeviceNoticeKind } from "@ao/shared";
+import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, ZOTERO_SYNC_SENTENCES, isDeviceNoticeKind, oldCopiesPendingText, type DeviceNoticeKind } from "@ao/shared";
 import { errorText, type IntegrityWarning, type LibraryState } from "../api/library";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
@@ -49,8 +49,7 @@ export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
     "This computer's list of folders approved for imports was damaged and was set aside. An import will ask again before it uses files from a folder outside the one you import from. The damaged list is kept beside the app's settings.",
   "watched-folder-choices-set-aside":
     "This computer's choices for its watched folders were damaged and were set aside. Folders whose choices could not be kept went back to the defaults: they are watched, not paused, and files that are not downloaded to this Mac are left alone. The damaged file is kept beside the app's settings.",
-  "zotero-sync-settings-set-aside":
-    "This computer's Zotero sync settings could not be read and were set aside. Automatic sync is off until you set it up again. Nothing in your library has changed.",
+  "zotero-sync-settings-set-aside": ZOTERO_SYNC_SENTENCES.settingsSetAside,
   "zotero-sync-settings-newer":
     "These sync settings were written by a newer version of the app. Update the app to change them. Until then, automatic sync with Zotero is off on this computer. Nothing in your library has changed.",
 };

@@ -19,6 +19,7 @@ import {
   deviceDeps,
   openLibrary,
   readZoteroSyncHistory,
+  readZoteroSyncSettings,
   writeZoteroSyncSettings,
   type ZoteroSyncLink,
 } from "@ao/library";
@@ -235,6 +236,28 @@ describe("ao zotero check-key", () => {
       secrets = useMemorySecrets();
       await setSecret("zotero-api-key", z.key);
     }
+  });
+
+  it("FR-507: a key check that works clears the pauses Zotero's refusals set, as the app's does; an undo's pause stays", async () => {
+    z.addGroup(9, "Fieldwork group");
+    const other = "group:10";
+    const gone = "group:11";
+    await linked(link(U, { paused: "key-refused" }), link(G, { paused: "library-gone" }), link(other, { paused: "undone" }), link(gone, { paused: "library-gone" }));
+    const r = await ao(["zotero", "check-key"]);
+    expect(r.code, r.stderr).toBe(0);
+    const after = (await readZoteroSyncSettings(config, libraryId)).links.map((l) => [l.ref, l.paused]);
+    // key-refused everywhere; library-gone where the key now reads the library; the researcher's own undo is theirs.
+    expect(after).toEqual([
+      [U, undefined],
+      [G, undefined],
+      [other, "undone"],
+      [gone, "library-gone"],
+    ]);
+    // A check that fails clears nothing.
+    await linked(link(U, { paused: "key-refused" }));
+    z.revokeKey();
+    expect((await ao(["zotero", "check-key"])).code).toBe(1);
+    expect((await readZoteroSyncSettings(config, libraryId)).links[0]!.paused).toBe("key-refused");
   });
 
   it("R299 a: check-key obeys a back-off an earlier run recorded: it asks Zotero nothing, says the sentence with its time, exits 1; with the wait in the past it checks as before", async () => {
@@ -510,6 +533,9 @@ describe("ao zotero sync", () => {
     const damaged = await ao(["zotero", "sync"]);
     expect(damaged.code).not.toBe(0);
     expect(damaged.stderr).toMatch(/damaged|set aside/u);
+    // FR-508: in the app's own words (its notice), then what the app says of a library with nothing linked.
+    expect(damaged.stderr).toContain(ZOTERO_SYNC_SENTENCES.settingsSetAside);
+    expect(damaged.stderr).toContain(ZOTERO_SYNC_SENTENCES.nothingLinked);
     expect(z.requests).toEqual([]);
   });
 

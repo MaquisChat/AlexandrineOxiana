@@ -34,6 +34,7 @@ import { raiseDeviceNotice } from "../device-notices.js";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { FileLockBusyError, FileLockUnavailableError, withFileLock } from "../fs/file-lock.js";
 import { InvalidInputError } from "../repo/errors.js";
+import type { ZoteroKeyAccess } from "./zotero-web-account.js";
 
 export const ZOTERO_SYNC_FILE = "zotero-sync.json";
 export const ZOTERO_SYNC_HISTORY_FILE = "zotero-sync-history.json";
@@ -539,6 +540,34 @@ export async function updateZoteroSyncSettings(
     o,
   );
   return copySettings(out!);
+}
+
+/**
+ * R248: a key check that worked clears the pauses Zotero's refusals set, for every link of the library in one settings
+ * write: `key-refused` everywhere, `library-gone` where the key now reads the library. `undone` is the researcher's own
+ * (only a settings save that resumes the link clears it, R265). Nothing is written when no link is cleared. The one rule
+ * for the service's key check and `ao zotero check-key` (FR-507). Throws as updateZoteroSyncSettings does.
+ */
+export async function clearZoteroKeyPauses(dir: string, libraryId: string, access: Pick<ZoteroKeyAccess, "userId" | "personal" | "groups">, o: ZoteroSyncFileOptions = {}): Promise<void> {
+  const reads = (ref: string) => {
+    const [type, id] = ref.split(":");
+    return type === "user" ? access.personal.library && access.userId === id : access.groups.some((g) => g.ref === ref);
+  };
+  const clears = (l: ZoteroSyncLink) => l.paused === "key-refused" || (l.paused === "library-gone" && reads(l.ref));
+  if (!(await readZoteroSyncSettings(dir, libraryId, o)).links.some(clears)) return;
+  await updateZoteroSyncSettings(
+    dir,
+    libraryId,
+    (cur) => ({
+      ...cur,
+      links: cur.links.map((l) => {
+        if (!clears(l)) return l;
+        const { paused: _p, ...rest } = l;
+        return rest;
+      }),
+    }),
+    o,
+  );
 }
 
 /** Changes the stored links of a library in one turn (nothing is written when the library has none or nothing changes). */

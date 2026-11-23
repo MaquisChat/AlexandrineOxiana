@@ -23,6 +23,7 @@ import {
   ZoteroSyncFileBusyError,
   ZoteroSyncFileUnreadableError,
   checkZoteroKey,
+  clearZoteroKeyPauses,
   getSecret,
   ocrQueueFor,
   proxyQueueFor,
@@ -543,23 +544,9 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     };
   }
 
-  /** Whether the key check's answer says the key reads `ref`. */
-  const reads = (a: LibraryKeyAccess, ref: string) => {
-    const [type, id] = ref.split(":");
-    return type === "user" ? a.personal.library && a.userId === id : a.groups.some((g) => g.ref === ref);
-  };
   async function clearRefusals(s: Session, a: LibraryKeyAccess): Promise<void> {
-    const clears = (l: ZoteroSyncLink) => l.paused === "key-refused" || (l.paused === "library-gone" && reads(a, l.ref));
     try {
-      if (!(await readZoteroSyncSettings(dir(), s.lib.id)).links.some(clears)) return;
-      await updateZoteroSyncSettings(dir(), s.lib.id, (cur) => ({
-        ...cur,
-        links: cur.links.map((l) => {
-          if (!clears(l)) return l;
-          const { paused: _p, ...rest } = l;
-          return rest;
-        }),
-      }));
+      await clearZoteroKeyPauses(dir(), s.lib.id, a);
     } catch (err) {
       // A settings file of a newer version, or one that cannot be read: left as it is; the check's answer stands.
       state.opts.log.info({ note: err instanceof Error ? err.name : "error" }, "zotero key check: the pauses could not be cleared");

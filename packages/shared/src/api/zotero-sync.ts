@@ -242,6 +242,8 @@ export const ZOTERO_SYNC_SENTENCES = {
   belongsToSync: "This import belongs to a Zotero sync. Stop it or run it again from the Zotero screen.",
   keyNotChecked: "Only the saved key can be checked. Save the key first, then check it.",
   settingsUnreadable: "This computer's Zotero sync settings could not be read, so nothing was changed. Try again in a moment.",
+  /** FR-508: the device notice `zotero-sync-settings-set-aside`, in the app's banner and the command line alike. */
+  settingsSetAside: "This computer's Zotero sync settings could not be read and were set aside. Automatic sync is off until you set it up again. Nothing in your library has changed.",
   /** The library module's own sentence for a settings file of a newer version (the service checks they are one). */
   settingsNewer: "These sync settings were written by a newer version of the app. Update the app to change them.",
 } as const;

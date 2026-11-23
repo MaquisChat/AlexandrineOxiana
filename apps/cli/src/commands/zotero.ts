@@ -8,6 +8,7 @@ import {
   ZoteroSyncFileBusyError,
   ZoteroSyncFileUnreadableError,
   checkZoteroKey,
+  clearZoteroKeyPauses,
   readZoteroSyncHistory,
   readZoteroSyncSettings,
   syncZoteroLibrary,
@@ -148,6 +149,13 @@ export function registerZotero(program: Command): void {
       } catch (err) {
         keyCheckFailure(err);
       }
+      // FR-507 (R248): a key that works again clears the pauses Zotero's refusals set, as the app's key check does. This
+      // command opens no library, so it does so for every library this computer knows (the key is this computer's). A
+      // settings file that cannot be changed is left as it is, as in the app; the check's answer stands.
+      const dir = appConfigDir();
+      for (const lib of await listLibraries({ appConfigDir: dir, clock: () => new Date() }).catch(() => [])) {
+        await clearZoteroKeyPauses(dir, lib.libraryId, access).catch(() => undefined);
+      }
       const view: ZoteroKeyAccess = {
         userId: access.userId,
         personal: { library: access.personal.library, files: access.personal.files, notes: access.personal.notes, write: access.personal.write },
@@ -182,7 +190,8 @@ export function registerZotero(program: Command): void {
         }
         if (newer) throw new ExitError(ZOTERO_SYNC_NEWER_SENTENCE, EXIT.failure);
         if (aside) {
-          throw new ExitError("This computer's Zotero sync settings were damaged, so they were set aside and no library is linked. Nothing was synced.", EXIT.failure, "The app shows a notice about it. Link your libraries again on its Zotero screen.");
+          // FR-508: the app's own words for it (its notice), then what the app says of a library with nothing linked.
+          throw new ExitError(ZOTERO_SYNC_SENTENCES.settingsSetAside, EXIT.failure, ZOTERO_SYNC_SENTENCES.nothingLinked);
         }
         // R295 a: a back-off any earlier run recorded (the app's or this command's) is obeyed before Zotero is asked anything:
         // nothing requested, nothing recorded, the sentence with its time (as the service refuses, before it looks at the links).
