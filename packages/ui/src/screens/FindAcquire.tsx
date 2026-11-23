@@ -894,6 +894,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
           onStoredCheck={onStoredCheck}
           onUnlocked={readProjects}
           waitForSwitch={waitForSwitch}
+          saidAbove={screenError}
         />
       )}
     </main>
@@ -984,8 +985,10 @@ function ProjectQueue(props: {
   onUnlocked: () => void;
   /** A change of "Check everything I have" still out: an add waits for it (R272 a). */
   waitForSwitch: () => Promise<SwitchResult> | undefined;
+  /** FR-576: the sentence the screen already says above the queue (its settings could not be read), not said again. */
+  saidAbove?: string | undefined;
 }) {
-  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch } = props;
+  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch, saidAbove } = props;
   /** The desktop shell's bridge (F16); undefined outside the desktop app. */
   const shell = useMemo(() => desktopShell(), []);
   const projectId = project.id;
@@ -2246,7 +2249,8 @@ function ProjectQueue(props: {
       )}
 
       <h2 id={`${ids}-queue`}>Queue</h2>
-      {loadError && !entries?.length && (
+      {/* FR-576: the same sentence (the service cannot be reached) is said once, not by the screen and again here. */}
+      {loadError && loadError !== saidAbove && !entries?.length && (
         <p role="alert" className="ao-error">
           <UserText>{loadError}</UserText>
         </p>

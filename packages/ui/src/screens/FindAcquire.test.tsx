@@ -5176,4 +5176,29 @@ describe("FindAcquire: rough edges (R460)", () => {
     await waitFor(() => expect(screen.getByRole("combobox", { name: "Project" })).toBeTruthy());
     expect(screen.getAllByText("The library service could not be reached.")).toHaveLength(1);
   });
+
+  it("FR-576: when the settings' read and the queue's read both cannot reach the service, its sentence is said once", async () => {
+    useService();
+    let queueFailed!: () => void;
+    const queueRead = new Promise<void>((r) => (queueFailed = r));
+    server.use(
+      http.get(url("/find/screen"), () => HttpResponse.error()),
+      http.get(url("/projects/:id/find"), () => {
+        queueFailed();
+        return HttpResponse.error();
+      }),
+    );
+    show(`?project=${PID}`);
+    await queueRead;
+    // Both failures have been taken: the queue no longer says it is reading (its failure was taken), and the screen's
+    // own alert — the settings', above the queue's heading — says the sentence.
+    await waitFor(() => expect(screen.queryByText("Reading the queue…")).toBeNull());
+    const heading = screen.getByRole("heading", { name: "Queue" });
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("alert").some((a) => a.textContent === "The library service could not be reached." && !!(a.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING)),
+      ).toBe(true),
+    );
+    expect(screen.getAllByText("The library service could not be reached.")).toHaveLength(1);
+  });
 });
