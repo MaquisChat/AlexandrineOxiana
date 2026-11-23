@@ -43,6 +43,7 @@ import {
   type Anchor,
   type Annotation,
   type Asset,
+  type AuditEvent,
   type Creator,
   type SourceFile,
 } from "@ao/core";
@@ -113,6 +114,69 @@ function exportedRecord(sf: SourceFile, exportedAs: ReadonlyMap<string, string>,
 }
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * What the project's records say of a destroyed file, for the export's notes (FR-410, R365 a; the
+ * sentences are R473's, each no more than its evidence gives):
+ *   own — the project's own verified log records its destruction (in this project, or in the
+ *     project it was restored from, before the backup was made);
+ *   restoredVerified — a restore left it out on a verified record in this library (possibly another project's);
+ *   restoredUnverified — a restore left it out on records the app could not verify;
+ *   logNotIntact — the project's own audit log does not verify, so nothing is stated as fact.
+ */
+type DestroyedBasis = "own" | "restoredVerified" | "restoredUnverified" | "logNotIntact";
+const DESTROYED_BASES: DestroyedBasis[] = ["own", "restoredVerified", "restoredUnverified", "logNotIntact"];
+const DESTROYED_NOTE: Record<DestroyedBasis, (n: number) => string> = {
+  own: (n) => `${plural(n, "file was", "files were")} destroyed under the project's retention rule and ${n === 1 ? "is" : "are"} not included.`,
+  restoredVerified: (n) =>
+    n === 1
+      ? "1 file is not included. It was left out when this project was restored from a backup, because a verified record in this library shows it was destroyed."
+      : `${n} files are not included. They were left out when this project was restored from a backup, because verified records in this library show they were destroyed.`,
+  restoredUnverified: (n) =>
+    n === 1
+      ? "1 file is not included. It was left out when this project was restored from a backup, because records the app could not verify name it as destroyed."
+      : `${n} files are not included. They were left out when this project was restored from a backup, because records the app could not verify name them as destroyed.`,
+  logNotIntact: (n) =>
+    n === 1
+      ? "1 file is not included. It is marked as destroyed, but the project's audit log does not hold together, so the app cannot confirm it."
+      : `${n} files are not included. They are marked as destroyed, but the project's audit log does not hold together, so the app cannot confirm it.`,
+};
+
+/**
+ * From the project's verified audit log: what each destroyed file rests on. A destruction the log
+ * records is the change's `delete` event (op `retention.destroy`) naming the file's id, or, for a
+ * file destroyed in the project a copy was restored from before its backup was made (the log keeps
+ * that project's ids), the same moment (`destroyedAt` is that change's time). A file a restore
+ * named as left out on unverified records keeps that mark. Any other destroyed file of a restored
+ * copy was left out by a restore: on a verified record, unless a restore made before the files were
+ * named (a count of unverified ones, no list; R473 M1) is in the log — those cannot be told apart,
+ * so none of them is stated as resting on a verified record.
+ */
+function destroyedBasis(events: AuditEvent[]): (a: Asset) => DestroyedBasis {
+  const namedUnverified = new Set<string>();
+  const recordedIds = new Set<string>();
+  const recordedAt = new Set<string>();
+  let restored = false;
+  let countOnly = false;
+  for (const e of events) {
+    const d = (e.details ?? {}) as { op?: unknown; destroyedAssets?: unknown; destroyedUnverifiedAssetIds?: unknown; leftOutUnverified?: unknown };
+    if (e.action === "delete" && d.op === "retention.destroy" && Array.isArray(d.destroyedAssets)) {
+      for (const id of d.destroyedAssets) if (typeof id === "string") recordedIds.add(id);
+      recordedAt.add(e.at);
+    }
+    if (e.action !== "project.restored") continue;
+    restored = true;
+    if (Array.isArray(d.destroyedUnverifiedAssetIds)) {
+      for (const id of d.destroyedUnverifiedAssetIds) if (typeof id === "string") namedUnverified.add(id);
+    } else if (typeof d.leftOutUnverified === "number" && d.leftOutUnverified > 0) countOnly = true;
+  }
+  return (a) => {
+    if (namedUnverified.has(a.id)) return "restoredUnverified";
+    if (recordedIds.has(a.id) || (a.destroyedAt !== undefined && recordedAt.has(a.destroyedAt))) return "own";
+    if (!restored) return "own";
+    return countOnly ? "restoredUnverified" : "restoredVerified";
+  };
+}
 
 // ------------------------------------------------------------------------------------------
 // Markdown
@@ -373,23 +437,13 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
   const getKey = (id: string) => (key && id === key.keyId ? key.key : undefined);
   const notes: string[] = [];
   let omittedLocated = 0;
-  let omittedDestroyed = 0;
-  /** Destroyed files whose destruction the project's log does not vouch for (FR-410). */
-  let omittedUnverified = 0;
-  /**
-   * FR-410 (R365 a): a destruction is stated as fact only while the project's log verifies and no
-   * restore named the file as left out on records the app could not vouch for; null: the log does
-   * not verify, so no destruction is stated as fact. Read only when there is a destroyed original.
-   */
-  let unverifiedDestroyed: Set<string> | null = new Set();
+  /** Destroyed files by what the project's records say of them (FR-410, R365 a, R473 I2/M1/M5). */
+  const omitted: Record<DestroyedBasis, number> = { own: 0, restoredVerified: 0, restoredUnverified: 0, logNotIntact: 0 };
+  /** Read only when there is a destroyed original. */
+  let basisOf: (a: Asset) => DestroyedBasis = () => "own";
   if (allowed.some(({ sf }) => sf.assets.some((a) => a.role === "original" && a.status === "destroyed"))) {
     const log = await verifiedAuditEvents(repo, projectId);
-    if (!log.ok) unverifiedDestroyed = null;
-    else
-      for (const e of log.events) {
-        const named = e.action === "project.restored" ? (e.details as { destroyedUnverifiedAssetIds?: unknown } | undefined)?.destroyedUnverifiedAssetIds : undefined;
-        if (Array.isArray(named)) for (const id of named) if (typeof id === "string") unverifiedDestroyed.add(id);
-      }
+    basisOf = log.ok ? destroyedBasis(log.events) : () => "logNotIntact";
   }
   let filesWritten = 0;
   const work = `worker-export-${randomUUID()}`;
@@ -428,8 +482,7 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
       for (const a of sf.assets) {
         if (a.role !== "original") continue;
         if (a.status === "destroyed") {
-          if (unverifiedDestroyed === null || unverifiedDestroyed.has(a.id)) omittedUnverified++;
-          else omittedDestroyed++;
+          omitted[basisOf(a)]++;
           continue;
         }
         if (mode === "keep" || !LOCATED_MEDIA.test(a.mime)) {
@@ -502,14 +555,7 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
         `${plural(omittedLocated, "file with a location was", "files with a location were")} left out: this project hides locations and no viewing copy without the location exists yet.`,
       );
     }
-    if (omittedDestroyed) notes.push(`${plural(omittedDestroyed, "file was", "files were")} destroyed under the project's retention rule and ${omittedDestroyed === 1 ? "is" : "are"} not included.`);
-    if (omittedUnverified) {
-      notes.push(
-        omittedUnverified === 1
-          ? "1 file is not included. The project's log says this file was destroyed under its retention rule; that entry could not be verified."
-          : `${omittedUnverified} files are not included. The project's log says these files were destroyed under its retention rule; those entries could not be verified.`,
-      );
-    }
+    for (const basis of DESTROYED_BASES) if (omitted[basis]) notes.push(DESTROYED_NOTE[basis](omitted[basis]));
     if (notes.length) await writeFileAtomic(join(root, "notes.txt"), `${notes.join("\n")}\n`, { mode: 0o600 });
     await renameWithRetry(root, finalRoot);
   } catch (err) {
@@ -521,11 +567,12 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
     await shredPath(workDir).catch(() => {});
     activeTemp.delete(work);
   }
+  const omittedDestroyed = DESTROYED_BASES.reduce((n, b) => n + omitted[b], 0);
   await appendLibraryEvent(repo, projectId, "export.project", {
     exported: allowed.length,
     withheld,
     files: filesWritten,
-    omittedFiles: omittedLocated + omittedDestroyed + omittedUnverified,
+    omittedFiles: omittedLocated + omittedDestroyed,
   });
-  return { path: finalRoot, exported: allowed.length, withheld, omittedFiles: omittedLocated + omittedDestroyed + omittedUnverified, notes };
+  return { path: finalRoot, exported: allowed.length, withheld, omittedFiles: omittedLocated + omittedDestroyed, notes };
 }
