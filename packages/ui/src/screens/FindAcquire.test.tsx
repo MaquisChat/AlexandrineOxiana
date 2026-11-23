@@ -4201,6 +4201,45 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       expect(posts("/library/start")).toHaveLength(1);
     });
 
+    it("FR-558: a read of the queue given up as never answering is cancelled: across many give-ups no more than one read is open, and the cancel changes nothing on the screen", async () => {
+      serveOne("hung reads");
+      let hang = false;
+      let open = 0;
+      let most = 0;
+      server.use(
+        http.get(url(`/projects/${PID}/find`), ({ request }) => {
+          if (!hang) return HttpResponse.json(queue(current));
+          open++;
+          most = Math.max(most, open);
+          request.signal.addEventListener("abort", () => open--, { once: true });
+          return new Promise<Response>(() => {});
+        }),
+      );
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await waitFor(() => expect(events.open()).toBe(true));
+      const before = reads();
+      hang = true;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        for (let k = 1; k <= 8; k++) {
+          // A read asked for by an event never answers, and is given up after QUEUE_READ_WAIT_MS.
+          progress(current[0]!, "no-open-copy");
+          await vi.advanceTimersByTimeAsync(1_000);
+          expect(reads()).toBe(before + k);
+          expect(open).toBe(1);
+          await vi.advanceTimersByTimeAsync(QUEUE_READ_WAIT_MS);
+          expect(open).toBe(0);
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(most).toBe(1);
+      // The cancelled reads changed nothing: the row as it was, and nothing said in alert.
+      expect(stateOf("hung reads")).toBe("No open copy");
+      expect(screen.queryAllByRole("alert")).toEqual([]);
+    });
+
     it("R342 j: two presses in the same moment (before the row shows itself busy) send ONE start", async () => {
       serveOne("twice at once");
       fake.shell!.openLibraryWindow.mockResolvedValue(true);

@@ -167,8 +167,8 @@ export const LIBRARY_SHELL_TIMEOUT_MS = 60_000;
 export const LIBRARY_CLOSE_WAIT_MS = 5_000;
 /**
  * FR-558: a read of the queue is waited for at most this long by what waits on it (a row's control, the next read asked
- * for); a read that never answers then keeps no control busy and holds no later read back. Its answer, if it comes, is
- * still taken in its order.
+ * for); a read that never answers then keeps no control busy and holds no later read back. It is cancelled then (R472):
+ * a late answer is not taken, and the next read shows what it would have.
  */
 export const QUEUE_READ_WAIT_MS = 60_000;
 
@@ -1331,16 +1331,16 @@ function ProjectQueue(props: {
     setLocked(true);
   }, [setDialog]);
 
-  /** One read of the queue (it may overlap another; the numbers keep the order). */
-  const readOnce = useCallback(async (): Promise<void> => {
+  /** One read of the queue (it may overlap another; the numbers keep the order). A read cancelled by `signal` changes nothing. */
+  const readOnce = useCallback(async (signal?: AbortSignal): Promise<void> => {
     const start = ++clock.current;
     const g = gen.current;
     try {
-      const r = await api.queue(projectId);
-      if (!alive.current || g !== gen.current) return;
+      const r = await api.queue(projectId, signal ? { signal } : {});
+      if (!alive.current || g !== gen.current || signal?.aborted) return;
       applyQueue(r, start);
     } catch (err) {
-      if (!alive.current || g !== gen.current || start < metaSeq.current) return;
+      if (!alive.current || g !== gen.current || signal?.aborted || start < metaSeq.current) return;
       metaSeq.current = start;
       if (isProjectLocked(err)) {
         markLocked();
@@ -1361,11 +1361,24 @@ function ProjectQueue(props: {
   }, [api, projectId, applyQueue, markLocked]);
 
   readOnceRef.current = readOnce;
-  /** One read, waited for at most QUEUE_READ_WAIT_MS (FR-558): the read itself goes on, and its answer is still taken. */
+  /**
+   * One read, waited for at most QUEUE_READ_WAIT_MS (FR-558). A read given up then is cancelled (R472), so that reads
+   * that never answer do not pile up against the web view's few connections to the service; the next read shows what
+   * it would have.
+   */
   const readWaited = useCallback(async (): Promise<void> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const cancel = new AbortController();
     try {
-      await Promise.race([readOnce(), new Promise<void>((r) => (timer = setTimeout(r, QUEUE_READ_WAIT_MS)))]);
+      await Promise.race([
+        readOnce(cancel.signal),
+        new Promise<void>((r) => {
+          timer = setTimeout(() => {
+            cancel.abort();
+            r();
+          }, QUEUE_READ_WAIT_MS);
+        }),
+      ]);
     } finally {
       clearTimeout(timer);
     }
