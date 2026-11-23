@@ -99,8 +99,8 @@ function portPair(name: string, sender: PortLike["sender"]): { tab: FakePort; bg
 interface FakeTab {
   url: string | undefined;
   contentType: string;
-  /** The file the tab's fetch answers with, or a Response factory. */
-  file?: Uint8Array | (() => Response);
+  /** The file the tab's fetch answers with, or a Response factory (given the fetch's init, its signal among it). */
+  file?: Uint8Array | ((init?: RequestInit) => Response);
   /** The browser refuses the injection (its own pages, Firefox's PDF viewer). */
   noScript?: boolean;
   /** The script is injected but never connects. */
@@ -109,15 +109,27 @@ interface FakeTab {
   length?: number | null;
 }
 
-/** A body that yields `file` in chunks of `chunk` bytes, counting what was pulled; `stallAfter` stops yielding. */
+/**
+ * A body that yields `file` in chunks of `chunk` bytes, counting what was pulled; `stallAfter` stops yielding.
+ * `follow(signal)` makes it behave as a real fetch's body does when the fetch's signal is aborted: the body is errored
+ * with an AbortError (a read waiting on it ends) and the reading is stopped (`aborted`; the publisher's end is closed).
+ */
 function streamOf(file: Uint8Array, o: { chunk?: number; stallAfter?: number } = {}) {
   const chunk = o.chunk ?? 64 * 1024;
   let at = 0;
-  const seen = { pulled: 0, cancelled: false };
+  let ended = false;
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const seen = { pulled: 0, cancelled: false, aborted: false };
   const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
     pull(c) {
       if (o.stallAfter !== undefined && at >= o.stallAfter) return new Promise<void>(() => undefined);
-      if (at >= file.length) return c.close();
+      if (at >= file.length) {
+        ended = true;
+        return c.close();
+      }
       const part = file.subarray(at, Math.min(at + chunk, file.length));
       at += part.length;
       seen.pulled = at;
@@ -125,10 +137,18 @@ function streamOf(file: Uint8Array, o: { chunk?: number; stallAfter?: number } =
       return undefined;
     },
     cancel() {
+      ended = true;
       seen.cancelled = true;
     },
   });
-  return { body, seen };
+  const follow = (signal: AbortSignal | null | undefined) =>
+    signal?.addEventListener("abort", () => {
+      if (ended) return;
+      ended = true;
+      seen.aborted = true;
+      controller!.error(new DOMException("This operation was aborted", "AbortError"));
+    });
+  return { body, seen, follow };
 }
 
 const pdfBytes = (n: number, fill = 0x41) => {
@@ -171,7 +191,7 @@ function rig(tabs: Record<number, FakeTab>, o: { post?: FinderDeps["post"]; wait
             contentType: tab.contentType,
             fetch: (async (url: string, init?: RequestInit) => {
               r.fetches.push({ url: String(url), init });
-              if (typeof tab.file === "function") return tab.file();
+              if (typeof tab.file === "function") return tab.file(init);
               const s = streamOf(tab.file ?? new Uint8Array(), {});
               r.streams.push(s.seen);
               const headers = new Headers({ "content-type": "application/pdf" });
@@ -623,12 +643,24 @@ describe("sending the tab's PDF: the whole way with the real tab script, a fake 
   });
 
   it("a tab whose file stops arriving: the wait for a piece ends, the tab's reading is stopped, nothing sent", async () => {
+    // One whole piece arrives, then the file stops: the tab's next read never ends by itself. The piece wait is set
+    // well above the first piece's honest work (its base64 and its copy, tens of milliseconds; more on a busy machine),
+    // so the wait that ends is the one for the SECOND piece, as asserted below, never the first.
     const file = pdfBytes(3 * 1024 * 1024);
-    const s = streamOf(file, { stallAfter: 1024 * 1024 + 64 * 1024 });
-    const r = rig({ 7: { url: PAGE, contentType: "application/pdf", file: () => new Response(s.body) } }, { waits: { piece: 50 } });
+    const stallAfter = FIND_PIECE_BYTES + 64 * 1024;
+    const s = streamOf(file, { stallAfter });
+    const file7 = (init?: RequestInit) => {
+      s.follow(init?.signal);
+      return new Response(s.body);
+    };
+    const r = rig({ 7: { url: PAGE, contentType: "application/pdf", file: file7 } }, { waits: { piece: 1_000 } });
     expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_TEXT.couldNotRead });
+    expect(pieces(r.tabPorts[0]!)).toHaveLength(1);
+    expect(r.bgPorts[0]!.sent.filter((m) => (m as { t?: string }).t === "more")).toHaveLength(2);
+    expect(s.seen.pulled).toBe(stallAfter);
+    // The background's disconnect aborts the tab's fetch; its read ends and the script ends.
     await Promise.all(r.scripts);
-    expect(s.seen.cancelled).toBe(true);
+    expect(s.seen.aborted).toBe(true);
     expect(r.tabPorts[0]!.messages.size).toBe(0);
     expect(r.posts).toEqual([]);
   });
