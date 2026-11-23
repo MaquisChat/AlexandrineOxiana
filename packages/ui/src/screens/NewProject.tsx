@@ -143,11 +143,12 @@ export interface NewProjectProps {
   /** Where focus goes when the dialog closes (the button that opened it), worked out at closing time. */
   returnFocusTo?: () => HTMLElement | null | undefined;
   /**
-   * Whether a recovery code is on screen and not yet confirmed (R134): the library screen then keeps
-   * the dialog even if the library is closed underneath, and tells it with `libraryClosed`.
+   * Whether a recovery code is on screen and not yet confirmed (R134), or the "found" panel of an encrypted project
+   * (FR-194): the library screen then keeps the dialog even if the library is closed underneath, and tells it with
+   * `libraryClosed`.
    */
   onRecoveryPending?: (pending: boolean) => void;
-  /** The library was closed while the recovery code was on screen. */
+  /** The library was closed while the recovery code (or an encrypted project's "found" panel) was on screen. */
   libraryClosed?: boolean;
 }
 
@@ -243,6 +244,17 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   useEffect(() => {
     if (found || foundMany) foundHeading.current?.focus();
   }, [found, foundMany]);
+
+  // FR-194 (R461 a): the "found" panel of an encrypted project is the only place that says its recovery code was never
+  // shown and the passphrase is the only way in, so a library closed underneath waits for it, as at the recovery code.
+  const holdRef = useRef(onRecoveryPending);
+  holdRef.current = onRecoveryPending;
+  const foundEncrypted = !!found?.encrypted;
+  useEffect(() => {
+    if (!foundEncrypted) return;
+    holdRef.current?.(true);
+    return () => holdRef.current?.(false);
+  }, [foundEncrypted]);
 
   const requirement = encryptionRequirement({ profiles, identifiable });
   const mandatory = requirement.required || serviceNeedsEncryption;
@@ -463,6 +475,11 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
                 <p className="ao-newproject__warning">
                   The project opens with the passphrase you just chose. Keep that passphrase safe: for now it is the only way to open the project. Once the project is open, choose “New recovery code…” on the library screen to get a recovery code you can save.
                 </p>
+                {libraryClosed && (
+                  <p role="status" className="ao-newproject__warning">
+                    The library was closed while this was open. The project was created; once you have read this, you return to choosing a library.
+                  </p>
+                )}
               </>
             ) : (
               <p>
@@ -470,8 +487,9 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
               </p>
             )}
             <div className="ao-row ao-newproject__actions">
+              {/* The library screen leaves for the chooser when the library was closed underneath. */}
               <button type="button" onClick={() => onCreated(found)}>
-                Open the project
+                {found.encrypted && libraryClosed ? "Back to choosing a library" : "Open the project"}
               </button>
             </div>
           </>

@@ -336,6 +336,42 @@ describe("New project dialog: the recovery code cannot be left unsaved (R134 I2)
     await confirmAndClose(step, user);
     expect(onClosed).toHaveBeenCalled();
   });
+
+  it("FR-194: a library closed while the “found” panel of an encrypted project is open keeps the panel until it is read, then goes back to the chooser", async () => {
+    serveLost(NEW_ENC);
+    const events = controllableEvents();
+    server.use(events.handler);
+    const onClosed = vi.fn();
+    const user = userEvent.setup();
+    render(<Library api={testApi()} current={CURRENT_RW as never} onClosed={onClosed} />);
+    const dialog = await openDialog(user);
+    await fillEncrypted(dialog, user);
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    const found = await screen.findByRole("dialog", { name: "The project was created" });
+    act(() => events.send("library.state", { open: false }));
+    expect(await within(found).findByText("The library was closed while this was open. The project was created; once you have read this, you return to choosing a library.")).toBeTruthy();
+    expect(onClosed).not.toHaveBeenCalled();
+    expect(found.textContent).toMatch(/opens with the passphrase you just chose/);
+    expect(within(found).queryByRole("button", { name: "Open the project" })).toBeNull();
+    await user.click(within(found).getByRole("button", { name: "Back to choosing a library" }));
+    await waitFor(() => expect(onClosed).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("FR-194: the “found” panel of a project that is not encrypted does not hold a library's close", async () => {
+    serveLost(NEW_OPEN);
+    const events = controllableEvents();
+    server.use(events.handler);
+    const onClosed = vi.fn();
+    const user = userEvent.setup();
+    render(<Library api={testApi()} current={CURRENT_RW as never} onClosed={onClosed} />);
+    const dialog = await openDialog(user);
+    await fillOpen(dialog, user);
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await screen.findByRole("dialog", { name: "The project was created" });
+    act(() => events.send("library.state", { open: false }));
+    await waitFor(() => expect(onClosed).toHaveBeenCalledTimes(1));
+  });
 });
 
 // ---- Fix round 2: the "cannot tell" state can no longer be left silently ----
