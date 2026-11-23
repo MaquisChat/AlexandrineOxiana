@@ -549,11 +549,7 @@ export async function updateZoteroSyncSettings(
  * for the service's key check and `ao zotero check-key` (FR-507). Throws as updateZoteroSyncSettings does.
  */
 export async function clearZoteroKeyPauses(dir: string, libraryId: string, access: Pick<ZoteroKeyAccess, "userId" | "personal" | "groups">, o: ZoteroSyncFileOptions = {}): Promise<void> {
-  const reads = (ref: string) => {
-    const [type, id] = ref.split(":");
-    return type === "user" ? access.personal.library && access.userId === id : access.groups.some((g) => g.ref === ref);
-  };
-  const clears = (l: ZoteroSyncLink) => l.paused === "key-refused" || (l.paused === "library-gone" && reads(l.ref));
+  const clears = keyPauseCleared(access);
   if (!(await readZoteroSyncSettings(dir, libraryId, o)).links.some(clears)) return;
   await updateZoteroSyncSettings(
     dir,
@@ -568,6 +564,56 @@ export async function clearZoteroKeyPauses(dir: string, libraryId: string, acces
     }),
     o,
   );
+}
+
+/** R248: whether a key check that worked (`access`) clears a link's pause: `key-refused`, or `library-gone` where the key reads the library. */
+function keyPauseCleared(access: Pick<ZoteroKeyAccess, "userId" | "personal" | "groups">): (l: ZoteroSyncLink) => boolean {
+  const reads = (ref: string) => {
+    const [type, id] = ref.split(":");
+    return type === "user" ? access.personal.library && access.userId === id : access.groups.some((g) => g.ref === ref);
+  };
+  return (l) => l.paused === "key-refused" || (l.paused === "library-gone" && reads(l.ref));
+}
+
+/**
+ * FR-507 (R474): `ao zotero check-key`, which opens no library: the rule of clearZoteroKeyPauses for EVERY library this
+ * computer's settings file lists (not the libraries list, which may be damaged or miss a library), in one write under
+ * the file's lock; `undone` is kept. Returns how many links were cleared (0: nothing written). A damaged file is set
+ * aside as on any read (`o.onSetAside` is told); a file of a newer version is left as it is (0). Throws as
+ * updateZoteroSyncSettings does.
+ */
+export async function clearZoteroKeyPausesEverywhere(dir: string, access: Pick<ZoteroKeyAccess, "userId" | "personal" | "groups">, o: ZoteroSyncFileOptions = {}): Promise<number> {
+  const clears = keyPauseCleared(access);
+  const file = await readFileStrict(dir, ZOTERO_SYNC_FILE, isSettingsFile, o);
+  if (!file || !Object.values(file.libraries).some((s) => s.links.some(clears))) return 0;
+  let cleared = 0;
+  await updateFile(
+    dir,
+    ZOTERO_SYNC_FILE,
+    isSettingsFile,
+    (cur) => {
+      cleared = 0;
+      if (!cur) return { v: 1 as const, libraries: {} };
+      const libraries = Object.fromEntries(
+        Object.entries(cur.libraries).map(([id, s]) => [
+          id,
+          {
+            ...s,
+            links: s.links.map((l) => {
+              const kept = copyLink(l);
+              if (!clears(kept)) return kept;
+              cleared++;
+              const { paused: _p, ...rest } = kept;
+              return rest;
+            }),
+          },
+        ]),
+      );
+      return { v: 1 as const, libraries };
+    },
+    o,
+  );
+  return cleared;
 }
 
 /** Changes the stored links of a library in one turn (nothing is written when the library has none or nothing changes). */

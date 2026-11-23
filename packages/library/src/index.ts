@@ -235,6 +235,7 @@ export {
   ZoteroSyncFileNewerError,
   ZoteroSyncFileUnreadableError,
   clearZoteroKeyPauses,
+  clearZoteroKeyPausesEverywhere,
   pauseAllZoteroSyncLinks,
   pauseLink,
   readZoteroSyncHistory,

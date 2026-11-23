@@ -246,7 +246,12 @@ export const ZOTERO_SYNC_SENTENCES = {
   settingsSetAside: "This computer's Zotero sync settings could not be read and were set aside. Automatic sync is off until you set it up again. Nothing in your library has changed.",
   /** The library module's own sentence for a settings file of a newer version (the service checks they are one). */
   settingsNewer: "These sync settings were written by a newer version of the app. Update the app to change them.",
+  /** FR-507 (R474): a key check that worked, but the pauses its refusals set could not be cleared (`ao zotero check-key`). */
+  keyPausesNotCleared: "This computer's Zotero sync settings could not be read or changed, so a Zotero library paused because of the key stays paused. Run the check again in a moment.",
 } as const;
+
+/** FR-507 (R474): how many links a key check that worked turned on again (said only when at least one was). */
+export const zoteroSyncsAgainLine = (n: number): string => `Syncing is on again for ${n} linked Zotero ${n === 1 ? "library" : "libraries"}.`;
 
 const timeOf = (d: Date) => new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(d);
 const dateOf = (d: Date) => new Intl.DateTimeFormat("en-GB", { dateStyle: "long" }).format(d);

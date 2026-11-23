@@ -8,7 +8,7 @@ import {
   ZoteroSyncFileBusyError,
   ZoteroSyncFileUnreadableError,
   checkZoteroKey,
-  clearZoteroKeyPauses,
+  clearZoteroKeyPausesEverywhere,
   readZoteroSyncHistory,
   readZoteroSyncSettings,
   syncZoteroLibrary,
@@ -25,6 +25,7 @@ import {
   zoteroKeySummary,
   zoteroSyncReasonText,
   zoteroSyncStatusLine,
+  zoteroSyncsAgainLine,
   type ZoteroKeyAccess,
   type ZoteroSyncReason,
   type ZoteroSyncRun as SharedRun,
@@ -149,21 +150,30 @@ export function registerZotero(program: Command): void {
       } catch (err) {
         keyCheckFailure(err);
       }
-      // FR-507 (R248): a key that works again clears the pauses Zotero's refusals set, as the app's key check does. This
-      // command opens no library, so it does so for every library this computer knows (the key is this computer's). A
-      // settings file that cannot be changed is left as it is, as in the app; the check's answer stands.
-      const dir = appConfigDir();
-      for (const lib of await listLibraries({ appConfigDir: dir, clock: () => new Date() }).catch(() => [])) {
-        await clearZoteroKeyPauses(dir, lib.libraryId, access).catch(() => undefined);
+      // FR-507 (R248, R474): a key that works again clears the pauses Zotero's refusals set, as the app's key check does.
+      // This command opens no library, so it does so for every library this computer's settings file lists (the key is
+      // this computer's), in one write under the file's lock. The check's answer stands whatever happens to the file;
+      // a file set aside is said in the app's words, one that cannot be read or changed is said and exits 1.
+      let syncsAgain = 0;
+      let setAside = false;
+      let notCleared = false;
+      try {
+        syncsAgain = await clearZoteroKeyPausesEverywhere(appConfigDir(), access, { onSetAside: () => (setAside = true) });
+      } catch {
+        notCleared = true;
       }
+      const notes = [...(setAside ? [ZOTERO_SYNC_SENTENCES.settingsSetAside] : []), ...(notCleared ? [ZOTERO_SYNC_SENTENCES.keyPausesNotCleared] : [])];
       const view: ZoteroKeyAccess = {
         userId: access.userId,
         personal: { library: access.personal.library, files: access.personal.files, notes: access.personal.notes, write: access.personal.write },
         groups: access.groups.map((g) => ({ ref: g.ref, name: g.name, write: g.write })),
       };
       const summary = zoteroKeySummary(view);
-      out.data({ ...view, summary });
+      out.data({ ...view, summary, syncsAgain, ...(notes.length ? { notes } : {}) });
       out.line(summary);
+      if (syncsAgain > 0) out.line(zoteroSyncsAgainLine(syncsAgain));
+      if (!out.json) for (const n of notes) out.progress(n);
+      if (notCleared) process.exitCode = EXIT.failure;
     });
 
   zotero
