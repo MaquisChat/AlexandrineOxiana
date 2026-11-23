@@ -87,16 +87,28 @@ export function sourceRecord(sf: SourceFile, roots: Iterable<string>): SourceFil
   };
 }
 
+/** R488 b: the longest the reachability check of one source read may take (ms); past it, nothing is marked missing. */
+export const SOURCE_REACH_MS = 2000;
+
 /**
  * R480 e: each linked file of ONE source record marked `linked.missing: true` when nothing is at its path now (the
  * Missing files rule, `missingAt`; an error other than "nothing is there" counts as there). Only where one source is
  * read (`GET /projects/:id/sources/:sid`), never on a list route. No path is added: the flag only.
  */
 async function withReach<T extends { assets: Asset[] }>(root: string, rec: T): Promise<T> {
-  const assets = await Promise.all(
-    rec.assets.map(async (a) => (a.linked && (await missingAt(root, a.path).catch(() => false)) ? ({ ...a, linked: { ...a.linked, missing: true } } as typeof a) : a)),
-  );
-  return { ...rec, assets };
+  // R488 b: the whole check is bounded (a network drive that does not answer must not hold up the reader's opening);
+  // when it runs out no file is marked missing, as before R480 e. The timer is cleared whatever happens.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const outOfTime = new Promise<null>((res) => {
+    timer = setTimeout(() => res(null), SOURCE_REACH_MS);
+  });
+  try {
+    const missing = await Promise.race([Promise.all(rec.assets.map((a) => (a.linked ? missingAt(root, a.path).catch(() => false) : Promise.resolve(false)))), outOfTime]);
+    if (!missing) return rec;
+    return { ...rec, assets: rec.assets.map((a, i) => (a.linked && missing[i] ? ({ ...a, linked: { ...a.linked, missing: true } } as typeof a) : a)) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

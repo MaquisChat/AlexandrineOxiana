@@ -8,11 +8,25 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CONFIRMABLE_IDENTIFIERS, deviceDeps, type Deps } from "@ao/library";
 import { CONFIRMABLE_IDENTIFIER_KEYS, type FieldConfirmRequest, type FieldReview, type SourceRecordExtras, type TranscriptListResponse, type TranscriptResponse } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService } from "./server.js";
+import { SOURCE_REACH_MS } from "./routes/sources.js";
+
+/** R488 b: a stand-in for the Missing files rule's file-system call, set by a test (else the real one). */
+const reach = vi.hoisted(() => ({ standIn: undefined as undefined | ((root: string, rel: string) => Promise<boolean>), calls: 0 }));
+vi.mock("@ao/library", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@ao/library")>();
+  return {
+    ...real,
+    missingAt: (root: string, rel: string) => {
+      reach.calls++;
+      return reach.standIn ? reach.standIn(root, rel) : real.missingAt(root, rel);
+    },
+  };
+});
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const auth = { authorization: `Bearer ${TOKEN}` };
@@ -47,6 +61,9 @@ beforeEach(async () => {
   expect((await call({ method: "POST", url: "/libraries", body: { path: join(tmp, "Lib"), name: "Lib" } })).status).toBe(200);
 });
 afterEach(async () => {
+  vi.useRealTimers();
+  reach.standIn = undefined;
+  reach.calls = 0;
   await svc.close();
   await rm(tmp, { recursive: true, force: true });
 });
@@ -180,6 +197,58 @@ describe("R480 e: the source record the reader reads says which linked file cann
     expect(b.linked).toEqual({ libraryRelativePath: sf.assets[1]!.linked!.libraryRelativePath });
     expect(c.linked).toBeUndefined();
     expect(c.missing).toBeUndefined();
+  });
+});
+
+describe("R488 b: the reachability check of one source read is bounded", () => {
+  async function linkedSource(pid: string) {
+    const gone = await file("gone.pdf", await buildPdf({ title: "Gone", author: "A B", lines: ["x"] }));
+    const repo = svc.state.session!.repo;
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "report", title: { variants: [{ lang: "en", kind: "original", value: "Linked" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: gone, role: "original", handling: "link" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+    await rm(gone);
+    return sf;
+  }
+
+  it(`a file system that never answers: after ${SOURCE_REACH_MS} ms the read answers as today, no file marked missing, and no timer is left`, async () => {
+    expect(SOURCE_REACH_MS).toBe(2000);
+    const pid = await project();
+    const sf = await linkedSource(pid);
+    let asked!: () => void;
+    const seen = new Promise<void>((res) => (asked = res));
+    reach.standIn = () => {
+      asked();
+      return new Promise<boolean>(() => {});
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let answered = false;
+    const pending = call({ url: `/projects/${pid}/sources/${sf.source.id}` }).then((r) => {
+      answered = true;
+      return r;
+    });
+    await seen;
+    await vi.advanceTimersByTimeAsync(SOURCE_REACH_MS - 1);
+    expect(answered).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const r = await pending;
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.assets[0].linked).toEqual({ libraryRelativePath: sf.assets[0]!.linked!.libraryRelativePath });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a check that answers in time leaves no timer behind", async () => {
+    const pid = await project();
+    const sf = await linkedSource(pid);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const r = await call({ url: `/projects/${pid}/sources/${sf.source.id}` });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.assets[0].linked.missing).toBe(true);
+    expect(reach.calls).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
