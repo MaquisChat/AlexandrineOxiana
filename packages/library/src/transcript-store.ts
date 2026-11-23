@@ -1,11 +1,12 @@
 /**
  * Storing a finished machine transcription (link-capture.ts `runTranscription`, and the
  * transcription job of Task 62): the worker's `transcript.vtt` and `segments.json` become derived
- * assets of kind `transcript` of the source, derived from its recording, each one governed,
- * audited change (R26).
+ * assets of kind `transcript` of the source, derived from its recording, both in ONE governed,
+ * audited, crash-safe change (R26; FR-393, R464 c): never one without the other.
  */
 import { basename } from "node:path";
 import type { Asset } from "@ao/core";
+import type { DerivedAssetInput } from "./repo/assets.js";
 import type { Repo } from "./repo/repo.js";
 import type { JobResult } from "./worker-client.js";
 
@@ -36,11 +37,11 @@ export async function storeTranscript(
   const lang = langs.length === 1 ? langs[0]! : langs.length > 1 ? "mul" : "und";
   const flagged = typeof meta.flaggedCount === "number" ? meta.flaggedCount : undefined;
   const at = new Date().toISOString();
-  const files: string[] = [];
+  const inputs: DerivedAssetInput[] = [];
   for (const ext of ["vtt", "json"]) {
     const file = r.files.find((f) => basename(f) === (ext === "vtt" ? "transcript.vtt" : "segments.json"));
     if (!file) continue;
-    const asset = await repo.addDerivedAsset(projectId, sourceId, {
+    inputs.push({
       fromPath: file,
       kind: "transcript",
       lang,
@@ -59,7 +60,8 @@ export async function storeTranscript(
         triggeredBy,
       },
     });
-    files.push(asset.path);
   }
+  // Both files in one governed change (FR-393, R464 c): a lock or a crash leaves both or neither.
+  const files = (await repo.addDerivedAssets(projectId, sourceId, inputs)).map((a) => a.path);
   return { files, flaggedSegments: flagged ?? 0 };
 }

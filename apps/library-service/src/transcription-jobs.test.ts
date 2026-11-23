@@ -432,9 +432,9 @@ describe("fix round 1", () => {
     const { pid, sid, versions, unlock } = await encryptedRun();
     worker!.instant = true;
     const repo = svc!.state.session!.repo;
-    const original = repo.addDerivedAsset.bind(repo);
+    const original = repo.addDerivedAssets.bind(repo);
     let first = true;
-    repo.addDerivedAsset = (async (...args: Parameters<typeof original>) => {
+    repo.addDerivedAssets = (async (...args: Parameters<typeof original>) => {
       if (first) {
         first = false;
         repo.lockProject(pid);

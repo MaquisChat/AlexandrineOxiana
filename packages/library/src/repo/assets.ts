@@ -63,10 +63,32 @@ export async function addDerivedAsset(
    */
   internal: { completesPendingProxy?: string; location?: LocationMode; completesPendingOcr?: string } = {},
 ): Promise<Asset> {
+  return (await deriveAssets(core, projectId, sourceId, [input], internal))[0]!;
+}
+
+/**
+ * Several derived assets of one source in ONE governed, audited change (FR-393, R464 c: a
+ * transcript's WebVTT and segments file): crash-safe through the transaction marker like every
+ * change (R26), so a lock, a failure or a crash leaves all of them or none. One `store` entry,
+ * whose details name each file by its asset id and extension (ids and kinds only, R177).
+ */
+export async function addDerivedAssets(core: RepoCore, projectId: string, sourceId: string, inputs: DerivedAssetInput[]): Promise<Asset[]> {
+  if (inputs.length === 0) return [];
+  return deriveAssets(core, projectId, sourceId, inputs, {});
+}
+
+async function deriveAssets(
+  core: RepoCore,
+  projectId: string,
+  sourceId: string,
+  inputs: DerivedAssetInput[],
+  internal: { completesPendingProxy?: string; location?: LocationMode; completesPendingOcr?: string },
+): Promise<Asset[]> {
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
   const current = await readSourceFile(core, st, sourceId);
+  const made: Asset[] = [];
   return runMutation(
     core,
     projectId,
@@ -74,12 +96,14 @@ export async function addDerivedAsset(
     async (tx) => {
       const cur = await readSourceFile(core, st, sourceId);
       // A derived asset's parents must still exist (e.g. not removed by an import's undo, R85 I1).
-      for (const parent of input.derivation.parents) {
-        const found = cur.assets.find((a) => a.id === parent);
-        if (!found || found.status === "destroyed") {
-          if (internal.completesPendingProxy) throw new ProxyRecordRefusedError("ORIGINAL_GONE");
-          // Nothing may be derived again from destroyed raw data (R92 I4).
-          throw found ? new DestroyedParentError(parent) : new MissingParentError(parent);
+      for (const input of inputs) {
+        for (const parent of input.derivation.parents) {
+          const found = cur.assets.find((a) => a.id === parent);
+          if (!found || found.status === "destroyed") {
+            if (internal.completesPendingProxy) throw new ProxyRecordRefusedError("ORIGINAL_GONE");
+            // Nothing may be derived again from destroyed raw data (R92 I4).
+            throw found ? new DestroyedParentError(parent) : new MissingParentError(parent);
+          }
         }
       }
       if (internal.completesPendingProxy) {
@@ -95,51 +119,57 @@ export async function addDerivedAsset(
       // The folder name is already pseudonymized; drop its "[id]" (and any collision suffix).
       const folderName = folder.slice(folder.lastIndexOf("/") + 1);
       const sourceName = folderName.replace(/\s*\[[^\]]*\](?: \(\d+\))?\s*$/, "");
-      let name = derivedFileName({
-        sourceName,
-        kind: input.kind,
-        ...(input.lang ? { lang: input.lang } : {}),
-        tool: input.tool,
-        modified: tx.now,
-        ext: input.ext,
-        tz: core.zoneOf(st.project),
-      });
-      if (tx.encrypted) name = encName(name);
       const dir = `${folder}/derived`;
       await tx.mkdir(dir);
       const taken = await namesIn(core.abs(dir));
-      name = withCollisionSuffix(name, (n) => taken.has(foldName(n)));
-      const rel = `${dir}/${name}`;
       const identifiable = cur.source.provenance.identifiable;
-      if (input.fromEncrypted && !tx.encrypted) throw new TypeError("an encrypted input file needs an encrypted project");
-      const { sha256, bytes } = await tx.copyFile(input.fromPath, rel, {
-        encrypt: tx.encrypted,
-        mode: fileMode(core, st, identifiable),
-        ...(input.fromEncrypted ? { sourceEncrypted: true } : {}),
-      });
-      const asset = Asset.parse({
-        id: newId(),
-        sourceId,
-        role: "derived",
-        kind: input.kind,
-        path: rel,
-        encrypted: tx.encrypted,
-        sha256,
-        bytes,
-        mime: mimeFor(input.ext.replace(/^\.+/, "")),
-        derivation: input.derivation,
-        ...(input.metadata ? { metadata: input.metadata } : {}),
-      });
-      tx.entity("asset", asset.id);
-      const sf: SourceFile = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor }, assets: [...cur.assets, asset] };
+      for (const input of inputs) {
+        let name = derivedFileName({
+          sourceName,
+          kind: input.kind,
+          ...(input.lang ? { lang: input.lang } : {}),
+          tool: input.tool,
+          modified: tx.now,
+          ext: input.ext,
+          tz: core.zoneOf(st.project),
+        });
+        if (tx.encrypted) name = encName(name);
+        name = withCollisionSuffix(name, (n) => taken.has(foldName(n)));
+        taken.add(foldName(name)); // the next file of this change never takes the same name
+        const rel = `${dir}/${name}`;
+        if (input.fromEncrypted && !tx.encrypted) throw new TypeError("an encrypted input file needs an encrypted project");
+        const { sha256, bytes } = await tx.copyFile(input.fromPath, rel, {
+          encrypt: tx.encrypted,
+          mode: fileMode(core, st, identifiable),
+          ...(input.fromEncrypted ? { sourceEncrypted: true } : {}),
+        });
+        made.push(
+          Asset.parse({
+            id: newId(),
+            sourceId,
+            role: "derived",
+            kind: input.kind,
+            path: rel,
+            encrypted: tx.encrypted,
+            sha256,
+            bytes,
+            mime: mimeFor(input.ext.replace(/^\.+/, "")),
+            derivation: input.derivation,
+            ...(input.metadata ? { metadata: input.metadata } : {}),
+          }),
+        );
+      }
+      tx.entity("asset", made[0]!.id);
+      const sf: SourceFile = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor }, assets: [...cur.assets, ...made] };
       if (internal.completesPendingProxy) withPending(sf, (cur.pendingProxies ?? []).filter((j) => j.id !== internal.completesPendingProxy));
       if (internal.completesPendingOcr) withPendingOcr(sf, (cur.pendingOcr ?? []).filter((j) => j.id !== internal.completesPendingOcr));
       await writeSourceFile(core, tx, sf);
-      tx.record("asset", asset.id, null, asset);
+      for (const asset of made) tx.record("asset", asset.id, null, asset);
       tx.index((sink) => sink.indexSource(sf));
-      return asset;
+      return made;
     },
-    { op: "asset.derive" },
+    // One file: the entry as it always was; several: the entry names each (FR-393).
+    { op: "asset.derive", ...(inputs.length > 1 ? { auditDetails: () => ({ files: made.map((a, i) => ({ asset: a.id, ext: inputs[i]!.ext })) }) } : {}) },
   );
 }
 

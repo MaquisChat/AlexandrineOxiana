@@ -11,7 +11,7 @@ import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { createAnnotation, deleteAnnotation, listAnnotations, updateAnnotation, type AnnotationDraft, type AnnotationPatch } from "./annotations.js";
 import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord, resetZoteroWebVersion, updateWatchedFolderOptions, type WatchedFolderOptionsPatch } from "./import-settings.js";
-import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingOcrMany, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
+import { addDerivedAsset, addDerivedAssets, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingOcrMany, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
 import {
   createCollection,
@@ -311,6 +311,10 @@ export class Repo {
   }
   addDerivedAsset(projectId: string, sourceId: string, input: DerivedAssetInput): Promise<Asset> {
     return addDerivedAsset(this.core, projectId, sourceId, input);
+  }
+  /** Several derived assets of one source in one governed change: all of them or none (FR-393, R464 c). */
+  addDerivedAssets(projectId: string, sourceId: string, inputs: DerivedAssetInput[]): Promise<Asset[]> {
+    return addDerivedAssets(this.core, projectId, sourceId, inputs);
   }
   /** Adds a further original (e.g. a refreshed, dated platform-metadata snapshot); originals are never replaced. */
   addOriginalAsset(projectId: string, sourceId: string, input: OriginalAssetInput): Promise<Asset> {
