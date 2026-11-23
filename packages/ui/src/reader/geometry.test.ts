@@ -15,7 +15,7 @@ import { getDocument, type PageViewport, type PDFPageProxy } from "pdfjs-dist/le
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { pdfSortIndex } from "@ao/core/annotations/sortIndex";
 import { buildRotatedCropPdf, buildTwoColumnPdf } from "../../../../tests/fixtures/generate.mjs";
-import { normaliseQuote, pdfRectToBox, selectionToAnchors, selectionToPdfRects, type Box, type DOMRectLike, type PageGeometry } from "./geometry";
+import { joinQuotes, normaliseQuote, pdfRectToBox, selectionToAnchors, selectionToPdfRects, type Box, type DOMRectLike, type PageGeometry } from "./geometry";
 import { canJudge, quoteStillUnder, type TextContent } from "./textCheck";
 
 let task: ReturnType<typeof getDocument>;
@@ -417,5 +417,27 @@ describe("normaliseQuote (Task R10)", () => {
     expect(normaliseQuote("a well-known name")).toBe("a well-known name");
     expect(normaliseQuote("ends with a dash -\n then more")).toBe("ends with a dash - then more");
     expect(normaliseQuote("bell\u0007 rang")).toBe("bell rang");
+  });
+
+  it("joins lines of Chinese or Japanese text with nothing between; mixed text keeps its spaces (FR-454)", () => {
+    expect(normaliseQuote("研究者は資料を\n整理する。")).toBe("研究者は資料を整理する。");
+    expect(normaliseQuote("社会科学的研究\n 方法论")).toBe("社会科学的研究方法论");
+    expect(normaliseQuote("「インタビュー」\nの記録")).toBe("「インタビュー」の記録");
+    expect(normaliseQuote("カタカナの語ー\nテキスト")).toBe("カタカナの語ーテキスト");
+    // Mixed: a line break between Latin and Chinese or Japanese text stays a space.
+    expect(normaliseQuote("the word\n研究 means research")).toBe("the word 研究 means research");
+    expect(normaliseQuote("研究\nmeans research")).toBe("研究 means research");
+    // A space within a line is kept, as are line breaks in Korean (written with spaces).
+    expect(normaliseQuote("東京 大学")).toBe("東京 大学");
+    expect(normaliseQuote("사회 과학\n연구")).toBe("사회 과학 연구");
+  });
+});
+
+describe("joinQuotes (FR-454)", () => {
+  it("joins a quote's pages as its lines are joined", () => {
+    expect(joinQuotes(["研究者は資料を", "整理する。"])).toBe("研究者は資料を整理する。");
+    expect(joinQuotes(["the end of one page", "and the next"])).toBe("the end of one page and the next");
+    expect(joinQuotes(["研究", "means"])).toBe("研究 means");
+    expect(joinQuotes(["only one"])).toBe("only one");
   });
 });

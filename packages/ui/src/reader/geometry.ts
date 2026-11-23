@@ -115,17 +115,42 @@ function sameLine(a: PdfRectDto, b: PdfRectDto): boolean {
 }
 
 /**
+ * A character of Chinese or Japanese text: Han, kana, and their punctuation and full-width forms
+ * (FR-454). Such text is written without spaces, so a line break between two of them is no space.
+ * Korean is written with spaces and is not among them.
+ */
+const CJK = "\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}\\u3000-\\u303F\\u30A0-\\u30FF\\uFF00-\\uFFEF";
+const CJK_LINE_BREAK = new RegExp(`(?<=[${CJK}])[^\\S\\n]*\\n\\s*(?=[${CJK}])`, "gu");
+const CJK_END = new RegExp(`[${CJK}]$`, "u");
+const CJK_START = new RegExp(`^[${CJK}]`, "u");
+
+/**
  * A quote as stored: the selection's text with a word hyphenated at a line's end joined again
- * ("self-" and "evident" on the next line → "selfevident"), control characters dropped, and every
- * run of white space (line breaks included) made one space, trimmed.
+ * ("self-" and "evident" on the next line → "selfevident"), a line break between two characters of
+ * Chinese or Japanese text dropped (FR-454), control characters dropped, and every other run of
+ * white space (line breaks included) made one space, trimmed.
  */
 export function normaliseQuote(text: string): string {
   return text
     .replace(/(\p{L})[-­‐]\s*\n\s*(?=\p{L})/gu, "$1")
+    .replace(CJK_LINE_BREAK, "")
     .replace(/­/gu, "")
     .replace(/\p{Cc}/gu, (c) => (/\s/u.test(c) ? c : " "))
     .replace(/\s+/gu, " ")
     .trim();
+}
+
+/**
+ * The quotes of a selection's pages as one quote, joined as its lines are: with nothing between
+ * Chinese or Japanese text on both sides of a page break, with a space otherwise (FR-454).
+ */
+export function joinQuotes(quotes: readonly string[]): string {
+  let out = "";
+  for (const q of quotes) {
+    if (out !== "" && !(CJK_END.test(out) && CJK_START.test(q))) out += " ";
+    out += q;
+  }
+  return out;
 }
 
 /** One drawn page as the selection sees it. */

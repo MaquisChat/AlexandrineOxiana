@@ -34,7 +34,7 @@ import { ApiClientError } from "../api/client";
 import type { AnnotationCreateRequest, AnnotationRecord, HighlightColourName, PdfRectDto, ReaderApi } from "../api/reader";
 import { NOTE_FIRST, noteBeingWritten, READ_ONLY_READER } from "./AnnotationList";
 import { HighlightToolbar, OverlapMenu } from "./HighlightToolbar";
-import { pdfRectToBox, selectionToAnchors, type Box, type PageGeometry, type SelectionAnchor } from "./geometry";
+import { joinQuotes, pdfRectToBox, selectionToAnchors, type Box, type PageGeometry, type SelectionAnchor } from "./geometry";
 import type { PdfHandle } from "./pdfjs";
 import { END_OF_CONTENT_CLASS } from "./textLayerSelection";
 
@@ -412,7 +412,7 @@ export function useHighlightMaking(o: MakingOptions) {
     await make({
       kind: "highlight",
       anchors: p.anchors,
-      quote: p.anchors.map((a) => a.quote).join(" "),
+      quote: joinQuotes(p.anchors.map((a) => a.quote)),
       colour,
       adding: ADDING,
       silent: SERVICE_SILENT,
