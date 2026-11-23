@@ -39,6 +39,7 @@ import {
   type RestoreOptions,
   type RestoreResult,
 } from "./backup.js";
+import { exportProjectOpenFormats } from "./project-export.js";
 import { OPEN_GOV, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./test-kit.js";
 
 type Restored = RestoreResult;
@@ -1245,5 +1246,66 @@ describe("4. a restored project's warning about inherited backups stands from th
     expect(left).toEqual([d.p.id, copy].sort());
     expect(await projectWarnings(kit.repo, copy)).toContain(WARNING);
     expect(await holdingNotRemoved(kit.repo, copy)).toEqual([rel(d.x)]);
+  });
+});
+
+describe("FR-410: exporting a restored copy states a destruction as fact only where the log vouches for it", () => {
+  /** RETAIN, with identifiable sources exportable, so the export reaches the raw file's source. */
+  const RETAIN_EXPORTABLE = RETAIN.replace("deidentifiedExportsOnly: true", "deidentifiedExportsOnly: false");
+  const notesOf = async (dir: string) => readFile(join(dir, "notes.txt"), "utf8").catch(() => "");
+
+  it("a file left out on records nothing vouches for: the export says the log says so and could not be verified", async () => {
+    const z = await makeProject(kit, RETAIN_EXPORTABLE, false, "Bystander");
+    const zRaw = await rawSource(z); // the same bytes as Origin's raw file
+    await addSource(kit, z, { title: "something else" });
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T09:59:00.000Z");
+    const offline = join(kit.tmp, "Origin offline copy.zip");
+    await writeFile(offline, await readFile((await backupProject(kit.repo, p.id)).path));
+    at("2026-12-02T10:00:00.000Z");
+    backupSeams.failBackup = true;
+    await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    await breakAudit(z, (l) => l.includes('"op":"retention.destroy"'));
+    const r = await restore(offline);
+    expect(r.leftOut).toEqual([expect.objectContaining({ unverified: true })]);
+    // The restore names the copy's file it left out on unverified ground (ids only).
+    expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ destroyedUnverifiedAssetIds: [r.leftOut[0]!.assetId] });
+
+    const out = await exportProjectOpenFormats(kit.repo, r.projectId, join(kit.tmp, "out"));
+    const notes = await notesOf(out.path);
+    expect(notes).toContain("1 file is not included. The project's log says this file was destroyed under its retention rule; that entry could not be verified.");
+    expect(notes).not.toMatch(/was destroyed under the project's retention rule/u);
+    expect(out.omittedFiles).toBe(1);
+
+    // A backup of the copy, restored: the file keeps its mark (an earlier restore named it).
+    later(HOUR);
+    const again = await restore((await backupProject(kit.repo, r.projectId)).path);
+    const out2 = await exportProjectOpenFormats(kit.repo, again.projectId, join(kit.tmp, "out2"));
+    expect(await notesOf(out2.path)).toContain("1 file is not included. The project's log says this file was destroyed under its retention rule; that entry could not be verified.");
+  });
+
+  it("a file left out on a verified record is still said to have been destroyed", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T09:59:00.000Z");
+    const offline = join(kit.tmp, "Origin offline copy.zip");
+    await writeFile(offline, await readFile((await backupProject(kit.repo, p.id)).path));
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    const r = await restore(offline);
+    expect(r.leftOut).toEqual([expect.not.objectContaining({ unverified: true })]);
+    const out = await exportProjectOpenFormats(kit.repo, r.projectId, join(kit.tmp, "out"));
+    expect(await notesOf(out.path)).toContain("1 file was destroyed under the project's retention rule and is not included.");
+
+    // The copy's log changed outside the app: no destruction is stated as fact any more.
+    await breakAudit(kit.repo.getProject(r.projectId), (l) => l.includes('"op":"project.restore"'));
+    const out2 = await exportProjectOpenFormats(kit.repo, r.projectId, join(kit.tmp, "out2"));
+    const notes2 = await notesOf(out2.path);
+    expect(notes2).toContain("1 file is not included. The project's log says this file was destroyed under its retention rule; that entry could not be verified.");
+    expect(notes2).not.toMatch(/was destroyed under the project's retention rule/u);
   });
 });

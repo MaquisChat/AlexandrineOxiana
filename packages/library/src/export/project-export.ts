@@ -21,7 +21,9 @@
  * location rule (`sharing.locationMetadata`): keep → the original; coarsen / strip → the source's
  * verified viewing proxy for it (its recorded rule at least as strict), else the original only if
  * its metadata, read again, shows no location; otherwise the file is left out with a note.
- * Destroyed files (retention) are not there to export. The folder is written as
+ * Destroyed files (retention) are not there to export; notes.txt states a destruction as fact only
+ * while the project's log verifies and no restore named the file as left out on records the app
+ * could not vouch for (FR-410). The folder is written as
  * `<folder>.partial` and renamed when complete; leftover .partial folders (a crash) are overwritten
  * and removed by the next export. `dest` is checked where it really is (the realpath of its nearest
  * existing ancestor), before and after it is created. File and folder names are pseudonymized
@@ -61,6 +63,7 @@ import {
   projectPseudonymMap,
   pseudonymizesIdentifiable,
   repoLibrary,
+  verifiedAuditEvents,
   type Repo,
 } from "../repo/repo.js";
 import { activeTemp } from "../tmp-registry.js";
@@ -371,6 +374,23 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
   const notes: string[] = [];
   let omittedLocated = 0;
   let omittedDestroyed = 0;
+  /** Destroyed files whose destruction the project's log does not vouch for (FR-410). */
+  let omittedUnverified = 0;
+  /**
+   * FR-410 (R365 a): a destruction is stated as fact only while the project's log verifies and no
+   * restore named the file as left out on records the app could not vouch for; null: the log does
+   * not verify, so no destruction is stated as fact. Read only when there is a destroyed original.
+   */
+  let unverifiedDestroyed: Set<string> | null = new Set();
+  if (allowed.some(({ sf }) => sf.assets.some((a) => a.role === "original" && a.status === "destroyed"))) {
+    const log = await verifiedAuditEvents(repo, projectId);
+    if (!log.ok) unverifiedDestroyed = null;
+    else
+      for (const e of log.events) {
+        const named = e.action === "project.restored" ? (e.details as { destroyedUnverifiedAssetIds?: unknown } | undefined)?.destroyedUnverifiedAssetIds : undefined;
+        if (Array.isArray(named)) for (const id of named) if (typeof id === "string") unverifiedDestroyed.add(id);
+      }
+  }
   let filesWritten = 0;
   const work = `worker-export-${randomUUID()}`;
   const workDir = join(lib.root, ".tmp", work);
@@ -408,7 +428,8 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
       for (const a of sf.assets) {
         if (a.role !== "original") continue;
         if (a.status === "destroyed") {
-          omittedDestroyed++;
+          if (unverifiedDestroyed === null || unverifiedDestroyed.has(a.id)) omittedUnverified++;
+          else omittedDestroyed++;
           continue;
         }
         if (mode === "keep" || !LOCATED_MEDIA.test(a.mime)) {
@@ -482,6 +503,13 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
       );
     }
     if (omittedDestroyed) notes.push(`${plural(omittedDestroyed, "file was", "files were")} destroyed under the project's retention rule and ${omittedDestroyed === 1 ? "is" : "are"} not included.`);
+    if (omittedUnverified) {
+      notes.push(
+        omittedUnverified === 1
+          ? "1 file is not included. The project's log says this file was destroyed under its retention rule; that entry could not be verified."
+          : `${omittedUnverified} files are not included. The project's log says these files were destroyed under its retention rule; those entries could not be verified.`,
+      );
+    }
     if (notes.length) await writeFileAtomic(join(root, "notes.txt"), `${notes.join("\n")}\n`, { mode: 0o600 });
     await renameWithRetry(root, finalRoot);
   } catch (err) {
@@ -497,7 +525,7 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
     exported: allowed.length,
     withheld,
     files: filesWritten,
-    omittedFiles: omittedLocated + omittedDestroyed,
+    omittedFiles: omittedLocated + omittedDestroyed + omittedUnverified,
   });
-  return { path: finalRoot, exported: allowed.length, withheld, omittedFiles: omittedLocated + omittedDestroyed, notes };
+  return { path: finalRoot, exported: allowed.length, withheld, omittedFiles: omittedLocated + omittedDestroyed + omittedUnverified, notes };
 }
