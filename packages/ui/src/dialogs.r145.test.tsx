@@ -1,11 +1,15 @@
 /**
- * R145, re-checked at the final review (FR-234, FR-601): every dialog and every popover of the
- * screens, opened from the control a researcher uses, in one table. For each, through
+ * R145, re-checked at the final review (FR-234, FR-601, R467 I2): every dialog and every popover in
+ * one table. The rows marked "from <screen>" open it from the screen that really uses it, by the
+ * control a researcher uses; the first rows check the shared dialog shells themselves under a
+ * stand-in opener, and the reader's menus and toolbar are opened from their own components (the
+ * reader screen draws pages with pdf.js, which this test environment cannot run). For each, through
  * `document.activeElement`:
  *  - a modal dialog: focus moves in on open (to the element named, where the dialog chooses one);
  *    the page behind is inert; Tab and Shift+Tab stay inside, past both ends; Escape (where allowed)
  *    and the close control close it and give focus back to the control that opened it, or to the
- *    named fallback when that control is gone;
+ *    named fallback when that control is gone; where confirming it takes the opener away (a row
+ *    deleted, a button that goes), focus lands on a named place (a heading), never the page body;
  *  - a menu: focus moves in on open; Tab, Shift+Tab and Escape close it and give focus back;
  *  - the highlight toolbar and the style picker's list are not dialogs: they never take focus;
  *    what they do with it is checked as they promise.
@@ -34,7 +38,15 @@ import { FieldCheck } from "./components/VerificationBadge";
 import { PATHS } from "./navigation";
 import { AnnotationList } from "./reader/AnnotationList";
 import { HighlightToolbar, OverlapMenu } from "./reader/HighlightToolbar";
+import { ApiClientError, type ApiClient } from "./api/client";
+import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
 import { AuditLog } from "./screens/AuditLog";
+import { ExtensionPairing } from "./screens/ExtensionPairing";
+import { Fieldwork } from "./screens/Fieldwork";
+import { FindAcquire } from "./screens/FindAcquire";
+import { GovernanceSettings } from "./screens/GovernanceSettings";
+import { MoveLibrary } from "./screens/MoveLibrary";
+import { SourceDetail } from "./screens/SourceDetail";
 import { Capture } from "./screens/Capture";
 import { ReviewQueue } from "./screens/import/ReviewQueue";
 import { StepReport } from "./screens/import/StepReport";
@@ -43,13 +55,16 @@ import { WatchedFoldersRoute } from "./screens/WatchedFolders";
 import { mockCapture, P1 as CAPTURE_P1, server as captureServer } from "./test/captureService";
 import { fakeShell, type FakeShell } from "./test/desktopShell";
 import { B1, mockService, P1 as IMPORT_P1, REPORT, server as importServer } from "./test/importService";
-import { makeApi as governanceApi, url as governanceUrl } from "./test/msw-governance";
+import { DEFAULT_APPEARANCE, type AppearanceSettings } from "./theme/appearance";
+import { AppearanceProvider } from "./theme/AppearanceProvider";
+import { BROWSER_A, BROWSER_B, makeApi as extensionApi, pairingService, server as extensionServer } from "./test/msw-extension";
+import { makeApi as governanceApi, server as governanceServer, url as governanceUrl } from "./test/msw-governance";
 import { makeApi as toolsApi, memoryStore, toolsService } from "./test/msw-tools";
-import { CURRENT_RW, libraryHandlers, PROJECTS, server, STYLES, testApi, testClient, url } from "./test/service";
-import { FIELD_ISSUED_CONFLICT } from "./test/verification";
+import { CURRENT_RW, libraryHandlers, ndjson, PROJECTS, server, SOURCE_FILE, STYLES, testApi, testClient, url } from "./test/service";
+import { FIELD_CREATORS_UNVERIFIED, FIELD_DOI_CONFIRMED, FIELD_ISSUED_CONFLICT, FIELD_PUBLISHER_SINGLE, FIELD_TITLE_VERIFIED, sourceHandlers, VERIFIED_SOURCE, withFields } from "./test/verification";
 
 const fake = vi.hoisted(() => ({ shell: undefined as FakeShell | undefined }));
-vi.mock("./desktopShell", () => ({ desktopShell: () => fake.shell, inDesktopShell: () => !!fake.shell }));
+vi.mock("./desktopShell", async (original) => ({ ...(await original<typeof import("./desktopShell")>()), desktopShell: () => fake.shell, inDesktopShell: () => !!fake.shell }));
 
 type User = ReturnType<typeof userEvent.setup>;
 
@@ -86,6 +101,8 @@ interface Opened {
   close: { name: string | RegExp; to?: () => HTMLElement };
   /** Opens it again (default: a click on the opener). */
   reopen?: () => Promise<void>;
+  /** Confirming it (after the other checks; it is opened again first), and where focus must land then (R467 I2). */
+  confirm?: { act: (dialog: HTMLElement) => Promise<void>; to: () => HTMLElement };
 }
 
 interface Row {
@@ -143,6 +160,16 @@ async function checkModal(user: User, o: Opened) {
   await waitFor(() => expect(o.shown()).toBeNull());
   await waitFor(() => expect(document.activeElement).toBe((o.close.to ?? (() => o.opener))()));
   expect(document.querySelector("[inert]")).toBeNull();
+  // Confirmed: focus lands where the row says, never on the page body (R467 I2).
+  if (o.confirm) {
+    await (o.reopen ? o.reopen() : user.click(o.opener));
+    await waitFor(() => expect(inside(o.shown())).toBe(true));
+    await o.confirm.act(o.shown()!);
+    await waitFor(() => expect(o.shown()).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(o.confirm!.to()));
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.querySelector("[inert]")).toBeNull();
+  }
   expect(refused).toEqual([]);
 }
 
@@ -324,6 +351,74 @@ async function checkRecoveryStep(user: User, opener: HTMLElement) {
   await waitFor(() => expect(document.activeElement).toBe(opener));
   expect(document.querySelector("[inert]")).toBeNull();
   expect(refused).toEqual([]);
+}
+
+/** The Fieldwork screen's records (as Fieldwork.test serves them), for a row to fill. */
+const FIELD_PID = "0190f0f0-0000-7000-8000-000000000003";
+function fieldwork() {
+  const db = { participants: [] as any[], sessions: [] as any[], consents: [] as any[] };
+  const P = (path: string) => governanceUrl(`/projects/${FIELD_PID}${path}`);
+  governanceServer.use(
+    http.get(P("/participants"), () => HttpResponse.json({ participants: db.participants, complete: true })),
+    http.get(P("/sessions"), () => HttpResponse.json({ sessions: db.sessions, complete: true })),
+    http.get(P("/consents"), () => HttpResponse.json({ consents: db.consents, complete: true })),
+    http.delete(P("/participants/:fid"), ({ params }) => {
+      db.participants = db.participants.filter((x) => x.id !== params.fid);
+      return HttpResponse.json({ deleted: true });
+    }),
+    http.delete(P("/sessions/:fid"), ({ params }) => {
+      db.sessions = db.sessions.filter((x) => x.id !== params.fid);
+      return HttpResponse.json({ deleted: true });
+    }),
+    http.post(P("/consents/:fid/withdraw"), ({ params }) => {
+      const c = db.consents.find((x) => x.id === params.fid);
+      c.withdrawn = { at: "2026-11-11T09:00:00.000Z" };
+      return HttpResponse.json({ consent: c, flaggedSourceIds: [] });
+    }),
+  );
+  return db;
+}
+
+/** The appearance screen with a settings file that cannot be read until it is reset (as AppearanceSettings.reset.test sets it up). */
+function appearance(o: { appearanceUnreadable?: boolean; fontsUnreadable?: boolean }) {
+  let cur: AppearanceSettings = structuredClone(DEFAULT_APPEARANCE);
+  const state = { appearanceUnreadable: !!o.appearanceUnreadable, fontsUnreadable: !!o.fontsUnreadable };
+  const unreadable = (reason: "appearance" | "fonts") => new ApiClientError(503, { code: "UNAVAILABLE", reason, message: "That settings file could not be read, so it was not changed." });
+  const put = async (patch: Partial<AppearanceSettings>) => {
+    if (state.appearanceUnreadable) throw unreadable("appearance");
+    cur = { ...cur, ...patch, fonts: { ...cur.fonts, ...(patch.fonts ?? {}) } } as AppearanceSettings;
+    return structuredClone(cur);
+  };
+  const request = async (method: string, path: string, opts?: { body?: { file?: string } }) => {
+    if (method === "POST" && path === "/settings/reset") {
+      if (opts?.body?.file === "fonts") state.fontsUnreadable = false;
+      if (opts?.body?.file === "appearance") state.appearanceUnreadable = false;
+      return { reset: true, keptAs: `${opts?.body?.file}.json.unreadable-20261112-101530` };
+    }
+    if (state.fontsUnreadable && path.startsWith("/settings/fonts")) throw unreadable("fonts");
+    if (method === "GET" && path === "/settings/fonts") return { fonts: [] };
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  const client = { appearance: { get: async () => structuredClone(cur), put }, request, bytes: async () => new Blob([]) } as unknown as ApiClient;
+  render(
+    <AppearanceProvider client={client} initial={DEFAULT_APPEARANCE}>
+      <AppearanceSettingsScreen />
+    </AppearanceProvider>,
+  );
+}
+
+/** The Find and acquire screen's service (as FindAcquire.test serves it): one project, its queue as `entries` gives it. */
+const FIND_PID = FIND_ENTRY.projectId;
+function findService(entries: () => FindEntryView[]) {
+  server.use(
+    http.get(url("/events"), () => new HttpResponse(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } })),
+    http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "lib-1", name: "Thesis library", mode: "read-write" } })),
+    http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: FIND_PID, name: "Market study", folder: "Market study", encrypted: false, unlocked: true }] })),
+    http.get(url("/projects/:id/collections"), () => HttpResponse.json({ collections: [] })),
+    http.get(url("/find/screen"), () => HttpResponse.json({ checkEverything: false })),
+    http.get(url("/projects/:id/find"), () => HttpResponse.json({ entries: entries(), checkEverything: false, lockedProjectsNotChecked: 0, readOnly: false, unreadableLines: 0 })),
+    http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(SOURCE_FILE)),
+  );
 }
 
 const ENC = { id: "p4", name: "Clinic follow-up", folder: "Projects/Clinic follow-up", encrypted: true, unlocked: true, profiles: ["hipaa"] };
@@ -712,6 +807,359 @@ const rows: Row[] = [
       expect(field.getAttribute("aria-expanded")).toBe("false");
       expect(document.activeElement).not.toBe(document.body);
       expect(refused).toEqual([]);
+    },
+  },
+  // ======== R467 I2: the shared dialogs opened from the screens that use them ========
+  {
+    name: "Delete old copy (from MoveLibrary; confirmed, the button is gone: focus on the Progress heading)",
+    srv: governanceServer,
+    kind: "modal",
+    open: async (user) => {
+      const DEST = "/Volumes/Field SSD/Library";
+      const plan = { destination: { kind: "removable" }, perProject: [{ projectId: "p1", name: "Coastal kinship", folder: "Projects/Coastal kinship", decision: { result: "allow", warnings: [] } }], projectsMovedAway: [], totalBytes: 5, fileCount: 1 };
+      const result = { newRoot: DEST, confirmToken: "tok-123", expiresAt: "2026-11-11T10:15:00.000Z", fileCount: 1, totalBytes: 5, filesCopied: 1, projectsMovedAway: [], warnings: [] };
+      governanceServer.use(
+        http.post(governanceUrl("/libraries/move/plan"), () => HttpResponse.json(plan)),
+        http.post(governanceUrl("/libraries/move"), () => ndjson([{ done: true, result }], 0)),
+        http.post(governanceUrl("/libraries/move/delete-old"), () => HttpResponse.json({ deleted: true, warnings: [] })),
+      );
+      render(<MoveLibrary api={governanceApi()} />);
+      await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
+      await user.click(screen.getByRole("button", { name: "Check destination" }));
+      await user.click(within(await screen.findByRole("region", { name: "Move plan" })).getByRole("button", { name: "Move library" }));
+      const opener = screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement;
+      await waitFor(() => expect(opener.disabled).toBe(false));
+      await user.click(opener);
+      return {
+        opener,
+        shown: byRole("dialog", "Delete old copy"),
+        first: () => screen.getByRole("textbox", { name: /Type delete to confirm/ }),
+        close: { name: "Cancel" },
+        confirm: {
+          act: async (d) => {
+            await user.type(within(d).getByRole("textbox", { name: /Type delete to confirm/ }), "delete");
+            await user.click(within(d).getByRole("button", { name: "Delete the old copy" }));
+          },
+          to: () => screen.getByRole("heading", { name: "Progress" }),
+        },
+      };
+    },
+  },
+  {
+    name: "Record a reason (from GovernanceSettings: a loosening chosen in a field)",
+    srv: governanceServer,
+    kind: "modal",
+    open: async (user) => {
+      const PID = "0190f0f0-0000-7000-8000-000000000001";
+      governanceServer.use(
+        http.get(governanceUrl(`/projects/${PID}/governance`), () => HttpResponse.json({ yaml: "encryption:\n  atRest: optional\n", sha256: "a".repeat(64), violations: [] })),
+        http.get(governanceUrl(`/projects/${PID}/protocol/documents`), () => HttpResponse.json({ documents: [] })),
+        http.get(governanceUrl(`/projects/${PID}/retention`), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+      );
+      render(<GovernanceSettings api={governanceApi()} projectId={PID} />);
+      await screen.findByRole("region", { name: "Encryption" });
+      await user.click(screen.getByRole("checkbox", { name: "HIPAA" }));
+      const select = () => within(screen.getByRole("region", { name: "Encryption" })).getByRole("combobox", { name: "Encryption at rest" });
+      const loosen = async () => {
+        await user.selectOptions(select(), "optional");
+        await screen.findByRole("dialog", { name: "Record a reason" });
+      };
+      await loosen();
+      return {
+        opener: select(),
+        shown: byRole("dialog", "Record a reason"),
+        first: () => screen.getByRole("textbox", { name: "Reason" }),
+        escapeTo: select,
+        close: { name: "Cancel", to: select },
+        reopen: loosen,
+        confirm: {
+          act: async (d) => {
+            await user.type(within(d).getByRole("textbox", { name: "Reason" }), "IRB amendment 7");
+            await user.type(within(d).getByRole("textbox", { name: "Approved by" }), "Dr Ana Souza");
+            await user.click(within(d).getByRole("button", { name: "Record reason" }));
+          },
+          to: select,
+        },
+      };
+    },
+  },
+  {
+    name: "Destroy raw data (from GovernanceSettings; confirmed, nothing is left to destroy: focus on the certificate's heading)",
+    srv: governanceServer,
+    kind: "modal",
+    open: async (user) => {
+      const PID = "0190f0f0-0000-7000-8000-000000000001";
+      let due = [{ sourceId: "s1", title: "Interview with the harbour master", assetIds: ["a1"] }];
+      governanceServer.use(
+        http.get(governanceUrl(`/projects/${PID}/governance`), () => HttpResponse.json({ yaml: "encryption:\n  atRest: optional\n", sha256: "a".repeat(64), violations: [] })),
+        http.get(governanceUrl(`/projects/${PID}/protocol/documents`), () => HttpResponse.json({ documents: [] })),
+        http.get(governanceUrl(`/projects/${PID}/retention`), () => HttpResponse.json({ destroyAfter: "2026-01-01", due })),
+        http.post(governanceUrl(`/projects/${PID}/retention/destroy`), () => {
+          due = [];
+          return HttpResponse.json({
+            certificateFile: "Projects/Field/retention/destruction.json",
+            certificate: { kind: "destruction-certificate", at: "2026-11-11T09:30:00.000Z", actor: "ana", assets: [{ assetId: "a1" }], backups: { status: "none", containing: [], deleted: [] }, notice: "Each file was overwritten with zeros and then deleted." },
+          });
+        }),
+      );
+      render(<GovernanceSettings api={governanceApi()} projectId={PID} />);
+      const ret = await screen.findByRole("region", { name: "Retention and destruction" });
+      await within(ret).findByText("Interview with the harbour master");
+      const opener = within(ret).getByRole("button", { name: "Destroy raw data" });
+      await user.click(opener);
+      return {
+        opener,
+        shown: byRole("dialog", "Destroy raw data"),
+        first: () => screen.getByRole("textbox", { name: /Type destroy to confirm/ }),
+        close: { name: "Cancel" },
+        confirm: {
+          act: async (d) => {
+            await user.type(within(d).getByRole("textbox", { name: /Type destroy to confirm/ }), "destroy");
+            await user.click(within(d).getByRole("button", { name: "Destroy permanently" }));
+          },
+          to: () => screen.getByRole("heading", { name: "Destruction certificate" }),
+        },
+      };
+    },
+  },
+  {
+    name: "Reset the list of paired browsers? (from ExtensionPairing; confirmed, the button is gone: focus on Paired browsers)",
+    srv: extensionServer,
+    kind: "modal",
+    open: async (user) => {
+      extensionServer.use(...pairingService({ unreadable: true }).handlers);
+      render(<ExtensionPairing api={extensionApi()} />);
+      const opener = await screen.findByRole("button", { name: "Reset the list of paired browsers…" });
+      await user.click(opener);
+      return {
+        opener,
+        shown: byRole("dialog", "Reset the list of paired browsers?"),
+        first: () => screen.getByRole("heading", { name: "Reset the list of paired browsers?" }),
+        close: { name: "Cancel" },
+        confirm: { act: (d) => user.click(within(d).getByRole("button", { name: "Reset the list" })), to: () => screen.getByRole("heading", { name: "Paired browsers" }) },
+      };
+    },
+  },
+  {
+    name: "Revoke this browser? (from ExtensionPairing; confirmed, its row is gone: focus on Paired browsers)",
+    srv: extensionServer,
+    kind: "modal",
+    open: async (user) => {
+      extensionServer.use(...pairingService({ pairings: [BROWSER_A, BROWSER_B] }).handlers);
+      render(<ExtensionPairing api={extensionApi()} />);
+      const opener = await screen.findByRole("button", { name: `Revoke ${BROWSER_A.origin}` });
+      await user.click(opener);
+      return {
+        opener,
+        shown: byRole("dialog", "Revoke this browser?"),
+        first: () => screen.getByRole("heading", { name: "Revoke this browser?" }),
+        close: { name: "Cancel" },
+        confirm: { act: (d) => user.click(within(d).getByRole("button", { name: "Revoke pairing" })), to: () => screen.getByRole("heading", { name: "Paired browsers" }) },
+      };
+    },
+  },
+  {
+    name: "Delete participant (from Fieldwork; confirmed, its row is gone: focus on Participants)",
+    srv: governanceServer,
+    kind: "modal",
+    open: async (user) => {
+      const db = fieldwork();
+      db.participants.push({ id: "0190f0f0-0000-7000-8000-0000000000p1".replace("p", "a"), code: "P-001", consentIds: [] }, { id: "0190f0f0-0000-7000-8000-0000000000b2", code: "P-002", consentIds: [] });
+      render(<Fieldwork api={governanceApi()} projectId={FIELD_PID} />);
+      const opener = await screen.findByRole("button", { name: "Delete P-001" });
+      await user.click(opener);
+      return {
+        opener,
+        shown: byRole("dialog", "Delete participant P-001"),
+        first: () => screen.getByRole("heading", { name: "Delete participant P-001" }),
+        close: { name: "Cancel" },
+        confirm: { act: (d) => user.click(within(d).getByRole("button", { name: "Delete" })), to: () => screen.getByRole("heading", { name: "Participants" }) },
+      };
+    },
+  },
+  {
+    name: "Delete the session (from Fieldwork; confirmed, its row is gone: focus on Sessions)",
+    srv: governanceServer,
+    kind: "modal",
+    open: async (user) => {
+      const db = fieldwork();
+      db.sessions.push({ id: "0190f0f0-0000-7000-8000-0000000000c1", date: "2026-11-02", place: "Harbour office", participantIds: [] }, { id: "0190f0f0-0000-7000-8000-0000000000c2", date: "2026-11-03", participantIds: [] });
+      render(<Fieldwork api={governanceApi()} projectId={FIELD_PID} />);
+      const opener = await screen.findByRole("button", { name: "Delete the session of 2026-11-02" });
+      await user.click(opener);
+      const title = /^Delete the session of 2026-11-02/;
+      return {
+        opener,
+        shown: byRole("dialog", title),
+        first: () => screen.getByRole("heading", { name: title }),
+        close: { name: "Cancel" },
+        confirm: { act: (d) => user.click(within(d).getByRole("button", { name: "Delete session" })), to: () => screen.getByRole("heading", { name: "Sessions" }) },
+      };
+    },
+  },
+  {
+    name: "Withdraw consent (from Fieldwork; confirmed, the button is gone: focus on Consent records)",
+    srv: governanceServer,
+    kind: "modal",
+    open: async (user) => {
+      const db = fieldwork();
+      const pid = "0190f0f0-0000-7000-8000-0000000000a1";
+      db.participants.push({ id: pid, code: "P-001", consentIds: ["0190f0f0-0000-7000-8000-0000000000d1"] });
+      db.consents.push({ id: "0190f0f0-0000-7000-8000-0000000000d1", participantId: pid, scope: "audio", date: "2026-11-01", method: "written" });
+      render(<Fieldwork api={governanceApi()} projectId={FIELD_PID} />);
+      const opener = await screen.findByRole("button", { name: "Withdraw consent of P-001" });
+      await user.click(opener);
+      return {
+        opener,
+        shown: byRole("dialog", "Withdraw consent"),
+        first: () => screen.getByRole("textbox", { name: /Reason/ }),
+        close: { name: "Cancel" },
+        confirm: { act: (d) => user.click(within(d).getByRole("button", { name: "Withdraw consent" })), to: () => screen.getByRole("heading", { name: "Consent records" }) },
+      };
+    },
+  },
+  {
+    name: "Reset the list of added fonts? (from AppearanceSettings; confirmed, the button is gone: focus on Your own font files)",
+    kind: "modal",
+    open: async (user) => {
+      appearance({ fontsUnreadable: true });
+      const opener = await screen.findByRole("button", { name: "Reset the list of added fonts…" });
+      await user.click(opener);
+      return {
+        opener,
+        shown: byRole("dialog", "Reset the list of added fonts?"),
+        first: () => screen.getByRole("heading", { name: "Reset the list of added fonts?" }),
+        close: { name: "Cancel" },
+        confirm: { act: (d) => user.click(within(d).getByRole("button", { name: "Reset the list" })), to: () => screen.getByRole("heading", { name: "Your own font files" }) },
+      };
+    },
+  },
+  {
+    name: "Reset appearance settings? (from AppearanceSettings; confirmed, the button is gone: focus on Appearance)",
+    kind: "modal",
+    open: async (user) => {
+      appearance({ appearanceUnreadable: true });
+      await user.click(screen.getByRole("radio", { name: "Dark" }));
+      const opener = await screen.findByRole("button", { name: "Reset appearance settings…" });
+      await user.click(opener);
+      return {
+        opener,
+        shown: byRole("dialog", "Reset appearance settings?"),
+        first: () => screen.getByRole("heading", { name: "Reset appearance settings?" }),
+        close: { name: "Cancel" },
+        confirm: { act: (d) => user.click(within(d).getByRole("button", { name: "Reset appearance" })), to: () => screen.getByRole("heading", { name: "Appearance" }) },
+      };
+    },
+  },
+  {
+    name: "Choose the work (from FindAcquire's queue row; confirmed: focus on the row's next control)",
+    kind: "modal",
+    open: async (user) => {
+      const e = { ...WORK_ENTRY, typed: "Bourdieu, Distinction" } as FindEntryView;
+      let current: FindEntryView = e;
+      findService(() => [current]);
+      server.use(
+        http.post(url(`/projects/${FIND_PID}/find/${e.id}/choose`), () => {
+          current = { ...e, state: "record-complete", chosen: "c2", sourceId: "0190a000-0000-7000-8000-0000000000b1", match: { method: "find-chosen", confidence: 1 }, updatedAt: "2026-11-13T11:00:00.000Z" } as FindEntryView;
+          return HttpResponse.json(current);
+        }),
+      );
+      render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search: "" }} />);
+      const opener = await screen.findByRole("button", { name: "Choose: “Bourdieu, Distinction”" });
+      await user.click(opener);
+      return {
+        opener,
+        shown: byRole("dialog"),
+        first: () => within(screen.getByRole("dialog")).getAllByRole("radio")[0]!,
+        close: { name: "Cancel" },
+        confirm: {
+          act: async (d) => {
+            await user.click(within(d).getAllByRole("radio")[1]!);
+            await user.click(within(d).getByRole("button", { name: "Use this one" }));
+          },
+          to: () => screen.getByRole("button", { name: "Open: “Bourdieu, Distinction”" }),
+        },
+      };
+    },
+  },
+  {
+    name: "Choose the person (from FindAcquire's queue row)",
+    kind: "modal",
+    open: async (user) => {
+      findService(() => [FIND_ENTRY]);
+      server.use(http.get(url(`/projects/${FIND_PID}/find/${FIND_ENTRY.id}/options`), () => HttpResponse.json({ people: [PERSON("A1", "David Stark"), PERSON("A2", "David Stark")] })));
+      render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search: "" }} />);
+      const opener = await screen.findByRole("button", { name: "Choose the person: “David Stark”" });
+      await user.click(opener);
+      await waitFor(() => expect(within(screen.getByRole("dialog")).getAllByRole("radio")).toHaveLength(2));
+      return { opener, shown: byRole("dialog", "Choose the person for “David Stark”"), close: { name: "Cancel" } };
+    },
+  },
+  {
+    name: "Choose the works (from FindAcquire's queue row)",
+    kind: "modal",
+    open: async (user) => {
+      const e = { ...FIND_ENTRY, state: "choose-works", peopleCount: 1, chosen: "A1", worksCount: 2 } as FindEntryView;
+      findService(() => [e]);
+      server.use(http.get(url(`/projects/${FIND_PID}/find/${e.id}/options`), () => HttpResponse.json({ works: WORKS, person: { name: "David Stark", subjects: [] } })));
+      render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search: "" }} />);
+      const opener = await screen.findByRole("button", { name: "Choose works: “David Stark”" });
+      await user.click(opener);
+      await waitFor(() => expect(within(screen.getByRole("dialog")).getAllByRole("checkbox").length).toBeGreaterThan(0));
+      return { opener, shown: byRole("dialog"), close: { name: "Cancel" } };
+    },
+  },
+  {
+    name: "A field's evidence (from SourceDetail's badge; confirmed: focus on the badge as it now reads)",
+    kind: "modal",
+    open: async (user) => {
+      server.use(
+        ...sourceHandlers(VERIFIED_SOURCE),
+        http.patch(url("/projects/:id/sources/:sid/fields"), () =>
+          HttpResponse.json(withFields([FIELD_CREATORS_UNVERIFIED, FIELD_DOI_CONFIRMED, { field: "/issued", status: "user-confirmed", checks: ["user"], evidence: FIELD_ISSUED_CONFLICT.evidence }, FIELD_PUBLISHER_SINGLE, FIELD_TITLE_VERIFIED], { source: { ...SOURCE_FILE.source, issued: "2018" } })),
+        ),
+      );
+      render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={() => {}} />);
+      const opener = await screen.findByRole("button", { name: "Publication date: Conflict" });
+      await user.click(opener);
+      return {
+        opener,
+        shown: byRole("dialog"),
+        first: () => screen.getByRole("heading", { name: "Publication date: evidence" }),
+        close: { name: "Close" },
+        confirm: {
+          act: async (d) => {
+            await user.click(within(d).getByRole("radio", { name: /2018/ }));
+            await user.click(within(d).getByRole("button", { name: "Confirm this value" }));
+          },
+          to: () => screen.getByRole("button", { name: "Publication date: Confirmed by you" }),
+        },
+      };
+    },
+  },
+  {
+    name: "A field's evidence (from the project's ReviewQueue, a capture's conflict)",
+    srv: importServer,
+    kind: "modal",
+    open: async (user) => {
+      const titleReview = {
+        field: "/title",
+        status: "conflict",
+        checks: ["lookup"],
+        reason: "The page and its metadata disagree.",
+        values: [
+          { value: { variants: [{ lang: "en", kind: "original", value: "Entry 3" }] }, from: { kind: "page-dom", label: "the web page" } },
+          { value: { variants: [{ lang: "en", kind: "original", value: "Entry three, revised" }] }, from: { kind: "platform-json", label: "the platform's data" } },
+        ],
+        evidence: [],
+      };
+      const capture = { ...WITHDRAWAL, id: "r3", sourceId: "s3", group: "capture", fields: { "/title": "conflict" }, cause: { kind: "capture-conflict" }, reasons: ["The title differs between the page and its metadata."], title: "Entry 3" };
+      const m = mockService({ batches: [], projectReview: { [IMPORT_P1]: [capture as never] }, sources: { s3: { ...RECORD4, source: { ...RECORD4.source, id: "s3", title: { variants: [{ lang: "en", kind: "original", value: "Entry 3" }] } }, fields: [titleReview] } as never } });
+      render(<ReviewQueue client={m.client} projectId={IMPORT_P1} />);
+      await press(user, await screen.findByRole("button", { name: "Show Entry 3" }));
+      const opener = await screen.findByRole("button", { name: "Title: Conflict" });
+      await user.click(opener);
+      return { opener, shown: byRole("dialog"), first: () => screen.getByRole("heading", { name: "Title: evidence" }), close: { name: "Close" } };
     },
   },
 ];

@@ -1029,6 +1029,11 @@ function Retention({ api, projectId, whyId }: { api: GovernanceApi; projectId: s
   const [busy, setBusy] = useState(false);
   const [cert, setCert] = useState<{ certificate: DestructionCertificate; certificateFile: string } | null>(null);
   const certId = useId();
+  /** After a destruction nothing may be left to destroy (its button is then disabled): focus goes to the certificate's heading (R467 I2). */
+  const certHeading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (cert) certHeading.current?.focus();
+  }, [cert]);
   const tzId = useId();
   // The project's time zone (R93): the retention date is read in it; null is UTC.
   const [zone, setZone] = useState<{ saved: string | null; input: string } | null>(null);
@@ -1169,7 +1174,9 @@ function Retention({ api, projectId, whyId }: { api: GovernanceApi; projectId: s
       ) : null}
       {cert ? (
         <section className="ao-certificate" aria-labelledby={certId}>
-          <h3 id={certId}>Destruction certificate</h3>
+          <h3 id={certId} ref={certHeading} tabIndex={-1}>
+            Destruction certificate
+          </h3>
           <p>
             {cert.certificate.assets.length === 1 ? "1 file destroyed" : `${cert.certificate.assets.length} files destroyed`} on {cert.certificate.at} by <UserText>{cert.certificate.actor}</UserText>.
           </p>
