@@ -523,3 +523,21 @@ describe("R483 a: entries already at rest are judged when the queue is opened", 
     expect(changes.filter((c) => c.entryId === w.eid && c.state === "record-complete")).toHaveLength(1);
   });
 });
+
+describe("R483 c: \"Not this file\" drops the pick", () => {
+  it("after the press and \"Not this file\", the entry rests as any record's does after that answer, without the pick on its line", async () => {
+    const w = await world("linked-missing");
+    const r = runner();
+    r.resume(w.p.id);
+    await restsAt(w, "record-complete", "linked-file-missing");
+    await r.getCopy(w.p.id, w.eid);
+    await restsAt(w, "needs-check", "file-looks-right");
+    const [rev] = await pendingReviews(w);
+    const after = await r.resolveHeld(w.p.id, rev!.id, "discard");
+    expect(after).toMatchObject({ state: "no-open-copy", reason: { code: "not-this-file" } });
+    const e = (await entryOf(w))!;
+    expect(e).toMatchObject({ state: "no-open-copy", reason: { code: "not-this-file" } });
+    expect(e.copyDespiteLink).toBeUndefined();
+    expect((await repo.getSource(w.p.id, w.sid)).assets).toHaveLength(1);
+  });
+});

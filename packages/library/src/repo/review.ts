@@ -753,7 +753,8 @@ export async function resolveHeldFile(core: RepoCore, projectId: string, reviewI
       const e = await heldEntry(core, tx.state, reviewId);
       await destroyHeld(tx, e.cause.held);
       await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: "file-discarded" });
-      const next = await entryLine(core, projectId, e.cause.findEntryId, { state: "no-open-copy", reason: { code: "not-this-file" } }, ["nextTryAt"], tx.at);
+      // R483 c: after "Not this file" the researcher's "Get a copy for this source" is not kept either.
+      const next = await entryLine(core, projectId, e.cause.findEntryId, { state: "no-open-copy", reason: { code: "not-this-file" } }, ["nextTryAt", "copyDespiteLink"], tx.at);
       line = next ? ((await appendFindLinesInTx(core, tx, "update", [next]))[0] ?? null) : null;
     },
     { op: FIND_HELD_OPS.discard, entity: { type: "source", id: first.sourceId }, auditDetails: () => ({ reviewEntry: reviewId, entries: [first.cause.findEntryId], count: line ? 1 : 0 }) },
