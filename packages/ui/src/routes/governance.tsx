@@ -19,13 +19,13 @@ export interface GovernanceRoute {
   path: string;
   label: string;
   needsProject: boolean;
-  render(api: GovernanceApi, projectId: string, ctx: { readOnlyReason?: string | undefined; encrypted?: boolean | undefined }): ReactNode;
+  render(api: GovernanceApi, projectId: string, ctx: { readOnlyReason?: string | undefined; encrypted?: boolean | undefined; readOnlyLibrary?: boolean }): ReactNode;
 }
 
 export const governanceRoutes: GovernanceRoute[] = [
   { path: PATHS.governance, label: "Governance", needsProject: true, render: (api, pid, ctx) => <GovernanceSettings key={pid} api={api} projectId={pid} readOnlyReason={ctx.readOnlyReason} encrypted={ctx.encrypted} /> },
   { path: PATHS.audit, label: "Audit log", needsProject: true, render: (api, pid) => <AuditLog key={pid} api={api} projectId={pid} /> },
-  { path: PATHS.fieldwork, label: "Fieldwork", needsProject: true, render: (api, pid, ctx) => <Fieldwork key={pid} api={api} projectId={pid} encrypted={ctx.encrypted} /> },
+  { path: PATHS.fieldwork, label: "Fieldwork", needsProject: true, render: (api, pid, ctx) => <Fieldwork key={pid} api={api} projectId={pid} encrypted={ctx.encrypted} readOnly={ctx.readOnlyLibrary === true} /> },
   { path: PATHS.moveLibrary, label: "Move library", needsProject: false, render: (api) => <MoveLibrary api={api} /> },
   { path: PATHS.missingFiles, label: "Missing files", needsProject: false, render: (api) => <MissingFiles api={api} /> },
 ];
@@ -59,7 +59,8 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
   // Whether the library may be changed here, read for the Governance form only: it then says why its
   // rules cannot be changed instead of letting a change be refused on save. Unknown: not said (the
   // service refuses a change it may not make either way).
-  const onGovernance = path === PATHS.governance;
+  // R463 M4: Fieldwork asks too, so that it does not offer a detach the library would refuse.
+  const onGovernance = path === PATHS.governance || path === PATHS.fieldwork;
   const [libraryMode, setLibraryMode] = useState<string | undefined>();
   useEffect(() => {
     if (!onGovernance) return;
@@ -128,7 +129,7 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
           to see and change everything in it here.
         </p>
       )}
-      {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId, { readOnlyReason, encrypted: project?.encrypted === true }) : null}
+      {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId, { readOnlyReason, encrypted: project?.encrypted === true, readOnlyLibrary: libraryMode === "read-only" }) : null}
     </div>
   );
 }

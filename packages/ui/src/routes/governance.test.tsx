@@ -163,3 +163,32 @@ describe("R362 h: the Fieldwork screen is told whether its project is encrypted"
     });
   }
 });
+
+describe("R463 M4: Fieldwork in a read-only library does not offer to detach a signed form", () => {
+  it.each([
+    ["read-only", false],
+    ["read-write", true],
+  ])("a %s library", async (mode, offered) => {
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted: false, unlocked: true }] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode } })),
+      http.get(url("/projects/p1/participants"), () => HttpResponse.json({ participants: [{ id: "f1", code: "P-001", consentIds: ["c1"] }], complete: true })),
+      http.get(url("/projects/p1/sessions"), () => HttpResponse.json({ sessions: [], complete: true })),
+      http.get(url("/projects/p1/consents"), () =>
+        HttpResponse.json({ consents: [{ id: "c1", participantId: "f1", scope: "Audio", date: "2026-03-14", documentAssetId: "0190f0f0-0000-7000-8000-0000000000aa" }], complete: true }),
+      ),
+    );
+    window.history.replaceState(null, "", "/fieldwork?project=p1");
+    render(<Host />);
+    const records = await screen.findByRole("region", { name: "Consent records" });
+    await within(records).findByText(/Signed form attached\./);
+    const why = "This library is open read-only here, so a signed form cannot be detached.";
+    if (offered) {
+      expect(await within(records).findByRole("button", { name: "Detach the signed form of P-001…" })).toBeTruthy();
+      expect(screen.queryByText(why)).toBeNull();
+    } else {
+      expect(await within(records).findByText(why)).toBeTruthy();
+      expect(within(records).queryByRole("button", { name: /Detach/ })).toBeNull();
+    }
+  });
+});

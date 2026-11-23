@@ -92,7 +92,11 @@ function ConsentEditor({ c, onSave, onCancel, encrypted, busy }: { c: ConsentRec
 /** The last part of a dropped file's path: its name, never the folders it is in (FR-168). */
 const fileName = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 
-export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; projectId: string; encrypted?: boolean | undefined }) {
+/** R463 M4: why a signed form cannot be detached here. */
+export const DETACH_READ_ONLY = "This library is open read-only here, so a signed form cannot be detached.";
+
+/** `readOnly`: the library is open read-only here; the detach is then not offered (R463 M4). */
+export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: GovernanceApi; projectId: string; encrypted?: boolean | undefined; readOnly?: boolean }) {
   const readableScope = useReadableNote(encrypted, READABLE_SCOPE_TEXT);
   const [participants, setParticipants] = useState<Participant[] | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -384,7 +388,12 @@ export function Fieldwork({ api, projectId, encrypted }: { api: GovernanceApi; p
               {c.documentAssetId ? (
                 <p className="ao-hint">
                   Signed form attached.
-                  {!c.withdrawn ? (
+                  {!c.withdrawn && readOnly ? (
+                    <>
+                      {" "}
+                      <span>{DETACH_READ_ONLY}</span>
+                    </>
+                  ) : !c.withdrawn ? (
                     <>
                       {" "}
                       <button type="button" aria-label={`Detach the signed form of ${codeOf(c.participantId)}…`} disabled={busy} onClick={() => setDetaching(c)}>
