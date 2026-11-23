@@ -1243,7 +1243,10 @@ async function main() {
             xvfb.stdout.once("data", (d) => res(`:${String(d).trim()}`));
             xvfb.once("exit", () => rej(new Error("Xvfb did not start")));
           });
-      const env = shellEnv(dir, { DBUS_SESSION_BUS_ADDRESS: address, AO_DESKTOP_WORKER_BIN: worker.bin, AO_SHELL_TEST_SLOW_STOP_MS: "6000", DISPLAY: display });
+      // A stop slowed by 12 s (R486 h): the closing window opens 2 s after the close, and its page's title must
+      // arrive before the first "stopped" line (only the events up to it are judged), which leaves about 10 s
+      // for a new web process on a loaded machine.
+      const env = shellEnv(dir, { DBUS_SESSION_BUS_ADDRESS: address, AO_DESKTOP_WORKER_BIN: worker.bin, AO_SHELL_TEST_SLOW_STOP_MS: "12000", DISPLAY: display });
       const run = startShell(env, "E (opened again while closing)", { direct: true });
       const shells = [];
       try {
