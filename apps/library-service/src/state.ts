@@ -996,8 +996,14 @@ export class ServiceState {
    * FR-720: this computer's list of watched folders was read successfully (the list route). When it could not be read
    * at the opening, the watches that did not start then are started the opening's way, and once every one has, the
    * warning that they were not started is taken away; a start that fails again leaves it. One at a time.
+   *
+   * R508 I1: never while a move or the service's stop is under way (nothing may write into a library being copied, R102
+   * N2; the move has stopped every watch), and only in a read-write library, as at the opening; the warning then stays and
+   * the next successful read afterwards starts them in the library open then. A locked project's list is refused before
+   * this is reached (423); a locked project's watch is started as the opening starts it, and waits until the unlock.
    */
   async watchedFoldersReadAgain(s: Session): Promise<void> {
+    if (this.moving || this.shuttingDown) return;
     if (this.session !== s || s.lib.mode !== "read-write" || !s.sessionWarnings?.some((w) => w.kind === WATCHED_FOLDERS_UNREADABLE)) return;
     if (s.watchRestart) return s.watchRestart;
     const run = (async () => {
