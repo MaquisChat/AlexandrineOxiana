@@ -226,6 +226,44 @@ describe("R528 M6: a record written by another build is never lost", () => {
     expect(after.warnings[0]).toEqual(LATER);
   });
 
+  it("R532 M6: an entry of a known kind keeps the fields this build does not know when another entry is dismissed (byte for byte)", async () => {
+    const { pid, folder } = await project("P");
+    const q = await project("Q");
+    await crashed(pid, folder);
+    await crashed(q.pid, q.folder);
+    await reopen();
+    const raw = JSON.parse((await fileText())!) as { formatVersion: number; warnings: Array<Record<string, unknown>> };
+    expect(raw.warnings).toHaveLength(2);
+    // Another build added a field to the first entry (a kind this build knows).
+    const richer: Record<string, unknown> = { ...raw.warnings[0]!, laterField: { note: "kept by a later build" } };
+    await writeFile(fromRel(lib.root, FILE), JSON.stringify({ formatVersion: 1, warnings: [richer, raw.warnings[1]] }));
+    await reopen();
+    // Both shown; the second dismissed: the first is still in the file exactly as the later build wrote it.
+    expect(kept().map((w) => w.keptId)).toEqual([richer.id, raw.warnings[1]!.id]);
+    await repo.dismissRecoveryWarning(raw.warnings[1]!.id as string);
+    expect(await fileText()).toBe(JSON.stringify({ formatVersion: 1, warnings: [richer] }));
+    expect(kept().map((w) => w.keptId)).toEqual([richer.id]);
+  });
+
+  it("R532 M6: an entry of a known kind whose known fields this build cannot read is kept in the file, not shown, and nothing is set aside", async () => {
+    const { pid, folder } = await project("P");
+    await crashed(pid, folder);
+    await reopen();
+    const [mineKept] = kept();
+    const raw = JSON.parse((await fileText())!) as { formatVersion: number; warnings: unknown[] };
+    // Another build wrote `at` as a number and `projectId` in another form.
+    const oddAt = { id: "019a7000-0000-7000-8000-00000000b001", kind: "rolled-back-incomplete-write", projectId: pid, at: 1763000000000 };
+    const oddProject = { id: "019a7000-0000-7000-8000-00000000b002", kind: "interrupted-change-closed", projectId: { id: pid }, at: NOW };
+    await writeFile(fromRel(lib.root, FILE), JSON.stringify({ formatVersion: 1, warnings: [oddAt, ...raw.warnings, oddProject] }));
+    await reopen();
+    expect(kept()).toEqual([mineKept]);
+    expect(repo.integrityWarnings.filter((w) => w.kind === "recovery-warnings-set-aside")).toEqual([]);
+    expect((await readdir(join(lib.root, ".tmp"))).filter((n) => n.startsWith("recovery-warnings.damaged-"))).toEqual([]);
+    await repo.dismissRecoveryWarning(mineKept!.keptId!);
+    expect(kept()).toEqual([]);
+    expect(await fileText()).toBe(JSON.stringify({ formatVersion: 1, warnings: [oddAt, oddProject] }));
+  });
+
   it("a file of a higher format version is left alone, byte for byte: never set aside, never rewritten, nothing dismissed from it", async () => {
     const { pid, folder } = await project("P");
     const NEWER = JSON.stringify({ formatVersion: 2, warnings: [{ ...LATER, kind: "rolled-back-incomplete-write", projectId: pid }], somethingNew: true });

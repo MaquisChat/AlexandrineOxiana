@@ -16,7 +16,8 @@
  *   set aside under a name that cannot collide (`recovery-warnings.damaged-<time>-<random>.json`, moved into `.tmp/`, the
  *   library's work folder) and one warning says so; read-only, it is left as it is and the same warning is raised.
  * - R528 M6: written by another build, it is never lost: an entry of a kind this build does not know (or of a state it does
- *   not know) is skipped and written back as it was when the file is rewritten; a file of a HIGHER `formatVersion` is
+ *   not know, or whose known fields it cannot read, R532) is skipped and written back as it was when the file is
+ *   rewritten; an entry it shows keeps the fields it does not know; a file of a HIGHER `formatVersion` is
  *   left alone, byte for byte: nothing of it is shown, nothing is added to it or dismissed from it, and it is never set
  *   aside (a library shared between two computers on different builds keeps the newer build's record).
  * - An older build ignores the file: nothing of it reads the library's root but `library.json`, the library's audit log
@@ -90,8 +91,14 @@ export async function readKeptWarnings(root: string): Promise<KeptRecord | "dama
         others.push(w);
         continue;
       }
-      if (typeof w.id !== "string" || !isId(w.id) || typeof w.projectId !== "string" || !isId(w.projectId) || typeof w.at !== "string") return "damaged";
-      list.push({ id: w.id, kind: w.kind, projectId: w.projectId, at: w.at, ...(w.rollback ? { rollback: w.rollback } : {}) });
+      // R532 M6: a known kind whose known fields this build cannot read (another build wrote them otherwise): kept as it
+      // is among the entries it does not show, never taken for damage to the whole record.
+      if (typeof w.id !== "string" || !isId(w.id) || typeof w.projectId !== "string" || !isId(w.projectId) || typeof w.at !== "string") {
+        others.push(w);
+        continue;
+      }
+      // R532 M6: the fields this build does not know stay on the entry (in their place), and are written back with it.
+      list.push({ ...w, id: w.id, kind: w.kind, projectId: w.projectId, at: w.at });
     }
     return { list, others };
   } catch {
