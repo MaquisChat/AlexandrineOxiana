@@ -21,6 +21,7 @@
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import { AppSettingUnreadableError, readAppSettingStrict, setAppSettingAside, updateAppSettingStrict } from "@ao/library";
 import { isCredentialQueryKey, type PairingCodeIssued, type PairingCodeStatus } from "@ao/shared";
+import { ApiError } from "./errors.js";
 
 const digest = (s: string) => createHash("sha256").update(s, "utf8").digest();
 
@@ -90,7 +91,19 @@ function usablePairings(list: unknown[]): PairedExtension[] {
     .map(({ port, ...e }) => (portOk(port) ? { ...e, port } : e));
 }
 
+/**
+ * FR-718: how long a confirmed pairing's save may take before the service gives up on it, tells the extension it is
+ * not paired, and takes the pairing back if the save lands later. Under the screen's own wait (SAVING_SLOW_MS, 60 s,
+ * in ExtensionPairing.tsx), so the screen shows the not-saved outcome rather than "taking longer".
+ */
+export const PAIRING_SAVE_LIMIT_MS = 30_000;
+
+/** FR-718: the extension's answer when the save did not end within the limit. */
+export const PAIRING_NOT_SAVED_IN_TIME = "This app could not save the pairing in time, so the browser is not paired. Show a new code in the desktop app and pair again.";
+
 export interface PairingOptions {
+  /** How long a pairing's save may take (default PAIRING_SAVE_LIMIT_MS, FR-718). */
+  saveLimitMs?: number;
   /** How long a code is valid (default 5 minutes). */
   ttlMs?: number;
   /** Wrong confirm attempts before the code is invalidated (default 5). */
@@ -137,6 +150,14 @@ export class Pairing {
   private currentPort: number | undefined;
   /** Port recordings under way, by pairing id: a burst of requests makes one write (R171). */
   private readonly recording = new Map<string, Promise<void>>();
+  private readonly saveLimitMs: number;
+  /**
+   * FR-718: pairings whose save was given up on (by id). Never usable, whatever list is read while the late save is
+   * being taken back, and dropped from the file by every later write of it.
+   */
+  private readonly givenUp = new Set<string>();
+  /** The takings-back under way (waited for by `idle()`). */
+  private readonly takingBack = new Set<Promise<void>>();
 
   constructor(
     private readonly configDir: string,
@@ -146,6 +167,17 @@ export class Pairing {
     this.maxAttempts = opts.maxAttempts ?? 5;
     this.perMinute = opts.confirmPerMinute ?? 10;
     this.now = opts.now ?? Date.now;
+    this.saveLimitMs = opts.saveLimitMs ?? PAIRING_SAVE_LIMIT_MS;
+  }
+
+  /** The usable pairings of a list, never one whose save was given up on (FR-718). */
+  private usable(list: unknown[]): PairedExtension[] {
+    return usablePairings(list).filter((e) => !this.givenUp.has(e.id));
+  }
+
+  /** A list as a write leaves it: without the pairings whose save was given up on (FR-718). */
+  private withoutGivenUp(list: unknown[]): unknown[] {
+    return this.givenUp.size === 0 ? list : list.filter((e) => !this.givenUp.has((e as PairedExtension | null)?.id as string));
   }
 
   /**
@@ -156,7 +188,7 @@ export class Pairing {
   async load(): Promise<void> {
     try {
       const f = await readAppSettingStrict(this.configDir, PAIRINGS_FILE, isPairingFile);
-      this.paired = usablePairings(f?.extensions ?? []);
+      this.paired = this.usable(f?.extensions ?? []);
       this.unreadable = false;
       this.notLoaded = false;
     } catch (err) {
@@ -189,7 +221,7 @@ export class Pairing {
   async checkFile(): Promise<boolean> {
     try {
       const f = await readAppSettingStrict(this.configDir, PAIRINGS_FILE, isPairingFile);
-      if (this.unreadable) this.paired = usablePairings(f?.extensions ?? []);
+      if (this.unreadable) this.paired = this.usable(f?.extensions ?? []);
       this.unreadable = false;
       this.notLoaded = false;
     } catch (err) {
@@ -298,21 +330,44 @@ export class Pairing {
     // Spent now (never usable twice), but "used" only once the pairing is durably written (I1).
     c.record.confirming = true;
     let next: PairingFile;
+    // One pairing per extension origin: pairing again replaces its token. Built only on a list
+    // that was read (Task 66 I1, Task 68).
+    const save = updateAppSettingStrict<PairingFile>(this.configDir, PAIRINGS_FILE, isPairingFile, (cur) => ({
+      ...(cur ?? {}),
+      v: 1,
+      extensions: [...this.withoutGivenUp(cur?.extensions ?? []).filter((e) => (e as PairedExtension | null)?.origin !== origin), entry],
+    }));
+    let limit: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<"late">((r) => (limit = setTimeout(() => r("late"), this.saveLimitMs)));
     try {
-      // One pairing per extension origin: pairing again replaces its token. Built only on a list
-      // that was read (Task 66 I1, Task 68).
-      next = await updateAppSettingStrict<PairingFile>(this.configDir, PAIRINGS_FILE, isPairingFile, (cur) => ({
-        ...(cur ?? {}),
-        v: 1,
-        extensions: [...(cur?.extensions ?? []).filter((e) => (e as PairedExtension | null)?.origin !== origin), entry],
-      }));
+      const first = await Promise.race([save, late]);
+      if (first === "late") {
+        // FR-718: given up on. The code ends as not saved, the pairing is never usable, and a save that lands later
+        // is taken back (in the file's own turn, after it), so the browser told it is not paired is not paired.
+        delete c.record.confirming;
+        c.record.end = { state: "invalidated", at: this.now(), reason: "not-saved" };
+        this.givenUp.add(entry.id);
+        this.paired = this.paired.filter((e) => e.id !== entry.id);
+        const back: Promise<void> = save
+          .then(
+            () => this.takeBack(entry.id),
+            () => undefined,
+          )
+          .finally(() => this.takingBack.delete(back));
+        this.takingBack.add(back);
+        throw new ApiError(503, "UNAVAILABLE", PAIRING_NOT_SAVED_IN_TIME);
+      }
+      next = first;
     } catch (err) {
+      if (err instanceof ApiError) throw err;
       // Spent, but nothing was paired: the code no longer works, and the status says why.
       delete c.record.confirming;
       c.record.end = { state: "invalidated", at: this.now(), reason: "not-saved" };
       this.noteUnreadable(err);
+    } finally {
+      clearTimeout(limit);
     }
-    this.paired = usablePairings(next.extensions);
+    this.paired = this.usable(next.extensions);
     delete c.record.confirming;
     c.record.end = { state: "used", at, browser: { id: entry.id, origin } };
     return token;
@@ -355,9 +410,25 @@ export class Pairing {
     return run;
   }
 
-  /** Resolves once every port recording under way has ended (shutdown and tests). */
+  /** Resolves once every port recording and every taking back under way has ended (shutdown and tests). */
   async idle(): Promise<void> {
-    await Promise.allSettled([...this.recording.values()]);
+    await Promise.allSettled([...this.recording.values(), ...this.takingBack]);
+  }
+
+  /**
+   * FR-718: removes from the file a pairing whose save landed after the service gave up on it. A failure leaves it
+   * unusable for as long as the service runs, and the next write of the file drops it.
+   */
+  private async takeBack(id: string): Promise<void> {
+    try {
+      const next = await updateAppSettingStrict<PairingFile>(this.configDir, PAIRINGS_FILE, isPairingFile, (cur) => ({
+        ...(cur ?? { v: 1 }),
+        extensions: this.withoutGivenUp(cur?.extensions ?? []),
+      }));
+      this.paired = this.usable(next.extensions);
+    } catch {
+      if (this.paired.some((e) => e.id === id)) this.paired = this.paired.filter((e) => e.id !== id);
+    }
   }
 
   private async recordPort(id: string): Promise<void> {
@@ -388,9 +459,9 @@ export class Pairing {
     // Built only on a list that was read (Task 66 I1, Task 68).
     const next = await updateAppSettingStrict<PairingFile>(this.configDir, PAIRINGS_FILE, isPairingFile, (cur) => ({
       ...(cur ?? { v: 1 }),
-      extensions: (cur?.extensions ?? []).filter((e) => (e as PairedExtension | null)?.id !== id),
+      extensions: this.withoutGivenUp(cur?.extensions ?? []).filter((e) => (e as PairedExtension | null)?.id !== id),
     })).catch((err: unknown) => this.noteUnreadable(err));
-    this.paired = usablePairings(next.extensions);
+    this.paired = this.usable(next.extensions);
     return this.paired.length < before;
   }
 
