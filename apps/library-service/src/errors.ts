@@ -4,7 +4,7 @@
  * one place.
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
-import type { ResettableSetting, ServiceErrorBody, ServiceErrorCode } from "@ao/shared";
+import { RECOVERY_PENDING_TEXT, type ResettableSetting, type ServiceErrorBody, type ServiceErrorCode } from "@ao/shared";
 import {
   AnnotationLimitError,
   AppSettingReadableError,
@@ -107,7 +107,8 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof PolicyDeniedError) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
   if (err instanceof PendingWriteChoiceError) return new ApiError(409, "CONFLICT", err.message, err.allowed.length ? `allowed: ${err.allowed.join(", ")}` : "allowed: none");
   // A recorded choice whose step could not be carried out yet: the plain reason is kept (R131 c).
-  if (err instanceof PendingWriteIncompleteError) return new ApiError(409, "CONFLICT", err.message);
+  // FR-736: marked, so that the list says the library's sentence of the undo's state, not "something changed meanwhile".
+  if (err instanceof PendingWriteIncompleteError) return new ApiError(409, "CONFLICT", err.message, "rollback-incomplete");
   if (err instanceof BatchRefusedError) {
     if (err.denied) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
     // Running (being paused or undone) or already finished: a state conflict (R102, by kind — R106).
@@ -177,7 +178,7 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof CustomStyleError) return new ApiError(400, "VALIDATION", err.message);
   if (err instanceof NoMediaError) return new ApiError(400, "VALIDATION", err.message);
   if (err instanceof AcknowledgementRequiredError) return new ApiError(409, "ACKNOWLEDGEMENT_REQUIRED", err.explanation);
-  if (err instanceof RecoveryPendingError) return new ApiError(409, "CONFLICT", "This project refuses changes until an interrupted change is resolved; see the library's integrity warnings.");
+  if (err instanceof RecoveryPendingError) return new ApiError(409, "CONFLICT", RECOVERY_PENDING_TEXT);
   if (err instanceof FolderNotEmptyError || err instanceof AlreadyALibraryError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof WrongLibraryError || err instanceof LibraryMovedError || err instanceof CorruptLibraryError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof LibraryNotWritableError) return new ApiError(409, "READ_ONLY", err.message);

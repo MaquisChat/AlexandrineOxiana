@@ -12,6 +12,7 @@ import type {
   DeviceNotice,
   DeviceNoticeDismissRequest,
   DeviceNoticeKind,
+  IncompleteRollback,
   LibraryFolderRoomRequest,
   LibraryFolderRoomResponse,
   LibrarySuggestedFolderResponse,
@@ -94,6 +95,9 @@ export interface PendingWrite {
   canRollBack: boolean;
   steps: number;
   detail?: string;
+  /** FR-736: its latest undo was not complete: the state, and what is in the way with its library-relative path. */
+  rollback?: IncompleteRollback;
+  causes?: Array<{ kind: string; path: string }>;
 }
 
 export type PendingWriteChoice = "roll-back" | "keep";
@@ -103,6 +107,8 @@ export interface IntegrityWarning {
   project: string;
   kind: string;
   detail: string;
+  /** FR-736: an undo that is not complete, by its state (chooses the banner's sentence). */
+  state?: IncompleteRollback;
 }
 
 /** The `library.state` event (LibraryState.libraryState in the service). */

@@ -5,7 +5,15 @@
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
 import { useRef, useState, type ReactNode } from "react";
-import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, ZOTERO_SYNC_SENTENCES, isDeviceNoticeKind, oldCopiesPendingText, type DeviceNoticeKind } from "@ao/shared";
+import {
+  DESTRUCTION_OLD_COPIES_PENDING_WARNING,
+  INCOMPLETE_ROLLBACK_BANNER,
+  ZOTERO_SYNC_SENTENCES,
+  isDeviceNoticeKind,
+  oldCopiesPendingText,
+  type DeviceNoticeKind,
+  type IncompleteRollback,
+} from "@ao/shared";
 import { errorText, type IntegrityWarning, type LibraryState } from "../api/library";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
@@ -23,9 +31,10 @@ export type BannerVariant =
   /**
    * `detail` is accepted for the record but never shown (R114 I1). `oldCopies`: for
    * `destruction-old-copies-pending`, the sentence that fits and the old copies' places, shown under
-   * it (R409 d). `count`: how many warnings of this kind in this project the banner stands for (R484 f).
+   * it (R409 d). `count`: how many warnings of this kind in this project the banner stands for (R484 f). `state`: an
+   * interrupted change whose undo is not complete, by its state (FR-736): its sentence, and "Resolve…".
    */
-  | { kind: "warning"; warning: string; project: string; detail?: string; oldCopies?: { text: string; places: string[] }; count?: number }
+  | { kind: "warning"; warning: string; project: string; detail?: string; oldCopies?: { text: string; places: string[] }; count?: number; state?: IncompleteRollback }
   /** This computer's own notice (Task 68, R154, R178): fixed words by kind; goes by "Got it". */
   | { kind: "notice"; notice: DeviceNoticeKind };
 
@@ -91,10 +100,11 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   "annotations-hash-mismatch": (p) => `Some annotations in ${p} were changed outside the app. They are shown as they are now.`,
   // R473 I1, R484 f: sources whose change did not finish and whose roll-back failed, for as long as the roll-back
   // waits; one banner per project ("this source" is said only for the source itself, in the library's own sentence).
+  // FR-736: never "close the library and open it again", which cannot help while a file is in the way: the list says.
   "source-change-unfinished": (p, n) =>
     n === 1
-      ? `A change to a source in ${p} did not finish and could not be undone. Close the library and open it again to put it back.`
-      : `Changes to ${n} sources in ${p} did not finish and could not be undone. Close the library and open it again to put them back.`,
+      ? `A change to a source in ${p} did not finish and could not be undone yet. Choose “Resolve…” to see what can be done.`
+      : `Changes to ${n} sources in ${p} did not finish and could not be undone yet. Choose “Resolve…” to see what can be done.`,
   "source-change-unfinished-read-only": (p, n) =>
     n === 1
       ? `A change to a source in ${p} did not finish and could not be undone. It can be put back only when the library is opened for changes.`
@@ -126,8 +136,13 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   [DESTRUCTION_OLD_COPIES_PENDING_WARNING]: () => "Old copies of this library, left by a move, still hold data that was destroyed here.",
 };
 
+/** The kinds that stand for an interrupted change whose undo may be incomplete; with a `state`, it is (FR-736). */
+const ROLLBACK_KINDS: ReadonlySet<string> = new Set(["rolled-back-incomplete-write", "incomplete-write-pending"]);
+
 /** The sentence for a warning kind; an unknown kind gets a generic sentence (never the detail). */
-export function warningText(kind: string, project: string, count = 1): string {
+export function warningText(kind: string, project: string, count = 1, state?: IncompleteRollback): string {
+  // FR-736: an undo that is not complete says its state, in the library's shared sentence.
+  if (state && ROLLBACK_KINDS.has(kind) && Object.hasOwn(INCOMPLETE_ROLLBACK_BANNER, state)) return INCOMPLETE_ROLLBACK_BANNER[state](project);
   const known = Object.hasOwn(WARNINGS, kind) ? WARNINGS[kind] : undefined;
   return known ? known(project, count) : `Something in ${project} needs attention. Open the verification report for details.`;
 }
@@ -137,9 +152,9 @@ export function warningText(kind: string, project: string, count = 1): string {
  * start of the sentence no longer turns the whole English sentence round. Each place the name stands is isolated.
  * `count`: how many warnings of this kind in this project the sentence stands for (R484 f).
  */
-function warningSentence(kind: string, project: string, count = 1): ReactNode {
+function warningSentence(kind: string, project: string, count = 1, state?: IncompleteRollback): ReactNode {
   const mark = "\u0000";
-  return warningText(kind, mark, count)
+  return warningText(kind, mark, count, state)
     .split(mark)
     .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={i}>{project}</UserText>, part]));
 }
@@ -162,7 +177,7 @@ function text(v: BannerVariant): string {
     case "index-failed":
       return "The library's search index could not be rebuilt, so sources and search may be incomplete. Your sources are safe in the library folder.";
     case "warning":
-      return v.oldCopies?.text ?? warningText(v.warning, v.project, v.count);
+      return v.oldCopies?.text ?? warningText(v.warning, v.project, v.count, v.state);
     case "notice":
       return NOTICE_TEXT[v.notice];
   }
@@ -221,15 +236,18 @@ export function DeviceNoticeBanners({ notices, onDismiss, error }: { notices: Li
   );
 }
 
-/** Warnings about an interrupted change the researcher can resolve by hand (R27). */
-export const RESOLVABLE_WARNINGS: ReadonlySet<string> = new Set(["incomplete-write-pending", "invalid-txn-marker", "txn-recovery-skipped-audit-unverifiable"]);
+/**
+ * Warnings about an interrupted change the researcher can resolve by hand (R27); also, by FR-736, a source whose change
+ * did not finish, and any interrupted change whose undo is not complete (a `state`).
+ */
+export const RESOLVABLE_WARNINGS: ReadonlySet<string> = new Set(["incomplete-write-pending", "invalid-txn-marker", "txn-recovery-skipped-audit-unverifiable", "source-change-unfinished"]);
 
 export function StatusBanner({ variant, onResolve, onDismiss }: { variant: BannerVariant; onResolve?: () => void; onDismiss?: (notice: DeviceNoticeKind) => void }) {
-  const resolvable = !!onResolve && variant.kind === "warning" && RESOLVABLE_WARNINGS.has(variant.warning);
+  const resolvable = !!onResolve && variant.kind === "warning" && (RESOLVABLE_WARNINGS.has(variant.warning) || (variant.state !== undefined && ROLLBACK_KINDS.has(variant.warning)));
   // Project names and service details are user text, shown with dir=auto; in a warning only the project's name (FR-158).
   return (
     <div role="status" className={`ao-banner ao-banner--${TONE[variant.kind]}`}>
-      {variant.kind === "warning" && !variant.oldCopies ? <span>{warningSentence(variant.warning, variant.project, variant.count)}</span> : <UserText>{text(variant)}</UserText>}
+      {variant.kind === "warning" && !variant.oldCopies ? <span>{warningSentence(variant.warning, variant.project, variant.count, variant.state)}</span> : <UserText>{text(variant)}</UserText>}
       {variant.kind === "warning" && !!variant.oldCopies?.places.length && (
         <ul>
           {variant.oldCopies.places.map((p) => (
@@ -311,7 +329,7 @@ export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyR
   const grouped = new Map<string, { count: number }>();
   for (const w of state.integrityWarnings ?? ([] as IntegrityWarning[])) {
     if (!PER_PROJECT.has(w.kind)) {
-      out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail });
+      out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail, ...(w.state ? { state: w.state } : {}) });
       continue;
     }
     const key = JSON.stringify([w.projectId, w.kind]);

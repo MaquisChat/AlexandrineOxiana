@@ -10,8 +10,9 @@
  * cannot resolve them. The page behind is inert; Tab stays inside; Escape or Close returns focus to
  * the button that opened the dialog.
  */
-import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { ROLLBACK_CAUSE_KINDS, ROLLBACK_CAUSE_TEXT, type RollbackCauseKind } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { errorText, type LibraryApi, type PendingWrite, type PendingWriteChoice } from "../api/library";
 import { UserText } from "./UserText";
@@ -56,6 +57,18 @@ const UNSURE_CONFIRM: Record<PendingWriteChoice, string> = {
   keep: "Keep this change? It cannot be confirmed whether it was finished. If it was not, keeping it may keep a half-written change.",
 };
 
+/**
+ * FR-736 (R503 d): what keeps the undo from completing, cause by cause, with the file's library-relative path — shown
+ * here only, through `UserText`, because the researcher has to find the file.
+ */
+function causeSentence(kind: string, path: string): ReactNode {
+  if (!(ROLLBACK_CAUSE_KINDS as readonly string[]).includes(kind)) return null;
+  const mark = "\u0000";
+  return ROLLBACK_CAUSE_TEXT[kind as RollbackCauseKind](mark)
+    .split(mark)
+    .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={i}>{path}</UserText>, part]));
+}
+
 const unsure = (pw: PendingWrite) => pw.status === "unverifiable" || pw.status === "invalid";
 const allowed = (pw: PendingWrite, c: PendingWriteChoice) => (c === "keep" ? pw.canKeep : pw.canRollBack);
 
@@ -97,6 +110,10 @@ function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean;
             </>
           )}
         </p>
+        {(pw.causes ?? []).map((c) => {
+          const said = causeSentence(c.kind, c.path);
+          return said ? <p key={`${c.kind}:${c.path}`}>{said}</p> : null;
+        })}
         {!resolvable && <p>The way forward is to restore the project from a backup made before this change.</p>}
         {resolvable && !confirm && (
           <div className="ao-row">
@@ -152,6 +169,10 @@ function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean;
 const NOT_RELISTED = "The interrupted changes could not be listed again, so no choice is offered now. Close this and open it again to see what can be done.";
 
 function refusalText(err: unknown, relisted = true): string {
+  // FR-736: an undo still incomplete is said in the library's sentence of its state (the list shows what is in the way).
+  if (err instanceof ApiClientError && err.code === "CONFLICT" && err.reason === "rollback-incomplete") {
+    return relisted ? err.message : `${err.message} ${NOT_RELISTED}`;
+  }
   const conflict = err instanceof ApiClientError && err.code === "CONFLICT";
   const what = conflict
     ? "That choice is no longer possible for this change: something changed in the meantime (it may have been resolved elsewhere)."

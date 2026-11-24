@@ -189,8 +189,9 @@ describe("StatusBanner", () => {
 });
 
 describe("R484 f: changes to sources that did not finish and could not be undone: one banner per project and kind", () => {
-  const ONE = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. Close the library and open it again to put it back.";
-  const SEVERAL = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. Close the library and open it again to put them back.`;
+  // FR-736: no "close the library and open it again", which cannot help while a file is in the way (these asserted it).
+  const ONE = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone yet. Choose “Resolve…” to see what can be done.";
+  const SEVERAL = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone yet. Choose “Resolve…” to see what can be done.`;
   const ONE_RO = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. It can be put back only when the library is opened for changes.";
   const SEVERAL_RO = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. They can be put back only when the library is opened for changes.`;
   const w = (projectId: string, project: string, kind: string, n: number) =>
@@ -230,8 +231,49 @@ describe("R484 f: changes to sources that did not finish and could not be undone
   });
 
   it("the sentence with \"this source\" stays the library's own, for the source itself", () => {
-    expect(SOURCE_CHANGE_UNFINISHED).toBe("A change to this source did not finish and could not be undone. Close the library and open it again to put it back.");
+    expect(SOURCE_CHANGE_UNFINISHED).toBe("A change to this source did not finish and could not be undone yet. The app's list of interrupted changes says what can be done.");
     expect(SOURCE_CHANGE_UNFINISHED_READ_ONLY).toBe("A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.");
+  });
+});
+
+describe("FR-736: an interrupted change whose undo is not complete says the state it is in", () => {
+  const P = "Dissertation <b>2</b>";
+  const SAYS = {
+    "try-again": `An interrupted change in ${P} could not be undone completely: a step failed. Nothing was lost; the app keeps what it needs to finish. Changes to ${P} are off until it is undone. Choose “Resolve…” to try again.`,
+    "in-the-way": `An interrupted change in ${P} could not be undone completely, because a file changed or put there outside the app is in the way. Nothing was lost. Changes to ${P} are off until it is undone. Choose “Resolve…” to see which file to move.`,
+    lost: `An interrupted change in ${P} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. That file is lost. Changes to ${P} are off until you close the change. Choose “Resolve…” to see what was lost.`,
+  } as const;
+  for (const state of ["try-again", "in-the-way", "lost"] as const) {
+    for (const kind of ["rolled-back-incomplete-write", "incomplete-write-pending"]) {
+      it(`${kind}, ${state}: its sentence, the name as text, never the detail; "Resolve…" opens the list`, async () => {
+        const detail = "transaction 7f3a: Projects/P/sources/x/kept.txt";
+        const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: P, kind, detail, state }] });
+        const onResolve = vi.fn();
+        render(<StatusBanner variant={b!} onResolve={onResolve} />);
+        const status = screen.getByRole("status");
+        expect(status.querySelector("span")!.textContent).toBe(SAYS[state]);
+        expect(status.querySelector("b")).toBeNull();
+        expect(status.textContent).not.toContain("kept.txt");
+        await userEvent.click(screen.getByRole("button", { name: `Resolve the interrupted change in ${P}…` }));
+        expect(onResolve).toHaveBeenCalledTimes(1);
+        cleanup();
+      });
+    }
+  }
+
+  it("a complete undo keeps its sentence, and offers nothing to resolve", () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: "P", kind: "rolled-back-incomplete-write", detail: "x" }] });
+    render(<StatusBanner variant={b!} onResolve={() => undefined} />);
+    expect(screen.getByRole("status").textContent).toBe("An interrupted change in P was undone when the library opened, so nothing half-saved was kept.");
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("a source whose change did not finish offers the list, where what can be done is said", async () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: "P", kind: "source-change-unfinished", detail: "x" }] });
+    const onResolve = vi.fn();
+    render(<StatusBanner variant={b!} onResolve={onResolve} />);
+    await userEvent.click(screen.getByRole("button", { name: "Resolve the interrupted change in P…" }));
+    expect(onResolve).toHaveBeenCalledTimes(1);
   });
 });
 

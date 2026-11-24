@@ -477,7 +477,8 @@ describe("a full disk during the scan stops the batch too (R436 a)", () => {
 
 describe("the stop sentences name what exists when a change could not be undone (R436 d)", () => {
   const FULL_UNDONE = "The import stopped because the disk is full, and its last change could not be undone. Free some space, close and reopen the library, then resume the import.";
-  const REFUSING = "The import stopped because an earlier change in this project could not be undone. Close and reopen the library, then resume the import.";
+  // FR-736: no reopening where it cannot help (this sentence asserted the old advice).
+  const REFUSING = "The import stopped because an earlier change in this project could not be undone. Do what the warning at the top of the library says, then resume the import.";
 
   /** Closes and reopens the library (the open finishes the rollback the session could not). */
   async function reopen(): Promise<void> {

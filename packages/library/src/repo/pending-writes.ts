@@ -24,6 +24,7 @@
 import { createHash } from "node:crypto";
 import { join, posix } from "node:path";
 import { verifyChain, type AuditEvent } from "@ao/core";
+import { ROLLBACK_INCOMPLETE_ANSWER, incompleteRollbackOf, type IncompleteRollback } from "@ao/shared";
 import { AuditStore, auditSegments, checkAnchor, type Head } from "./audit-store.js";
 import { assertContained, incompleteTail, truncateDurable } from "./io.js";
 import { NotFoundError, PendingWriteChoiceError, PendingWriteIncompleteError } from "./errors.js";
@@ -40,6 +41,7 @@ import {
   undoEntries,
   type MarkerInspection,
   type MarkerStatus,
+  type UndoCause,
 } from "./txn.js";
 
 export type PendingWriteChoice = "roll-back" | "keep";
@@ -55,6 +57,12 @@ export interface PendingWrite {
   detail?: string;
   /** Steps the marker records. */
   steps: number;
+  /**
+   * FR-736: the latest attempt to undo it was not complete: its state, and what kept each path from being undone with
+   * the library-relative path (R503 d: shown in this list only, for the researcher to find the file).
+   */
+  rollback?: IncompleteRollback;
+  causes?: UndoCause[];
 }
 
 /** The choices a marker allows (R131 a, b): none for an invalid or unverifiable marker. */
@@ -74,7 +82,7 @@ async function anchorsOf(core: RepoCore): Promise<(projectId: string) => Head | 
 const NO_CHOICE =
   "The app cannot confirm whether this change was finished, so it will change nothing itself. Restoring the project from a backup made before the change is the safe way on.";
 
-function view(i: MarkerInspection, writable: boolean): PendingWrite {
+function view(core: RepoCore, i: MarkerInspection, writable: boolean): PendingWrite {
   const a = writable ? allowed(i) : [];
   const detail = !writable
     ? `${i.detail ? `${i.detail}; ` : ""}this library is open read-only here, so nothing can be resolved (the change may still be in progress on the computer that has the library open)`
@@ -89,13 +97,20 @@ function view(i: MarkerInspection, writable: boolean): PendingWrite {
     canRollBack: a.includes("roll-back"),
     ...(detail ? { detail } : {}),
     steps: i.marker?.entries.length ?? 0,
+    ...incompleteOf(core, i.txn),
   };
+}
+
+/** FR-736: the state and causes of the latest incomplete attempt to undo `txn`, when there was one. */
+function incompleteOf(core: RepoCore, txn: string): Pick<PendingWrite, "rollback" | "causes"> {
+  const a = core.rollbackAttempts.get(txn);
+  return a ? { rollback: incompleteRollbackOf(a.causes, a.stepFailed), causes: a.causes } : {};
 }
 
 /** Every unresolved interrupted change, with the choices it allows. Reads only (read-only libraries too, with no choices). */
 export function pendingWrites(core: RepoCore): Promise<PendingWrite[]> {
   const writable = core.library.mode === "read-write";
-  return core.serial(async () => (await inspectMarkers(core.root, await anchorsOf(core))).map((i) => view(i, writable)));
+  return core.serial(async () => (await inspectMarkers(core.root, await anchorsOf(core))).map((i) => view(core, i, writable)));
 }
 
 const folderOf = (rel: string) => posix.normalize(rel.replaceAll("\\", "/")).toLowerCase();
@@ -153,14 +168,18 @@ async function carryOut(
     maybeCrash("before-changes");
     const undone = choice === "keep" ? { ok: await finishCommittedSteps(core.root, m), causes: [] } : await undoEntries(core.root, m.entries);
     if (!undone.ok) {
+      // FR-736: the answer says the state of the undo; the list says what is in the way, from this attempt.
+      const attempt = { causes: undone.causes, stepFailed: "stepFailed" in undone && undone.stepFailed === true };
+      if (choice === "roll-back") core.rollbackAttempts.set(m.txn, attempt);
       throw new PendingWriteIncompleteError(
         m.txn,
         choice === "keep"
           ? "The change could not be finished: files it destroyed could not be overwritten yet. The choice is recorded; try again, or reopen the library."
-          : "The change could not be undone completely: a step failed. The choice is recorded; try again, or reopen the library.",
+          : ROLLBACK_INCOMPLETE_ANSWER[incompleteRollbackOf(attempt.causes, attempt.stepFailed)],
         undone.causes,
       );
     }
+    core.rollbackAttempts.delete(m.txn);
     maybeCrash("before-audit");
     // A txn.resolve line torn by an earlier attempt would refuse every append after it (41a N1).
     const trimmed = await trimTornAuditLine(core, m.projectFolder);

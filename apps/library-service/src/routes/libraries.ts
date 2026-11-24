@@ -432,6 +432,8 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         canRollBack: p.canRollBack,
         steps: p.steps,
         ...(p.detail ? { detail: scrubPaths(p.detail, state.roots) } : {}),
+        // FR-736: what keeps its undo from completing, with the library-relative path (R503 d: shown in this list only).
+        ...(p.rollback ? { rollback: p.rollback, causes: (p.causes ?? []).map((c) => ({ kind: c.kind, path: c.path })) } : {}),
       })),
     };
   });

@@ -106,6 +106,7 @@ export interface AnnotationDeleteResponse {
 /**
  * R473 I1: what is said of a source whose change did not finish and whose roll-back failed (the paths a pending
  * marker names), for as long as the roll-back waits: in a library open for changes, and in one opened without them.
+ * FR-736: no advice to reopen, which cannot help while a file is in the way or the kept copy is gone.
  */
-export const SOURCE_CHANGE_UNFINISHED = "A change to this source did not finish and could not be undone. Close the library and open it again to put it back.";
+export const SOURCE_CHANGE_UNFINISHED = "A change to this source did not finish and could not be undone yet. The app's list of interrupted changes says what can be done.";
 export const SOURCE_CHANGE_UNFINISHED_READ_ONLY = "A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.";

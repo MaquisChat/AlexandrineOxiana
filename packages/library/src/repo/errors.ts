@@ -60,8 +60,9 @@ export class RecoveryPendingError extends Error {
   override name = "RecoveryPendingError";
   constructor(readonly projectId: string) {
     super(
-      `Project ${projectId} refuses changes: an earlier change could not be fully undone, or its audit log could not be repaired when the library was opened. ` +
-        "Check the library's integrity warnings, then reopen the library",
+      // FR-736: no advice to reopen, which cannot help while what holds the project stands; the warnings say what does.
+      `Project ${projectId} refuses changes until an interrupted change is resolved or its audit log is repaired. ` +
+        "The library's integrity warnings say which, and what to do.",
     );
   }
 }

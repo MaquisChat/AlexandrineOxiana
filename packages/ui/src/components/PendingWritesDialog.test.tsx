@@ -216,3 +216,37 @@ describe("PendingWritesDialog", () => {
     page.remove();
   });
 });
+
+describe("FR-736: what is in the way of an undo that is not complete", () => {
+  const F = "Projects/Dissertation/sources/Smith <b>2020</b>/kept.txt";
+  const SAYS: Record<string, string> = {
+    "hand-changed-file": `${F} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (your version is kept there), then choose “Roll it back”.`,
+    "path-occupied": `A file this change removed cannot be put back at ${F}, because another file is there now. Move that file somewhere outside the library, then choose “Roll it back” to put the removed file back.`,
+    "kept-copy-gone": `The file this change removed from ${F} cannot be put back: the copy the app kept of it is gone, so it is lost.`,
+    "could-not-look": `The app could not read ${F}, so it left it as it is. Make sure the file can be read, then choose “Roll it back”.`,
+  };
+  for (const [kind, said] of Object.entries(SAYS)) {
+    it(`${kind}: said with the file's place in the library, shown as text`, async () => {
+      serve([[pw({ rollback: kind === "kept-copy-gone" ? "lost" : kind === "could-not-look" ? "try-again" : "in-the-way", causes: [{ kind, path: F }] })]]);
+      show();
+      const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
+      const item = within(group).getByText((_, el) => el?.tagName === "P" && el.textContent === said);
+      expect(item.querySelector("b")).toBeNull();
+      expect(item.querySelector("bdi, [dir]")?.textContent).toBe(F);
+    });
+  }
+
+  it("\"Roll it back\" answered with the undo's state: the library's own sentence, not \"something changed meanwhile\"", async () => {
+    const said = "The change could not be undone completely: a file changed or put there outside the app is in the way. The list shows which file; move it, then choose “Roll it back” again.";
+    serve([[pw({ rollback: "in-the-way", causes: [{ kind: "hand-changed-file", path: F }] })]], () =>
+      HttpResponse.json({ error: { code: "CONFLICT", message: said, reason: "rollback-incomplete" } }, { status: 409 }),
+    );
+    const user = userEvent.setup();
+    show();
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    await user.click(await within(dialog).findByRole("button", { name: "Roll it back" }));
+    await user.click(within(dialog).getByRole("button", { name: "Yes, roll it back" }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toBe(said);
+  });
+});

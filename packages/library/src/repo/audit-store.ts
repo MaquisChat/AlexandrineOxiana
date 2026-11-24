@@ -11,6 +11,7 @@ import { sealEvent, verifyChain, type AuditEvent, type AuditVerifyResult } from 
 import { renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { SimulatedCrash, seams } from "./seams.js";
 import { appendDurable, assertContained, readMaybe, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
+import type { IncompleteRollback } from "@ao/shared";
 import type { UndoCause } from "./txn.js";
 
 export const AUDIT_SEGMENT_SIZE = 10_000;
@@ -68,6 +69,11 @@ export interface IntegrityWarning {
   bytes?: number;
   /** An incomplete roll-back (`rolled-back-incomplete-write`): what kept each path from being undone (R519). */
   causes?: UndoCause[];
+  /**
+   * FR-736: an undo that is not complete (`rolled-back-incomplete-write`, or `incomplete-write-pending` for a recorded
+   * choice to roll back): its state, which chooses the words the researcher is told. Absent: the undo was complete.
+   */
+  rollback?: IncompleteRollback;
 }
 
 /** Segment file names in `dir`, oldest first (empty when the folder is missing). */

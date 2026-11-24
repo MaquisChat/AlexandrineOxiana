@@ -272,6 +272,8 @@ export interface UndoCause {
 export interface UndoResult {
   ok: boolean;
   causes: UndoCause[];
+  /** A step failed for no cause the undo can name (FR-736: such a roll-back may complete when tried again). */
+  stepFailed?: true;
 }
 
 /** What is at a path: nothing, a regular file (with the hash of its bytes), or something else. Throws when it cannot be looked at. */
@@ -374,6 +376,7 @@ function knowsBytes(entries: MarkerEntry[], i: number): boolean {
 export async function undoEntries(root: string, entries: MarkerEntry[]): Promise<UndoResult> {
   let ok = true;
   const causes: UndoCause[] = [];
+  let stepFailed = false;
   const because = (kind: UndoCauseKind, path: string) => {
     ok = false;
     if (!causes.some((c) => c.kind === kind && c.path === path)) causes.push({ kind, path });
@@ -529,10 +532,11 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       }
     } catch {
       ok = false;
+      stepFailed = true;
     }
   }
   if (cut()) return { ok: false, causes };
-  return { ok, causes };
+  return { ok, causes, ...(stepFailed ? { stepFailed: true as const } : {}) };
 }
 
 export async function removeMarker(root: string, m: TxnMarker): Promise<void> {
@@ -659,6 +663,8 @@ export interface RecoveryResult {
   paths?: string[];
   /** Not completely rolled back: what kept each path from being undone, when known (R519). */
   causes?: UndoCause[];
+  /** Not completely rolled back: a step failed for no cause the undo could name (FR-736). */
+  stepFailed?: true;
   /** The marker's `projectFolder` as written, when it has one (it may be a different project's folder). */
   projectFolder?: string;
   txn: string;
@@ -911,7 +917,7 @@ export async function recoverTransactions(
     // outside change is lost silently: there is no "changed outside, not kept" to report any more.
     const r = await rollBackMarker(root, m);
     if (r.ok) out.push({ projectId: m.projectId, txn: m.txn, outcome: "rolled-back" });
-    else out.push({ ...where, paths: markerPaths(m), outcome: "rollback-incomplete", ...(r.causes.length ? { causes: r.causes } : {}) });
+    else out.push({ ...where, paths: markerPaths(m), outcome: "rollback-incomplete", ...(r.causes.length ? { causes: r.causes } : {}), ...(r.stepFailed ? { stepFailed: true as const } : {}) });
   }
   return out;
 }

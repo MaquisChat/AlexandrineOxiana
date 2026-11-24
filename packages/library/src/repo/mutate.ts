@@ -41,6 +41,7 @@ import { decryptStream, encryptStream } from "../crypto/format.js";
 import { copyFileAtomic, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
 import { scrubPaths } from "../app-settings.js";
+import { incompleteRollbackOf } from "@ao/shared";
 
 const SMALL_FILE_BYTES = 256 * 1024;
 import type { AuditInput } from "./audit-store.js";
@@ -534,13 +535,25 @@ export async function runMutation<T>(
       maybeCrash("before-marker-delete");
     } catch (err) {
       if (err instanceof SimulatedCrash) throw err; // tests: the process "died" here
-      if ((await log.undo()).ok) {
+      const undone = await log.undo();
+      if (undone.ok) {
         st.audit.head = headBefore;
         await log.finish().catch(() => {});
       } else {
         // Keep the marker so the next open can finish the rollback, and stop writing to this
         // project until then: later writes could otherwise be undone by that recovery.
         st.recoveryPending = true;
+        // FR-736: said at once, with its state, so that the researcher is offered the list of interrupted changes
+        // (the refusal of every later write points to this warning); resolving the change takes it away.
+        const attempt = { causes: undone.causes, stepFailed: undone.stepFailed === true };
+        core.rollbackAttempts.set(log.id, attempt);
+        core.integrityWarnings.push({
+          projectId,
+          kind: "rolled-back-incomplete-write",
+          detail: `a change that failed could only be partly rolled back; the marker is kept and recovery is retried on the next open (transaction ${log.id})`,
+          ...(undone.causes.length ? { causes: undone.causes } : {}),
+          rollback: incompleteRollbackOf(attempt.causes, attempt.stepFailed),
+        });
         // The paths it names stay half changed until then: a read of a source among them says so (R473 I1).
         st.unfinished = new Set([...(st.unfinished ?? []), ...markerPaths(log.marker)]);
         st.audit.head = (await AuditStore.load(st.audit.dir).catch(() => null))?.store.head ?? headBefore;

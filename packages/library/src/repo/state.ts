@@ -20,6 +20,7 @@ import { AnchorStore, AuditStore, type AuditInput, type IntegrityWarning } from 
 import { NotFoundError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
 import { absPath, readMaybe } from "./io.js";
 import type { InternalOptions } from "./seams.js";
+import type { UndoCause } from "./txn.js";
 import type { ReviewItemRow } from "./review.js";
 
 /** Search-index port (Task 12). Called last in a mutation, after files, change log and audit. */
@@ -149,6 +150,12 @@ export const lockPurges: Array<(core: RepoCore, st: ProjectState) => void> = [];
 export class RepoCore {
   readonly projects = new Map<string, ProjectState>();
   readonly integrityWarnings: IntegrityWarning[] = [];
+  /**
+   * FR-736: the latest attempt to undo each interrupted change whose undo is not complete, by transaction (at the
+   * opening, a choice recorded earlier, "Roll it back", or the change's own undo in this process): what kept it from
+   * completing. The list of interrupted changes says it; a complete undo takes its entry away.
+   */
+  readonly rollbackAttempts = new Map<string, { causes: UndoCause[]; stepFailed: boolean }>();
   /** Index failures after a committed mutation (the index is rebuildable; the mutation stands). */
   readonly indexErrors: Array<{ op: string; error: unknown }> = [];
   readonly anchors: AnchorStore;

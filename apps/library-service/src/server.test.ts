@@ -3003,6 +3003,52 @@ describe("screens integration (R118): resolve a pending write (R27)", () => {
   });
 });
 
+describe("FR-736: an interrupted change whose undo is not complete, as the service says it", () => {
+  beforeEach(() => start());
+
+  /** A change that trashed an original and stopped before its audit entry; the copy the app kept of it is gone. */
+  async function lostOriginal(): Promise<{ path: string; pid: string; folder: string; txn: string; rel: string }> {
+    const { mkdir } = await import("node:fs/promises");
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const folder = (await call({ url: "/projects" })).json.projects[0].folder as string;
+    const txn = "019a7000-0000-7000-8000-0000000000d1";
+    const rel = `${folder}/kept.txt`;
+    const auditLines = (await readFile(join(path, folder, "audit", "0001.jsonl"), "utf8")).trim().split("\n").length;
+    await mkdir(join(path, ".tmp"), { recursive: true });
+    await writeFile(
+      join(path, ".tmp", `txn-${txn}.json`),
+      JSON.stringify({ formatVersion: 1, txn, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: auditLines, entries: [{ kind: "trashed", from: rel, to: `.tmp/trash-${txn}-0`, ino: "1", size: 1, mtimeNs: "1" }] }),
+    );
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    return { path, pid, folder, txn, rel };
+  }
+
+  it("the list names what is in the way with its place in the library; the warnings say the state, never a path", async () => {
+    const { path, txn, rel } = await lostOriginal();
+    const list = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;
+    expect(list).toEqual([expect.objectContaining({ txn, status: "uncommitted", canRollBack: true, rollback: "lost", causes: [{ kind: "kept-copy-gone", path: rel }] })]);
+    expect(JSON.stringify(list)).not.toContain(path);
+    const integrity = (await call({ url: "/libraries/integrity" })).json.integrityWarnings as Array<Record<string, unknown>>;
+    const w = integrity.find((x) => x.kind === "rolled-back-incomplete-write")!;
+    expect(w).toMatchObject({ project: "Study", state: "lost" });
+    expect(JSON.stringify(integrity)).not.toContain("kept.txt");
+    expect(Object.keys(w)).not.toContain("causes");
+  });
+
+  it("\"Roll it back\" answers with the state's sentence, marked; a write is refused without advice to reopen", async () => {
+    const { pid, txn } = await lostOriginal();
+    const back = await call({ method: "POST", url: `/libraries/pending-writes/${txn}/resolve`, body: { choice: "roll-back" } });
+    expect([back.status, back.json.error]).toEqual([
+      409,
+      { code: "CONFLICT", message: "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back.", reason: "rollback-incomplete" },
+    ]);
+    const write = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } });
+    expect([write.status, write.json.error.message]).toEqual([409, "This project takes no changes until a problem found when the library was opened is resolved. The warning at the top of the library says what to do."]);
+  });
+});
+
 describe("Task 46b D2 (R137): a library row's needsReview means an item waits in the import review queue", () => {
   beforeEach(() => start());
 
