@@ -474,6 +474,22 @@ describe("normaliseQuote (Task R10)", () => {
     expect(normaliseQuote("사회2023\n2024장")).toBe("사회2023 2024장");
   });
 
+  it("R507 c: a note mark printed as a plain digit after a sentence's end is not joined to a number starting the next line (as before FR-725); a split number still joins", () => {
+    // As 579bdcd gave them: a space between the note mark and the year.
+    expect(normaliseQuote("研究した。1\n2020年には")).toBe("研究した。1 2020年には");
+    expect(normaliseQuote("研究した．12\n2020年には")).toBe("研究した．12 2020年には");
+    expect(normaliseQuote("本当か？3\n2020年")).toBe("本当か？3 2020年");
+    expect(normaliseQuote("驚いた！4\n2020年")).toBe("驚いた！4 2020年");
+    expect(normaliseQuote("「研究した。」5\n2020年には")).toBe("「研究した。」5 2020年には");
+    expect(normaliseQuote("研究した｡6\n2020年")).toBe("研究した｡6 2020年");
+    // A split number still joins, also after a closing bracket that ends no sentence.
+    expect(normaliseQuote("西暦20\n23年")).toBe("西暦2023年");
+    expect(normaliseQuote("「研究」20\n23年")).toBe("「研究」2023年");
+    expect(joinQuotes(["研究した。1", "2020年には"])).toBe("研究した。1 2020年には");
+    // Latin control: a note mark after a full stop keeps its space, as before.
+    expect(normaliseQuote("it was studied.1\n2020 was")).toBe("it was studied.1 2020 was");
+  });
+
   it("FR-725 (3): a superscript digit (a note's mark) joins across the break as a digit does; Latin text keeps its space", () => {
     expect(normaliseQuote("研究者の記録¹\n本文は")).toBe("研究者の記録¹本文は");
     expect(normaliseQuote("研究²³\n方法")).toBe("研究²³方法");

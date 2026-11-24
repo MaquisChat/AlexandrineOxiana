@@ -133,6 +133,12 @@ const CJK_OR_DIGIT = `${CJK}${DIGIT}`;
 /** The white space of a line break; a full-width space before it is not part of it (FR-725 1), nor is one after it. */
 const BREAK = "[^\\S\\n\\u3000]*\\n[^\\S\\u3000]*";
 /**
+ * The marks that close a sentence in Chinese or Japanese text: 。．！？ and the half-width ｡ (R507 c), and the closing
+ * brackets and quotes that may follow them (」』）】〕〉》〙〛”’＂).
+ */
+const SENTENCE_END = "\\u3002\\uFF0E\\uFF01\\uFF1F\\uFF61";
+const CLOSING = "\\u300D\\u300F\\uFF09\\u3011\\u3015\\u3009\\u300B\\u3019\\u301B\\u201D\\u2019\\uFF02";
+/**
  * The white space of a line break between Chinese or Japanese text and Chinese, Japanese or a digit, or between two
  * runs of digits in a Chinese or Japanese run — digits that follow Chinese or Japanese on the line before and are
  * followed by it on the line after ("西暦2023" / "2024年", FR-725 2); digits with such text on one side only, as
@@ -143,7 +149,8 @@ const CJK_LINE_BREAK = new RegExp(
   [
     `(?<=[${CJK}][${MARKS}]*)${BREAK}(?=[${MARKS}]*[${CJK_OR_DIGIT}])`,
     `(?<=[${CJK_OR_DIGIT}][${MARKS}]*)${BREAK}(?=[${MARKS}]*[${CJK}])`,
-    `(?<=[${CJK}][${DIGIT}${MARKS}]*[${DIGIT}][${MARKS}]*)${BREAK}(?=[${MARKS}]*[${DIGIT}][${DIGIT}${MARKS}]*[${CJK}])`,
+    // Only a break that splits one number (R507 c): digits right after a sentence's end are a note mark, not a number's start.
+    `(?<=[${CJK}][${DIGIT}${MARKS}]*[${DIGIT}][${MARKS}]*)(?<![${SENTENCE_END}][${CLOSING}]*[${DIGIT}${MARKS}]*)${BREAK}(?=[${MARKS}]*[${DIGIT}][${DIGIT}${MARKS}]*[${CJK}])`,
   ].join("|"),
   "gu",
 );
