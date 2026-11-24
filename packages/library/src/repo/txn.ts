@@ -44,7 +44,7 @@ import { AuditStore, auditSegments, type Head } from "./audit-store.js";
 import { PathEscapeError } from "./errors.js";
 import { shredPath } from "../fs/shred.js";
 import { assertContained, exists, undoAppend, type AppendUndo } from "./io.js";
-import { seams } from "./seams.js";
+import { seams, type IdentityLookAt } from "./seams.js";
 
 /**
  * `sha256` (created, replaced): of the bytes the change wrote there, when it wrote them itself: a roll-back that finds
@@ -59,21 +59,40 @@ export type MarkerEntry =
    */
   | { kind: "created"; path: string; sha256?: string; complete?: true }
   | { kind: "replaced"; path: string; backup: string; mode: number; sha256?: string }
-  | { kind: "dir"; path: string }
   /**
-   * `shred`: destroyed, not deleted (R90 d): overwritten before it is removed once committed. `ino`, `size`, `mtimeNs`
-   * (R519 (3)): the original's identity when it was trashed (the file number and the time of last modification in
-   * nanoseconds as decimal strings), which a rename keeps: where the trash copy is gone, a file with this identity at
-   * the path is the original, put back.
+   * `ino`, `birthtimeNs` (R526 M2): a completion line, a second "dir" line for the path written once the folder is made,
+   * with its identity (only where the file system gives a time of birth). The undo removes the folder only when what is
+   * at the path has that identity: one a person made again after an earlier undo removed the change's is left. An older
+   * reader ignores the fields and undoes the second line as the first (`rm -r`, the second finding nothing).
    */
-  | { kind: "trashed"; from: string; to: string; shred?: boolean; ino?: string; size?: number; mtimeNs?: string }
+  | { kind: "dir"; path: string; ino?: string; birthtimeNs?: string }
+  /**
+   * `shred`: destroyed, not deleted (R90 d): overwritten before it is removed once committed. `ino`, `birthtimeNs`
+   * (R519 (3) as corrected by R526): the original's identity when it was trashed, its file number and its time of birth
+   * in nanoseconds (decimal strings), for a file or a folder; a rename keeps both, and an edit in place or a file added
+   * inside a folder changes neither: where the trash copy is gone, what has this identity at the path is the original,
+   * put back. Recorded only where it is seen to hold: with no time of birth, the line has none; where the look after the
+   * rename finds it not kept, a second "trashed" line for the same `from` and `to` says `noIdentity` (an older reader
+   * ignores the field and undoes that line as the first), and the first line is then judged as an older build's.
+   */
+  | { kind: "trashed"; from: string; to: string; shred?: boolean; ino?: string; birthtimeNs?: string; noIdentity?: true }
   | { kind: "append"; path: string; prevSize: number; created: boolean };
 
-/** The identity a "trashed" line records of its original (R519 (3)). */
+/** The identity a "trashed" line records of its original (R519 (3), R526): its file number and time of birth. */
 export interface FileIdentity {
   ino: string;
-  size: number;
-  mtimeNs: string;
+  birthtimeNs: string;
+}
+
+/**
+ * The identity of what is at `abs` (not following a link), as the file system gives it (R526), or undefined when it
+ * gives no time of birth (zero): then no identity can be recorded. Throws when it cannot look (ENOENT included).
+ */
+export async function identityOf(abs: string, at: IdentityLookAt): Promise<FileIdentity | undefined> {
+  const st = await fsp.lstat(abs, { bigint: true });
+  let id = { ino: st.ino, birthtimeNs: st.birthtimeNs };
+  if (process.env.NODE_ENV === "test" && seams.identityLook) id = seams.identityLook(at, id);
+  return id.birthtimeNs === 0n ? undefined : { ino: id.ino.toString(), birthtimeNs: id.birthtimeNs.toString() };
 }
 
 /**
@@ -207,6 +226,12 @@ export class TxnLog {
     await this.add({ kind: "created", path: toRel(this.root, abs), sha256, complete: true });
   }
 
+  /** The completion line of a folder this transaction just made (R526 M2): its identity, when there is one to record. */
+  async dirMade(abs: string) {
+    const identity = await identityOf(abs, "dir-made").catch(() => undefined);
+    if (identity) await this.add({ kind: "dir", path: toRel(this.root, abs), ...identity });
+  }
+
   async createdDir(abs: string) {
     const rel = toRel(this.root, abs);
     if (this.inNewDir(rel)) return;
@@ -237,6 +262,15 @@ export class TxnLog {
     for (const p of [...this.appended]) if (covers(p)) this.appended.delete(p);
     for (let i = this.newDirs.length - 1; i >= 0; i--) if (covers(this.newDirs[i]!)) this.newDirs.splice(i, 1);
     await this.add({ kind: "trashed", from: rel, to: toRel(this.root, to), ...(shred ? { shred: true } : {}), ...(identity ?? {}) });
+  }
+
+  /**
+   * R526: the look after the rename found the identity recorded on the "trashed" line not kept (or could not look): a
+   * second line for the same move says so, and that line is judged as an older build's. Written after the first line and
+   * the rename, as a completion line is: a marker cut between the two keeps an identity that may not hold (see undoEntries).
+   */
+  async identityNotKept(from: string, to: string) {
+    await this.add({ kind: "trashed", from: toRel(this.root, from), to: toRel(this.root, to), noIdentity: true });
   }
 
   async append(u: AppendUndo) {
@@ -281,8 +315,8 @@ export interface UndoResult {
   stepFailed?: true;
 }
 
-/** What is at a path: nothing, a regular file (with the hash of its bytes), or something else. Throws when it cannot be looked at. */
-type Look = { at: "nothing" } | { at: "file"; sha256: string } | { at: "other" };
+/** What is at a path: nothing, a regular file (with the hash of its bytes), a folder, or something else. Throws when it cannot be looked at. */
+type Look = { at: "nothing" } | { at: "file"; sha256: string } | { at: "folder" } | { at: "other" };
 async function look(root: string, rel: string): Promise<Look> {
   if (process.env.NODE_ENV === "test" && seams.failLook === rel) throw new Error("simulated read failure");
   const st = await fsp.lstat(fromRel(root, rel)).catch((err: NodeJS.ErrnoException) => {
@@ -290,6 +324,7 @@ async function look(root: string, rel: string): Promise<Look> {
     throw err;
   });
   if (!st) return { at: "nothing" };
+  if (st.isDirectory()) return { at: "folder" };
   if (!st.isFile()) return { at: "other" };
   const sha256 = await sha256File(fromRel(root, rel));
   return sha256 === null ? { at: "nothing" } : { at: "file", sha256 };
@@ -300,7 +335,8 @@ async function look(root: string, rel: string): Promise<Look> {
  * under or above its path; "the change's" when an earlier line made it (created or replaced it whole, made the folder
  * or one above it, or created it by appending): then nothing of the researcher's is in that copy (a replaced file's
  * original is in its backup); "changed by the change" when the change only added to it (an append, or lines under a
- * folder): the original with the change's additions, whose undo after it is put back changes its size and time.
+ * folder): the original with the change's additions. The first and the last are judged alike by the original's
+ * identity, which the undo of those additions in place keeps (R526).
  */
 function trashedContent(entries: MarkerEntry[], i: number): "the original" | "the change's" | "changed by the change" {
   const from = (entries[i] as Extract<MarkerEntry, { kind: "trashed" }>).from;
@@ -318,19 +354,43 @@ function trashedContent(entries: MarkerEntry[], i: number): "the original" | "th
 }
 
 /**
- * Whether what is at a "trashed" line's path has the identity the line recorded of its original (R519 (3)): the same
- * file number, size and time of last modification, which a rename inside the volume keeps; the file number alone when
- * the change had added to it (`numberOnly`: undoing that addition in place keeps the number, not the size or time).
- * Throws when it cannot look.
+ * The identity "trashed" line `i` recorded of its original, or undefined: none recorded (an older build's line, or no
+ * time of birth), or a later line for the same move says it was not kept by the rename (R526).
  */
-async function isOriginal(root: string, e: Extract<MarkerEntry, { kind: "trashed" }>, numberOnly: boolean): Promise<boolean> {
-  if (process.env.NODE_ENV === "test" && seams.failLook === e.from) throw new Error("simulated read failure");
-  const st = await fsp.lstat(fromRel(root, e.from), { bigint: true }).catch((err: NodeJS.ErrnoException) => {
+function trashedIdentity(entries: MarkerEntry[], i: number): FileIdentity | undefined {
+  const e = entries[i] as Extract<MarkerEntry, { kind: "trashed" }>;
+  if (e.ino === undefined || e.birthtimeNs === undefined) return undefined;
+  const lost = entries.some((x, j) => j > i && x.kind === "trashed" && x.noIdentity === true && x.from === e.from && x.to === e.to);
+  return lost ? undefined : { ino: e.ino, birthtimeNs: e.birthtimeNs };
+}
+
+/**
+ * Whether what is at `rel` has `id` (R519 (3), R526): the same file number and time of birth, which a rename inside the
+ * volume, an edit in place and a file added inside a folder all keep; a file made after another was deleted may get its
+ * number, never its time of birth. Throws when it cannot look.
+ */
+async function isOriginal(root: string, rel: string, id: FileIdentity): Promise<boolean> {
+  if (process.env.NODE_ENV === "test" && seams.failLook === rel) throw new Error("simulated read failure");
+  const st = await fsp.lstat(fromRel(root, rel), { bigint: true }).catch((err: NodeJS.ErrnoException) => {
     if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
     throw err;
   });
-  if (st === null || st.ino.toString() !== e.ino) return false;
-  return numberOnly || (Number(st.size) === e.size && st.mtimeNs.toString() === e.mtimeNs);
+  return st !== null && st.ino.toString() === id.ino && st.birthtimeNs.toString() === id.birthtimeNs;
+}
+
+/**
+ * The identity the completion line of "dir" line `i` recorded of the folder the change made (R526 M2): the next "dir"
+ * line at that path, before a trash at or above it; undefined when there is none (an older build's line, no time of
+ * birth, or a crash between the folder and its completion line).
+ */
+function dirIdentity(entries: MarkerEntry[], i: number): FileIdentity | undefined {
+  const e = entries[i] as Extract<MarkerEntry, { kind: "dir" }>;
+  for (let j = i + 1; j < entries.length; j++) {
+    const x = entries[j]!;
+    if (x.kind === "dir" && x.path === e.path) return x.ino !== undefined && x.birthtimeNs !== undefined ? { ino: x.ino, birthtimeNs: x.birthtimeNs } : undefined;
+    if (x.kind === "trashed" && (e.path === x.from || e.path.startsWith(`${x.from}/`))) return undefined;
+  }
+  return undefined;
 }
 
 /** The hashes the change recorded for what it wrote at `rel` ("created", completion and "replaced" lines). */
@@ -390,7 +450,8 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
   /** Paths where something not of the change, or not known to be, was left as it is (R519). */
   const blocked: string[] = [];
   for (const [i, e] of entries.entries()) {
-    if (e.kind !== "trashed") continue;
+    // A line that says the identity was not kept is no step of its own: its first line's move (R526).
+    if (e.kind !== "trashed" || e.noIdentity) continue;
     let putBack: boolean;
     try {
       putBack = !(await exists(fromRel(root, e.to)));
@@ -401,7 +462,8 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
     }
     if (!putBack) continue;
     const earlier = trashedContent(entries, i);
-    if (e.ino === undefined) {
+    const id = trashedIdentity(entries, i);
+    if (id === undefined) {
       // An older build's line (no identity), judged as before. R503 b 2: a copy gone while the change's own bytes (a
       // later line's hash) are still at the path was not put back: it was deleted outside the app. The roll-back is
       // then not complete (the marker is kept); nothing is deleted.
@@ -410,25 +472,18 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       } catch {
         because("could-not-look", e.from);
       }
-    } else if (earlier === "the original") {
-      // R519 (3): the line knows the original's identity. A file with it at the path IS the original, put back (or never
-      // moved: a crash between the line and its rename), whatever its bytes equal (R509 M1). The change's own file,
-      // anything else, or nothing there: the original was not put back and cannot be, the copy being gone (R509 M2).
-      // Nothing at the path is deleted or moved, and no line at or under it is undone.
+    } else if (earlier !== "the change's") {
+      // R519 (3), R526: the line knows the original's identity (file number, time of birth). What has it at the path IS
+      // the original, put back (or never moved: a crash between the line and its rename), whatever its bytes or its
+      // times now (R509 M1; edited in place, a file added inside the folder, the change's additions undone in place).
+      // The change's own file, anything else (a reused file number included: born later), or nothing there: the
+      // original was not put back and cannot be, the copy being gone (R509 M2). Nothing at the path is deleted, cut or
+      // moved, and no line at or under it is undone. A marker cut between the line and the one saying the identity was
+      // not kept holds an identity that may not hold: an original put back then does not match, and the roll-back is
+      // incomplete (kept-copy-gone), closable: the safe side; what matches is the original (a rename that does not keep
+      // the time of birth gives the original a new one, never another file the recorded one).
       try {
-        if (!(await isOriginal(root, e, false))) {
-          because("kept-copy-gone", e.from);
-          blocked.push(e.from);
-        }
-      } catch {
-        because("could-not-look", e.from);
-        blocked.push(e.from);
-      }
-    } else if (earlier === "changed by the change") {
-      // The same, by its file number alone: the original with the change's additions, which their undo, after it is put
-      // back, takes away in place (its size and time change, its number stays).
-      try {
-        if (!(await isOriginal(root, e, true))) {
+        if (!(await isOriginal(root, e.from, id))) {
           because("kept-copy-gone", e.from);
           blocked.push(e.from);
         }
@@ -464,6 +519,8 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
     if (cut()) return { ok: false, causes };
     steps++;
     if (done.has(i)) continue;
+    if (e.kind === "trashed" && e.noIdentity) continue; // its first line undoes the move (R526)
+    if (e.kind === "dir" && e.ino !== undefined) continue; // a completion line: its first line removes the folder (R526 M2)
     const at = e.kind === "trashed" ? e.from : e.path;
     if (isBlocked(at)) continue; // left for the researcher, with the line that found it (the roll-back is not complete)
     try {
@@ -477,12 +534,33 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
           continue;
         }
         if (now.at === "nothing") continue;
+        // R526 M4: a folder stands where the change wrote a file: never the change's own; named, nothing removed.
+        if (now.at === "folder") {
+          block("path-occupied", e.path);
+          continue;
+        }
         if (knowsBytes(entries, i) && !(now.at === "file" && writeHashes(entries, e.path).includes(now.sha256))) {
           block("hand-changed-file", e.path);
           continue;
         }
         await fsp.rm(fromRel(root, e.path), { force: true });
-      } else if (e.kind === "dir") await fsp.rm(fromRel(root, e.path), { recursive: true, force: true });
+      } else if (e.kind === "dir") {
+        // R526 M2: with a recorded identity, the folder is removed only when it is the change's own. Anything else there
+        // (a folder a person made again after an earlier undo removed the change's) is left exactly as it is: the step
+        // is done, as it was when that earlier undo removed the change's folder. Without one: as before.
+        const id = dirIdentity(entries, i);
+        if (id !== undefined) {
+          let own: boolean;
+          try {
+            own = await isOriginal(root, e.path, id);
+          } catch {
+            block("could-not-look", e.path);
+            continue;
+          }
+          if (!own) continue;
+        }
+        await fsp.rm(fromRel(root, e.path), { recursive: true, force: true });
+      }
       else if (e.kind === "replaced") {
         const backup = fromRel(root, e.backup);
         if (!(await exists(backup))) continue;
@@ -502,7 +580,7 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
             block("could-not-look", e.path);
             continue;
           }
-          if (now.at === "other" || (now.at === "file" && !writeHashes(entries, e.path).includes(now.sha256) && !kept.includes(now.sha256))) {
+          if (now.at === "other" || now.at === "folder" || (now.at === "file" && !writeHashes(entries, e.path).includes(now.sha256) && !kept.includes(now.sha256))) {
             block("hand-changed-file", e.path);
             continue;
           }
@@ -595,6 +673,10 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
       case "created":
       case "dir":
         if (!under(en.path, pf)) return `${en.kind} path outside the project`;
+        // A folder's identity (R526 M2): whole or absent, on a "dir" line only.
+        if (en.ino !== undefined || en.birthtimeNs !== undefined) {
+          if (en.kind !== "dir" || !isDigits(en.ino) || !isDigits(en.birthtimeNs)) return "bad entry";
+        }
         if (en.sha256 !== undefined && (en.kind === "dir" || !isSha(en.sha256))) return "bad entry";
         if (en.complete !== undefined && (en.kind === "dir" || en.complete !== true || en.sha256 === undefined)) return "bad entry";
         break;
@@ -608,10 +690,12 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
         if (!under(en.from, pf)) return "trashed path outside the project";
         if (!isTrashOf(en.to, x.txn)) return "trash is not this transaction's folder in .tmp";
         if (en.shred !== undefined && typeof en.shred !== "boolean") return "bad trashed entry";
-        // The identity is whole or absent (an older build's line): never judged on part of it.
-        if (en.ino !== undefined || en.size !== undefined || en.mtimeNs !== undefined) {
-          if (!isDigits(en.ino) || !count(en.size) || !isDigits(en.mtimeNs)) return "bad trashed entry";
+        // The identity is whole or absent (an older build's line): never judged on part of it (R526: number and birth).
+        if (en.ino !== undefined || en.birthtimeNs !== undefined) {
+          if (!isDigits(en.ino) || !isDigits(en.birthtimeNs)) return "bad trashed entry";
         }
+        // A line saying the identity was not kept carries none itself.
+        if (en.noIdentity !== undefined && (en.noIdentity !== true || en.ino !== undefined)) return "bad trashed entry";
         break;
       case "append":
         if (!under(en.path, pf)) return "append path outside the project";

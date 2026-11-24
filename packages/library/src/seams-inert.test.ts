@@ -4,14 +4,17 @@
  * "test", and neither is exported from the package's entry. Each is shown to be reached under "test" first, so that
  * its silence outside it is the guard's doing.
  */
-import { rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { addSource, makeKit, makeProject, type Kit } from "./export/test-kit.js";
 import * as entry from "./index.js";
 import { importChange } from "./repo/repo.js";
+import { seams } from "./repo/seams.js";
 import { confirmationSeams } from "./repo/sources.js";
+import { fromRel, identityOf, undoEntries } from "./repo/txn.js";
 import { listDestructions, retentionSeams } from "./retention.js";
 
 const STORE = { action: "store" as const, store: { identifiable: false, hasLocation: false } };
@@ -25,6 +28,8 @@ afterEach(async () => {
   process.env.NODE_ENV = env;
   retentionSeams.afterScan = undefined;
   confirmationSeams.onRun = undefined;
+  seams.failLook = undefined;
+  seams.identityLook = undefined;
   await kit.close();
 });
 
@@ -74,5 +79,53 @@ describe("R484 c: the new seams are inert outside NODE_ENV=test", () => {
     expect(Object.keys(entry)).not.toContain("confirmationSeams");
     expect(Object.values(entry)).not.toContain(retentionSeams);
     expect(Object.values(entry)).not.toContain(confirmationSeams);
+  });
+});
+
+/**
+ * R526 M5 (R47): the roll-back's look seam `seams.failLook` has two sites, the look at a file the change wrote (`look`)
+ * and the look at a trashed original's identity (`isOriginal`); the identity look `seams.identityLook` (R526) replaces
+ * what the file system gives. Each is reached under "test", and does nothing under "production".
+ */
+describe("R526 M5: the roll-back's look seams are inert outside NODE_ENV=test", () => {
+  let root: string;
+  const R = "Projects/P/kept.txt";
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "ao-r526m5-"));
+    await mkdir(fromRel(root, "Projects/P"), { recursive: true });
+    await writeFile(fromRel(root, R), "the original\n");
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("seams.failLook at the look of a file the change wrote: could-not-look under test, the file removed under production", async () => {
+    seams.failLook = R;
+    expect(await under("test", () => undoEntries(root, [{ kind: "created", path: R }]))).toEqual({ ok: false, causes: [{ kind: "could-not-look", path: R }] });
+    expect(await readFile(fromRel(root, R), "utf8")).toBe("the original\n");
+    expect(await under("production", () => undoEntries(root, [{ kind: "created", path: R }]))).toEqual({ ok: true, causes: [] });
+    expect(await readFile(fromRel(root, R)).catch(() => null)).toBeNull();
+  });
+
+  it("seams.failLook at the look of a trashed original's identity: could-not-look under test, the original found put back under production", async () => {
+    const st = await stat(fromRel(root, R), { bigint: true });
+    // The kept copy is gone (never made): only the identity look is reached at this path.
+    const entries = [{ kind: "trashed" as const, from: R, to: ".tmp/trash-0-0", ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() }];
+    seams.failLook = R;
+    expect(await under("test", () => undoEntries(root, entries))).toEqual({ ok: false, causes: [{ kind: "could-not-look", path: R }] });
+    expect(await under("production", () => undoEntries(root, entries))).toEqual({ ok: true, causes: [] });
+    expect(await readFile(fromRel(root, R), "utf8")).toBe("the original\n");
+  });
+
+  it("seams.identityLook replaces the identity the file system gives under test, never under production", async () => {
+    const st = await stat(fromRel(root, R), { bigint: true });
+    seams.identityLook = (_at, real) => ({ ino: real.ino, birthtimeNs: 0n });
+    expect(await under("test", () => identityOf(fromRel(root, R), "trash-before"))).toBeUndefined();
+    expect(await under("production", () => identityOf(fromRel(root, R), "trash-before"))).toEqual({ ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() });
+  });
+
+  it("the seams object is not exported from the package's entry", () => {
+    expect(Object.values(entry)).not.toContain(seams);
+    expect(Object.keys(entry)).not.toContain("seams");
   });
 });

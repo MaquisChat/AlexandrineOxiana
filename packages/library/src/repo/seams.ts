@@ -25,6 +25,9 @@ export type CrashPoint =
   /** R362 b: the library's log: a reason's sealed text is written, the library's entry not yet. */
   | "library-reason-before-entry";
 
+/** Where the transaction looks at an identity (R526): a trashed original before and after its rename, a folder it made. */
+export type IdentityLookAt = "trash-before" | "trash-after" | "dir-made";
+
 export const seams: {
   crashAt?: CrashPoint;
   /** Makes every undo step of this kind fail (until cleared). */
@@ -36,6 +39,12 @@ export const seams: {
   stopUndoAfter?: number;
   /** Makes the roll-back's look at this library-relative path fail, as a permission or I/O error would (R519; until cleared). */
   failLook?: string;
+  /**
+   * Replaces the identity (file number, time of birth) the file system gives at one of the transaction's looks (R526),
+   * as a file system with no time of birth, or one whose rename does not keep it, would give it. Honoured only when
+   * NODE_ENV is "test" (R47).
+   */
+  identityLook?: (at: IdentityLookAt, real: { ino: bigint; birthtimeNs: bigint }) => { ino: bigint; birthtimeNs: bigint };
   /** Runs after a new folder is recorded in the marker and before it is created (a racing writer, R62). */
   beforeMkdir?: (abs: string) => Promise<void>;
   /** Makes every audit append for this project id fail (until cleared). */

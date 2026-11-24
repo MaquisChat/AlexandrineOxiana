@@ -101,6 +101,7 @@ afterEach(async () => {
   seams.crashAt = undefined;
   seams.stopUndoAfter = undefined;
   seams.failLook = undefined;
+  seams.identityLook = undefined;
   await lib.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
@@ -402,7 +403,7 @@ describe("R519 (3) (R509 M1, M2): where the kept copy of a trashed original is g
     });
     const identity = async () => {
       const st = await stat(fromRel(root, R), { bigint: true });
-      return { ino: st.ino.toString(), size: Number(st.size), mtimeNs: st.mtimeNs.toString() };
+      return { ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() };
     };
 
     it("a crash between the trashed line and its rename (no copy was ever made, no later line): the original is at its path, done", async () => {
@@ -425,6 +426,313 @@ describe("R519 (3) (R509 M1, M2): where the kept copy of a trashed original is g
       expect(await readFile(fromRel(root, R), "utf8")).toBe(own);
     });
   });
+});
+
+describe("R526 I1 (with M3): the original's identity is its file number and its time of birth, recorded only where it is seen to hold", () => {
+  const rel = () => `${folder}/kept.txt`;
+  const own = "the change's own file\n";
+
+  it("probe C: a source's folder put back, a file added inside it, the blocking file moved away: the roll-back COMPLETES", async () => {
+    const sf2 = await repo.createSource(pid, draft("Two"), [{ path: join(tmp, "in.pdf"), role: "original", handling: "copy" }], { provenance: provenance() });
+    const f2 = sf2.source.folder;
+    const record = await text(`${f2}/source.json`);
+    const a = `${folder}/a.txt`;
+    const m = await crashed(async (tx) => {
+      await tx.writeFile(a, "written by the change\n");
+      await tx.trash(f2);
+    });
+    await writeFile(fromRel(lib.root, a), HAND);
+    for (const run of ["first", "second"]) {
+      await reopen();
+      expect(await text(`${f2}/source.json`), run).toBe(record);
+      expect(await markers(), run).toEqual([`txn-${m.txn}.json`]);
+      expect(causes(), run).toEqual([{ kind: "hand-changed-file", path: a }]);
+    }
+    // The Finder writes its own file in the folder put back (the folder's time of last writing changes), and the
+    // researcher moves the hand-changed file away.
+    await writeFile(fromRel(lib.root, `${f2}/.DS_Store`), "the Finder's own file\n");
+    await rename(fromRel(lib.root, a), join(tmp, "a-moved.txt"));
+    await reopen();
+    expect(await markers()).toEqual([]);
+    expect(causes()).toEqual([]);
+    expect(await text(`${f2}/source.json`)).toBe(record);
+    expect(await text(`${f2}/.DS_Store`)).toBe("the Finder's own file\n");
+    expect(await text(a)).toBeNull();
+  });
+
+  it("an original put back, then edited in place by the researcher: still the original, the roll-back completes with the edit kept", async () => {
+    await writeFile(fromRel(lib.root, rel()), ORIGINAL);
+    const m = await crashed(async (tx) => {
+      await tx.trash(rel());
+      await tx.writeFile(rel(), own);
+    });
+    await lib.close();
+    seams.stopUndoAfter = m.entries.length;
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    expect(seams.stopUndoAfter).toBeUndefined();
+    expect(await text(rel())).toBe(ORIGINAL);
+    const edited = "the researcher's original, edited by them in place\n";
+    await writeFile(fromRel(lib.root, rel()), edited);
+    for (const run of ["second", "third"]) {
+      await reopen();
+      expect(await text(rel()), run).toBe(edited);
+      expect(await markers(), run).toEqual([]);
+      expect(causes(), run).toEqual([]);
+    }
+  });
+
+  it("a trashed line records the file number and the time of birth, no size or time of last writing, and nothing more once the rename kept them", async () => {
+    await writeFile(fromRel(lib.root, rel()), ORIGINAL);
+    const st = await stat(fromRel(lib.root, rel()), { bigint: true });
+    const m = await crashed(async (tx) => {
+      await tx.trash(rel());
+    });
+    expect(m.entries).toEqual([{ kind: "trashed", from: rel(), to: (m.entries[0] as { to: string }).to, ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() }]);
+  });
+
+  describe("a file system that gives no time of birth, or whose rename does not keep it (a stand-in through the identity look)", () => {
+    it("no time of birth: no identity on the line; judged as an older build's line (a hand file at the path, the copy gone: counted as put back)", async () => {
+      seams.identityLook = (_at, real) => ({ ino: real.ino, birthtimeNs: 0n });
+      await writeFile(fromRel(lib.root, rel()), ORIGINAL);
+      const m = await crashed(async (tx) => {
+        await tx.trash(rel());
+        await tx.writeFile(rel(), own);
+      });
+      seams.identityLook = undefined;
+      const t = m.entries[0] as Extract<MarkerEntry, { kind: "trashed" }>;
+      expect(t).toEqual({ kind: "trashed", from: rel(), to: t.to });
+      expect(m.entries.filter((e) => e.kind === "trashed")).toHaveLength(1);
+      await rm(fromRel(lib.root, t.to), { force: true });
+      await writeFile(fromRel(lib.root, rel()), HAND);
+      await reopen();
+      expect(await text(rel())).toBe(HAND);
+      expect(await markers()).toEqual([]);
+    });
+
+    it("the time of birth not kept by the rename: a second trashed line says no identity; judged as an older build's line", async () => {
+      seams.identityLook = (at, real) => (at === "trash-after" ? { ino: real.ino, birthtimeNs: real.birthtimeNs + 1n } : real);
+      await writeFile(fromRel(lib.root, rel()), ORIGINAL);
+      const st = await stat(fromRel(lib.root, rel()), { bigint: true });
+      const m = await crashed(async (tx) => {
+        await tx.trash(rel());
+        await tx.writeFile(rel(), own);
+      });
+      seams.identityLook = undefined;
+      const t = m.entries[0] as Extract<MarkerEntry, { kind: "trashed" }>;
+      expect(m.entries.slice(0, 2)).toEqual([
+        { kind: "trashed", from: rel(), to: t.to, ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() },
+        { kind: "trashed", from: rel(), to: t.to, noIdentity: true },
+      ]);
+      await rm(fromRel(lib.root, t.to), { force: true });
+      await writeFile(fromRel(lib.root, rel()), HAND);
+      await reopen();
+      expect(await text(rel())).toBe(HAND);
+      expect(await markers()).toEqual([]);
+    });
+
+    it("the control: with the identity kept, the same hand file is not the original: incomplete (kept-copy-gone), nothing deleted", async () => {
+      await writeFile(fromRel(lib.root, rel()), ORIGINAL);
+      const m = await crashed(async (tx) => {
+        await tx.trash(rel());
+        await tx.writeFile(rel(), own);
+      });
+      await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { force: true });
+      await writeFile(fromRel(lib.root, rel()), HAND);
+      await keptAndIncomplete(rel(), [{ kind: "kept-copy-gone", path: rel() }], m.txn);
+    });
+  });
+
+  describe("at the level of the marker's lines", () => {
+    let root: string;
+    const R = "Projects/P/kept.txt";
+    const T = ".tmp/trash-0-0";
+    beforeEach(async () => {
+      root = await mkdtemp(join(tmpdir(), "ao-r526id-"));
+      await mkdir(fromRel(root, "Projects/P"), { recursive: true });
+      await mkdir(fromRel(root, ".tmp"), { recursive: true });
+    });
+    afterEach(async () => {
+      await rm(root, { recursive: true, force: true });
+    });
+
+    it("probe F: the kept copy deleted, a new file at the path with the SAME file number (born later): not the original, nothing cut short, incomplete (kept-copy-gone)", async () => {
+      // The change appended to the 2-byte original "a " and then trashed it; the kept copy is deleted by hand and a person
+      // writes a new file at the path, which the file system gave the freed number. The line is built with that number
+      // and a time of birth before the new file's (the original's), so the case does not hang on the number being reused.
+      await writeFile(fromRel(root, R), "a person's new file, longer than two bytes\n");
+      const st = await stat(fromRel(root, R), { bigint: true });
+      const entries: MarkerEntry[] = [
+        { kind: "append", path: R, prevSize: 2, created: false },
+        { kind: "trashed", from: R, to: T, ino: st.ino.toString(), birthtimeNs: (st.birthtimeNs - 5_000_000_000n).toString() },
+      ];
+      for (const run of ["first", "second"]) {
+        expect(await undoEntries(root, entries), run).toEqual({ ok: false, causes: [{ kind: "kept-copy-gone", path: R }] });
+        expect(await readFile(fromRel(root, R), "utf8"), run).toBe("a person's new file, longer than two bytes\n");
+      }
+    });
+
+    it("a marker cut between the trashed line and the one that says the identity did not hold: an identity that does not match is the safe side (kept-copy-gone, closable), nothing touched", async () => {
+      await writeFile(fromRel(root, R), ORIGINAL);
+      const st = await stat(fromRel(root, R), { bigint: true });
+      // The rename did not keep the time of birth (a file system unlike APFS or ext4): the original at the path no longer matches.
+      const entries: MarkerEntry[] = [{ kind: "trashed", from: R, to: T, ino: st.ino.toString(), birthtimeNs: (st.birthtimeNs + 1n).toString() }];
+      expect(await undoEntries(root, entries)).toEqual({ ok: false, causes: [{ kind: "kept-copy-gone", path: R }] });
+      expect(await readFile(fromRel(root, R), "utf8")).toBe(ORIGINAL);
+      // With the second line written, the same marker is judged as an older build's: the original at its path, done.
+      entries.push({ kind: "trashed", from: R, to: T, noIdentity: true });
+      expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
+      expect(await readFile(fromRel(root, R), "utf8")).toBe(ORIGINAL);
+    });
+
+    it("a FOLDER put back, with a file added inside it later: its number and time of birth still match, done", async () => {
+      const F = "Projects/P/F";
+      await mkdir(fromRel(root, F));
+      await writeFile(fromRel(root, `${F}/a.txt`), ORIGINAL);
+      const st = await stat(fromRel(root, F), { bigint: true });
+      const entries: MarkerEntry[] = [{ kind: "trashed", from: F, to: T, ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() }];
+      await writeFile(fromRel(root, `${F}/.DS_Store`), "x");
+      expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
+      expect(await readFile(fromRel(root, `${F}/a.txt`), "utf8")).toBe(ORIGINAL);
+    });
+  });
+});
+
+describe("R526 M2: a folder the change made is removed only when it is the change's own (its file number and time of birth)", () => {
+  const D = () => `${folder}/made`;
+  /** The change makes a folder and writes a file in it; a crash before its audit entry. */
+  const madeAndWritten = () =>
+    crashed(async (tx) => {
+      await tx.mkdir(D());
+      await tx.writeFile(`${D()}/f.txt`, "the change's file in its folder\n");
+    });
+
+  it("the folder's line is followed, once it is made, by a second dir line with its identity", async () => {
+    const m = await madeAndWritten();
+    const st = await stat(fromRel(lib.root, D()), { bigint: true });
+    expect(m.entries.slice(0, 2)).toEqual([
+      { kind: "dir", path: D() },
+      { kind: "dir", path: D(), ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() },
+    ]);
+  });
+
+  it("probe D: the first undo cut after its steps, a person makes the folder again with a file of theirs: the second undo leaves it exactly, and completes", async () => {
+    // The person's folder is made before the change's is removed (then moved into place), so that it is a folder of its
+    // own: one made by hand within the same clock tick, given the freed number, could not be told from the change's.
+    await mkdir(join(tmp, "theirs"));
+    await writeFile(join(tmp, "theirs", "mine.txt"), HAND);
+    const m = await madeAndWritten();
+    await lib.close();
+    seams.stopUndoAfter = m.entries.length;
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    expect(seams.stopUndoAfter).toBeUndefined();
+    expect(await text(`${D()}/f.txt`)).toBeNull();
+    expect(await markers()).toHaveLength(1);
+    await rename(join(tmp, "theirs"), fromRel(lib.root, D()));
+    for (const run of ["second", "third"]) {
+      await reopen();
+      expect(await text(`${D()}/mine.txt`), run).toBe(HAND);
+      expect(await markers(), run).toEqual([]);
+      expect(causes(), run).toEqual([]);
+    }
+  });
+
+  it("the ordinary crash: the change's own folder, with its own files in it, is removed", async () => {
+    const m = await crashed(async (tx) => {
+      await tx.mkdir(`${D()}/sub`);
+      await tx.writeFile(`${D()}/f.txt`, "the change's file\n");
+      await tx.copyFile(join(tmp, "src.txt"), `${D()}/sub/copied.txt`);
+    });
+    expect(m.entries.filter((e) => e.kind === "dir")).toHaveLength(2);
+    await reopen();
+    expect(await stat(fromRel(lib.root, D())).catch(() => null)).toBeNull();
+    expect(await markers()).toEqual([]);
+    expect(causes()).toEqual([]);
+  });
+
+  it("no time of birth (a stand-in through the identity look): no second line, and the folder's undo is as before", async () => {
+    seams.identityLook = (_at, real) => ({ ino: real.ino, birthtimeNs: 0n });
+    const m = await madeAndWritten();
+    seams.identityLook = undefined;
+    expect(m.entries.filter((e) => e.kind === "dir")).toEqual([{ kind: "dir", path: D() }]);
+    await reopen();
+    expect(await stat(fromRel(lib.root, D())).catch(() => null)).toBeNull();
+    expect(await markers()).toEqual([]);
+  });
+
+  describe("at the level of the marker's lines", () => {
+    let root: string;
+    const P = "Projects/P/D";
+    beforeEach(async () => {
+      root = await mkdtemp(join(tmpdir(), "ao-r526dir-"));
+      await mkdir(fromRel(root, "Projects/P"), { recursive: true });
+    });
+    afterEach(async () => {
+      await rm(root, { recursive: true, force: true });
+    });
+    const lines = async (): Promise<MarkerEntry[]> => {
+      await mkdir(fromRel(root, P));
+      const st = await stat(fromRel(root, P), { bigint: true });
+      await rm(fromRel(root, P), { recursive: true });
+      return [
+        { kind: "dir", path: P },
+        { kind: "dir", path: P, ino: st.ino.toString(), birthtimeNs: (st.birthtimeNs - 5_000_000_000n).toString() },
+      ];
+    };
+
+    it("a folder at the path with another identity is left exactly as it is; the step counts as done", async () => {
+      const entries = await lines();
+      await mkdir(fromRel(root, P));
+      await writeFile(fromRel(root, `${P}/mine.txt`), HAND);
+      for (const run of ["first", "second"]) {
+        expect(await undoEntries(root, entries), run).toEqual({ ok: true, causes: [] });
+        expect(await readFile(fromRel(root, `${P}/mine.txt`), "utf8"), run).toBe(HAND);
+      }
+    });
+
+    it("a file at the path is left as it is too; nothing at the path is done", async () => {
+      const entries = await lines();
+      await writeFile(fromRel(root, P), HAND);
+      expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
+      expect(await readFile(fromRel(root, P), "utf8")).toBe(HAND);
+      await rm(fromRel(root, P));
+      expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
+    });
+
+    it("without a recorded identity (an older build's line): the folder is removed as before", async () => {
+      await mkdir(fromRel(root, P));
+      await writeFile(fromRel(root, `${P}/f`), "x");
+      expect(await undoEntries(root, [{ kind: "dir", path: P }])).toEqual({ ok: true, causes: [] });
+      expect(await stat(fromRel(root, P)).catch(() => null)).toBeNull();
+    });
+  });
+});
+
+describe("R526 M4: a folder standing at a created file's path is named (path-occupied), and nothing is removed", () => {
+  let root: string;
+  const F = "Projects/P/copied.bin";
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "ao-r526m4-"));
+    await mkdir(fromRel(root, F), { recursive: true });
+    await writeFile(fromRel(root, `${F}/inside.txt`), HAND);
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+  const cases: Array<{ name: string; entries: MarkerEntry[] }> = [
+    { name: "probe E3: a cut copy (no completion line)", entries: [{ kind: "created", path: F }] },
+    { name: "a copy with its completion line", entries: [{ kind: "created", path: F }, { kind: "created", path: F, sha256: "a".repeat(64), complete: true }] },
+    { name: "a file written whole (its hash on its line)", entries: [{ kind: "created", path: F, sha256: "b".repeat(64) }] },
+  ];
+  for (const c of cases) {
+    it(`${c.name}: incomplete with path-occupied and the path, the folder and its file kept, at every run`, async () => {
+      for (const run of ["first", "second"]) {
+        expect(await undoEntries(root, c.entries), run).toEqual({ ok: false, causes: [{ kind: "path-occupied", path: F }] });
+        expect(await readFile(fromRel(root, `${F}/inside.txt`), "utf8"), run).toBe(HAND);
+      }
+    });
+  }
 });
 
 describe("R47: the roll-back's look seam (seams.failLook) does nothing outside NODE_ENV=test", () => {

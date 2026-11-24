@@ -110,7 +110,7 @@ describe("R519 (2): the completion line of a copied file", () => {
 });
 
 describe("R519 (2): files written inside a folder the change created", () => {
-  it("a written file and a copied file each get only a completion line, after the folder's line", async () => {
+  it("a written file and a copied file each get only a completion line, after the folder's line and its completion (R526 M2)", async () => {
     const p = await project(false);
     const dir = `${p.folder}/made`;
     const m = await crashed(p.id, async (tx) => {
@@ -118,8 +118,10 @@ describe("R519 (2): files written inside a folder the change created", () => {
       await tx.writeFile(`${dir}/written.txt`, "written inside\n");
       await tx.copyFile(join(tmp, "src.txt"), `${dir}/copied.txt`);
     });
+    const st = await stat(fromRel(lib.root, dir), { bigint: true });
     expect(m.entries).toEqual([
       { kind: "dir", path: dir },
+      { kind: "dir", path: dir, ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() },
       { kind: "created", path: `${dir}/written.txt`, sha256: sha("written inside\n"), complete: true },
       { kind: "created", path: `${dir}/copied.txt`, sha256: sha(SRC), complete: true },
     ]);
@@ -136,8 +138,8 @@ describe("R519 (2): files written inside a folder the change created", () => {
   });
 });
 
-describe("R519 (3): a trashed line records the original's identity as the file system gives it", () => {
-  it("file number (bigint as a string), size, and time of last modification in nanoseconds (as a string)", async () => {
+describe("R519 (3), R526: a trashed line records the original's identity as the file system gives it", () => {
+  it("file number and time of birth in nanoseconds (bigints as strings), no size or time of last writing (R526)", async () => {
     const p = await project(false);
     const rel = `${p.folder}/kept.txt`;
     await writeFile(fromRel(lib.root, rel), "the original\n");
@@ -146,7 +148,7 @@ describe("R519 (3): a trashed line records the original's identity as the file s
       await tx.trash(rel);
     });
     const t = m.entries[0] as Extract<MarkerEntry, { kind: "trashed" }>;
-    expect(t).toMatchObject({ kind: "trashed", from: rel, ino: st.ino.toString(), size: Number(st.size), mtimeNs: st.mtimeNs.toString() });
+    expect(t).toEqual({ kind: "trashed", from: rel, to: t.to, ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() });
     expect(markerProblem(m, m.txn)).toBeNull();
   });
 });
@@ -157,7 +159,11 @@ describe("the reader checks the new fields (an older build ignores them)", () =>
   const at = (entries: unknown[]) => markerProblem({ ...head, entries }, head.txn);
   it("accepts a completion line and a trashed line with an identity", () => {
     expect(at([{ kind: "created", path: "Projects/P/a", sha256: H, complete: true }])).toBeNull();
-    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "12345678901234567890", size: 3, mtimeNs: "1795511903096443559" }])).toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "12345678901234567890", birthtimeNs: "1795511903096443559" }])).toBeNull();
+    // R526 M2: a folder's completion line.
+    expect(at([{ kind: "dir", path: "Projects/P/d", ino: "12", birthtimeNs: "1795511903096443559" }])).toBeNull();
+    // R526: the line saying the identity was not kept by the rename.
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, noIdentity: true }])).toBeNull();
   });
   it("a marker with only the known fields is accepted (the control for the refusals below)", () => {
     expect(at([{ kind: "created", path: "Projects/P/a", sha256: H }])).toBeNull();
@@ -165,8 +171,12 @@ describe("the reader checks the new fields (an older build ignores them)", () =>
   it("refuses a completion line without a hash, or one whose flag is not true; an identity that is not whole numbers", () => {
     expect(at([{ kind: "created", path: "Projects/P/a", complete: true }])).not.toBeNull();
     expect(at([{ kind: "created", path: "Projects/P/a", sha256: H, complete: "yes" }])).not.toBeNull();
-    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: 5, size: 3, mtimeNs: "1" }])).not.toBeNull();
-    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "5", size: -1, mtimeNs: "1" }])).not.toBeNull();
-    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "5", size: 3, mtimeNs: "1.5" }])).not.toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: 5, birthtimeNs: "1" }])).not.toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "5" }])).not.toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "5", birthtimeNs: "1.5" }])).not.toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, noIdentity: false }])).not.toBeNull();
+    expect(at([{ kind: "dir", path: "Projects/P/d", ino: "12" }])).not.toBeNull();
+    expect(at([{ kind: "created", path: "Projects/P/a", ino: "12", birthtimeNs: "1" }])).not.toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, noIdentity: true, ino: "5", birthtimeNs: "1" }])).not.toBeNull();
   });
 });
