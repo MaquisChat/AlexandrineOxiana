@@ -1,8 +1,9 @@
 /**
- * R503 f (FR-727): what counts as a MISSING linked file — the one rule the Missing files list and Find and acquire
- * share. Missing: nothing at the path, a symbolic link that leads nowhere (a link to a file on a drive that is not
- * connected), a folder where a file is recorded. A file that is there but cannot be read for want of permission is not
- * missing: the rule throws, and its callers keep today's answer ("there").
+ * R503 f as corrected by R510 (FR-727): what counts as a MISSING linked file — the one rule the Missing files list and
+ * Find and acquire share. Missing: nothing at the path, ANY symbolic link at the path (whether or not its target is
+ * there: the app reads no content through a link, so what it calls present it must be able to read), a folder where a
+ * file is recorded. The rule never looks through a link. A file that is there but cannot be read for want of
+ * permission is not missing: the rule throws, and its callers keep today's answer ("there").
  */
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,8 +11,8 @@ import { join } from "node:path";
 import type { Asset } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-/** Paths whose status the stand-in refuses with EACCES (`lstat`, or `stat` when a link is followed). */
-const refused = vi.hoisted(() => ({ lstat: new Set<string>(), stat: new Set<string>() }));
+/** Paths whose status the stand-in refuses with EACCES; and every path `stat` (which follows links) was asked for. */
+const refused = vi.hoisted(() => ({ lstat: new Set<string>(), stat: new Set<string>(), statAsked: [] as string[] }));
 vi.mock("node:fs/promises", async (orig) => {
   const real = await orig<typeof import("node:fs/promises")>();
   const deny = (p: unknown) => Object.assign(new Error(`EACCES: permission denied, '${String(p)}'`), { code: "EACCES" });
@@ -20,6 +21,7 @@ vi.mock("node:fs/promises", async (orig) => {
     return (real.lstat as (...a: unknown[]) => unknown)(p, ...rest);
   }) as typeof real.lstat;
   const stat = (async (p: string, ...rest: unknown[]) => {
+    refused.statAsked.push(String(p));
     if (refused.stat.has(String(p))) throw deny(p);
     return (real.stat as (...a: unknown[]) => unknown)(p, ...rest);
   }) as typeof real.stat;
@@ -37,6 +39,7 @@ beforeEach(async () => {
   await mkdir(join(tmp, "Drive"));
   refused.lstat.clear();
   refused.stat.clear();
+  refused.statAsked.length = 0;
 });
 afterEach(async () => {
   refused.lstat.clear();
@@ -55,13 +58,23 @@ describe("R503 f: the missing kinds", () => {
   });
 
   it("a symbolic link that leads nowhere is missing (its file on a drive not connected)", async () => {
-    await mkdir(join(tmp, "Volume"));
-    await writeFile(join(tmp, "Volume", "paper.pdf"), "%PDF-1.7\n");
     await symlink(join(tmp, "Volume", "paper.pdf"), join(tmp, "Drive", "paper.pdf"));
-    expect(await missingAt(root, "../Drive/paper.pdf")).toBe(false);
-    await rm(join(tmp, "Volume"), { recursive: true }); // the drive is unplugged
     expect(await missingAt(root, "../Drive/paper.pdf")).toBe(true);
     expect(await reach("../Drive/paper.pdf")).toBe("linked-missing");
+  });
+
+  it("R510: a symbolic link to a file that IS there is missing too — the app reads nothing through a link", async () => {
+    await writeFile(join(tmp, "Drive", "paper.pdf"), "%PDF-1.7\n");
+    await symlink(join(tmp, "Drive", "paper.pdf"), join(tmp, "Drive", "link.pdf"));
+    expect(await missingAt(root, "../Drive/link.pdf")).toBe(true);
+    expect(await reach("../Drive/link.pdf")).toBe("linked-missing");
+  });
+
+  it("R510: the rule never looks through a link (a target on a mount that does not answer cannot hold it up)", async () => {
+    await symlink(join(tmp, "Volume", "paper.pdf"), join(tmp, "Drive", "link.pdf"));
+    refused.stat.add(join(tmp, "Drive", "link.pdf"));
+    expect(await missingAt(root, "../Drive/link.pdf")).toBe(true);
+    expect(refused.statAsked).toEqual([]);
   });
 
   it("a link that leads round in a circle is missing", async () => {
@@ -81,12 +94,10 @@ describe("R503 f: the missing kinds", () => {
 });
 
 describe("R503 f: what stays there", () => {
-  it("a file, and a link to a file that is there, are there", async () => {
+  it("a file is there", async () => {
     await writeFile(join(tmp, "Drive", "paper.pdf"), "%PDF-1.7\n");
-    await symlink(join(tmp, "Drive", "paper.pdf"), join(tmp, "Drive", "link.pdf"));
     expect(await missingAt(root, "../Drive/paper.pdf")).toBe(false);
-    expect(await missingAt(root, "../Drive/link.pdf")).toBe(false);
-    expect(await reach("../Drive/link.pdf")).toBe("reachable");
+    expect(await reach("../Drive/paper.pdf")).toBe("reachable");
   });
 
   it("one reachable linked original among missing ones makes the record reachable", async () => {
@@ -100,13 +111,5 @@ describe("R503 f: what stays there", () => {
     refused.lstat.add(join(tmp, "Drive", "paper.pdf"));
     await expect(missingAt(root, "../Drive/paper.pdf")).rejects.toMatchObject({ code: "EACCES" });
     expect(await reach("../Drive/paper.pdf")).toBe("reachable");
-  });
-
-  it("a link whose file cannot be read for want of permission is not missing either", async () => {
-    await writeFile(join(tmp, "Drive", "paper.pdf"), "%PDF-1.7\n");
-    await symlink(join(tmp, "Drive", "paper.pdf"), join(tmp, "Drive", "link.pdf"));
-    refused.stat.add(join(tmp, "Drive", "link.pdf"));
-    await expect(missingAt(root, "../Drive/link.pdf")).rejects.toMatchObject({ code: "EACCES" });
-    expect(await reach("../Drive/link.pdf")).toBe("reachable");
   });
 });

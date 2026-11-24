@@ -213,6 +213,13 @@ async function restsAt(w: World, state: FindState, reason?: string): Promise<Fin
 }
 const pendingReviews = async (w: World) => (await readReviewEntries(coreOf(), coreOf().state(w.p.id))).filter((e) => e.status === "pending");
 
+/** R510: the linked path made a symbolic link to a copy of its file elsewhere on the drive (the file is there). */
+async function linkToRealFile(): Promise<void> {
+  await writeFile(join(tmp, "Drive", "real.pdf"), await readFile(outside()));
+  await rm(outside());
+  await symlink(join(tmp, "Drive", "real.pdf"), outside());
+}
+
 describe("R470 a: the copy part tells a linked original it cannot reach", () => {
   it("a record whose only original is a linked file that cannot be found rests with its own reason, and nothing is asked or fetched", async () => {
     const w = await world("linked-missing");
@@ -239,6 +246,8 @@ describe("R470 a: the copy part tells a linked original it cannot reach", () => 
       await rm(outside());
       await mkdir(outside());
     }],
+    // R510: the app reads nothing through a link, so a link to a file that is there is missing too.
+    ["a symbolic link to a file that is there", linkToRealFile],
   ];
   for (const [kind, make] of KINDS) {
     it(`R503 f: ${kind} rests with the linked file's reason, and nothing is asked or fetched`, async () => {
@@ -266,17 +275,6 @@ describe("R470 a: the copy part tells a linked original it cannot reach", () => 
       expect(fileRequests).toEqual([]);
     });
   }
-
-  it("R503 f: a link to a file that is there is in your library", async () => {
-    const w = await world("linked");
-    await writeFile(join(tmp, "Drive", "real.pdf"), await readFile(outside()));
-    await rm(outside());
-    await symlink(join(tmp, "Drive", "real.pdf"), outside());
-    runner().resume(w.p.id);
-    await restsAt(w, "in-library");
-    expect(copyRequests).toEqual([]);
-    expect(fileRequests).toEqual([]);
-  });
 
   it("a linked original that can be reached rests in the library, as before", async () => {
     const w = await world("linked");
@@ -666,6 +664,17 @@ describe("R503 g (FR-728): an entry resting for want of a copy is judged again a
       expect(asked()).toEqual({ copies: 0, files: 0 });
     });
   }
+
+  it("R510: an entry resting on Not this file whose only original is now a symbolic link to a file that is there stays as it is", async () => {
+    const w = await world("linked", { state: "no-open-copy", reason: { code: "not-this-file" } });
+    await linkToRealFile();
+    const s = await sentinel(w);
+    const before = await entryOf(w);
+    await reopen(w);
+    await restsAt(s, "record-complete", "linked-file-missing");
+    expect(await entryOf(w)).toEqual(before);
+    expect(asked()).toEqual({ copies: 0, files: 0 });
+  });
 
   /** Resting states that are NOT for want of a copy (the researcher must act in another way), or not resting. */
   const OTHERS: Array<[string, Partial<FindEntry>]> = [

@@ -741,6 +741,12 @@ describe("R503 f (FR-727): the Missing files list counts every missing kind of l
       await mkdir(join(tmp, "AFolder"));
       await symlink(join(tmp, "AFolder"), f);
     }],
+    // R510: the app reads nothing through a link, so a link to a file that is there is missing too.
+    ["a link to a file that is there", async (f) => {
+      await mkdir(join(tmp, "Elsewhere"), { recursive: true });
+      await rename(f, join(tmp, "Elsewhere", "scan.pdf"));
+      await symlink(join(tmp, "Elsewhere", "scan.pdf"), f);
+    }],
   ];
 
   for (const [kind, make] of KINDS) {
@@ -771,14 +777,14 @@ describe("R503 f (FR-727): the Missing files list counts every missing kind of l
     });
   }
 
-  it("a link to a file that is there is present: not missing, not mismatched, and its content is checked", async () => {
-    const { lib, linkedFile } = await linkedFixture();
-    await rename(linkedFile, join(lib.root, "Exports", "real.pdf"));
-    await symlink(join(lib.root, "Exports", "real.pdf"), linkedFile);
-    const r = await checkIntegrity(lib, "full", { keyRing: ring, confirm: (fn) => fn() });
+  it("R510 (M6): a linked file's status is asked through the check's own stat seam", async () => {
+    const { lib, linkedFile, entry } = await linkedFixture();
+    const { lstat } = await import("node:fs/promises");
+    const asked: string[] = [];
+    const r = await checkIntegrity(lib, "full", { keyRing: ring, stat: (p) => (asked.push(p), lstat(p)) });
+    expect(asked).toContain(linkedFile);
     expect(r.missing).toEqual([]);
-    expect(r.mismatched).toEqual([]);
-    expect(r.hashed).toBe(4);
+    expect(entry.path).toBe("Exports/linked/scan.pdf");
   });
 });
 
