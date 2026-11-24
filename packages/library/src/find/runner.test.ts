@@ -4949,11 +4949,15 @@ describe("F15: a fetch through the researcher's library", () => {
     const p = await project();
     const r = runner();
     const view = async (access: LibraryAccess | null = EZ, q: Project = p) => libraryChancesOf(repo, q.id, (await queue(q)).values(), { access, atWork: (id) => r.atWork(q.id, id) });
-    // A file already in the record.
-    const withFile = await resting(p, RESTING[0]!);
+    // A file already in the record. R544 a: one whose record had its file at the queue's opening is moved to "in your
+    // library" by the opening's pass (R503 g); one whose file comes AFTER the pass has ended stays resting, and is the
+    // entry this test asks about. Each is read at a moment the pass cannot change.
     const mine = join(tmp, "f15-mine.pdf");
     await writeFile(mine, await buildPdf({ title: "Mine", lines: ["Mine"] }));
-    await addCapturedOriginal(repo, p.id, withFile.sourceId!, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+    const attach = (e: FindEntry) => addCapturedOriginal(repo, p.id, e.sourceId!, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+    const atOpening = await resting(p, RESTING[0]!);
+    await attach(atOpening);
+    const withFile = await resting(p, RESTING[0]!);
     // A file waiting for the check: another entry of the same record holds one.
     const sid = await record(p);
     const waitingFor = await resting(p, RESTING[1]!, sid);
@@ -4966,9 +4970,14 @@ describe("F15: a fetch through the researcher's library", () => {
     const isbnOnly = await resting(p, RESTING[0]!, await record(p, { doi: null, isbn: ["9780674212770"], type: "book" }));
     const plain = await resting(p, RESTING[0]!);
     settingsFn = () => new Promise(() => {}); // the copy part waits on the settings: the entry stays at work
-    r.resume(p.id);
+    await r.resume(p.id); // settled when the opening's pass has ended (R538)
     await until(() => r.atWork(p.id, atWork.id), "the entry to be at work");
+    expect((await entryOf(p, atOpening.id))!.state).toBe("in-library");
+    await attach(withFile);
+    expect((await entryOf(p, withFile.id))!.state).toBe(withFile.state);
     const v = await view();
+    // In your library: no start, and no links (R324 a's table: "in-library" is not a resting state of the library start).
+    expect(v.get(atOpening.id)).toBeUndefined();
     expect(v.get(withFile.id)!.chance).toBeUndefined();
     expect(v.get(waitingFor.id)!.chance).toBeUndefined();
     expect(v.get(atWork.id)!.chance).toBeUndefined();
