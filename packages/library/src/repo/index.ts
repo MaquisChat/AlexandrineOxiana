@@ -20,6 +20,7 @@ export {
   GovernanceViolationError,
   InvalidInputError,
   KeyFileChangedError,
+  LibraryClosedError,
   DestroyedParentError,
   FieldworkInUseError,
   ReviewEntryDecidedError,

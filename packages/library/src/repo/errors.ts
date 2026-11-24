@@ -9,6 +9,17 @@ export class ReadOnlyLibraryError extends Error {
   }
 }
 
+/**
+ * FR-749 (R546 1): the library has been closed (or the session that asked is closing it), so nothing more is written
+ * through it; nothing was evaluated or written, and nothing of this change is in the library's folder.
+ */
+export class LibraryClosedError extends Error {
+  override name = "LibraryClosedError";
+  constructor() {
+    super("The library has been closed; nothing more can be changed through it");
+  }
+}
+
 /** The governance engine denied the action. The deny decision has been audited. */
 export class PolicyDeniedError extends Error {
   override name = "PolicyDeniedError";

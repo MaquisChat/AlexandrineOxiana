@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { lstat, mkdir, readFile, readdir } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { newId } from "@ao/core";
@@ -412,6 +413,11 @@ interface HandleState {
 interface HandleControl {
   state: HandleState;
   closed: boolean;
+  /**
+   * FR-749 (R546 1): what `close()` waits for before the lock is released — the change already in its store turn of
+   * each repository opened on this handle (registered with `onClose`), without a time limit (R247 d).
+   */
+  drains: Array<() => Promise<void>>;
   /** The mode and reason before the library went offline. */
   beforeOffline?: { mode: Library["mode"]; reason?: Library["readOnlyReason"] };
   /** Read-write handles only: stop the heartbeat while offline. */
@@ -429,7 +435,7 @@ function makeHandle(
   movedTo: Library["movedTo"],
   release?: () => Promise<void>,
 ): Library {
-  const ctl: HandleControl = { state, closed: false };
+  const ctl: HandleControl = { state, closed: false, drains: [] };
   const lib: Library = {
     id: meta.libraryId,
     name: meta.name,
@@ -448,7 +454,10 @@ function makeHandle(
     deviceId: deps.deviceId,
     async close() {
       if (ctl.closed) return;
+      // From here every further write through this handle is refused (`isClosed`, R546 1); a change already in its
+      // store turn finishes and is recorded first, and only then is the lock released (R247 c, d).
       ctl.closed = true;
+      await Promise.allSettled(ctl.drains.map((d) => d()));
       await release?.();
     },
   };
@@ -494,6 +503,32 @@ export async function markOnline(lib: Library, opts: { acceptNotWritable?: boole
   }
   ctl.state.mode = before.mode;
   ctl.state.reason = before.reason;
+}
+
+/**
+ * Package-internal (FR-749, R546 1): `drain` is awaited by the handle's `close()` before its lock is released (a
+ * repository's write queue: the change in its store turn finishes). Never throws; the handle's own state only.
+ */
+export function onClose(lib: Library, drain: () => Promise<void>): void {
+  controls.get(lib)?.drains.push(drain);
+}
+
+/**
+ * FR-749 (R546 2): the closing signal of the library session a piece of work runs for (an attach, a watched folder's
+ * bringing-in). Once it is aborted — the service has begun to close the library — that work begins no further change
+ * (its repository refuses it with LibraryClosedError, as a closed handle does), and the lookup client cuts its waits
+ * short (a wait cut is never a request sent again). A change already in its store turn is not touched by it.
+ */
+const closingScope = new AsyncLocalStorage<AbortSignal>();
+
+/** Runs `fn` as work of the session that `signal` closes (see `closingSignal`); without a signal, `fn` as it is. */
+export function whileOpen<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+  return signal ? closingScope.run(signal, fn) : fn();
+}
+
+/** The closing signal of the session the current work runs for (`whileOpen`), if any. */
+export function closingSignal(): AbortSignal | undefined {
+  return closingScope.getStore();
 }
 
 /** Package-internal: true once `close()` was called on the handle. */
