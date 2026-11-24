@@ -5889,8 +5889,11 @@ describe("F15: a fetch through the researcher's library", () => {
         settingsFn = () => new Promise(() => {}); // the copy part waits on the settings: the entry stays at work
         r.resume(p.id);
         await until(() => r.atWork(p.id, atWork.id), "the entry to be at work");
+        // R503 g (FR-728): the opening's pass finds the file of the entry with one, and it rests in your library.
+        await until(async () => (await entryOf(p, withFile.id))?.state === "in-library", "the entry with a file to rest in your library");
         const v = await view();
-        for (const e of [withFile, waitingFor, atWork]) expect(v.get(e.id)!.link, e.typed).toBeUndefined();
+        expect(v.get(withFile.id)?.link).toBeUndefined();
+        for (const e of [waitingFor, atWork]) expect(v.get(e.id)!.link, e.typed).toBeUndefined();
         expect(v.get(plain.id)!.link).toBe(true);
         // The rules forbid free copies: none (and the start is refused in its own words).
         const q = await project({ gov: NO_FREE });

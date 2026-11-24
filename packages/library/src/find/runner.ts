@@ -188,6 +188,11 @@ export function cleanAcquiredAddress(raw: string): string {
   return out.length <= 2000 ? out : "";
 }
 
+/** R503 g: the reasons of a "no open copy" entry that rests for want of a copy (none: no copy was found). */
+const WANTING_COPY_NO_OPEN: ReadonlySet<string | undefined> = new Set([undefined, "not-this-file", "copy-some-unreachable", "copy-not-downloaded", "library-unfinished"]);
+/** R503 g: the reasons of the copy part's "failed" (a record made) that rest for want of a copy: a passing fault. */
+const WANTING_COPY_FAILED: ReadonlySet<string | undefined> = new Set(["unreachable", "unexpected"]);
+
 /** Task F11: the states of the free-copy part of an entry's life (an entry with its record made, and no file yet). */
 const COPY_STATES: ReadonlySet<FindState> = new Set(["record-complete", "looking-for-copy", "fetching"]);
 /**
@@ -2619,6 +2624,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   /** R470 a: an entry resting for want of its linked file, without the researcher's "Get a copy for this source". */
   const restsForLink = (e: FindEntry): boolean => e.state === "record-complete" && e.reason?.code === LINKED_MISSING.code && !e.copyDespiteLink;
+  /**
+   * R503 g (FR-728): an entry of a record that RESTS for want of a copy, without the researcher's pick: "no open copy"
+   * (none found; "Not this file"; some services unreachable; a copy found but not downloaded; a fetch in the sign-in
+   * window not finished), or the copy part's "failed" for a passing fault (unreachable, unexpected — "Try again" looks
+   * for a copy again). Not: one the record of which was removed; one a rule, a setting or a missing key or legal basis
+   * stops (the researcher acts in another way, and the copy part judges those anew when they are woken); a found file
+   * waiting for the researcher's check (R301); any state being worked on. "record-complete" entries are queued in the
+   * copy part at every opening, which finds a file of their source by itself.
+   */
+  const restsWantingCopy = (e: FindEntry): boolean =>
+    !!e.sourceId &&
+    !e.copyDespiteLink &&
+    ((e.state === "no-open-copy" && WANTING_COPY_NO_OPEN.has(e.reason?.code)) || (e.state === "failed" && WANTING_COPY_FAILED.has(e.reason?.code)));
 
   /**
    * R483 a: at a project's opening (the library opened, the project unlocked: `resume`), each entry that RESTS with
@@ -2634,6 +2652,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
    * One resting so whose record has no original any more, or was deleted, goes through the ordinary resume, as it did
    * before R483 a: queued in the copy part like any record without a file (which then looks for a copy, or says the
    * record was removed). An "in your library" entry whose record has no file any more is left as it is (never woken).
+   * R503 g (FR-728): an entry resting for want of a copy (`restsWantingCopy`) whose record now has a file that can be
+   * reached (stored, or linked and found by the Missing files rule) rests "in your library", as "Try again" and the copy
+   * part would leave it (attempts back to 0; reason, offers and next try dropped); otherwise it is left as it is. Its
+   * line is written once: at the next opening it is an "in your library" entry, which stays so while its file is there.
    */
   /** The copy part's ordinary resume of an entry (as `resume` queues it). */
   function ordinary(pid: string, e: FindEntry): void {
@@ -2649,19 +2671,22 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     for (const e of q.values()) {
       if (!live()) return;
       const inLibrary = e.state === "in-library" && !e.copyDespiteLink;
-      if (!e.sourceId || (!inLibrary && !restsForLink(e))) continue;
+      const forLink = restsForLink(e);
+      const wanting = restsWantingCopy(e);
+      if (!e.sourceId || (!inLibrary && !forLink && !wanting)) continue;
       let reach: Awaited<ReturnType<typeof originalsReach>>;
       try {
         reach = await guard(r, repo.getSource(pid, e.sourceId).then((sf) => originalsReach(root, sf)));
       } catch (err) {
         if (err instanceof Abandoned) throw err;
         // R488 a: a deleted record's entry resting for its link goes on as at any resume (it says the record was removed).
-        if (!inLibrary && err instanceof NotFoundError) ordinary(pid, e);
+        if (forLink && err instanceof NotFoundError) ordinary(pid, e);
         continue; // otherwise its record cannot be read now: left as it is
       }
-      if (!inLibrary && reach === "none") ordinary(pid, e); // R488 a: no original any more: the ordinary resume
+      if (forLink && reach === "none") ordinary(pid, e); // R488 a: no original any more: the ordinary resume
       else if (inLibrary && reach === "linked-missing") moves.push({ from: e, to: { state: "record-complete", reason: LINKED_MISSING }, drop: ["nextTryAt", "offers"] });
-      else if (!inLibrary && reach === "reachable") moves.push({ from: e, to: { state: "in-library" }, drop: ["nextTryAt", "reason", "offers"] });
+      else if (forLink && reach === "reachable") moves.push({ from: e, to: { state: "in-library" }, drop: ["nextTryAt", "reason", "offers"] });
+      else if (wanting && reach === "reachable") moves.push({ from: e, to: { state: "in-library", attempts: 0 }, drop: ["nextTryAt", "reason", "offers"] });
     }
     if (!moves.length || !live()) return;
     await inTurn(r, pid, live, async () => {
