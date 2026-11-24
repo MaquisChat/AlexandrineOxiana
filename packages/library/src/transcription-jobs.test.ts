@@ -97,6 +97,42 @@ describe("transcription as a job", () => {
     expect(await c.resumePending(undefined, { prepare: (rec) => transcriptionRerun(kit.repo, rec) })).toEqual([]);
   });
 
+  it("S3 (R486 c): two reruns of one pending job at once: the second is told the job is not its own, never that it failed; one run, stored once", async () => {
+    const p = await makeProject(kit, OPEN_GOV, true);
+    const sf = await audioSource(p);
+    const down = await stubWorker(() => ({ status: "done" }), { closers });
+    await closers.pop()!();
+    const id = randomUUID();
+    const job = await transcriptionJob(kit.repo, p.id, sf.source.id, { model: "small" }, { id });
+    await expect(new WorkerClient({ repo: kit.repo, worker: down, pollMs: 5 }).submit(p.id, job)).rejects.toBeInstanceOf(WorkerUnavailableError);
+    let submitted = 0;
+    const c = await client(async (j) => {
+      submitted++;
+      return transcribe(j);
+    });
+    // Both reruns pass the "running here now?" check before either has prepared its job: each waits in
+    // `prepare` until the other has reached it too, then both go on together.
+    let entered = 0;
+    let both!: () => void;
+    const together = new Promise<void>((r) => (both = r));
+    const ends: Array<{ claimed: boolean; error?: unknown }> = [];
+    const prepare = async (rec: Parameters<typeof transcriptionRerun>[1]) => {
+      if (++entered === 2) both();
+      await together;
+      const extras = await transcriptionRerun(kit.repo, rec);
+      return { ...extras, onEnd: (o: { claimed: boolean; error?: unknown }) => void ends.push({ claimed: o.claimed, ...(o.error !== undefined ? { error: o.error } : {}) }) };
+    };
+    const [a, b] = await Promise.all([c.resumePending(p.id, { prepare }), c.resumePending(p.id, { prepare })]);
+    expect(entered).toBe(2);
+    // One rerun ran it and stored it; the other was told it was not its own, with no error.
+    expect(ends.filter((e) => e.claimed)).toEqual([{ claimed: true }]);
+    expect(ends.filter((e) => !e.claimed)).toEqual([{ claimed: false }]);
+    expect([...a, ...b]).toEqual([{ id, projectId: p.id, result: expect.anything() }]);
+    expect(submitted).toBe(1);
+    expect((await transcriptionRecords(kit.repo, p.id, sf.source.id)).map((x) => x.status)).toEqual(["done"]);
+    expect(transcriptVersions(await kit.repo.getSource(p.id, sf.source.id))).toHaveLength(2);
+  });
+
   it("fix 1 I1: a transcription the rules forbid is refused when the job is built: audited once, nothing recorded", async () => {
     const p = await makeProject(kit, `${OPEN_GOV}processing:\n  transcription: []\n`);
     const sf = await audioSource(p);

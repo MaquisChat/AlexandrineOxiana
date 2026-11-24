@@ -107,7 +107,7 @@ export interface ResumeExtras {
   onProgress?: (progress: number) => void;
   signal?: AbortSignal;
   finish?: (result: JobResult) => Promise<void>;
-  /** After the rerun: `claimed` false when another resubmission took the job first (nothing ran). */
+  /** After the rerun: `claimed` false when another resubmission took the job first, or another rerun of this process runs it now (nothing ran here; no error). */
   onEnd?: (outcome: { claimed: boolean; result?: JobResult; error?: unknown }) => void;
 }
 
@@ -414,8 +414,12 @@ export class WorkerClient {
         tell(extras, { claimed: true, result });
         out.push({ id: rec.id, projectId: rec.projectId, result });
       } catch (error) {
-        const took = !(error instanceof NotClaimed);
-        tell(extras, { claimed: took, error });
+        // Another rerun of this process holds the job (both passed the check above before either ran
+        // it): not claimed here, as when the journal's claim went to another (R486 c). The run that
+        // holds it goes on and is followed; this one neither fails it nor reports it.
+        const heldHere = error instanceof WorkerJobError && error.code === "ALREADY_RUNNING";
+        const took = !(error instanceof NotClaimed) && !heldHere;
+        tell(extras, took ? { claimed: true, error } : { claimed: false });
         if (took) report(rec.id, rec.projectId, error);
       }
     }
