@@ -79,13 +79,22 @@ describe("a watched folder and the library's closing (FR-749, R546 2)", () => {
   it("a file waiting on its lookup stays in the folder, unregistered, and comes in at the next start", async () => {
     const p = (await repo.createProject({ name: "Study", governanceYaml: GOV, encryption: { enabled: false } })).project;
     const wid = newId();
-    agent.enableCallHistory();
-    const sent = () => agent.getCallHistory()?.calls().length ?? 0;
+    let requests = 0;
+    const sent = () => requests;
+    let arrived!: () => void;
+    const lookedUp = new Promise<void>((r) => (arrived = r));
     const openalex = agent.get("https://api.openalex.org");
-    // In the air (an answer ten minutes away, abandoned when the request is): decision 31 b, a "too many requests"
-    // answer is no longer waited for.
-    openalex.intercept({ path: (x) => x.startsWith("/works"), method: "GET" }).reply(404, "").delay(600_000).times(1);
-    const lookedUp = until(() => sent() > 0);
+    // The request stays in the air: its answer is ten minutes away and is dropped when the request is abandoned. Since
+    // decision 31 (b) a "too many requests" answer is no longer waited for. The reply handler says when it arrives.
+    openalex
+      .intercept({ path: (x) => x.startsWith("/works"), method: "GET" })
+      .reply(() => {
+        requests++;
+        arrived();
+        return { statusCode: 404, data: "" };
+      })
+      .delay(600_000)
+      .times(1);
     const closing = new AbortController();
     // The request stays in the air (the client's own limit is a real 60 seconds): only the closing ends it.
     const http = new HttpClient({ libraryRoot: lib.root, dispatcher: agent });

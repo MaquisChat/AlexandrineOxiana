@@ -1,9 +1,10 @@
 /**
- * FR-749 (R546 2, 3; R247 c, d): closing a library while an attach is under way. A close (the close route, the close
- * inside opening or creating another library, the service's stop) answers promptly while an attach waits on a lookup
- * (a request in the air; since decision 31 b an attach no longer waits on a "too many requests" answer): the attach is
- * cancelled, answers the one sentence, and NOTHING is written into the library after its lock is released. An attach already inside its store turn is waited for: it is fully stored and audited,
- * then the lock goes. A change asked for once the close has begun is refused, and writes nothing.
+ * FR-749 (R546 2, 3; R247 c, d): closing a library while an attach is under way. A close answers promptly while an
+ * attach waits on a lookup. The close can be the close route, the close inside opening or creating another library, or
+ * the service's stop. The lookup it waits on is a request in the air: since decision 31 (b) an attach no longer waits
+ * on a "too many requests" answer. The attach is cancelled and answers the one sentence, and NOTHING is written into
+ * the library after its lock is released. An attach already inside its store turn is waited for: it is fully stored and
+ * audited, then the lock goes. A change asked for once the close has begun is refused, and writes nothing.
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -103,22 +104,25 @@ async function snapshot(root: string, base = ""): Promise<string[]> {
 }
 
 /**
- * Every OpenAlex request stays in the air (an answer ten minutes away, abandoned when the request is) (an attach no longer waits on a
- * "too many requests" answer, decision 31 b, R556; a slow service is what it still waits for). `asked` resolves at the first.
+ * Every OpenAlex request stays in the air: its answer is ten minutes away and is dropped when the request is abandoned.
+ * Since decision 31 (b) an attach no longer waits on a "too many requests" answer; a slow service is what it still waits
+ * for. `asked` is resolved by the stand-in's own reply handler when the first request arrives.
  */
 function openAlexSaysWait(): { asked: Promise<void>; count: () => number } {
-  agent.enableCallHistory();
-  const count = () => agent.getCallHistory()?.calls().filter((c) => c.origin === "https://api.openalex.org").length ?? 0;
+  let n = 0;
+  let arrived!: () => void;
+  const asked = new Promise<void>((r) => (arrived = r));
   agent
     .get("https://api.openalex.org")
     .intercept({ path: (x: string) => x.startsWith("/works"), method: "GET" })
-    .reply(404, "")
+    .reply(() => {
+      n++;
+      arrived();
+      return { statusCode: 404, data: "" };
+    })
     .delay(600_000)
     .persist();
-  const asked = (async () => {
-    while (count() === 0) await new Promise((r) => setTimeout(r, 5));
-  })();
-  return { asked, count };
+  return { asked, count: () => n };
 }
 
 /** The lock is free: a second Library object opens the folder read-write and finds it clean (no marker, no warning). */
