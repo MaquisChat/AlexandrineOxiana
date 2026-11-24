@@ -235,3 +235,97 @@ describe("a close while an attach is inside its store turn (FR-749, R546; R247 d
     await cleanForAnother(path);
   });
 });
+
+/** Every OpenAlex request answers 429 / Retry-After 60 while `wait` is true, else "not found"; `asked` at the first. */
+function openAlexSwitchable(): { asked: Promise<void>; count: () => number; answer: () => void } {
+  let n = 0;
+  let wait = true;
+  let asked!: () => void;
+  const p = new Promise<void>((r) => (asked = r));
+  agent
+    .get("https://api.openalex.org")
+    .intercept({ path: () => true, method: "GET" })
+    .reply(() => {
+      n++;
+      asked();
+      return wait ? { statusCode: 429, data: "slow down", responseOptions: { headers: { "retry-after": "60" } } } : { statusCode: 404, data: "" };
+    })
+    .persist();
+  return { asked: p, count: () => n, answer: () => void (wait = false) };
+}
+
+/** Waits until the batch has ended and the service let its run go; returns its listed state. */
+async function settledBatch(pid: string, batchId: string): Promise<string> {
+  for (;;) {
+    const b = ((await call({ url: `/projects/${pid}/imports` })).json.batches as Array<{ batchId: string; state: string }>).find((x) => x.batchId === batchId);
+    if (b && b.state !== "running" && !svc!.state.session?.batches.has(batchId)) return b.state;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+async function journalLines(path: string): Promise<Array<{ key: string; outcome: string }>> {
+  const found = (await readdir(path, { recursive: true })).find((x) => x.replaceAll("\\", "/").endsWith("imports/batch-0001/journal.jsonl"));
+  const text = found ? await readFile(join(path, found), "utf8") : "";
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as { key: string; outcome: string });
+}
+
+/**
+ * FR-749 (R551 I1): a Bulk Import running when the library closes is left paused — no item failed, nothing journaled
+ * for the item whose lookup was cut — and, once the library is opened again, resumes and completes, each item once.
+ */
+async function importCutBy(close: (path: string) => Promise<void>): Promise<void> {
+  const { path, pid } = await libraryWithProject();
+  const src = join(tmp, "Papers");
+  for (const [name, title] of [
+    ["alpha.pdf", "Harbour ledgers of the northern coast"],
+    ["beta.pdf", "Salt works and their keepers"],
+    ["gamma.pdf", "Nets, boats and the tide-line"],
+  ] as const) {
+    await mkdir(src, { recursive: true });
+    await writeFile(join(src, name), await buildPdf({ title, author: "Ana Souza", lines: [`${title}.`] }));
+  }
+  const oa = openAlexSwitchable();
+  const start = await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: src } } });
+  expect(start.status, start.body).toBe(200);
+  const batchId = start.json.batchId as string;
+  await oa.asked;
+  await close(path);
+  expect(oa.count()).toBe(1); // the wait was cut, nothing was asked again
+  expect((await journalLines(path)).filter((l) => l.outcome === "failed")).toEqual([]);
+  expect(await journalLines(path)).toEqual([]);
+
+  // Opened again: the batch is paused, nothing failed; resumed, it completes with each item once.
+  const opened = await call({ method: "POST", url: "/libraries/open", body: { path } });
+  expect(opened.status, opened.body).toBe(200);
+  expect(await settledBatch(pid, batchId)).toBe("paused");
+  expect((await call({ url: `/imports/${batchId}/report` })).json.counts.failed).toBe(0);
+  oa.answer();
+  const resumed = await call({ method: "POST", url: `/imports/${batchId}/resume` });
+  expect(resumed.status, resumed.body).toBe(200);
+  expect(await settledBatch(pid, batchId)).toBe("finished");
+  const done = (await call({ url: `/imports/${batchId}/report` })).json;
+  expect(done.counts.failed).toBe(0);
+  expect(done.counts.created + done.counts.needsReview).toBe(3);
+  const lines = await journalLines(path);
+  expect(lines.map((l) => l.key).sort()).toEqual(["alpha.pdf", "beta.pdf", "gamma.pdf"]);
+  expect(lines.every((l) => l.outcome !== "failed")).toBe(true);
+}
+
+describe("a Bulk Import running when the library closes (FR-749, R551 I1)", () => {
+  it("POST /libraries/close: the batch is left paused, no item failed; after reopening it resumes and imports each item once", async () => {
+    await importCutBy(async () => {
+      const r = await call({ method: "POST", url: "/libraries/close" });
+      expect(r.status, r.body).toBe(200);
+    });
+  }, 60_000);
+
+  it("the service's stop: the same, read back by a new service", async () => {
+    await importCutBy(async () => {
+      await svc!.close();
+      svc = await createService({ token: TOKEN, deps, worker: null, logLevel: "silent" });
+    });
+  }, 60_000);
+});
