@@ -1388,7 +1388,9 @@ pub trait Host: Send + Sync {
     /// Builds the window at `url` with the given store (macOS) or an ephemeral one (elsewhere), under
     /// `title`.
     fn create_window(&self, url: &Url, store: [u8; 16], title: &str) -> bool;
-    fn navigate(&self, url: &Url) -> bool;
+    /// Sends the window to `url`. When the navigation has been issued, `issued` runs on the main thread, in that
+    /// same turn (before any later event of the window is delivered there); the call answers once that is done.
+    fn navigate(&self, url: &Url, issued: Box<dyn FnOnce() + Send>) -> bool;
     /// Sets the window's title (R347 b: the shell's alone).
     fn set_title(&self, title: &str);
     /// The window's current address.
@@ -1467,7 +1469,8 @@ struct Inner {
 /// The sign-in window's state in the shell: the open ticket, the fetch, the pause, the store.
 #[derive(Default)]
 pub struct Library {
-    inner: Mutex<Inner>,
+    /// Shared, so that a navigation's `issued` step can end a waiting open's hold on the main thread (N1, R514).
+    inner: Arc<Mutex<Inner>>,
     /// Signalled when a build answers (`building` cleared): an open waiting for it goes on (FR-734).
     built: Condvar,
     config: OnceLock<Config>,
@@ -1526,9 +1529,9 @@ impl Library {
     /// close ended that open meanwhile, so its ticket is free), this open does not build a second window
     /// beside it: it takes the ticket and the window at once, as any newer open does (the older open, when
     /// its build answers, finds the window taken and answers false), waits for that build to answer, and
-    /// then re-uses the window it made, or builds its own if that build failed. Until it has sent that window to
-    /// its own address, nothing the window loads or asks to download is fetched under its ticket (M3, R511: the
-    /// page shown is the other open's). The wait holds no lock and
+    /// then re-uses the window it made, or builds its own if that build failed. Until its navigation of that
+    /// window to its own address has been issued on the main thread, nothing the window loads or asks to download
+    /// is fetched under its ticket (M3, R511; N1, R514: the page shown is the other open's). The wait holds no lock and
     /// calls nothing of the host; `open` never runs on the main thread (the command runs it on a thread of
     /// its own), where the build it waits for is done.
     pub fn open(&self, host: &dyn Host, caller: &str, ticket: &str, url: &str, start: Start) -> bool {
@@ -1621,15 +1624,23 @@ impl Library {
             g.title = Some(title.clone());
         }
         let shown = if reuse {
-            let moved = host.navigate(&url);
+            // M3 (R511), N1 (R514): a waiting open's hold ends on the main thread, in the same turn in which its
+            // navigation is issued, so that every event of the old page the main thread delivers before that is
+            // still held. What remains: an event the web view would deliver for the OLD page after the navigation
+            // was issued. By reading WebKit's documented behaviour, a new navigation cancels the old load, which
+            // then never reports "finished"; this cannot be shown here.
+            let held = self.inner.clone();
+            let own = ticket.to_string();
+            let moved = host.navigate(
+                &url,
+                Box::new(move || {
+                    let mut g = held.lock().unwrap_or_else(|p| p.into_inner());
+                    if g.waiting.as_deref() == Some(own.as_str()) {
+                        g.waiting = None;
+                    }
+                }),
+            );
             if moved {
-                // M3 (R511): the window has been sent to this open's own address: what it loads from now on is
-                // this open's.
-                let mut g = self.lock();
-                if g.waiting.as_deref() == Some(ticket) {
-                    g.waiting = None;
-                }
-                drop(g);
                 host.set_title(&title);
             }
             moved
@@ -2199,8 +2210,27 @@ impl Host for TauriHost {
         true
     }
 
-    fn navigate(&self, url: &Url) -> bool {
-        self.window().is_some_and(|w| w.navigate(url.clone()).is_ok())
+    fn navigate(&self, url: &Url, issued: Box<dyn FnOnce() + Send>) -> bool {
+        let Some(w) = self.window() else { return false };
+        let url = url.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        // N1 (R514): on the main thread `navigate` issues the navigation at once (tauri-runtime-wry 2.12.3
+        // `send_user_message`, `load_url`), and `issued` runs in that same turn, before the main thread delivers
+        // any later event of the window. Off it, the whole is one task posted to the main thread, waited for here.
+        let task = move || {
+            let ok = w.navigate(url).is_ok();
+            if ok {
+                issued();
+            }
+            let _ = tx.send(ok);
+        };
+        if self.on_main_thread() {
+            task();
+        } else if self.app.run_on_main_thread(task).is_err() {
+            return false;
+        }
+        // A loop that is gone drops the task, and with it the sender: false.
+        rx.recv().unwrap_or(false)
     }
 
     fn set_title(&self, title: &str) {
@@ -3307,6 +3337,9 @@ process.stdout.write(JSON.stringify({{
         on_create: Mutex<Option<Box<dyn FnOnce(&FakeHost) + Send>>>,
         /// The next build fails (FR-734: decided as that build starts, whatever another thread does meanwhile).
         fail_next_build: AtomicBool,
+        /// N1 (R514): a navigation is posted but not yet issued on the main thread; `issue` issues it.
+        defer_issue: AtomicBool,
+        pending_issue: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     }
 
     impl FakeHost {
@@ -3329,6 +3362,8 @@ process.stdout.write(JSON.stringify({{
                 removed: AtomicUsize::new(0),
                 on_create: Mutex::default(),
                 fail_next_build: AtomicBool::new(false),
+                defer_issue: AtomicBool::new(false),
+                pending_issue: Mutex::default(),
             }
         }
         fn events(&self) -> Vec<LibraryEvent> {
@@ -3342,6 +3377,13 @@ process.stdout.write(JSON.stringify({{
         }
         fn at(&self, url: &str) {
             *self.current.lock().unwrap() = Some(u(url));
+        }
+        /// The main thread reaches the posted navigation and issues it (N1).
+        fn issue(&self) {
+            let pending: Vec<_> = self.pending_issue.lock().unwrap().drain(..).collect();
+            for f in pending {
+                f();
+            }
         }
     }
 
@@ -3360,9 +3402,17 @@ process.stdout.write(JSON.stringify({{
             self.exists.store(ok, Ordering::SeqCst);
             ok
         }
-        fn navigate(&self, url: &Url) -> bool {
+        fn navigate(&self, url: &Url, issued: Box<dyn FnOnce() + Send>) -> bool {
             self.navigated.lock().unwrap().push(url.clone());
-            self.navigate_ok.load(Ordering::SeqCst)
+            let ok = self.navigate_ok.load(Ordering::SeqCst);
+            if ok {
+                if self.defer_issue.load(Ordering::SeqCst) {
+                    self.pending_issue.lock().unwrap().push(issued);
+                } else {
+                    issued();
+                }
+            }
+            ok
         }
         fn set_title(&self, title: &str) {
             self.titles.lock().unwrap().push(title.to_string());
@@ -3953,6 +4003,34 @@ process.stdout.write(JSON.stringify({{
         assert!(host.events().iter().all(|e| e.state != State::Fetching));
         assert_eq!(*host.navigated.lock().unwrap(), vec![u(START2)]);
         // The window now shows the waiting open's own address: its own page is fetched as before.
+        host.at(PDF);
+        lib.page_loaded(&*host, &u(PDF), Instant::now());
+        assert_eq!(jobs(&host), vec![(TICKET2.to_string(), PDF.to_string())]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// The reviewer's probe `p3_old_page_event_after_navigation_sent` (N1, R514): the real host posts the waiting
+    /// open's navigation to the main thread, which may first deliver the old page's load or download events. Those
+    /// arrive after the open has answered and before the navigation is issued: they start no fetch under its ticket.
+    /// Once the navigation is issued, the open's own page is fetched as before.
+    #[test]
+    fn an_old_page_s_event_before_the_waiting_open_s_navigation_is_issued_starts_no_fetch() {
+        const FIRST_PDF: &str = "https://publisher.example/article/1.pdf";
+        const FIRST_DOWNLOAD: &str = "https://publisher.example/article/1/download";
+        let (lib, host, d) = started("fr734-posted-navigation");
+        host.defer_issue.store(true, Ordering::SeqCst);
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
+        assert!(!first);
+        assert!(second.answer());
+        assert_eq!(*host.navigated.lock().unwrap(), vec![u(START2)], "the navigation was posted");
+        let now = Instant::now();
+        host.at(FIRST_PDF);
+        lib.page_loaded(&*host, &u(FIRST_PDF), now);
+        lib.download_requested(&*host, &u(FIRST_DOWNLOAD), now);
+        let jobs = |h: &FakeHost| h.jobs.lock().unwrap().iter().map(|j| (j.ticket.clone(), j.input.url.to_string())).collect::<Vec<_>>();
+        assert_eq!(jobs(&host), vec![], "the old page's event was fetched under the waiting open's ticket");
+        host.issue();
         host.at(PDF);
         lib.page_loaded(&*host, &u(PDF), Instant::now());
         assert_eq!(jobs(&host), vec![(TICKET2.to_string(), PDF.to_string())]);
