@@ -308,8 +308,8 @@ export interface UndoResult {
   causes: UndoCause[];
 }
 
-/** What is at a path: nothing, a regular file (with the hash of its bytes), or something else. Throws when it cannot be looked at. */
-type Look = { at: "nothing" } | { at: "file"; sha256: string } | { at: "other" };
+/** What is at a path: nothing, a regular file (with the hash of its bytes), a folder, or something else. Throws when it cannot be looked at. */
+type Look = { at: "nothing" } | { at: "file"; sha256: string } | { at: "folder" } | { at: "other" };
 async function look(root: string, rel: string): Promise<Look> {
   if (process.env.NODE_ENV === "test" && seams.failLook === rel) throw new Error("simulated read failure");
   const st = await fsp.lstat(fromRel(root, rel)).catch((err: NodeJS.ErrnoException) => {
@@ -317,6 +317,7 @@ async function look(root: string, rel: string): Promise<Look> {
     throw err;
   });
   if (!st) return { at: "nothing" };
+  if (st.isDirectory()) return { at: "folder" };
   if (!st.isFile()) return { at: "other" };
   const sha256 = await sha256File(fromRel(root, rel));
   return sha256 === null ? { at: "nothing" } : { at: "file", sha256 };
@@ -525,6 +526,11 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
           continue;
         }
         if (now.at === "nothing") continue;
+        // R526 M4: a folder stands where the change wrote a file: never the change's own; named, nothing removed.
+        if (now.at === "folder") {
+          block("path-occupied", e.path);
+          continue;
+        }
         if (knowsBytes(entries, i) && !(now.at === "file" && writeHashes(entries, e.path).includes(now.sha256))) {
           block("hand-changed-file", e.path);
           continue;
@@ -566,7 +572,7 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
             block("could-not-look", e.path);
             continue;
           }
-          if (now.at === "other" || (now.at === "file" && !writeHashes(entries, e.path).includes(now.sha256) && !kept.includes(now.sha256))) {
+          if (now.at === "other" || now.at === "folder" || (now.at === "file" && !writeHashes(entries, e.path).includes(now.sha256) && !kept.includes(now.sha256))) {
             block("hand-changed-file", e.path);
             continue;
           }

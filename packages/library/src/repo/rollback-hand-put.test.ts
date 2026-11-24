@@ -713,6 +713,32 @@ describe("R526 M2: a folder the change made is removed only when it is the chang
   });
 });
 
+describe("R526 M4: a folder standing at a created file's path is named (path-occupied), and nothing is removed", () => {
+  let root: string;
+  const F = "Projects/P/copied.bin";
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "ao-r526m4-"));
+    await mkdir(fromRel(root, F), { recursive: true });
+    await writeFile(fromRel(root, `${F}/inside.txt`), HAND);
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+  const cases: Array<{ name: string; entries: MarkerEntry[] }> = [
+    { name: "probe E3: a cut copy (no completion line)", entries: [{ kind: "created", path: F }] },
+    { name: "a copy with its completion line", entries: [{ kind: "created", path: F }, { kind: "created", path: F, sha256: "a".repeat(64), complete: true }] },
+    { name: "a file written whole (its hash on its line)", entries: [{ kind: "created", path: F, sha256: "b".repeat(64) }] },
+  ];
+  for (const c of cases) {
+    it(`${c.name}: incomplete with path-occupied and the path, the folder and its file kept, at every run`, async () => {
+      for (const run of ["first", "second"]) {
+        expect(await undoEntries(root, c.entries), run).toEqual({ ok: false, causes: [{ kind: "path-occupied", path: F }] });
+        expect(await readFile(fromRel(root, `${F}/inside.txt`), "utf8"), run).toBe(HAND);
+      }
+    });
+  }
+});
+
 describe("R47: the roll-back's look seam (seams.failLook) does nothing outside NODE_ENV=test", () => {
   it("under test the look fails (could-not-look, nothing deleted); under production the same undo removes the change's file", async () => {
     const root = await mkdtemp(join(tmpdir(), "ao-r519seam-"));
