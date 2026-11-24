@@ -134,6 +134,21 @@ export interface JobsRetryResponse {
  * refusal of an import whose OWN file (a ZIP, a BibTeX, RIS, CSL-JSON or Zotero RDF export) lies inside the library —
  * a backup above all, which holds the held files too (a backup is brought back by the restore, not by an import).
  */
+/**
+ * FR-749 (R546 2): an attach (or a watched folder's bringing-in) that the library's closing cancelled before anything of
+ * the file was written — it was still looking the file's record up. The attach route answers the file with outcome
+ * `cancelled` and this sentence; the page says it with the file's name shown as the researcher's own text.
+ */
+export const ATTACH_CLOSED_TEXT = {
+  before: "The library was closed before ",
+  after: " was attached, so nothing was changed; attach it again after opening the library.",
+} as const;
+
+/** The one sentence for a file whose attach the library's closing cancelled (ATTACH_CLOSED_TEXT around its name). */
+export function attachClosedSentence(fileName: string): string {
+  return `${ATTACH_CLOSED_TEXT.before}${fileName}${ATTACH_CLOSED_TEXT.after}`;
+}
+
 export const IN_LIBRARY_TEXT = {
   file: "That file is inside this library's own folder. Files already in the library cannot be attached again.",
   folder: "That folder is inside this library's own folder, or holds it. Choose a folder outside the library.",
