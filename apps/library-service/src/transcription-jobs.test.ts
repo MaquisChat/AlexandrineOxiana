@@ -874,3 +874,175 @@ describe("N-5: a close stops the rerun of interrupted jobs", () => {
     expect(lines.at(-1)!.status).toBe("running"); // pending: it runs again at the next open
   });
 });
+
+/**
+ * R513 M2 (FR-733): every refusal the move's route gave before its plan was taken early is answered as before, in the
+ * old order of precedence: the route's own checks; then (old: after the stop, in executeMove's plan) a library that is
+ * read-only, then interrupted changes ("pending writes", nothing audited), then the destination (overlap, not empty),
+ * then unreadable projects, the walk, a project to exclude that is not there, and last each project's rules (audited).
+ * Each case: the status, the sentence, and how many audit entries were written in each project.
+ */
+describe("R513 M2 (FR-733): the move's refusals, as before and in the old order", () => {
+  const REMOVABLE_ONLY = `${GOV}residency:\n  allowed: [removable]\n`;
+  const PENDING = { code: "CONFLICT", message: "Some changes are still being written. Try the move again in a moment." };
+  const MOVED_THERE = "The library cannot be moved there.";
+
+  /** A library with a project whose rules forbid this computer's disk (so any destination here) next to "Study". */
+  async function twoProjects(): Promise<{ pid: string; strict: string }> {
+    const { pid } = await library();
+    const r = await call({ method: "POST", url: "/projects", body: { name: "Strict", governanceYaml: REMOVABLE_ONLY, encryption: { enabled: false } } });
+    expect(r.status, r.body).toBe(200);
+    return { pid, strict: r.json.project.id as string };
+  }
+  /** A change interrupted in the library: its write-ahead marker in `.tmp`. */
+  async function interruptedChange(): Promise<void> {
+    await mkdir(join(tmp, "Lib", ".tmp"), { recursive: true });
+    await writeFile(join(tmp, "Lib", ".tmp", "txn-01JX0000000000000000000000.json"), "{}");
+  }
+  const audits = async (...pids: string[]) => Promise.all(pids.map(async (p) => (await svc!.state.session!.repo.readAudit(p)).events.length));
+  /** The answer: its status, and the error (the body's, or the stream's last line). */
+  const answer = (r: { status: number; json: any; body: string }) => ({
+    status: r.status,
+    error: r.json?.error ?? (JSON.parse(r.body.trim().split("\n").at(-1)!) as { error?: unknown }).error,
+  });
+
+  it("the reviewer's probe: an interrupted change AND a project whose rules forbid the place: 'pending writes', and nothing audited", async () => {
+    await start();
+    const { pid, strict } = await twoProjects();
+    const before = await audits(pid, strict);
+    await interruptedChange();
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(answer(r)).toEqual({ status: 200, error: PENDING });
+    expect(await audits(pid, strict)).toEqual(before);
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ running: false, failed: { error: PENDING } });
+  });
+
+  it("an interrupted change AND a destination that is not empty: 'pending writes' (asked before the destination), nothing audited", async () => {
+    await start();
+    const { pid } = await library();
+    const before = await audits(pid);
+    await interruptedChange();
+    const dest = join(tmp, "Full");
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, "notes.txt"), "someone else's file");
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    expect(answer(r)).toEqual({ status: 200, error: PENDING });
+    expect(await audits(pid)).toEqual(before);
+  });
+
+  it("a destination that is not empty AND a project whose rules forbid the place: the destination's refusal (asked before any project's rules), nothing audited", async () => {
+    await start();
+    const { pid, strict } = await twoProjects();
+    const before = await audits(pid, strict);
+    const dest = join(tmp, "Full");
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, "notes.txt"), "someone else's file");
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    expect(answer(r)).toEqual({ status: 200, error: { code: "POLICY_DENIED", message: MOVED_THERE, reason: "The destination folder is not empty; choose an empty folder" } });
+    expect(await audits(pid, strict)).toEqual(before);
+  });
+
+  it("a destination inside the library: the overlap's refusal, nothing audited", async () => {
+    await start();
+    const { pid, strict } = await twoProjects();
+    const before = await audits(pid, strict);
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Lib", "Exports", "Moved") } });
+    expect(answer(r)).toEqual({ status: 200, error: { code: "POLICY_DENIED", message: MOVED_THERE, reason: "The destination must not be the library folder, inside it, or contain it" } });
+    expect(await audits(pid, strict)).toEqual(before);
+  });
+
+  it("a project to exclude that is not in the library AND a project whose rules forbid the place: the unknown project's refusal, nothing audited", async () => {
+    await start();
+    const { pid, strict } = await twoProjects();
+    const before = await audits(pid, strict);
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), excludeProjectIds: ["01ZZZZZZZZZZZZZZZZZZZZZZZZ"] } });
+    expect(answer(r)).toEqual({ status: 200, error: { code: "POLICY_DENIED", message: MOVED_THERE, reason: "No such project in this library: 01ZZZZZZZZZZZZZZZZZZZZZZZZ" } });
+    expect(await audits(pid, strict)).toEqual(before);
+  });
+
+  it("a project whose rules forbid the place, alone: the policy's refusal, audited once in that project only", async () => {
+    await start();
+    const { pid, strict } = await twoProjects();
+    const before = await audits(pid, strict);
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    const a = answer(r);
+    expect(a).toEqual({ status: 200, error: { code: "POLICY_DENIED", message: MOVED_THERE, reason: expect.stringContaining("this project's rules do not allow its data there") } });
+    expect(await audits(pid, strict)).toEqual([before[0], before[1]! + 1]);
+    const moves = (await svc!.state.session!.repo.readAudit(strict)).events.filter((e) => e.action === "move");
+    expect(moves.map((e) => e.decision?.result)).toEqual(["deny"]);
+  });
+
+  it("a second move while one runs: 409, before anything else is asked (its destination not empty), nothing audited", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inMove = new Promise<void>((r) => (entered = r));
+    await start({ beforeExecuteMove: async () => (entered(), gate) });
+    const { pid } = await library();
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    try {
+      await inMove;
+      const before = await audits(pid);
+      const dest = join(tmp, "Full");
+      await mkdir(dest, { recursive: true });
+      await writeFile(join(dest, "notes.txt"), "someone else's file");
+      const second = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+      expect(answer(second)).toEqual({ status: 409, error: { code: "CONFLICT", message: "A move of this library is already running." } });
+      expect(await audits(pid)).toEqual(before);
+    } finally {
+      release();
+    }
+    expect((await moving).body).toContain('"done":true');
+  });
+
+  it("a destination that is not an absolute path: 400, before anything else is asked, nothing audited", async () => {
+    await start();
+    const { pid, strict } = await twoProjects();
+    const before = await audits(pid, strict);
+    await interruptedChange();
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest: "Moved" } });
+    expect(answer(r)).toEqual({ status: 400, error: { code: "VALIDATION", message: '"dest" must be an absolute path.' } });
+    expect(await audits(pid, strict)).toEqual(before);
+  });
+
+  it("an attempt that is not a short plain string: 400, before anything else is asked, nothing audited", async () => {
+    await start();
+    const { pid, strict } = await twoProjects();
+    const before = await audits(pid, strict);
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "x".repeat(200) } });
+    expect(answer(r).status).toBe(400);
+    expect(answer(r).error).toMatchObject({ code: "VALIDATION" });
+    expect(await audits(pid, strict)).toEqual(before);
+  });
+
+  it("background work that cannot be paused (the plan accepted): 409 with its sentence, nothing audited", async () => {
+    await start({ suspendTimeoutMs: 300 });
+    const { pid } = await library();
+    const before = await audits(pid);
+    let free!: () => void;
+    const stuck = svc!.state.startWork("stuck", () => new Promise<void>((r) => (free = r)));
+    try {
+      const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+      expect(answer(r)).toEqual({ status: 409, error: { code: "CONFLICT", message: "Some background work could not be paused in time, so the library was not moved; try again in a moment." } });
+    } finally {
+      free();
+      await stuck;
+    }
+    expect(await audits(pid)).toEqual(before);
+  });
+
+  it("the copy fails after the plan: an error line of the stream, kept as the last failed move, nothing audited", async () => {
+    await start({
+      beforeExecuteMove: async () => {
+        throw new Error("the copy could not start");
+      },
+    });
+    const { pid } = await library();
+    const before = await audits(pid);
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved"), attempt: "a-1" } });
+    expect(r.status).toBe(200);
+    expect(answer(r).error).toMatchObject({ code: expect.any(String), message: expect.any(String) });
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ running: false, failed: { attempt: "a-1" } });
+    expect(await audits(pid)).toEqual(before);
+  });
+});

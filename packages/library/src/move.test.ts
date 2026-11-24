@@ -663,6 +663,36 @@ describe("acceptMovePlan (R503 l, FR-733)", () => {
     await expect(executeMove(lib, join(tmp, "Dest"), { deps: mkDeps(), env })).rejects.toMatchObject({ code: "pending-writes" });
   });
 
+  // R513 M2: the old order of refusals — interrupted changes ("pending writes", nothing audited) before any project's rules.
+  it("R513 M2 (the reviewer's probe): an interrupted change's marker AND a project whose rules forbid the place: nothing judged and nothing audited here; executeMove answers 'pending writes', unaudited, as before", async () => {
+    const { lib, repo, a, b } = await fixture(HIPAA_GOV, true);
+    const macEnv: LocationEnv = { ...env, platform: "darwin" };
+    const dest = join(env.homeDir, "Library/CloudStorage/OneDrive-Contoso/Lib");
+    await writeFile(join(lib.root, ".tmp", "txn-01JX0000000000000000000000.json"), "{}");
+    const before = [(await auditOf(lib.root, a.folder)).length, (await auditOf(lib.root, b.folder)).length];
+    await expect(acceptMovePlan(lib, dest, { deps: mkDeps(), env: macEnv, sourceRepo: repo })).resolves.toBeUndefined();
+    expect([(await auditOf(lib.root, a.folder)).length, (await auditOf(lib.root, b.folder)).length]).toEqual(before);
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env: macEnv, sourceRepo: repo })).rejects.toMatchObject({ code: "pending-writes" });
+    expect([(await auditOf(lib.root, a.folder)).length, (await auditOf(lib.root, b.folder)).length]).toEqual(before);
+  });
+
+  it("R513 M2: a project left refusing changes by an interrupted change (in the open repo) AND a project whose rules forbid the place: 'pending writes' at once, nothing audited", async () => {
+    const { lib, repo, a, b } = await fixture(HIPAA_GOV, true);
+    const dir = join(lib.root, a.folder);
+    const month = (await readdir(join(dir, "changes")))[0]!;
+    await rm(join(dir, "changes", month));
+    await mkdir(join(dir, "changes", month));
+    seams.failUndo = "dir";
+    await expect(repo.createSource(a.id, draft("X"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() })).rejects.toThrow();
+    seams.failUndo = undefined;
+    for (const n of await readdir(join(lib.root, ".tmp"))) await rm(join(lib.root, ".tmp", n), { recursive: true });
+    const macEnv: LocationEnv = { ...env, platform: "darwin" };
+    const dest = join(env.homeDir, "Library/CloudStorage/OneDrive-Contoso/Lib");
+    const before = (await auditOf(lib.root, b.folder)).length;
+    await expect(acceptMovePlan(lib, dest, { deps: mkDeps(), env: macEnv, sourceRepo: repo })).rejects.toMatchObject({ name: "MoveNotAllowedError", code: "pending-writes" });
+    expect((await auditOf(lib.root, b.folder)).length).toBe(before);
+  });
+
   it("a switch already decided (a crash during it) is accepted without a plan, as executeMove finishes it", async () => {
     const { lib } = await fixture();
     const dest = join(tmp, "Dest");

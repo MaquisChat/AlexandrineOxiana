@@ -315,15 +315,26 @@ async function markerFiles(root: string): Promise<number> {
 }
 
 /**
+ * acceptMovePlan met a write-ahead marker: a change still being written by work that runs until the move stops it, or a
+ * change interrupted earlier — it cannot tell which while that work runs. It judges nothing more (R513 M2): the move's
+ * own plan, after the stop, answers in the old order ("pending writes" before the destination and any project's rules).
+ */
+class PlanAfterStop extends Error {}
+
+/**
  * Shared refusals of planMove and executeMove. Returns the journal of an interrupted move, if any. `checkPending` false
- * leaves out the check for interrupted changes (acceptMovePlan: work still running may be writing one now).
+ * (acceptMovePlan, while work may still be writing): a project left refusing changes by an interrupted change (the
+ * open repo's own state, which running work does not change) still refuses at once, as "pending writes"; a write-ahead
+ * marker ends the early plan with nothing judged (PlanAfterStop), so that no later check is answered before it.
  */
 async function preflight(lib: Library, destRoot: string, repo?: Repo, checkPending = true): Promise<Journal | null> {
   if (lib.mode !== "read-write") {
     throw new MoveNotAllowedError("read-only", `The library is open read-only${lib.readOnlyReason ? ` (${lib.readOnlyReason})` : ""}; it cannot be moved`);
   }
-  const pending = checkPending && ((await markerFiles(lib.root)) > 0 || (repo !== undefined && recoveryPendingProjects(repo).length > 0));
-  if (pending) {
+  const markers = (await markerFiles(lib.root)) > 0;
+  const recovering = repo !== undefined && recoveryPendingProjects(repo).length > 0;
+  if (markers && !recovering && !checkPending) throw new PlanAfterStop();
+  if (markers || recovering) {
     throw new MoveNotAllowedError("pending-writes", "Some changes were interrupted and are not resolved yet; finish or resolve pending writes first (reopen the library)");
   }
   const src = await realish(lib.root);
@@ -556,10 +567,13 @@ async function refuseUnaccepted(lib: Library, dest: string, plan: MovePlan, excl
  * R503 l (FR-733): the move's own plan, accepted or refused, for a caller that must stop work still writing in the
  * library (a running transcription) only once the move is accepted. The same code as executeMove's first steps — a
  * switch already decided is accepted (the move finishes it); otherwise the plan is taken and refused as executeMove
- * refuses it (each policy refusal audited in its project) — and nothing is written at the destination. Two things it
- * leaves to executeMove, which takes its plan again once that work has stopped: interrupted changes (a change still
- * being written by the running work has its marker now), and any failure that is not one of the move's refusals (a file
- * that changed under the plan's walk). Nothing of this plan is used by executeMove.
+ * refuses it (each policy refusal audited in its project), in executeMove's order — and nothing is written at the
+ * destination. Two things it leaves to executeMove, which takes its plan again once that work has stopped: a write-ahead
+ * marker in the library (a change still being written by the running work, or one interrupted earlier: it judges
+ * nothing after it, so that "pending writes" is still answered before the destination and any project's rules, unaudited,
+ * R513 M2), and any failure that is not one of the move's refusals (a file that changed under the plan's walk). A project
+ * left refusing changes by an interrupted change is refused here at once, as executeMove refuses it. Nothing of this
+ * plan is used by executeMove.
  */
 export async function acceptMovePlan(lib: Library, destRoot: string, opts: MoveOptions): Promise<void> {
   const { deps, env } = opts;
@@ -570,6 +584,8 @@ export async function acceptMovePlan(lib: Library, destRoot: string, opts: MoveO
     const plan = await planWith(lib, dest, env, { sourceRepo: opts.sourceRepo, now: deps.clock(), tz: opts.tz, actor: opts.actor }, false);
     await refuseUnaccepted(lib, dest, plan, exclude, opts);
   } catch (err) {
+    // PlanAfterStop: an interrupted change may be there; the plan after the stop judges it first, as before (R513 M2).
+    if (err instanceof PlanAfterStop) return;
     if (err instanceof MoveNotAllowedError || err instanceof MoveVerificationError) throw err;
   }
 }
