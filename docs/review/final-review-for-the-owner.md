@@ -376,7 +376,7 @@ Everything built up to 23 November is on `main`, checked by GitHub and on a Mac.
 - [ ] **1. Install Mac build 10** (part 10 says where: run 13's download). It replaces builds 8 and 9: build 8 could not install any optional tool, build 9 mended that, and build 10 adds the rough-edge fixes.
 - [ ] **2. Undo the import that stopped when the disk filled, then import again** with enough free space, or with "leave the files where they are".
 - [ ] **3. Work through the hands-on checklist in part 4** (51 boxes, about ten areas). Tell me what you find, in any form; a sentence per problem is enough. Three areas matter most because nothing but your Mac can test them: "Get through my library" (the sign-in window), watched cloud folders, and the macOS prompts.
-- [ ] **4. Answer the decisions.** There are 29 (28 and 29 are new, in part 10); two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26), part 8 (27) and part 10 (28, 29).
+- [ ] **4. Answer the decisions.** There are 30 (28, 29 and 30 are new, in part 10); two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26), part 8 (27) and part 10 (28–30).
 - [x] **5. Say whether the 94 small rough edges should be fixed** (part 3). You said yes on 23 November; they are fixed (part 10).
 - [ ] **6. Tell me how much usage I may spend**, and remind me to stop at any usage warning. As a guide from the last round: a small reviewed fix costs about 1% of a week, a fix with two review rounds 2–3%, a hard one 5% or more.
 
@@ -458,7 +458,7 @@ The 94 rough edges of part 3 are fixed. They were built in seven batches, and a 
 - [ ] In Optional tools, install "Speech model: tiny". This is build 9's fix, which you have not yet confirmed.
 - [ ] Highlight lines in a Chinese or Japanese PDF. The highlighted text should read correctly.
 
-### Two more decisions for you (28, 29)
+### Three more decisions for you (28, 29, 30)
 
 28. **Links waiting to be captured when a project is locked**
    **What it is:** If you lock an encrypted project while links are still waiting to be captured, the app forgets them (nothing of an encrypted project is kept readable or in memory at a lock) and tells you after the unlock how many were dropped, so you can add them again.
@@ -472,10 +472,17 @@ The 94 rough edges of part 3 are fixed. They were built in seven batches, and a 
    **My recommendation:** (a) unless you meet the problem: you said no such network is in your way.
    <sub>(FR-722)</sub>
 
-### What I am building next, and GitHub's check (24 November, late evening)
+30. **Logging out or shutting down while the app is open**
+   **What it is:** From the next build, Quit (Cmd-Q, the Dock's Quit) closes the app the safe way: it waits for its helper programs and shows "Closing Alexandrine Oxiana" if that takes more than two seconds. When macOS itself asks the app to quit — you log out, restart or shut down — the app still ends at once, as it always has; its helpers then stop by themselves, and nothing is lost by that (every change is made so that an interruption is undone or completed the next time the library is opened).
+   **Your options:** (a) Leave it so. (b) Make the app hold the logout until it has closed safely; macOS would then tell you the app interrupted the logout, and you would log out again once it has closed. (c) Ask macOS to wait for the app without cancelling; this can only be tried on a real Mac.
+   **My recommendation:** (a) now; (c) later if you ever see a "the last change was not finished" notice after a shutdown.
+   <sub>(FR-731)</sub>
 
-- **Building now, as you asked ("keep building"):** the known gaps listed below, except the two decisions above — 23 items in nine batches, each built, checked by a second reviewer, then tested together, as before. They will come to you as Mac build 11. Nothing reaches `main` without your word.
-- **GitHub's own check is red on `main` and on the working branch, for a reason outside the app:** one of Ubuntu's package mirrors has been missing a file for hours, so the check cannot install its tools on most of GitHub's machines (on the one machine that could, the tests ran). The app, the Mac build and what was merged are not affected. I am adding a third download source to the check's install step; it will reach `main` with the next merge you approve.
+### What I am building next, and GitHub's check (24 November, 2:30 am Central)
+
+- **Building now, as you asked ("keep building"):** the known gaps listed below, except decisions 28 and 29 — 23 items in nine batches. Seven batches are built and with their second reviewers now; two more follow on the same code. Then everything is tested together and comes to you as Mac build 11. Nothing reaches `main` without your word.
+- **Two things build 11 will change that you will notice:** Quit goes the safe way (decision 30 above), and every ready-made library inside the media helper is pinned to exactly what build 10 holds, so a build no longer changes by itself.
+- **GitHub's own check:** green on the working branch since 12:11 am Central, with the whole rough-edges round in it. On `main` it is red for a reason outside the app: one of Ubuntu's package mirrors was missing a file for hours, so the check could not install its tools on most of GitHub's machines. I have re-run those jobs now that the mirror has had time to catch up, and I added a third download source to the check on the working branch; that small change reaches `main` with the next merge you approve.
 
 ### Known gaps found during the round (not fixed)
 - **FR-738:** after two crashes in a row, the second at one exact moment of Find and acquire's own repair, that project would stay blocked: each time the library opens, the app tries to undo the change and refuses. Nothing is lost. It is very unlikely.
