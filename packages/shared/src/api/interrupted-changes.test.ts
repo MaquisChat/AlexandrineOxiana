@@ -15,7 +15,9 @@ type Flags = { lost: boolean; unconfirmed: boolean; unreadGone: boolean; hand: b
 function expected(f: Flags): IncompleteRollback {
   const gone = f.lost || f.unconfirmed || f.unreadGone;
   if (gone) {
-    if (f.hand || f.occupied || f.unread || f.unreadGone || f.failed) return "lost-and-blocked";
+    if (f.hand || f.occupied || f.unread || f.unreadGone) return "lost-and-blocked";
+    // R532 M2: the only other blocker a step that failed (nothing the list names): "try again".
+    if (f.failed) return "lost-and-try-again";
     if (f.copyKept) return "lost-copy-stuck";
     return f.lost ? "lost" : "unconfirmed";
   }
@@ -46,6 +48,16 @@ describe("R528: every combination of causes gives the banner of the worst thing 
     });
   }
 
+  it("R532 M2: a loss whose only other blocker is a step that failed never points at a file the list does not name", () => {
+    for (const f of ALL) {
+      const s = incompleteRollbackOf(causesOf(f), f.failed, f.copyKept);
+      const nameable = f.hand || f.occupied || f.unread || f.unreadGone;
+      if (!(f.lost || f.unconfirmed || f.unreadGone) || nameable) continue;
+      const words = [INCOMPLETE_ROLLBACK_BANNER[s]("P"), ROLLBACK_INCOMPLETE_ANSWER[s], ROLLBACK_LIST_NEXT[s] ?? ""].join(" ");
+      expect(words, NAMES.filter((k) => f[k]).join("+")).not.toMatch(/names|named|move the file/u);
+    }
+  });
+
   it("\"Nothing was lost\" is said only in a state with no copy gone", () => {
     for (const f of ALL) {
       const s = incompleteRollbackOf(causesOf(f), f.failed, f.copyKept);
@@ -57,7 +69,8 @@ describe("R528: every combination of causes gives the banner of the worst thing 
   it("a cause of a kind this build does not know is never taken for one that can be closed", () => {
     const gone = [{ kind: "kept-copy-gone", path: "a" }, { kind: "a-later-kind", path: "b" }];
     const later = [{ kind: "a-later-kind", path: "b" }];
-    expect(incompleteRollbackOf(gone, false)).toBe("lost-and-blocked");
+    // R532 M2: nothing the list names (it shows no line for a kind it does not know): "try again", as for a failed step.
+    expect(incompleteRollbackOf(gone, false)).toBe("lost-and-try-again");
     expect(incompleteRollbackOf(later, false)).toBe("try-again");
   });
 });
@@ -76,6 +89,8 @@ describe("R528: the words of each state, word for word", () => {
         "An interrupted change in P cannot be undone completely: the copy the app kept of a file it removed is gone, so the app cannot put that file back. Something is at its place now, which may be that file, but the app cannot confirm it, so it left it as it is. Changes to P are off until you close the change. Choose “Resolve…” to see what is there.",
       "lost-and-blocked":
         "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, the list says whether the change can be closed as it is. Changes to P are off until then. Choose “Resolve…” to see what to do first.",
+      "lost-and-try-again":
+        "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. A step of the undo also failed, and you can try again first. After that, the list says whether the change can be closed as it is. Changes to P are off until then. Choose “Resolve…” to try again.",
       "lost-copy-stuck":
         "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. The app still keeps a copy of another file of the change, which it cannot put back either, and closing the change would let that copy go, so it cannot be closed. Changes to P are off. Restoring the project from a backup made before the change is the way to undo it.",
     });
@@ -90,6 +105,8 @@ describe("R528: the words of each state, word for word", () => {
       unconfirmed: "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back. You can now close the change as it is from the list.",
       "lost-and-blocked":
         "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the undo. The list shows what; deal with it first (move the file it names, or try again), then choose “Roll it back” again. After that, the list says whether the change can be closed as it is.",
+      "lost-and-try-again":
+        "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and a step of the undo also failed. Try again first: choose “Roll it back” again. After that, the list says whether the change can be closed as it is.",
       "lost-copy-stuck":
         "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and the app keeps a copy of another file of the change, which it cannot put back either. Restoring the project from a backup made before the change is the way to undo it.",
     });
@@ -98,6 +115,7 @@ describe("R528: the words of each state, word for word", () => {
   it("R530: the list's next step (never a promise of the close after that, which one rare combination does not keep)", () => {
     expect(ROLLBACK_LIST_NEXT).toEqual({
       "lost-and-blocked": "Deal with what is named above first, then choose “Roll it back” again. After that, this list says whether the change can be closed as it is.",
+      "lost-and-try-again": "A step of the undo also failed: first choose “Roll it back” again. After that, this list says whether the change can be closed as it is.",
       "lost-copy-stuck":
         "The app still keeps a copy of another file of this change, which it cannot put back either, and closing would let that copy go, so this change cannot be closed. The way forward is to restore the project from a backup made before this change.",
     });

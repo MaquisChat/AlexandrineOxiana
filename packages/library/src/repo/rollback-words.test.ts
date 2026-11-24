@@ -8,7 +8,7 @@ import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
-import { INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_CAUSE_TEXT, ROLLBACK_INCOMPLETE_ANSWER } from "@ao/shared";
+import { INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_CAUSE_TEXT, ROLLBACK_INCOMPLETE_ANSWER, ROLLBACK_LIST_NEXT } from "@ao/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -352,15 +352,37 @@ describe("R528 I1, M2: the banner speaks of the worst thing true, and the words 
     ]);
   });
 
-  it("probe P2: a lost file AND a step that failed: the same banner; the list names the lost file", async () => {
+  it("probe P2: a lost file AND a step that failed: the loss leads, then \"try again\" (R532 M2: never a file the list does not name); the list names the lost file", async () => {
     const { a } = await lostAndWritten();
     seams.failUndo = "created";
     await reopen();
-    expect(standing().map((w) => w.rollback)).toEqual(["lost-and-blocked"]);
-    expect(bannerOf(standing()[0]!.rollback)).not.toMatch(/Nothing was lost|a step failed/u);
+    expect(standing().map((w) => w.rollback)).toEqual(["lost-and-try-again"]);
+    expect(bannerOf(standing()[0]!.rollback)).toBe(
+      "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. A step of the undo also failed, and you can try again first. After that, the list says whether the change can be closed as it is. Changes to P are off until then. Choose “Resolve…” to try again.",
+    );
     const [pw] = await repo.pendingWrites();
-    expect(pw).toMatchObject({ rollback: "lost-and-blocked", canClose: false, causes: [{ kind: "kept-copy-gone", path: a }] });
+    expect(pw).toMatchObject({ rollback: "lost-and-try-again", canClose: false, causes: [{ kind: "kept-copy-gone", path: a }] });
     expect(pw!.causes!.map((c) => ROLLBACK_CAUSE_TEXT[c.kind](c.path))).toEqual([`The file this change removed from ${a} cannot be put back: the copy the app kept of it is gone, so it is lost.`]);
+    expect(ROLLBACK_LIST_NEXT[pw!.rollback!]).toBe("A step of the undo also failed: first choose “Roll it back” again. After that, this list says whether the change can be closed as it is.");
+    // The command line's detail and the close's refusal name no file either.
+    expect(standing()[0]!.detail).toBe(
+      `a change interrupted before it was audited could only be partly rolled back: the copy the app kept of a file it removed is gone, so that file cannot be put back, and a step of the roll-back also failed; the marker is kept, and once the roll-back is tried again (at the next open, or from the app's list of interrupted changes), that list says whether the change can be closed as it is (transaction ${pw!.txn})`,
+    );
+    const refused = await repo.closePendingWrite(pw!.txn, pid).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((refused as Error).message).toBe(
+      "This change cannot be closed yet: a step of its undo also failed. Choose “Roll it back” again first; after that, the list says whether the change can be closed as it is.",
+    );
+    // "Roll it back" while the step still fails: the answer says try again, and names no file.
+    const again = await repo.resolvePendingWrite(pw!.txn, "roll-back").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((again as Error).message).toBe(
+      "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and a step of the undo also failed. Try again first: choose “Roll it back” again. After that, the list says whether the change can be closed as it is.",
+    );
     // Tried again once the step passes: only the loss is left, and the close is offered.
     seams.failUndo = undefined;
     const err = await repo.resolvePendingWrite(pw!.txn, "roll-back").then(

@@ -28,11 +28,21 @@ export type RollbackCauseKind = (typeof ROLLBACK_CAUSE_KINDS)[number];
  *   also stops the undo (a file in the way, a file that could not be read, a step that failed): that first; then the
  *   list says whether the change can be closed (R530: in one rare combination it cannot, `lost-copy-stuck`); not
  *   closable yet;
+ * - `lost-and-try-again` (R532 M2): the same, where the only other blocker is a step that failed (or a cause of a kind
+ *   this build does not know): nothing the list names, so the words say "try again" and point at no file;
  * - `lost-copy-stuck` (R528 M2): a copy is gone, nothing else the researcher can deal with stops the undo, and the app
  *   still keeps a copy of another file of the change that it cannot put back (probe P5: a file inside a folder whose own
  *   copy is gone): closing would let that copy go, so no close is offered; a backup made before the change is the way.
  */
-export type IncompleteRollback = "try-again" | "could-not-read" | "in-the-way" | "lost" | "unconfirmed" | "lost-and-blocked" | "lost-copy-stuck";
+export type IncompleteRollback =
+  | "try-again"
+  | "could-not-read"
+  | "in-the-way"
+  | "lost"
+  | "unconfirmed"
+  | "lost-and-blocked"
+  | "lost-and-try-again"
+  | "lost-copy-stuck";
 
 /**
  * The state of an incomplete roll-back from its causes; `stepFailed`: a step failed for no cause the undo could name;
@@ -51,7 +61,9 @@ export function incompleteRollbackOf(
   const unread = causes.some((c) => c.kind === "could-not-look");
   const unknown = causes.some((c) => !(ROLLBACK_CAUSE_KINDS as readonly string[]).includes(c.kind));
   if (gone.length > 0) {
-    if (inTheWay || unread || unknown || stepFailed) return "lost-and-blocked";
+    if (inTheWay || unread) return "lost-and-blocked";
+    // R532 M2: nothing the list names stops it (it shows no line for a failed step or a kind it does not know).
+    if (unknown || stepFailed) return "lost-and-try-again";
     if (copyKept) return "lost-copy-stuck";
     // Lost where nothing is at one place at least (a file of the change is lost there); else nothing is confirmed lost.
     return gone.some((c) => c.somethingThere !== true) ? "lost" : "unconfirmed";
@@ -80,6 +92,8 @@ export const INCOMPLETE_ROLLBACK_BANNER: Record<IncompleteRollback, (p: string) 
   // R528: never "lost" (the place may hold the file, R527) and never "nothing was lost"; what can be done first leads.
   "lost-and-blocked": (p) =>
     `An interrupted change in ${p} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, the list says whether the change can be closed as it is. Changes to ${p} are off until then. Choose “Resolve…” to see what to do first.`,
+  "lost-and-try-again": (p) =>
+    `An interrupted change in ${p} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. A step of the undo also failed, and you can try again first. After that, the list says whether the change can be closed as it is. Changes to ${p} are off until then. Choose “Resolve…” to try again.`,
   "lost-copy-stuck": (p) =>
     `An interrupted change in ${p} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. The app still keeps a copy of another file of the change, which it cannot put back either, and closing the change would let that copy go, so it cannot be closed. Changes to ${p} are off. Restoring the project from a backup made before the change is the way to undo it.`,
 };
@@ -115,6 +129,8 @@ export const ROLLBACK_INCOMPLETE_ANSWER: Record<IncompleteRollback, string> = {
   unconfirmed: LOST_ANSWER,
   "lost-and-blocked":
     "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the undo. The list shows what; deal with it first (move the file it names, or try again), then choose “Roll it back” again. After that, the list says whether the change can be closed as it is.",
+  "lost-and-try-again":
+    "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and a step of the undo also failed. Try again first: choose “Roll it back” again. After that, the list says whether the change can be closed as it is.",
   "lost-copy-stuck":
     "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and the app keeps a copy of another file of the change, which it cannot put back either. Restoring the project from a backup made before the change is the way to undo it.",
 };
@@ -125,6 +141,7 @@ export const ROLLBACK_INCOMPLETE_ANSWER: Record<IncompleteRollback, string> = {
  */
 export const ROLLBACK_LIST_NEXT: Partial<Record<IncompleteRollback, string>> = {
   "lost-and-blocked": "Deal with what is named above first, then choose “Roll it back” again. After that, this list says whether the change can be closed as it is.",
+  "lost-and-try-again": "A step of the undo also failed: first choose “Roll it back” again. After that, this list says whether the change can be closed as it is.",
   "lost-copy-stuck":
     "The app still keeps a copy of another file of this change, which it cannot put back either, and closing would let that copy go, so this change cannot be closed. The way forward is to restore the project from a backup made before this change.",
 };
