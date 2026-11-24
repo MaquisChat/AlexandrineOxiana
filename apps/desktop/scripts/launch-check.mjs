@@ -24,7 +24,8 @@
 //  Q. a Mac only (FR-731, R503 h): the app asked to quit by a quit Apple event (osascript; the same
 //     terminate: as Cmd-Q and the Dock's Quit) takes the orderly way: the helpers stop cleanly, the
 //     shell exits 0 and no process is left; with a slowed stop, the closing window is shown. Skipped,
-//     with the reason as a note, when the event cannot be sent for a reason outside the app.
+//     with the reason, when the event cannot be sent or answered for a reason outside the app, and then
+//     only when the app, stopped by SIGTERM instead, passes B's checks; a closing line says whether Q ran.
 //
 //   pnpm --filter @ao/desktop run launch-check            (node apps/desktop/scripts/launch-check.mjs)
 //
@@ -256,6 +257,15 @@ export function printedAfterEvent(lines, err) {
   const errPart = e ? `${e} character${e === 1 ? "" : "s"} on its standard error` : "";
   if (!n) return e ? `the shell printed nothing on its output after the event was sent, and ${errPart}` : "the shell printed nothing after the event was sent";
   return `the shell printed ${n} line${n === 1 ? "" : "s"} after the event was sent (the last: ${JSON.stringify(lines[n - 1].slice(0, 200))})${e ? `, and ${errPart}` : ""}`;
+}
+
+/**
+ * Whether Q examines a crash (M6, R511): the shell ended at the quit (`exit`: {code, signal}, not a time-out)
+ * without its quit line, or by a signal. The check's Mac crash diagnosis then runs before the failure is said.
+ */
+export function quitCrashSuspected(exit, events) {
+  if (exit?.code === "timeout") return false;
+  return !!exit?.signal || !events.some((e) => e.kind === "quit");
 }
 
 /** What is wrong with a quit that should have gone the orderly way (the events of the run, the shell's exit code). */
@@ -1505,7 +1515,9 @@ async function main() {
     //    osascript, without the keyboard. As A: the quit is taken the orderly way, the helpers stop cleanly,
     //    the shell exits 0, nothing is left; run again with the slowed stop, as F: the closing window is
     //    shown. A request that cannot be made for a reason outside the app (no permission to send Apple
-    //    events, no answer, the app not found under its bundle id) is a note, and Q's checks are skipped.
+    //    events, no answer, the app not found under its bundle id) skips Q's checks of the quit, once the app,
+    //    stopped by SIGTERM instead, passed B's checks (M1, R511); a shell that ends at the quit without its
+    //    quit line, or by a signal, is examined as a crash (M6); one closing line says whether Q ran (M2).
     if (!MAC) {
       process.stdout.write("launch-check: skip Q (quit by Apple event): the Mac's own Quit (Cmd-Q, the Dock's Quit, a quit Apple event) exists only on macOS\n");
     } else {
@@ -1568,8 +1580,11 @@ async function main() {
             problems.push(`Q: ${verdict.problem}`);
             continue;
           }
-          const { code } = await Promise.race([run.exit, sleep(150_000).then(() => ({ code: "timeout" }))]);
-          const qp = orderlyQuitProblems(run.events, code);
+          const exit = await Promise.race([run.exit, sleep(150_000).then(() => ({ code: "timeout" }))]);
+          // M6 (R511): a shell that ended at the quit without its quit line, or by a signal, is examined first, as
+          // upAndProbed examines one that died at the start (the crash report, a backtrace, the bundle).
+          if (quitCrashSuspected(exit, run.events)) await diagnoseMacCrash(run, { debug: true });
+          const qp = orderlyQuitProblems(run.events, exit.code ?? exit.signal);
           report(`${label}: the quit went the orderly way: the helpers stop cleanly and the shell exits 0`, qp.length === 0, qp.length ? qp.join("; ") : `quit hook installed; osascript ${sent.ok ? "answered" : `said ${firstLine(sent.out) || sent.reason}`}`) || problems.push(...qp.map((x) => `Q: ${x}`));
           if (slow) {
             const cw = closingWindowProblems(run.events, { expect: "shown", closeAt });

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { appleEventScripts, appRunningSkip, quitSkipLine, quitSummaryLine, printedAfterEvent, sigtermStopProblems, skippedQuitVerdict, SIGTERM_STOP_LIMIT_MS, bundleIdOf, orderlyQuitProblems, QUIT_EVENT_LIMIT_MS, quitEventVerdict, appProcesses, capLines, CLOSING_WINDOW_TITLE, closingWindowProblems, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
+import { appleEventScripts, appRunningSkip, quitCrashSuspected, quitSkipLine, quitSummaryLine, printedAfterEvent, sigtermStopProblems, skippedQuitVerdict, SIGTERM_STOP_LIMIT_MS, bundleIdOf, orderlyQuitProblems, QUIT_EVENT_LIMIT_MS, quitEventVerdict, appProcesses, capLines, CLOSING_WINDOW_TITLE, closingWindowProblems, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -856,6 +856,16 @@ describe("scenario Q: quit by Apple event (a Mac only; FR-731, R503 h)", () => {
     assert.deepEqual(orderlyQuitProblems(ORDERLY, 1), ["the shell exited 1, not 0"]);
     assert.deepEqual(orderlyQuitProblems(ORDERLY, "timeout"), ["the shell exited timeout, not 0"]);
     assert.deepEqual(orderlyQuitProblems([...ORDERLY, { kind: "stopped", how: "clean" }, { kind: "relaunching" }], 0), ["the helpers were stopped 2 times", "the app started again"]);
+  });
+
+  it("examines a crash when the shell ended at the quit without its quit line, or by a signal (M6, R511)", () => {
+    const quit = { kind: "quit", how: "orderly" };
+    assert.equal(quitCrashSuspected({ code: 0, signal: null }, [quit]), false, "the orderly end");
+    assert.equal(quitCrashSuspected({ code: 0, signal: null }, []), true, "ended without its quit line");
+    assert.equal(quitCrashSuspected({ code: null, signal: "SIGSEGV" }, [quit]), true, "ended by a signal");
+    assert.equal(quitCrashSuspected({ code: null, signal: "SIGABRT" }, []), true);
+    assert.equal(quitCrashSuspected({ code: "timeout" }, []), false, "not ended: nothing to examine");
+    assert.equal(quitCrashSuspected({ code: 1, signal: null }, [quit]), false, "an exit code is judged, not a crash");
   });
 
   it("names a quit hook that was not installed instead of the generic sentence, and a shell that did not say (M5, R511)", () => {
