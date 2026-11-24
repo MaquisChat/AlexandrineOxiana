@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
-import { attachClosedSentence } from "@ao/shared";
+import { LOOKUP_WAITING_TEXT, attachClosedSentence } from "@ao/shared";
 import { CURRENT_RW, libraryHandlers, PROJECTS, server, SOURCES, TAGS, serviceError, testApi, url, useMockService } from "../test/service";
 import { Library } from "./Library";
 
@@ -108,6 +108,25 @@ describe("Library screen", () => {
     // It leads to the project's queue, at that source's entries (Task 67).
     expect(within(items[1]!).getByRole("link", { name: /needs review/i }).getAttribute("href")).toBe("/import/review?project=p1&source=s10");
     expect(items[2]!.textContent).toMatch(/c\.pdf.*The file could not be read\./);
+  });
+
+  it("decision 31 (b), R556 (2) iii: a file stored while a lookup service asked to wait reads, in the owner's words, \"Stored; it needs review: Waiting for lookup service response.\"", async () => {
+    server.use(
+      ...libraryHandlers(),
+      http.post(url("/projects/:id/attach"), () =>
+        HttpResponse.json({ items: [{ path: "/home/r/tide-line-notes.pdf", outcome: "needs-review", sourceId: "s10", reason: LOOKUP_WAITING_TEXT }] }),
+      ),
+    );
+    renderLibrary();
+    await screen.findByText("Ethnography at Work");
+    drop(screen.getByRole("region", { name: /attach files/i }), ["/home/r/tide-line-notes.pdf"]);
+    const list = await screen.findByRole("list", { name: "Attached files" });
+    const [item] = within(list).getAllByRole("listitem");
+    expect(item!.textContent).toBe("tide-line-notes.pdf — Stored; it needs review: Waiting for lookup service response.");
+    expect(within(item!).getByRole("link", { name: "needs review" }).getAttribute("href")).toBe("/import/review?project=p1&source=s10");
+    // The file name and the service's sentence are shown as outside text (UserText); the line is not a failure.
+    expect([...item!.querySelectorAll('[dir="auto"]')].map((e) => e.textContent)).toEqual(["tide-line-notes.pdf", LOOKUP_WAITING_TEXT]);
+    expect(item!.className).toBe("");
   });
 
   it("FR-749 (R546; R551 M5): a file whose attach the library's closing cancelled says so in one sentence, its name as the researcher's own text", async () => {
