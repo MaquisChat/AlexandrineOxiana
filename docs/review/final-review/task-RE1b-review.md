@@ -88,3 +88,64 @@ Worktree `.claude/worktrees/re-1b`, branch `re-1b-core`, 05451c3..54b9f25 (six c
 - Large files in `changedSinceMarker`: it reads a whole file into memory. Such a file was already held in memory when it was written.
 - Encrypted projects: the marker hash is of the ciphertext written, so no key is needed at the reopen.
 - `holdsTurn()` is true in callbacks a turn started, even after that turn ends. This pattern existed before.
+
+## Second look (R484 A, R491 C)
+
+Head 0cacb9f: eight commits, 54b9f25..0cacb9f. The brief is `task-RE1d-brief.md` and the report is `task-RE1d-report.md`.
+
+**Verdict: APPROVED WITH SMALL POINTS for this round's own changes. Batch 1 as a whole is NOT whole:** one **Critical, older than the round** (C1 below) loses a researcher's annotations with no hand edit involved. It needs a ruling before batch 1 can be called whole.
+
+### What I ran
+- **Probe** `packages/library/src/repo/rollback2.probeRE1b.test.ts`, since deleted. Q1 fails (C1). Q2 passes: the occupied-trash rule holds across three reopens, a refused resolve, and a final completion.
+- **Test files, each run alone; all passed:**
+  - `rollback-own-writes` 14/14
+  - `integrity-confirm-batches` 6/6
+  - `integrity-confirm` 5/5
+  - `seams-inert` 3/3
+  - `sources-read-race` 13/13
+  - UI `StatusBanner` 52/52
+  - service `server.test.ts -t "integrity|R491"` 3 passed
+- **Guards taken out, one at a time, then put back with `git checkout`:**
+  - The occupied-trash `ok = false` (`txn.ts:222`): 3 of 14 tests fail.
+  - M4's hash rule: 1 test fails.
+  - Each seam's `NODE_ENV` gate in `seams-inert`: 1 test fails per seam.
+  - In `changedSinceMarker`, each of these taken out alone fails nothing, because the rules overlap: `putBack`, accepting the change's EARLIER writes, and the skip for a trashed path the change did not refill. Each case is still caught by another rule: the backups of later "replaced" lines, or the check that a path's last write has no hash. So no false report comes back. But no one of these three rules is held by a test of its own.
+- **Final state:** `git status --short` is empty, and no implementer work is uncommitted.
+
+### Findings
+
+**C1, Critical, older than this round (the roll-back runs twice; `txn.ts:211` and the "trashed" step).** A "created" undo is not safe to run twice when the same path was also trashed.
+
+- **Probe Q1:**
+  1. One change empties a source's annotations (the annotations file is trashed), then writes annotations again (the file is created).
+  2. The change fails, and its in-process undo fails at "replaced".
+  3. That undo already deleted the change's new file and moved the original annotations back from the trash. The trash copy is now gone, and the marker is kept.
+  4. At the reopen, the roll-back runs again. The "created" step deletes `annotations.json` again: by now that file is the researcher's ORIGINAL annotations.
+  5. The "trashed" step then finds no trash copy and does nothing. The outcome is "rolled-back" and the marker is removed.
+- **Result:** the source's annotations are gone for good. Neither the file nor a trash copy remains. The only warning is `rolled-back-incomplete-write` ("…nothing half-saved was kept"). The next read says the annotations "could not be read".
+- **No hand edit is needed.** A crash during the reopen's own roll-back, cut after the trashed step was undone, reaches the same point.
+- **What this round changed:** nothing in the steps involved. R491 C a now keeps markers through partial roll-backs in a new case, which means more re-runs. In my Q2 shape, though, re-running is safe: `replaced` restores the same backup, a trashed step whose copy is gone does nothing, and `created` deletes what is already absent.
+- **Direction:** the remedy R491 listed as FR-735 (a "created" undo removes only bytes the change wrote, by hash) closes this case too. It is a data-loss case with no outside edit, so it should not wait as a listed item.
+
+**M8, Minor (M6, R484 f): the "N sources" count can be too low.** A `source-change-unfinished` warning is recorded only when a source is READ. So the count is the named sources read so far, not the sources the change named, and before any read there is no banner. On the "this source" constants: no screen shows them. They are the warning's `detail` only, and the `detail` is never shown. R484 f's "where they are said on the source's own screen" has no such place. The implementer says so too.
+
+**M9, Minor (R491 C a): the words shown while a trashed path is occupied.** I judged these by reading, together with the Q2 output.
+
+### Item by item
+
+| Point | Verdict | Note |
+|---|---|---|
+| I1 (R484 a) | holds | P1 and P2 give no false report. The reverse order and 54b9f25's case are tested. A real edit is reported once, never twice. Equally a crash during the reopen's roll-back followed by a real edit: reported once. The earlier state is put back in every tested case, but C1 is a case where it is not. **Blindness:** a real edit equal to one of the change's earlier writes is missed. This does not matter: those bytes are the app's own half-written state, and the roll-back replaces them with the earlier state. |
+| R491 C a | holds | **Occupied trashed path:** the step is not done, the marker and trash copy are kept, nothing is overwritten, and no outside-change warning is raised. Removing the hand-put file lets a reopen finish: the original is back, then the trash copy and marker are gone. A second and third reopen change nothing. **Resolving from the list** refuses with `PendingWriteIncompleteError`: "The change could not be undone completely: a step failed. The choice is recorded; try again, or reopen the library." **The sweep** deletes `trash-*` only when no marker is left (`repo.ts:535`). `retention.strayCopies` skips trash with a live marker. A commit purges only its own trash. `removeMarker` is called only after a complete undo or resolve. A move does not remove project markers. **Re-runs:** replaced, append (the project is blocked, so nothing is appended), dir and trashed are safe to run twice. `created` is not, see C1. **Read-only open:** nothing is written, and `incomplete-write-pending` is raised. |
+| M1 / R479 a | holds | An annotations file found changed is recorded as `changed-outside-before-rollback`. The banner's words match R479 a exactly (`StatusBanner.tsx`). The project name goes through the usual `UserText`, and the `detail` is not shown. |
+| M6 | holds (M8) | One banner per project and kind, with the four ruled sentences. |
+| M5 + R491 C b | holds | Each source is read once. A batch is at most 200 sources per turn. The signal is checked between batches. The close check runs before the turn is asked for and again inside it. A close or move gives 409 CONFLICT with the ruled sentence, only when the session is gone or replaced. A library really open read-only keeps its own answer. |
+| M4, M3 | holds | Each new test fails with its guard taken out. |
+
+### Point 4, my line
+The `rollback-incomplete` banner ("…was undone when the library opened, so nothing half-saved was kept") is false. In the occupied-trash case, these are the other things the researcher can be told, and each is false or unhelpful:
+- **The source's banner,** once the source has been read: "Close the library and open it again to put it back". Reopening never helps while the hand-put file stays.
+- **The list of interrupted changes:** the refusal "a step failed… try again, or reopen".
+- **What is never said:** that a file at that place blocks the undo.
+
+None of these is false in a way that loses data. Nothing tells the researcher to delete anything, and no instruction reaches the kept trash copy. The researcher ends up stuck, but loses nothing. They should still be told what blocks the roll-back, and the banner should stop claiming "nothing half-saved was kept". I recommend listing both.
