@@ -460,7 +460,14 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireWritable();
     const txn = (req.params as { txn?: string }).txn ?? "";
     const projectId = str(bodyOf(req), "projectId", 64);
-    const r = await s.repo.closePendingWrite(txn, projectId);
+    let r: Awaited<ReturnType<typeof s.repo.closePendingWrite>>;
+    try {
+      r = await s.repo.closePendingWrite(txn, projectId);
+    } catch (err) {
+      // R528 I2: a refused attempt changed the warnings too (they follow the latest attempt): the banner says what the list says.
+      state.publishState();
+      throw err;
+    }
     // The index was built with the change half there: rebuilt in the background, as after a roll-back.
     state.startIndexRebuild(s, true);
     state.publishState();
@@ -472,7 +479,14 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const txn = (req.params as { txn?: string }).txn ?? "";
     const choice = str(bodyOf(req), "choice", 16);
     if (choice !== "roll-back" && choice !== "keep") throw badRequest('"choice" must be "roll-back" or "keep".');
-    const r = await s.repo.resolvePendingWrite(txn, choice);
+    let r: Awaited<ReturnType<typeof s.repo.resolvePendingWrite>>;
+    try {
+      r = await s.repo.resolvePendingWrite(txn, choice);
+    } catch (err) {
+      // R528 I2: a refused attempt changed the warnings too (they follow the latest attempt): the banner says what the list says.
+      state.publishState();
+      throw err;
+    }
     // The index was built with the change half there (or, kept, without it): rebuild it in the background.
     state.startIndexRebuild(s, true);
     state.publishState();

@@ -145,6 +145,27 @@ const DETAIL_AFTER: Record<IncompleteRollback, string> = {
 export const incompleteDetail = (state: IncompleteRollback, origin: "open" | "in-process"): string =>
   `${origin === "open" ? "a change interrupted before it was audited" : "a change that failed"} could only be partly rolled back${DETAIL_AFTER[state]}`;
 
+/**
+ * R528 I2: records an incomplete attempt to undo `txn` and brings its standing warning up to date with it (the banner
+ * says the state of the latest attempt, as the list does): its state, its causes and, for the command line, its detail.
+ */
+export function noteAttempt(core: RepoCore, txn: string, attempt: RollbackAttempt): void {
+  core.rollbackAttempts.set(txn, attempt);
+  const state = stateOf(attempt);
+  for (const w of core.integrityWarnings) {
+    if (w.rollback === undefined || !w.detail.includes(`transaction ${txn}`)) continue;
+    if (w.kind !== "rolled-back-incomplete-write" && w.kind !== "incomplete-write-pending") continue;
+    w.rollback = state;
+    if (attempt.causes.length) w.causes = attempt.causes;
+    else delete w.causes;
+    if (w.kind === "rolled-back-incomplete-write") {
+      const at = w.detail.indexOf(" (transaction ");
+      const origin = w.detail.startsWith("a change that failed") ? "in-process" : "open";
+      w.detail = `${incompleteDetail(state, origin)}${at >= 0 ? w.detail.slice(at) : ` (transaction ${txn})`}`;
+    }
+  }
+}
+
 /** FR-736: the state and causes of the latest incomplete attempt to undo `txn`, when there was one. */
 function incompleteOf(core: RepoCore, txn: string): Pick<PendingWrite, "rollback" | "causes"> {
   const a = core.rollbackAttempts.get(txn);
@@ -219,7 +240,7 @@ async function carryOut(
       // FR-736: the answer says the state of the undo; the list says what is in the way, from this attempt.
       const stepFailed = "stepFailed" in undone && undone.stepFailed === true;
       const attempt: RollbackAttempt = { causes: undone.causes, stepFailed, ...((await copyKeptOf(core.root, m, { causes: undone.causes, ...(stepFailed ? { stepFailed } : {}) })) ? { copyKept: true as const } : {}) };
-      if (choice === "roll-back") core.rollbackAttempts.set(m.txn, attempt);
+      if (choice === "roll-back") noteAttempt(core, m.txn, attempt);
       throw new PendingWriteIncompleteError(
         m.txn,
         choice === "keep"
@@ -390,7 +411,7 @@ export async function closePendingWrite(core: RepoCore, txn: string, projectId: 
     const attempt: RollbackAttempt = { causes: undone.causes, stepFailed: undone.stepFailed === true, ...((await copyKeptOf(core.root, m, undone)) ? { copyKept: true as const } : {}) };
     const state = undone.ok ? undefined : stateOf(attempt);
     if (state !== undefined && !CLOSABLE_ROLLBACK.has(state)) {
-      core.rollbackAttempts.set(txn, attempt);
+      noteAttempt(core, txn, attempt);
       throw new PendingWriteIncompleteError(txn, ROLLBACK_INCOMPLETE_ANSWER[state], undone.causes);
     }
     if (await keptCopiesLeft(core.root, m)) throw new PendingWriteIncompleteError(txn, CLOSE_COPIES_LEFT_TEXT);

@@ -3064,6 +3064,25 @@ describe("FR-736: an interrupted change whose undo is not complete, as the servi
     expect([write.status, write.json.error.message]).toEqual([409, "This project takes no changes until a problem found when the library was opened is resolved. The warning at the top of the library says what to do."]);
   });
 
+  it("R528 I2: a refused \"Roll it back\" or close publishes the library's state, so that the banner follows the list", async () => {
+    const { txn, pid, path, folder } = await lostOriginal();
+    // What the opening published is out of the way first.
+    await svc.state.idle();
+    const states: Array<{ integrityWarnings: Array<{ kind: string; state?: string }> }> = [];
+    svc.state.events.subscribe((e) => {
+      if (e.type === "library.state") states.push(e.data as (typeof states)[number]);
+    });
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${txn}/resolve`, body: { choice: "roll-back" } })).status).toBe(409);
+    await svc.state.idle();
+    expect(states).toHaveLength(1);
+    expect(states[0]!.integrityWarnings.find((w) => w.kind === "rolled-back-incomplete-write")).toMatchObject({ state: "lost" });
+    // A close refused (named with the right project, but the project's rules cannot be read): published too.
+    await writeFile(join(path, folder, "governance.yaml"), "identifiability: [not: valid");
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${txn}/close`, body: { projectId: pid } })).status).toBe(403);
+    await svc.state.idle();
+    expect(states).toHaveLength(2);
+  });
+
   it("R509: the list offers to close it, with what is lost; closing is for the app's own token, names its project, and unblocks the project", async () => {
     const { pid, txn, rel } = await lostOriginal();
     const [listed] = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;

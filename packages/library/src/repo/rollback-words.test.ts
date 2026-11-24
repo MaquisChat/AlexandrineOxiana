@@ -362,9 +362,85 @@ describe("R528 I1, M2: the banner speaks of the worst thing true, and the words 
     expect(await readFile(fromRel(lib.root, c), "utf8")).toBe("the researcher's c\n");
     [pw] = await repo.pendingWrites();
     expect(pw).toMatchObject({ rollback: "lost", canClose: true, causes: [{ kind: "kept-copy-gone", path: a }] });
+    // R528 I2: the banner says the same as the list.
+    expect(standing().map((w) => w.rollback)).toEqual(["lost"]);
+    expect(bannerOf(standing()[0]!.rollback)).toBe(
+      "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. That file is lost. Changes to P are off until you close the change. Choose “Resolve…” to see what was lost.",
+    );
     // 4. Closed: the project takes changes again.
     await repo.closePendingWrite(pw!.txn, pid);
     expect(await repo.pendingWrites()).toEqual([]);
     await repo.mutate(pid, STORE, async (tx) => tx.writeFile(`${folder}/after.txt`, "a later change\n"));
+  });
+});
+
+describe("R528 I2: the warning follows every outcome of the list's acts", () => {
+  it("probe P1 continued: the file moved away, \"Roll it back\": the list says lost and offers the close, and so does the warning", async () => {
+    const a = `${folder}/a.txt`;
+    const b = `${folder}/b.txt`;
+    await writeFile(fromRel(lib.root, a), ORIGINAL);
+    const m = await crashed(async (tx) => {
+      await tx.trash(a);
+      await tx.writeFile(b, "written by the change\n");
+    });
+    await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { recursive: true, force: true });
+    await writeFile(fromRel(lib.root, b), HAND);
+    await reopen();
+    expect(standing().map((w) => [w.rollback, w.causes?.map((c) => c.kind)])).toEqual([["lost-and-blocked", ["kept-copy-gone", "hand-changed-file"]]]);
+    await rename(fromRel(lib.root, b), join(tmp, "b-moved-out.txt"));
+    await expect(repo.resolvePendingWrite(m.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteIncompleteError);
+    expect((await repo.pendingWrites())[0]).toMatchObject({ rollback: "lost", canClose: true });
+    const w = standing();
+    expect(w.map((x) => [x.rollback, x.causes?.map((c) => c.kind)])).toEqual([["lost", ["kept-copy-gone"]]]);
+    // The command line's detail follows too (never "retried", never "in the way").
+    expect(w[0]!.detail).toBe(
+      `a change interrupted before it was audited could only be partly rolled back: the copy the app kept of a file it removed is gone, so that file cannot be put back; the marker is kept until the change is closed in the app's list of interrupted changes (transaction ${m.txn})`,
+    );
+  });
+
+  it("a change whose own undo failed in the running app, then rolled back from the list with a file changed by hand: try-again → in-the-way", async () => {
+    const rel = `${folder}/written.txt`;
+    seams.failUndo = "created";
+    await expect(
+      repo.mutate(pid, STORE, async (tx) => {
+        await tx.writeFile(rel, "written by the change\n");
+        throw new Error("the change failed");
+      }),
+    ).rejects.toThrow("the change failed");
+    seams.failUndo = undefined;
+    expect(standing().map((x) => x.rollback)).toEqual(["try-again"]);
+    await writeFile(fromRel(lib.root, rel), HAND);
+    const [pw] = await repo.pendingWrites();
+    await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteIncompleteError);
+    const w = standing();
+    expect(w.map((x) => [x.rollback, x.causes])).toEqual([["in-the-way", [{ kind: "hand-changed-file", path: rel }]]]);
+    expect(w[0]!.detail).toBe(
+      `a change that failed could only be partly rolled back, because a file changed or put there outside the app is in the way; the marker is kept, and the roll-back completes once that file is moved away (the app's list of interrupted changes names it) (transaction ${pw!.txn})`,
+    );
+    // Moved away and rolled back: the warning goes.
+    await rm(fromRel(lib.root, rel));
+    await repo.resolvePendingWrite(pw!.txn, "roll-back");
+    expect(standing()).toEqual([]);
+  });
+
+  it("a recorded choice's warning (incomplete-write-pending) follows too", async () => {
+    const a = `${folder}/a.txt`;
+    const c = `${folder}/c.txt`;
+    await writeFile(fromRel(lib.root, a), ORIGINAL);
+    await writeFile(fromRel(lib.root, c), "c\n");
+    const m = await crashed(async (tx) => {
+      await tx.trash(a);
+      await tx.trash(c);
+    });
+    await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { recursive: true, force: true });
+    await writeFile(fromRel(lib.root, c), HAND);
+    await reopen();
+    await expect(repo.resolvePendingWrite(m.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteIncompleteError);
+    await reopen();
+    const pending = () => mine().filter((x) => x.kind === "incomplete-write-pending");
+    expect(pending().map((x) => x.rollback)).toEqual(["lost-and-blocked"]);
+    await rm(fromRel(lib.root, c));
+    await expect(repo.resolvePendingWrite(m.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteIncompleteError);
+    expect(pending().map((x) => [x.rollback, x.causes?.map((k) => k.kind)])).toEqual([["lost", ["kept-copy-gone"]]]);
   });
 });
