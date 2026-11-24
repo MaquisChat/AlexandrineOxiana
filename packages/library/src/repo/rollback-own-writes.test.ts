@@ -14,6 +14,7 @@ import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
 import type { Repo } from "./index.js";
 import { importChange } from "./repo.js";
+import { PendingWriteIncompleteError } from "./errors.js";
 import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
 import { undoEntries, type TxnMarker } from "./txn.js";
 
@@ -299,23 +300,68 @@ describe("R484 b, R479 a: a file the unfinished change named, changed by hand be
     expect(outside()).toEqual([["changed-outside-before-rollback", `${folder}/annotations.json`]]);
     await earlierStateBack(before);
   });
+});
 
-  it("a trashed path filled again by hand while its trash copy waits", async () => {
-    const before = await sourceJson();
-    seams.failUndo = "trashed";
+describe("R491 C a: a trashed path found filled by hand is not overwritten, and its trash copy is never lost", () => {
+  const HAND = "a different file put there by hand\n";
+  /** A change that trashed the stored original and wrote the source, cut off by a crash; then a file put at the original's path by hand. */
+  async function trashedThenFilledByHand(): Promise<string> {
+    seams.crashAt = "before-audit";
     await expect(
       importChange(repo, pid, STORE, async (ops) => {
         const cur = await ops.readSource(sid);
         await ops.trashAssetFile(cur.assets[0]!);
-        throw new Error("the change failed");
-      }, { op: "test.trash" }),
-    ).rejects.toThrow("the change failed");
-    seams.failUndo = undefined;
-    await writeFile(join(lib.root, original), "a different file put there by hand\n");
+        await ops.writeSource(cur, withNotes(cur, ["after the trash"]));
+      }, { op: "test.trash-then-write" }),
+    ).rejects.toBeInstanceOf(SimulatedCrash);
+    const [name] = await markers();
+    const m = JSON.parse(await readFile(join(lib.root, ".tmp", name!), "utf8")) as TxnMarker;
+    const trash = m.entries.find((e) => e.kind === "trashed" && e.from === original);
+    expect(trash).toBeDefined();
+    await writeFile(join(lib.root, original), HAND);
+    return (trash as { to: string }).to;
+  }
+  /** The hand-put file untouched, the original kept in the trash, the marker kept. */
+  async function nothingLost(copy: string): Promise<void> {
+    expect(await readFile(join(lib.root, copy), "utf8")).toBe(PDF);
+    expect(await readFile(join(lib.root, original), "utf8")).toBe(HAND);
+    expect(await markers()).toHaveLength(1);
+  }
+
+  it("the reopen keeps the marker and the trash copy, leaves the hand-put file, says the change could not be undone, and puts the rest back", async () => {
+    const before = await sourceJson();
+    const copy = await trashedThenFilledByHand();
     await reopen();
-    expect(outside()).toEqual([["changed-outside-before-rollback", original]]);
+    await nothingLost(copy);
     expect(await sourceJson()).toBe(before);
-    // Not asserted here: the stored original itself. Today's roll-back leaves the file put there by hand and the
-    // original in the trash, which is then cleared; reported for a ruling (task RE-1d report, point 2).
+    expect(repo.integrityWarnings.map((w) => w.kind)).toEqual(["rolled-back-incomplete-write"]);
+    expect(outside()).toEqual([]);
+    expect((await repo.pendingWrites()).map((w) => [w.status, w.canRollBack])).toEqual([["uncommitted", true]]);
+    // A second reopen changes nothing and loses nothing: the sweep leaves the trash copy.
+    await reopen();
+    await nothingLost(copy);
+    expect(await sourceJson()).toBe(before);
+    expect(outside()).toEqual([]);
+  });
+
+  it("resolving it from the list while the path is occupied refuses and keeps the trash copy", async () => {
+    const copy = await trashedThenFilledByHand();
+    await reopen();
+    const [pending] = await repo.pendingWrites();
+    await expect(repo.resolvePendingWrite(pending!.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteIncompleteError);
+    await nothingLost(copy);
+    await reopen();
+    await nothingLost(copy);
+  });
+
+  it("once the hand-put file is removed, a reopen completes the roll-back: the original is back at its path, the marker gone", async () => {
+    const before = await sourceJson();
+    const copy = await trashedThenFilledByHand();
+    await reopen();
+    await rm(join(lib.root, original));
+    await reopen();
+    expect(outside()).toEqual([]);
+    expect(await readFile(join(lib.root, copy), "utf8").catch(() => null)).toBeNull();
+    await earlierStateBack(before);
   });
 });

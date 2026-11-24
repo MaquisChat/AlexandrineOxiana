@@ -215,7 +215,13 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
         if (await exists(backup)) await writeFileAtomic(fromRel(root, e.path), await fsp.readFile(backup), { mode: e.mode });
       } else if (e.kind === "trashed") {
         const to = fromRel(root, e.to);
-        if ((await exists(to)) && !(await exists(fromRel(root, e.from)))) await renameWithRetry(to, fromRel(root, e.from));
+        if (await exists(to)) {
+          // Steps after it are undone first, so something at the path now is not the change's (or a later undo
+          // failed): it is never overwritten, and the step is not done, so the marker, and with it the trash copy,
+          // is kept for the researcher to resolve (R491 C a; nothing overwritten, nothing deleted).
+          if (await exists(fromRel(root, e.from))) ok = false;
+          else await renameWithRetry(to, fromRel(root, e.from));
+        }
       } else {
         // Nothing to undo when the file is gone or is not a regular file (the append never happened).
         const path = fromRel(root, e.path);
@@ -570,7 +576,7 @@ const sha256File = async (abs: string): Promise<string | null> => {
  * and the bytes the change wrote there, its LAST write's above all; an earlier write of the change counts as its own
  * too, since a roll-back cut off half-way (in the running app, or a crash during the reopen's) leaves one there. A
  * trashed path whose trash copy is gone was put back by the app's own roll-back; one whose copy is still in the trash
- * is changed outside when something is there again that no later step of the change put there. Only what the marker
+ * and that something not of the change fills is never listed: the roll-back leaves it and stays incomplete. Only what the marker
  * can tell is judged: a path whose last write the change recorded no hash for (a copied file) is not. The roll-back
  * puts the earlier state back all the same; the caller records these. Reads only.
  */
@@ -595,10 +601,9 @@ export async function changedSinceMarker(root: string, m: TxnMarker): Promise<st
       if (lastTrash !== undefined) {
         // Something there again is the change's own only when a later step of it wrote at or under that path.
         const refilled = m.entries.slice(lastTrash + 1).some((x) => x.kind !== "trashed" && (x.path === p || x.path.startsWith(`${p}/`)));
-        if (!refilled) {
-          if (await exists(fromRel(root, p))) out.push(p);
-          continue;
-        }
+        // Not refilled by the change: something there now is not put back over (the roll-back stays incomplete, its
+        // marker and trash copy kept, R491 C a), so "the outside change was not kept" would be untrue: not listed here.
+        if (!refilled) continue;
         if (lastWrite === undefined || lastWrite < lastTrash) continue; // refilled by a step that records no hash
       }
       if (!writes.at(-1)?.sha256) continue;
