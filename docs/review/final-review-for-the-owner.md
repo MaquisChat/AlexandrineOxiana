@@ -1,5 +1,7 @@
 # The final review — what I need from you
 
+*Updated 24 November 2026, later: part 11, at the end, is new — the known gaps of part 10 are built and pass GitHub's check, but there is no Mac build of them yet: GitHub has not given the build a Mac. Build 10 stays the build to use. Start at part 11; it also has a new decision (31).*
+
 *Updated 24 November 2026: part 10, at the end, is new — the 94 rough edges are fixed and come to you as Mac build 10. Start there.*
 
 *Updated 17 November 2026: part 6, at the end, is new — four more decisions (22–25) after the last review of the whole branch.*
@@ -395,8 +397,8 @@ The 94 rough edges of part 3 are fixed. They were built in seven batches, and a 
 - **Where:** run 13 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45321193812 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon`, unzip it and open the `.dmg` inside. Its SHA-256 is `de3f679d60def4bc9671800025054c31d3fc592661f8950bdd6563f8520999f9`.
 - **It replaces builds 8 and 9.** It contains build 9's download fix and everything below.
 - **It passed every check on GitHub's Mac** (24 November): the app starts, reaches its helpers, and stops cleanly; and the new "Closing Alexandrine Oxiana" window appeared there two seconds into a slowed quit, as it should.
-- **It is in `main`** (the approved version) since 24 November, shortly before 11 pm Central on the 23rd: you said "Merge and keep building please". GitHub's check of the merged state is running as I write; I will tell you its result.
-- **What I build next, as you asked:** the known gaps at the end of this part (FR-717 to FR-741), most serious first.
+- **It is in `main`** (the approved version) since 24 November, shortly before 11 pm Central on the 23rd: you said "Merge and keep building please". GitHub's check of `main` has been red since then for a reason outside the app (a package mirror missing a file; see the end of this part and part 11).
+- **What I built next, as you asked:** the known gaps at the end of this part (FR-717 to FR-741). They are done: part 11.
 
 ### What you will notice
 
@@ -407,7 +409,7 @@ The 94 rough edges of part 3 are fixed. They were built in seven batches, and a 
 - A new project whose rules need things only you can give (such as a destruction date) lists them as soon as it is created, with "Open Governance".
 - On Fieldwork you can detach a signed form ("Detach the form…"). The app asks for a reason.
 - A project name written right to left no longer flips the banner.
-- An interrupted change is reported once per project: "A change to a source in <project> did not finish and could not be undone. Close the library and open it again to put it back."
+- An interrupted change is reported once per project: "A change to a source in <project> did not finish and could not be undone. Close the library and open it again to put it back." *(The next build changes these words: part 11, "When a change was interrupted".)*
 
 **Locked and encrypted projects**
 - The project picker marks a locked project "(locked)", and Governance, Audit log and Fieldwork link you to unlock it.
@@ -451,7 +453,7 @@ The 94 rough edges of part 3 are fixed. They were built in seven batches, and a 
 - The app no longer reports its own writes as "changed outside the app". Real outside changes are still reported.
 - A transcript's two files are stored together or not at all.
 
-### Things only you can check in build 10
+### Things only you can check in build 10 (still the build to use; part 11 has the list for the next one)
 - [ ] Start something long, such as a transcription, then quit with **Cmd-Q**. Does "Closing Alexandrine Oxiana" appear if closing takes more than two seconds, and does the app end completely? (FR-731)
 - [ ] In the review queue, press "Look at the file" on a found PDF. You should be able to read it but not add anything. Close it and note where the keyboard focus lands.
 - [ ] Unplug the drive that holds a source's linked file and press "Get a copy for this source". After "Use this file", the reader should open the copy.
@@ -478,13 +480,13 @@ The 94 rough edges of part 3 are fixed. They were built in seven batches, and a 
    **My recommendation:** (a) now; (c) later if you ever see a "the last change was not finished" notice after a shutdown.
    <sub>(FR-731)</sub>
 
-### What I am building next, and GitHub's check (24 November, 2:30 am Central)
+### What I was building next (24 November, 2:30 am Central)
 
-- **Building now, as you asked ("keep building"):** the known gaps listed below, except decisions 28 and 29 — 23 items in nine batches. Seven batches are built and with their second reviewers now; two more follow on the same code. Then everything is tested together and comes to you as Mac build 11. Nothing reaches `main` without your word.
-- **Two things build 11 will change that you will notice:** Quit goes the safe way (decision 30 above), and every ready-made library inside the media helper is pinned to exactly what build 10 holds, so a build no longer changes by itself.
-- **GitHub's own check:** green on the working branch since 12:11 am Central, with the whole rough-edges round in it. On `main` it is still red for a reason outside the app: thirteen hours on, one of Ubuntu's package mirrors is still missing a file, so the check cannot install its tools on most of GitHub's machines (I re-ran it at 2:20 am; same result). The working branch has a third download source for the check and passes with it. **If you want `main` green before build 11, say "merge the check's fix"**: it changes only the check's install script, nothing of the app. Otherwise it goes with the next merge you approve.
+*This was the state in the night. All of it is now done: part 11.*
 
 ### Known gaps found during the round (not fixed)
+
+*24 November, later: all of these but FR-722 (your decision 29) are now built — part 11 says what became of each, and what is still open. The list is kept as it was written. One line of it was wrong: FR-738 does not need "two crashes in a row" in any build after build 10 — it can no longer happen there at all; part 11 says what remains of it.*
 - **FR-738:** after two crashes in a row, the second at one exact moment of Find and acquire's own repair, that project would stay blocked: each time the library opens, the app tries to undo the change and refuses. Nothing is lost. It is very unlikely.
 - **FR-735, FR-736:** when a file put there by hand is in the way, the original is kept, but the app cannot yet put it back itself, and its messages do not tell you what to do.
 - **FR-722:** a network that inspects secure connections (some universities) still refuses tool downloads. The app's message says why.
@@ -494,3 +496,110 @@ The 94 rough edges of part 3 are fixed. They were built in seven batches, and a 
 - **FR-723, FR-737:** rare cases in undoing an unfinished change.
 - **FR-724, FR-732:** small inaccuracies in an export's notes about left-out files.
 - Small technical points, and small points of wording, focus and speed: FR-725, FR-726, FR-730, FR-734, FR-739, FR-740, FR-741.
+
+## 11. Added on 24 November: the known gaps are built — what changed, and what to check
+
+You said "keep building". The 23 known gaps of part 10 are built; the other two of the 25 are your decisions 28 and 29 and stay so. A second reviewer checked each batch and tried to break it; several were sent back and mended, and then everything was tested together. Nothing in it needs a decision from you before you use it.
+
+- **Where it stands:** built, tested together on my side, and green in GitHub's own check: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45464905103
+- **There is no Mac build of it yet.** I asked for Mac build 11 twice. GitHub cancelled the Mac job four times, each time about fifteen minutes after it was queued, without ever giving it a Mac; nothing of the build ran, so this says nothing about the app. The last time a Mac was given was for build 10, the night before. I cannot see GitHub's reason from here; the cancelled job's page may show it: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45464905098 (the job "apple-silicon (macos-15)"). I will ask again with the next change (FR-749, below) and put the download here when it exists.
+- **Until then, build 10 is the build to use** (part 10 says where). What follows describes the next build.
+- **It is not in `main`** (the approved version). `main` has the rough-edges round (build 10) and lacks this round and the small fix to GitHub's check. **May I merge it?** A yes in the chat is enough.
+
+### What you will notice (in the next Mac build)
+
+**Quitting the app**
+- Quit (Cmd-Q, the Dock's Quit) now closes the app the safe way. If that takes more than two seconds you see the "Closing Alexandrine Oxiana" window. Logging out, restarting or shutting down still ends the app at once (decision 30).
+
+**The library and projects**
+- If "Move library" is refused (for example, the destination is not empty), a running transcription is no longer stopped: it goes on.
+- The warning that the watched folders were not started goes away by itself once their list can be read again.
+
+**Locked and encrypted projects**
+- A file sealed with another project's key no longer says the project is locked: "An encrypted file could not be read (damaged, or made with another key)."
+
+**Watched folders**
+- "Bring in the new version…" and "Keep the library's copy as it is" now say what happened: "The disk is full. Free some space and try again.", or "Watching of this folder stopped before this could be done, so nothing was changed. Try again."
+
+**Find and acquire and linked files**
+- A linked file whose place now holds a shortcut (a symbolic link, even to a real file) or a folder counts as missing. It appears under Missing files and in Find and acquire, and the reader says "File not found".
+- An entry waiting for a copy says "In your library" once its source has a file by another route.
+
+**Getting a PDF through your library**
+- Leaving Find and acquire while a sign-in window was opening could leave a stuck sign-in that blocked every "Get through my library" for up to half an hour. That is mended.
+
+**Exports**
+- An export's notes about left-out files are more exact: where a record is missing they name it, instead of saying the audit log "does not hold together".
+
+**The PDF reader**
+- More Chinese and Japanese highlights join correctly across a line break (full-width spaces, split numbers, superscript note marks).
+
+**The browser extension's pairing**
+- A pairing the app cannot save in time is refused with "…so the browser is not paired. Show a new code in the desktop app and pair again."
+
+### When a change was interrupted
+
+This is the largest part of the round, and I hope you never meet it: the app was closed or crashed in the middle of a change and cannot simply undo it.
+
+**The app never deletes, overwrites or moves a file it can tell is not its own: it waits, and tells you which file is in the way.**
+
+- The warning has "Resolve…". The list names the file and its place, for example: "{file} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (it is kept there as it is), then choose “Roll it back”."
+- You move that file out of the library and choose "Roll it back".
+- Where the app's own kept copy of a removed file is gone, you can choose "Close this change as it is". The app says plainly whether that file is lost or merely cannot be confirmed, and: "Closing deletes nothing. The project takes changes again, and a warning about what could not be put back stays until you dismiss it."
+- Such warnings now stay until you press "Dismiss", also after a restart.
+
+**The honest limit.** A change that an older build (up to 10) left stuck at one exact step cannot be closed this way: the app keeps the only copy of the earlier state, and closing would delete it. A backup made before that change is the way. No build from 11 on can produce that state. This corrects what I told you in the chat during the night, that such a change could be closed.
+
+### What became safer underneath
+
+- Every ready-made library inside the media helper is pinned to exactly what build 10 holds, and the build fails if anything differs. Builds no longer change by themselves (the speech engine had moved on its own between builds 8 and 9).
+- A move of the library never has a folder watch running during the copy.
+- A lock now also cuts off a picture that was being sent.
+- Find and acquire's queue no longer reads every record again after each opening.
+- A browser pairing that could not be saved in time is taken back, never left half-made.
+
+The reviews caught, on the way: watches restarted in the middle of a move; a ruling of mine that would have moved a hand-placed file into a folder the app empties; and a guard that, in one contrived sequence, would have let a close delete the only copy of a file.
+
+### Things only you can check in the next Mac build (build 11)
+
+- [ ] Start a transcription, then quit with **Cmd-Q**. You should see "Closing Alexandrine Oxiana" if closing takes more than two seconds, and the app should end completely. GitHub's Mac has not yet run its test of a quit sent as a system request, because no Mac build has run. Your own Cmd-Q is the last word.
+- [ ] The same with the Dock's Quit.
+- [ ] In Optional tools, install "Speech model: tiny" (still unconfirmed since build 9).
+- [ ] Replace a linked file with a folder, or unplug its drive. Missing files and Find and acquire should list it, and the reader should say "File not found".
+- [ ] Start "Move library" to a folder that is not empty while a transcription runs. The move is refused and the transcription goes on.
+
+### Still open
+
+**Your decisions (part 10):**
+- 28, links waiting when a project is locked: I recommend (a), leave it so.
+- 29, tool downloads on a network that inspects secure connections: I recommend (a), unless you meet the problem.
+- 30, logging out or shutting down: I recommend (a) now; (c) later if you ever see a "the last change was not finished" notice after a shutdown.
+- **31 (new, below), attaching a file when a metadata service says "too many requests": I recommend (b) now and (c) next.**
+
+**Listed in this round, not built (most serious first):**
+- **FR-749:** a library closed while a file is still "Attaching…" is written into after its lock is released. Being fixed and reviewed now; it comes with the next build (see "What GitHub's own check found", below).
+- **FR-738:** a library already holding a change stuck by an older build stays blocked; a backup is the way. Very unlikely (a crash at that one step under build 10 or earlier). In two rare shapes the app also refuses a close that would be safe.
+- **FR-746:** the "never touch what is not its own" rule does not yet cover a hand-put file where the app only adds to its own logs, or inside a folder the change made. Far-fetched.
+- **FR-745:** with a shortcut or folder at a linked file's place, Find and acquire still suggests a disconnected drive; whether to follow such a shortcut is a choice with a safety side.
+- **FR-744:** after two failed saves and a restart, a pairing can be listed again; nobody can use it.
+- **FR-742:** a few build tools and the Linux side of the helper's build are not yet pinned.
+- **FR-743:** after an older kind of restore, an export can call false-dated evidence verified. Very narrow.
+- **Small points:** FR-717, FR-725, FR-729, FR-734 and FR-740 each keep a small leftover of wording, timing or a rare join.
+- **Tests only:** FR-747 and FR-750 are three tests that failed once on a heavily loaded machine and pass alone; they are watched, not changed.
+
+### What GitHub's own check found after the push
+
+The round passed every test on my side, and then GitHub's check of the same code failed twice. Both were followed up rather than run again until green.
+
+- **A test of Find and acquire** depended on timing and failed on GitHub's slower machine. The app was right and the test's order was wrong. The test is mended.
+- **The desktop test attached a file and waited more than a minute.** The app had asked a public metadata service about the file, was told "too many requests", and waited as long as the service asked. That is what the app does today, in build 10 as well; it is decision 31 below. The test now switches the lookups off for its project through the real settings screen, so it no longer depends on a public service.
+- **A guard** now fails any unit test that reaches the internet without having prepared for it. It found one more such test, which is mended.
+- **A fault in the app, older than this round, came to light on the way** (FR-749): if you close the library, or open another one, while a file is still "Attaching…", the close finishes at once and the attach later writes the new source into the library after its lock has been released. In the test nothing was lost. But another device or the command line could be using the library at that moment, and the app's own rule is that nothing is written into a library after its lock is released. The fix is being built and reviewed now and comes with the next build: a closed library refuses every write, and a close cancels an attach that has not written anything yet, with a plain message. Quit will then also no longer wait a minute in that case.
+
+### One more decision for you (31)
+
+31. **Attaching a file when a metadata service says "too many requests"**
+   **What it is:** When you attach a file, the app first asks public services (Crossref, OpenAlex, Open Library, the Library of Congress) for its details. If one answers "too many requests", the app waits as long as that service asks, up to a minute per try, and then asks again. Measured with a stand-in: one minute for a plain PDF with one such answer; three minutes if every service keeps answering so; nine minutes for a PDF with a DOI. Several files wait one after another. All you see meanwhile is "Attaching…" with the buttons off: no progress and no Cancel. One of these services appears to have changed its limits for requests without a key (its answers now carry a shared allowance), so this may happen more often than it used to. When a lookup fails outright (no network), the file comes in within seconds marked "needs review", and nothing looks that record up again later.
+   **Your options:** (a) Wait, as now. (b) Bring the file in at once, marked "needs review", whenever a service asks to wait: small to build; the record then holds only what the file itself says, and you fill in the rest by hand. (c) As (b), and add "look up again", which completes such a record later: a medium piece of work. (d) Keep waiting, but for about ten seconds at most, with "Looking up the details…" and a Cancel.
+   **My recommendation:** (b) now and (c) next. A file you chose should be in your library at once; what the services know can follow.
+   <sub>(FR-748)</sub>
