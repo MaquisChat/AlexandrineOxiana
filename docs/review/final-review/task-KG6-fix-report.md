@@ -79,7 +79,12 @@ Other failures use the same closing line, `Q FAILED (…)`:
 ## For the Mac build to watch (the whole of KG-6 as it now is)
 
 The step is "Launch check A-D"; its name is stale, as it runs A–F and Q.
-1. **The closing line.** `grep "launch-check: Q "` gives one line. `Q ran: 2 of 2 runs …` means FR-731 was proved by the Apple event. `Q SKIPPED (…)` or `SKIPPED in part` means it was not, and the reason is there. A skip now also proved that the app ends cleanly on SIGTERM after the event.
+1. **The closing line (updated by N2, R514).** `grep "launch-check: scenario Q result:"` finds exactly one line, on every path of a Mac run:
+   - `launch-check: scenario Q result: ran (2 of 2 runs quit the app by Apple event and were checked)`: FR-731 was proved by the Apple event;
+   - `launch-check: scenario Q result: SKIPPED (<reason>): the Mac's own Quit was not checked`, or `… SKIPPED in part (Q (quit by Apple event) ran and was checked; Q (quit by Apple event during a slowed quit): <reason>)`: it was not, and a skip also proved that the app ends cleanly on SIGTERM after the event;
+   - `launch-check: scenario Q result: FAILED (<labels, or label: it did not finish: <error>>): see its FAIL lines above`;
+   - `launch-check: scenario Q result: not reached (the check ended before scenario Q: <the error's first line>)`.
+   The `launch-check: Q …` lines of the first fix round's closing line no longer exist (the sections above show them as they were; the R514 section below gives the lines that replace them).
 2. **The hook was installed.** The ok line's detail says `quit hook installed`. If it does not, read the FAIL line: `not installed` means `class_addMethod` refused, or the delegate was missing. That is a tao/AppKit change, and a finding for the code.
 3. No `the quit did not reach the shell's quit handler` with `quit hook installed`. That combination would mean AppKit does not consult a method added at run time: the one unknown by reading (R511).
 4. **No crash diagnosis block in Q.** If one appears (`the shell exited (…); what macOS can say follows`), the shell ended at the quit without its line, or by a signal: read the crash report and backtrace.
@@ -97,7 +102,7 @@ The step is "Launch check A-D"; its name is stale, as it runs A–F and Q.
 
 ## NEEDS A RULING
 
-None. One choice was made within the brief and is stated under M3, for the reviewer to judge: the hold ends when the waiting open's own navigation has been sent, not at an exact-address match, so that a redirected address still auto-fetches.
+None (R514 ruled on the M3 choice below; see "Last points"). One choice was made within the brief and is stated under M3, for the reviewer to judge: the hold ends when the waiting open's own navigation has been sent, not at an exact-address match, so that a redirected address still auto-fetches.
 
 ## Runs (last line of each)
 
@@ -107,3 +112,40 @@ None. One choice was made within the brief and is stated under M3, for the revie
 - M4 scratch proof (notify removed, then restored): `test result: FAILED. 2 passed; 3 failed; … finished in 60.18s`.
 - Not run, as the brief says: `build:linux`, the launch check itself, any end-to-end run. Nothing was refused by a permission check. No `git stash`. Not pushed.
 - `git status --short`: empty.
+
+## Last points (R514)
+
+Head **9704f93**. Two commits on `kg-6-shell` after 0a17de2:
+- edb3690: N1
+- 9704f93: N2
+
+**N1 (M3): the hold now ends on the main thread, as the navigation is issued.**
+- **The host.** `Host::navigate(url, issued)` takes a step to run once the navigation is issued (`library_window.rs`, the trait). `TauriHost::navigate` posts ONE task with `run_on_main_thread`, or runs it at once when it is already on the main thread. That task calls `WebviewWindow::navigate`, which on the main thread is issued in that same turn (tauri-runtime-wry 2.12.3 `send_user_message` → `load_url`). It then runs `issued` and sends the result back. The waiting open waits for that answer; a loop that is gone drops the task, and the answer is false.
+- **The release.** `Library::open` passes `issued` as a closure that ends the waiting open's hold, if that open still holds it (`waiting == own ticket`). To let it do that, `Library.inner` is now `Arc<Mutex<Inner>>`. The closure takes the controller's lock only inside itself. No lock is held across the host call or across a wait, and the closure calls nothing of the host. The waiting open answers as before.
+- **What remains, as the comment says.** An event the web view would deliver for the OLD page after the navigation was issued. By reading WebKit's documented behaviour, a new navigation cancels the old load, which then never reports "finished". This cannot be shown here.
+- **The test.** The reviewer's probe is `an_old_page_s_event_before_the_waiting_open_s_navigation_is_issued_starts_no_fetch`. `FakeHost` can now hold a posted navigation un-issued (`defer_issue`, `issue()`), as the real host's main thread does. Between "posted" and "issued", the old page's `page_loaded` (a PDF) and `download_requested` start no fetch; after `issue()`, the open's own PDF is fetched under TICKET2. It FAILED first, with the old release kept and the new signature in place: `left: [("fedcba98…", "https://publisher.example/article/1.pdf")]`, the probe's own result. All other tests are unchanged and pass.
+
+**N2 (M2): one line, printed on every path, with a prefix of its own.**
+- **Where.** `quitSummaryLine(outcomes, {reached, error})` in `launch-check.mjs`. It is now printed from `main`'s outer `finally`, after the end-of-check process line, on a Mac only.
+- **When something throws.** A scenario that throws is caught there, kept as `ended` and thrown on. A Q run that throws is recorded as `failed` with `it did not finish: <message>`, never as passed. If the check ends before Q, the line is `not reached`.
+- **The prefix** `launch-check: scenario Q result:` is written once in the script, and a test asserts that. The crash-diagnosis line (`launch-check: Q (…): the shell exited …`) no longer matches the search.
+- **The tests.** The M2 closing-line test was rewritten for the new words. It covers ran, skipped, skipped in part, failed, failed after a skip, a run that threw, Q throwing before a run, not reached (with and without the error), and uniqueness. It failed first (1 failure) before the change.
+
+**The exact lines (a Mac):**
+```
+launch-check: scenario Q result: ran (2 of 2 runs quit the app by Apple event and were checked)
+launch-check: scenario Q result: SKIPPED (osascript had no answer within 30 s (…); the shell printed nothing after the event was sent): the Mac's own Quit was not checked
+launch-check: scenario Q result: SKIPPED in part (Q (quit by Apple event) ran and was checked; Q (quit by Apple event during a slowed quit): <reason>)
+launch-check: scenario Q result: FAILED (Q (quit by Apple event)): see its FAIL lines above
+launch-check: scenario Q result: FAILED (Q (quit by Apple event): it did not finish: timed out after 180 s waiting for the page's probe): see its FAIL lines above
+launch-check: scenario Q result: FAILED (scenario Q did not finish: <error>)
+launch-check: scenario Q result: not reached (the check ended before scenario Q: <first line of the error>)
+```
+On Linux nothing changes: Q's own skip line, and no closing line.
+
+**Runs:**
+- `cargo test --locked --lib`, shared target: `test result: ok. 143 passed; 0 failed`.
+- The Mac type-check with `CC_/AR_aarch64_apple_darwin`: `Finished dev profile`, no warning.
+- `node --test apps/desktop/scripts/launch-check.test.mjs`: `# tests 64`, `# pass 64`, `# fail 0`.
+- `git status --short`: empty.
+- Not pushed. No `git stash`. Nothing was refused.

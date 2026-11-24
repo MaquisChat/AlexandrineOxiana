@@ -69,3 +69,33 @@ None.
 - `lint:css` clean; `lint:colours`: "ok: no hard-coded colours"
 - `@ao/ui build`: built; e2e `find-copies.spec.ts` (chromium): 8 passed (1.9m)
 - `git status --short`: empty
+
+## Fix round (R510)
+
+Head **e59ea20**. Seven commits on top of 07f0ae0, one per point, plus one e2e test commit.
+
+| point | commit | what changed (file:line) | its test, failed first? |
+|---|---|---|---|
+| 1. I1 (FR-734 point 2) | 3857728 | `packages/ui/src/screens/FindAcquire.tsx:1707-1717`: after the ticketed close, `opened` is set to false, so the start takes the existing not-opened path. That path cancels at the service once (`libApi.cancel`, sent also when the screen is gone) and shows nothing on a row that has left. | `FindAcquire.test.tsx` "FR-734 (2): the row leaves (unmount/project)…". Both now also assert one cancel POST to that entry's `/library/cancel` and that the service's entry no longer waits. Both failed first (0 cancels). "The reverse" still asserts no close and no cancel. The service frees its one ticket on cancel by the existing route, already tested in the service. I added no service test. |
+| 2. M1, the rule corrected | 7093f21 | `packages/library/src/repo/linked-file.ts:22` `linkedNotThere`, `:26` `missingAt` (`lstat` only: any symbolic link or a folder at a linked path is missing; ENOENT/ENOTDIR as before; other errors thrown, so a file not readable for want of permission stays "there"). `linkedStat` is removed, so the rule no longer looks through a link and M2 goes with it. `packages/library/src/reconnect.ts:522` (checkOnce, through the `opts.stat` seam again, M6), `:677` (stillWrong), `:1007` (Search a folder). | `linked-file.test.ts`: "a symbolic link to a file that IS there is missing too", and "the rule never looks through a link" (asserts that `stat` is never asked). Both failed first. The test for a link with a permission error on its target is gone, because the rule no longer asks that. `reconnect.test.ts`: the kind "a link to a file that is there" was added to the missing kinds, listed and relinked, with the old link left in place. The old "present" test was replaced by "R510 (M6): … through the check's own stat seam". All three failed first. `runner.linked-missing.test.ts`: the same kind added to the missing kinds (rests `linked-file-missing`, nothing asked or fetched). The "a link to a file … is in your library" test was replaced. A new FR-728 test, "an entry resting on Not this file whose only original is now a symbolic link to a file that is there stays as it is". All three failed first. |
+| 3. M1, the reader | f7ef13c, e59ea20 | `packages/library/src/asset-content.ts:120-154`: `openStored` gains `linked`, passed only by `openAssetContent` for a linked original. For such an original, ELOOP from O_NOFOLLOW (a symbolic link) and a folder at the path are refused with the existing not-found error. The route then gives its existing 404 "The file of this source is not where it was recorded.", and the reader gives its existing "File not found" with "The file of this source is not where it was recorded, so it cannot be shown." A FIFO or socket stays unsafe. A stored file is unchanged: a link stays a PathEscapeError and a folder stays unsafe. The service's `missing` flag now covers these kinds through the corrected `missingAt`. | `asset-content.test.ts`: a new describe with 4 kinds (a link to a file that is there, a dangling link, a folder, a link to a folder). All 4 failed first. Two contrasts pass before and after: a FIFO at a linked path is unsafe, and a folder at a stored path is unsafe. `documents-route.test.ts`: **an existing test was changed because it asserted the old answer.** In "a symbolic link swapped in for the stored file or the linked file is never followed", the linked case now expects 404 NOT_FOUND with MISSING instead of 400 UNSAFE, and still never the secret bytes. New test "R510 (FR-727): … answers 404 as a file not there". Both failed first. The screen's mapping was not involved: a 404 already maps to "File not found" (`routes/reader.test.tsx` and `Reader.test.tsx` were run, not changed). The e2e step was added to `e2e/reader.spec.ts` "a missing linked file says so": a link to a copy that is there, and a link that leads nowhere, each give "File not found". It failed first with the old `asset-content.ts` (checked by restoring the old file temporarily, then putting the new one back). |
+| 4. M4 | 1e7f08f | `packages/shared/src/api/sources.ts:55-58` and `apps/library-service/src/routes/sources.ts:94-96`: the comments now say the flag covers nothing at the path, any symbolic link, and a folder, and that a permission error counts as there. | comments only |
+| 5. M5 | 8c34232 | `packages/library/src/find/runner.test.ts` "R345 b: not offered for an entry with a file…": one entry has a file at the opening (the pass moves it, marking the pass's end). The entry under test gets its file AFTER that; it still rests, and `v.get(withFile.id)!.link` must be undefined (`!` again, not `?.`). | Mutation: removing `!facts.hasFile` at `runner.ts:526` makes it fail ("expected true to be undefined"). Restored from a copy, and `git diff` was empty afterwards. |
+
+**Sentences shown in a new case (none is new):**
+- The reader now shows "File not found" and "The file of this source is not where it was recorded, so it cannot be shown." for a symbolic link or a folder at a linked original's path. Before, it showed "Not a PDF".
+- The service sends "The file of this source is not where it was recorded." with 404 in those cases.
+- Find and acquire's "Its linked file cannot be found at the moment; the drive it is on may not be connected." is now shown for a link to a file that is there too. That wording is FR-745, which is not built.
+- The Missing files list now lists these paths.
+
+**NEEDS A RULING:** none.
+
+**Runs (fix round, `nice -n 10`, single files):**
+- library: linked-file 9/9, reconnect 54/54, runner.linked-missing 62/62, runner 300/300, review-held.linked 6/6, integrity-confirm 5/5, integrity-confirm-batches 6/6, lock-mid-read 44/44 (passes fully now that the citation styles are there), asset-content 15/15, asset-content-open 3/3
+- service: find-routes 46/46, documents-route 25/25, records 9/9
+- ui: FindAcquire 218/218, Reader 59/59, routes/reader 13/13
+- typechecks of `@ao/shared`, `@ao/library`, `@ao/library-service`, `@ao/ui`: clean
+- `lint:css` clean; `lint:colours` ok
+- `@ao/ui build` done
+- e2e (Chromium): `reader.spec.ts -g "missing linked file"` 1 passed; `find-copies.spec.ts` 8 passed
+- `git status --short`: empty
