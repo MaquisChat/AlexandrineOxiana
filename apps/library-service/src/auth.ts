@@ -99,7 +99,7 @@ function usablePairings(list: unknown[]): PairedExtension[] {
 export const PAIRING_SAVE_LIMIT_MS = 30_000;
 
 /** FR-718: the extension's answer when the save did not end within the limit. */
-export const PAIRING_NOT_SAVED_IN_TIME = "This app could not save the pairing in time, so the browser is not paired. Show a new code in the desktop app and pair again.";
+export const PAIRING_NOT_SAVED_IN_TIME = "The desktop app could not save the pairing in time, so the browser is not paired. Show a new code in the desktop app and pair again.";
 
 export interface PairingOptions {
   /** How long a pairing's save may take (default PAIRING_SAVE_LIMIT_MS, FR-718). */

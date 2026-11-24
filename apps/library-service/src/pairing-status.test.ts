@@ -306,7 +306,7 @@ describe("FR-718: the pairing's save has a time limit, and a save that lands aft
     const r = await pending;
     expect([r.statusCode, r.json()]).toEqual([
       503,
-      { error: { code: "UNAVAILABLE", message: "This app could not save the pairing in time, so the browser is not paired. Show a new code in the desktop app and pair again." } },
+      { error: { code: "UNAVAILABLE", message: "The desktop app could not save the pairing in time, so the browser is not paired. Show a new code in the desktop app and pair again." } },
     ]);
     expect(r.body).not.toContain(c.code);
     expect((await status(c.codeId)).json).toMatchObject({ state: "invalidated", reason: "not-saved" });
