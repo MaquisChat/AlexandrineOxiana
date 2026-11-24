@@ -410,9 +410,20 @@ export class Pairing {
     return run;
   }
 
-  /** Resolves once every port recording and every taking back under way has ended (shutdown and tests). */
-  async idle(): Promise<void> {
-    await Promise.allSettled([...this.recording.values(), ...this.takingBack]);
+  /**
+   * Resolves once every port recording and every taking back under way has ended (shutdown and tests). With
+   * `takeBackWaitMs`, the takings back are waited for no longer than that (the service's stop, R508 M2): a pairing given up
+   * stays unusable in memory whether or not its taking back has landed.
+   */
+  async idle(takeBackWaitMs?: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const back = Promise.allSettled([...this.takingBack]);
+    const bounded = takeBackWaitMs === undefined ? back : Promise.race([back, new Promise<void>((r) => (timer = setTimeout(r, takeBackWaitMs)))]);
+    try {
+      await Promise.allSettled([...this.recording.values(), bounded]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

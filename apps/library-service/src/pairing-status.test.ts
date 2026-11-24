@@ -356,6 +356,35 @@ describe("FR-718: the pairing's save has a time limit, and a save that lands aft
   });
 });
 
+describe("FR-718 (R508 M2): the service's orderly stop waits for a pairing's taking back no longer than for a request in flight", () => {
+  it("a save that never lands does not hold the stop for ever; the pairing stays unusable", async () => {
+    await svc.close();
+    await start({ pairing: { confirmPerMinute: 100, now: () => now, saveLimitMs: 50 }, inFlightWaitMs: 200 });
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    write.release = release;
+    onTestFinished(() => release());
+    let entered!: () => void;
+    const started = new Promise<void>((r) => (entered = r));
+    write.before = async () => {
+      write.before = undefined;
+      entered();
+      await held; // never released before the stop
+    };
+    const c = await issue();
+    const pending = confirm(c.code);
+    await started;
+    expect((await pending).statusCode).toBe(503);
+    // A guard so that a stop that never ends fails the test rather than hanging it (far past the 200 ms bound).
+    let guard: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([svc.close().then(() => "closed"), new Promise<string>((r) => (guard = setTimeout(() => r("still closing"), 10_000)))]);
+    clearTimeout(guard);
+    expect(outcome).toBe("closed");
+    expect(svc.pairing.isPairedOrigin(EXT)).toBe(false);
+    expect(svc.pairing.list()).toEqual([]);
+  });
+});
+
 describe("who may read a code's status (R96)", () => {
   async function pairedToken(): Promise<string> {
     const c = await issue();
