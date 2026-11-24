@@ -168,14 +168,6 @@ export interface MoveOptions extends Omit<PlanOptions, "now"> {
   index?: IndexHandle;
   /** An already-open repo on the destination library (rare); otherwise the move opens the destination itself. */
   destRepo?: Repo;
-  /**
-   * Called once the move's plan is accepted (its destination, residency rules and projects checked),
-   * before anything is written or copied: the caller stops work that still writes in the library here
-   * (R486 b). With it, the check for interrupted changes runs after it, once that work has stopped,
-   * so a change still being written by that work is never taken for an interrupted one. Throwing
-   * aborts the move, nothing copied.
-   */
-  onPlanAccepted?: () => Promise<void>;
 }
 
 export interface MoveResult {
@@ -323,11 +315,11 @@ async function markerFiles(root: string): Promise<number> {
 }
 
 /** Shared refusals of planMove and executeMove. Returns the journal of an interrupted move, if any. */
-async function preflight(lib: Library, destRoot: string, repo?: Repo, checkPending = true): Promise<Journal | null> {
+async function preflight(lib: Library, destRoot: string, repo?: Repo): Promise<Journal | null> {
   if (lib.mode !== "read-write") {
     throw new MoveNotAllowedError("read-only", `The library is open read-only${lib.readOnlyReason ? ` (${lib.readOnlyReason})` : ""}; it cannot be moved`);
   }
-  const pending = checkPending && ((await markerFiles(lib.root)) > 0 || (repo !== undefined && recoveryPendingProjects(repo).length > 0));
+  const pending = (await markerFiles(lib.root)) > 0 || (repo !== undefined && recoveryPendingProjects(repo).length > 0);
   if (pending) {
     throw new MoveNotAllowedError("pending-writes", "Some changes were interrupted and are not resolved yet; finish or resolve pending writes first (reopen the library)");
   }
@@ -468,12 +460,7 @@ export function candidates(destinations: Location[]): Array<{ loc: Location; gue
  * MoveVerificationError for symbolic links in the library.
  */
 export async function planMove(lib: Library, destRoot: string, env: LocationEnv, opts: PlanOptions = {}): Promise<MovePlan> {
-  return planFor(lib, destRoot, env, opts, true);
-}
-
-/** planMove; `checkPending` false leaves the check for interrupted changes to the caller (executeMove's `onPlanAccepted`). */
-async function planFor(lib: Library, destRoot: string, env: LocationEnv, opts: PlanOptions, checkPending: boolean): Promise<MovePlan> {
-  await preflight(lib, destRoot, opts.sourceRepo, checkPending);
+  await preflight(lib, destRoot, opts.sourceRepo);
   const { destination, destinations } = await locate(destRoot, env);
   const now = (opts.now ?? new Date()).toISOString();
   const { projects, movedAway } = await readProjects(lib.root);
@@ -531,13 +518,12 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   if (prior?.phase === "switching") {
     const rec = await getPendingOldCopy(deps, prior.switch!.pendingId);
     if (prior.libraryId === lib.id || rec?.oldRoot === resolve(lib.root)) {
-      await opts.onPlanAccepted?.(); // the move goes ahead: it finishes a switch already decided
       return completeMove(dest, deps, env, { source: lib, tz: opts.tz, actor: opts.actor, destRepo: opts.destRepo });
     }
   }
 
   const exclude = [...new Set(opts.excludeProjectIds ?? [])].sort();
-  const plan = await planFor(lib, dest, env, { sourceRepo: opts.sourceRepo, now: deps.clock(), tz: opts.tz, actor: opts.actor }, opts.onPlanAccepted === undefined);
+  const plan = await planMove(lib, dest, env, { sourceRepo: opts.sourceRepo, now: deps.clock(), tz: opts.tz, actor: opts.actor });
   await progress({ phase: "plan", filesDone: 0, fileCount: plan.fileCount, bytesDone: 0, totalBytes: plan.totalBytes });
   const known = new Set(plan.perProject.map((p) => p.projectId));
   const unknown = exclude.filter((id) => !known.has(id));
@@ -565,8 +551,6 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
       `Some projects may not be moved there (exclude them or choose another destination): ${why}${unrecorded ? " (this refusal could not be recorded in the audit log)" : ""}`,
     );
   }
-  // The plan is accepted: the caller stops what still writes in the library, then everything is checked again.
-  await opts.onPlanAccepted?.();
   const excludedFolders = plan.perProject.filter((p) => exclude.includes(p.projectId)).map((p) => p.folder);
   const { movedAway } = await readProjects(lib.root);
   const journal = await preflight(lib, dest, opts.sourceRepo);
