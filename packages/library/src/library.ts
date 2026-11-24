@@ -461,11 +461,12 @@ function makeHandle(
     appConfigDir: deps.appConfigDir,
     deviceId: deps.deviceId,
     close(opts) {
+      // R551 M2: a change that closes its own library would wait for itself for ever: refused, and the library stays
+      // open (the change's own turn then ends as it would have). Checked first (R555 1): also while another close
+      // already waits for that change, whose promise it must not be handed.
+      if (ctl.drains.some((d) => d.holdsTurn())) return Promise.reject(new CloseInsideChangeError());
       // R551 M1: a second call (while the first still waits for a change in its turn) is the first call.
       if (ctl.closing) return ctl.closing;
-      // R551 M2: a change that closes its own library would wait for itself for ever: refused, and the library stays
-      // open (the change's own turn then ends as it would have).
-      if (ctl.drains.some((d) => d.holdsTurn())) return Promise.reject(new CloseInsideChangeError());
       // From here every further write through this handle is refused (`isClosed`, R546 1); a change already in its
       // store turn finishes and is recorded first, and only then is the lock released (R247 c, d).
       ctl.closed = true;
