@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
+import { executeMove } from "../move.js";
 import { checkIntegrity } from "../reconnect.js";
 import type { Repo } from "./index.js";
 import { NotFoundError, ReadOnlyLibraryError } from "./errors.js";
@@ -24,7 +25,8 @@ encryption:
 `;
 const NOW = "2026-11-11T10:00:00.000Z";
 const STORE = { action: "store" as const, store: { identifiable: false, hasLocation: false } };
-const FILE = ".tmp/recovery-warnings.json";
+/** R527: at the library's root, beside library.json and the library's audit log, which a move carries (never in .tmp). */
+const FILE = "recovery-warnings.json";
 
 let tmp: string;
 let lib: Library;
@@ -124,6 +126,36 @@ describe("FR-729: a change undone when the library opened is said until dismisse
     // Shown by its project's id, as every warning is (a locked project's name is shown as the library lists it).
     expect(kept().map((w) => w.projectId)).toEqual([pid]);
     expect((await readdir(join(lib.root, ".tmp"))).filter((n) => n.includes(".tmp-"))).toEqual([]);
+  });
+});
+
+describe("R527: the record travels with the library", () => {
+  const MOVABLE_GOV = `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: optional
+residency:
+  allowed: [device, removable, cloud_folder]
+`;
+  it("kept across a move of the library: the moved library shows the same warning, with its id, and dismisses it", async () => {
+    const { project: p } = await repo.createProject({ name: "P", governanceYaml: MOVABLE_GOV, encryption: { enabled: false } });
+    await crashed(p.id, p.folder);
+    await reopen();
+    const before = kept();
+    expect(before).toEqual([{ kind: "rolled-back-incomplete-write", projectId: p.id, keptId: expect.any(String) }]);
+    // Not in the work folder, which a move leaves behind.
+    expect(await readdir(join(lib.root, ".tmp"))).not.toContain("recovery-warnings.json");
+    const dest = join(tmp, "Moved", "Lib");
+    const env = { homeDir: join(tmp, "home"), platform: "linux" as const, mounts: [{ path: "/", removable: false, network: false }] };
+    const res = await executeMove(lib, dest, { deps: mkDeps(), env });
+    expect(res.verified).toBe(true);
+    await lib.close();
+    lib = await openLibrary(dest, mkDeps());
+    repo = await repoFor();
+    expect(kept()).toEqual(before);
+    await repo.dismissRecoveryWarning(before[0]!.keptId!);
+    await reopen();
+    expect(kept()).toEqual([]);
   });
 });
 

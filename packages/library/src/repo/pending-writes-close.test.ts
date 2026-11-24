@@ -86,7 +86,8 @@ async function snapshot(): Promise<Map<string, string>> {
   const walk = async (rel: string): Promise<void> => {
     for (const e of await readdir(join(lib.root, rel), { withFileTypes: true })) {
       const r = rel ? `${rel}/${e.name}` : e.name;
-      if (r === ".tmp" || r === ".lock" || r.startsWith(".cache") || r.endsWith("/audit") || r === "audit") continue;
+      // The kept warnings' record (R527: at the library's root) is written by closing: it says what was closed.
+      if (r === ".tmp" || r === ".lock" || r.startsWith(".cache") || r.endsWith("/audit") || r === "audit" || r === "recovery-warnings.json") continue;
       if (e.isDirectory()) await walk(r);
       else out.set(r, await readFile(join(lib.root, r), "utf8").catch(() => "?"));
     }

@@ -1,20 +1,23 @@
 /**
  * FR-729 (R503 e): the warnings recovery raises about what it did to an interrupted change are kept WITH THE LIBRARY
  * until the researcher dismisses them: a change undone completely when the library opened, and a change closed as it
- * was (R509). They are the app's own bookkeeping, beside the transaction markers in `.tmp/` and written as the markers
- * are (atomically, whole), not a governed change of a project: the recovery they report is already audited.
+ * was (R509). They are the library's own bookkeeping, written as the transaction markers are (atomically, whole), not a
+ * governed change of a project: the recovery they report is already audited.
  *
- * - `.tmp/recovery-warnings.json`: `{ "formatVersion": 1, "warnings": [{ id, kind, projectId, at }] }`. Nothing of a
+ * - `<Library>/recovery-warnings.json` (R527: at the library's root, beside `library.json` and the library's own audit
+ *   log, which a move of the library copies, whole or split, and a copy or backup of the library folder carries; never in
+ *   `.tmp/`, the work folder a move leaves behind):
+ *   `{ "formatVersion": 1, "warnings": [{ id, kind, projectId, at, rollback? }] }`. Nothing of a
  *   project is in it but its id (not a secret): no name, no title, no path, so a locked project's warning hides nothing
  *   its lock hides (its name is shown, as for every warning, from the project as the library lists it).
  * - Shown again at every opening until dismissed; dismissed, gone for good. A library open read-only shows them and
  *   writes nothing (no dismissal there).
  * - A file that cannot be read or does not hold a list never stops the library from opening: in a writable library it is
- *   set aside under a name that cannot collide (`recovery-warnings.damaged-<time>-<random>.json`, kept in `.tmp/`) and
- *   one warning says so; read-only, it is left as it is and the same warning is raised.
- * - An older build ignores the file: its sweep of `.tmp/` removes only its own work folders, trash and orphan backups,
- *   by name. The integrity check reads only the files the library records, so it never reports this one.
- * - Moving the library leaves them behind: a move copies no part of `.tmp/` (the old place keeps them).
+ *   set aside under a name that cannot collide (`recovery-warnings.damaged-<time>-<random>.json`, moved into `.tmp/`, the
+ *   library's work folder) and one warning says so; read-only, it is left as it is and the same warning is raised.
+ * - An older build ignores the file: nothing of it reads the library's root but `library.json`, the library's audit log
+ *   and the folders it knows; its integrity check, like this one, reads only the files the library records (read at
+ *   `main`), so neither ever reports this one.
  */
 import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
@@ -47,7 +50,7 @@ export interface KeptWarning {
   rollback?: "unconfirmed";
 }
 
-const pathOf = (root: string) => join(root, ".tmp", KEPT_WARNINGS_FILE);
+const pathOf = (root: string) => join(root, KEPT_WARNINGS_FILE);
 
 /** The kept warnings; "damaged" when the file is there but cannot be read as a list of them. */
 export async function readKeptWarnings(root: string): Promise<KeptWarning[] | "damaged"> {
@@ -74,7 +77,6 @@ export async function readKeptWarnings(root: string): Promise<KeptWarning[] | "d
 }
 
 async function writeKeptWarnings(root: string, list: KeptWarning[]): Promise<void> {
-  await fsp.mkdir(join(root, ".tmp"), { recursive: true });
   await writeSmallFileAtomic(pathOf(root), JSON.stringify({ formatVersion: 1, warnings: list }), { mode: 0o600 });
 }
 
@@ -94,6 +96,7 @@ export async function keepRecoveryWarnings(core: RepoCore, writable: boolean, ra
     if (writable) {
       const stamp = core.clock().toISOString().replace(/[:.]/g, "-");
       try {
+        await fsp.mkdir(join(core.root, ".tmp"), { recursive: true });
         await renameWithRetry(pathOf(core.root), join(core.root, ".tmp", `recovery-warnings.damaged-${stamp}-${randomBytes(4).toString("hex")}.json`));
         detail += "; it was set aside in the library's work folder and a new record was started";
       } catch {
