@@ -3047,6 +3047,33 @@ describe("FR-736: an interrupted change whose undo is not complete, as the servi
     const write = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } });
     expect([write.status, write.json.error.message]).toEqual([409, "This project takes no changes until a problem found when the library was opened is resolved. The warning at the top of the library says what to do."]);
   });
+
+  it("R509: the list offers to close it, with what is lost; closing is for the app's own token, names its project, and unblocks the project", async () => {
+    const { pid, txn, rel } = await lostOriginal();
+    const [listed] = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;
+    expect(listed).toMatchObject({ txn, canClose: true, lost: [{ path: rel, now: "nothing" }] });
+    // The browser extension's token never reaches it.
+    const p = await call({ method: "POST", url: "/extension/pair" });
+    const EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+    const c = await svc.app.inject({ method: "POST", url: "/extension/pair/confirm", headers: { origin: EXT, "content-type": "application/json" }, payload: JSON.stringify({ code: p.json.code }) });
+    const ext = await svc.app.inject({
+      method: "POST",
+      url: `/libraries/pending-writes/${txn}/close`,
+      headers: { authorization: `Bearer ${c.json().token as string}`, origin: EXT, "content-type": "application/json" },
+      payload: JSON.stringify({ projectId: pid }),
+    });
+    expect(ext.statusCode).toBe(403);
+    // Named with another project, or with none: refused, nothing changed.
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${txn}/close`, body: { projectId: "019a7000-0000-7000-8000-0000000000ee" } })).status).toBe(404);
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${txn}/close`, body: {} })).status).toBe(400);
+    expect((await call({ url: "/libraries/pending-writes" })).json.pendingWrites).toHaveLength(1);
+    const closed = await call({ method: "POST", url: `/libraries/pending-writes/${txn}/close`, body: { projectId: pid } });
+    expect([closed.status, closed.json]).toEqual([200, { txn, projectId: pid }]);
+    expect((await call({ url: "/libraries/pending-writes" })).json.pendingWrites).toEqual([]);
+    const integrity = (await call({ url: "/libraries/integrity" })).json.integrityWarnings as Array<Record<string, unknown>>;
+    expect(integrity.filter((w) => w.projectId === pid).map((w) => w.kind)).toEqual(["interrupted-change-closed"]);
+    expect((await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } })).status).toBe(200);
+  });
 });
 
 describe("Task 46b D2 (R137): a library row's needsReview means an item waits in the import review queue", () => {

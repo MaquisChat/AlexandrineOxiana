@@ -94,7 +94,7 @@ import { loadPseudonyms, participantCodeOf } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "./errors.js";
-import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
+import { closePendingWrite, completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { inspectMarkers, isOrphanBackup, markerPaths, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import {
   adoptRestoredProject as adoptRestoredIn,
@@ -412,6 +412,14 @@ export class Repo {
    */
   resolvePendingWrite(txn: string, choice: PendingWriteChoice): Promise<{ txn: string; choice: PendingWriteChoice; projectId: string }> {
     return resolvePendingWrite(this.core, txn, choice);
+  }
+  /**
+   * R509 (FR-736): closes, as it is, an interrupted change of `projectId` whose undo can never complete (the kept copy
+   * of a file it removed is gone): decided by the project's rules, audited as `txn.resolve` (choice `close`), nothing
+   * deleted; the project takes changes again. Writable libraries only.
+   */
+  closePendingWrite(txn: string, projectId: string): Promise<{ txn: string; projectId: string }> {
+    return closePendingWrite(this.core, txn, projectId);
   }
   listWorkspaceTags(): Promise<Tag[]> {
     return workspaceTags(this.core);

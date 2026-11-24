@@ -69,11 +69,51 @@ function causeSentence(kind: string, path: string): ReactNode {
     .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={i}>{path}</UserText>, part]));
 }
 
+/** R509: the act beside "Roll it back" for a change whose undo can never complete, and its confirmation. */
+const CLOSE_BUTTON = "Close this change as it is";
+const CLOSE_HINT = "You can close this change as it is.";
+const NOW_THERE: Record<NonNullable<PendingWrite["lost"]>[number]["now"], string> = {
+  nothing: "Nothing is at that place now.",
+  "a file": "A file is at that place now; it stays as it is.",
+  "something else": "Something else is at that place now; it stays as it is.",
+};
+const CLOSE_ENDS = "Closing deletes nothing. The project takes changes again, and a warning about what was lost stays until you dismiss it.";
+const CLOSED = "The change was closed as it is. Nothing was deleted, and the project takes changes again.";
+
+/** The close confirmation's question: what cannot be put back (path and source as text), what is there now, and that nothing is deleted. */
+function closeQuestion(pw: PendingWrite): ReactNode {
+  return (
+    <>
+      Close this change as it is?
+      {(pw.lost ?? []).map((l) => (
+        <span key={l.path}>
+          {" "}
+          What it removed from <UserText>{l.path}</UserText> cannot be put back.
+          {l.source !== undefined && (
+            <>
+              {" "}
+              It belonged to the source <UserText>{l.source}</UserText>.
+            </>
+          )}{" "}
+          {NOW_THERE[l.now] ?? ""}
+        </span>
+      ))}{" "}
+      {CLOSE_ENDS}
+    </>
+  );
+}
+
 const unsure = (pw: PendingWrite) => pw.status === "unverifiable" || pw.status === "invalid";
 const allowed = (pw: PendingWrite, c: PendingWriteChoice) => (c === "keep" ? pw.canKeep : pw.canRollBack);
 
-function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean; onChoose: (choice: PendingWriteChoice) => Promise<void> }) {
+function Item({ pw, readOnly, onChoose, onCloseAsIs }: { pw: PendingWrite; readOnly: boolean; onChoose: (choice: PendingWriteChoice) => Promise<void>; onCloseAsIs: () => Promise<void> }) {
   const [confirm, setConfirm] = useState<PendingWriteChoice | null>(null);
+  /** R509: the close confirmation is open; `busy` while its request runs. */
+  const [closing, setClosing] = useState(false);
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const closeQuestionRef = useRef<HTMLSpanElement>(null);
+  /** Set when the close confirmation is taken back (Escape, Cancel): the focus goes back to the button that opened it. */
+  const backToClose = useRef(false);
   const [acknowledged, setAcknowledged] = useState(false);
   const [busy, setBusy] = useState(false);
   const yes = useRef<HTMLButtonElement>(null);
@@ -85,6 +125,22 @@ function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean;
   useEffect(() => {
     if (confirm) question.current?.focus();
   }, [confirm]);
+  // R509: the close question takes the focus when it opens (never "Yes"); taken back, the button that opened it has it.
+  useEffect(() => {
+    if (closing) closeQuestionRef.current?.focus();
+    else if (backToClose.current) {
+      backToClose.current = false;
+      closeButton.current?.focus();
+    }
+  }, [closing]);
+  // A reloaded list that no longer offers the close drops its question.
+  useEffect(() => {
+    if (closing && !pw.canClose) setClosing(false);
+  }, [pw, closing]);
+  const cancelClose = () => {
+    backToClose.current = true;
+    setClosing(false);
+  };
   // A reloaded list may no longer allow the choice being confirmed: drop the confirmation.
   useEffect(() => {
     if (confirm && !allowed(pw, confirm)) setConfirm(null);
@@ -93,7 +149,7 @@ function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean;
     setAcknowledged(false);
     setConfirm(c);
   };
-  const resolvable = pw.canKeep || pw.canRollBack;
+  const resolvable = pw.canKeep || pw.canRollBack || pw.canClose === true;
   return (
     <li>
       <div role="group" aria-label={`Interrupted change in ${pw.project}`} className="ao-pending">
@@ -114,12 +170,18 @@ function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean;
           const said = causeSentence(c.kind, c.path);
           return said ? <p key={`${c.kind}:${c.path}`}>{said}</p> : null;
         })}
+        {pw.canClose === true && <p>{CLOSE_HINT}</p>}
         {!resolvable && <p>The way forward is to restore the project from a backup made before this change.</p>}
-        {resolvable && !confirm && (
+        {resolvable && !confirm && !closing && (
           <div className="ao-row">
             {pw.canRollBack && (
               <button type="button" disabled={readOnly || busy} onClick={() => open("roll-back")}>
                 Roll it back
+              </button>
+            )}
+            {pw.canClose === true && (
+              <button ref={closeButton} type="button" disabled={readOnly || busy} onClick={() => setClosing(true)}>
+                {CLOSE_BUTTON}
               </button>
             )}
             {pw.canKeep && (
@@ -127,6 +189,39 @@ function Item({ pw, readOnly, onChoose }: { pw: PendingWrite; readOnly: boolean;
                 Keep it
               </button>
             )}
+          </div>
+        )}
+        {closing && (
+          <div
+            className="ao-inline-form"
+            onKeyDown={(e) => {
+              // Escape takes back this question only, not the whole list (R509).
+              if (e.key === "Escape" && !busy) {
+                e.stopPropagation();
+                cancelClose();
+              }
+            }}
+          >
+            <span ref={closeQuestionRef} tabIndex={-1}>
+              {closeQuestion(pw)}
+            </span>
+            <button
+              type="button"
+              disabled={busy || readOnly}
+              onClick={() => {
+                setBusy(true);
+                void onCloseAsIs().finally(() => {
+                  setBusy(false);
+                  setClosing(false);
+                });
+              }}
+            >
+              Yes, close it as it is
+            </button>
+            <button type="button" disabled={busy} onClick={cancelClose}>
+              Cancel
+            </button>
+            {busy && <span aria-live="polite">Closing the change…</span>}
           </div>
         )}
         {confirm && (
@@ -184,6 +279,8 @@ function refusalText(err: unknown, relisted = true): string {
 export function PendingWritesDialog({ api, readOnly, onClose, onResolved, changed }: PendingWritesDialogProps) {
   const [list, setList] = useState<PendingWrite[] | null>(null);
   const [error, setError] = useState<string | undefined>();
+  /** R509: said once a change was closed as it is. */
+  const [done, setDone] = useState<string | undefined>();
   const box = useRef<HTMLDivElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   const alert = useRef<HTMLParagraphElement>(null);
@@ -234,6 +331,7 @@ export function PendingWritesDialog({ api, readOnly, onClose, onResolved, change
 
   const choose = async (pw: PendingWrite, choice: PendingWriteChoice) => {
     setError(undefined);
+    setDone(undefined);
     try {
       await api.pendingWrites.resolve(pw.txn, choice);
       onResolved?.();
@@ -244,6 +342,32 @@ export function PendingWritesDialog({ api, readOnly, onClose, onResolved, change
       setError(refusalText(err));
       // What the service allows may have changed: offer only that (41b2 I2). If it cannot be read
       // again, the old list's choices are taken away rather than left on offer (FR-153).
+      void api.pendingWrites.list().then(
+        (l) => live.current && setList(l),
+        () => {
+          if (!live.current) return;
+          setList(null);
+          setError(refusalText(err, false));
+        },
+      );
+      setTimeout(() => alert.current?.focus());
+    }
+  };
+
+  /** R509: closes the change as it is; refused, the reason as an alert and the list read again. */
+  const closeAsIs = async (pw: PendingWrite) => {
+    setError(undefined);
+    setDone(undefined);
+    try {
+      await api.pendingWrites.close(pw.txn, pw.projectId);
+      if (!live.current) return;
+      setDone(CLOSED);
+      onResolved?.();
+      void load();
+      heading.current?.focus();
+    } catch (err) {
+      if (!live.current) return;
+      setError(refusalText(err));
       void api.pendingWrites.list().then(
         (l) => live.current && setList(l),
         () => {
@@ -287,7 +411,8 @@ export function PendingWritesDialog({ api, readOnly, onClose, onResolved, change
           Interrupted changes
         </h2>
         <p>
-          A change was interrupted (for example by a crash) and could not be settled when the library opened. Its project takes no changes until it is resolved. A change is never kept half-written.
+          A change was interrupted (for example by a crash) and could not be settled when the library opened. Its project takes no changes until it is resolved. A change is never kept
+          half-written, unless it can never be undone completely and you close it as it is.
         </p>
         {readOnly && <p className="ao-muted">This library is open read-only here, so these can be looked at but not resolved. Open it with write access to resolve them.</p>}
         {error && (
@@ -295,12 +420,13 @@ export function PendingWritesDialog({ api, readOnly, onClose, onResolved, change
             {error}
           </p>
         )}
+        {done && <p role="status">{done}</p>}
         {list === null && !error && <p aria-live="polite">Looking for interrupted changes…</p>}
         {list && list.length === 0 && <p>Nothing is waiting: every interrupted change is resolved.</p>}
         {list && list.length > 0 && (
           <ul className="ao-plain-list">
             {list.map((pw) => (
-              <Item key={pw.txn} pw={pw} readOnly={readOnly} onChoose={(c) => choose(pw, c)} />
+              <Item key={pw.txn} pw={pw} readOnly={readOnly} onChoose={(c) => choose(pw, c)} onCloseAsIs={() => closeAsIs(pw)} />
             ))}
           </ul>
         )}

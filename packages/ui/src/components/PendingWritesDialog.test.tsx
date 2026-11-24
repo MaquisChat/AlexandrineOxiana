@@ -250,3 +250,99 @@ describe("FR-736: what is in the way of an undo that is not complete", () => {
     expect(alert.textContent).toBe(said);
   });
 });
+
+describe("R509: closing, as it is, a change whose undo can never complete", () => {
+  const F = "Projects/Dissertation/sources/Smith 2020/kept <i>1</i>.txt";
+  const LOST = pw({ rollback: "lost", causes: [{ kind: "kept-copy-gone", path: F }], canClose: true, lost: [{ path: F, now: "a file", source: "Smith <b>2020</b>" }] });
+  const QUESTION = `Close this change as it is? What it removed from ${F} cannot be put back. It belonged to the source Smith <b>2020</b>. A file is at that place now; it stays as it is. Closing deletes nothing. The project takes changes again, and a warning about what was lost stays until you dismiss it.`;
+  function serveClose(answer?: () => Response) {
+    const posted: unknown[] = [];
+    let calls = 0;
+    server.use(
+      http.get(url("/libraries/pending-writes"), () => HttpResponse.json({ pendingWrites: calls++ === 0 ? [LOST] : [] })),
+      http.post(url("/libraries/pending-writes/:txn/close"), async ({ request, params }) => {
+        posted.push({ txn: params.txn, body: await request.json() });
+        return answer ? answer() : HttpResponse.json({ txn: T1, projectId: "p1" });
+      }),
+    );
+    return posted;
+  }
+
+  it("is offered only where the service allows it, after \"Roll it back\" in the Tab order, and said beside what is lost", async () => {
+    serve([[pw({ rollback: "in-the-way", causes: [{ kind: "hand-changed-file", path: F }], canClose: false })]]);
+    const { unmount } = show();
+    await screen.findByRole("button", { name: "Roll it back" });
+    expect(screen.queryByRole("button", { name: "Close this change as it is" })).toBeNull();
+    unmount();
+    serveClose();
+    const user = userEvent.setup();
+    show();
+    const back = await screen.findByRole("button", { name: "Roll it back" });
+    back.focus();
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Close this change as it is" }));
+    expect(screen.getByText("You can close this change as it is.")).toBeTruthy();
+  });
+
+  it("the confirmation takes the focus on its question, says what is lost and that nothing is deleted; Escape and Cancel give the focus back", async () => {
+    const posted = serveClose();
+    const user = userEvent.setup();
+    show();
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    const open = await within(dialog).findByRole("button", { name: "Close this change as it is" });
+    await user.click(open);
+    const question = document.activeElement as HTMLElement;
+    expect(question.textContent).toBe(QUESTION);
+    expect(question.querySelector("b, i")).toBeNull();
+    await user.keyboard("{Escape}");
+    // Escape takes back the question only: the dialog stays, the focus on the button that asked it.
+    expect(screen.getByRole("dialog", { name: "Interrupted changes" })).toBeTruthy();
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Close this change as it is" }));
+    await user.click(within(dialog).getByRole("button", { name: "Close this change as it is" }));
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Close this change as it is" }));
+    expect(posted).toEqual([]);
+  });
+
+  it("confirmed: one request naming the project, busy meanwhile, then the sentence after closing and the list read again", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const posted = serveClose(() => HttpResponse.json({ txn: T1, projectId: "p1" }));
+    server.use(
+      http.post(url("/libraries/pending-writes/:txn/close"), async ({ request, params }) => {
+        posted.push({ txn: params.txn, body: await request.json() });
+        await held;
+        return HttpResponse.json({ txn: T1, projectId: "p1" });
+      }),
+    );
+    const onResolved = vi.fn();
+    const user = userEvent.setup();
+    show({ onResolved });
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    await user.click(await within(dialog).findByRole("button", { name: "Close this change as it is" }));
+    const yes = within(dialog).getByRole("button", { name: "Yes, close it as it is" });
+    await user.click(yes);
+    await user.click(yes);
+    expect(await within(dialog).findByText("Closing the change…")).toBeTruthy();
+    expect((within(dialog).getByRole("button", { name: "Yes, close it as it is" }) as HTMLButtonElement).disabled).toBe(true);
+    release();
+    const said = await within(dialog).findByText("The change was closed as it is. Nothing was deleted, and the project takes changes again.");
+    expect(said.getAttribute("role")).toBe("status");
+    expect(posted).toEqual([{ txn: T1, body: { projectId: "p1" } }]);
+    expect(onResolved).toHaveBeenCalledTimes(1);
+    expect(await within(dialog).findByText(/Nothing is waiting/)).toBeTruthy();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
+  it("refused: the service's reason as an alert, which takes the focus; the list read again", async () => {
+    serveClose(() => HttpResponse.json({ error: { code: "POLICY_DENIED", message: "This project's rules do not allow that." } }, { status: 403 }));
+    const user = userEvent.setup();
+    show();
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    await user.click(await within(dialog).findByRole("button", { name: "Close this change as it is" }));
+    await user.click(within(dialog).getByRole("button", { name: "Yes, close it as it is" }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toMatch(/rules do not allow that/);
+    await waitFor(() => expect(document.activeElement).toBe(alert));
+  });
+});

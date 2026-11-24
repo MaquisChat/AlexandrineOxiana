@@ -174,7 +174,7 @@ describe("StatusBanner", () => {
       "recovery-code-unshown", "recovery-staging-discarded", "recovery-staging-unverifiable",
       "audit-unrecorded", "permissions-not-set", "audit-recorded-late", "refusal-unrecorded",
       "audit-unrecorded-blocked", "attention-unreadable", "audit-waiting",
-      "source-change-unfinished", "source-change-unfinished-read-only",
+      "source-change-unfinished", "source-change-unfinished-read-only", "interrupted-change-closed",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();
@@ -266,6 +266,15 @@ describe("FR-736: an interrupted change whose undo is not complete says the stat
     render(<StatusBanner variant={b!} onResolve={() => undefined} />);
     expect(screen.getByRole("status").textContent).toBe("An interrupted change in P was undone when the library opened, so nothing half-saved was kept.");
     expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("R509: a change closed as it was says what was lost, and where it is recorded, never the file", () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: P, kind: "interrupted-change-closed", detail: "1 file(s) (transaction 7f3a)" }] });
+    render(<StatusBanner variant={b!} onResolve={() => undefined} />);
+    expect(screen.getByRole("status").querySelector("span")!.textContent).toBe(
+      `An interrupted change in ${P} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone: that file is lost. The closing is recorded in the audit log of ${P}.`,
+    );
+    expect(screen.queryByRole("button", { name: /Resolve/ })).toBeNull();
   });
 
   it("a source whose change did not finish offers the list, where what can be done is said", async () => {

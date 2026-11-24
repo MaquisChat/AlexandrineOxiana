@@ -85,6 +85,11 @@ export interface ResolveRecord {
   choice: "keep" | "roll-back";
   status: "committed" | "uncommitted";
   at: string;
+  /**
+   * R509: the researcher chose to close the change as it is (its undo can never complete). Recorded as a roll-back
+   * with this field, which an older build ignores (it reads, and retries, a roll-back), never as a choice of its own.
+   */
+  close?: true;
 }
 
 export interface TxnMarker {
@@ -572,7 +577,14 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
   if (!Array.isArray(x.entries)) return "entries missing";
   if (x.resolve !== undefined) {
     const r = x.resolve as Partial<ResolveRecord> | null;
-    if (!r || typeof r !== "object" || (r.choice !== "keep" && r.choice !== "roll-back") || (r.status !== "committed" && r.status !== "uncommitted") || typeof r.at !== "string") {
+    if (
+      !r ||
+      typeof r !== "object" ||
+      (r.choice !== "keep" && r.choice !== "roll-back") ||
+      (r.status !== "committed" && r.status !== "uncommitted") ||
+      typeof r.at !== "string" ||
+      (r.close !== undefined && (r.close !== true || r.choice !== "roll-back"))
+    ) {
       return "bad resolve record";
     }
   }

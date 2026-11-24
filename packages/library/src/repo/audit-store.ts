@@ -58,6 +58,8 @@ export interface IntegrityWarning {
     | "source-change-unfinished-read-only"
     /** Files destroyed under the retention rule could not be overwritten yet; retried on each open (R94). */
     | "destroy-incomplete"
+    /** R509: the researcher closed an interrupted change whose undo could never complete; what it removed is lost. */
+    | "interrupted-change-closed"
     /** A staged recovery-code key file that is not the committed one was removed, not activated (R148). */
     | "recovery-staging-discarded"
     /** A staged recovery-code key file was left in place, not activated: the audit log does not verify (R148). */

@@ -98,6 +98,9 @@ export interface PendingWrite {
   /** FR-736: its latest undo was not complete: the state, and what is in the way with its library-relative path. */
   rollback?: IncompleteRollback;
   causes?: Array<{ kind: string; path: string }>;
+  /** R509: it can be closed as it is (its undo can never complete); `lost`: what that leaves lost, and what is there now. */
+  canClose?: boolean;
+  lost?: Array<{ path: string; now: "nothing" | "a file" | "something else"; source?: string }>;
 }
 
 export type PendingWriteChoice = "roll-back" | "keep";
@@ -345,6 +348,8 @@ export function libraryApi(client: ApiClient) {
     pendingWrites: {
       list: async () => (await r<{ pendingWrites: PendingWrite[] }>("GET", "/libraries/pending-writes")).pendingWrites,
       resolve: (txn: string, choice: PendingWriteChoice) => r<{ txn: string; choice: PendingWriteChoice; projectId: string }>("POST", `/libraries/pending-writes/${seg(txn)}/resolve`, { body: { choice } }),
+      /** R509: closes, as it is, a change whose undo can never complete; named with its project. */
+      close: (txn: string, projectId: string) => r<{ txn: string; projectId: string }>("POST", `/libraries/pending-writes/${seg(txn)}/close`, { body: { projectId } }),
     },
     libraries: {
       list: () => r<LibraryList>("GET", "/libraries"),

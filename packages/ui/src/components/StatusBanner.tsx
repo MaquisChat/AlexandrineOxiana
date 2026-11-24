@@ -109,6 +109,9 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
     n === 1
       ? `A change to a source in ${p} did not finish and could not be undone. It can be put back only when the library is opened for changes.`
       : `Changes to ${n} sources in ${p} did not finish and could not be undone. They can be put back only when the library is opened for changes.`,
+  // R509: an interrupted change closed as it was, by the researcher's choice; the path is in the audit log only (R503 d).
+  "interrupted-change-closed": (p) =>
+    `An interrupted change in ${p} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone: that file is lost. The closing is recorded in the audit log of ${p}.`,
   "destroy-incomplete": (p) =>
     `A destruction of raw data in ${p} did not finish: some files could not be overwritten yet. They are kept out of the project and overwriting is tried again each time the library opens.`,
   "protocol-manifest-unreadable": (p) => `The sealed list of protocol document names in ${p} could not be read. The documents themselves are unchanged; check the verification report.`,

@@ -3,7 +3,22 @@ import type { Provenance } from "../model/source.js";
 import { effectivePolicy } from "./merge.js";
 import { ACQUIRE_METHODS, ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
 
-export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move" | "backup" | "restore" | "set-aside" | "review-withdrawal";
+/** `close-change` (R509, FR-736): closing, as it is, an interrupted change whose undo can never complete; deletes nothing. */
+export type PolicyAction =
+  | "capture"
+  | "process"
+  | "store"
+  | "sync"
+  | "view"
+  | "export"
+  | "share"
+  | "delete"
+  | "move"
+  | "backup"
+  | "restore"
+  | "set-aside"
+  | "review-withdrawal"
+  | "close-change";
 
 export interface PolicyRequest {
   action: PolicyAction;
@@ -425,6 +440,7 @@ function run(cfg: GovernanceConfig, req: PolicyRequest): PolicyDecision {
     case "delete":
     case "view":
     case "share":
+    case "close-change":
       return allow(warnings);
     default:
       throw new Error(`unknown action "${String((req as { action?: unknown }).action)}"`);
