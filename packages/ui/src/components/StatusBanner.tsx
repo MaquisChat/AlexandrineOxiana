@@ -99,7 +99,9 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   "rolled-back-incomplete-write": (p) => `An interrupted change in ${p} was undone when the library opened, so nothing half-saved was kept.`,
   "invalid-txn-marker": (p) => `A note left by an interrupted change in ${p} could not be read. It was kept aside and nothing was changed.`,
   "incomplete-write-pending": (p) => `An interrupted change in ${p} could not be finished or undone yet. It is tried again when the library is next opened with write access.`,
-  "txn-recovery-skipped-audit-unverifiable": (p) => `An interrupted change in ${p} was left as it is, because its audit log could not be checked first. It is tried again on the next open.`,
+  // R529: refused every time (never "tried again"); no act is offered for it: a backup made before the change is the way.
+  "txn-recovery-skipped-audit-unverifiable": (p) =>
+    `An interrupted change in ${p} was left as it is, because its audit log could not be checked first. The app cannot undo it safely. Restoring a backup made before the change is the way to undo it.`,
   "trimmed-incomplete-audit-line": (p) => `The last entry of an audit log in ${p} was cut off by a crash and has been removed. The removal is recorded.`,
   "incomplete-audit-line-pending": (p) => `The last entry of an audit log in ${p} was cut off by a crash. It is tidied up when the library is next opened with write access.`,
   "audit-append-failed-at-open": (p) => `A check made while opening ${p} could not be recorded in the audit log, so changes to ${p} are off until the library is opened again.`,

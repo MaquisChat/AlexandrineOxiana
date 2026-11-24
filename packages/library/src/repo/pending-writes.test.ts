@@ -218,6 +218,12 @@ describe("pending writes: an unverifiable change is never acted on (R131 a, b)",
   it("P3: chain before the change does not verify (torn audit line): no choice is offered, roll-back is refused and nothing changes", async () => {
     const { repo, pid } = await unverifiableOnReopen("torn-audit");
     expect(repo.integrityWarnings.map((w) => w.kind)).toContain("txn-recovery-skipped-audit-unverifiable");
+    // R529: the command line's detail says what the banner says: never a retry (it is refused every time); a backup is the way.
+    const w = repo.integrityWarnings.find((x) => x.kind === "txn-recovery-skipped-audit-unverifiable")!;
+    expect(w.detail.startsWith(
+      "an interrupted change was not rolled back because the audit log cannot be trusted to show it was uncommitted; the marker is kept, and restoring the project from a backup made before the change is the way to undo it (transaction ",
+    )).toBe(true);
+    expect(w.detail).not.toMatch(/retried|tried again/u);
     const [pw] = await repo.pendingWrites();
     expect(pw).toMatchObject({ projectId: pid, status: "unverifiable", canKeep: false, canRollBack: false });
     expect(pw!.detail).toMatch(/audit/);

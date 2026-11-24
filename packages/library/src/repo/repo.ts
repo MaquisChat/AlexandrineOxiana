@@ -566,7 +566,8 @@ const RECOVERY_WARNINGS: Partial<Record<RecoveryOutcome, { kind: IntegrityWarnin
   invalid: { kind: "invalid-txn-marker", text: "a write-ahead marker is unreadable or points outside its project; it was kept and nothing was changed" },
   "skipped-audit-unverifiable": {
     kind: "txn-recovery-skipped-audit-unverifiable",
-    text: "an interrupted change was not rolled back because the audit log cannot be trusted to show it was uncommitted; the marker is kept",
+    // R529: as the banner says it: never retried with any other outcome; a backup made before the change is the way.
+    text: "an interrupted change was not rolled back because the audit log cannot be trusted to show it was uncommitted; the marker is kept, and restoring the project from a backup made before the change is the way to undo it",
   },
   "resolve-incomplete": {
     kind: "incomplete-write-pending",

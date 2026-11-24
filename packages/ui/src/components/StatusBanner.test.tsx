@@ -268,6 +268,16 @@ describe("FR-736: an interrupted change whose undo is not complete says the stat
     }
   }
 
+  it("R529: a change left as it is because its audit log could not be checked: never \"tried again\"; a backup is the way; only \"Resolve…\" to see it", () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: P, kind: "txn-recovery-skipped-audit-unverifiable", detail: "x" }] });
+    render(<StatusBanner variant={b!} onResolve={() => undefined} onDismissWarning={() => undefined} />);
+    const status = screen.getByRole("status");
+    expect(status.querySelector("span")!.textContent).toBe(
+      `An interrupted change in ${P} was left as it is, because its audit log could not be checked first. The app cannot undo it safely. Restoring a backup made before the change is the way to undo it.`,
+    );
+    expect(screen.getAllByRole("button").map((x) => x.textContent)).toEqual(["Resolve…"]);
+  });
+
   it("a complete undo keeps its sentence, and offers nothing to resolve", () => {
     const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: "P", kind: "rolled-back-incomplete-write", detail: "x" }] });
     render(<StatusBanner variant={b!} onResolve={() => undefined} />);
