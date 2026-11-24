@@ -9,7 +9,8 @@
 //! service does not become ready, a plain error window is shown and the program exits non-zero; no
 //! empty window is ever shown.
 //!
-//! Closing: when the last window closes (or on SIGTERM, SIGINT or SIGHUP), the event loop ends, the
+//! Closing: when the last window closes (or on SIGTERM, SIGINT or SIGHUP, or the Mac's own Quit:
+//! `quit`), the event loop ends, the
 //! service's standard input is closed (it shuts down cleanly and stops the worker), and the shell
 //! waits until both are gone, forcing the stop after SHUTDOWN_GRACE. If the shell is killed outright
 //! (SIGKILL, a crash), the closed pipe stops the service, and the service's closed pipe stops the
@@ -24,6 +25,7 @@ pub mod library_window;
 pub mod paths;
 #[cfg(debug_assertions)]
 pub mod probe;
+pub mod quit;
 pub mod service;
 pub mod token;
 
@@ -440,6 +442,30 @@ pub fn run() {
             eprintln!("{APP_NAME} could not start its window system.");
             std::process::exit(1);
         });
+    // FR-731 (R503 h): on a Mac, the app's own Quit (Cmd-Q, the Dock's Quit, a quit Apple event) asks for
+    // the same exit a termination signal asks for, instead of ending the process at once (`quit`).
+    #[cfg(target_os = "macos")]
+    {
+        let quit_app = app.handle().clone();
+        let quit_shell = shell.clone();
+        let hook = quit::install(move |system| {
+            let answer = quit::on_terminate(system, quit_shell.helpers_stopped.load(Ordering::SeqCst), quit_shell.failed.load(Ordering::SeqCst));
+            if test_mode() {
+                println!("AO_SHELL_QUIT {}", answer.word());
+            }
+            if answer == quit::Terminate::Orderly {
+                quit_app.exit(0);
+            }
+            answer
+        });
+        // M5 (R511): whether the hook was installed, for the launch check's scenario Q (debug builds in test
+        // mode only); without it a Quit ends the app at once, as before.
+        #[cfg(debug_assertions)]
+        if test_mode() {
+            println!("AO_SHELL_QUIT_HOOK {}", if hook { "installed" } else { "not installed" });
+        }
+        let _ = hook;
+    }
     // Closing (the last window closed, or a termination signal): the exit is held back until the
     // helpers are confirmed gone, because ending the event loop releases the single-instance guard
     // (the plugin's cleanup runs on RunEvent::Exit). While the guard is held, a second launch hands

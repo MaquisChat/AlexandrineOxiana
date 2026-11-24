@@ -21,12 +21,17 @@
 //     closing page); closing that window changes nothing: the helpers stop cleanly, the shell exits
 //     0 and no process is left. In A and B, where the helpers normally go within two seconds, whether
 //     the closing window was shown is printed as a note.
+//  Q. a Mac only (FR-731, R503 h): the app asked to quit by a quit Apple event (osascript; the same
+//     terminate: as Cmd-Q and the Dock's Quit) takes the orderly way: the helpers stop cleanly, the
+//     shell exits 0 and no process is left; with a slowed stop, the closing window is shown. Skipped,
+//     with the reason, when the event cannot be sent or answered for a reason outside the app, and then
+//     only when the app, stopped by SIGTERM instead, passes B's checks; a closing line says whether Q ran.
 //
 //   pnpm --filter @ao/desktop run launch-check            (node apps/desktop/scripts/launch-check.mjs)
 //
 // On a Mac (Task 37f; no virtual display: GitHub's Mac runners have a logged-in desktop session):
 //
-//   node apps/desktop/scripts/launch-check.mjs --app <the DEBUG .app>       scenarios A-F
+//   node apps/desktop/scripts/launch-check.mjs --app <the DEBUG .app>       scenarios A-F (E skipped) and Q
 //   node apps/desktop/scripts/launch-check.mjs --release-app <the .app>     scenario R only
 //
 // With --app the shell runs from inside the bundle and finds Node, the service folder and the worker
@@ -83,6 +88,10 @@ export function parseShellLine(line) {
   if (line === "AO_SHELL_CLOSING") return { kind: "closing" };
   if (line === "AO_SHELL_RELAUNCH_REQUESTED") return { kind: "relaunch-requested" };
   if (line === "AO_SHELL_RELAUNCHING") return { kind: "relaunching" };
+  m = /^AO_SHELL_QUIT (orderly|now)$/.exec(line);
+  if (m) return { kind: "quit", how: m[1] };
+  m = /^AO_SHELL_QUIT_HOOK (installed|not installed)$/.exec(line);
+  if (m) return { kind: "quit-hook", installed: m[1] === "installed" };
   m = /^AO_SHELL_LIBRARY (opened|fetching|handed-over|not-a-pdf|failed|closed)$/.exec(line);
   if (m) return { kind: "library", state: m[1] };
   if (line === "AO_SHELL_BROWSER_OPENED") return { kind: "browser-opened" };
@@ -141,6 +150,157 @@ export function closingWindowProblems(events, { expect, closeAt, closedByButton 
     if (ix === -1) p.push("closing it by its close button did not close it");
     else if (is !== -1 && is < ix) p.push("it was closed only once the helpers had gone");
   }
+  return p;
+}
+
+// ---------- scenario Q: quit by Apple event (a Mac only; FR-731, R503 h) ----------
+
+/** The app's bundle identifier (tauri.conf.json `identifier`), refused unless it is safe inside an AppleScript string. */
+export function bundleIdOf(conf) {
+  const id = conf?.identifier;
+  if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(id)) throw new Error(`tauri.conf.json's identifier ${JSON.stringify(id)} is not a bundle identifier`);
+  return id;
+}
+
+/**
+ * osascript's arguments. `running`: whether the app runs, asked of the system (no Apple event is sent and
+ * nothing is launched). `quit`: the quit Apple event, which AppKit answers with the same `terminate:` as
+ * Cmd-Q and the Dock's Quit.
+ */
+export function appleEventScripts(id) {
+  return { running: ["-e", `application id "${id}" is running`], quit: ["-e", `tell application id "${id}" to quit`] };
+}
+
+/** How long osascript may wait for the app's answer to the quit Apple event. */
+export const QUIT_EVENT_LIMIT_MS = 30_000;
+
+const firstLine = (s) => String(s ?? "").trim().split("\n")[0].slice(0, 300);
+
+/** Why scenario Q cannot ask the app to quit (the system does not see it running under its bundle id), or null when it can. */
+export function appRunningSkip(r) {
+  if (r.ok && String(r.out).trim() === "true") return null;
+  if (r.ok) return `the system does not see the app as running under its bundle id (osascript: ${firstLine(r.out) || "no answer"}), so no quit Apple event can be addressed to it`;
+  return `the system could not tell whether the app runs: ${[firstLine(r.out), r.reason].filter(Boolean).join("; ")}`;
+}
+
+/**
+ * What scenario Q does with the quit Apple event (`osascript`: {ok, out, reason, timedOut}). `reached`: the
+ * shell printed its quit line or exited after the event was sent. The app is judged whenever the quit
+ * reached it ({check: true}); a request that could not be made for a reason outside the app — no
+ * permission to send Apple events (macOS's Automation consent), no answer (a consent request may be
+ * waiting on the runner's screen), the app not found by its bundle id, osascript missing — is skipped
+ * with the reason ({skip}); an event delivered that the app did nothing about is a problem ({problem}).
+ */
+export function quitEventVerdict({ reached, osascript }) {
+  if (reached) return { check: true };
+  const out = String(osascript?.out ?? "");
+  const said = [firstLine(out), osascript?.reason].filter(Boolean).join("; ");
+  if (osascript?.timedOut) return { skip: `osascript had no answer within ${QUIT_EVENT_LIMIT_MS / 1000} s (a request for permission to control the app may be waiting on the runner's screen)` };
+  if (/\(-1743\)|not authori[sz]ed|not permitted/i.test(out)) return { skip: `macOS did not permit osascript to send Apple events to the app (Automation): ${said}` };
+  if (/\((-600|-10814|-1728)\)/.test(out)) return { skip: `osascript could not find the running app by its bundle id: ${said}` };
+  if (!osascript?.ok && /^not found/.test(String(osascript?.reason))) return { skip: `osascript could not be run: ${osascript.reason}` };
+  return { problem: `the quit Apple event was sent (osascript: ${osascript?.ok ? "answered" : said}) but the shell neither took the quit nor exited` };
+}
+
+/** The runs of scenario Q on a Mac: [scenario name, slowed stop (ms), label]. */
+const Q_RUN_LIST = [
+  ["q", undefined, "Q (quit by Apple event)"],
+  ["q-slow", "10000", "Q (quit by Apple event during a slowed quit)"],
+];
+const Q_RUNS = Q_RUN_LIST.length;
+
+/** A skip of a run of Q on a Mac, with the prefix every other skip uses (M2, R511). */
+export function quitSkipLine(label, reason) {
+  return `launch-check: skip ${label}: ${reason}\n`;
+}
+
+/**
+ * The one closing line of scenario Q on a Mac (M2, R511; N2, R514; R505 e: whether Q ran is read in one line, and
+ * its prefix is printed by no other line), from each run's outcome: {label, state: "passed" | "failed" |
+ * "skipped", reason}. A failure wins over a skip; a run that threw is a failure with what ended it; a skip of
+ * only some runs says what ran. `reached: false`: the check ended before Q (`error`, its first line, says why; with
+ * `setupFailed`, the check's own set-up failed before any scenario). `threw`: something was thrown (a flag, so
+ * that a thrown falsy value counts; by default `error` being given); `planned`: how many runs Q was to make
+ * (KG-6 m3, m5, R517): a throw that leaves fewer outcomes than planned is a failure, never "ran".
+ */
+export function quitSummaryLine(outcomes, { reached = true, error, threw = error !== undefined, planned = 0, setupFailed = false } = {}) {
+  const prefix = "launch-check: scenario Q result:";
+  const why = threw && error ? firstLine(error) : "";
+  if (!reached) return `${prefix} not reached (${setupFailed ? "the check's set-up failed" : "the check ended before scenario Q"}${why ? `: ${why}` : ""})\n`;
+  // Q began and threw before some run had its outcome.
+  if (threw && outcomes.length < Math.max(planned, 1)) return `${prefix} FAILED (scenario Q did not finish${why ? `: ${why}` : ""})\n`;
+  const failed = outcomes.filter((o) => o.state === "failed");
+  const skipped = outcomes.filter((o) => o.state === "skipped");
+  const ran = outcomes.filter((o) => o.state === "passed");
+  if (failed.length) return `${prefix} FAILED (${failed.map((o) => (o.reason ? `${o.label}: ${o.reason}` : o.label)).join("; ")}): see its FAIL lines above\n`;
+  if (!ran.length) return `${prefix} SKIPPED (${skipped[0]?.reason ?? "no run of Q was made"}): the Mac's own Quit was not checked\n`;
+  if (skipped.length) return `${prefix} SKIPPED in part (${ran.map((o) => `${o.label} ran and was checked`).join("; ")}; ${skipped.map((o) => `${o.label}: ${o.reason}`).join("; ")})\n`;
+  return `${prefix} ran (${ran.length} of ${Math.max(planned, outcomes.length)} runs quit the app by Apple event and were checked)\n`;
+}
+
+/** How long B (and Q, where it stops the app that way) waits for the shell to end after SIGTERM. */
+export const SIGTERM_STOP_LIMIT_MS = 120_000;
+
+/**
+ * What is wrong with a stop by SIGTERM (scenario B, and Q where its quit could not be judged): how the wait
+ * for the shell's exit ended (`exit`: {code, signal}, or {code: "timeout"}) and the helpers' stop line.
+ */
+export function sigtermStopProblems(exit, events) {
+  const p = [];
+  if (exit?.code === "timeout") p.push(`the shell did not end within ${SIGTERM_STOP_LIMIT_MS / 1000} s of SIGTERM`);
+  const stopped = events.find((e) => e.kind === "stopped");
+  if (!stopped) p.push("the helpers were not reported stopped");
+  else if (stopped.how !== "clean") p.push(`the helpers were stopped ${stopped.how}, not cleanly`);
+  return p;
+}
+
+/**
+ * Q once its quit could not be judged (`verdict`, from `quitEventVerdict`) and the app was stopped by SIGTERM
+ * instead, as B stops it (`stopProblems`: what B's checks found; M1, R511): the skip stands only when that
+ * stop passed them. An app that did not end cleanly then fails, because it may hang at the quit (the quit
+ * hook blocking the main thread would look exactly like an event that got no answer). A verdict that judged
+ * the app, or found a problem, is returned as it is.
+ */
+export function skippedQuitVerdict(verdict, stopProblems) {
+  if (!verdict.skip || !stopProblems.length) return verdict;
+  return { problem: `the app neither answered the quit Apple event nor ended cleanly on SIGTERM afterwards: it may hang at the quit (${verdict.skip}; ${stopProblems.join("; ")})` };
+}
+
+/** Whether the shell printed anything after the quit event was sent (its output lines and standard error since then), for a skip's note. */
+export function printedAfterEvent(lines, err) {
+  const n = lines.length;
+  const e = String(err ?? "").length;
+  const errPart = e ? `${e} character${e === 1 ? "" : "s"} on its standard error` : "";
+  if (!n) return e ? `the shell printed nothing on its output after the event was sent, and ${errPart}` : "the shell printed nothing after the event was sent";
+  return `the shell printed ${n} line${n === 1 ? "" : "s"} after the event was sent (the last: ${JSON.stringify(lines[n - 1].slice(0, 200))})${e ? `, and ${errPart}` : ""}`;
+}
+
+/**
+ * Whether Q examines a crash (M6, R511): the shell ended at the quit (`exit`: {code, signal}, not a time-out)
+ * without its quit line, or by a signal. The check's Mac crash diagnosis then runs before the failure is said.
+ */
+export function quitCrashSuspected(exit, events) {
+  if (exit?.code === "timeout") return false;
+  return !!exit?.signal || !events.some((e) => e.kind === "quit");
+}
+
+/** What is wrong with a quit that should have gone the orderly way (the events of the run, the shell's exit code). */
+export function orderlyQuitProblems(events, code) {
+  const p = [];
+  const quit = events.find((e) => e.kind === "quit");
+  // M5 (R511): the shell says in test mode whether its quit hook was installed; a hook that was not is named.
+  const hook = events.find((e) => e.kind === "quit-hook");
+  if (!hook) p.push("the shell did not say whether its quit hook was installed (no AO_SHELL_QUIT_HOOK line)");
+  if (!quit && hook?.installed === false) p.push("the shell's quit hook was not installed (AO_SHELL_QUIT_HOOK not installed): without it the quit cannot go the orderly way");
+  else if (!quit) p.push("the quit did not reach the shell's quit handler (no AO_SHELL_QUIT line): the app ended without its orderly path");
+  else if (quit.how !== "orderly") p.push(`the shell answered the quit "${quit.how}", not the orderly way`);
+  if (!events.some((e) => e.kind === "closing")) p.push("the orderly close never began (no AO_SHELL_CLOSING line)");
+  const stopped = events.filter((e) => e.kind === "stopped");
+  if (!stopped.length) p.push("the helpers were not reported stopped");
+  else if (stopped[0].how !== "clean") p.push(`the helpers were stopped ${stopped[0].how}, not cleanly`);
+  if (stopped.length > 1) p.push(`the helpers were stopped ${stopped.length} times`);
+  if (events.some((e) => e.kind === "relaunching")) p.push("the app started again");
+  if (code !== 0) p.push(`the shell exited ${code}, not 0`);
   return p;
 }
 
@@ -647,6 +807,38 @@ function runCapped(cmd, args, { env = process.env, timeout = 20_000 } = {}) {
   return { ok: true, out };
 }
 
+/**
+ * `runCapped` without blocking: the shell's output keeps being read (and its pipes drained) while the
+ * command runs. Also says whether the time limit ended it (`timedOut`).
+ */
+function runCappedAsync(cmd, args, { timeout = 20_000 } = {}) {
+  return new Promise((done) => {
+    let out = "";
+    let timedOut = false;
+    let child;
+    try {
+      child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    } catch (err) {
+      done({ ok: false, out: "", reason: err.message });
+      return;
+    }
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeout);
+    for (const s of [child.stdout, child.stderr]) s.on("data", (d) => (out = `${out}${d}`.slice(-64 * 1024)));
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      done({ ok: false, out, reason: err.code === "ENOENT" ? `not found (${err.message})` : err.message });
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (timedOut) done({ ok: false, out, reason: `timed out after ${Math.round(timeout / 1000)} s`, timedOut: true });
+      else done(code === 0 ? { ok: true, out } : { ok: false, out, reason: `exit ${code ?? signal}` });
+    });
+  });
+}
+
 /** The context is printed once per run of the check. */
 const MAC_DIAG_STATE = { contextShown: false };
 
@@ -987,6 +1179,24 @@ async function assertGone(label, pids, marker, problems, ms = 30_000) {
   }
 }
 
+/**
+ * Stops the shell with SIGTERM and checks the stop as scenario B does (M1, R511: Q uses the same code where
+ * its quit could not be judged): the shell ends within the limit, the helpers stop cleanly, no helper
+ * process is left. Prints each check; returns what was wrong (also killing anything left).
+ */
+async function stopBySigterm(run, label, shellPid, helpers, dir) {
+  const problems = [];
+  try {
+    process.kill(shellPid, "SIGTERM");
+  } catch {}
+  const exit = await Promise.race([run.exit, sleep(SIGTERM_STOP_LIMIT_MS).then(() => ({ code: "timeout" }))]);
+  const sp = sigtermStopProblems(exit, run.events);
+  report(`${label}: an orderly stop`, sp.length === 0, `${MAC ? "" : "xvfb-run "}exit ${exit.code ?? exit.signal}, stop ${run.find("stopped")?.how ?? "not reported"}${sp.length ? `: ${sp.join("; ")}` : ""}`) || problems.push(...sp.map((x) => `${label}: ${x}`));
+  closingWindowNote(run);
+  await assertGone(label, helpers, dir, problems);
+  return problems;
+}
+
 /** A D-Bus session bus for the run (Linux: the keychain and the web view use it); none on a Mac. */
 function startBus() {
   if (MAC) return { proc: undefined, address: Promise.resolve(undefined) };
@@ -1093,25 +1303,33 @@ async function main() {
   } else if (args.app || args.releaseApp) {
     throw new Error("--app and --release-app are for a Mac.");
   }
-  for (const [what, p] of [[MAC ? "the app's program" : "the built shell (pnpm --filter @ao/desktop run build:linux)", SHELL], ...(PACKAGED ? [] : [["the built service folder", join(SERVICE_DIR, "service.mjs")]])]) {
-    if (!existsSync(p)) throw new Error(`Missing ${what}.`);
-  }
-  // The watched-folder chooser is not called by the probe (it would open a dialog): its grant is
-  // judged from the capability files the shell was built with.
-  const caps = capabilityFileProblems();
-  report("the main window's capability grants exactly the expected commands, the watched-folder chooser included", caps.length === 0, caps.join("; ")) || problems.push(...caps);
-  const root = mkdtempSync(join(tmpdir(), "ao-launch-check-"));
-  if (!(await leftoverSearchWorks(root))) {
-    report("the search for leftover processes can see a process by its environment", false, "it could not; every 'no process is left' check would be blind");
-    problems.push("could not check: leftover processes");
-  }
-  const before = stopAppProcesses();
-  if (before.length) {
-    report("no copy of the app was running before the check", false, before.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; "));
-    problems.push("the app was already running");
-  }
-  const bus = startBus();
+  /** Scenario Q's runs on a Mac (null where Q does not exist), for its closing line; `setup`: the check's own set-up is not over yet (KG-6 m5, R517). */
+  const q = MAC ? { reached: false, outcomes: [], setup: true } : null;
+  // What ended the check, if it threw (a flag too: a thrown falsy value counts).
+  let ended;
+  let didThrow = false;
+  let root;
+  let bus;
   try {
+    for (const [what, p] of [[MAC ? "the app's program" : "the built shell (pnpm --filter @ao/desktop run build:linux)", SHELL], ...(PACKAGED ? [] : [["the built service folder", join(SERVICE_DIR, "service.mjs")]])]) {
+      if (!existsSync(p)) throw new Error(`Missing ${what}.`);
+    }
+    // The watched-folder chooser is not called by the probe (it would open a dialog): its grant is
+    // judged from the capability files the shell was built with.
+    const caps = capabilityFileProblems();
+    report("the main window's capability grants exactly the expected commands, the watched-folder chooser included", caps.length === 0, caps.join("; ")) || problems.push(...caps);
+    root = mkdtempSync(join(tmpdir(), "ao-launch-check-"));
+    if (!(await leftoverSearchWorks(root))) {
+      report("the search for leftover processes can see a process by its environment", false, "it could not; every 'no process is left' check would be blind");
+      problems.push("could not check: leftover processes");
+    }
+    const before = stopAppProcesses();
+    if (before.length) {
+      report("no copy of the app was running before the check", false, before.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; "));
+      problems.push("the app was already running");
+    }
+    bus = startBus();
+    if (q) q.setup = false;
     const address = await bus.address;
     const worker = workerBin(root);
     process.stdout.write(`launch-check: shell ${SHELL}\nlaunch-check: worker: ${worker.kind}\n`);
@@ -1186,16 +1404,14 @@ async function main() {
       const run = startShell(env, label);
       try {
         const { svc, helpers } = await upAndProbed(run, media, problems);
-        process.kill(svc.shell, signal);
-        const { code, signal: sig } = await Promise.race([run.exit, sleep(120_000).then(() => ({ code: "timeout" }))]);
         if (signal === "SIGTERM") {
-          const stopped = run.find("stopped");
-          report(`${label}: an orderly stop`, stopped?.how === "clean", `xvfb-run exit ${code ?? sig}, stop ${stopped?.how ?? "not reported"}`) || problems.push(`${label}: not orderly`);
-          closingWindowNote(run);
+          problems.push(...(await stopBySigterm(run, label, svc.shell, helpers, dir)));
         } else {
+          process.kill(svc.shell, signal);
+          const { code, signal: sig } = await Promise.race([run.exit, sleep(120_000).then(() => ({ code: "timeout" }))]);
           report(`${label}: the shell is gone`, !running(svc.shell), `xvfb-run exit ${code ?? sig}`);
+          await assertGone(label, helpers, dir, problems);
         }
-        await assertGone(label, helpers, dir, problems);
       } finally {
         if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
       }
@@ -1315,11 +1531,118 @@ async function main() {
         if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
       }
     }
+
+    // Q. Quit by Apple event (FR-731, R503 h; a Mac only): the app's own Quit goes the orderly way. The
+    //    quit Apple event is answered by the same terminate: as Cmd-Q and the Dock's Quit; it is sent by
+    //    osascript, without the keyboard. As A: the quit is taken the orderly way, the helpers stop cleanly,
+    //    the shell exits 0, nothing is left; run again with the slowed stop, as F: the closing window is
+    //    shown. A request that cannot be made for a reason outside the app (no permission to send Apple
+    //    events, no answer, the app not found under its bundle id) skips Q's checks of the quit, once the app,
+    //    stopped by SIGTERM instead, passed B's checks (M1, R511); a shell that ends at the quit without its
+    //    quit line, or by a signal, is examined as a crash (M6); one closing line says whether Q ran (M2).
+    if (!MAC) {
+      process.stdout.write("launch-check: skip Q (quit by Apple event): the Mac's own Quit (Cmd-Q, the Dock's Quit, a quit Apple event) exists only on macOS\n");
+    } else {
+      q.reached = true;
+      const scripts = appleEventScripts(bundleIdOf(JSON.parse(readFileSync(TAURI_CONF, "utf8"))));
+      let skipped = null;
+      const qOutcomes = q.outcomes;
+      for (const [name, slow, label] of Q_RUN_LIST) {
+        if (skipped) {
+          process.stdout.write(quitSkipLine(label, "for the reason above"));
+          qOutcomes.push({ label, state: "skipped", reason: "for the reason above" });
+          continue;
+        }
+        const { dir, env } = scenario(name);
+        if (slow) env.AO_SHELL_TEST_SLOW_STOP_MS = slow;
+        const run = startShell(env, label);
+        const exited = () => run.child.exitCode !== null || run.child.signalCode !== null;
+        // This run's outcome for the closing line: skipped (with the reason) or else passed unless a problem was found in it.
+        const problemsBefore = problems.length;
+        let skippedHere = null;
+        let threw = null;
+        let didThrowHere = false;
+        try {
+          const { svc, helpers } = await upAndProbed(run, media, problems);
+          // M1 (R511): the app is then stopped the orderly way the check can use, SIGTERM, and that stop is
+          // checked exactly as B checks it; the skip stands only when it passed (`skippedQuitVerdict`).
+          const skip = async (why) => {
+            const stop = await stopBySigterm(run, `${label}, stopped by SIGTERM instead`, svc.shell, helpers, dir);
+            problems.push(...stop);
+            const v = skippedQuitVerdict({ skip: why }, stop);
+            if (v.problem) {
+              report(`${label}: the app ended after the quit could not be judged`, false, v.problem);
+              return;
+            }
+            skipped = skippedHere = why;
+            process.stdout.write(quitSkipLine(label, why));
+          };
+          const notRunning = appRunningSkip(await runCappedAsync("osascript", scripts.running, { timeout: 20_000 }));
+          if (notRunning) {
+            await skip(notRunning);
+            continue;
+          }
+          const closeAt = performance.now();
+          const [linesAtEvent, errAtEvent] = [run.lines.length, run.log().length];
+          const sent = await runCappedAsync("osascript", scripts.quit, { timeout: QUIT_EVENT_LIMIT_MS });
+          const reached = await until("the shell to take the quit", 20_000, async () => !!run.find("quit") || exited()).then(
+            () => true,
+            () => false,
+          );
+          const verdict = quitEventVerdict({ reached, osascript: sent });
+          if (verdict.skip) {
+            // Whether the shell said anything after the event (read before SIGTERM makes it print its stop).
+            // (Its standard error is kept to its last 200,000 characters: after such a cut the count is approximate.)
+            const printed = printedAfterEvent(run.lines.slice(linesAtEvent), run.log().slice(Math.min(errAtEvent, run.log().length)));
+            await skip(`${verdict.skip}; ${printed}`);
+            continue;
+          }
+          if (verdict.problem) {
+            report(`${label}: the app took the quit`, false, verdict.problem);
+            problems.push(`Q: ${verdict.problem}`);
+            continue;
+          }
+          const exit = await Promise.race([run.exit, sleep(150_000).then(() => ({ code: "timeout" }))]);
+          // M6 (R511): a shell that ended at the quit without its quit line, or by a signal, is examined first, as
+          // upAndProbed examines one that died at the start (the crash report, a backtrace, the bundle).
+          if (quitCrashSuspected(exit, run.events)) await diagnoseMacCrash(run, { debug: true });
+          const qp = orderlyQuitProblems(run.events, exit.code ?? exit.signal);
+          report(`${label}: the quit went the orderly way: the helpers stop cleanly and the shell exits 0`, qp.length === 0, qp.length ? qp.join("; ") : `quit hook installed; osascript ${sent.ok ? "answered" : `said ${firstLine(sent.out) || sent.reason}`}`) || problems.push(...qp.map((x) => `Q: ${x}`));
+          if (slow) {
+            const cw = closingWindowProblems(run.events, { expect: "shown", closeAt });
+            report(`${label}: the closing window "${CLOSING_WINDOW_TITLE}" was shown two seconds after the quit, while the helpers ran`, cw.length === 0, cw.join("; ")) || problems.push(...cw.map((x) => `Q: ${x}`));
+          } else {
+            closingWindowNote(run);
+          }
+          await assertGone(label, helpers, dir, problems, 10_000);
+        } catch (err) {
+          threw = err;
+          didThrowHere = true;
+          throw err;
+        } finally {
+          if (!exited()) killTree(run.child.pid);
+          // N2 (R514): a run that threw never counts as passed.
+          if (didThrowHere) qOutcomes.push({ label, state: "failed", reason: `it did not finish: ${firstLine(threw instanceof Error ? threw.message : threw)}` });
+          else qOutcomes.push(skippedHere ? { label, state: "skipped", reason: skippedHere } : { label, state: problems.length > problemsBefore ? "failed" : "passed" });
+        }
+      }
+    }
+  } catch (err) {
+    ended = err;
+    didThrow = true;
+    throw err;
   } finally {
-    bus.proc?.kill("SIGTERM");
-    const left = stopAppProcesses();
-    if (MAC) report("no process of the app is left at the end", left.length === 0, left.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; ")) || problems.push("app processes left");
-    rmSync(root, { recursive: true, force: true });
+    // M2 (R511), N2 (R514), KG-6 m3, m5 (R517): on a Mac, one line says whether Q ran, on every path, also when a
+    // scenario threw or the set-up failed (on Linux Q's skip line above says it does not exist there). It is
+    // printed FIRST: a failing clean-up below cannot lose it.
+    if (q) process.stdout.write(quitSummaryLine(q.outcomes, { reached: q.reached, setupFailed: q.setup, threw: didThrow, planned: Q_RUNS, error: !didThrow ? undefined : ended instanceof Error ? ended.message : String(ended) }));
+    bus?.proc?.kill("SIGTERM");
+    // Only once the bus was started: a failed set-up has started nothing to clean up (as before).
+    if (bus) {
+      const left = stopAppProcesses();
+      if (MAC) report("no process of the app is left at the end", left.length === 0, left.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; ")) || problems.push("app processes left");
+    }
+    if (root) rmSync(root, { recursive: true, force: true });
   }
   finish(problems);
 }
