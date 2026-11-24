@@ -16,7 +16,7 @@
  * after its steps, its kept copy deleted as before). A backup of a path the change created by copying holds the
  * researcher's bytes, and counts as kept; only a path the change wrote from bytes of its own making is "its own".
  */
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -265,5 +265,192 @@ describe("R532 I1: the close guard", () => {
     console.log(`R532 I1 table: ${JSON.stringify(counts)}`);
     expect(counts.undone.kept + counts.undone.notKept).toBe(CASES.length);
     expect(counts.asCrashed.kept + counts.asCrashed.notKept).toBe(CASES.length);
+  });
+});
+
+/**
+ * Review 3, I1: folders that COVER the path. The file is `d/f.txt` inside a folder `d`; beside the file steps (C create
+ * from the change's own bytes, K create by copying the researcher's q, R rewrite, T trash the file) the change takes
+ * folder steps: M make `d` (where it is not), D trash `d` (where it is), X trash `d` and make it again. Every sequence of
+ * one to four steps the transaction can take with at least one folder step, from three starts (`d` with the researcher's
+ * `f.txt` and `g.txt`; `d` with `g.txt` only; no `d`), each a case of its own (a cut of a longer sequence is the shorter
+ * sequence; four steps are needed to reach C X K R, the reviewer's shape). Every kept copy the change trashed (q's,
+ * the file's, the folder's) is deleted after the crash. The oracle works from the bytes on disk alone: the researcher's
+ * contents (f's original, g's, q's) are each either in a file of the library outside `.tmp`, or only in what `.tmp`
+ * holds (walked into folders), or nowhere. The property: the guard never says "not kept" while any is held only in a
+ * kept copy, and a close that goes ahead loses none of what `.tmp` held.
+ */
+type FStep = "C" | "K" | "R" | "T" | "M" | "D" | "X";
+type Start = "d+f" | "d" | "none";
+interface FCase {
+  name: string;
+  start: Start;
+  steps: FStep[];
+}
+const G = "the researcher's g beside f in d\n";
+function folderSequences(start: Start): FStep[][] {
+  const out = new Map<string, FStep[]>();
+  const grow = (seq: FStep[], d: boolean, f: boolean) => {
+    if (seq.length && seq.some((s) => s === "M" || s === "D" || s === "X")) out.set(seq.join(""), seq);
+    if (seq.length === 4) return;
+    if (d && !f) {
+      grow([...seq, "C"], d, true);
+      grow([...seq, "K"], d, true);
+    }
+    if (f) {
+      grow([...seq, "R"], d, f);
+      grow([...seq, "T"], d, false);
+    }
+    if (!d) grow([...seq, "M"], true, false);
+    if (d) {
+      grow([...seq, "D"], false, false);
+      grow([...seq, "X"], true, false);
+    }
+  };
+  grow([], start !== "none", start === "d+f");
+  return [...out.values()];
+}
+const FCASES: FCase[] = (["d+f", "d", "none"] as const).flatMap((start) => folderSequences(start).map((steps) => ({ name: `${start} ${steps.join("")}`, start, steps })));
+
+/** Every file `.tmp` holds (folders walked into), with its bytes; the marker files and the lock aside. */
+async function keptContents(x: World): Promise<string[]> {
+  const out: string[] = [];
+  const walk = async (abs: string): Promise<void> => {
+    for (const e of await readdir(abs, { withFileTypes: true }).catch(() => [])) {
+      if (/^txn-.*\.json$/u.test(e.name)) continue;
+      const a = join(abs, e.name);
+      if (e.isDirectory()) await walk(a);
+      else if (e.isFile()) out.push(await readFile(a, "utf8"));
+    }
+  };
+  await walk(join(x.lib.root, ".tmp"));
+  return out;
+}
+/** The researcher's contents held ONLY in a copy the app keeps (in `.tmp`, in no file of the library outside it). */
+async function onlyKeptOf(x: World): Promise<string[]> {
+  const kept = await keptContents(x);
+  const lib = [...(await snapshot(x)).values()];
+  return [ORIGINAL, G, OTHER].filter((r) => kept.includes(r) && !lib.includes(r));
+}
+
+async function crashedFolderCase(x: World, c: FCase): Promise<{ m: TxnMarker; q: string }> {
+  const d = `${x.project}/d`;
+  const f = `${d}/f.txt`;
+  const q = `${x.project}/q.txt`;
+  await writeFile(fromRel(x.lib.root, q), OTHER);
+  if (c.start !== "none") {
+    await mkdir(fromRel(x.lib.root, d));
+    await writeFile(fromRel(x.lib.root, `${d}/g.txt`), G);
+    if (c.start === "d+f") await writeFile(fromRel(x.lib.root, f), ORIGINAL);
+  }
+  const copies = c.steps.includes("K");
+  seams.crashAt = "before-audit";
+  await expect(
+    x.repo.mutate(x.pid, STORE, async (tx: Tx) => {
+      if (!copies) await tx.trash(q);
+      for (const [k, s] of c.steps.entries()) {
+        if (s === "C" || s === "R") await tx.writeFile(f, `the change's write ${k + 1}\n`);
+        else if (s === "K") await tx.copyFile(fromRel(x.lib.root, q), f);
+        else if (s === "T") await tx.trash(f);
+        else if (s === "M") await tx.mkdir(d);
+        else {
+          await tx.trash(d);
+          if (s === "X") await tx.mkdir(d);
+        }
+      }
+      if (copies) await tx.trash(q);
+    }),
+  ).rejects.toBeInstanceOf(SimulatedCrash);
+  seams.crashAt = undefined;
+  const [name] = await markers(x);
+  const m = JSON.parse(await readFile(join(x.lib.root, ".tmp", name!), "utf8")) as TxnMarker;
+  for (const e of m.entries) if (e.kind === "trashed") await rm(fromRel(x.lib.root, e.to), { recursive: true, force: true });
+  return { m, q };
+}
+
+const fcounts = { undone: { kept: 0, notKept: 0 }, asCrashed: { kept: 0, notKept: 0 }, onlyKept: 0, closed: 0, notClosed: 0, refused: 0 };
+
+describe("review 3 I1: the close guard where a folder covers the path", () => {
+  it("the reviewer's probe: write d/f, trash d, make d again, copy q into d/f, rewrite d/f, trash q, both kept copies deleted: kept, at both moments, and the close refused with nothing changed", async () => {
+    for (const moment of ["undone", "asCrashed"] as const) {
+      w = await makeWorld();
+      const x = w;
+      const { m } = await crashedFolderCase(x, { name: "probe", start: "d", steps: ["C", "X", "K", "R"] });
+      await reopen(x, () => void (moment === "asCrashed" ? (seams.stopUndoAfter = 0) : undefined));
+      expect(await onlyKeptOf(x), moment).toEqual([OTHER]);
+      expect(await keptCopiesLeft(x.lib.root, m), moment).toBe(true);
+      expect((await x.repo.pendingWrites())[0], moment).toMatchObject({ txn: m.txn, rollback: "lost-copy-stuck", canClose: false });
+      const markerBytes = await readFile(join(x.lib.root, ".tmp", `txn-${m.txn}.json`), "utf8");
+      const keptBefore = await keptContents(x);
+      const libBefore = await snapshot(x);
+      const err = await x.repo.closePendingWrite(m.txn, x.pid).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err, moment).toBeInstanceOf(PendingWriteIncompleteError);
+      expect((err as Error).message).toBe(COPIES_LEFT_TEXT);
+      expect(await readFile(join(x.lib.root, ".tmp", `txn-${m.txn}.json`), "utf8")).toBe(markerBytes);
+      expect(await keptContents(x)).toEqual(keptBefore);
+      expect(await snapshot(x)).toEqual(libBefore);
+      expect(await onlyKeptOf(x)).toEqual([OTHER]);
+      await w.lib.close();
+      w.ring.clear();
+      await rm(w.tmp, { recursive: true, force: true });
+      w = undefined;
+    }
+  });
+
+  for (const moment of ["undone", "asCrashed"] as const) {
+    describe(moment === "undone" ? "undone" : "as crashed", () => {
+      it.each(FCASES)("$name", async (c) => {
+        w = await makeWorld();
+        const x = w;
+        const { m } = await crashedFolderCase(x, c);
+        await reopen(x, () => void (moment === "asCrashed" ? (seams.stopUndoAfter = 0) : undefined));
+        expect(seams.stopUndoAfter).toBeUndefined();
+        expect(await markers(x)).toEqual([`txn-${m.txn}.json`]);
+
+        const onlyKept = await onlyKeptOf(x);
+        const guard = await keptCopiesLeft(x.lib.root, m);
+        // Never fewer: one miss is a researcher's file destroyed by a close.
+        if (onlyKept.length) expect(guard).toBe(true);
+        fcounts[moment][guard ? "kept" : "notKept"]++;
+        if (onlyKept.length) fcounts.onlyKept++;
+
+        const markerBytes = await readFile(join(x.lib.root, ".tmp", `txn-${m.txn}.json`), "utf8");
+        const keptBefore = await keptContents(x);
+        const libBefore = await snapshot(x);
+        const err = await x.repo.closePendingWrite(m.txn, x.pid).then(
+          () => null,
+          (e: unknown) => e,
+        );
+        if (guard) {
+          // Held by the guard: refused (in its words, or earlier where the change is not closable at all), nothing changed.
+          fcounts.refused++;
+          expect(err).not.toBeNull();
+          expect(await readFile(join(x.lib.root, ".tmp", `txn-${m.txn}.json`), "utf8")).toBe(markerBytes);
+          expect(await keptContents(x)).toEqual(keptBefore);
+          expect(await snapshot(x)).toEqual(libBefore);
+          return;
+        }
+        // Let through by the guard: closed, or refused as not closable, or a close whose own undo stayed incomplete (its
+        // choice recorded on the marker, R532 M3). Whichever: nothing of the researcher's that a kept copy held before
+        // is lost by it.
+        if (err) fcounts.notClosed++;
+        else {
+          fcounts.closed++;
+          expect(await markers(x)).toEqual([]);
+        }
+        const lib = [...(await snapshot(x)).values()];
+        const keptAfter = await keptContents(x);
+        for (const r of [ORIGINAL, G, OTHER]) if (keptBefore.includes(r)) expect(lib.includes(r) || (err !== null && keptAfter.includes(r)), r).toBe(true);
+      });
+    });
+  }
+
+  it("the counts (for the report)", () => {
+    console.log(`review 3 folder table: ${FCASES.length} cases, ${JSON.stringify(fcounts)}`);
+    expect(fcounts.undone.kept + fcounts.undone.notKept).toBe(FCASES.length);
+    expect(fcounts.asCrashed.kept + fcounts.asCrashed.notKept).toBe(FCASES.length);
   });
 });

@@ -1054,11 +1054,17 @@ export async function lookNow(root: string, rel: string): Promise<"nothing" | "a
  * appending. Every other origin counts as holding the researcher's bytes (the safe side): the path was there before the
  * change; the change created it BY COPYING a file (a "created" line with no hash of its own, whose completion line
  * carries the hash as stored); or it lies in a folder the change made, where a copy and a write leave the same line.
+ * Where the scan back meets a "trashed" or "dir" line that covers the path (the path itself or a folder above it)
+ * before the line that made the file as it stood at the rewrite, it stops and counts the backup as kept (review 3 I1).
  */
 function backupHoldsOriginal(entries: MarkerEntry[], i: number): boolean {
   const path = (entries[i] as Extract<MarkerEntry, { kind: "replaced" }>).path;
   for (let j = i - 1; j >= 0; j--) {
     const x = entries[j]!;
+    // Review 3 I1: a trash or a folder made at the path or above it covers it: what the scan would meet beyond is about a
+    // file that is no longer the one rewritten, so it stops on the safe side.
+    const at = x.kind === "trashed" ? x.from : x.path;
+    if ((x.kind === "trashed" || x.kind === "dir") && (path === at || path.startsWith(`${at}/`))) return true;
     if (x.kind === "trashed" || x.kind === "dir" || x.path !== path) continue;
     if (x.kind === "replaced" || (x.kind === "append" && x.created)) return false;
     if (x.kind === "created" && x.complete !== true) return x.sha256 === undefined;
