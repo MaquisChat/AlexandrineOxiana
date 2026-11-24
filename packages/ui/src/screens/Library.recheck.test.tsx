@@ -6,7 +6,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import { CURRENT_RW, libraryHandlers, server, SOURCES, serviceError, testApi, url, useMockService } from "../test/service";
 import { FIELD_ISSUED_CONFLICT, FIELD_TITLE_VERIFIED, VERIFIED_SOURCE, withFields } from "../test/verification";
 import { Library } from "./Library";
@@ -226,23 +226,41 @@ describe("Recheck project (R99)", () => {
 
   it("FR-717: an answer older than the job's own end (the end's event came first) does not show the job running again", async () => {
     const ev = liveEvents();
-    let answered = false;
+    // The service's answer is held back until the job's end has been shown (released whatever the test's end).
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
     server.use(
       ev.handler,
       http.get(url("/projects/:id/recheck"), async () => {
         ev.send("job.progress", { ...progress(10, 10, { finished: true, changed: 1, failed: 0 }), jobId: "job-old" });
-        await new Promise((r) => setTimeout(r, 40));
-        answered = true;
+        await held;
         return HttpResponse.json({ running: { jobId: "job-old", done: 9, total: 10 } });
       }),
       ...libraryHandlers(),
     );
+    // Tells when the screen has read the answer: `running` is read as the answer is taken in, and what the screen does
+    // with it runs in the same turn, so the flag is set once that is done.
+    const api = testApi();
+    let read = false;
+    const ask = api.verification.recheckState;
+    api.verification.recheckState = async (pid) => {
+      const answer = await ask(pid);
+      return {
+        get running() {
+          queueMicrotask(() => (read = true));
+          return answer.running;
+        },
+      };
+    };
     ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
-    await libraryShown();
-    const status = screen.getByRole("status", { name: "Project recheck" });
+    render(<Library api={api} current={CURRENT_RW as never} />);
+    const nav = await screen.findByRole("navigation", { name: "Projects" });
+    await within(nav).findByRole("button", { name: /Dissertation/ });
+    const status = await screen.findByRole("status", { name: "Project recheck" });
     await waitFor(() => expect(status.textContent).toBe("Recheck finished: 1 source changed."));
-    await waitFor(() => expect(answered).toBe(true));
-    await new Promise((r) => setTimeout(r, 30));
+    release();
+    await waitFor(() => expect(read).toBe(true));
     expect(status.textContent).toBe("Recheck finished: 1 source changed.");
     expect(screen.queryByText("9 of 10")).toBeNull();
     expect((screen.getByRole("button", { name: "Recheck project" }) as HTMLButtonElement).disabled).toBe(false);
