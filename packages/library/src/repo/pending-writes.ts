@@ -138,7 +138,7 @@ const DETAIL_AFTER: Record<IncompleteRollback, string> = {
   unconfirmed:
     ": the copy the app kept of a file it removed is gone, so that file cannot be put back; the marker is kept until the change is closed in the app's list of interrupted changes",
   "lost-and-blocked":
-    ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the roll-back (the app's list of interrupted changes names it); the marker is kept until that is dealt with and the change is closed in that list",
+    ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the roll-back (the app's list of interrupted changes names it); the marker is kept, and once that is dealt with, that list says whether the change can be closed as it is",
   "lost-copy-stuck":
     ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and the app keeps a copy of another file of the change that it cannot put back either; the marker is kept, and restoring the project from a backup made before the change is the way to undo it",
 };

@@ -24,8 +24,9 @@ export type RollbackCauseKind = (typeof ROLLBACK_CAUSE_KINDS)[number];
  *   that the app cannot confirm is the file the change removed (an older build half undid the change, the library was
  *   copied, a file system keeps no time of birth): never said to be lost; closable as `lost` is;
  * - `lost-and-blocked` (R528 I1, M2): a copy is gone (lost or not confirmed) AND something the researcher can deal with
- *   also stops the undo (a file in the way, a file that could not be read, a step that failed): that first, then the
- *   change can be closed; not closable yet;
+ *   also stops the undo (a file in the way, a file that could not be read, a step that failed): that first; then the
+ *   list says whether the change can be closed (R530: in one rare combination it cannot, `lost-copy-stuck`); not
+ *   closable yet;
  * - `lost-copy-stuck` (R528 M2): a copy is gone, nothing else the researcher can deal with stops the undo, and the app
  *   still keeps a copy of another file of the change that it cannot put back (probe P5: a file inside a folder whose own
  *   copy is gone): closing would let that copy go, so no close is offered; a backup made before the change is the way.
@@ -71,7 +72,7 @@ export const INCOMPLETE_ROLLBACK_BANNER: Record<IncompleteRollback, (p: string) 
     `An interrupted change in ${p} cannot be undone completely: the copy the app kept of a file it removed is gone, so the app cannot put that file back. Something is at its place now, which may be that file, but the app cannot confirm it, so it left it as it is. Changes to ${p} are off until you close the change. Choose “Resolve…” to see what is there.`,
   // R528: never "lost" (the place may hold the file, R527) and never "nothing was lost"; what can be done first leads.
   "lost-and-blocked": (p) =>
-    `An interrupted change in ${p} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, you can close the change as it is. Changes to ${p} are off until then. Choose “Resolve…” to see what to do first.`,
+    `An interrupted change in ${p} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, the list says whether the change can be closed as it is. Changes to ${p} are off until then. Choose “Resolve…” to see what to do first.`,
   "lost-copy-stuck": (p) =>
     `An interrupted change in ${p} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. The app still keeps a copy of another file of the change, which it cannot put back either, and closing the change would let that copy go, so it cannot be closed. Changes to ${p} are off. Restoring the project from a backup made before the change is the way to undo it.`,
 };
@@ -106,7 +107,7 @@ export const ROLLBACK_INCOMPLETE_ANSWER: Record<IncompleteRollback, string> = {
   // R527: true whether or not something stands at the place (it says nothing of what is there).
   unconfirmed: LOST_ANSWER,
   "lost-and-blocked":
-    "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the undo. The list shows what; deal with it first (move the file it names, or try again), then choose “Roll it back” again. After that, you can close the change as it is.",
+    "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the undo. The list shows what; deal with it first (move the file it names, or try again), then choose “Roll it back” again. After that, the list says whether the change can be closed as it is.",
   "lost-copy-stuck":
     "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and the app keeps a copy of another file of the change, which it cannot put back either. Restoring the project from a backup made before the change is the way to undo it.",
 };
@@ -116,7 +117,7 @@ export const ROLLBACK_INCOMPLETE_ANSWER: Record<IncompleteRollback, string> = {
  * by its own hint where it is offered).
  */
 export const ROLLBACK_LIST_NEXT: Partial<Record<IncompleteRollback, string>> = {
-  "lost-and-blocked": "Deal with what is named above first, then choose “Roll it back” again. After that, you can close this change as it is.",
+  "lost-and-blocked": "Deal with what is named above first, then choose “Roll it back” again. After that, this list says whether the change can be closed as it is.",
   "lost-copy-stuck":
     "The app still keeps a copy of another file of this change, which it cannot put back either, and closing would let that copy go, so this change cannot be closed. The way forward is to restore the project from a backup made before this change.",
 };

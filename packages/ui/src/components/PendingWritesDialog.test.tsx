@@ -275,7 +275,7 @@ describe("R528 I1, M2: a copy gone together with something else: the words lead 
     expect(lines(group)).toEqual([
       `The file this change removed from ${A} cannot be put back: the copy the app kept of it is gone, so it is lost.`,
       `${B} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (it is kept there as it is), then choose “Roll it back”.`,
-      "Deal with what is named above first, then choose “Roll it back” again. After that, you can close this change as it is.",
+      "Deal with what is named above first, then choose “Roll it back” again. After that, this list says whether the change can be closed as it is.",
     ]);
     expect(within(group).getByRole("button", { name: "Roll it back" })).toBeTruthy();
     expect(within(group).queryByRole("button", { name: "Close this change as it is" })).toBeNull();

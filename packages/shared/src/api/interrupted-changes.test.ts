@@ -6,7 +6,7 @@
  * keeps and cannot put back (nothing left to do) says a backup is the way, never an act that is not offered.
  */
 import { describe, expect, it } from "vitest";
-import { INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_INCOMPLETE_ANSWER, incompleteRollbackOf, type IncompleteRollback } from "./interrupted-changes.js";
+import { INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_INCOMPLETE_ANSWER, ROLLBACK_LIST_NEXT, incompleteRollbackOf, type IncompleteRollback } from "./interrupted-changes.js";
 
 type Flags = { lost: boolean; unconfirmed: boolean; hand: boolean; occupied: boolean; unread: boolean; failed: boolean; copyKept: boolean };
 
@@ -73,7 +73,7 @@ describe("R528: the words of each state, word for word", () => {
       unconfirmed:
         "An interrupted change in P cannot be undone completely: the copy the app kept of a file it removed is gone, so the app cannot put that file back. Something is at its place now, which may be that file, but the app cannot confirm it, so it left it as it is. Changes to P are off until you close the change. Choose “Resolve…” to see what is there.",
       "lost-and-blocked":
-        "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, you can close the change as it is. Changes to P are off until then. Choose “Resolve…” to see what to do first.",
+        "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, the list says whether the change can be closed as it is. Changes to P are off until then. Choose “Resolve…” to see what to do first.",
       "lost-copy-stuck":
         "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. The app still keeps a copy of another file of the change, which it cannot put back either, and closing the change would let that copy go, so it cannot be closed. Changes to P are off. Restoring the project from a backup made before the change is the way to undo it.",
     });
@@ -87,9 +87,17 @@ describe("R528: the words of each state, word for word", () => {
       lost: "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back. You can now close the change as it is from the list.",
       unconfirmed: "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back. You can now close the change as it is from the list.",
       "lost-and-blocked":
-        "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the undo. The list shows what; deal with it first (move the file it names, or try again), then choose “Roll it back” again. After that, you can close the change as it is.",
+        "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the undo. The list shows what; deal with it first (move the file it names, or try again), then choose “Roll it back” again. After that, the list says whether the change can be closed as it is.",
       "lost-copy-stuck":
         "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and the app keeps a copy of another file of the change, which it cannot put back either. Restoring the project from a backup made before the change is the way to undo it.",
+    });
+  });
+
+  it("R530: the list's next step (never a promise of the close after that, which one rare combination does not keep)", () => {
+    expect(ROLLBACK_LIST_NEXT).toEqual({
+      "lost-and-blocked": "Deal with what is named above first, then choose “Roll it back” again. After that, this list says whether the change can be closed as it is.",
+      "lost-copy-stuck":
+        "The app still keeps a copy of another file of this change, which it cannot put back either, and closing would let that copy go, so this change cannot be closed. The way forward is to restore the project from a backup made before this change.",
     });
   });
 });

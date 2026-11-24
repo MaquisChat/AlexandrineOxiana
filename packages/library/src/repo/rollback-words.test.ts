@@ -338,7 +338,11 @@ describe("R528 I1, M2: the banner speaks of the worst thing true, and the words 
     await reopen();
     expect(standing().map((w) => w.rollback)).toEqual(["lost-and-blocked"]);
     expect(bannerOf(standing()[0]!.rollback)).toBe(
-      "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, you can close the change as it is. Changes to P are off until then. Choose “Resolve…” to see what to do first.",
+      "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, the list says whether the change can be closed as it is. Changes to P are off until then. Choose “Resolve…” to see what to do first.",
+    );
+    // R530: the command line's detail promises no close either.
+    expect(standing()[0]!.detail).toMatch(
+      /^a change interrupted before it was audited could only be partly rolled back: the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the roll-back \(the app's list of interrupted changes names it\); the marker is kept, and once that is dealt with, that list says whether the change can be closed as it is \(transaction [^)]+\)$/u,
     );
     const [pw] = await repo.pendingWrites();
     expect(pw).toMatchObject({ rollback: "lost-and-blocked", canClose: false, causes: [{ kind: "kept-copy-gone", path: a }, { kind: "hand-changed-file", path: b }] });
