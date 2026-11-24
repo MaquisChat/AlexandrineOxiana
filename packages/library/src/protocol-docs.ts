@@ -16,11 +16,11 @@ import * as fsp from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { fileTypeFromFile } from "file-type";
 import { newId } from "@ao/core";
-import { InvalidInputError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError, RecoveryPendingError, isLockedRefusal } from "./repo/errors.js";
+import { InvalidInputError, LibraryClosedError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError, RecoveryPendingError, isLockedRefusal } from "./repo/errors.js";
 import { decryptBytes, readMaybe } from "./repo/io.js";
 import type { Tx } from "./repo/mutate.js";
 import { noteIntegrityWarning, projectDataKey, projectEncrypted, repoLibrary, type Repo } from "./repo/repo.js";
-import { IN_LIBRARY_TEXT } from "@ao/shared";
+import { IN_LIBRARY_TEXT, LIBRARY_CLOSED_TEXT } from "@ao/shared";
 import { insideLibrary } from "./fs/inside-library.js";
 
 /** Test seam (package-internal): a smaller cap for the check made on what was copied. */
@@ -223,7 +223,9 @@ export async function addProtocolDocuments(repo: Repo, projectId: string, paths:
                   ? "The project refuses changes until an interrupted change is resolved; nothing of this file was kept."
                   : err instanceof ReadOnlyLibraryError
                     ? "The library is open read-only, so nothing can be added."
-                    : `${file} could not be copied (a file or disk error); nothing of it was kept.`;
+                    : err instanceof LibraryClosedError
+                      ? LIBRARY_CLOSED_TEXT
+                      : `${file} could not be copied (a file or disk error); nothing of it was kept.`;
       out.push({ file, outcome: "failed", reason });
     }
   }

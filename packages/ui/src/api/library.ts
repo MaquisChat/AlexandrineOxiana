@@ -18,6 +18,7 @@ import type {
   LibrarySuggestedFolderResponse,
   ProjectReviewPage,
 } from "@ao/shared";
+import { LIBRARY_CLOSED_TEXT } from "@ao/shared";
 
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
 import { verificationApi } from "./verification";
@@ -456,6 +457,8 @@ const CODE_LEAD: Partial<Record<string, string>> = {
   POLICY_DENIED: "The project's rules don't allow this.",
   READ_ONLY: "This library is read-only, so nothing was changed.",
   LIBRARY_OFFLINE: "The library is offline, so nothing was changed. It reconnects when its drive returns.",
+  // R551 M5: a change that reached a library after it was closed (not the offline case: no drive is coming back).
+  LIBRARY_CLOSED: LIBRARY_CLOSED_TEXT,
   PROJECT_LOCKED: "This project is locked. Unlock it to continue.",
   UNAVAILABLE: "The library service could not be reached.",
   RATE_LIMITED: "Too many attempts. Wait a moment, then try again.",
@@ -468,7 +471,8 @@ export function errorText(err: unknown, fallback: string): string {
   if (!(err instanceof ApiClientError)) return fallback;
   const parts: string[] = [];
   // A rate limit the service explains itself is said once, in its words.
-  const lead = err.code === "RATE_LIMITED" && err.message ? undefined : CODE_LEAD[err.code];
+  // So is a closed library's refusal: its own sentence (a cancelled backup's names the project), else the lead (R551 M5).
+  const lead = (err.code === "RATE_LIMITED" || err.code === "LIBRARY_CLOSED") && err.message ? undefined : CODE_LEAD[err.code];
   if (lead) parts.push(lead);
   if (err.message && !parts.includes(err.message) && !(err.code === "PROJECT_LOCKED" || err.code === "READ_ONLY")) parts.push(err.message);
   if (err.reason && !parts.some((p) => p.includes(err.reason!))) parts.push(err.reason);

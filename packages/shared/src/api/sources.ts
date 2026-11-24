@@ -135,14 +135,21 @@ export interface JobsRetryResponse {
  * a backup above all, which holds the held files too (a backup is brought back by the restore, not by an import).
  */
 /**
- * FR-749 (R546 2): an attach (or a watched folder's bringing-in) that the library's closing cancelled before anything of
- * the file was written — it was still looking the file's record up. The attach route answers the file with outcome
- * `cancelled` and this sentence; the page says it with the file's name shown as the researcher's own text.
+ * FR-749 (R546 2; R551 M5, word for word): an attach (or a watched folder's bringing-in) that a close of the library,
+ * the opening of another library or the library going offline cancelled before anything of the file was written — it
+ * was still looking the file's record up. The attach route answers the file with outcome `cancelled` and this
+ * sentence; the page says it with the file's name shown as the researcher's own text.
  */
 export const ATTACH_CLOSED_TEXT = {
-  before: "The library was closed before ",
-  after: " was attached, so nothing was changed; attach it again after opening the library.",
+  before: "The library was closed or went offline before ",
+  after: " was attached, so nothing was changed. Attach it again when the library is open.",
 } as const;
+
+/**
+ * R551 M5 (word for word): a watched folder's act ("Bring in the new version…", "Keep the library's copy as it is")
+ * cut by a close, another library's opening or the library going offline; nothing was changed.
+ */
+export const WATCH_ACT_CLOSED_TEXT = "The library was closed or went offline before this could be done, so nothing was changed. Try again when the library is open.";
 
 /** The one sentence for a file whose attach the library's closing cancelled (ATTACH_CLOSED_TEXT around its name). */
 export function attachClosedSentence(fileName: string): string {

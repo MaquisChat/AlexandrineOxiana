@@ -30,6 +30,7 @@ import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { WATCH_REASONS, createLibrary, deviceDeps, type Deps, type FolderWatch, type LocationEnv, type WatchRegisterEntry, type WatchStatus } from "@ao/library";
 import type { WatchedFolderSummary } from "@ao/shared";
+import { WATCH_ACT_CLOSED_TEXT } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { FolderGrants } from "./folder-grants.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
@@ -668,6 +669,37 @@ describe("whether a changed file's new version is on this computer (R251, Task W
     const keep = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "keep-as-it-is" } });
     expect(keep.status, keep.body).toBe(200);
     expect(await originOf(pid, sid)).toMatchObject({ state: "settled", presence: "unknown" });
+  }, 120_000);
+
+  it("R551 M5: both acts cut by the library's closing answer the one sentence, and change nothing", async () => {
+    const { pid, wid, file, sid, repo } = await cameIn("Closing", "A Paper Changed Before A Close");
+    await replace(file, "Its Version After The Change");
+    await until(async () => ((await originOf(pid, sid)).state === "changed" ? true : undefined), 30_000, "changed");
+    const assets = (await repo.getSource(pid, sid)).assets.length;
+    // Each act has taken the session and found its origin; it is held there while the library closes.
+    let letGo!: () => void;
+    const held = new Promise<void>((r) => (letGo = r));
+    onTestFinished(() => letGo());
+    let looks = 0;
+    let bothIn!: () => void;
+    const inside = new Promise<void>((r) => (bothIn = r));
+    const look = repo.watchOrigins.bind(repo);
+    vi.spyOn(repo, "watchOrigins").mockImplementation(async (...a) => {
+      const found = await look(...a);
+      if (++looks === 2) bothIn();
+      await held;
+      return found;
+    });
+    const keep = call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "keep-as-it-is" } });
+    const bring = call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "bring-in-new-version" } });
+    await inside;
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    letGo();
+    const sentence = "The library was closed or went offline before this could be done, so nothing was changed. Try again when the library is open.";
+    for (const r of [await keep, await bring]) expect([r.status, r.json], r.body).toEqual([409, { error: { code: "LIBRARY_CLOSED", message: sentence } }]);
+    expect(WATCH_ACT_CLOSED_TEXT).toBe(sentence);
+    expect((await repo.getSource(pid, sid)).assets.length).toBe(assets);
+    expect((await repo.watchRegister(pid, wid)).get("paper.pdf")?.state).not.toBe("settled"); // the keep wrote nothing
   }, 120_000);
 
   it("a paused or stopped watch and a folder not set up answer unknown", async () => {

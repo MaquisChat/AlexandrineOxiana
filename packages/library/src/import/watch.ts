@@ -117,7 +117,7 @@ import { overlapsLibrary, within } from "../fs/inside-library.js";
 import { isClosed, type Library } from "../library.js";
 import type { LocationEnv } from "../location.js";
 import type { HttpClient } from "../lookup/index.js";
-import { InvalidInputError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { InvalidInputError, LibraryClosedError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
 import { addWatchedFolderEntry, hasSource, projectCollectionsAndTags, projectEncrypted, removeWatchedFolderEntry, type Repo } from "../repo/repo.js";
 import { WATCHED_FILE_STATES, isRegisterEntry, type WatchRegisterEntry, type WatchedFileState } from "../repo/watch-register.js";
 import { ATTACH_REASONS, NOT_DOWNLOADED_REASON, WATCHED_FOLDER_TOOL, createAttach, type Attach, type AttachOutcome, type AttachStatus } from "./attach.js";
@@ -996,7 +996,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         } catch (err) {
           flushError = err;
           deps.debug?.(`watched folder: the register could not be written now (${err instanceof Error ? err.name : "error"})`);
-          if (!(err instanceof ProjectLockedError) && !(err instanceof ReadOnlyLibraryError) && registerProblem !== WATCH_REASONS.registerUnreadable) {
+          // R551: a closed library is "cannot write now", as a locked project or a read-only library is.
+          if (!(err instanceof ProjectLockedError) && !(err instanceof ReadOnlyLibraryError) && !(err instanceof LibraryClosedError) && registerProblem !== WATCH_REASONS.registerUnreadable) {
             registerProblem = WATCH_REASONS.registerUnwritable;
             touch();
           }
@@ -2697,7 +2698,9 @@ type Entry = Awaited<ReturnType<WatchFs["readdir"]>>[number];
 
 /** A read-only library and a locked project are refused in plain words, before anything is read or written. */
 function refuseUnwritable(deps: Pick<WatchDeps, "repo" | "lib">, projectId: string): void {
-  if (isClosed(deps.lib) || deps.lib.mode !== "read-write") throw new ReadOnlyLibraryError(deps.lib.readOnlyReason);
+  // R551 M5: a closed library is said as such (its act's own sentence at the route), not as a read-only one.
+  if (isClosed(deps.lib)) throw new LibraryClosedError();
+  if (deps.lib.mode !== "read-write") throw new ReadOnlyLibraryError(deps.lib.readOnlyReason);
   if (projectEncrypted(deps.repo, projectId) && !deps.repo.isUnlocked(projectId)) throw new ProjectLockedError(projectId);
 }
 

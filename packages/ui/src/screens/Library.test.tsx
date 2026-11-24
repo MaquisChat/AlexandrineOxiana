@@ -110,7 +110,7 @@ describe("Library screen", () => {
     expect(items[2]!.textContent).toMatch(/c\.pdf.*The file could not be read\./);
   });
 
-  it("FR-749 (R546): a file whose attach the library's closing cancelled says so in one sentence, its name as the researcher's own text", async () => {
+  it("FR-749 (R546; R551 M5): a file whose attach the library's closing cancelled says so in one sentence, its name as the researcher's own text", async () => {
     server.use(
       ...libraryHandlers(),
       http.post(url("/projects/:id/attach"), () =>
@@ -123,7 +123,7 @@ describe("Library screen", () => {
     const list = await screen.findByRole("list", { name: "Attached files" });
     const [item] = within(list).getAllByRole("listitem");
     expect(item!.textContent).toBe(attachClosedSentence("דוח.pdf"));
-    expect(item!.textContent).toBe("The library was closed before דוח.pdf was attached, so nothing was changed; attach it again after opening the library.");
+    expect(item!.textContent).toBe("The library was closed or went offline before דוח.pdf was attached, so nothing was changed. Attach it again when the library is open.");
     // The name is isolated as the researcher's own text; nothing else of the line is.
     const isolated = item!.querySelectorAll('[dir="auto"]');
     expect([...isolated].map((e) => e.textContent)).toEqual(["דוח.pdf"]);

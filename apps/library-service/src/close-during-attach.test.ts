@@ -11,10 +11,11 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
-import { attachClosedSentence } from "@ao/shared";
+import { LIBRARY_CLOSED_TEXT, attachClosedSentence, backupClosedSentence } from "@ao/shared";
 import { KeyRing, deviceDeps, openLibrary, openRepo, type Deps } from "@ao/library";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "../../../packages/library/node_modules/undici/index.js";
 import { seams } from "../../../packages/library/src/repo/testing.js";
+import { backupSeams } from "../../../packages/library/src/export/backup.js";
 import { pendingMarkers } from "../../../packages/library/src/repo/txn.js";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService } from "./server.js";
@@ -50,6 +51,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   seams.beforeMkdir = undefined;
+  backupSeams.afterSnapshot = undefined;
   await svc?.close();
   svc = undefined;
   setGlobalDispatcher(previous);
@@ -144,6 +146,8 @@ async function closeDuringLookup(close: () => Promise<{ status: number; body: st
   const att = await attaching;
   expect(att.status, att.body).toBe(200);
   expect(att.json.items).toEqual([{ path: file, outcome: "cancelled", reason: attachClosedSentence("tide-line-notes.pdf") }]);
+  // R551 M5, word for word.
+  expect(att.json.items[0].reason).toBe("The library was closed or went offline before tide-line-notes.pdf was attached, so nothing was changed. Attach it again when the library is open.");
   await svc!.state.idle();
   expect(await snapshot(path)).toEqual(afterClose);
   expect(afterClose.filter((l) => l.includes("source.json") || l.includes("/original/") || l.includes("review/pending"))).toEqual([]);
@@ -174,14 +178,17 @@ describe("a close while an attach waits on its lookup (FR-749, R546)", () => {
     const wait = openAlexSaysWait();
     const attaching = call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [file] } });
     await wait.asked;
-    const before = await snapshot(path);
     const stopping = svc!.close();
     const att = await attaching;
     expect(att.json.items).toEqual([{ path: file, outcome: "cancelled", reason: attachClosedSentence("tide-line-notes.pdf") }]);
     await stopping;
     svc = undefined;
-    expect(before.filter((l) => l.includes("source.json") || l.includes("/original/") || l.includes("review/pending"))).toEqual([]);
-    expect((await snapshot(path)).filter((l) => l.includes("source.json") || l.includes("/original/") || l.includes("review/pending"))).toEqual([]);
+    // R551 M8: the whole folder, byte for byte, as the close route's test compares it: right after the stop, and once
+    // everything has settled.
+    const afterStop = await snapshot(path);
+    expect(afterStop.filter((l) => l.includes("source.json") || l.includes("/original/") || l.includes("review/pending"))).toEqual([]);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(await snapshot(path)).toEqual(afterStop);
     expect(await pendingMarkers(path)).toBe(0);
     expect(wait.count()).toBe(1);
     expect(existsSync(join(path, ".lock"))).toBe(false);
@@ -328,4 +335,99 @@ describe("a Bulk Import running when the library closes (FR-749, R551 I1)", () =
       svc = await createService({ token: TOKEN, deps, worker: null, logLevel: "silent" });
     });
   }, 60_000);
+});
+
+/** Resolves once the session's closing has begun (beginClosing aborted its signal). */
+function closingBegun(): Promise<void> {
+  const sig = svc!.state.session!.closing.signal;
+  return sig.aborted ? Promise.resolve() : new Promise((r) => sig.addEventListener("abort", () => r(), { once: true }));
+}
+
+/** A hold on a seam: `inside` once reached; `release` lets it go (also when the test ends). */
+function heldSeam(): { seam: () => Promise<void>; inside: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  onTestFinished(() => release());
+  let entered!: () => void;
+  const inside = new Promise<void>((r) => (entered = r));
+  return { seam: async () => (entered(), gate), inside, release };
+}
+
+async function stateFailures(path: string): Promise<Record<string, unknown>> {
+  try {
+    return JSON.parse(await readFile(join(path, "Backups", "backups-state.json"), "utf8")).failures ?? {};
+  } catch {
+    return {};
+  }
+}
+
+describe("a backup in flight when the library closes (FR-749, R551 I2)", () => {
+  it("POST /projects/:id/backups: cancelled, its own sentence; nothing under the library changes after the close; no backup-failed at the next opening", async () => {
+    const { path, pid } = await libraryWithProject(NO_LOOKUP_GOV);
+    const h = heldSeam();
+    backupSeams.afterSnapshot = h.seam;
+    const backingUp = call({ method: "POST", url: `/projects/${pid}/backups` });
+    await h.inside;
+    const closing = call({ method: "POST", url: "/libraries/close" });
+    await closingBegun();
+    h.release();
+    expect((await closing).status).toBe(200);
+    const afterClose = await snapshot(path);
+    const b = await backingUp;
+    expect(b.status, b.body).toBe(409);
+    expect(b.json.error).toEqual({ code: "LIBRARY_CLOSED", message: backupClosedSentence("Study") });
+    expect(b.json.error.message).toBe("The library was closed or went offline before the backup of Study was finished, so no backup was made. Back it up again when the library is open.");
+    await svc!.state.idle();
+    expect(await snapshot(path)).toEqual(afterClose);
+    expect(afterClose.filter((l) => /\.tmp-[0-9a-f]+ /u.test(l) || /\.zip(\.enc)? /u.test(l))).toEqual([]);
+    expect(await stateFailures(path)).toEqual({});
+    // Opened again: no `backup-failed`.
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await svc!.state.projectWarnings(svc!.state.session!);
+    const st = svc!.state.libraryState() as { projectWarnings: Record<string, string[]> };
+    expect(st.projectWarnings[pid] ?? []).not.toContain("backup-failed");
+  });
+
+  it("the scheduler's backup is cut the same way: nothing made, nothing recorded", async () => {
+    const { path, pid } = await libraryWithProject(NO_LOOKUP_GOV);
+    const h = heldSeam();
+    backupSeams.afterSnapshot = h.seam;
+    const running = svc!.state.runScheduledBackups(pid);
+    await h.inside;
+    const closing = call({ method: "POST", url: "/libraries/close" });
+    await closingBegun();
+    h.release();
+    expect((await closing).status).toBe(200);
+    const afterClose = await snapshot(path);
+    expect(await running).toEqual([{ projectId: pid, ok: true, backedUp: false }]);
+    await svc!.state.idle();
+    expect(await snapshot(path)).toEqual(afterClose);
+    expect(await stateFailures(path)).toEqual({});
+  });
+});
+
+describe("a change that reaches the engine after its library was closed (FR-749, R551 M5)", () => {
+  it("answers 409 LIBRARY_CLOSED, \"That library has been closed, so nothing was changed.\"; a request with no library open keeps its answer", async () => {
+    const { path, pid, folder } = await libraryWithProject(NO_LOOKUP_GOV);
+    // The request takes the session, then is held before its change reaches the engine; the library closes meanwhile.
+    const repo = svc!.state.session!.repo;
+    const h = heldSeam();
+    const original = repo.createCollection.bind(repo);
+    repo.createCollection = (async (...a: Parameters<typeof original>) => {
+      await h.seam();
+      return original(...a);
+    }) as typeof original;
+    const late = call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Late" } });
+    await h.inside;
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    h.release();
+    const r = await late;
+    expect(r.status, r.body).toBe(409);
+    expect(r.json.error).toEqual({ code: "LIBRARY_CLOSED", message: LIBRARY_CLOSED_TEXT });
+    expect(LIBRARY_CLOSED_TEXT).toBe("That library has been closed, so nothing was changed.");
+    expect(await readFile(join(path, folder, "project.json"), "utf8")).not.toContain("Late");
+    const none = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "None" } });
+    expect(none.status).toBe(503);
+    expect(none.json.error).toEqual({ code: "LIBRARY_OFFLINE", message: "No library is open." });
+  });
 });

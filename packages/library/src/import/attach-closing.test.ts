@@ -134,7 +134,7 @@ describe("an attach and the library's closing (FR-749, R546)", () => {
     await wait.asked;
     closing.abort();
     expect(await outcome).toEqual([{ path, outcome: "cancelled", reason: attachClosedSentence("tide-line-notes.pdf") }]);
-    expect(attachClosedSentence("tide-line-notes.pdf")).toBe("The library was closed before tide-line-notes.pdf was attached, so nothing was changed; attach it again after opening the library.");
+    expect(attachClosedSentence("tide-line-notes.pdf")).toBe("The library was closed or went offline before tide-line-notes.pdf was attached, so nothing was changed. Attach it again when the library is open.");
     expect(wait.count()).toBe(1); // cutting the wait is not asking again
     expect(await snapshot(lib.root)).toEqual(before);
     expect(await pendingMarkers(lib.root)).toBe(0);
