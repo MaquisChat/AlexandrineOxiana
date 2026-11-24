@@ -84,6 +84,7 @@ beforeEach(async () => {
   lib = await createLibrary(join(tmp, "Lib"), "Lib", mkDeps());
   await writeFile(join(tmp, "in.pdf"), PDF);
   await writeFile(join(tmp, "src.txt"), ORIGINAL);
+  await writeFile(join(tmp, "other.txt"), "the change's own copied file\n");
   repo = await repoFor();
   pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
   const sf = await repo.createSource(pid, draft("Annotated"), [{ path: join(tmp, "in.pdf"), role: "original", handling: "copy" }], { provenance: provenance() });
@@ -264,4 +265,47 @@ describe("the in-process undo answers its causes", () => {
     expect((err as PendingWriteIncompleteError).causes).toEqual([{ kind: "hand-changed-file", path: rel }]);
     expect(await text(rel)).toBe(HAND);
   });
+});
+
+describe("R519 (1): a trashed original whose path is occupied", () => {
+  it("by a file put there by hand: nothing touched, the kept copy stays, incomplete (path-occupied); moved away, the original is put back", async () => {
+    const rel = `${folder}/kept.txt`;
+    await writeFile(fromRel(lib.root, rel), ORIGINAL);
+    const m = await crashed(async (tx) => {
+      await tx.trash(rel);
+    });
+    const copy = (m.entries[0] as { to: string }).to;
+    await writeFile(fromRel(lib.root, rel), HAND);
+    await keptAndIncomplete(rel, [{ kind: "path-occupied", path: rel }], m.txn);
+    expect(await text(copy)).toBe(ORIGINAL);
+    await rename(fromRel(lib.root, rel), join(tmp, "moved-away.txt"));
+    await reopen();
+    expect(await markers()).toEqual([]);
+    expect(await text(rel)).toBe(ORIGINAL);
+    expect(causes()).toEqual([]);
+  });
+
+  for (const how of ["written whole", "copied"] as const) {
+    it(`by the change's own file (${how}) whose undo failed: that file is removed as its own undo does, and the original is put back`, async () => {
+      const rel = `${folder}/kept.txt`;
+      await writeFile(fromRel(lib.root, rel), ORIGINAL);
+      seams.failUndo = "created";
+      await expect(
+        repo.mutate(pid, STORE, async (tx) => {
+          await tx.trash(rel);
+          if (how === "copied") await tx.copyFile(join(tmp, "other.txt"), rel);
+          else await tx.writeFile(rel, "the change's own file\n");
+          throw new Error("the change failed");
+        }),
+      ).rejects.toThrow("the change failed");
+      seams.failUndo = undefined;
+      // The in-process undo: its "created" step failed, yet the trashed step found the change's own bytes and put the original back.
+      expect(await text(rel)).toBe(ORIGINAL);
+      expect(await markers()).toHaveLength(1);
+      await reopen();
+      expect(await text(rel)).toBe(ORIGINAL);
+      expect(await markers()).toEqual([]);
+      expect(causes()).toEqual([]);
+    });
+  }
 });

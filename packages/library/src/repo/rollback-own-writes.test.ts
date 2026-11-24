@@ -163,7 +163,11 @@ async function trashedThenWrittenThenFailed(): Promise<void> {
   expect(await markers()).toHaveLength(1);
 }
 
-/** 54b9f25's case: a file is trashed, then written again at the same path by the same change; its undo fails. */
+/**
+ * 54b9f25's case: a file is trashed, then written again at the same path by the same change; its undo fails at the
+ * "created" step. The trashed step then finds the change's own bytes at the path (R519 (1)): removed, the original put
+ * back; the marker is kept, since a step failed.
+ */
 async function trashedThenWrittenAgainThenFailed(rel: string): Promise<void> {
   seams.failUndo = "created";
   await expect(
@@ -174,6 +178,18 @@ async function trashedThenWrittenAgainThenFailed(rel: string): Promise<void> {
     }),
   ).rejects.toThrow("the change failed");
   seams.failUndo = undefined;
+  expect(await markers()).toHaveLength(1);
+}
+
+/** The same change cut off by a crash before its audit entry: nothing undone, the file written again still at the path. */
+async function trashedThenWrittenAgainThenCrashed(rel: string): Promise<void> {
+  seams.crashAt = "before-audit";
+  await expect(
+    repo.mutate(pid, STORE, async (tx) => {
+      await tx.trash(rel);
+      await tx.writeFile(rel, "written again by the change\n");
+    }),
+  ).rejects.toBeInstanceOf(SimulatedCrash);
   expect(await markers()).toHaveLength(1);
 }
 
@@ -220,7 +236,7 @@ describe("R484 a: the app's own writes are never recorded as changed outside the
     await writeFile(join(lib.root, rel), "before the change\n");
     const before = await sourceJson();
     await trashedThenWrittenAgainThenFailed(rel);
-    expect(await readFile(join(lib.root, rel), "utf8")).toBe("written again by the change\n");
+    expect(await readFile(join(lib.root, rel), "utf8")).toBe("before the change\n");
     await reopen();
     expect(outside()).toEqual([]);
     expect(await readFile(join(lib.root, rel), "utf8")).toBe("before the change\n");
@@ -231,7 +247,8 @@ describe("R484 a: the app's own writes are never recorded as changed outside the
     const rel = `${folder}/notes.txt`;
     await writeFile(join(lib.root, rel), "before the change\n");
     const before = await sourceJson();
-    await trashedThenWrittenAgainThenFailed(rel);
+    await trashedThenWrittenAgainThenCrashed(rel);
+    expect(await readFile(join(lib.root, rel), "utf8")).toBe("written again by the change\n");
     await writeFile(join(lib.root, rel), "edited by hand\n");
     await reopen();
     await handEditKeptThenMovedAway(rel, "edited by hand\n", before);

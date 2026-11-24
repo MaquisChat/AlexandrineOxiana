@@ -432,10 +432,22 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       } else if (e.kind === "trashed") {
         const to = fromRel(root, e.to);
         if (await exists(to)) {
-          // Steps after it are undone first, so something at the path now is not the change's (or a later undo
-          // failed): it is never overwritten, and the step is not done, so the marker, and with it the trash copy,
-          // is kept for the researcher to resolve (R491 C a; nothing overwritten, nothing deleted).
-          if (await exists(fromRel(root, e.from))) ok = false;
+          // Steps after it are undone first, so something at the path now is the change's own only when a later undo
+          // failed (R519 (1)): its bytes, by a later line's hash, are removed as that line's undo does, then the
+          // original is put back. Anything else is never overwritten or removed: the step is not done, so the marker,
+          // and with it the trash copy, is kept for the researcher to move it away (R491 C a, R519: path-occupied).
+          let occupied: boolean;
+          try {
+            occupied = (await look(root, e.from)).at !== "nothing";
+            if (occupied && (await ownBytesAt(root, e.from, entries.slice(i + 1)))) {
+              await fsp.rm(fromRel(root, e.from), { force: true });
+              occupied = false;
+            }
+          } catch {
+            block("could-not-look", e.from);
+            continue;
+          }
+          if (occupied) block("path-occupied", e.from);
           else await renameWithRetry(to, fromRel(root, e.from));
         }
       } else {
