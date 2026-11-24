@@ -1200,8 +1200,8 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       expect(u.getAttribute("aria-busy")).toBe("true");
       await vi.advanceTimersByTimeAsync(1_500);
     } finally {
-      vi.useRealTimers();
-      vi.useFakeTimers({ toFake: ["Date"] });
+      // From the time the clock shows (as in giveUp): never back 60 seconds, behind a quiet held at the give-up.
+      refake(["Date"]);
     }
     await waitFor(() => expect(reads()).toBeGreaterThan(readsBefore));
     await waitFor(() => expect(within(card(RECORD)).getByText("The service did not answer. Look at the queue again before deciding.")).toBeTruthy());
@@ -1286,8 +1286,9 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       fireEvent.click(use(title));
       await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
     } finally {
-      vi.useRealTimers();
-      vi.useFakeTimers({ toFake: ["Date"] });
+      // Back to a faked Date only, from the time the clock shows: never back to the real time, 60 seconds earlier — a
+      // quiet the re-read held at the give-up's time would then outlast passGuard().
+      refake(["Date"]);
     }
     await waitFor(() => expect(within(card(title)).getByText(HELD_NO_ANSWER_TEXT)).toBeTruthy());
   };
