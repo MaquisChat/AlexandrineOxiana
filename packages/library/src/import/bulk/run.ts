@@ -2465,6 +2465,27 @@ async function knownVersions(repo: Repo, projectId: string, kind: ImportBatch["s
   return out;
 }
 
+/**
+ * Whether any of `versionIds` came in before, in a batch of `kind` that is not undone: `knownVersions(...).has(id)` for
+ * any of them, without reading every journal (FR-726, R482 c). The journals are read newest first, and the reading
+ * stops at the first line that knows one of them; the answer is the same, since a later line never takes an item out of
+ * what is known. Nothing is read when nothing is asked.
+ */
+async function anyImportedBefore(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"], versionIds: ReadonlySet<string>): Promise<boolean> {
+  if (versionIds.size === 0) return false;
+  for (const d of (await batchDirs(repo, projectId)).reverse()) {
+    let rec: BatchRecord | undefined;
+    try {
+      rec = await readBatchAt(repo, projectId, d.name);
+    } catch {
+      continue;
+    }
+    if (!rec || rec.source.kind !== kind || rec.state === "undone") continue;
+    for (const e of await readJournal(repo, projectId, rec.dir)) if (e.ext && e.sourceId && versionIds.has(e.ext.id)) return true;
+  }
+  return false;
+}
+
 /** A linked original (merge with `fileHandling: 'link'`): nothing is copied (R24). */
 async function linkedAsset(root: string, f: SourceInputFile, sourceId: string, sha256: string): Promise<Asset> {
   const abs = resolve(f.path);
@@ -2763,13 +2784,14 @@ export async function dryRun(
     const secret = randomBytes(32).toString("hex");
     const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))], secret, await approvalHashes(secret, opts.approveOutside));
     const inLibrary = await libraryFileTest(repo, dir, adapter.kind);
-    const known = adapter.kind === "zotero-local" || adapter.kind === "zotero-web" ? await knownVersions(repo, projectId, adapter.kind) : undefined;
-    let seenAgain = false;
+    const zotero = adapter.kind === "zotero-local" || adapter.kind === "zotero-web";
+    /** The Zotero items found, by version id: whether one came in before is asked of the journals after the scan (FR-726). */
+    const versionIds = new Set<string>();
     for await (const scanned of scan) {
       let item = scanned;
       if (item.gone) continue; // gone at its source: nothing to import
       summary.items++;
-      if (item.version && known?.has(item.version.id)) seenAgain = true;
+      if (zotero && item.version) versionIds.add(item.version.id);
       if (item.unreadable) {
         summary.unreadable.push({ path: item.key, reason: item.unreadable });
         continue;
@@ -2852,7 +2874,7 @@ export async function dryRun(
     }
     // FR-132 (R474 I1, M5): the wizard's summary of either Zotero import says what an import does not take away,
     // when an item would come in again (not before a first import).
-    if (seenAgain && (adapter.kind === "zotero-local" || adapter.kind === "zotero-web")) summary.notes.push(ZOTERO_NOTES.removalsKept(adapter.kind));
+    if ((adapter.kind === "zotero-local" || adapter.kind === "zotero-web") && (await anyImportedBefore(repo, projectId, adapter.kind, versionIds))) summary.notes.push(ZOTERO_NOTES.removalsKept(adapter.kind));
     await spaceOfScan(repo, projectId, adapter, summary, linkedBytes, opts.approveOutside);
   } finally {
     if (made) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
