@@ -31,7 +31,7 @@ import {
 import type { LocationEnv } from "./location.js";
 import { listUnfinishedMoves, movedToFor } from "./old-copies.js";
 import { recordLocation } from "./registry.js";
-import { ProjectLockedError, ReadOnlyLibraryError, isLockedRefusal } from "./repo/errors.js";
+import { LibraryClosedError, ProjectLockedError, ReadOnlyLibraryError, isLockedRefusal } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
 import { holdsLock, newAttentionId, projectFolders, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
 import {
@@ -615,6 +615,11 @@ async function confirmFindings(
         for (const [entry, x] of list) out.set(entry, await stillWrong(lib.root, x.f, x.hashed, fresh, stat));
       }
       return out;
+    }).catch(async (err: unknown) => {
+      // FR-749 (R546 1, R570 a): a library closed while the check waited for its turn refuses that turn; the check
+      // still ends with the closed or the moved library's error, as when the close comes between two batches.
+      if (err instanceof LibraryClosedError) await endIfClosed(lib);
+      throw err;
     });
     for (const [entry, v] of got) verdicts.set(entry, v);
   }
