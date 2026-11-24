@@ -9,7 +9,7 @@
  * line written, its event sent, its download folder gone).
  */
 import { copyFileSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp } from "node:fs/promises";
@@ -213,6 +213,13 @@ async function restsAt(w: World, state: FindState, reason?: string): Promise<Fin
 }
 const pendingReviews = async (w: World) => (await readReviewEntries(coreOf(), coreOf().state(w.p.id))).filter((e) => e.status === "pending");
 
+/** R510: the linked path made a symbolic link to a copy of its file elsewhere on the drive (the file is there). */
+async function linkToRealFile(): Promise<void> {
+  await writeFile(join(tmp, "Drive", "real.pdf"), await readFile(outside()));
+  await rm(outside());
+  await symlink(join(tmp, "Drive", "real.pdf"), outside());
+}
+
 describe("R470 a: the copy part tells a linked original it cannot reach", () => {
   it("a record whose only original is a linked file that cannot be found rests with its own reason, and nothing is asked or fetched", async () => {
     const w = await world("linked-missing");
@@ -228,6 +235,46 @@ describe("R470 a: the copy part tells a linked original it cannot reach", () => 
     expect(sf.assets).toHaveLength(1);
     expect(sf.assets[0]!.linked).toBeDefined();
   });
+
+  // R503 f (FR-727): the shared rule's other missing kinds, as the Missing files list counts them.
+  const KINDS: Array<[string, () => Promise<void>]> = [
+    ["a symbolic link that leads nowhere (its file on a drive not connected)", async () => {
+      await rm(outside());
+      await symlink(join(tmp, "Unplugged", "zorblatt.pdf"), outside());
+    }],
+    ["a folder where the file is recorded", async () => {
+      await rm(outside());
+      await mkdir(outside());
+    }],
+    // R510: the app reads nothing through a link, so a link to a file that is there is missing too.
+    ["a symbolic link to a file that is there", linkToRealFile],
+  ];
+  for (const [kind, make] of KINDS) {
+    it(`R503 f: ${kind} rests with the linked file's reason, and nothing is asked or fetched`, async () => {
+      const w = await world("linked");
+      await make();
+      runner().resume(w.p.id);
+      const e = await restsAt(w, "record-complete", "linked-file-missing");
+      expect(e.reason).toEqual({ code: "linked-file-missing" });
+      expect(copyRequests).toEqual([]);
+      expect(fileRequests).toEqual([]);
+      expect(await pendingReviews(w)).toEqual([]);
+      expect((await checkIntegrity(lib, "full", { keyRing: ring })).missing.map((m) => m.path)).toEqual([(await repo.getSource(w.p.id, w.sid)).assets[0]!.path]);
+    });
+
+    it(`R503 f: ${kind} — an entry resting in your library is moved to the linked file's reason at the next opening, nothing asked or fetched`, async () => {
+      const w = await world("linked");
+      runner().resume(w.p.id);
+      await restsAt(w, "in-library");
+      for (const x of runners) await x.stopAll();
+      await make();
+      changes = [];
+      runner().resume(w.p.id);
+      await restsAt(w, "record-complete", "linked-file-missing");
+      expect(copyRequests).toEqual([]);
+      expect(fileRequests).toEqual([]);
+    });
+  }
 
   it("a linked original that can be reached rests in the library, as before", async () => {
     const w = await world("linked");
@@ -451,14 +498,15 @@ describe("R483 a: entries already at rest are judged when the queue is opened", 
     expect(asked()).toEqual({ copies: 0, files: 0 });
   });
 
-  it("an entry resting on \"Not this file\" is left alone, whether its linked file is there or not", async () => {
+  it("an entry resting on \"Not this file\" stays so while its linked file cannot be found; R503 g: one whose linked file is there rests in your library", async () => {
     const w = await world("linked-missing", { state: "no-open-copy", reason: { code: "not-this-file" } });
     const there = await another(w.p, "linked", { state: "no-open-copy", reason: { code: "not-this-file" } }, "there");
     const s = await sentinel(w);
-    const before = [await entryOf(w), await entryOf(there)];
+    const before = await entryOf(w);
     await reopen(w);
     await restsAt(s, "record-complete", "linked-file-missing");
-    expect([await entryOf(w), await entryOf(there)]).toEqual(before);
+    await restsAt(there, "in-library");
+    expect(await entryOf(w)).toEqual(before);
     expect(asked()).toEqual({ copies: 0, files: 0 });
   });
 
@@ -564,5 +612,132 @@ describe("R483 c: \"Not this file\" drops the pick", () => {
     expect(e).toMatchObject({ state: "no-open-copy", reason: { code: "not-this-file" } });
     expect(e.copyDespiteLink).toBeUndefined();
     expect((await repo.getSource(w.p.id, w.sid)).assets).toHaveLength(1);
+  });
+});
+
+describe("R503 g (FR-728): an entry resting for want of a copy is judged again at the opening when its source now has a file", () => {
+  async function reopen(w: World): Promise<FindRunner> {
+    for (const x of runners) await x.stopAll();
+    const r = runner();
+    r.resume(w.p.id);
+    return r;
+  }
+  /** A further entry the opening's pass moves (in your library → its linked file's reason): once it rests, the pass's one write is made. */
+  const sentinel = (w: World) => another(w.p, "linked-missing", { state: "in-library" }, `sentinel-${Math.random().toString(36).slice(2, 7)}`);
+  const queueLines = async (w: World) => (await readFile(join(lib.root, w.p.folder, "find", "queue.jsonl"), "utf8")).split("\n").filter(Boolean).length;
+  const asked = () => ({ copies: copyRequests.length, files: fileRequests.length });
+  const OFFERS = [{ label: "Publisher's page" as const, url: "https://publisher.example.org/zorblatt", host: "publisher.example.org" }];
+
+  /** The resting states that mean "for want of a copy" (R503 g). */
+  const WANTING: Array<[string, Partial<FindEntry>]> = [
+    ["no open copy", { state: "no-open-copy", offers: OFFERS }],
+    ["Not this file", { state: "no-open-copy", reason: { code: "not-this-file" } }],
+    ["no open copy, some services unreachable", { state: "no-open-copy", reason: { code: "copy-some-unreachable" }, offers: OFFERS }],
+    ["a copy found that could not be downloaded", { state: "no-open-copy", reason: { code: "copy-not-downloaded" }, offers: OFFERS }],
+    ["a fetch in the sign-in window not finished", { state: "no-open-copy", reason: { code: "library-unfinished" } }],
+    ["the copy part failed: services unreachable", { state: "failed", reason: { code: "unreachable" }, attempts: 4 }],
+    ["the copy part failed: something unexpected", { state: "failed", reason: { code: "unexpected" }, attempts: 1 }],
+  ];
+  for (const [label, rest] of WANTING) {
+    for (const file of ["stored", "linked"] as const) {
+      it(`${label}: its source now has a ${file === "stored" ? "file added in the library" : "linked file that can be reached"} — it rests in your library; nothing asked or fetched`, async () => {
+        const w = await world(file, rest);
+        const s = await sentinel(w);
+        await reopen(w);
+        await restsAt(s, "record-complete", "linked-file-missing");
+        const e = await restsAt(w, "in-library");
+        expect(e.reason).toBeUndefined();
+        expect(e.offers).toBeUndefined();
+        expect(e.nextTryAt).toBeUndefined();
+        expect(asked()).toEqual({ copies: 0, files: 0 });
+        expect(await pendingReviews(w)).toEqual([]);
+      });
+    }
+    it(`${label}: its source's only file is linked and cannot be found, or it has none — it stays as it is`, async () => {
+      const w = await world("linked-missing", rest);
+      const none = await another(w.p, "none", rest, "none");
+      const s = await sentinel(w);
+      const before = [await entryOf(w), await entryOf(none)];
+      await reopen(w);
+      await restsAt(s, "record-complete", "linked-file-missing");
+      expect([await entryOf(w), await entryOf(none)]).toEqual(before);
+      expect(asked()).toEqual({ copies: 0, files: 0 });
+    });
+  }
+
+  it("R510: an entry resting on Not this file whose only original is now a symbolic link to a file that is there stays as it is", async () => {
+    const w = await world("linked", { state: "no-open-copy", reason: { code: "not-this-file" } });
+    await linkToRealFile();
+    const s = await sentinel(w);
+    const before = await entryOf(w);
+    await reopen(w);
+    await restsAt(s, "record-complete", "linked-file-missing");
+    expect(await entryOf(w)).toEqual(before);
+    expect(asked()).toEqual({ copies: 0, files: 0 });
+  });
+
+  /** Resting states that are NOT for want of a copy (the researcher must act in another way), or not resting. */
+  const OTHERS: Array<[string, Partial<FindEntry>]> = [
+    ["the record was removed", { state: "no-open-copy", reason: { code: "record-removed" } }],
+    ["a rule forbids (record part)", { state: "failed", reason: { code: "not-allowed", by: "rules" } }],
+    ["a key is missing", { state: "failed", reason: { code: "needs-key" } }],
+    ["switched off in Search sources", { state: "failed", reason: { code: "switched-off", by: "settings" } }],
+    ["a legal basis is needed", { state: "failed", reason: { code: "no-legal-basis" } }],
+    ["a found file waits for the researcher's check", { state: "needs-check", reason: { code: "file-looks-right" } }],
+    ["already in the library", { state: "already" }],
+    ["the researcher's pick is set", { state: "no-open-copy", reason: { code: "copy-some-unreachable" }, copyDespiteLink: true }],
+  ];
+  for (const [label, rest] of OTHERS) {
+    it(`${label}: left as it is, though its source has a file; nothing asked or fetched`, async () => {
+      const w = await world("stored", rest);
+      const s = await sentinel(w);
+      const before = await entryOf(w);
+      await reopen(w);
+      await restsAt(s, "record-complete", "linked-file-missing");
+      expect(await entryOf(w)).toEqual(before);
+      expect(asked()).toEqual({ copies: 0, files: 0 });
+    });
+  }
+
+  it("a locked project is judged at the unlock, not before", async () => {
+    const w = await world("stored", { state: "no-open-copy", reason: { code: "not-this-file" } }, { encrypted: true });
+    const before = await entryOf(w);
+    await repo.lockProject(w.p.id);
+    const r = await reopen(w);
+    await r.stopAll();
+    await repo.unlockProject(w.p.id, "pw");
+    expect(await entryOf(w)).toEqual(before);
+    await reopen(w);
+    await restsAt(w, "in-library");
+    expect(asked()).toEqual({ copies: 0, files: 0 });
+  });
+
+  it("the line is written once over two openings", async () => {
+    const w = await world("stored", { state: "no-open-copy", reason: { code: "not-this-file" } });
+    await reopen(w);
+    await restsAt(w, "in-library");
+    const lines = await queueLines(w);
+    const s = await sentinel(w);
+    expect(await queueLines(w)).toBe(lines + 1);
+    await reopen(w);
+    await restsAt(s, "record-complete", "linked-file-missing");
+    expect(await queueLines(w)).toBe(lines + 2);
+    expect(changes.filter((c) => c.entryId === w.eid && c.state === "in-library")).toHaveLength(1);
+  });
+
+  it("the entry re-judged is exactly as one that came to rest in your library the usual way (\"Try again\", then the copy part)", async () => {
+    const w = await world("stored", { state: "no-open-copy", reason: { code: "copy-some-unreachable" }, offers: OFFERS, attempts: 2 });
+    const r = await reopen(w);
+    await restsAt(w, "in-library");
+    // The usual way: an entry resting alike, made after the opening's pass; "Try again", and the copy part finds its
+    // source's file.
+    const usual = await another(w.p, "stored", { state: "no-open-copy", reason: { code: "copy-some-unreachable" }, offers: OFFERS, attempts: 2 }, "usual");
+    await r.retry(usual.p.id, usual.eid);
+    await restsAt(usual, "in-library");
+    const strip = (e: FindEntry) => {
+      const { id: _i, createdAt: _c, updatedAt: _u, sourceId: _s, ...rest } = e;
+      return rest;
+    };
+    expect(strip((await entryOf(w))!)).toEqual(strip((await entryOf(usual))!));
   });
 });

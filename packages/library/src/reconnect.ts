@@ -47,7 +47,7 @@ import {
 } from "./repo/repo.js";
 import { SimulatedCrash } from "./repo/seams.js";
 // The Missing files rule (what "missing" means for a file of the library), shared with Find and acquire (R470 a).
-import { absIn, isGone } from "./repo/linked-file.js";
+import { absIn, isGone, linkedNotThere, missingAt } from "./repo/linked-file.js";
 import { LinkedContentChangedError } from "./repo/sources.js";
 import { LockNotWritableError } from "./lock.js";
 import type { Manifest } from "./repo/state.js";
@@ -519,6 +519,11 @@ async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySam
       else report.errors.push({ path: f.path, message: msg(err) });
       continue;
     }
+    // R503 f, R510: at a linked file's path, a symbolic link (whatever it leads to) or a folder is missing (the shared rule).
+    if (f.asset?.linked && linkedNotThere(st)) {
+      flag(report.missing, entry, f);
+      continue;
+    }
     if (!st.isFile()) {
       flag(report.mismatched, entry, f);
       continue;
@@ -669,6 +674,8 @@ async function stillWrong(
   } catch (err) {
     return isGone(err) ? "missing" : { error: msg(err) };
   }
+  // R503 f, R510: a linked file by the shared rule, as checkOnce judged it.
+  if (fresh?.linked && linkedNotThere(st)) return "missing";
   if (!st.isFile()) return "mismatched";
   if (await isPlaceholder(absIn(root, path), { stat: async () => st })) return "placeholder";
   if (!fresh) return undefined; // a locked project's file, present
@@ -997,9 +1004,11 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
   const missing: ExpectedFile[] = [];
   for (const f of files) {
     try {
-      await fsp.lstat(absIn(lib.root, f.path));
-    } catch (err) {
-      if (isGone(err)) missing.push(f);
+      // R503 f, R510: a linked file is missing by the shared rule (nothing there, a symbolic link, a folder); what is at its
+      // old path is never touched — a relink only points the record at the file found.
+      if (f.asset?.linked ? await missingAt(lib.root, f.path) : !(await pathExists(absIn(lib.root, f.path)))) missing.push(f);
+    } catch {
+      // Neither missing nor known to be there (it cannot be read): not searched for, as before.
     }
   }
   result.stillMissing = missing.length;

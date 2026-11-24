@@ -1,9 +1,15 @@
 /**
  * Whether a record's file can be reached now — the Missing files screen's rule, shared with Find and acquire (R470 a).
- * A file is missing when nothing is at its library-relative path (a linked file's path may start with "..", R24):
- * `lstat` answers ENOENT or ENOTDIR. Anything else (a cloud placeholder, a file that cannot be read) is there.
+ * R503 f as corrected by R510 (FR-727): a recorded LINKED file (its library-relative path may start with "..", R24) is
+ * MISSING when nothing is at its path (`lstat` answers ENOENT or ENOTDIR), when ANY symbolic link is at its path
+ * (whether or not its target is there: the app opens content without following links, so a file it calls present must
+ * be one it can read), and when a folder is there. The rule never looks through a link (`lstat` only), so a link into
+ * a mount that does not answer cannot hold it up. Anything else (a cloud placeholder, a file that cannot be read for
+ * want of permission) is there: an error other than "nothing is there" is thrown, and the callers count it as there
+ * (today's answer — the app has no state that says a source's file "cannot be read").
  */
 import * as fsp from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { join } from "node:path";
 import type { Asset } from "@ao/core";
 
@@ -13,11 +19,13 @@ export const isGone = (err: unknown): boolean => ["ENOENT", "ENOTDIR"].includes(
 /** A library-relative path (a linked one may start with "..") under the library's root. */
 export const absIn = (root: string, rel: string): string => join(root, ...rel.split("/"));
 
-/** Whether nothing is at `rel` under `root` now (the Missing files screen's "missing"). */
+/** R510: whether what `lstat` found at a recorded LINKED path is not a file the app can read there (a link, a folder). */
+export const linkedNotThere = (st: Pick<Stats, "isSymbolicLink" | "isDirectory">): boolean => st.isSymbolicLink() || st.isDirectory();
+
+/** Whether the linked file recorded at `rel` under `root` is missing now (the Missing files screen's "missing"). */
 export async function missingAt(root: string, rel: string): Promise<boolean> {
   try {
-    await fsp.lstat(absIn(root, rel));
-    return false;
+    return linkedNotThere(await fsp.lstat(absIn(root, rel)));
   } catch (err) {
     if (isGone(err)) return true;
     throw err;

@@ -6,7 +6,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { lstat, rm, symlink } from "node:fs/promises";
+import { lstat, mkdir, rm, symlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project, SourceFile } from "@ao/core";
@@ -112,6 +112,53 @@ describe("openAssetContent", () => {
     const err = (await openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true).catch((e: unknown) => e)) as Error;
     expect(err).toBeInstanceOf(NotFoundError);
     expect(err.message).not.toContain(kit.tmp);
+  });
+
+  describe("R510 (FR-727): a LINKED original whose path holds a symbolic link or a folder is answered as a file not there", () => {
+    /** A source whose only original is linked in place (outside the library), and its recorded absolute path. */
+    async function linkedSource() {
+      const p = await makeProject(kit);
+      const file = await scratchFile(kit, "talk.mp3", randomBytes(100));
+      const sf = await addSource(kit, p, { type: "audio", title: "A linked talk", files: [{ path: file, role: "original", handling: "link" }] });
+      expect(sf.assets[0]!.linked).toBeDefined();
+      return { p, sf, abs: sf.assets[0]!.linked!.absolutePath };
+    }
+    const KINDS: Array<[string, (abs: string) => Promise<void>]> = [
+      ["a symbolic link to a file that is there", async (abs) => symlink(await scratchFile(kit, "real.mp3", randomBytes(100)), abs)],
+      ["a symbolic link that leads nowhere", async (abs) => symlink(join(kit.tmp, "unplugged", "talk.mp3"), abs)],
+      ["a folder", async (abs) => mkdir(abs)],
+      ["a symbolic link to a folder", async (abs) => symlink(dirname(await scratchFile(kit, "x.mp3", "x")), abs)],
+    ];
+    for (const [kind, make] of KINDS) {
+      it(`${kind}: NotFoundError, without its path`, async () => {
+        const { p, sf, abs } = await linkedSource();
+        await rm(abs);
+        await make(abs);
+        const err = (await openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true).catch((e: unknown) => e)) as Error;
+        expect(err).toBeInstanceOf(NotFoundError);
+        expect(err.message).not.toContain(kit.tmp);
+      });
+    }
+
+    it("a FIFO at a linked path is still refused as unsafe (only a link or a folder counts as not there)", async () => {
+      const { p, sf, abs } = await linkedSource();
+      await rm(abs);
+      expect(spawnSync("mkfifo", [abs]).status).toBe(0);
+      const err = (await openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true).catch((e: unknown) => e)) as Error;
+      expect(err).toBeInstanceOf(InvalidInputError);
+      expect(err.message).toBe("this file could not be opened safely");
+    });
+
+    it("a folder in place of a file STORED inside the library is still refused as unsafe", async () => {
+      const p = await makeProject(kit);
+      const sf = await mediaSource(p, randomBytes(100));
+      const abs = join(kit.lib.root, ...sf.assets[0]!.path.split("/"));
+      await rm(abs);
+      await mkdir(abs);
+      const err = (await openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true).catch((e: unknown) => e)) as Error;
+      expect(err).toBeInstanceOf(InvalidInputError);
+      expect(err.message).toBe("this file could not be opened safely");
+    });
   });
 
   it("closing while a range is being read ends it and releases the file", async () => {

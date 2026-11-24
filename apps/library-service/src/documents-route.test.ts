@@ -334,14 +334,32 @@ describe("the ranged PDF route (Task R5)", () => {
     plainError(inLib, 400, "VALIDATION", UNSAFE);
     expect(inLib.body).not.toContain("INSIDE-THE-LIBRARY");
 
-    // A linked file replaced by a link.
+    // A linked file replaced by a link: never followed, and (R510) answered as a file that is not there.
     const linked = await scratch("linked.pdf", pdfBytes(1000));
     const l = await sourceWith(pid, linked, "link");
     await unlink(linked);
     await symlink(secret, linked);
     const viaLink = await get(pid, l.sid, l.aid, "bytes=0-");
-    plainError(viaLink, 400, "VALIDATION", UNSAFE);
+    plainError(viaLink, 404, "NOT_FOUND", MISSING);
     expect(viaLink.body).not.toContain("SECRET-BYTES");
+  });
+
+  it("R510 (FR-727): a linked file's path holding a link that leads nowhere, a folder, or a link to a folder answers 404 as a file not there", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject();
+    for (const make of [
+      (p: string) => symlink(join(tmp, "unplugged", "x.pdf"), p),
+      (p: string) => mkdir(p),
+      async (p: string) => symlink(join(tmp, "in"), p),
+    ]) {
+      const linked = await scratch("linked.pdf", pdfBytes(1000));
+      const l = await sourceWith(pid, linked, "link");
+      await unlink(linked);
+      await make(linked);
+      plainError(await get(pid, l.sid, l.aid, "bytes=0-9"), 404, "NOT_FOUND", MISSING);
+    }
+    expect(logs).not.toContain(tmp);
   });
 
   it("a file over the limit answers 413, decided from the recorded size before the file is opened", async () => {

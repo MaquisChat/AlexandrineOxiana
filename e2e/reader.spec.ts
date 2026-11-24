@@ -37,7 +37,7 @@
  * once, with nothing of the document left (nor of its highlights, R8); real 600 dpi pages stay within the reader's budget. Each
  * under the app's policy, with nothing fetched from elsewhere.
  */
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve, sep } from "node:path";
@@ -842,6 +842,23 @@ test("a missing linked file says so", async ({ page, app }) => {
     await expect(page.getByText("The file of this source is not where it was recorded, so it cannot be shown.", { exact: true })).toBeVisible();
     await expect(page.locator("canvas")).toHaveCount(0);
   });
+
+  // R510 (FR-727): the app reads nothing through a symbolic link, so a link in the file's place — to a copy that is
+  // there, or leading nowhere — is a file not there, said in the same words (not "Not a PDF").
+  for (const [what, to] of [
+    ["a link to a copy that is there", join(app.root, "outside", "copy-of-linked-paper.pdf")],
+    ["a link that leads nowhere", join(app.root, "unplugged", "linked-paper.pdf")],
+  ] as const) {
+    await test.step(`${what} in its place: the reader says the file is not where it was recorded`, async () => {
+      if (what === "a link to a copy that is there") writeFileSync(to, await buildMultiPagePdf(3));
+      rmSync(linked, { force: true });
+      symlinkSync(to, linked);
+      await readFromLibrary(page, app, projectId, sid);
+      await expect(page.getByRole("heading", { level: 2, name: "File not found" })).toBeFocused();
+      await expect(page.getByText("The file of this source is not where it was recorded, so it cannot be shown.", { exact: true })).toBeVisible();
+      await expect(page.locator("canvas")).toHaveCount(0);
+    });
+  }
   expect(seen.pageErrors).toEqual([]);
   expectOnlyOwnOrigins(seen, app);
 });
