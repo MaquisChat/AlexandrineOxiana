@@ -5,8 +5,8 @@
  * original put back is never removed or overwritten. Proven by the reviewer's probe Q1, the crash-in-reopen case, and
  * an enumeration of every two- and three-step sequence at one path, each first roll-back cut after each of its steps.
  */
-import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { appendFile, copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
@@ -17,6 +17,7 @@ import { createLibrary, openLibrary, type Library } from "../library.js";
 import type { Repo } from "./index.js";
 import type { Tx } from "./mutate.js";
 import { importChange } from "./repo.js";
+import { AuditStore } from "./audit-store.js";
 import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
 import { MIXED_WRITE, fromRel, undoEntries, type MarkerEntry, type TxnMarker } from "./txn.js";
 
@@ -377,25 +378,32 @@ const sequences = (n: number): Op[][] => (n === 0 ? [[]] : sequences(n - 1).flat
  * One case: the change takes its steps at one path and fails; its in-process roll-back is cut after `cut` steps; a
  * second roll-back (a reopen) runs to the end, then a third. Returns the failures found, each naming the case.
  */
-async function runCase(seq: Op[], startExists: boolean, cut: number): Promise<{ failures: string[]; lines: number }> {
+async function runCase(seq: Op[], startExists: boolean, cut: number, legacy = false): Promise<{ failures: string[]; lines: number }> {
   const v = await makeWorld();
   const failures: string[] = [];
-  const name = `[${seq.join(", ")}] from ${startExists ? "a file with original bytes" : "no file"}, first roll-back cut after ${cut} step(s)`;
+  const name = `${legacy ? "an older build's marker " : ""}[${seq.join(", ")}] from ${startExists ? "a file with original bytes" : "no file"}, first roll-back cut after ${cut} step(s)`;
   try {
     const rel = `${v.folder}/rerun.txt`;
     if (startExists) await writeFile(fromRel(v.lib.root, rel), ORIGINAL);
     const before = await bytesAt(v, rel);
     seams.stopUndoAfter = cut;
-    await expect(
-      v.repo.mutate(v.pid, STORE, async (tx) => {
-        for (const [i, op] of seq.entries()) {
-          if (op === "trash") await tx.trash(rel);
-          else if (op === "append") await tx.appendLine(rel, `step ${i} appended`);
-          else await tx.writeFile(rel, `step ${i} wrote (${op})\n`);
-        }
-        throw new Error("the change failed");
-      }),
-    ).rejects.toThrow("the change failed");
+    if (legacy) {
+      // The steps and the marker as an older build left them (it took the shape the transaction now refuses), then
+      // its in-process roll-back, cut as by a crash.
+      const entries = await legacySteps(v, rel, seq);
+      if (await undoEntries(v.lib.root, entries)) failures.push(`${name}: the cut roll-back reported complete`);
+    } else {
+      await expect(
+        v.repo.mutate(v.pid, STORE, async (tx) => {
+          for (const [i, op] of seq.entries()) {
+            if (op === "trash") await tx.trash(rel);
+            else if (op === "append") await tx.appendLine(rel, `step ${i} appended`);
+            else await tx.writeFile(rel, `step ${i} wrote (${op})\n`);
+          }
+          throw new Error("the change failed");
+        }),
+      ).rejects.toThrow("the change failed");
+    }
     if (seams.stopUndoAfter !== undefined) failures.push(`${name}: the cut did not happen`);
     seams.stopUndoAfter = undefined;
     if ((await markerNames(v)).length !== 1) return { failures: [...failures, `${name}: no marker after the cut roll-back`], lines: 0 };
@@ -420,14 +428,70 @@ async function runCase(seq: Op[], startExists: boolean, cut: number): Promise<{ 
         failures.push(`${name}: after the ${run} roll-back, incomplete with ${e.kind} copy ${copy} gone${e.kind === "trashed" ? " and nothing at its path" : ""}`);
       }
     };
+    const invalid = () => {
+      if (v.repo.integrityWarnings.some((x) => x.kind === "invalid-txn-marker")) failures.push(`${name}: the marker was found invalid`);
+    };
     await reopen(v);
+    invalid();
     await judge("second");
     await reopen(v);
+    invalid();
     await judge("third");
     return { failures, lines: m.entries.length };
   } finally {
     await dropWorld(v);
   }
+}
+
+/** The marker's head, as the transaction writes it for one `store` request at the project's audit head now. */
+async function markerHead(v: World): Promise<Omit<TxnMarker, "entries">> {
+  const projectFolder = v.repo.getProject(v.pid).folder;
+  const auditSeqBefore = (await AuditStore.read(fromRel(v.lib.root, `${projectFolder}/audit`))).length;
+  return { formatVersion: 1, txn: newId(), projectId: v.pid, projectFolder, auditEvents: 1, auditSeqBefore };
+}
+
+/**
+ * R509 (M3): what an older build (before R503 a) did for a change that both appends to a file and rewrites it, written
+ * directly to disk: each step recorded in the marker as its transaction recorded it, then taken; the marker as it left
+ * it. A trash moves the file into `.tmp/trash-<txn>-<hex>`; a write records "replaced" (the file copied aside to
+ * `.tmp/txn-<txn>.orig-<n>`, with its mode) or "created", each with the hash of what it wrote; an append records the
+ * size before it, once per file until a trash of that file.
+ */
+async function legacySteps(v: World, rel: string, seq: Op[]): Promise<MarkerEntry[]> {
+  const root = v.lib.root;
+  const head = await markerHead(v);
+  const entries: MarkerEntry[] = [];
+  const abs = fromRel(root, rel);
+  const tmp = join(root, ".tmp");
+  await mkdir(tmp, { recursive: true });
+  let backups = 0;
+  let appended = false;
+  for (const [i, op] of seq.entries()) {
+    const there = (await bytesAt(v, rel)) !== null;
+    if (op === "trash") {
+      const to = `.tmp/trash-${head.txn}-${randomBytes(8).toString("hex")}`;
+      entries.push({ kind: "trashed", from: rel, to });
+      await rename(abs, fromRel(root, to));
+      appended = false;
+    } else if (op === "append") {
+      const prevSize = there ? (await stat(abs)).size : 0;
+      if (!appended) entries.push({ kind: "append", path: rel, prevSize, created: !there });
+      appended = true;
+      await appendFile(abs, `step ${i} appended\n`);
+    } else {
+      const bytes = `step ${i} wrote (${op})\n`;
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      if (there) {
+        const backup = `.tmp/txn-${head.txn}.orig-${backups++}`;
+        const mode = (await stat(abs)).mode & 0o777;
+        await copyFile(abs, fromRel(root, backup));
+        entries.push({ kind: "replaced", path: rel, backup, mode, sha256 });
+      } else entries.push({ kind: "created", path: rel, sha256 });
+      await writeFile(abs, bytes);
+    }
+  }
+  await writeFile(join(tmp, `txn-${head.txn}.json`), JSON.stringify({ ...head, entries } satisfies TxnMarker));
+  return entries;
 }
 
 /** A sequence the transaction refuses (R503 a): refused at its first step that mixes, nothing of it is left, no marker. */
@@ -462,14 +526,46 @@ async function refusedCase(seq: Op[], startExists: boolean): Promise<string[]> {
 }
 
 /**
- * Cases per group: the sum, over the sequences the API takes, of the marker's lines + 1 (a cut after 0 … all its steps).
+ * The enumeration: every two- and three-step sequence at one path that the transaction API took before R503 a, 52
+ * sequences, in three groups.
+ * - Taken now (26 sequences, 85 cases): the change runs through the transaction and fails; its roll-back is cut after
+ *   each of its steps (a case per cut: the marker's lines + 1), then undone at a reopen, and again at a second.
+ * - Refused now (the 26 that both append to the file and write it whole, R503 a): the transaction refuses each at its
+ *   first step that mixes, writing nothing, and no marker is left (26 checks).
+ * - Left by an older build (the same 26, 94 cases; R509 M3): a library may still hold such a marker. It is written
+ *   directly to disk as that build left it, its roll-back cut after each of its steps, then undone at a reopen, and
+ *   again at a second, with the assertions these sequences had when the API still took them.
  * Every step records one line, except an append to a file already appended to since its last trash (covered by the
- * first). A sequence that both appends and writes the file whole is refused by the transaction (R503 a) and is checked
- * as refused instead. Two steps: 6 sequences (17 cases) from a file, 4 (11) from none, and 2 + 2 refused; three: 10 (36)
- * and 6 (21), and 12 + 10 refused. 26 sequences and 85 cases rolled back, 26 sequences refused.
+ * first). Taken now: two steps, 6 sequences (17 cases) from a file, 4 (11) from none; three, 10 (36) and 6 (21).
+ * Refused now and left by an older build: two steps, 2 sequences (6 cases) from a file, 2 (6) from none; three, 12 (45)
+ * and 10 (37). In all 179 roll-back cases (85 + 94), as before R503 a, and 26 refusals.
  */
 const EXPECTED_CASES: Record<string, number> = { "2-true": 17, "2-false": 11, "3-true": 36, "3-false": 21 };
 const EXPECTED_REFUSED: Record<string, number> = { "2-true": 2, "2-false": 2, "3-true": 12, "3-false": 10 };
+const EXPECTED_LEGACY: Record<string, number> = { "2-true": 6, "2-false": 6, "3-true": 45, "3-false": 37 };
+
+describe("R509 (M3): the head of a marker written by hand is the transaction's own", () => {
+  it("formatVersion, project, its folder, the audit events of one store request, and the audit head at its start", async () => {
+    const v = await makeWorld();
+    try {
+      const rel = `${v.folder}/rerun.txt`;
+      const head = await markerHead(v);
+      seams.stopUndoAfter = 0;
+      await expect(
+        v.repo.mutate(v.pid, STORE, async (tx) => {
+          await tx.writeFile(rel, "x\n");
+          throw new Error("the change failed");
+        }),
+      ).rejects.toThrow("the change failed");
+      seams.stopUndoAfter = undefined;
+      const { entries: _e, txn: _t, ...real } = await readMarker(v);
+      const { txn: _h, ...mine } = head;
+      expect(mine).toEqual(real);
+    } finally {
+      await dropWorld(v);
+    }
+  });
+});
 
 describe("R493: every two- and three-step sequence at one path, every cut of the first roll-back", () => {
   for (const length of [2, 3]) {
@@ -479,9 +575,18 @@ describe("R493: every two- and three-step sequence at one path, every cut of the
         const taken = sequences(length).filter((s) => takes(s, startExists));
         let cases = 0;
         let refused = 0;
+        let legacy = 0;
         for (const seq of taken.filter(mixed)) {
           failures.push(...(await refusedCase(seq, startExists)));
           refused++;
+          // The same shape, as a marker an older build left: every cut of its roll-back, then undone and undone again.
+          const first = await runCase(seq, startExists, 0, true);
+          failures.push(...first.failures);
+          legacy++;
+          for (let cut = 1; cut <= first.lines; cut++) {
+            failures.push(...(await runCase(seq, startExists, cut, true)).failures);
+            legacy++;
+          }
         }
         for (const seq of taken.filter((s) => !mixed(s))) {
           // The first case (no step undone) shows how many lines the marker holds: then one cut after each step, the last
@@ -496,7 +601,8 @@ describe("R493: every two- and three-step sequence at one path, every cut of the
         }
         expect(cases).toBe(EXPECTED_CASES[`${length}-${startExists}`]);
         expect(refused).toBe(EXPECTED_REFUSED[`${length}-${startExists}`]);
-        expect(failures, `${failures.length} of ${cases} case(s) failed`).toEqual([]);
+        expect(legacy).toBe(EXPECTED_LEGACY[`${length}-${startExists}`]);
+        expect(failures, `${failures.length} of ${cases + legacy} case(s) failed`).toEqual([]);
       }, 600_000);
     }
   }
