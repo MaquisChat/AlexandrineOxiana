@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
+import { attachClosedSentence } from "@ao/shared";
 import { CURRENT_RW, libraryHandlers, PROJECTS, server, SOURCES, TAGS, serviceError, testApi, url, useMockService } from "../test/service";
 import { Library } from "./Library";
 
@@ -107,6 +108,26 @@ describe("Library screen", () => {
     // It leads to the project's queue, at that source's entries (Task 67).
     expect(within(items[1]!).getByRole("link", { name: /needs review/i }).getAttribute("href")).toBe("/import/review?project=p1&source=s10");
     expect(items[2]!.textContent).toMatch(/c\.pdf.*The file could not be read\./);
+  });
+
+  it("FR-749 (R546): a file whose attach the library's closing cancelled says so in one sentence, its name as the researcher's own text", async () => {
+    server.use(
+      ...libraryHandlers(),
+      http.post(url("/projects/:id/attach"), () =>
+        HttpResponse.json({ items: [{ path: "/home/r/דוח.pdf", outcome: "cancelled", reason: attachClosedSentence("דוח.pdf") }] }),
+      ),
+    );
+    renderLibrary();
+    await screen.findByText("Ethnography at Work");
+    drop(screen.getByRole("region", { name: /attach files/i }), ["/home/r/דוח.pdf"]);
+    const list = await screen.findByRole("list", { name: "Attached files" });
+    const [item] = within(list).getAllByRole("listitem");
+    expect(item!.textContent).toBe(attachClosedSentence("דוח.pdf"));
+    expect(item!.textContent).toBe("The library was closed before דוח.pdf was attached, so nothing was changed; attach it again after opening the library.");
+    // The name is isolated as the researcher's own text; nothing else of the line is.
+    const isolated = item!.querySelectorAll('[dir="auto"]');
+    expect([...isolated].map((e) => e.textContent)).toEqual(["דוח.pdf"]);
+    expect(item!.className).toBe("ao-outcome--failed");
   });
 
   it("links the project's review queue beside its other actions, with the count of waiting entries (Task 67)", async () => {

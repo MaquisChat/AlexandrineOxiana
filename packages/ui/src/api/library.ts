@@ -311,7 +311,8 @@ export interface SourceFile {
 
 export type SourcePatch = Partial<Pick<SourceFile["source"], "type" | "title" | "creators" | "publisher" | "issued" | "accessed" | "identifiers" | "collectionIds" | "tagIds">> & Record<string, unknown>;
 
-export type AttachStatus = "created" | "attached" | "duplicate" | "needs-review" | "failed";
+/** `cancelled` (FR-749, R546): the library's closing cancelled the file's attach before anything of it was written. */
+export type AttachStatus = "created" | "attached" | "duplicate" | "needs-review" | "failed" | "cancelled";
 export interface AttachOutcome {
   path: string;
   outcome: AttachStatus;
