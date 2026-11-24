@@ -3351,14 +3351,14 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       for (const sp of [...spies, pushState, replaceState]) seen.push(JSON.stringify(sp.mock.calls.map((c) => c.map(String))));
       const all = seen.join("\n");
       for (const secret of [TICKET, LIB_URL, "ezproxy.lib.example.edu", "ao.through.zq7"]) expect(all.includes(secret), secret).toBe(false);
-      // The calls to the shell that carry them — the open, and R342 b's second open — and no other (the take and the
-      // closes, the leftover's and Cancel's, carry nothing).
+      // The calls to the shell that carry them — the open, R342 b's second open, and Cancel's close of the window this
+      // page opened (R477 b: the ticket only) — and no other (the take and the leftover's close carry nothing).
       expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([
         [TICKET, LIB_URL, "library"],
         [TICKET, LIB_URL, "library"],
       ]);
       expect(fake.shell!.libraryWindowTakePdf.mock.calls).toEqual([[]]);
-      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[], []]);
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[], [TICKET]]);
       expect(fake.shell!.openInBrowser).not.toHaveBeenCalled();
       // No request after the start carries them.
       expect(JSON.stringify(calls.filter((c) => !c.path.endsWith("/library/start")))).not.toMatch(/0123456789abcdef0123456789abcdef|ezproxy/u);
@@ -3712,6 +3712,9 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       await user.click(btn("remove me", "Remove from the queue"));
       await waitFor(() => expect(rows()).toHaveLength(1));
       await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      // R477 b: the close is on behalf of the open that made the window — it carries that open's ticket.
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[fake.shell!.openLibraryWindow.mock.calls[0]![0]]]);
+      expect(fake.shell!.closeLibraryWindow.mock.calls[0]![0]).toBe(TICKET);
       for (const s of ["fetching", "handed-over", "closed"] as const) await say({ ticket: TICKET, state: s });
       await quiet();
       expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1);
@@ -3726,6 +3729,7 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       progress(e, "no-open-copy");
       await waitFor(() => expect(stateOf("returned")).toBe("No open copy"));
       await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[TICKET]]);
       const h = heard();
       for (const s of ["fetching", "not-a-pdf", "handed-over", "closed"] as const) await say({ ticket: TICKET, state: s });
       await quiet();
@@ -3757,6 +3761,9 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       // The shell opens the window after all: the page closes it.
       act(() => answer(true));
       await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      // R477 b: the close carries THAT open's ticket, so the shell closes only the window that open made.
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[fake.shell!.openLibraryWindow.mock.calls[0]![0]]]);
+      expect(fake.shell!.closeLibraryWindow.mock.calls[0]![0]).toBe(TICKET);
       // Its closing, reported with the ticket, is no row's.
       await say({ ticket: TICKET, state: "closed" });
       await say({ ticket: TICKET, state: "fetching" });
@@ -3767,11 +3774,23 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       expect(note("late shell")).toBe(NOT_OPENED);
     });
 
-    it("FR-561: an open given up on that the shell carries out only after a newer start opened its window does not close the newer window", async () => {
+    it("FR-561: an open given up on that the shell carries out only after a newer start opened its window does not close the newer window (R477 b: the page's close carries the OLDER ticket, which the shell refuses)", async () => {
       serveOne("late then newer");
       let answer!: (v: boolean) => void;
-      fake.shell!.openLibraryWindow.mockReturnValueOnce(new Promise<boolean>((r) => (answer = r)));
-      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      // As the shell (FR-561): the newest open owns the window; a close with another ticket closes nothing.
+      let owner: string | null = null;
+      const shell = fake.shell!;
+      shell.openLibraryWindow.mockReturnValueOnce(new Promise<boolean>((r) => (answer = r)));
+      shell.openLibraryWindow.mockImplementation(async (t) => {
+        owner = t;
+        return true;
+      });
+      shell.closeLibraryWindow.mockImplementation(async (t) => {
+        if (t !== undefined && t !== owner) return;
+        const was = owner;
+        owner = null;
+        queueMicrotask(() => shell.libraryWindow({ ticket: was, state: "closed" }));
+      });
       show();
       await waitFor(() => expect(rows()).toHaveLength(1));
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
@@ -3791,10 +3810,12 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       await waitFor(() => expect(stateOf("late then newer")).toBe("Waiting for you in the sign-in window"));
       expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(2);
       expect(fake.shell!.openLibraryWindow.mock.calls[1]![0]).toBe(SECOND);
-      // The first open is answered only now: the newer window is not closed, and its wait goes on.
+      // The first open is answered only now: the page asks to close the window THAT open made — with its (older) ticket,
+      // never the newer one and never none — so the newer window is not closed, and its wait goes on.
       act(() => answer(true));
       await quiet();
-      expect(fake.shell!.closeLibraryWindow).not.toHaveBeenCalled();
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[TICKET]]);
+      expect(owner).toBe(SECOND);
       expect(posts("/library/cancel")).toHaveLength(1);
       expect(stateOf("late then newer")).toBe("Waiting for you in the sign-in window");
     });
@@ -3857,6 +3878,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
         [TICKET, LIB_URL, "library"],
       ]);
       expect(shell.closeLibraryWindow).toHaveBeenCalledTimes(1);
+      // The page does not know the leftover's ticket: its close carries none (R477 b).
+      expect(shell.closeLibraryWindow.mock.calls).toEqual([[]]);
       const [first, second] = shell.openLibraryWindow.mock.invocationCallOrder;
       expect(shell.closeLibraryWindow.mock.invocationCallOrder[0]).toBeGreaterThan(first!);
       expect(shell.closeLibraryWindow.mock.invocationCallOrder[0]).toBeLessThan(second!);

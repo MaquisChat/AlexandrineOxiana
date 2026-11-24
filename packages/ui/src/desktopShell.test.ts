@@ -253,6 +253,16 @@ describe("the library sign-in window (Task F16): six commands and one event, thr
     invoke.mockResolvedValueOnce(null);
     await m.closeLibraryWindow();
     expect(invoke).toHaveBeenLastCalledWith("close_library_window", {});
+    // R477 b: a ticket goes with the close only when it is a non-empty string; never `{ ticket: undefined }` or null.
+    invoke.mockResolvedValueOnce(null);
+    await m.closeLibraryWindow(TICKET);
+    expect(invoke).toHaveBeenLastCalledWith("close_library_window", { ticket: TICKET });
+    for (const none of [undefined, ""]) {
+      invoke.mockResolvedValueOnce(null);
+      await m.closeLibraryWindow(none);
+      expect(invoke.mock.lastCall).toEqual(["close_library_window", {}]);
+      expect(Object.keys(invoke.mock.lastCall![1] as object)).toEqual([]);
+    }
     invoke.mockRejectedValueOnce(new Error("x"));
     await expect(m.closeLibraryWindow()).resolves.toBeUndefined();
     invoke.mockResolvedValueOnce(false);

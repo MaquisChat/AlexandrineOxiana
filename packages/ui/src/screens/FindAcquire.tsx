@@ -1584,7 +1584,8 @@ function ProjectQueue(props: {
     if (libTicket.current?.ticket === ticket) libTicket.current = null;
     if (endedTickets.current.has(ticket)) return;
     endedTickets.current.add(ticket);
-    if (shell) void shellWithin(shell.closeLibraryWindow());
+    // R477 b: the close carries the ticket of the open that made the window, so it never closes a newer one.
+    if (shell) void shellWithin(shell.closeLibraryWindow(ticket));
   };
   // The ticket is held only while its row waits. Once the row was seen waiting and no longer does (the service returned
   // it: the ticket's end, a lock, a save of the rules), or it is gone (removed here), the window is closed — unless the
@@ -1634,12 +1635,12 @@ function ProjectQueue(props: {
         if (libTicket.current?.ticket === ticket) libTicket.current = null;
         p.then(
           (late) => {
-            // FR-561 (R472): the shell is the guard — it closes a sign-in window only on behalf of the open that made
-            // it (its ticket), so a late answer never ends a newer window's wait. This check is only a second guard: it
-            // does not ask the shell to close when this part of the screen has itself started a newer window since (it
-            // holds that ticket). It sees nothing beyond this part of the screen: not a start made after the screen was
-            // left and opened again or another project chosen, nor the window "Test" opened on Your library.
-            if (late === true && !libTicket.current) void shellWithin(shell.closeLibraryWindow());
+            // FR-561 (R472, R477 b): the shell is the guard — the close carries THIS open's ticket, and the shell closes
+            // a sign-in window only on behalf of the open that made it, so a late answer never ends a newer window's
+            // wait (one started here, after the screen was left and opened again, or by "Test" on Your library). The
+            // page keeps no second guard of its own: one would only keep this open's window standing whenever the page
+            // held a newer ticket, and the shell refuses the close for an older ticket by itself.
+            if (late === true) void shellWithin(shell.closeLibraryWindow(ticket));
           },
           () => {},
         );
@@ -1651,6 +1652,7 @@ function ProjectQueue(props: {
     if (first !== "refused") return first;
     if (!live()) return false;
     const closed = nextClosed(LIBRARY_CLOSE_WAIT_MS);
+    // The leftover's ticket is not the page's to know: this close carries none (R477 b).
     void shellWithin(shell.closeLibraryWindow());
     if (!(await closed) || !live()) return false;
     return (await ask()) === true;
