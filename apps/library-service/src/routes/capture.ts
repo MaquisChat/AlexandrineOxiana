@@ -45,6 +45,7 @@ import {
   SPEECH_MODELS,
   type BrowserCaptureProgressEvent,
   type CaptureBrowser,
+  type CaptureCutByLockAcknowledged,
   type CaptureContentType,
   type CaptureItemOutcome,
   type CaptureItemStatus,
@@ -282,7 +283,18 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireSession();
     const projectId = projectParam(ctx, req);
     requireUnlocked(s, projectId);
-    return { queues: state.captureQueues.list(projectId) };
+    // The links a lock cut, as a count only, told once the project is unlocked again (R464 b).
+    const cut = state.capturesCutByLock(projectId);
+    return { queues: state.captureQueues.list(projectId), ...(cut ? { cutByLock: cut } : {}) };
+  });
+
+  // The desktop app's "Got it" for that count (not one of the extension's routes: server.ts).
+  app.post("/projects/:id/captures/cut-by-lock/acknowledge", async (req): Promise<CaptureCutByLockAcknowledged> => {
+    const s = state.requireSession();
+    const projectId = projectParam(ctx, req);
+    requireUnlocked(s, projectId);
+    state.acknowledgeCapturesCutByLock(projectId);
+    return { acknowledged: true };
   });
 
   app.get("/projects/:id/captures/:qid", async (req): Promise<CaptureQueueDetail> => {

@@ -11,6 +11,9 @@
  * - `GET /projects/:id/captures/:queueId` → CaptureQueueDetail: one queue with its items' outcomes.
  *   404 for a queue of another project, an unknown one, or one no longer kept.
  * - Both refuse a locked project (423 PROJECT_LOCKED).
+ * - `POST /projects/:id/captures/cut-by-lock/acknowledge` → CaptureCutByLockAcknowledged: the
+ *   researcher's "Got it" for `cutByLock` (FR-370, FR-371; R464 b); the count is forgotten. Desktop
+ *   app only; refuses a locked project (423) as the reads do.
  *
  * A finished queue stays readable for CAPTURE_QUEUE_KEEP_MS after it ended, and the service keeps at
  * most CAPTURE_QUEUES_KEPT finished queues (the oldest finished go first). Running queues are always
@@ -117,6 +120,15 @@ export interface CaptureQueueDetail extends CaptureQueueSummary {
 
 export interface CaptureQueueListResponse {
   queues: CaptureQueueSummary[];
+  /**
+   * How many links a lock of this project stopped before they were captured, not yet acknowledged
+   * (R464 b). Only the count: the addresses were not kept while the project was locked. Absent when none.
+   */
+  cutByLock?: number;
+}
+
+export interface CaptureCutByLockAcknowledged {
+  acknowledged: true;
 }
 
 // ---- starting a capture (Task 47: one declaration for the service and the interface) ----

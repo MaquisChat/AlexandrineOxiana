@@ -430,9 +430,9 @@ describe("a locked project (Task 63 fix round 1: I1, I2; R30, R50, R142)", () =>
     expect(mine.at(-1)?.data).toMatchObject({ finished: true });
     expect(mine.at(-1)?.data.error).toMatch(/^ProjectLockedError/);
     expect(svc.state.captureQueues.detail(plain, plainQueue)).toMatchObject({ finished: true, done: 1 });
-    // After the unlock the screen reads what the service has: nothing of before.
+    // After the unlock the screen reads what the service has: nothing of before, but the count of the links it cut.
     expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
-    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [], cutByLock: 3 }); // only the count of the links it cut (R464 b)
   });
 
   it("I2: a finished queue of a project is forgotten when the project is locked", async () => {
@@ -492,7 +492,7 @@ describe("a lock ends a project's running captures for good (fix round 2: I3, R1
     expect(again.status).toBe(409);
     expect(again.json.error).toMatchObject({ code: "CONFLICT", reason: "CAPTURE_STOPPING" });
     expect(again.json.error.message).not.toMatch(/https?:/);
-    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [], cutByLock: 3 }); // only the count of the links it cut (R464 b)
     worker.release();
     await svc.state.idle();
     // Only the download in flight at the lock ran; nothing of the queue was published after its end.
@@ -502,7 +502,7 @@ describe("a lock ends a project's running captures for good (fix round 2: I3, R1
     expect(mine[0]!.data).toMatchObject({ finished: true });
     expect(mine[0]!.data.error).toMatch(/^ProjectLockedError/);
     expect(svc.state.captureQueue(queueId)).toBeUndefined();
-    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [], cutByLock: 3 });
     // Now a new capture of the same address is accepted, and visible.
     const fresh = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT] } });
     expect(fresh.status).toBe(200);
@@ -679,5 +679,86 @@ describe("a lock ends a project's running captures for good (fix round 2: I3, R1
     expect(r.json.error.message).not.toMatch(/locked/);
     worker.release();
     await svc.state.idle();
+  });
+});
+
+describe("what a lock cut from a project's capture queue: only its COUNT is kept, to remind after the unlock (FR-370, FR-371; R464 b)", () => {
+  const ACK = (pid: string) => `/projects/${pid}/captures/cut-by-lock/acknowledge`;
+  const ADDRESSES = [YT, YT2, IG];
+  /** Every address of the cut queue, and the part of each that names the post (without the site). */
+  const held = (text: string) => ADDRESSES.some((u) => text.includes(u) || text.includes(new URL(u).pathname + new URL(u).search));
+
+  it("after the lock no address of the cut links is held anywhere the service can reach; the count is told only after the unlock, until 'Got it'", async () => {
+    const worker = gatedWorker();
+    let logs = "";
+    await start({ worker, autoStartWorker: false, logStream: new Writable({ write: (c, _e, cb) => ((logs += c.toString()), cb()) }) });
+    await openLibrary();
+    const pid = await project("Secret", true);
+    const events: Array<{ type: string; data: any }> = [];
+    const q = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: ADDRESSES } });
+    expect(q.status, q.body).toBe(200);
+    const queueId = q.json.queueId as string;
+    await until(() => worker.calls.length > 0);
+    svc.state.events.subscribe((e) => events.push(e));
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+
+    // The count's record is a number, and the queue's what remains holds counters only.
+    expect(svc.state.capturesCutByLock(pid)).toBe(3);
+    const reachable = () => [JSON.stringify(svc.state.captureQueue(queueId) ?? null), JSON.stringify(svc.state.captureQueues.list(pid)), JSON.stringify(svc.state.capturesCutByLock(pid)), JSON.stringify(events), logs];
+    for (const text of reachable()) expect(held(text), text.slice(0, 300)).toBe(false);
+
+    // While the project is locked the count is not told: the queues' route refuses as it did, and so does the acknowledgement.
+    const whileLocked = await call({ url: `/projects/${pid}/captures` });
+    expect(whileLocked.status).toBe(423);
+    expect(whileLocked.body).not.toMatch(/cut|3/i);
+    expect((await call({ method: "POST", url: ACK(pid) })).status).toBe(423);
+    expect(svc.state.capturesCutByLock(pid)).toBe(3);
+
+    // The download in flight returns; still nothing of the addresses, an error included.
+    worker.release();
+    await svc.state.idle();
+    for (const text of reachable()) expect(held(text), text.slice(0, 300)).toBe(false);
+
+    // After the unlock the capture state the screen reads carries the count.
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [], cutByLock: 3 });
+
+    // The acknowledgement is the desktop app's own: the extension's token does not reach it.
+    const ext = await extensionToken();
+    const fromExt = await call({ method: "POST", url: ACK(pid), noAuth: true, headers: { authorization: `Bearer ${ext}`, origin: EXT } });
+    expect(fromExt.status).toBe(403);
+    expect((await call({ method: "POST", url: ACK(pid), noAuth: true })).status).toBe(401);
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [], cutByLock: 3 });
+
+    // "Got it": the count is gone, and another lock with nothing running brings nothing back.
+    expect((await call({ method: "POST", url: ACK(pid) })).status).toBe(200);
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+    expect(svc.state.capturesCutByLock(pid)).toBeUndefined();
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+  });
+
+  it("only the links not reached are counted; another project and a project not encrypted count nothing", async () => {
+    const worker = gatedWorker();
+    await start({ worker, autoStartWorker: false });
+    await openLibrary();
+    const pid = await project("Secret", true);
+    const other = await project("Other", true);
+    const plain = await project("Plain");
+    const q = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT, YT2] } });
+    expect(q.status, q.body).toBe(200);
+    const p = await call({ method: "POST", url: `/projects/${plain}/capture`, body: { urls: [IG] } });
+    expect(p.status, p.body).toBe(200);
+    await until(() => worker.calls.length > 1);
+    expect((await call({ method: "POST", url: `/projects/${plain}/lock` })).status).toBe(200);
+    expect((await call({ method: "POST", url: `/projects/${other}/lock` })).status).toBe(200);
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    expect(svc.state.capturesCutByLock(pid)).toBe(2);
+    expect(svc.state.capturesCutByLock(other)).toBeUndefined();
+    expect(svc.state.capturesCutByLock(plain)).toBeUndefined();
+    worker.release();
+    await svc.state.idle();
+    expect((await call({ url: `/projects/${plain}/captures` })).json.cutByLock).toBeUndefined();
   });
 });

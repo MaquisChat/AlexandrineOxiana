@@ -51,6 +51,7 @@ import {
   type CaptureProfileRequest,
   type CaptureQueueDetail,
   type CaptureQueueListResponse,
+  type CaptureCutByLockAcknowledged,
   type CaptureQueueProgressEvent,
   type CaptureQueueSummary,
   type CaptureRequestOptions,
@@ -604,8 +605,10 @@ export function captureApi(client: ApiClient) {
       const body: AcknowledgeRequest = { kind: "cookies" };
       return (await r<AcknowledgeResponse>("POST", `/projects/${pid(projectId)}/acknowledge`, { body })).acknowledgements;
     },
-    /** The project's running and recent capture queues (summaries; Task 63). */
-    queues: async (projectId: string): Promise<CaptureQueueSummary[]> => (await r<CaptureQueueListResponse>("GET", `/projects/${pid(projectId)}/captures`)).queues,
+    /** The project's running and recent capture queues (summaries; Task 63), and the count of links a lock cut (R464 b). */
+    queues: (projectId: string) => r<CaptureQueueListResponse>("GET", `/projects/${pid(projectId)}/captures`),
+    /** The researcher's "Got it" for the links a lock cut (R464 b). */
+    acknowledgeCutByLock: (projectId: string) => r<CaptureCutByLockAcknowledged>("POST", `/projects/${pid(projectId)}/captures/cut-by-lock/acknowledge`),
     /** One queue with its items' outcomes. */
     queue: (projectId: string, queueId: string) => r<CaptureQueueDetail>("GET", `/projects/${pid(projectId)}/captures/${encodeURIComponent(queueId)}`),
     toolVersions: async () => (await r<CaptureToolVersionsResponse>("GET", "/tools/versions")).versions,
