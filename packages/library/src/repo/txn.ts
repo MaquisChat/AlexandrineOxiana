@@ -288,6 +288,44 @@ async function look(root: string, rel: string): Promise<Look> {
   return sha256 === null ? { at: "nothing" } : { at: "file", sha256 };
 }
 
+/**
+ * What a "trashed" line `i` moved, by the lines before it: "the original" when no earlier line of the change is at,
+ * under or above its path; "the change's" when an earlier line made it (created or replaced it whole, made the folder
+ * or one above it, or created it by appending): then nothing of the researcher's is in that copy (a replaced file's
+ * original is in its backup); "changed by the change" when the change only added to it (an append, or lines under a
+ * folder): the original with the change's additions, whose undo after it is put back changes its size and time.
+ */
+function trashedContent(entries: MarkerEntry[], i: number): "the original" | "the change's" | "changed by the change" {
+  const from = (entries[i] as Extract<MarkerEntry, { kind: "trashed" }>).from;
+  let changed = false;
+  for (let j = 0; j < i; j++) {
+    const x = entries[j]!;
+    const p = x.kind === "trashed" ? x.from : x.path;
+    if (from.startsWith(`${p}/`) && x.kind === "dir") return "the change's";
+    if (p === from) {
+      if (x.kind === "created" || x.kind === "replaced" || x.kind === "dir" || (x.kind === "append" && x.created)) return "the change's";
+      changed = true;
+    } else if (p.startsWith(`${from}/`)) changed = true;
+  }
+  return changed ? "changed by the change" : "the original";
+}
+
+/**
+ * Whether what is at a "trashed" line's path has the identity the line recorded of its original (R519 (3)): the same
+ * file number, size and time of last modification, which a rename inside the volume keeps; the file number alone when
+ * the change had added to it (`numberOnly`: undoing that addition in place keeps the number, not the size or time).
+ * Throws when it cannot look.
+ */
+async function isOriginal(root: string, e: Extract<MarkerEntry, { kind: "trashed" }>, numberOnly: boolean): Promise<boolean> {
+  if (process.env.NODE_ENV === "test" && seams.failLook === e.from) throw new Error("simulated read failure");
+  const st = await fsp.lstat(fromRel(root, e.from), { bigint: true }).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
+    throw err;
+  });
+  if (st === null || st.ino.toString() !== e.ino) return false;
+  return numberOnly || (Number(st.size) === e.size && st.mtimeNs.toString() === e.mtimeNs);
+}
+
 /** The hashes the change recorded for what it wrote at `rel` ("created", completion and "replaced" lines). */
 const writeHashes = (entries: MarkerEntry[], rel: string): string[] =>
   entries.flatMap((x) => ((x.kind === "created" || x.kind === "replaced") && x.path === rel && x.sha256 ? [x.sha256] : []));
@@ -341,6 +379,8 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
     if (!causes.some((c) => c.kind === kind && c.path === path)) causes.push({ kind, path });
   };
   const done = new Set<number>();
+  /** Paths where something not of the change, or not known to be, was left as it is (R519). */
+  const blocked: string[] = [];
   for (const [i, e] of entries.entries()) {
     if (e.kind !== "trashed") continue;
     let putBack: boolean;
@@ -352,12 +392,31 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       because("could-not-look", e.from);
     }
     if (!putBack) continue;
-    // R503 b 2: a copy gone while the change's own bytes (a later line's hash) are still at the path was not put back:
-    // it was deleted outside the app. The roll-back is then not complete (the marker is kept); nothing is deleted.
-    try {
-      if (await ownBytesAt(root, e.from, entries.slice(i + 1))) because("kept-copy-gone", e.from);
-    } catch {
-      because("could-not-look", e.from);
+    const earlier = trashedContent(entries, i);
+    if (e.ino !== undefined && earlier !== "the change's") {
+      // R519 (3): the line knows the original's identity. A file with it at the path IS the original, put back (or never
+      // moved: a crash between the line and its rename), whatever its bytes equal (R509 M1). The change's own file,
+      // anything else, or nothing there: the original was not put back and cannot be, the copy being gone (R509 M2).
+      // Nothing at the path is deleted or moved, and no line at or under it is undone.
+      try {
+        if (!(await isOriginal(root, e, earlier === "changed by the change"))) {
+          because("kept-copy-gone", e.from);
+          blocked.push(e.from);
+        }
+      } catch {
+        because("could-not-look", e.from);
+        blocked.push(e.from);
+      }
+    } else {
+      // An older build's line (no identity), or a copy of what the change itself had made (it holds nothing of the
+      // researcher's, and once the earlier lines are undone nothing at the path has its identity), judged as before.
+      // R503 b 2: a copy gone while the change's own bytes (a later line's hash) are still at the path was not put
+      // back: it was deleted outside the app. The roll-back is then not complete (the marker is kept); nothing is deleted.
+      try {
+        if (await ownBytesAt(root, e.from, entries.slice(i + 1))) because("kept-copy-gone", e.from);
+      } catch {
+        because("could-not-look", e.from);
+      }
     }
     for (let j = i + 1; j < entries.length; j++) {
       const x = entries[j]!;
@@ -366,8 +425,6 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       if (p === e.from || p.startsWith(`${e.from}/`)) done.add(j);
     }
   }
-  /** Paths where something not of the change was left as it is (R519). */
-  const blocked: string[] = [];
   const block = (kind: UndoCauseKind, path: string) => {
     because(kind, path);
     blocked.push(path);

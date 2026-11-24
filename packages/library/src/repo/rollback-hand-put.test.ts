@@ -4,7 +4,8 @@
  * leaves it exactly where it is, does not undo the earlier steps at or above that path either, and is incomplete with a
  * cause and the library-relative path; once the researcher moves the file away, the roll-back completes.
  */
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
@@ -17,7 +18,7 @@ import type { Tx } from "./mutate.js";
 import { importChange } from "./repo.js";
 import { PendingWriteIncompleteError } from "./errors.js";
 import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
-import { fromRel, undoEntries, type TxnMarker, type UndoCause } from "./txn.js";
+import { fromRel, undoEntries, type MarkerEntry, type TxnMarker, type UndoCause } from "./txn.js";
 
 const OPEN_GOV = `identifiability:
   containsIdentifiable: false
@@ -308,4 +309,124 @@ describe("R519 (1): a trashed original whose path is occupied", () => {
       expect(causes()).toEqual([]);
     });
   }
+});
+
+describe("R519 (3) (R509 M1, M2): where the kept copy of a trashed original is gone, the original's identity tells whether it was put back", () => {
+  const rel = () => `${folder}/kept.txt`;
+  /** The change trashes the original and writes `again` at its path; a crash before its audit entry. */
+  async function trashedThenWritten(again: (tx: Tx) => Promise<void>): Promise<TxnMarker> {
+    await writeFile(fromRel(lib.root, rel()), ORIGINAL);
+    return crashed(async (tx) => {
+      await tx.trash(rel());
+      await again(tx);
+    });
+  }
+  const write = (bytes: string) => (tx: Tx) => tx.writeFile(rel(), bytes);
+
+  it("M1: the change wrote the original's very bytes back; the original put back by a roll-back cut before the marker went is DONE, at every later reopen", async () => {
+    const m = await trashedThenWritten(write(ORIGINAL));
+    await lib.close();
+    seams.stopUndoAfter = m.entries.length;
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    expect(seams.stopUndoAfter).toBeUndefined();
+    expect(await text(rel())).toBe(ORIGINAL);
+    expect(await markers()).toHaveLength(1);
+    for (const run of ["second", "third"]) {
+      await reopen();
+      expect(await text(rel()), run).toBe(ORIGINAL);
+      expect(await markers(), run).toEqual([]);
+      expect(causes(), run).toEqual([]);
+    }
+  });
+
+  const GONE: Array<{ name: string; again: (tx: Tx) => Promise<void>; after?: () => Promise<void>; left: string | null }> = [
+    { name: "the change's own file written whole at the path", again: write("the change's own file\n"), left: "the change's own file\n" },
+    { name: "the change's own COPIED file at the path", again: (tx) => tx.copyFile(join(tmp, "other.txt"), rel()).then(() => undefined), left: "the change's own copied file\n" },
+    { name: "a file put there by hand", again: write("the change's own file\n"), after: () => writeFile(fromRel(lib.root, rel()), HAND), left: HAND },
+    { name: "nothing at the path", again: write("the change's own file\n"), after: () => rm(fromRel(lib.root, rel())), left: null },
+  ];
+  for (const g of GONE) {
+    it(`M2: the kept copy deleted by hand, ${g.name}: incomplete (kept-copy-gone), nothing deleted or moved, at every reopen`, async () => {
+      const m = await trashedThenWritten(g.again);
+      await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { recursive: true, force: true });
+      await g.after?.();
+      for (const run of ["first", "second"]) {
+        await reopen();
+        expect(await text(rel()), run).toBe(g.left);
+        expect(await markers(), run).toEqual([`txn-${m.txn}.json`]);
+        expect(causes(), run).toEqual([{ kind: "kept-copy-gone", path: rel() }]);
+        expect(kinds(), run).not.toContain("changed-outside-before-rollback");
+      }
+    });
+  }
+
+  it("an original the change appended to, then trashed, its kept copy deleted by hand: the original part is gone, incomplete (kept-copy-gone)", async () => {
+    await writeFile(fromRel(lib.root, rel()), ORIGINAL);
+    const m = await crashed(async (tx) => {
+      await tx.appendLine(rel(), "a line the change added");
+      await tx.trash(rel());
+    });
+    await rm(fromRel(lib.root, (m.entries.find((e) => e.kind === "trashed") as { to: string }).to), { force: true });
+    for (const run of ["first", "second"]) {
+      await reopen();
+      expect(await text(rel()), run).toBeNull();
+      expect(await markers(), run).toEqual([`txn-${m.txn}.json`]);
+      expect(causes(), run).toEqual([{ kind: "kept-copy-gone", path: rel() }]);
+    }
+  });
+
+  it("the original put back, then replaced by a copy of itself (as when the library was copied to another disk): its identity is lost, incomplete (kept-copy-gone), the file kept", async () => {
+    const m = await trashedThenWritten(write("the change's own file\n"));
+    await lib.close();
+    seams.stopUndoAfter = m.entries.length;
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    expect(await text(rel())).toBe(ORIGINAL);
+    await copyFile(fromRel(lib.root, rel()), join(tmp, "copy-of-it"));
+    await rename(join(tmp, "copy-of-it"), fromRel(lib.root, rel()));
+    await reopen();
+    expect(await text(rel())).toBe(ORIGINAL);
+    expect(await markers()).toEqual([`txn-${m.txn}.json`]);
+    expect(causes()).toEqual([{ kind: "kept-copy-gone", path: rel() }]);
+  });
+
+  describe("at the level of the marker's lines", () => {
+    let root: string;
+    const R = "Projects/P/kept.txt";
+    const T = ".tmp/trash-0-0";
+    beforeEach(async () => {
+      root = await mkdtemp(join(tmpdir(), "ao-r519id-"));
+      await mkdir(fromRel(root, "Projects/P"), { recursive: true });
+      await mkdir(fromRel(root, ".tmp"), { recursive: true });
+      await writeFile(fromRel(root, R), ORIGINAL);
+    });
+    afterEach(async () => {
+      await rm(root, { recursive: true, force: true });
+    });
+    const identity = async () => {
+      const st = await stat(fromRel(root, R), { bigint: true });
+      return { ino: st.ino.toString(), size: Number(st.size), mtimeNs: st.mtimeNs.toString() };
+    };
+
+    it("a crash between the trashed line and its rename (no copy was ever made, no later line): the original is at its path, done", async () => {
+      const entries: MarkerEntry[] = [{ kind: "trashed", from: R, to: T, ...(await identity()) }];
+      expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
+      expect(await readFile(fromRel(root, R), "utf8")).toBe(ORIGINAL);
+    });
+
+    it("an older build's trashed line (no identity) is judged as before: copy gone, a different file there, counted as put back; the change's own bytes there, kept-copy-gone", async () => {
+      const own = "the change's own file\n";
+      const entries: MarkerEntry[] = [
+        { kind: "trashed", from: R, to: T },
+        { kind: "created", path: R, sha256: createHash("sha256").update(own).digest("hex") },
+      ];
+      await writeFile(fromRel(root, R), HAND);
+      expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
+      expect(await readFile(fromRel(root, R), "utf8")).toBe(HAND);
+      await writeFile(fromRel(root, R), own);
+      expect(await undoEntries(root, entries)).toEqual({ ok: false, causes: [{ kind: "kept-copy-gone", path: R }] });
+      expect(await readFile(fromRel(root, R), "utf8")).toBe(own);
+    });
+  });
 });
