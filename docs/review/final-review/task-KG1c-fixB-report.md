@@ -225,7 +225,7 @@ Tests, **both failed first**:
 All shared ones live once in `packages/shared/src/api/interrupted-changes.ts` unless named.
 - `{p}` is the project's name, always through `UserText`.
 - `{f}` is a library-relative path, shown ONLY in the list and its close question, through `UserText`.
-- [B] is new or changed in round B. [A] is changed in round A. No mark means unchanged since KG-1c.
+- [B] is new or changed in round B. [A] is changed in round A. [R530] is new or changed in the last round (see "Last points (R530)"). No mark means unchanged since KG-1c.
 
 **Banner of an incomplete undo, by state** (`INCOMPLETE_ROLLBACK_BANNER`; kinds `rolled-back-incomplete-write` and `incomplete-write-pending` with a state). Each has "Resolve…".
 1. try-again (a step failed, nothing else): "An interrupted change in {p} could not be undone completely: a step failed. Nothing was lost; the app keeps what it needs to finish. Changes to {p} are off until it is undone. Choose “Resolve…” to try again."
@@ -233,7 +233,7 @@ All shared ones live once in `packages/shared/src/api/interrupted-changes.ts` un
 3. in-the-way: "An interrupted change in {p} could not be undone completely, because a file changed or put there outside the app is in the way. Nothing was lost. Changes to {p} are off until it is undone. Choose “Resolve…” to see which file to move."
 4. lost: "An interrupted change in {p} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. That file is lost. Changes to {p} are off until you close the change. Choose “Resolve…” to see what was lost."
 5. [A] unconfirmed: "An interrupted change in {p} cannot be undone completely: the copy the app kept of a file it removed is gone, so the app cannot put that file back. Something is at its place now, which may be that file, but the app cannot confirm it, so it left it as it is. Changes to {p} are off until you close the change. Choose “Resolve…” to see what is there."
-6. [B] lost-and-blocked: "An interrupted change in {p} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, you can close the change as it is. Changes to {p} are off until then. Choose “Resolve…” to see what to do first."
+6. [B, R530] lost-and-blocked: "An interrupted change in {p} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, the list says whether the change can be closed as it is. Changes to {p} are off until then. Choose “Resolve…” to see what to do first."
 7. [B] lost-copy-stuck: "An interrupted change in {p} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. The app still keeps a copy of another file of the change, which it cannot put back either, and closing the change would let that copy go, so it cannot be closed. Changes to {p} are off. Restoring the project from a backup made before the change is the way to undo it."
 
 **The list, per cause** (`ROLLBACK_CAUSE_TEXT`, `KEPT_COPY_GONE_UNCONFIRMED_TEXT`):
@@ -246,7 +246,7 @@ All shared ones live once in `packages/shared/src/api/interrupted-changes.ts` un
 
 **The list, the next step** (`ROLLBACK_LIST_NEXT` [B]; the close hint in `PendingWritesDialog.tsx`):
 
-13. [B] lost-and-blocked: "Deal with what is named above first, then choose “Roll it back” again. After that, you can close this change as it is."
+13. [B, R530] lost-and-blocked: "Deal with what is named above first, then choose “Roll it back” again. After that, this list says whether the change can be closed as it is."
 14. [B] lost-copy-stuck: "The app still keeps a copy of another file of this change, which it cannot put back either, and closing would let that copy go, so this change cannot be closed. The way forward is to restore the project from a backup made before this change."
 15. Where the close is offered: "You can close this change as it is."
 
@@ -256,14 +256,14 @@ All shared ones live once in `packages/shared/src/api/interrupted-changes.ts` un
 17. [B] could-not-read: "The change could not be undone completely: the app could not read a file. The list shows which file; make sure it can be read, then choose “Roll it back” again."
 18. in-the-way: "The change could not be undone completely: a file changed or put there outside the app is in the way. The list shows which file; move it, then choose “Roll it back” again."
 19. [B] lost and unconfirmed (was 11): "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back. You can now close the change as it is from the list."
-20. [B] lost-and-blocked: "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the undo. The list shows what; deal with it first (move the file it names, or try again), then choose “Roll it back” again. After that, you can close the change as it is."
+20. [B, R530] lost-and-blocked: "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the undo. The list shows what; deal with it first (move the file it names, or try again), then choose “Roll it back” again. After that, the list says whether the change can be closed as it is."
 21. [B] lost-copy-stuck: "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and the app keeps a copy of another file of the change, which it cannot put back either. Restoring the project from a backup made before the change is the way to undo it."
 
 **A write refused:**
 
 22. [B] Held by an interrupted change (`RECOVERY_PENDING_TEXT`: the service's 409 and Find and acquire's `recovery-pending`): "This project takes no changes until an interrupted change is resolved. The warning on the library's main screen says what to do."
 23. [B] Held until the library is opened again (`RECOVERY_PENDING_REOPEN_TEXT`: the service's 409 with reason `reopen`, and Find and acquire's new `reopen-pending`): "This project takes no changes until the library is opened again. The warning on the library's main screen says why."
-24. The import's stop note (`RECOVERY_NOTE`, `space.ts`, untouched): "The import stopped because an earlier change in this project could not be undone. Do what the warning at the top of the library says, then resume the import."
+24. [R530] The import's stop note (`RECOVERY_NOTE`, `packages/library/src/import/bulk/space.ts`): "The import stopped because this project takes no changes until a problem is resolved. Do what the warning on the library's main screen says, then resume the import."
 25. CLI and library error (`RecoveryPendingError`, untouched): "Project {id} refuses changes until an interrupted change is resolved or its audit log is repaired. The library's integrity warnings say which, and what to do."
 
 **A source whose change did not finish:**
@@ -281,7 +281,7 @@ The prefix is followed by, per state:
 29. [B] could-not-read: ", because the app could not read a file; the marker is kept, and recovery is retried on the next open or by rolling it back in the app's list of interrupted changes, which names the file"
 30. in-the-way: ", because a file changed or put there outside the app is in the way; the marker is kept, and the roll-back completes once that file is moved away (the app's list of interrupted changes names it)"
 31. lost and unconfirmed: ": the copy the app kept of a file it removed is gone, so that file cannot be put back; the marker is kept until the change is closed in the app's list of interrupted changes"
-32. [B] lost-and-blocked: ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the roll-back (the app's list of interrupted changes names it); the marker is kept until that is dealt with and the change is closed in that list"
+32. [B, R530] lost-and-blocked: ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the roll-back (the app's list of interrupted changes names it); the marker is kept, and once that is dealt with, that list says whether the change can be closed as it is"
 33. [B] lost-copy-stuck: ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and the app keeps a copy of another file of the change that it cannot put back either; the marker is kept, and restoring the project from a backup made before the change is the way to undo it"
 
 **Closing (R509), in the list dialog:**
@@ -325,6 +325,11 @@ The prefix is followed by, per state:
     - "The app cannot confirm whether this change was finished: the audit log has no record that it was, but the log itself could not be checked in full. So it will not change anything itself."
     - "The way forward is to restore the project from a backup made before this change."
     - Its detail ends: "The app cannot confirm whether this change was finished, so it will change nothing itself. Restoring the project from a backup made before the change is the safe way on."
+
+**A change resolved while its audit log does not match this computer's record (R530; kind `interrupted-change-resolved-reopen`, for the session only: the next opening records the mismatch and raises the anchor's own warning):**
+
+51. [R530] Banner (`StatusBanner.tsx`; no button): "An interrupted change in {p} was resolved, but {p}'s audit log may have been changed outside the app. The app records this the next time the library is opened, and changes to {p} are off until then: close the library and open it again."
+52. [R530] Its CLI detail (`afterResolved`, `pending-writes.ts`): "an interrupted change was resolved, but {the anchor problem's own detail}; this is recorded the next time the library is opened, and this project refuses changes until then: close the library and open it again"
 
 **Unchanged, for completeness:**
 - Read-only: "An interrupted change in {p} could not be finished or undone yet. It is tried again when the library is next opened with write access."
@@ -435,3 +440,57 @@ In an unencrypted project with NOTHING at the place, the source cannot be named.
 **End to end** (`interrupted-change.spec.ts`): chromium 1 passed; webkit 1 passed.
 
 `git status --short`: empty.
+
+## Last points (R530)
+
+Same worktree and branch; from 1634be4. Not pushed. `git stash` never used. `…/kg-1-look` not touched. No permission check refused anything. `git status --short` empty. The numbered list above is corrected (6, 13, 20, 24, 32 changed; 51 and 52 new).
+
+| Point | Commit | What |
+|---|---|---|
+| 1 | 9da8f79 | `lost-and-blocked` no longer promises the close. |
+| 2 | 4375a9f | The import's stop note. |
+| 3 | 5f55203 | The held resolve's own warning kind. |
+| 4 | 47302d6 | Confirmed; one test added, no code changed. |
+
+### 1. The words for a loss with something else in the way
+- Sentence 6 (`INCOMPLETE_ROLLBACK_BANNER["lost-and-blocked"]`, `packages/shared/src/api/interrupted-changes.ts`): "…or try again. After that, the list says whether the change can be closed as it is. Changes to {p} are off until then. Choose “Resolve…” to see what to do first."
+- Sentence 13 (`ROLLBACK_LIST_NEXT["lost-and-blocked"]`, same file): "Deal with what is named above first, then choose “Roll it back” again. After that, this list says whether the change can be closed as it is."
+- Sentence 20 (`ROLLBACK_INCOMPLETE_ANSWER["lost-and-blocked"]`, same file): "…then choose “Roll it back” again. After that, the list says whether the change can be closed as it is."
+- Sentence 32 (`DETAIL_AFTER["lost-and-blocked"]`, `packages/library/src/repo/pending-writes.ts`): "…; the marker is kept, and once that is dealt with, that list says whether the change can be closed as it is"
+- Tests (each failed first): `interrupted-changes.test.ts` (banners and answers word for word; new: `ROLLBACK_LIST_NEXT` word for word); `rollback-words.test.ts` probe P1 (the banner, and new: the whole CLI detail at the opening). Changed to the new words: `StatusBanner.test.tsx`, `PendingWritesDialog.test.tsx`.
+
+### 2. The import's stop note
+- Sentence 24 (`RECOVERY_NOTE`, `packages/library/src/import/bulk/space.ts`): "The import stopped because this project takes no changes until a problem is resolved. Do what the warning on the library's main screen says, then resume the import."
+- The ending is kept: a resumed run drops the note by `STOPPED_NOTE` (`run.ts`).
+- Test: `disk-full.test.ts`, "a project that refuses writes from the batch's first item…". Its `REFUSING` is now the new sentence (failed first). It already asserts that the note is gone after the resume, so the coupling is covered and no test was added.
+
+### 3. A resolved change held at an anchor mismatch
+- **Built as a new kind**, `interrupted-change-resolved-reopen`, beside the existing ones. Why not a state on the anchor warning: the existing `state` field is typed as an incomplete roll-back's state, and the service and `StatusBanner` read it only for the roll-back kinds. A kind needs one union member (`audit-store.ts`), one changed push (`afterResolved`, `pending-writes.ts`) and one sentence (`StatusBanner.tsx` `WARNINGS`). The service passes kinds through unchanged.
+- Banner (sentence 51): "An interrupted change in {p} was resolved, but {p}'s audit log may have been changed outside the app. The app records this the next time the library is opened, and changes to {p} are off until then: close the library and open it again." {p} goes through `UserText` each time (three times). There is no button: nothing to resolve, and it is not kept.
+- CLI detail (sentence 52): "an interrupted change was resolved, but {anchor detail}; this is recorded the next time the library is opened, and this project refuses changes until then: close the library and open it again"
+- **Kept?** No, like round B's states: `KEPT_KINDS` holds only `rolled-back-incomplete-write` (without a state) and `interrupted-change-closed`. The warning lasts for the session. The next opening records the mismatch, raises the anchor kind's own warning, and the project takes changes again.
+- Tests (each failed first):
+  - `pending-writes.test.ts` (d): the held resolve raises exactly this warning, with its whole detail. After the reopen, only `head-mismatch` is left.
+  - `server.test.ts`, new describe "R530": a marker whose undo failed at the opening (seam `failUndo = "created"`), then the anchor's hash changed, then "Roll it back" gives 200. `/libraries/integrity` lists `[interrupted-change-resolved-reopen, "Study"]`, and a write gets 409 with sentence 23. With the kind scratch-reverted, it failed: "expected [['head-mismatch','Study']]".
+  - `StatusBanner.test.tsx`: the whole sentence with a right-to-left name isolated three times, no button; and the kind is added to "every warning kind … has its own sentence".
+
+### 4. The second refused-write sentence
+- Confirmed. `reopenToResume` is set in exactly two places:
+  - `repo.ts` (an audit entry that failed at the opening);
+  - `afterResolved` (the held resolve).
+- `pendingReason` gives `reopen` only then, and the service maps it to sentence 23. With point 3, the warning it points to says what to do.
+- Tests:
+  - the held resolve: `pending-writes.test.ts` (d) (`reason: "reopen"`, already there) and the new `server.test.ts` test (the 409's text);
+  - the opening's failed audit entry: `runner.test.ts` (`reopen-pending` and its text, already there); new in `repo.test.ts`, "an audit append that fails during open…", a write is refused with `reason: "reopen"`. It passed at once, as expected for a confirmation.
+- No code changed.
+
+### Runs (each alone, `nice -n 10`)
+- @ao/shared `interrupted-changes`: 133/133.
+- @ao/library: pending-writes 22/22, kept-warnings 11/11, rollback-words 18/18, pending-writes-close 13/13, repo 61/61, import/bulk/disk-full 14/14.
+- @ao/library-service `server.test`: 158 passed, 1 skipped.
+- @ao/ui: StatusBanner 74/74, PendingWritesDialog (the list's screen) 24/24.
+- @ao/cli: no test quotes a changed sentence; none run.
+- Typechecks (0 errors): shared, library, library-service, ui, cli.
+- `lint:css` clean; `lint:colours` ok.
+- End to end: not run. `interrupted-change.spec.ts` asserts only the `in-the-way` banner and the list's line, and neither changed.
+
