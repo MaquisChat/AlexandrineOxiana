@@ -74,3 +74,97 @@ The report names this as uncertain (§8). It needs a ruling. Option 1: callers w
 
 ## Verdict
 **Not approved.** I1 (R411 under concurrency, in retries, and for a 429 that a caller without the choice receives) must be mended and tested. I2 needs the coordinator's or owner's ruling: either "unchanged" or "never sooner" for Bulk, Zotero and Find, and a 200 should clear a hold. Then a scoped re-look.
+
+## Second look (R563)
+
+Reviewed: the fix round, `git diff 6e9c1f4..HEAD` (bebe640, four commits, five files), read in full, with its report `task-D31b-fix-report.md`.
+
+The probes were three new files:
+- `http.probeD31b.test.ts`;
+- `bulk/bulk.probeD31b.test.ts`;
+- a scratch copy of `db8623b:packages/library/src/lookup/http.ts` beside them.
+
+All three are deleted, `git status --short` is empty, and nothing was committed. One planted fault is noted below: a background run held it in the file until that run restored it with `git checkout`.
+
+### Per finding
+
+| finding | verdict | probe |
+|---|---|---|
+| I1 | **closed** | See "I1 in detail" below. |
+| I2 | **closed** | See "I2 in detail" below. |
+| M1 | **closed** | See "M1 in detail" below. |
+| M5 | **closed** | See "M5 in detail" below. |
+
+#### I1 in detail
+
+Requests counted for each probe:
+
+| probe | requests the host received |
+|---|---|
+| Three leave-out calls to Crossref at once, first answered 429 / RA 60 | **1** (was 3) |
+| Five calls to OpenAlex at once, throttle gaps taking real time, 20 ms answers | **1** (was 5) |
+| A call whose first try got a 500 while another call set a hold | the retry is not sent (2 requests, both first tries in the air together) |
+| Bulk receives 429 / RA 60, then an attach while Bulk sleeps | the attach is left out and sends nothing; Bulk's own retry still goes at +60 s |
+| Engine: three attaches in three projects at once, 50 ms answers | Crossref asked **1** time (was 3) |
+
+In the three-project probe, OpenAlex received the three DOI lookups. With the injected throttle sleep resolving instantly, all three were in the air before the first answer arrived. R563 does not count requests already in the air.
+
+The window between the check and the send, by reading: `leftOutIfHeld` is called after `hold()` and after `throttle()`. Between it and `request()` there is no `await`, so no other call can set a hold in that window. A redirect hop checks again. `postJson` is used only by Find and Elicit. It never carries the choice, and it neither sets nor reads a hold.
+
+A hold set by a caller without the choice whose own wait is shorter than the hold: Bulk gets 429 / RA 3600 (hold of an hour). Bulk's own retry after 60 s gets a 200, which clears the hold, so the next attach asks. This is as R563 ruled.
+
+`stop()` with a hold: a later call, with or without the choice, ends as `LookupCancelledError` and nothing is sent.
+
+Planted fault: the pre-send check removed. The test "five calls … nothing more is sent" fails.
+
+#### I2 in detail
+
+The old client (db8623b, scratch copy) and the new one were run through the same answers on the same injected clock. The caller has no choice. The new client ran twice: once with no hold, and once with an hour's hold left by a leave-out call. These answers were used:
+- 429 RA 60 ×3, then 200;
+- 429 RA 3600 for ever (the 420 s case);
+- 429 with no RA for ever;
+- 429 RA 0 for ever;
+- 429 then 200;
+- 503 RA 30 ×2, then 200;
+- 503 with no RA for ever;
+- 503 RA 0 for ever.
+
+Result: **identical** in all three runs (old, new, new with hold) — the same requests at the same times, the same sleeps and the same result. The 420 s case is now 0, 60, 120 and 180 s, as at db8623b.
+
+Engine: a Bulk Import of 4 files gave `{finished, 4 requests at 0/0.2/0.4/0.6 s, no long sleeps}` both without and with an attach's hour hold. The Bulk, Find and import route code is unchanged since db8623b. `retryAfterMs` and `retryDelay` are byte-for-byte as at db8623b (compared with `diff`).
+
+#### M1 in detail
+
+On a 429 with a leave-out call, each odd value now gives a hold of **60 s**: absent, `x 7`, `0`, `-5`, a past date, `1e3`.
+
+Usable values are honoured:
+- `30` gives 30 s;
+- a 2099 date gives 3600 s;
+- `86400` gives 3600 s;
+- an RFC 850 date gives 3600 s.
+
+A 503 with `0`, `-5`, a past date or `x 7` takes the failure path: LookupHttpError after 4 requests, with sleeps the same as at db8623b, and no hold. A 503 with `120` gives a hold of 120 s.
+
+#### M5 in detail
+
+All three tests now learn of the request from the stand-in's reply callback, and their assertions are unchanged. What polling remains is not new: the `until(...)` of the restart half of watch-closing and two short pauses in close-during-attach are as they were at db8623b.
+
+Planted fault: the closing abort was taken out of the request's signal. All three tests then fail:
+- attach-closing: 1;
+- watch-closing: 1;
+- close-during-attach: 4.
+
+Restored, they pass: 5, 1 and 11.
+
+### New findings
+No Critical. No Important.
+
+- **N1 (Minor). A good answer can clear a hold that was set after its request left.** `http.ts:766` clears the hold on any 2xx, even one that answers a request sent before the 429 that set the hold.
+  - Probe: request A (200, slow) and request B (429 / RA 60, fast) are both in the air. B's 429 sets the hold, then A's 200 arrives and clears it. A third leave-out call C is then **sent at once**.
+  - This matters only for hosts without a one-at-a-time limit: OpenAlex, Open Library and the Library of Congress. Each such out-of-order answer lets one more request through early.
+  - R563 says "whoever received it", so this follows the ruling's words, not its intent. To mend it, clear the hold only for a 2xx whose request was sent after the hold was set (keep the time each hold was set).
+- **N2 (Minor, as the implementer said).** A leave-out call stopped at the pre-send check has already taken its throttle slot. For up to one gap (0.2 s, or 1 s for Open Library) the next caller waits longer. That caller may be Bulk, so in that rare case Bulk's timing shifts by one gap.
+- **Note only.** The check before each retry (`http.ts:751`) is redundant with the pre-send check: removing it fails no test, and it is harmless.
+
+### Verdict now
+**Approve with small points** (N1, N2). Neither needs to be mended before the join. N1 is worth a line for (c), or a one-line mend.
