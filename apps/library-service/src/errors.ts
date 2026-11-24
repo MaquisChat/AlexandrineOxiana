@@ -4,7 +4,7 @@
  * one place.
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
-import { RECOVERY_PENDING_REOPEN_TEXT, RECOVERY_PENDING_TEXT, type ResettableSetting, type ServiceErrorBody, type ServiceErrorCode } from "@ao/shared";
+import { LIBRARY_CLOSED_TEXT, RECOVERY_PENDING_REOPEN_TEXT, RECOVERY_PENDING_TEXT, type ResettableSetting, type ServiceErrorBody, type ServiceErrorCode } from "@ao/shared";
 import {
   AnnotationLimitError,
   AppSettingReadableError,
@@ -20,6 +20,7 @@ import {
   EncryptionFormatError,
   ExportDestinationError,
   ExportFailedError,
+  ExportCancelledError,
   FieldworkInUseError,
   ReviewEntryDecidedError,
   GovernanceConflictError,
@@ -53,6 +54,8 @@ import {
   ImmutableProvenanceError,
   InvalidConfirmTokenError,
   InvalidRecoveryCodeError,
+  LibraryClosedError,
+  BackupCancelledError,
   LibraryMovedError,
   LibraryNotWritableError,
   MoveNotAllowedError,
@@ -120,6 +123,12 @@ export function toApiError(err: unknown): ApiError {
   // A source's annotations at a cap (R74 I4): nothing was written (Task R4).
   if (err instanceof AnnotationLimitError) return err.kind === "count" ? new ApiError(409, "CONFLICT", err.message) : new ApiError(413, "PAYLOAD_TOO_LARGE", err.message);
   if (err instanceof ReadOnlyLibraryError) return new ApiError(409, "READ_ONLY", "This library is open read-only, so nothing can be changed.");
+  // FR-749 (R546; R551 M5): the change reached the engine after its library was closed; nothing was written. A code of
+  // its own (not the offline one, whose words speak of a drive coming back), true whether or not another library is
+  // open by now. A request that finds no library open at all keeps 503 LIBRARY_OFFLINE (requireSession).
+  if (err instanceof LibraryClosedError) return new ApiError(409, "LIBRARY_CLOSED", LIBRARY_CLOSED_TEXT);
+  // R551 I2: a backup the close cancelled: nothing kept, nothing recorded; its own sentence names the project.
+  if (err instanceof BackupCancelledError) return new ApiError(409, "LIBRARY_CLOSED", err.message);
   if (err instanceof WrongPassphraseError) return new ApiError(401, "WRONG_PASSPHRASE", "That passphrase is not correct.");
   if (err instanceof InvalidRecoveryCodeError) return new ApiError(401, "WRONG_PASSPHRASE", "That recovery code is not valid.");
   if (err instanceof ProjectLockedError) return new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
@@ -150,6 +159,7 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof CustomStyleSandboxError || err instanceof SandboxError) return new ApiError(400, "VALIDATION", "That citation style could not be used (it is too complex or took too long).");
   if (err instanceof ParticipantCodeMissingError) return new ApiError(409, "CONFLICT", "A participant in these sources has no participant code yet, so they cannot be cited.");
   if (err instanceof ExportDestinationError) return new ApiError(400, "VALIDATION", err.message);
+  if (err instanceof ExportCancelledError) return new ApiError(409, "LIBRARY_CLOSED", err.message); // R551 M6
   if (err instanceof ExportFailedError) return new ApiError(500, "INTERNAL", "The export could not be finished; nothing was left half-written.");
   if (err instanceof BackupNotRecordedError) return new ApiError(500, "INTERNAL", err.message);
   if (err instanceof DestroyedParentError || err instanceof MissingParentError) return new ApiError(409, "CONFLICT", "The file this would be made from is no longer there.");

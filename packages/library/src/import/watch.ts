@@ -117,7 +117,7 @@ import { overlapsLibrary, within } from "../fs/inside-library.js";
 import { isClosed, type Library } from "../library.js";
 import type { LocationEnv } from "../location.js";
 import type { HttpClient } from "../lookup/index.js";
-import { InvalidInputError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { InvalidInputError, LibraryClosedError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
 import { addWatchedFolderEntry, hasSource, projectCollectionsAndTags, projectEncrypted, removeWatchedFolderEntry, type Repo } from "../repo/repo.js";
 import { WATCHED_FILE_STATES, isRegisterEntry, type WatchRegisterEntry, type WatchedFileState } from "../repo/watch-register.js";
 import { ATTACH_REASONS, NOT_DOWNLOADED_REASON, WATCHED_FOLDER_TOOL, createAttach, type Attach, type AttachOutcome, type AttachStatus } from "./attach.js";
@@ -339,6 +339,11 @@ export interface WatchDeps {
   repo: Repo;
   http: HttpClient;
   lib: Library;
+  /**
+   * FR-749 (R546 2): the library session's closing signal (see AttachDeps.closing). A file whose bringing-in it cancels
+   * stays in its folder, is not written in the register, and is brought in at the next start.
+   */
+  closing?: AbortSignal;
   /**
    * The attach used for each file (default: createAttach({ repo, http, readable })). A caller's own attach
    * is not given the engine's `readable` check: it must not read what the engine has not checked.
@@ -991,7 +996,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         } catch (err) {
           flushError = err;
           deps.debug?.(`watched folder: the register could not be written now (${err instanceof Error ? err.name : "error"})`);
-          if (!(err instanceof ProjectLockedError) && !(err instanceof ReadOnlyLibraryError) && registerProblem !== WATCH_REASONS.registerUnreadable) {
+          // R551: a closed library is "cannot write now", as a locked project or a read-only library is.
+          if (!(err instanceof ProjectLockedError) && !(err instanceof ReadOnlyLibraryError) && !(err instanceof LibraryClosedError) && registerProblem !== WATCH_REASONS.registerUnreadable) {
             registerProblem = WATCH_REASONS.registerUnwritable;
             touch();
           }
@@ -1890,7 +1896,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   }
   // Viewing proxies go through the library's one queue (R85), unless the caller gives one.
   const attach =
-    deps.attach ?? createAttach({ repo: deps.repo, http: deps.http, proxies: deps.proxies ?? proxyQueueFor(deps.repo), readable, ...(deps.debug ? { debug: deps.debug } : {}) });
+    deps.attach ?? createAttach({ repo: deps.repo, http: deps.http, proxies: deps.proxies ?? proxyQueueFor(deps.repo), readable, ...(deps.closing ? { closing: deps.closing } : {}), ...(deps.debug ? { debug: deps.debug } : {}) });
 
   /** Reads and imports one stable, local file. */
   async function importNext(): Promise<void> {
@@ -2009,6 +2015,14 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     }
     if (gate.epoch !== epoch) throw new FolderNotAnsweringError(); // decided again once the folder answers
     if (!o) return;
+    if (o.outcome === "cancelled") {
+      // FR-749 (R546 2): the library began to close while the file was being looked up; nothing of it was written. It
+      // stays in its folder, unregistered, and is brought in at the next start; this watch stops, as when the library
+      // is gone (above).
+      imports.unshift(job);
+      void stopWith(WATCH_REASONS.libraryClosed, true);
+      return;
+    }
     if (o.outcome === "failed" && o.reason === NOT_DOWNLOADED_REASON) {
       settling.set(rel, { a: b, at: Date.now(), flags }); // changed or evicted since the check: decided again
       return;
@@ -2684,7 +2698,9 @@ type Entry = Awaited<ReturnType<WatchFs["readdir"]>>[number];
 
 /** A read-only library and a locked project are refused in plain words, before anything is read or written. */
 function refuseUnwritable(deps: Pick<WatchDeps, "repo" | "lib">, projectId: string): void {
-  if (isClosed(deps.lib) || deps.lib.mode !== "read-write") throw new ReadOnlyLibraryError(deps.lib.readOnlyReason);
+  // R551 M5: a closed library is said as such (its act's own sentence at the route), not as a read-only one.
+  if (isClosed(deps.lib)) throw new LibraryClosedError();
+  if (deps.lib.mode !== "read-write") throw new ReadOnlyLibraryError(deps.lib.readOnlyReason);
   if (projectEncrypted(deps.repo, projectId) && !deps.repo.isUnlocked(projectId)) throw new ProjectLockedError(projectId);
 }
 
@@ -2719,7 +2735,7 @@ async function standaloneIo(deps: WatchDeps, projectId: string, watchId: string)
       return false;
     }
   };
-  const attach = createAttach({ repo: deps.repo, http: deps.http, proxies: deps.proxies ?? proxyQueueFor(deps.repo), readable, ...(deps.debug ? { debug: deps.debug } : {}) });
+  const attach = createAttach({ repo: deps.repo, http: deps.http, proxies: deps.proxies ?? proxyQueueFor(deps.repo), readable, ...(deps.closing ? { closing: deps.closing } : {}), ...(deps.debug ? { debug: deps.debug } : {}) });
   const buf = Buffer.allocUnsafe(HASH_CHUNK);
   return {
     realRoot,

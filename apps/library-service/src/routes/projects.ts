@@ -215,7 +215,8 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireWritable();
     const id = projectParam(ctx, req);
     try {
-      const r = await backupProject(s.repo, id);
+      // R551 I2: a close that begins meanwhile cancels it (409 LIBRARY_CLOSED, its own sentence; nothing recorded).
+      const r = await backupProject(s.repo, id, { signal: s.closing.signal });
       return { backup: { file: basename(r.path), sha256: r.sha256, bytes: r.bytes, pruned: r.pruned, warnings: r.warnings } };
     } finally {
       state.publishState(); // `backup-failed` set or cleared

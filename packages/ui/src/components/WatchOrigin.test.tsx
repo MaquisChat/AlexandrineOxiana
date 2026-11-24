@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
 import type { SourceWatchOriginResponse, WatchedFileActionRequest, WatchedSourceOrigin } from "@ao/shared";
+import { WATCH_ACT_CLOSED_TEXT } from "@ao/shared";
 import { server, serviceError, testApi, url, useMockService } from "../test/service";
 import { WatchOrigin } from "./WatchOrigin";
 
@@ -420,6 +421,18 @@ describe("WatchOrigin", () => {
     expect(svc.seen.reads).toBe(1);
     expect((screen.getByRole("button", { name: new RegExp(`^${KEEP}`) }) as HTMLButtonElement).disabled).toBe(false);
   });
+
+  for (const act of [KEEP, BRING] as const) {
+    it(`R551 M5: "${act}" cut by the library's closing shows the one sentence, and changes nothing`, async () => {
+      const svc = service([origin()]);
+      svc.acting(() => serviceError(409, "LIBRARY_CLOSED", WATCH_ACT_CLOSED_TEXT));
+      const user = userEvent.setup();
+      render(ui());
+      await user.click(await screen.findByRole("button", { name: new RegExp(`^${act}`) }));
+      expect((await screen.findByRole("alert")).textContent).toBe("The library was closed or went offline before this could be done, so nothing was changed. Try again when the library is open.");
+      expect(svc.seen.reads).toBe(1);
+    });
+  }
 
   it("a refusal for a wrong state (400) is shown in the service's words", async () => {
     const svc = service([origin()]);

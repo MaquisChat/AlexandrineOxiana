@@ -124,8 +124,11 @@ import {
   backupFailureReason,
   backupFilesNow,
   backupProjectHeld,
+  backupStateExists,
+  cutByClose,
   destructionNotes,
   forgetMissingBackups,
+  inFlight,
   isBackupFileName,
   listBackups,
   noteDestruction,
@@ -148,7 +151,8 @@ import {
   type RetentionRetry,
 } from "./export/backup.js";
 import { DESTRUCTION_CERTIFICATE, amendmentNumber } from "./repo/destroy.js";
-import { NotFoundError } from "./repo/errors.js";
+import { LibraryClosedError, NotFoundError } from "./repo/errors.js";
+import { closingSignal, isClosed } from "./library.js";
 import { SimulatedCrash } from "./repo/seams.js";
 import {
   amendProjectDestruction,
@@ -435,6 +439,11 @@ async function destroyRawLocked(repo: Repo, hold: MaintenanceHold, projectId: st
     backupsContaining: containing.length,
     // Of the certificate's JSON (the plaintext, also when it is sealed).
     certificateSha256: res.certificateSha256,
+  }).catch((err: unknown) => {
+    // R560 I2: the destruction's own change has committed (its `retention.destroy` entry, the authority, R147, names the
+    // certificate and its sha256; nothing else reads this report line). Refused because the library is closing, it is not
+    // an error: the destruction is returned as it stands, its backups step pending (cut below, as a step is).
+    if (!(err instanceof LibraryClosedError)) throw err;
   });
   // What the change's own audit event now says of this destruction: the list this call works on.
   const audited = newAudited(projectId, basename(res.certificateRel), res.certificateSha256, res.at, toRemove, unreadable);
@@ -447,7 +456,11 @@ async function destroyRawLocked(repo: Repo, hold: MaintenanceHold, projectId: st
   }
   const amendments: DestructionAmendment[] = [];
   if (containing.length) {
-    const written = await settleBackups(repo, hold, projectId, audited, { retry: false, certificate: res.certificate });
+    // R554: a step cut by the library's close records nothing; the destruction itself stands and is returned as it is.
+    const written = await settleBackups(repo, hold, projectId, audited, { retry: false, certificate: res.certificate }).catch((err: unknown) => {
+      if (err instanceof StepCutByClose) return undefined;
+      throw err;
+    });
     if (written) amendments.push(written);
   }
   return { certificatePath, certificate: present(res.certificate, amendments, audited), original: res.certificate, amendments, status: statusOf(audited) };
@@ -478,8 +491,11 @@ function statusOf(a: Audited): BackupsStepStatus {
 /** Lines of the audit log worth parsing for this: the destruction and backups-step events, and backups made. */
 const NEEDLES = ['"retention.', '"backup.create"'] as const;
 
-/** Test seam (R47): runs after the audit view is taken (`scan`), only while NODE_ENV is "test". */
-export const retentionSeams: { afterScan?: (projectId: string) => Promise<void> } = {};
+/** Test seams (R47), only while NODE_ENV is "test": after the audit view is taken (`scan`); before a pass writes its notes (R555 4 probes). */
+export const retentionSeams: { afterScan?: (projectId: string) => Promise<void>; beforeNotes?: (which: "destruction" | "old-copies") => Promise<void> } = {};
+const testSeam = async <A>(seam: ((a: A) => Promise<void>) | undefined, a: A) => {
+  if (seam && process.env.NODE_ENV === "test") await seam(a);
+};
 
 /** A cheap pass over the audit log for the destructions it records, and whether the log is as this process left it. */
 async function scan(repo: Repo, projectId: string): Promise<{ list: Audited[]; certificateHashes: Set<string>; headMatches: boolean }> {
@@ -699,7 +715,33 @@ interface SettleOptions {
  * them. A retry that changes nothing writes no amendment and no event, except one summarising
  * `retention.backups` a day with the number of attempts (R2-I1). Returns the amendment written.
  */
-async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: string, a: Audited, opts: SettleOptions): Promise<DestructionAmendment | undefined> {
+function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: string, a: Audited, opts: SettleOptions): Promise<DestructionAmendment | undefined> {
+  // R554: the step's work is waited for by the library's close, as a backup's is: nothing under Backups/ changes after
+  // `close()` resolved.
+  return inFlight(repoLibrary(repo), () => settleRun(repo, hold, projectId, a, opts));
+}
+
+/**
+ * R554: the library closed (or its session began to close) during a destruction's backups step. The step stopped
+ * there: no further backup removed (a removal under way finished), nothing recorded, the retry record as it was. Not a
+ * failure of the step: R138 e speaks of a fresh backup that could not be made, and this one was cut by the close.
+ */
+class StepCutByClose extends Error {
+  override name = "StepCutByClose";
+  constructor() {
+    super("The library was closed during a destruction's backups step; the step is done again at the next opening.");
+  }
+}
+
+async function settleRun(repo: Repo, hold: MaintenanceHold, projectId: string, a: Audited, opts: SettleOptions): Promise<DestructionAmendment | undefined> {
+  // R554: once the library is closed, or its session closing, the step stops at its next point.
+  const lib = repoLibrary(repo);
+  const signal = closingSignal(lib);
+  const cut = () => isClosed(lib) || signal?.aborted === true;
+  const stopIfCut = () => {
+    if (cut()) throw new StepCutByClose();
+  };
+  stopIfCut();
   const left = outstandingOf(a);
   const first = a.amendments.length === 0;
   if (!left.length) return undefined;
@@ -711,8 +753,11 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
   const act = !opts.observeOnly;
   const before = act ? await retentionRetry(repo, key) : undefined;
   let rec = before;
+  /** No state file before this attempt's stamp (R560 M4): a put-back leaves none. */
+  let stateWasAbsent = false;
   if (act && opts.retry) {
-    // Noted before anything is tried, so the back-off holds even if this attempt cannot be recorded.
+    // Noted before anything is tried, so the back-off holds even if this attempt cannot be recorded — and an attempt
+    // that brings the app down is not made again at once at every opening (R147, R558 c): a crash leaves the stamp.
     rec = {
       firstFailedAt: before?.firstFailedAt ?? a.amendments[0]?.at ?? at,
       lastAttemptAt: at,
@@ -720,213 +765,244 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
       attemptsSinceRecord: (before?.attemptsSinceRecord ?? 0) + 1,
       ...(before?.lastFreshAt ? { lastFreshAt: before.lastFreshAt } : {}),
     };
+    stateWasAbsent = !(await backupStateExists(repo));
     await setRetentionRetry(repo, key, rec).catch(() => {});
   }
-
-  // How each listed backup stands now. Decided before any backup is made, so a name given to the
-  // fresh backup is never taken for a listed one.
-  const files = await backupFilesNow(repo, left.map(fileOf));
-  const destroyed = opts.certificate ? destroyedIds(opts.certificate) : undefined;
-  // An inherited destruction (R175): the listed backups are the origin's. This project's audit log
-  // cannot see what the origin did after the copy was made, so a file is removed only when it is, byte
-  // for byte, the backup the inherited log recorded under that name: never one that only carries the name.
-  const inherited = a.projectId !== projectId;
-  const gone: string[] = [];
-  const missing: string[] = [];
-  const notHolding: string[] = [];
-  const toDelete: string[] = [];
-  const unidentified: string[] = [];
-  /** Missing because the app removed it for another destruction of this project, as the audit log says (M3): file → that record. */
-  const elsewhere = new Map<string, { certificate: string; at: string }>();
-  for (const f of left) {
-    const s = files.get(fileOf(f));
-    if (a.reused.has(f)) gone.push(f);
-    else if (!s?.present) {
-      // (Not a removal from before this destruction: that was an earlier backup of the same name.)
-      const o = (opts.all ?? []).find((x) => x.certificateSha256 !== a.certificateSha256 && x.removed.has(f) && !x.removedUnder.has(f) && x.removed.get(f)! >= a.at);
-      if (o) elsewhere.set(f, { certificate: o.certificate, at: o.removed.get(f)! });
-      else gone.push(f);
-      missing.push(f);
-    } else if (!act) continue;
-    else if (a.toRemove.includes(f)) (inherited && !a.made.has(f) ? unidentified : toDelete).push(f);
-    else if (!s.entry || !destroyed) continue; // still cannot be read: stays listed, never deleted blindly
-    else if (s.entry.projectId === a.projectId && (!Array.isArray(s.entry.assets) || s.entry.assets.some((id) => destroyed.has(id)))) toDelete.push(f);
-    else notHolding.push(f);
+  try {
+    return await settleAttempt();
+  } catch (err) {
+    // R554, R558 c: an attempt cut by the library's close does not count: the record is put back to what it was. This
+    // write belongs to the step, which the close waits for (R558 a), so it lands before the lock is released.
+    // Where there was no state file before the stamp, none is left (R560 M4).
+    if (err instanceof StepCutByClose && rec !== before) await setRetentionRetry(repo, key, before, { dropIfEmpty: stateWasAbsent }).catch(() => {});
+    throw err;
   }
-  // An observing pass has nothing to do unless a listed backup is gone; and it records that only on
-  // the word of a log that holds together: otherwise nothing is written, not even to the manifest.
-  if (!act && ((!gone.length && !elsewhere.size) || (opts.mayRecord !== undefined && !(await opts.mayRecord())))) return undefined;
 
-  // A fresh backup first, when it can be made (R90 d), at most once a day on a retry; the listed
-  // backups are removed whether or not it could (R138 e).
-  let freshMade: string | undefined;
-  let freshFailed: string | undefined;
-  let freshTried = false;
-  const freshDue = !before?.lastFreshAt || now.getTime() - Date.parse(before.lastFreshAt) >= DAY_MS;
-  if (act && toDelete.length && !a.freshBackup && (!opts.retry || freshDue)) {
-    freshTried = true;
+  async function settleAttempt(): Promise<DestructionAmendment | undefined> {
+    // How each listed backup stands now. Decided before any backup is made, so a name given to the
+    // fresh backup is never taken for a listed one.
+    const files = await backupFilesNow(repo, left.map(fileOf));
+    stopIfCut();
+    const destroyed = opts.certificate ? destroyedIds(opts.certificate) : undefined;
+    // An inherited destruction (R175): the listed backups are the origin's. This project's audit log
+    // cannot see what the origin did after the copy was made, so a file is removed only when it is, byte
+    // for byte, the backup the inherited log recorded under that name: never one that only carries the name.
+    const inherited = a.projectId !== projectId;
+    const gone: string[] = [];
+    const missing: string[] = [];
+    const notHolding: string[] = [];
+    const toDelete: string[] = [];
+    const unidentified: string[] = [];
+    /** Missing because the app removed it for another destruction of this project, as the audit log says (M3): file → that record. */
+    const elsewhere = new Map<string, { certificate: string; at: string }>();
+    for (const f of left) {
+      const s = files.get(fileOf(f));
+      if (a.reused.has(f)) gone.push(f);
+      else if (!s?.present) {
+        // (Not a removal from before this destruction: that was an earlier backup of the same name.)
+        const o = (opts.all ?? []).find((x) => x.certificateSha256 !== a.certificateSha256 && x.removed.has(f) && !x.removedUnder.has(f) && x.removed.get(f)! >= a.at);
+        if (o) elsewhere.set(f, { certificate: o.certificate, at: o.removed.get(f)! });
+        else gone.push(f);
+        missing.push(f);
+      } else if (!act) continue;
+      else if (a.toRemove.includes(f)) (inherited && !a.made.has(f) ? unidentified : toDelete).push(f);
+      else if (!s.entry || !destroyed) continue; // still cannot be read: stays listed, never deleted blindly
+      else if (s.entry.projectId === a.projectId && (!Array.isArray(s.entry.assets) || s.entry.assets.some((id) => destroyed.has(id)))) toDelete.push(f);
+      else notHolding.push(f);
+    }
+    // An observing pass has nothing to do unless a listed backup is gone; and it records that only on
+    // the word of a log that holds together: otherwise nothing is written, not even to the manifest.
+    if (!act && ((!gone.length && !elsewhere.size) || (opts.mayRecord !== undefined && !(await opts.mayRecord())))) return undefined;
+
+    // A fresh backup first, when it can be made (R90 d), at most once a day on a retry; the listed
+    // backups are removed whether or not it could (R138 e).
+    let freshMade: string | undefined;
+    let freshFailed: string | undefined;
+    let freshTried = false;
+    const freshDue = !before?.lastFreshAt || now.getTime() - Date.parse(before.lastFreshAt) >= DAY_MS;
+    if (act && toDelete.length && !a.freshBackup && (!opts.retry || freshDue)) {
+      freshTried = true;
+      try {
+        const fresh = await backupProjectHeld(repo, hold, projectId, { prune: false, ...(signal ? { signal } : {}) });
+        freshMade = backupRel(basename(fresh.path));
+      } catch (err) {
+        if (err instanceof SimulatedCrash) throw err;
+        // R554: cut by the library's close, it is not a backup that could not be made (R138 e): the step stops.
+        if (cutByClose(err) || cut()) throw new StepCutByClose();
+        // backupProject has recorded `backup-failed` with the same reason.
+        freshFailed = backupFailureReason(repo, err);
+      }
+    }
+    stopIfCut();
+
+    // Each listed backup: removed (with when), or named as NOT removed with the plain reason (N1).
+    let removed: string[] = [];
+    let failed: Array<{ file: string; reason: string }> = [];
+    let otherError: string | undefined;
     try {
-      const fresh = await backupProjectHeld(repo, hold, projectId, { prune: false });
-      freshMade = backupRel(basename(fresh.path));
+      if (toDelete.length) {
+        const names = toDelete.map(fileOf);
+        // Of an inherited list: only the very file that was listed, and never at the same time as a
+        // backup, a prune, a restore or a destruction of the project it belongs to (R138 a).
+        const expect = inherited ? new Map(toDelete.flatMap((f) => (a.made.has(f) ? [[fileOf(f), a.made.get(f)!] as const] : []))) : undefined;
+        // R554: before each removal, the step stops if the library is closing (one under way finishes).
+        const remove = () => removeHoldingBackups(repo, names, expect, stopIfCut);
+        const r = inherited && repo.listProjects().some((p) => p.id === a.projectId) ? await withProjectMaintenance(repo, a.projectId, remove) : await remove();
+        removed = r.removed.map(backupRel);
+        // A file of another content under a listed name is a later backup: the listed one is gone.
+        gone.push(...r.gone.map(backupRel), ...r.other.map(backupRel));
+        failed = r.failed.map(({ file, error }) => ({ file: backupRel(file), reason: `It could not be overwritten and removed (${plainErrorText(repo, error)}).` }));
+        if (r.failed.length) otherError = `A backup holding the destroyed files could not be removed (${plainErrorText(repo, r.failed[0]!.error)}); the step will be tried again`;
+      }
+      failed.push(...unidentified.map((file) => ({ file, reason: CANNOT_TELL })));
+      stopIfCut();
+      await forgetMissingBackups(repo, missing.map(fileOf));
     } catch (err) {
       if (err instanceof SimulatedCrash) throw err;
-      // backupProject has recorded `backup-failed` with the same reason.
-      freshFailed = backupFailureReason(repo, err);
+      if (err instanceof StepCutByClose || cutByClose(err)) throw new StepCutByClose();
+      otherError = plainError(repo, err);
     }
-  }
+    backupCrashPoint("before-removal-record");
+    stopIfCut();
 
-  // Each listed backup: removed (with when), or named as NOT removed with the plain reason (N1).
-  let removed: string[] = [];
-  let failed: Array<{ file: string; reason: string }> = [];
-  let otherError: string | undefined;
-  try {
-    if (toDelete.length) {
-      const names = toDelete.map(fileOf);
-      // Of an inherited list: only the very file that was listed, and never at the same time as a
-      // backup, a prune, a restore or a destruction of the project it belongs to (R138 a).
-      const expect = inherited ? new Map(toDelete.flatMap((f) => (a.made.has(f) ? [[fileOf(f), a.made.get(f)!] as const] : []))) : undefined;
-      const remove = () => removeHoldingBackups(repo, names, expect);
-      const r = inherited && repo.listProjects().some((p) => p.id === a.projectId) ? await withProjectMaintenance(repo, a.projectId, remove) : await remove();
-      removed = r.removed.map(backupRel);
-      // A file of another content under a listed name is a later backup: the listed one is gone.
-      gone.push(...r.gone.map(backupRel), ...r.other.map(backupRel));
-      failed = r.failed.map(({ file, error }) => ({ file: backupRel(file), reason: `It could not be overwritten and removed (${plainErrorText(repo, error)}).` }));
-      if (r.failed.length) otherError = `A backup holding the destroyed files could not be removed (${plainErrorText(repo, r.failed[0]!.error)}); the step will be tried again`;
+    const freshBackupFailed = a.freshBackup || freshMade ? undefined : (freshFailed ?? a.freshBackupFailed);
+    const changed = removed.length > 0 || gone.length > 0 || elsewhere.size > 0 || notHolding.length > 0 || freshMade !== undefined;
+    if (!changed && (!act || !first)) {
+      if (!act || !rec) return undefined;
+      const noted = rec;
+      // A retry that changed nothing: no amendment, no audit event, except one summary a day.
+      if (now.getTime() - Date.parse(rec.lastRecordedAt) >= DAY_MS) {
+        await appendLibraryEvent(repo, projectId, "retention.backups", {
+          certificate: a.certificate,
+          certificateSha256: a.certificateSha256,
+          status: statusOf(a),
+          summary: true,
+          attempts: rec.attemptsSinceRecord,
+          removed: [],
+          notRemoved: left,
+          ...(freshBackupFailed ? { freshBackupFailed } : {}),
+        }).catch(async (err: unknown) => {
+          if (cutByClose(err)) throw new StepCutByClose();
+          throw err;
+        });
+        a.lastRecordedAt = at;
+        delete a.reportedProblem;
+        rec = { ...rec, lastRecordedAt: at, attemptsSinceRecord: 0 };
+      }
+      if (freshTried) rec = { ...rec, lastFreshAt: at };
+      if (rec !== noted) await setRetentionRetry(repo, key, rec).catch(() => {});
+      return undefined;
     }
-    failed.push(...unidentified.map((file) => ({ file, reason: CANNOT_TELL })));
-    await forgetMissingBackups(repo, missing.map(fileOf));
-  } catch (err) {
-    if (err instanceof SimulatedCrash) throw err;
-    otherError = plainError(repo, err);
-  }
-  backupCrashPoint("before-removal-record");
 
-  const freshBackupFailed = a.freshBackup || freshMade ? undefined : (freshFailed ?? a.freshBackupFailed);
-  const changed = removed.length > 0 || gone.length > 0 || elsewhere.size > 0 || notHolding.length > 0 || freshMade !== undefined;
-  if (!changed && (!act || !first)) {
-    if (!act || !rec) return undefined;
-    const noted = rec;
-    // A retry that changed nothing: no amendment, no audit event, except one summary a day.
-    if (now.getTime() - Date.parse(rec.lastRecordedAt) >= DAY_MS) {
-      await appendLibraryEvent(repo, projectId, "retention.backups", {
-        certificate: a.certificate,
-        certificateSha256: a.certificateSha256,
-        status: statusOf(a),
-        summary: true,
-        attempts: rec.attemptsSinceRecord,
-        removed: [],
-        notRemoved: left,
+    // What this pass found, applied to a copy of the list: `a` itself changes only once it is recorded.
+    const next: Audited = { ...a, removed: new Map(a.removed), removedUnder: new Map(a.removedUnder), gone: new Map(a.gone), notHolding: new Map(a.notHolding) };
+    for (const f of removed) next.removed.set(f, at);
+    for (const [f, e] of elsewhere) {
+      next.removed.set(f, e.at);
+      next.removedUnder.set(f, e.certificate);
+    }
+    for (const f of gone) next.gone.set(f, at);
+    for (const f of notHolding) next.notHolding.set(f, at);
+    if (freshMade) next.freshBackup = freshMade;
+    if (freshBackupFailed) next.freshBackupFailed = freshBackupFailed;
+    else delete next.freshBackupFailed;
+    const outstanding = outstandingOf(next);
+    const status = statusOf(next);
+    // The note says only what happened (N1): composed from the outcome above.
+    let note: string | undefined;
+    if (act && freshBackupFailed) {
+      const stop = /[.!?]$/u.test(freshBackupFailed) ? "" : ".";
+      const one = failed.length === 1;
+      note = failed.length
+        ? `No new backup could be made after the destruction: ${freshBackupFailed}${stop} ${one ? "A backup that holds the destroyed files could not be removed yet" : "Some backups that hold the destroyed files could not be removed yet"} (see notRemoved); removing ${one ? "it" : "them"} is tried again.`
+        : `${next.gone.size ? "None of the earlier backups that held the destroyed files is in the Backups folder any more" : "The earlier backups that held the destroyed files were removed"}. No new backup could be made afterwards: ${freshBackupFailed}${stop} This project has no backup until one succeeds.`;
+    }
+    const number = a.amendments.length + 1;
+    const content = {
+      formatVersion: 1,
+      kind: "destruction-certificate-amendment",
+      projectId,
+      certificate: a.certificate,
+      certificateSha256: a.certificateSha256,
+      number,
+      at,
+      backups: {
+        removed: [...removed.map((file) => ({ file, at })), ...[...elsewhere].map(([file, e]) => ({ file, at: e.at, under: e.certificate }))],
+        noLongerPresent: gone.map((file) => ({ file, at })),
+        ...(notHolding.length ? { notHolding: notHolding.map((file) => ({ file, at })) } : {}),
+        notRemoved: failed.map((f) => ({ ...f, at })),
+        ...(freshMade ? { freshBackup: freshMade } : {}),
         ...(freshBackupFailed ? { freshBackupFailed } : {}),
-      });
-      a.lastRecordedAt = at;
-      delete a.reportedProblem;
-      rec = { ...rec, lastRecordedAt: at, attemptsSinceRecord: 0 };
-    }
-    if (freshTried) rec = { ...rec, lastFreshAt: at };
-    if (rec !== noted) await setRetentionRetry(repo, key, rec).catch(() => {});
-    return undefined;
-  }
-
-  // What this pass found, applied to a copy of the list: `a` itself changes only once it is recorded.
-  const next: Audited = { ...a, removed: new Map(a.removed), removedUnder: new Map(a.removedUnder), gone: new Map(a.gone), notHolding: new Map(a.notHolding) };
-  for (const f of removed) next.removed.set(f, at);
-  for (const [f, e] of elsewhere) {
-    next.removed.set(f, e.at);
-    next.removedUnder.set(f, e.certificate);
-  }
-  for (const f of gone) next.gone.set(f, at);
-  for (const f of notHolding) next.notHolding.set(f, at);
-  if (freshMade) next.freshBackup = freshMade;
-  if (freshBackupFailed) next.freshBackupFailed = freshBackupFailed;
-  else delete next.freshBackupFailed;
-  const outstanding = outstandingOf(next);
-  const status = statusOf(next);
-  // The note says only what happened (N1): composed from the outcome above.
-  let note: string | undefined;
-  if (act && freshBackupFailed) {
-    const stop = /[.!?]$/u.test(freshBackupFailed) ? "" : ".";
-    const one = failed.length === 1;
-    note = failed.length
-      ? `No new backup could be made after the destruction: ${freshBackupFailed}${stop} ${one ? "A backup that holds the destroyed files could not be removed yet" : "Some backups that hold the destroyed files could not be removed yet"} (see notRemoved); removing ${one ? "it" : "them"} is tried again.`
-      : `${next.gone.size ? "None of the earlier backups that held the destroyed files is in the Backups folder any more" : "The earlier backups that held the destroyed files were removed"}. No new backup could be made afterwards: ${freshBackupFailed}${stop} This project has no backup until one succeeds.`;
-  }
-  const number = a.amendments.length + 1;
-  const content = {
-    formatVersion: 1,
-    kind: "destruction-certificate-amendment",
-    projectId,
-    certificate: a.certificate,
-    certificateSha256: a.certificateSha256,
-    number,
-    at,
-    backups: {
-      removed: [...removed.map((file) => ({ file, at })), ...[...elsewhere].map(([file, e]) => ({ file, at: e.at, under: e.certificate }))],
-      noLongerPresent: gone.map((file) => ({ file, at })),
-      ...(notHolding.length ? { notHolding: notHolding.map((file) => ({ file, at })) } : {}),
-      notRemoved: failed.map((f) => ({ ...f, at })),
+        ...(note ? { note } : {}),
+        ...(otherError ? { lastError: otherError } : {}),
+        outstanding,
+        status,
+      },
+    };
+    // The same facts in the audit event that reports the amendment (with its sha256): the authority.
+    const removedByApp = [...removed, ...elsewhere.keys()];
+    const facts = {
+      stepAt: at,
+      status,
+      removed: removedByApp,
+      ...(elsewhere.size ? { removedUnder: Object.fromEntries(elsewhere) } : {}),
+      noLongerPresent: gone,
+      ...(notHolding.length ? { notHolding } : {}),
+      notRemoved: outstanding,
       ...(freshMade ? { freshBackup: freshMade } : {}),
       ...(freshBackupFailed ? { freshBackupFailed } : {}),
-      ...(note ? { note } : {}),
-      ...(otherError ? { lastError: otherError } : {}),
-      outstanding,
+    };
+    const w = await amendProjectDestruction(repo, projectId, { certificate: a.certificate, certificateSha256: a.certificateSha256, number, content, facts }).catch(async (err: unknown) => {
+      // R554: refused by the closed library: nothing was recorded.
+      if (cutByClose(err)) throw new StepCutByClose();
+      throw err;
+    });
+    // Recorded: the list is now what the audit log says.
+    Object.assign(a, { removed: next.removed, removedUnder: next.removedUnder, gone: next.gone, notHolding: next.notHolding });
+    if (next.freshBackup) a.freshBackup = next.freshBackup;
+    if (next.freshBackupFailed) a.freshBackupFailed = next.freshBackupFailed;
+    else delete a.freshBackupFailed;
+    a.amendments.push({ name: w.name, sha256: w.sha256, at });
+    a.lastRecordedAt = at;
+    delete a.reportedProblem;
+    await noteDestruction(repo, projectId, certificateRel, { files: outstanding }).catch(() => {});
+    if (!outstanding.length) {
+      // Pruning keeps its own record when it cannot be audited (backup-audit-pending): not this step's failure.
+      // (Not with the library closing, R554: its older backups are left for the next backup, as a backup's prune is.)
+      if (act && !cut()) await pruneBackupsHeld(repo, hold, projectId, repo.getProject(projectId).backups?.keep ?? DEFAULT_KEEP).catch(() => {});
+      await setRetentionRetry(repo, key, undefined).catch(() => {});
+    } else if (act) {
+      // The retry record: started by a failure, reset by each recorded outcome, gone once settled.
+      await setRetentionRetry(repo, key, {
+        firstFailedAt: rec?.firstFailedAt ?? at,
+        ...(opts.retry ? { lastAttemptAt: at } : {}),
+        lastRecordedAt: at,
+        attemptsSinceRecord: 0,
+        ...(freshTried ? { lastFreshAt: at } : rec?.lastFreshAt ? { lastFreshAt: rec.lastFreshAt } : {}),
+      }).catch(() => {});
+    }
+    // A report of the same facts, in the form the earlier events had.
+    await appendLibraryEvent(repo, projectId, "retention.backups", {
+      certificate: a.certificate,
+      certificateSha256: a.certificateSha256,
+      amendment: w.name,
+      amendmentSha256: w.sha256,
       status,
-    },
-  };
-  // The same facts in the audit event that reports the amendment (with its sha256): the authority.
-  const removedByApp = [...removed, ...elsewhere.keys()];
-  const facts = {
-    stepAt: at,
-    status,
-    removed: removedByApp,
-    ...(elsewhere.size ? { removedUnder: Object.fromEntries(elsewhere) } : {}),
-    noLongerPresent: gone,
-    ...(notHolding.length ? { notHolding } : {}),
-    notRemoved: outstanding,
-    ...(freshMade ? { freshBackup: freshMade } : {}),
-    ...(freshBackupFailed ? { freshBackupFailed } : {}),
-  };
-  const w = await amendProjectDestruction(repo, projectId, { certificate: a.certificate, certificateSha256: a.certificateSha256, number, content, facts });
-  // Recorded: the list is now what the audit log says.
-  Object.assign(a, { removed: next.removed, removedUnder: next.removedUnder, gone: next.gone, notHolding: next.notHolding });
-  if (next.freshBackup) a.freshBackup = next.freshBackup;
-  if (next.freshBackupFailed) a.freshBackupFailed = next.freshBackupFailed;
-  else delete a.freshBackupFailed;
-  a.amendments.push({ name: w.name, sha256: w.sha256, at });
-  a.lastRecordedAt = at;
-  delete a.reportedProblem;
-  await noteDestruction(repo, projectId, certificateRel, { files: outstanding }).catch(() => {});
-  if (!outstanding.length) {
-    // Pruning keeps its own record when it cannot be audited (backup-audit-pending): not this step's failure.
-    if (act) await pruneBackupsHeld(repo, hold, projectId, repo.getProject(projectId).backups?.keep ?? DEFAULT_KEEP).catch(() => {});
-    await setRetentionRetry(repo, key, undefined).catch(() => {});
-  } else if (act) {
-    // The retry record: started by a failure, reset by each recorded outcome, gone once settled.
-    await setRetentionRetry(repo, key, {
-      firstFailedAt: rec?.firstFailedAt ?? at,
-      ...(opts.retry ? { lastAttemptAt: at } : {}),
-      lastRecordedAt: at,
-      attemptsSinceRecord: 0,
-      ...(freshTried ? { lastFreshAt: at } : rec?.lastFreshAt ? { lastFreshAt: rec.lastFreshAt } : {}),
-    }).catch(() => {});
+      deleted: a.removed.size,
+      removed: removedByApp,
+      ...(elsewhere.size ? { removedUnder: Object.fromEntries(elsewhere) } : {}),
+      noLongerPresent: gone,
+      ...(notHolding.length ? { notHolding } : {}),
+      notRemoved: outstanding,
+      ...(failed.length ? { reasons: failed } : {}),
+      ...(opts.retry && rec ? { attempts: rec.attemptsSinceRecord } : {}),
+      ...(freshBackupFailed ? { freshBackupFailed } : {}),
+    }).catch((err: unknown) => {
+      // R554: the amendment and its own audit event are recorded; this report of the same facts is refused by the close.
+      if (!cutByClose(err)) throw err;
+    });
+    return { file: w.amendmentRel, sha256: w.sha256, verified: true, content };
   }
-  // A report of the same facts, in the form the earlier events had.
-  await appendLibraryEvent(repo, projectId, "retention.backups", {
-    certificate: a.certificate,
-    certificateSha256: a.certificateSha256,
-    amendment: w.name,
-    amendmentSha256: w.sha256,
-    status,
-    deleted: a.removed.size,
-    removed: removedByApp,
-    ...(elsewhere.size ? { removedUnder: Object.fromEntries(elsewhere) } : {}),
-    noLongerPresent: gone,
-    ...(notHolding.length ? { notHolding } : {}),
-    notRemoved: outstanding,
-    ...(failed.length ? { reasons: failed } : {}),
-    ...(opts.retry && rec ? { attempts: rec.attemptsSinceRecord } : {}),
-    ...(freshBackupFailed ? { freshBackupFailed } : {}),
-  });
-  return { file: w.amendmentRel, sha256: w.sha256, verified: true, content };
 }
 
 /** The ids of the assets a certificate says were destroyed. */
@@ -961,10 +1037,15 @@ export function resumeDestruction(repo: Repo, projectId: string): Promise<string
 
 async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string): Promise<string[]> {
   const lib = repoLibrary(repo);
-  // Nothing can be recorded in a read-only library, nor read or recorded in a locked project.
-  if (lib.mode !== "read-write" || !repo.isUnlocked(projectId)) return [];
+  // Nothing can be recorded in a read-only library, nor read or recorded in a locked project. Nor in a closed one
+  // (R551 M6): the pass ends there, recording nothing — no finding, no failure, no attempt.
+  if (isClosed(lib) || lib.mode !== "read-write" || !repo.isUnlocked(projectId)) return [];
   const dirRel = `${repo.getProject(projectId).folder}/retention`;
-  const view = await scan(repo, projectId);
+  const view = await scan(repo, projectId).catch((err: unknown) => {
+    if (err instanceof LibraryClosedError) return undefined; // closed while it began: as above
+    throw err;
+  });
+  if (!view) return [];
   const names = await retentionNames(repo, dirRel);
   // The app's own notes as they were found: compared with the audit log, then rewritten from it.
   const found = await destructionNotes(repo, projectId).catch((): Record<string, DestructionNote> => ({}));
@@ -1040,6 +1121,8 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
       }
     } catch (err) {
       if (err instanceof SimulatedCrash) throw err;
+      // R554: the library closed during the step: the pass ends here, recording nothing more (not even the notes).
+      if (err instanceof StepCutByClose) return out;
       firstError ??= err;
     }
     const left = outstandingOf(a);
@@ -1068,6 +1151,8 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
     // It could not be checked: the notes are not rewritten this time, and the next pass checks again.
     throw firstError ?? err;
   }
+  // A closed library's state file is not written (R555 4, at its one writer): refused, this is "cannot run now".
+  await testSeam(retentionSeams.beforeNotes, "destruction");
   await setDestructionNotes(repo, projectId, notes).catch(() => {});
   if (firstError !== undefined) throw firstError;
   return out;
@@ -1659,6 +1744,7 @@ async function syncOldCopies(
   if (leaving.length && !(await logHolds().catch(() => false))) {
     for (const [rel, n] of leaving) notes[rel] = { copies: [...(notes[rel]?.copies ?? []), ...n.copies.filter((c) => !notes[rel]?.copies.some((x) => x.id === c.id))], ...(n.unchecked || notes[rel]?.unchecked ? { unchecked: true as const } : {}) };
   }
+  await testSeam(retentionSeams.beforeNotes, "old-copies");
   await setOldCopiesNotes(repo, projectId, notes).catch(() => {});
   // Records of old copies the app deleted, kept to be looked at (R409 a): dropped once nothing of the library is left there and no destruction names them.
   const lib = repoLibrary(repo);
@@ -1677,7 +1763,7 @@ async function syncOldCopies(
  */
 export function recordOldCopyDeleted(repo: Repo, projectId: string, id: string): Promise<void> {
   return withProjectMaintenance(repo, projectId, async () => {
-    if (repoLibrary(repo).mode !== "read-write" || !repo.isUnlocked(projectId)) return;
+    if (isClosed(repoLibrary(repo)) || repoLibrary(repo).mode !== "read-write" || !repo.isUnlocked(projectId)) return;
     const view = await scan(repo, projectId);
     if (!view.list.some((a) => a.oldCopies.has(id))) return;
     let holds: boolean | undefined;

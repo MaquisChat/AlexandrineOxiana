@@ -766,6 +766,33 @@ describe("Your library: draft and save (as Search sources)", () => {
     expect(described(btn("Test"))).not.toContain(T.saveFirst);
   });
 
+  it("R555 3: a save refused because the library was closed (409 LIBRARY_CLOSED): the draft is kept, nothing is read again, the answer's sentence is shown", async () => {
+    const closed = "That library has been closed, so nothing was changed.";
+    const svc = useSvc(SET);
+    await show(svc);
+    const user = userEvent.setup();
+    await user.type(nameField(), " DRAFTNAME");
+    svc.onPut = async () => HttpResponse.json({ error: { code: "LIBRARY_CLOSED", message: closed } }, { status: 409 });
+    await user.click(btn("Save"));
+    await waitFor(() => expect(document.body.textContent).toContain(closed));
+    expect(nameField().value).toContain("DRAFTNAME");
+    expect(svc.count("GET", "/settings/your-library")).toBe(1);
+  });
+
+  it("R555 3: the switch's save refused because the library was closed: the draft is kept, nothing is read again, the answer's sentence is said", async () => {
+    const closed = "That library has been closed, so nothing was changed.";
+    const svc = useSvc(SET);
+    await show(svc);
+    const user = userEvent.setup();
+    await user.type(nameField(), " DRAFTNAME");
+    fake.shell!.setStaySignedIn.mockResolvedValue(true);
+    svc.onPut = async () => HttpResponse.json({ error: { code: "LIBRARY_CLOSED", message: closed } }, { status: 409 });
+    await user.click(stay());
+    await waitFor(() => expect(screen.getByTestId("yl-stay-note").textContent).toBe(closed));
+    expect(nameField().value).toContain("DRAFTNAME");
+    expect(svc.count("GET", "/settings/your-library")).toBe(1);
+  });
+
   it("of a read and a save, the answer that came later wins: a read started before the switch's save answered is dropped", async () => {
     const svc = useSvc(SET);
     await show(svc);

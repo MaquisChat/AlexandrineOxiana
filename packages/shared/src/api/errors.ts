@@ -8,8 +8,9 @@
  * comments, the refusals a handler itself makes. Besides those, any route can answer 401
  * UNAUTHORIZED and 403 FORBIDDEN (token, host, origin), 400 VALIDATION (a malformed body), 413
  * PAYLOAD_TOO_LARGE, 503 UNAVAILABLE while the service shuts down, and 500 INTERNAL; a route that
- * reads the open library also 503 LIBRARY_OFFLINE; and a request other than GET, HEAD or OPTIONS
- * also 503 MOVE_IN_PROGRESS while the library is being moved.
+ * reads the open library also 503 LIBRARY_OFFLINE; a request that changes the library also 409 LIBRARY_CLOSED when
+ * the library it began with was closed before its change was made (R551 M5); and a request other than GET, HEAD or
+ * OPTIONS also 503 MOVE_IN_PROGRESS while the library is being moved.
  */
 
 /** Every code the service answers with. */
@@ -17,6 +18,7 @@ export const SERVICE_ERROR_CODES = [
   "POLICY_DENIED",
   "READ_ONLY",
   "LIBRARY_OFFLINE",
+  "LIBRARY_CLOSED",
   "WRONG_PASSPHRASE",
   "NOT_FOUND",
   "VALIDATION",
@@ -41,4 +43,40 @@ export type ServiceErrorCode = (typeof SERVICE_ERROR_CODES)[number];
 /** The body of every error answer. */
 export interface ServiceErrorBody {
   error: { code: ServiceErrorCode; message: string; reason?: string };
+}
+
+/**
+ * R551 M5 (word for word): a change that reached the library after that library was closed (409 LIBRARY_CLOSED).
+ * True whether or not another library is open by then. A request that finds no library open at all keeps
+ * 503 LIBRARY_OFFLINE "No library is open.".
+ */
+export const LIBRARY_CLOSED_TEXT = "That library has been closed, so nothing was changed.";
+
+/**
+ * R551 M5 (word for word): a backup in flight when its library was closed, another library opened or the library
+ * went offline: it was cancelled and nothing of it kept (409 LIBRARY_CLOSED with this sentence). The project's name is
+ * the researcher's own text.
+ */
+export const BACKUP_CLOSED_TEXT = {
+  before: "The library was closed or went offline before the backup of ",
+  after: " was finished, so no backup was made. Back it up again when the library is open.",
+} as const;
+
+/** The one sentence for a backup of `projectName` that a close cancelled (BACKUP_CLOSED_TEXT around the name). */
+export function backupClosedSentence(projectName: string): string {
+  return `${BACKUP_CLOSED_TEXT.before}${projectName}${BACKUP_CLOSED_TEXT.after}`;
+}
+
+/**
+ * R551 M6 (in the style of the ruled sentences): an export the library's close cut short: a read through the closed
+ * library is refused, so nothing was exported and nothing is left in the chosen folder.
+ */
+export const EXPORT_CLOSED_TEXT = {
+  before: "The library was closed or went offline before the export of ",
+  after: " was finished, so no export was made. Export it again when the library is open.",
+} as const;
+
+/** The one sentence for an export of `projectName` that a close cancelled. */
+export function exportClosedSentence(projectName: string): string {
+  return `${EXPORT_CLOSED_TEXT.before}${projectName}${EXPORT_CLOSED_TEXT.after}`;
 }

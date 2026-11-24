@@ -24,6 +24,7 @@ import { PendingWritesDialog } from "../components/PendingWritesDialog";
 import { StatusBanner, bannersFor, useNoticeDismiss, volumeOf } from "../components/StatusBanner";
 import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
+import { ATTACH_CLOSED_TEXT } from "@ao/shared";
 import { findHref } from "../api/find";
 import { zoteroSyncEventOf } from "../api/zoteroSync";
 import { watchedFoldersHref } from "../api/watchedFolders";
@@ -83,6 +84,8 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
   duplicate: "Already in the library",
   "needs-review": "Stored; it",
   failed: "Not added",
+  // Said in its own sentence (ATTACH_CLOSED_TEXT, below); never shown on its own.
+  cancelled: "Not added",
 };
 
 const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing", transcription: "Transcribing recordings" };
@@ -955,8 +958,19 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             {outcomes && (
               <ul aria-label="Attached files" className="ao-plain-list ao-outcomes">
                 {outcomes.map((o, i) => (
-                  <li key={`${o.path}-${i}`} className={o.outcome === "failed" ? "ao-outcome--failed" : undefined}>
-                    <UserText>{baseName(o.path)}</UserText> — {OUTCOME_TEXT[o.outcome] ?? o.outcome}
+                  <li key={`${o.path}-${i}`} className={o.outcome === "failed" || o.outcome === "cancelled" ? "ao-outcome--failed" : undefined}>
+                    {o.outcome === "cancelled" ? (
+                      // FR-749 (R546): one sentence, the service's and the page's (ATTACH_CLOSED_TEXT), the name as the researcher's own text.
+                      <>
+                        {ATTACH_CLOSED_TEXT.before}
+                        <UserText>{baseName(o.path)}</UserText>
+                        {ATTACH_CLOSED_TEXT.after}
+                      </>
+                    ) : (
+                      <>
+                        <UserText>{baseName(o.path)}</UserText> — {OUTCOME_TEXT[o.outcome] ?? o.outcome}
+                      </>
+                    )}
                     {o.outcome === "needs-review" && (
                       <>
                         {" "}
@@ -965,7 +979,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                         </a>
                       </>
                     )}
-                    {o.reason && (
+                    {o.reason && o.outcome !== "cancelled" && (
                       <>
                         : <UserText>{o.reason}</UserText>
                       </>

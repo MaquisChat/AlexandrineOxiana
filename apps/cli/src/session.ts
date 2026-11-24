@@ -132,13 +132,20 @@ export async function openSession(opts: OpenSessionOptions): Promise<Session> {
       closing ??= (async () => {
         for (const h of hooks) await h().catch(() => {});
         await session.worker?.stop().catch(() => {});
-        try {
-          index?.close();
-        } catch {
-          // already closed
-        }
+        // The library's close waits for a change in its store turn (R247 d), which still needs its key and updates the
+        // index: both go after it (R551 M7) — the index before the lock is released (its file is in the library).
+        await lib
+          .close({
+            beforeRelease: () => {
+              try {
+                index?.close();
+              } catch {
+                // already closed
+              }
+            },
+          })
+          .catch(() => {});
         ring.clear();
-        await lib.close().catch(() => {});
         open.delete(session); // only once the library is released: a Ctrl+C handler must still see it until then
       })();
       return closing;

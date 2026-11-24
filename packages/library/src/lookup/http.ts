@@ -49,6 +49,7 @@ import { libraryVersion } from "../resources.js";
 import { join } from "node:path";
 import { request, type Dispatcher } from "undici";
 import { writeFileAtomic } from "../fs/atomic.js";
+import { closingSignalAt } from "../library.js";
 import { recordedLookupsFromEnv, type RecordedFiles, type RecordedLookups } from "./recorded.js";
 
 const VERSION: string = libraryVersion();
@@ -129,6 +130,19 @@ export class LookupHttpError extends Error {
   ) {
     super(message);
     if (rateLimit) Object.defineProperty(this, "rateLimit", { value: Object.freeze({ ...rateLimit }), enumerable: false });
+  }
+}
+
+/**
+ * FR-749 (R546 2, 3): the library session this lookup runs for has begun to close — the client was stopped (`stop`) or
+ * the work runs for a closing session (`whileOpen`) — so the lookup was let go:
+ * a wait (a Retry-After, a back-off, a place or a slot at the host) was cut short, or a request in the air abandoned.
+ * Nothing is asked again because of it (R411: never sooner than the service allows).
+ */
+export class LookupCancelledError extends Error {
+  override name = "LookupCancelledError";
+  constructor() {
+    super("The lookup was stopped because the library is being closed");
   }
 }
 
@@ -243,8 +257,12 @@ export class HttpClient {
    * A client made for a folder that does not exist yet creates it as before.
    */
   private readonly rootExisted: boolean;
+  /** The library this client serves (R551 M3: only that library's closing scope cuts its waits). */
+  private readonly libraryRoot: string;
   /** R247 (c): false once the service has said the library is closing or moving: nothing more is written to disk. */
   private diskCache = true;
+  /** FR-749 (R546 2, 3): aborted by `stop()`: from then on the client sends nothing more, for every caller. */
+  private readonly stopped = new AbortController();
   private readonly dispatcher?: Dispatcher;
   private readonly clock: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -268,6 +286,7 @@ export class HttpClient {
     this.keyForHost = opts.keyFor;
     this.keyReady = opts.keyReady;
     this.cacheDir = join(opts.libraryRoot, ".cache", "lookups");
+    this.libraryRoot = opts.libraryRoot;
     this.rootExisted = existsSync(opts.libraryRoot);
     this.dispatcher = opts.dispatcher;
     this.clock = opts.clock ?? Date.now;
@@ -354,6 +373,39 @@ export class HttpClient {
    */
   purgeSensitive(): void {
     for (const [k, e] of this.memory) if (e.sensitive) this.memory.delete(k);
+  }
+
+  /**
+   * FR-749 (R546 2, 3; R247 c): the library is being closed (its close, the close inside opening or creating another
+   * library, the service's stop). From now on this client sends NOTHING more, for every caller (an attach, a watched
+   * folder, Bulk Import, Find and acquire): requests waiting for a place or a slot are dropped, Retry-After and back-off
+   * waits end, no retry is made, a request in the air is aborted; each such call settles at once with
+   * LookupCancelledError. Nothing is asked again because of it (R411). Answers already in the memory cache still serve.
+   */
+  stop(): void {
+    this.stopped.abort();
+  }
+
+  /** What ends this call's waits: the client's stop, and the closing of the session the current work runs for. */
+  private halt(): AbortSignal {
+    const scope = closingSignalAt(this.libraryRoot);
+    return scope ? AbortSignal.any([this.stopped.signal, scope]) : this.stopped.signal;
+  }
+
+  /** Throws LookupCancelledError once the client is stopped or the current work's session is closing. */
+  private assertOpen(): void {
+    if (this.stopped.signal.aborted || closingSignalAt(this.libraryRoot)?.aborted) throw new LookupCancelledError();
+  }
+
+  /** `p`, or LookupCancelledError as soon as the client is stopped or the current work's session closes (the wait is cut). */
+  private untilClosing<T>(p: Promise<T>): Promise<T> {
+    const sig = this.halt();
+    if (sig.aborted) return Promise.reject(new LookupCancelledError());
+    return new Promise<T>((resolve, reject) => {
+      const stop = () => reject(new LookupCancelledError());
+      sig.addEventListener("abort", stop, { once: true });
+      p.then(resolve, reject).finally(() => sig.removeEventListener("abort", stop));
+    });
   }
 
   /**
@@ -482,8 +534,10 @@ export class HttpClient {
     const u = new URL(url);
     // A POST carries only its own key: `keyFor(host)` is never asked for it.
     const key = this.keyFor(u, opts.key ?? { host: "", value: "" });
+    this.assertOpen();
     const limit = AbortSignal.timeout(opts.timeoutMs ?? this.attemptTimeoutMs);
-    const signal = opts.signal ? AbortSignal.any([opts.signal, limit]) : limit;
+    const halt = this.halt();
+    const signal = AbortSignal.any([...(opts.signal ? [opts.signal] : []), limit, halt]);
     const payload = JSON.stringify(body);
     let giveBack: (() => void) | undefined;
     let given = false;
@@ -543,6 +597,7 @@ export class HttpClient {
       }
     } catch (e) {
       if (e instanceof LookupHttpError) throw e;
+      if (halt.aborted) throw new LookupCancelledError(); // the library is being closed (R546 2, 3)
       // Nothing of the library's own words: they could hold the address or the request.
       throw new LookupHttpError(signal.aborted ? "The service did not answer in time" : "The service could not be reached");
     } finally {
@@ -561,7 +616,7 @@ export class HttpClient {
       this.nextSlot.set(host, this.clock() + gap);
     });
     this.hostQueue.set(host, turn.catch(() => {}));
-    await turn;
+    await this.untilClosing(turn);
   }
 
   /**
@@ -575,7 +630,27 @@ export class HttpClient {
     const queue = this.waiting.get(host) ?? [];
     this.waiting.set(host, queue);
     if ((this.open.get(host) ?? 0) < limit && queue.length === 0) this.open.set(host, (this.open.get(host) ?? 0) + 1);
-    else await new Promise<void>((r) => queue.push(r)); // resolved with the place already counted as ours
+    else {
+      // Resolved with the place already counted as ours. A wait the library's closing cuts short leaves the line, so no
+      // place is ever handed to a caller that has gone (R546 2).
+      const sig = this.halt();
+      this.assertOpen();
+      await new Promise<void>((r, reject) => {
+        const leave = () => {
+          const i = queue.indexOf(granted);
+          if (i >= 0) {
+            queue.splice(i, 1);
+            reject(new LookupCancelledError());
+          }
+        };
+        const granted = () => {
+          sig.removeEventListener("abort", leave);
+          r();
+        };
+        queue.push(granted);
+        sig.addEventListener("abort", leave, { once: true });
+      });
+    }
     let given = false;
     return () => {
       if (given) return;
@@ -599,6 +674,7 @@ export class HttpClient {
     final5xx = false,
   ): Promise<{ status: 200 | 404; body: string | null; sent?: Record<string, string> }> {
     if (this.recorded) return this.recorded.answer(url);
+    this.assertOpen();
     const first = new URL(url);
     if (this.keyReady && first.hostname === KEY_FOR_HOST && this.keyForHost) {
       try {
@@ -620,6 +696,8 @@ export class HttpClient {
         res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) });
       } catch (e) {
         if (e instanceof LookupHttpError) throw e; // refused redirect or oversized body: not retryable
+        // The library is being closed: a request in the air is abandoned and never sent again (R546 2).
+        if (e instanceof LookupCancelledError || this.halt().aborted) throw new LookupCancelledError();
         // The library's own words can hold the address it was asked; with a query (an e-mail), a key or a contact
         // e-mail they are not passed on.
         const why = params.length || key || email ? "" : `: ${e instanceof Error ? e.message : String(e)}`;
@@ -646,7 +724,9 @@ export class HttpClient {
           if (res.status < 500 || final5xx) throw lastError;
         }
       }
-      if (attempt < this.maxRetries) await this.sleep(this.retryDelay(attempt, res?.retryAfter));
+      // The wait before asking again (a Retry-After, a back-off) is cut short when the library is being closed; that
+      // ends the lookup: nothing is asked again sooner than the service allows (R411, R546 2).
+      if (attempt < this.maxRetries) await this.untilClosing(this.sleep(this.retryDelay(attempt, res?.retryAfter)));
     }
     throw lastError!;
   }
@@ -665,7 +745,9 @@ export class HttpClient {
       const giveBack = await this.hold(current.hostname);
       try {
         await this.throttle(current.hostname);
-        signal ??= AbortSignal.timeout(this.attemptTimeoutMs);
+        if (!signal) {
+          signal = AbortSignal.any([AbortSignal.timeout(this.attemptTimeoutMs), this.halt()]);
+        }
         const res = await request(current, {
           method: "GET",
           headers: {

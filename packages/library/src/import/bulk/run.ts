@@ -81,8 +81,8 @@ import {
 import { UnsafeFileError } from "../../extract/errors.js";
 import { extractMetadata } from "../../extract/index.js";
 import type { IndexDb } from "../../index/db.js";
-import { lookupContextFor, providerAllowed, type HttpClient, type LookupContext } from "../../lookup/index.js";
-import { NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError, isLockedRefusal } from "../../repo/errors.js";
+import { LookupCancelledError, lookupContextFor, providerAllowed, type HttpClient, type LookupContext } from "../../lookup/index.js";
+import { LibraryClosedError, NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError, isLockedRefusal } from "../../repo/errors.js";
 import type { CreateSourceOptions, SourceInputFile } from "../../repo/sources.js";
 import { storeRequest } from "../../repo/sources.js";
 import {
@@ -692,6 +692,11 @@ async function saveRecord(repo: Repo, projectId: string, rec: BatchRecord, journ
 }
 
 const sleepTurn = () => new Promise<void>((r) => setImmediate(r));
+/**
+ * FR-749 (R551 I1): the library is being closed — a lookup its closing cut short (`LookupCancelledError`) or a write the
+ * closed library refused (`LibraryClosedError`). A condition of the batch, never a failure of an item.
+ */
+const isClosingCut = (err: unknown): boolean => err instanceof LookupCancelledError || err instanceof LibraryClosedError;
 
 /**
  * New sources are stored in groups of up to this many per governed change: every source's capture
@@ -1075,6 +1080,16 @@ class Run {
       }
     } catch (err) {
       if (this.cancelled && (err as Error)?.name === "AbortError") state = "cancelled";
+      // FR-749 (R546 2, 3; R551 I1): the library is being closed: its lookup client let the item's lookup go, or the
+      // closed library refused a write. The item in hand is not stored (its record would rest on a lookup that was cut
+      // short) and not journaled: the batch is left paused on disk exactly as a suspend leaves it (R99 I4) — when the
+      // library is already closed that save is refused too and the batch stays "running" on disk, read as interrupted
+      // and resumable — and the item is brought in when the batch is resumed.
+      else if (isClosingCut(err)) {
+        state = "paused";
+        this.suspending = true;
+        await this.checkpoint("paused").catch(() => {});
+      }
       else {
         state = "failed";
         // R436 d: a project left refusing every write (a change could not be undone) is what must be settled first,
@@ -1129,6 +1144,9 @@ class Run {
       await writeBatchReport(this.repo, this.projectId, this.rec.id);
     } catch (err) {
       this.deps.debug?.(`bulk import: the batch record could not be saved: ${errorForLog(err)}`);
+      // FR-749 (R546 1): the library was closed under the run, so its end was not saved: on disk the batch is still
+      // "running" (shown as interrupted, resumable). The run's answer says no more than that: it stopped, resumable.
+      if (err instanceof LibraryClosedError && state !== "failed") state = "paused";
       // R413 b, c: the report still says why the batch stopped (kept in memory until the record is saved again).
       const stop = this.rec.notes.find((n) => STOPPED_NOTE.test(n));
       if (stop) unsavedStops.set(this.rec.id, stop);
@@ -1202,6 +1220,9 @@ class Run {
     // refusal, instead of failing every item after it.
     if (isDiskFull(err) || err instanceof RecoveryPendingError) throw err;
     if ((err as Error)?.name === "AbortError") throw err;
+    // FR-749 (R551 I1): a lookup the library's closing cut short, and a write the closed library refused, are the
+    // batch's condition, not the item's: the batch is left paused (`run`) and the item in hand gets no line.
+    if (isClosingCut(err)) throw err;
     // Anything else is unexpected (R393 a, b): the line keeps its kind and the report says it; the log gets the
     // kind and the program's stack, never the error's message (it may hold a path, a title or a name).
     const cause = causeOf(err);
@@ -1871,7 +1892,7 @@ class Run {
     } catch (err) {
       // R413 b: a full disk stops the batch; the group's items keep no line (a resume takes them up again), and are
       // not retried one by one (each would fail the same way).
-      if (err instanceof ProjectLockedError || (err as Error)?.name === "AbortError" || isDiskFull(err) || err instanceof RecoveryPendingError) throw err;
+      if (err instanceof ProjectLockedError || (err as Error)?.name === "AbortError" || isDiskFull(err) || err instanceof RecoveryPendingError || isClosingCut(err)) throw err;
       if (!(err instanceof PolicyDeniedError)) this.deps.debug?.(`bulk import group store failed, storing item by item: ${errorForLog(err)}`);
       // The group as a whole was refused (e.g. the rules changed during the run) or failed: each
       // item on its own, so only the items concerned fail, each with its own audited decision.

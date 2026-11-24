@@ -25,6 +25,7 @@ import path from "node:path";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import {
   FolderNotAnsweringError,
+  LibraryClosedError,
   WATCH_REASONS,
   WatchedFoldersUnreadableError,
   folderCallOutstanding,
@@ -55,6 +56,7 @@ import {
   type WatchedFileState as EngineFileState,
 } from "@ao/library";
 import {
+  WATCH_ACT_CLOSED_TEXT,
   WATCHED_FILE_LIST_KINDS,
   WATCHED_FILES_LIMIT_MAX,
   type CloudProviderId,
@@ -873,11 +875,17 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     const origin = onDisk ?? (held ? { watchId: b.watchId, entry: held } : undefined);
     if (!origin) throw notFound("That file of a watched folder");
     const deps = state.watchDeps(s, projectId);
+    // R551 M5: the act cut by a close, another library's opening or the library going offline says so in its own words.
+    const cut = (err: unknown): never => {
+      if (err instanceof LibraryClosedError) throw new ApiError(409, "LIBRARY_CLOSED", WATCH_ACT_CLOSED_TEXT);
+      throw err;
+    };
     if (b.action === "keep-as-it-is") {
-      await settleWatchedFile(deps, projectId, origin.watchId, origin.entry.key);
+      await settleWatchedFile(deps, projectId, origin.watchId, origin.entry.key).catch(cut);
       return { done: "settled", sourceId: sid };
     }
-    const out = await bringInNewVersion(deps, projectId, origin.watchId, origin.entry.key);
+    const out = await bringInNewVersion(deps, projectId, origin.watchId, origin.entry.key).catch(cut);
+    if (out.outcome === "cancelled") throw new ApiError(409, "LIBRARY_CLOSED", WATCH_ACT_CLOSED_TEXT);
     if (out.outcome !== "attached" && out.outcome !== "duplicate") throw new ApiError(409, "CONFLICT", out.reason ? scrubPaths(out.reason, state.roots) : WATCH_ROUTE_TEXT.notBroughtIn);
     return { done: bringInDone(out.outcome), sourceId: sid };
   });

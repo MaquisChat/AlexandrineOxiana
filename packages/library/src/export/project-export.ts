@@ -53,7 +53,9 @@ import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.j
 import { shredPath } from "../fs/shred.js";
 import { LOCATED_MEDIA, mayHaveLocation } from "../import/resolve.js";
 import { stricterLocation, type LocationMode } from "../repo/assets.js";
-import { PolicyDeniedError, isLockedRefusal } from "../repo/errors.js";
+import { LibraryClosedError, PolicyDeniedError, isLockedRefusal } from "../repo/errors.js";
+import { isClosed } from "../library.js";
+import { exportClosedSentence } from "@ao/shared";
 import { foldName, namesIn } from "../repo/io.js";
 import {
   appendLibraryEvent,
@@ -380,6 +382,17 @@ export class ExportFailedError extends Error {
   }
 }
 
+/**
+ * R551 M6: the library was closed (or went offline) while the export read it: a read through the closed library is
+ * refused, so the export would not be true. Nothing is left in the destination, nothing is recorded as a failure.
+ */
+export class ExportCancelledError extends Error {
+  override name = "ExportCancelledError";
+  constructor(projectName: string) {
+    super(exportClosedSentence(projectName));
+  }
+}
+
 const inside = (child: string, parent: string) => child === parent || child.startsWith(parent.endsWith(sep) ? parent : `${parent}${sep}`);
 
 /**
@@ -391,6 +404,8 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
   try {
     return await exportInner(repo, projectId, dest);
   } catch (err) {
+    // R551 M6: cut by the library's close: cancelled, in its own sentence (never "could not be completed").
+    if (err instanceof LibraryClosedError) throw new ExportCancelledError(repo.getProject(projectId).name);
     if (err instanceof ExportDestinationError || err instanceof PolicyDeniedError || err instanceof ExportFailedError) throw err;
     // Only a lock is "locked" (R435 d): a file sealed under another key id is damage, an ExportFailedError.
     if (isLockedRefusal(err)) throw err;
@@ -401,6 +416,7 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
 
 async function exportInner(repo: Repo, projectId: string, dest: string): Promise<ProjectExportResult> {
   const lib = repoLibrary(repo);
+  if (isClosed(lib)) throw new LibraryClosedError(); // R551 M6: nothing read from, or written into, a closed library
   const libReal = await realOrResolved(lib.root);
   const refuseInside = async () => {
     if (inside(await realOrResolved(dest), libReal) || inside(resolve(dest), resolve(lib.root))) {
@@ -657,6 +673,10 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
     withheld,
     files: filesWritten,
     omittedFiles: omittedLocated + omittedDestroyed,
+  }).catch(async (err: unknown) => {
+    // R551 M6: the library closed before the export could be recorded: no unrecorded export is left behind.
+    if (err instanceof LibraryClosedError) await shredPath(finalRoot).catch(() => {});
+    throw err;
   });
   return { path: finalRoot, exported: allowed.length, withheld, omittedFiles: omittedLocated + omittedDestroyed, notes };
 }
