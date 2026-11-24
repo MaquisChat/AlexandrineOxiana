@@ -1018,15 +1018,34 @@ export async function lookNow(root: string, rel: string): Promise<"nothing" | "a
 }
 
 /**
- * Whether the app still keeps a copy of something of this change that is not back in its place: a trash copy, or a
- * backup of a replaced file whose bytes are not at its path. Removing the marker lets such a copy go (its backups are
- * deleted with it, and the next opening sweeps the trash): closing must delete nothing (R509), so it waits; where nothing
- * else stops the undo and its own copy is gone, nothing the researcher can do in the app remains (R528 M2).
+ * R532 I1: whether the backup of "replaced" line `i` holds bytes that are not the change's own: only the backup of the
+ * FIRST "replaced" line of its path that no earlier line of the change created (a "created" line at the path, a folder
+ * the change made at or above it, a file it created by appending). A later rewrite's backup, or one after the change's
+ * own creation, holds the change's own earlier write. (A path the change trashed and then created again: the created
+ * file is the change's own, and the original is in the trashed copy, which counts by its own rule.)
+ */
+function backupHoldsOriginal(entries: MarkerEntry[], i: number): boolean {
+  const path = (entries[i] as Extract<MarkerEntry, { kind: "replaced" }>).path;
+  for (let j = 0; j < i; j++) {
+    const x = entries[j]!;
+    if (x.kind === "replaced" && x.path === path) return false;
+    if ((x.kind === "created" || (x.kind === "append" && x.created)) && x.path === path) return false;
+    if (x.kind === "dir" && (x.path === path || path.startsWith(`${x.path}/`))) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether the app still keeps a copy of something of the researcher's that is not back in its place: a trash copy, or
+ * the backup of a replaced file that holds bytes not the change's own (`backupHoldsOriginal`) and whose bytes are not
+ * at its path. Removing the marker lets such a copy go (its backups are deleted with it, and the next opening sweeps the
+ * trash): closing must delete nothing (R509), so it waits; where nothing else stops the undo and its own copy is gone,
+ * nothing the researcher can do in the app remains (R528 M2). The change's own intermediate bytes do not hold it (R532).
  */
 export async function keptCopiesLeft(root: string, m: Pick<TxnMarker, "entries">): Promise<boolean> {
-  for (const e of m.entries) {
+  for (const [i, e] of m.entries.entries()) {
     if (e.kind === "trashed" && (await exists(fromRel(root, e.to)))) return true;
-    if (e.kind === "replaced") {
+    if (e.kind === "replaced" && backupHoldsOriginal(m.entries, i)) {
       const backup = await readMaybe(fromRel(root, e.backup));
       if (backup === null) continue;
       const now = await readMaybe(fromRel(root, e.path)).catch(() => null);
