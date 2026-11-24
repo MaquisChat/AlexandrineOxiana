@@ -420,8 +420,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const refocusAfterRead = useRef<string | null>(null);
   /**
    * R513 (I1): when focus went somewhere at once and is to move again once the read lands (a look closed during the
-   * read), the element the first move put it on. The second move happens only if focus is still there: focus is never
-   * taken from where the researcher has put it meanwhile (a control inside the screen, or anything outside it). Null when
+   * read), the element the first move put it on. The second move happens only if focus is still there, or on the page
+   * body (R513 N1): focus is never taken from where the researcher has put it meanwhile (a control inside the screen, or anything outside it). Null when
    * the move after the read is R313 e's own (a given-up decision, whose focus was judged when it was recorded).
    */
   const refocusOnlyFrom = useRef<Element | null>(null);
@@ -558,8 +558,10 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         refocusAfterRead.current = null;
         refocusOnlyFrom.current = null;
         // R313 e: back to that file's heading; its card is still in its place (R319 b), whether or not it still waits.
-        // R513 (I1): after a look closed during the read, only if focus is still where that close put it.
-        if (back && (!from || document.activeElement === from)) setFileFocus({ to: laidRef.current?.items.some((i) => i.id === back) ? back : ":title" });
+        // R513 (I1, N1): after a look closed during the read, only if focus is still where that close put it, or on the
+        // page (nowhere: never left there, FR-739 2) — never taken from any other element the researcher put it on.
+        const active = document.activeElement;
+        if (back && (!from || active === from || !active || active === document.body)) setFileFocus({ to: laidRef.current?.items.some((i) => i.id === back) ? back : ":title" });
         // A waiting file is shown in full in its own section; the panel shows the first of the others.
         setCurrent(list.find((i) => !isFound(i))?.id ?? null);
         // Titles come with the items; only items sent without one need their record for the list. A waiting file's

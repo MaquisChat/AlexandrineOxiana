@@ -501,6 +501,21 @@ describe("R487 a: a look and the card's own decision", () => {
     expect(document.activeElement).toBe(elsewhere);
   });
 
+  // R513 N1: focus on the page body when the read lands (the researcher has not put it anywhere): it moves to the card's
+  // heading — focus is never left on the page (FR-739 2).
+  it("R513 (N1): Close during a slow re-read, then focus falls to the page body: when the read lands, focus goes to the looked-at card's heading", async () => {
+    const s = await lookDuringSlowReread((items) => HttpResponse.json({ items, total: items.length, offset: 0, limit: 500 }));
+    await s.user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const heading = screen.getByRole("heading", { level: 1, name: "Review queue" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    heading.blur();
+    expect(document.activeElement).toBe(document.body);
+    s.releaseRead();
+    await waitFor(() => expect(document.activeElement).toBe(card(OTHER).querySelector("h4")));
+    expect(reachable(document.activeElement!)).toBe(true);
+  });
+
   it("R513 (I1): Close during a slow re-read, then focus moved to another control INSIDE the screen: when the read lands, focus stays there", async () => {
     const s = await lookDuringSlowReread((items) => HttpResponse.json({ items, total: items.length, offset: 0, limit: 500 }), { sourceId: "s8" });
     await s.user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
