@@ -11,6 +11,10 @@
  * twice: as the crash left it (the opening's undo cut off before its first step), and after the opening's undo. The
  * test works out from the bytes whether the researcher's original is held only in a kept copy; the guard must say so.
  * Then every case the guard lets through is closed for real, and every case it holds is refused with nothing changed.
+ *
+ * R533 (4): a create may also be made BY COPYING a file of the library (the researcher's q, which the change then trashes
+ * after its steps, its kept copy deleted as before). A backup of a path the change created by copying holds the
+ * researcher's bytes, and counts as kept; only a path the change wrote from bytes of its own making is "its own".
  */
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -37,15 +41,19 @@ const OTHER = "the researcher's original at q\n";
 const COPIES_LEFT_TEXT =
   "This change cannot be closed: the app still keeps a copy of a file it could not put back, and closing would let that copy go. Restoring the project from a backup made before the change is the way to undo it.";
 
-type Step = "create" | "rewrite" | "trash";
+type Step = "create" | "copy" | "rewrite" | "trash";
+/** C create (bytes of the change's own), K create by copying q, R rewrite, T trash. */
+const LETTER: Record<Step, string> = { create: "C", copy: "K", rewrite: "R", trash: "T" };
 
-/** Every sequence of `n` steps at one path that the transaction can take: a create only where nothing is, a rewrite or a trash only where a file is. */
+/** Every sequence of `n` steps at one path that the transaction can take: a create (of either kind) only where nothing is, a rewrite or a trash only where a file is. */
 function sequences(n: number, original: boolean): Step[][] {
   const out: Step[][] = [];
   const grow = (seq: Step[], present: boolean) => {
     if (seq.length === n) return void out.push(seq);
-    if (!present) grow([...seq, "create"], true);
-    else {
+    if (!present) {
+      grow([...seq, "create"], true);
+      grow([...seq, "copy"], true);
+    } else {
       grow([...seq, "rewrite"], true);
       grow([...seq, "trash"], false);
     }
@@ -59,13 +67,13 @@ interface Case {
   original: boolean;
   steps: Step[];
 }
-/** Each sequence cut after each of its steps (the crash comes after that step). Named "orig"/"none" (an original at p or not), the steps (C create, R rewrite, T trash), and the cut. */
+/** Each sequence cut after each of its steps (the crash comes after that step). Named "orig"/"none" (an original at p or not), the steps (`LETTER`), and the cut. */
 const CASES: Case[] = [];
 for (const original of [true, false]) {
   for (const n of [2, 3]) {
     for (const seq of sequences(n, original)) {
       for (let cut = 1; cut <= n; cut++) {
-        CASES.push({ name: `${original ? "orig" : "none"} ${seq.map((x) => x[0]!.toUpperCase()).join("")} cut ${cut}`, original, steps: seq.slice(0, cut) });
+        CASES.push({ name: `${original ? "orig" : "none"} ${seq.map((x) => LETTER[x]).join("")} cut ${cut}`, original, steps: seq.slice(0, cut) });
       }
     }
   }
@@ -145,7 +153,8 @@ async function snapshot(x: World): Promise<Map<string, string>> {
 
 /**
  * The case's change, crashed before its audit: the original at q trashed first, then the steps at p, each rewrite
- * and create writing bytes of its own; then the kept copy of q deleted (q is lost before any close).
+ * and create writing bytes of its own; then the kept copy of q deleted (q is lost before any close). Where the steps
+ * create p by copying q (R533 (4)), q is trashed after the steps instead (a copy is made of it first).
  */
 async function crashedCase(x: World, c: Case): Promise<{ m: TxnMarker; p: string; q: string; before: Map<string, string> }> {
   const p = `${x.project}/p.txt`;
@@ -156,11 +165,14 @@ async function crashedCase(x: World, c: Case): Promise<{ m: TxnMarker; p: string
   seams.crashAt = "before-audit";
   await expect(
     x.repo.mutate(x.pid, STORE, async (tx: Tx) => {
-      await tx.trash(q);
+      const copies = c.steps.includes("copy");
+      if (!copies) await tx.trash(q);
       for (const [k, s] of c.steps.entries()) {
         if (s === "trash") await tx.trash(p);
+        else if (s === "copy") await tx.copyFile(fromRel(x.lib.root, q), p);
         else await tx.writeFile(p, `the change's write ${k + 1}\n`);
       }
+      if (copies) await tx.trash(q);
     }),
   ).rejects.toBeInstanceOf(SimulatedCrash);
   seams.crashAt = undefined;
@@ -171,10 +183,15 @@ async function crashedCase(x: World, c: Case): Promise<{ m: TxnMarker; p: string
   return { m, p, q, before };
 }
 
-/** Worked out from the bytes: the researcher's original at p is held ONLY in a copy the app keeps (not at p). */
+/**
+ * Worked out from the bytes: something of the researcher's is held ONLY in a copy the app keeps — the original at p
+ * (not at p), or q's bytes (lost from q; R533 (4): a copy the change made of q may hold them) in no file of the library.
+ */
 async function originalOnlyKept(x: World, c: Case, p: string): Promise<boolean> {
+  const kept = [...(await tmpFiles(x)).values()];
+  if (kept.includes(OTHER) && ![...(await snapshot(x)).values()].includes(OTHER)) return true;
   if (!c.original || (await text(x, p)) === ORIGINAL) return false;
-  return [...(await tmpFiles(x)).values()].includes(ORIGINAL);
+  return kept.includes(ORIGINAL);
 }
 /** Trashed copies count as before: any of this change's trash copies still there. */
 const trashLeft = async (x: World): Promise<boolean> => [...(await tmpFiles(x)).keys()].some((n) => n.startsWith("trash-"));
@@ -183,8 +200,9 @@ const counts = { undone: { kept: 0, notKept: 0 }, asCrashed: { kept: 0, notKept:
 
 describe("R532 I1: the close guard", () => {
   it("the table has its cases", () => {
-    // With an original: RR, RT, TC (2 steps), RRR, RRT, RTC, TCR, TCT (3 steps); without: CR, CT, CRR, CRT, CTC.
-    expect(CASES).toHaveLength(3 * 2 + 5 * 3 + 2 * 2 + 3 * 3);
+    // With an original: RR, RT, TC, TK (2 steps), RRR, RRT, RTC, RTK, TCR, TCT, TKR, TKT (3 steps); without: CR, CT, KR,
+    // KT, CRR, CRT, CTC, CTK, KRR, KRT, KTC, KTK.
+    expect(CASES).toHaveLength(4 * 2 + 8 * 3 + 4 * 2 + 8 * 3);
   });
 
   for (const moment of ["undone", "asCrashed"] as const) {

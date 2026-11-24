@@ -1036,19 +1036,21 @@ export async function lookNow(root: string, rel: string): Promise<"nothing" | "a
 }
 
 /**
- * R532 I1: whether the backup of "replaced" line `i` holds bytes that are not the change's own: only the backup of the
- * FIRST "replaced" line of its path that no earlier line of the change created (a "created" line at the path, a folder
- * the change made at or above it, a file it created by appending). A later rewrite's backup, or one after the change's
- * own creation, holds the change's own earlier write. (A path the change trashed and then created again: the created
- * file is the change's own, and the original is in the trashed copy, which counts by its own rule.)
+ * R532 I1, R533 (4): whether the backup of "replaced" line `i` may hold bytes that are not the change's own. It holds
+ * only the change's own bytes where the nearest earlier line of the change at its path shows the change wrote the file
+ * there from bytes of its own making: an earlier "replaced" line at the path (the backup holds that rewrite's bytes), a
+ * "created" line with a hash of its own and no completion mark (a file written whole), or a file the change created by
+ * appending. Every other origin counts as holding the researcher's bytes (the safe side): the path was there before the
+ * change; the change created it BY COPYING a file (a "created" line with no hash of its own, whose completion line
+ * carries the hash as stored); or it lies in a folder the change made, where a copy and a write leave the same line.
  */
 function backupHoldsOriginal(entries: MarkerEntry[], i: number): boolean {
   const path = (entries[i] as Extract<MarkerEntry, { kind: "replaced" }>).path;
-  for (let j = 0; j < i; j++) {
+  for (let j = i - 1; j >= 0; j--) {
     const x = entries[j]!;
-    if (x.kind === "replaced" && x.path === path) return false;
-    if ((x.kind === "created" || (x.kind === "append" && x.created)) && x.path === path) return false;
-    if (x.kind === "dir" && (x.path === path || path.startsWith(`${x.path}/`))) return false;
+    if (x.kind === "trashed" || x.kind === "dir" || x.path !== path) continue;
+    if (x.kind === "replaced" || (x.kind === "append" && x.created)) return false;
+    if (x.kind === "created" && x.complete !== true) return x.sha256 === undefined;
   }
   return true;
 }
@@ -1058,7 +1060,8 @@ function backupHoldsOriginal(entries: MarkerEntry[], i: number): boolean {
  * the backup of a replaced file that holds bytes not the change's own (`backupHoldsOriginal`) and whose bytes are not
  * at its path. Removing the marker lets such a copy go (its backups are deleted with it, and the next opening sweeps the
  * trash): closing must delete nothing (R509), so it waits; where nothing else stops the undo and its own copy is gone,
- * nothing the researcher can do in the app remains (R528 M2). The change's own intermediate bytes do not hold it (R532).
+ * nothing the researcher can do in the app remains (R528 M2). The change's own intermediate bytes do not hold it (R532);
+ * a copy the change made of a file of the library does (R533 (4)).
  */
 export async function keptCopiesLeft(root: string, m: Pick<TxnMarker, "entries">): Promise<boolean> {
   for (const [i, e] of m.entries.entries()) {
