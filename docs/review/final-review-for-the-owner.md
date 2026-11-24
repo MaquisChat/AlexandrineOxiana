@@ -506,7 +506,7 @@ You said "keep building". The 23 known gaps of part 10 are built; the other two 
 - **Where it stands:** built, tested together on my side, and green in GitHub's own check: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45464905103
 - **There is no Mac build of it yet.** I asked for Mac build 11 twice. GitHub cancelled the Mac job four times, each time about fifteen minutes after it was queued, without ever giving it a Mac; nothing of the build ran, so this says nothing about the app. The last time a Mac was given was for build 10, the night before. I cannot see GitHub's reason from here; the cancelled job's page may show it: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45464905098 (the job "apple-silicon (macos-15)"). I will ask again with the next change (FR-749, below) and put the download here when it exists.
 - **Until then, build 10 is the build to use** (part 10 says where). What follows describes the next build.
-- **It is in `main`** (the approved version) since 24 November, about 3 pm Central: you said "merge". The app's code in `main` is, file for file, the code that was tested and that passed GitHub's check. GitHub's check of `main` itself runs on that merge.
+- **It is in `main`** (the approved version) since 24 November, about 3 pm Central: you said "merge". The app's code in `main` is, file for file, the code that was tested and that passed GitHub's check. GitHub's check of `main` itself passed on that merge (4:13 pm Central): https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45487722814
 
 ### What you will notice (in the next Mac build)
 
