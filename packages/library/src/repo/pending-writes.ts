@@ -320,12 +320,13 @@ async function afterResolved(core: RepoCore, st: ProjectState, txn: string, held
     if (w.projectId === st.project.id && w.kind === "incomplete-audit-line-pending" && w.file !== undefined && !stillIncomplete.has(w.file)) core.integrityWarnings.splice(k, 1);
   }
   if (held) {
-    // R528 M3: the refusal of a write then says that opening the library again is the way.
+    // R528 M3: the refusal of a write then says that opening the library again is the way. R530: so does its warning,
+    // a kind of its own (the anchor kind's sentence says why, not what to do); the next opening raises the anchor's own.
     st.reopenToResume = true;
     core.integrityWarnings.push({
       projectId: st.project.id,
-      kind: held.kind,
-      detail: `${held.detail}; the interrupted change was resolved, and this project takes changes again once the library is reopened, which records this first`,
+      kind: "interrupted-change-resolved-reopen",
+      detail: `an interrupted change was resolved, but ${held.detail}; this is recorded the next time the library is opened, and this project refuses changes until then: close the library and open it again`,
     });
   }
   // Writes resume unless something else still holds the project.

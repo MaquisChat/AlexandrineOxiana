@@ -60,6 +60,11 @@ export interface IntegrityWarning {
     | "destroy-incomplete"
     /** R509: the researcher closed an interrupted change whose undo could never complete; what it removed is lost. */
     | "interrupted-change-closed"
+    /**
+     * R530: an interrupted change was resolved while the project's audit log does not match this computer's record of
+     * it (R131 d): the next opening records that first, and the project refuses changes until then.
+     */
+    | "interrupted-change-resolved-reopen"
     /** FR-729: the record of recovery's warnings kept until dismissed could not be read; set aside when writable. */
     | "recovery-warnings-set-aside"
     /** A staged recovery-code key file that is not the committed one was removed, not activated (R148). */

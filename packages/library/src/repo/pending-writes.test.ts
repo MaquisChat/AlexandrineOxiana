@@ -418,8 +418,20 @@ describe("pending writes: the resolve is durable before it acts (R131 c, d)", ()
     expect(err).toBeInstanceOf(RecoveryPendingError);
     // R528 M3: held for another reason than an interrupted change: reopening the library is the way, and is said.
     expect((err as RecoveryPendingError).reason).toBe("reopen");
+    // R530: its warning is a kind of its own, which says to open the library again (not the anchor kind's sentence).
+    expect(repo.integrityWarnings.filter((w) => w.projectId === pid)).toEqual([
+      {
+        projectId: pid,
+        kind: "interrupted-change-resolved-reopen",
+        detail: expect.stringMatching(
+          /^an interrupted change was resolved, but audit event \d+ differs from the recorded head; the audit log changed outside the app; this is recorded the next time the library is opened, and this project refuses changes until then: close the library and open it again$/u,
+        ),
+      },
+    ]);
     const again = await reopen();
     expect((await audit(again, pid)).map((e) => e.action)).toContain("audit.anchor-mismatch");
+    // Recorded at the opening: the anchor's own warning says it from then on, and this one is gone.
+    expect(again.integrityWarnings.filter((w) => w.projectId === pid).map((w) => w.kind)).toEqual(["head-mismatch"]);
     await add(again, pid, "After");
   });
 

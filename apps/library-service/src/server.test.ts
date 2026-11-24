@@ -3111,6 +3111,44 @@ describe("FR-736: an interrupted change whose undo is not complete, as the servi
   });
 });
 
+describe("R530: a change resolved while its audit log does not match this computer's record, as the service says it", () => {
+  beforeEach(() => start());
+
+  it("the status lists a warning of its own kind; a write is refused with the sentence for a project held until the library is opened again", async () => {
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const folder = (await call({ url: "/projects" })).json.projects[0].folder as string;
+    // A plainly uncommitted change (its marker matches the audit log) whose undo at the opening failed part-way, so the
+    // project is held; then an anchor that names the change's start with a different event there.
+    const txn = "019a7000-0000-7000-8000-0000000000e1";
+    const lines = (await readFile(join(path, folder, "audit", "0001.jsonl"), "utf8")).trim().split("\n").length;
+    await mkdir(join(path, ".tmp"), { recursive: true });
+    await writeFile(
+      join(path, ".tmp", `txn-${txn}.json`),
+      JSON.stringify({ formatVersion: 1, txn, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: lines, entries: [{ kind: "created", path: `${folder}/half-written.txt` }] }),
+    );
+    await writeFile(join(path, folder, "half-written.txt"), "half");
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    repoSeams.failUndo = "created";
+    try {
+      expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    } finally {
+      repoSeams.failUndo = undefined;
+    }
+    const anchors = join(tmp, "config", "audit-anchors.json");
+    const raw = JSON.parse(await readFile(anchors, "utf8")) as { anchors: Record<string, { seq: number; hash: string }> };
+    const key = Object.keys(raw.anchors).find((k) => k.endsWith(`/${pid}`))!;
+    raw.anchors[key]!.hash = "0".repeat(64);
+    await writeFile(anchors, JSON.stringify(raw));
+    const r = await call({ method: "POST", url: `/libraries/pending-writes/${txn}/resolve`, body: { choice: "roll-back" } });
+    expect(r.status, r.body).toBe(200);
+    const integrity = (await call({ url: "/libraries/integrity" })).json.integrityWarnings as Array<Record<string, unknown>>;
+    expect(integrity.filter((w) => w.projectId === pid).map((w) => [w.kind, w.project])).toEqual([["interrupted-change-resolved-reopen", "Study"]]);
+    const write = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } });
+    expect([write.status, write.json.error.message]).toEqual([409, "This project takes no changes until the library is opened again. The warning on the library's main screen says why."]);
+  });
+});
+
 describe("FR-729: recovery's warnings, kept with the library until dismissed, as the service says them", () => {
   beforeEach(() => start());
 

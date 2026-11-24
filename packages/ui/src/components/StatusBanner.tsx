@@ -125,6 +125,10 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   // R509: an interrupted change closed as it was, by the researcher's choice; the path is in the audit log only (R503 d).
   "interrupted-change-closed": (p) =>
     `An interrupted change in ${p} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone: that file is lost. The closing is recorded in the audit log of ${p}.`,
+  // R530: resolved while the audit log does not match this computer's record of it: the next opening records that, and
+  // the project takes no changes until then (the anchor kinds' sentences say why, not what to do).
+  "interrupted-change-resolved-reopen": (p) =>
+    `An interrupted change in ${p} was resolved, but ${p}'s audit log may have been changed outside the app. The app records this the next time the library is opened, and changes to ${p} are off until then: close the library and open it again.`,
   // FR-729: the record of recovery's warnings kept until dismissed could not be read (set aside when writable).
   "recovery-warnings-set-aside": () =>
     "The library's record of earlier warnings about interrupted changes could not be read, so some of those warnings may not be shown again. The damaged record is kept in the library's work folder.",

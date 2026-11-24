@@ -175,6 +175,7 @@ describe("StatusBanner", () => {
       "audit-unrecorded", "permissions-not-set", "audit-recorded-late", "refusal-unrecorded",
       "audit-unrecorded-blocked", "attention-unreadable", "audit-waiting",
       "source-change-unfinished", "source-change-unfinished-read-only", "interrupted-change-closed", "recovery-warnings-set-aside",
+      "interrupted-change-resolved-reopen",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();
@@ -276,6 +277,18 @@ describe("FR-736: an interrupted change whose undo is not complete says the stat
       `An interrupted change in ${P} was left as it is, because its audit log could not be checked first. The app cannot undo it safely. Restoring a backup made before the change is the way to undo it.`,
     );
     expect(screen.getAllByRole("button").map((x) => x.textContent)).toEqual(["Resolve…"]);
+  });
+
+  it("R530: a change resolved while its audit log does not match this computer's record: what to do (close and open again), the name isolated, nothing to press", () => {
+    const name = "مقابلات هرات";
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: name, kind: "interrupted-change-resolved-reopen", detail: "x" }] });
+    render(<StatusBanner variant={b!} onResolve={() => undefined} onDismissWarning={() => undefined} />);
+    const status = screen.getByRole("status");
+    expect(status.querySelector("span")!.textContent).toBe(
+      `An interrupted change in ${name} was resolved, but ${name}'s audit log may have been changed outside the app. The app records this the next time the library is opened, and changes to ${name} are off until then: close the library and open it again.`,
+    );
+    expect([...status.querySelectorAll("[dir=auto]")].map((el) => el.textContent)).toEqual([name, name, name]);
+    expect(screen.queryByRole("button")).toBeNull();
   });
 
   it("a complete undo keeps its sentence, and offers nothing to resolve", () => {
