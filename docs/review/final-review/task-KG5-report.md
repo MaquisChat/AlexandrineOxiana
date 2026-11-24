@@ -44,3 +44,34 @@ The artefact `worker-bundle-report-macos-apple-silicon`'s `sidecar-manifest.json
 - `cd apps/desktop && nice -n 10 node --test scripts/build-macos.test.mjs`: `# tests 34 / # pass 34 / # fail 0`
 - `cd services/media-worker && nice -n 10 <venv python> -m pytest -q tests/test_packaging_manifest.py`: `28 passed`
 - `git status --short`: empty
+
+## Fix round (R506)
+
+Head: `5f9d91a`. Commits: `285b794` (M1), `b7b4067` (M2 with M3: one commit, because both use the manifest script's new reader `read_pins`), `7abaa98` (M4), `5f9d91a` (M6 with M8, comments only).
+
+| Point | What changed (file) | Its test, and that it failed first |
+|---|---|---|
+| M1 | No code change. | New test in `services/media-worker/tests/test_packaging_manifest.py`: `test_main_with_pins_complete_fails_the_build_when_the_bundle_differs_from_the_constraints`. It runs `manifest.main()` with `--pins-complete` on a one-package bundle built with `make_bundle` (`packaging`, at this venv's version). The licence folder, the native libraries and `metadata.version` are stubbed. Results: (a) a file without the package exits non-zero and names it; (b) a file with another version (`.post9`) exits non-zero and names it; (c) a matching file exits 0. It passes on the code as it is. With `manifest.py`'s `return complete or pinned` changed to `return complete` in a scratch edit, it FAILED; the line was restored and `git status` was clean. |
+| M2 | `manifest.py`: new `unused_pins`. `report_pins` prints, after a passing check, `constraints note: <file> also pins N package(s) the bundle does not hold: <names>`. Exit code unchanged. README "Changing a pin", step 3, mentions the line. | `test_pins_for_packages_the_bundle_does_not_hold_are_named_on_one_line_without_failing`: the line is printed, the result is 0, and there is no line when nothing is stale. It failed first (no note was printed). |
+| M3 | `manifest.py`: new `read_pins`, used by `check_pinned`. It raises `ValueError("the constraints file names <canonical name> twice (<line>, <line>)")`. `report_pins` turns that into `constraints check FAILED: …`, exit 1. `apps/desktop/scripts/build-sidecars.mjs` `parseConstraints` throws the same sentence. Both compare names after PEP 503 normalisation. | Python: `test_a_constraints_file_that_names_a_package_twice_is_refused` (PyYAML/pyyaml; pydantic_core/Pydantic-Core through `report_pins`). Failed first. JS: `scripts/build-sidecars.test.mjs` "a constraints file that names one package twice is refused, naming it (R506 M3)". Failed first. |
+| M4 | `.github/workflows/desktop-macos.yml`: `python-version: "3.13.17"`, with a one-line comment; both cache-key lines now say `py3.13.17`. `build-sidecars.mjs`: `findPython` also returns `full` (`platform.python_version()`). New exported `venvStamp(python, pyproject, constraints)` puts the full version in the build venv's stamp, so a different patch release rebuilds the venv; the resolve venv's stamp also uses `full`. `apps/desktop/README.md` says Python 3.13.17. The manifest's `python` field was already the full version. Not changed: `ci.yml`, and pip's `--python-version`, which stays at major.minor. The YAML parses. | `build-macos.test.mjs` "asks for Python 3.13.17 exactly…": the setup-python step and both cache keys. `build-sidecars.test.mjs` "the build venv is made again when Python's patch release changes…". Both failed first: the first on the workflow's `"3.13"`, the second because `venvStamp` was not exported. |
+| M6 | Comments only. `docs/adr/0012-citations.md` (Limits), and the `sandbox.ts` head comment, say the setting is a cap per thread, not a total: the main thread has 512 MB and each worker another 512 MB; at most two workers run at once, so the service can approach three times 512 MB. `custom-styles.ts`, `sandbox-worker.mjs` and one comment in `custom-styles.test.ts` now say "512 MB per worker". | None (comments). `custom-styles.test.ts` was re-run: 33 passed. |
+| M8 | Comment only. The head comment of `build-sidecars.mjs` says that any constraints file that is not a complete pin set (the Intel file, a hand-given file, even a copy of the arm64 file at another path) overrides the direct pins for the packages it names and is not checked. | None (comment). |
+
+Correction to the first report (M5): the sentence "the cached `venv-default` is restored but unused" was wrong. The cache key includes the new file's hash, so the next Mac build restores nothing: it builds the venv cold and downloads the Node archive again. Because of M4's `py3.13.17` key, the same holds for this branch's first Mac build.
+
+New log lines (build log only; nothing a researcher sees):
+- `constraints note: <file> also pins N package(s) the bundle does not hold: <names>`
+- `constraints check FAILED: the constraints file names <name> twice (<line>, <line>)`
+- the build script's error: `build-sidecars: the constraints file names <name> twice (<line>, <line>)`
+
+For the next Mac build: after the `constraints check:` line there should be NO `constraints note:` line, since build 10's 56 packages are exactly the file's.
+
+Runs (fix round):
+- `nice -n 10 node --test scripts/build-sidecars.test.mjs`: `# pass 11 / # fail 0`
+- `cd apps/desktop && nice -n 10 node --test scripts/build-macos.test.mjs`: `# tests 35 / # pass 35 / # fail 0`
+- `test_packaging_manifest.py` with the main checkout's venv: `31 passed`
+- `custom-styles.test.ts` (machine environment): `Tests  33 passed (33)`
+- `pnpm --filter @ao/library typecheck`: exit 0
+- the workflow parses (`yaml.safe_load`)
+- `git status --short`: empty
