@@ -41,12 +41,24 @@ export interface LookupContext {
   titleSearchAllowed?: boolean;
   /** Receives a short note when a provider is skipped (denied by policy, or unavailable). */
   debug?: (note: string) => void;
+  /**
+   * Decision 31 (b), R556 (2): "leave-out" — a service that asks to wait is not waited for (the client's
+   * `GetOptions.askedToWait`): its lookup ends at once with LookupLeftOutError. Set only by the interactive attach and a
+   * watched folder's bringing-in; absent, every lookup waits as before (Bulk Import, Zotero, Find and acquire).
+   */
+  askedToWait?: "leave-out";
 }
 
 export type Provider = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit";
 
 /** True unless the context explicitly says `sensitive: false` (R52, fail-closed). */
 export const isSensitive = (ctx: LookupContext): boolean => ctx.sensitive !== false;
+
+/** The request options every provider passes from its context: sensitivity (R52) and the rule on waits (R556 2). */
+export const requestRules = (ctx: LookupContext): { sensitive: boolean; askedToWait?: "leave-out" } => ({
+  sensitive: isSensitive(ctx),
+  ...(ctx.askedToWait === "leave-out" ? { askedToWait: "leave-out" as const } : {}),
+});
 
 /** `evaluate({action:'process', process:{op:'metadata_lookup', provider}})`; a deny is a debug note, never an error. */
 export function providerAllowed(ctx: LookupContext, provider: Provider): boolean {

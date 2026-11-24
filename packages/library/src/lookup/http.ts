@@ -41,6 +41,13 @@
  *  - arXiv's export host: one request every 3 seconds, one at a time (its API terms; F10, R254 a).
  *  - An answer whose body holds a value of the request's private `query` (an echoed e-mail) is returned but never
  *    cached, on disk or in memory (R257 h). `GetOptions.final5xx` (R257 i) makes a 5xx final: not retried.
+ *  - Decision 31 (b), R556 (2): `GetOptions.askedToWait: "leave-out"` (the interactive attach and a watched folder's
+ *    bringing-in). A 429, or a 503 with a wait asked (a readable Retry-After), is not waited for: the call ends at once
+ *    with LookupLeftOutError, and the client keeps, per host and in memory only, "not before T" (the time asked, a 429
+ *    without one counting as a minute, at most an hour: R411 b). Until T every such call to that host is left out
+ *    without anything being sent. A call without the option that meets T waits for it before asking (R411: never
+ *    sooner), as it waits for its own Retry-After: at most `maxRetryAfterMs`; its own 429s are handled as before. The
+ *    holds are lost when the client goes (the library is closed, the app quits).
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -146,6 +153,28 @@ export class LookupCancelledError extends Error {
   }
 }
 
+/**
+ * Decision 31 (b), R556 (2): a service asked to wait (a 429, or a 503 with a wait asked), or is still within the time it
+ * asked for, and the caller asked not to wait (`askedToWait: "leave-out"`): the lookup was left out at once. Not a
+ * LookupHttpError: it is neither "failed" nor "not found". `notBefore` is the time (client clock, ms) before which that
+ * host is not asked again; `services` names the providers left out (set by the lookup chain; [] from the client itself).
+ */
+export class LookupLeftOutError extends Error {
+  override name = "LookupLeftOutError";
+  constructor(
+    readonly host: string,
+    readonly notBefore: number,
+    readonly services: readonly string[] = [],
+  ) {
+    super("The metadata service asked to wait, so it was left out for now");
+  }
+}
+
+/** The longest "not before" the client keeps for a host (R411 b: a longer wish is cut to the hour). */
+export const MAX_HOLD_MS = 3_600_000;
+/** What a 429 that names no time counts as (R556 2 i). */
+export const UNNAMED_WAIT_MS = 60_000;
+
 /** Keeps an answer's Retry-After on its error, not enumerable (R411 b: the free-copy runner's next try honours it). */
 function withRetryAfter(e: LookupHttpError, value: string | undefined): void {
   if (value !== undefined) Object.defineProperty(e, "retryAfter", { value: value.slice(0, 100), enumerable: false });
@@ -211,6 +240,12 @@ export interface GetOptions {
   final429?: (answer: RateLimitAnswer) => boolean;
   /** True: a 5xx answer is final for this request (not retried). Free-copy lookups set it (R257 i). */
   final5xx?: boolean;
+  /**
+   * Decision 31 (b), R556 (2): "leave-out" — a service that asks to wait (429, or 503 with a wait asked), or whose
+   * "not before" has not passed, is not waited for: the call ends at once with LookupLeftOutError. Default "wait"
+   * (today's behaviour). Only the interactive attach and a watched folder's bringing-in pass "leave-out".
+   */
+  askedToWait?: "wait" | "leave-out";
   /**
    * Parameters added to the address when it is requested (F10: Unpaywall's `email`), percent-encoded. Never part of
    * the cache key, a cached entry, a log line, an error's message or any property of an error: the same answer is
@@ -280,6 +315,8 @@ export class HttpClient {
   private readonly concurrency: Record<string, number>;
   private readonly open = new Map<string, number>();
   private readonly waiting = new Map<string, Array<() => void>>();
+  /** Decision 31 (b), R411: per host, the time (client clock) before which it is not asked again. Memory only. */
+  private readonly notBefore = new Map<string, number>();
 
   constructor(opts: HttpClientOptions) {
     this.contactEmailFor = opts.contactEmailFor;
@@ -348,7 +385,7 @@ export class HttpClient {
       }
     }
 
-    const res = await this.fetchWithRetries(url, opts.final429, opts.query, opts.final5xx === true);
+    const res = await this.fetchWithRetries(url, opts.final429, opts.query, opts.final5xx === true, opts.askedToWait === "leave-out");
     if (res.body !== null) validate?.(res.body); // throws: nothing is cached
     const entry: CacheEntry = { v: 1, storedAt: this.clock(), status: res.status, body: res.body };
     // Never cached (R257 h; R290 a, e): an answer that holds the private query, or the key or the e-mail sent with it.
@@ -661,6 +698,24 @@ export class HttpClient {
     };
   }
 
+  /** Records "not before now + ms" (at most an hour) for `host`, keeping a later time already held; returns the time held. */
+  private holdHost(host: string, ms: number): number {
+    const t = Math.max(this.notBefore.get(host) ?? 0, this.clock() + Math.min(Math.max(0, ms), MAX_HOLD_MS));
+    this.notBefore.set(host, t);
+    return t;
+  }
+
+  /**
+   * R411 for a caller that waits: a host's "not before" is waited for before it is asked — as long as the client waits
+   * for a Retry-After of its own (`maxRetryAfterMs`). The wait is cut short when the library closes (R546 2).
+   */
+  private async awaitHold(host: string): Promise<void> {
+    const t = this.notBefore.get(host);
+    if (t === undefined) return;
+    const wait = Math.min(t - this.clock(), this.maxRetryAfterMs);
+    if (wait > 0) await this.untilClosing(this.sleep(wait));
+  }
+
   private retryDelay(attempt: number, retryAfter: string | undefined): number {
     const ms = retryAfterMs(retryAfter, this.clock());
     if (ms !== undefined) return Math.min(ms, this.maxRetryAfterMs);
@@ -672,10 +727,17 @@ export class HttpClient {
     final429?: (a: RateLimitAnswer) => boolean,
     query?: Readonly<Record<string, string>>,
     final5xx = false,
+    leaveOut = false,
   ): Promise<{ status: 200 | 404; body: string | null; sent?: Record<string, string> }> {
     if (this.recorded) return this.recorded.answer(url);
     this.assertOpen();
     const first = new URL(url);
+    const host = first.hostname;
+    // R556 (2) ii: within a host's "not before", a caller that does not wait is left out at once: nothing is sent.
+    if (leaveOut) {
+      const t = this.notBefore.get(host);
+      if (t !== undefined && this.clock() < t) throw new LookupLeftOutError(host, t);
+    }
     if (this.keyReady && first.hostname === KEY_FOR_HOST && this.keyForHost) {
       try {
         await this.keyReady(first.hostname);
@@ -691,6 +753,7 @@ export class HttpClient {
     const target = params.length ? `${url}${url.includes("?") ? "&" : "?"}${params.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&")}` : url;
     let lastError: LookupHttpError | undefined;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      if (!leaveOut) await this.awaitHold(host);
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
       try {
         res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) });
@@ -706,6 +769,13 @@ export class HttpClient {
       if (res) {
         if (res.status === 200) return { status: 200, body: res.body, sent };
         if (res.status === 404 || res.status === 410) return { status: 404, body: null, sent };
+        if (leaveOut) {
+          // R556 (2) i: a 429 (a minute when it names no time), or a 503 that asks for a wait, is not waited for.
+          const asked = retryAfterMs(res.retryAfter, this.clock());
+          if (res.status === 429 || (res.status === 503 && asked !== undefined)) {
+            throw new LookupLeftOutError(host, this.holdHost(host, asked ?? UNNAMED_WAIT_MS));
+          }
+        }
         if (res.status === 429 && res.rateLimit) {
           // The answer (body included) is shown to the caller's decision and then dropped: only
           // the parsed numbers and the decision stay on the error.
