@@ -169,7 +169,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 
 ## 4. Things only you can check
 
-*Use Mac build 8 for these (part 8 says where to download it). Note your findings beside each box.*
+*Use Mac build 9 for these (part 8 says where to download it). Note your findings beside each box.*
 
 ### Installing and opening the app on your Mac
 
@@ -339,10 +339,15 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 **It is merged.** You asked me to check and merge. `main` now holds everything built so far, and its files are identical to the branch that was verified.
 
-**Your new Mac build exists: build 8.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. It passed every start-up check on GitHub's Mac, in both the debug app and the release app from the disk image.
+**Your Mac build is build 9 (24 November 2026). Use it instead of build 8.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. It passed every start-up check on GitHub's Mac, in both the debug app and the release app from the disk image.
 
-- **Where:** GitHub → Actions → "Desktop (macOS)" → run 10 → Artifacts → `alexandrine-oxiana-macos-apple-silicon` (209 MB). The browser extension is beside it. GitHub keeps both until 18 December 2026. Direct link to the run: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/44271123395
-- **Use only run 10.** Runs 6, 8 and 9 also show a download of the same name, but those builds failed their checks: two crash at start-up, and the third lacks the last check's proof.
+- **Why build 9.** In build 8 you found that nothing on the Optional tools screen would install ("The download did not finish…"). The fault was the app's: the helper that downloads the tools looked for its list of trusted certificate authorities in a place that exists on the machine that built the app and not on your Mac, so it trusted nobody and refused every connection. Build 9 carries that list inside the app, and its build proves it from inside the finished app ("118 authorities from the app's own list"). If an install fails now, the message says whether it is the connection or a certificate that could not be verified (a VPN, a security program or a network that inspects secure connections can cause that).
+- **Where (build 9):** GitHub → Actions → "Desktop (macOS)" → run 12 → Artifacts → `alexandrine-oxiana-macos-apple-silicon`. Direct link to the run: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45291457721 — the disk image's checksum (SHA-256) is `1415478b68f59901b1b15a2938b490ca4623e981cb1cb798606fe9c22526852f`. Quit the app, then replace it with the one in this disk image.
+- **Build 9 is build 8 plus that one fix.** The rough-edge fixes of 23–24 November are not in it; they come in the build after it.
+- **Build 8, for the record:**
+
+  - **Where it was:** GitHub → Actions → "Desktop (macOS)" → run 10 → Artifacts → `alexandrine-oxiana-macos-apple-silicon` (209 MB). The browser extension is beside it. GitHub keeps both until 18 December 2026. Direct link to the run: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/44271123395
+  - Runs 6, 8 and 9 also show a download of the same name, but those builds failed their checks: two crash at start-up, and the third lacks the last check's proof. Do not use them.
 - **What it took.** Build 5 crashed within two seconds of starting on a Mac: at every start the app asked Apple's web engine to clear the sign-in window's saved data before the web engine had been started. That is mended. One check then could not complete on a Mac, the one proving that a web page shown in the sign-in window cannot reach anything of the app; its method relied on an error page that only Linux shows. With the method mended the check passed: on a Mac too, every attempt by such a page was refused.
 - **The checklist in part 4 is for this build.**
 - **These Mac fixes are on `main`** since 23 November, on your word.
@@ -364,7 +369,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 Everything built so far is on `main`, checked by GitHub and on a Mac. What is left is yours. In the order I would do it:
 
-- [ ] **1. Install Mac build 8** (part 8 says where). Use only run 10's download.
+- [ ] **1. Install Mac build 9** (part 8 says where: run 12's download). It replaces build 8, in which no optional tool could be installed.
 - [ ] **2. Undo the import that stopped when the disk filled, then import again** with enough free space, or with "leave the files where they are".
 - [ ] **3. Work through the hands-on checklist in part 4** (51 boxes, about ten areas). Tell me what you find, in any form; a sentence per problem is enough. Three areas matter most because nothing but your Mac can test them: "Get through my library" (the sign-in window), watched cloud folders, and the macOS prompts.
 - [ ] **4. Answer the decisions.** There are 27; two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26) and part 8 (27).
