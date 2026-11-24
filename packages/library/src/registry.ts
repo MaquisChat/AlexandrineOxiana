@@ -28,24 +28,29 @@ function validEntry(e: unknown): e is RegistryEntry {
   );
 }
 
-/** Reads the registry; never throws on bad content. `damaged` = something was unusable. */
-async function load(deps: RegDeps): Promise<{ entries: RegistryEntry[]; damaged: boolean }> {
-  let raw: string;
+/** The list's text as it is now, or null when there is none. */
+async function rawNow(deps: RegDeps): Promise<string | null> {
   try {
-    raw = await readFile(file(deps), "utf8");
+    return await readFile(file(deps), "utf8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { entries: [], damaged: false };
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
   }
+}
+
+/** Reads the registry; never throws on bad content. `damaged` = something was unusable; `raw` = the text read (null: none). */
+async function load(deps: RegDeps): Promise<{ entries: RegistryEntry[]; damaged: boolean; raw: string | null }> {
+  const raw = await rawNow(deps);
+  if (raw === null) return { entries: [], damaged: false, raw };
   let v: unknown;
   try {
     v = JSON.parse(raw);
   } catch {
-    return { entries: [], damaged: true };
+    return { entries: [], damaged: true, raw };
   }
-  if (!Array.isArray(v)) return { entries: [], damaged: true };
+  if (!Array.isArray(v)) return { entries: [], damaged: true, raw };
   const entries = v.filter(validEntry);
-  return { entries, damaged: entries.length !== v.length };
+  return { entries, damaged: entries.length !== v.length, raw };
 }
 
 /**
@@ -88,7 +93,13 @@ async function corruptName(deps: RegDeps, now: Date): Promise<string> {
 async function backupIfDamaged(deps: RegDeps, damaged: boolean): Promise<void> {
   if (!damaged) return;
   const now = deps.clock();
-  await rename(file(deps), await corruptName(deps, now));
+  try {
+    await rename(file(deps), await corruptName(deps, now));
+  } catch (err) {
+    // FR-721: another process (the command line, or the service) set it aside first, and said so itself.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
   await raiseDeviceNotice(deps.appConfigDir, "libraries-list-set-aside", now);
 }
 
@@ -103,8 +114,8 @@ async function save(deps: RegDeps, entries: RegistryEntry[]): Promise<void> {
  * settings folder. Without this, the chooser setting a damaged list aside while a library is opened
  * or created made one of the two renames fail. The service is not the list's only writer: the
  * command line opens and creates libraries too, in a process of its own, and no lock is held
- * between processes (listed, FR-721); `update` narrows that race by reading the list again just
- * before it saves.
+ * between processes: `update` compares what it read with the list as it is just before it changes
+ * the file, and merges again on a difference (FR-721).
  */
 const turns = new Map<string, Promise<unknown>>();
 function inTurn<T>(deps: RegDeps, work: () => Promise<T>): Promise<T> {
@@ -121,25 +132,51 @@ function inTurn<T>(deps: RegDeps, work: () => Promise<T>): Promise<T> {
   return run;
 }
 
+/** Tries of one change before it is saved over a list that keeps changing under it (FR-721). */
+const UPDATE_TRIES = 5;
+
 /**
  * One change of the list, in this process's turn. `apply` changes the entries in place and says
  * whether anything changed (it is also told whether the list was damaged). When a damaged list was
  * set aside, the list is read again after that, just before the save, and the change is applied to
  * what it holds then merged with what was usable of the damaged one (R473 M3): a list another
  * writer saved in the meantime is not lost.
+ *
+ * Across processes (FR-721; the command line writes the list too): just before a damaged list is
+ * set aside and just before the save, the list's text is compared with what was read; on a
+ * difference another process has changed it, and the change is made again on the list as it is
+ * then (with what was usable of any damaged list this writer set aside). After UPDATE_TRIES it is
+ * saved all the same. Each save is an atomic rename, so the list is never unreadable in between; the
+ * moment between the last comparison and the rename stays open, as no lock is held.
  */
 function update(deps: RegDeps, apply: (entries: RegistryEntry[], damaged: boolean) => boolean): Promise<void> {
   return inTurn(deps, async () => {
-    const first = await load(deps);
-    let entries = first.entries;
-    if (first.damaged) {
-      await backupIfDamaged(deps, true);
-      const latest = await load(deps);
-      await backupIfDamaged(deps, latest.damaged);
-      const known = new Set(latest.entries.map((e) => e.libraryId));
-      entries = [...latest.entries, ...first.entries.filter((e) => !known.has(e.libraryId))];
+    /** What was usable of the damaged lists this writer set aside, kept across tries. */
+    const salvaged: RegistryEntry[] = [];
+    let setAside = false;
+    for (let tries = 1; ; tries++) {
+      const last = tries >= UPDATE_TRIES;
+      const first = await load(deps);
+      let entries = first.entries;
+      let read = first.raw;
+      if (first.damaged) {
+        if (!last && (await rawNow(deps)) !== first.raw) continue;
+        await backupIfDamaged(deps, true);
+        setAside = true;
+        salvaged.push(...first.entries.filter((e) => !salvaged.some((x) => x.libraryId === e.libraryId)));
+        const latest = await load(deps);
+        await backupIfDamaged(deps, latest.damaged);
+        entries = latest.damaged ? [] : latest.entries;
+        read = latest.damaged ? null : latest.raw;
+        if (latest.damaged) salvaged.push(...latest.entries.filter((e) => !salvaged.some((x) => x.libraryId === e.libraryId)));
+      }
+      const known = new Set(entries.map((e) => e.libraryId));
+      entries = [...entries, ...salvaged.filter((e) => !known.has(e.libraryId))];
+      if (!apply(entries, setAside)) return;
+      if (!last && (await rawNow(deps)) !== read) continue;
+      await save(deps, entries);
+      return;
     }
-    if (apply(entries, first.damaged)) await save(deps, entries);
   });
 }
 
