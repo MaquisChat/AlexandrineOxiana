@@ -3018,7 +3018,7 @@ describe("FR-736: an interrupted change whose undo is not complete, as the servi
     await mkdir(join(path, ".tmp"), { recursive: true });
     await writeFile(
       join(path, ".tmp", `txn-${txn}.json`),
-      JSON.stringify({ formatVersion: 1, txn, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: auditLines, entries: [{ kind: "trashed", from: rel, to: `.tmp/trash-${txn}-0`, ino: "1", size: 1, mtimeNs: "1" }] }),
+      JSON.stringify({ formatVersion: 1, txn, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: auditLines, entries: [{ kind: "trashed", from: rel, to: `.tmp/trash-${txn}-0`, ino: "1", birthtimeNs: "1" }] }),
     );
     expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
     expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
