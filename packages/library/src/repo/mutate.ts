@@ -50,7 +50,7 @@ import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo, type ContainmentCache } from "./io.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
 import { AUDIT_REASONS_FILE, reasonMac, sealedReasonLine } from "./audit-reasons.js";
-import { TxnLog, markerPaths } from "./txn.js";
+import { TxnLog, identityOf, markerPaths } from "./txn.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
 
 /** A policy request without the fields the repository fills in (projectId; actor, now and tz by default). */
@@ -313,12 +313,20 @@ class TxImpl implements Tx {
     await fsp.mkdir(dir, { recursive: true });
     const to = join(dir, `trash-${this.log.id}-${randomBytes(8).toString("hex")}`);
     await assertContained(dir, to);
-    // The original's identity as the file system gives it, before it moves (R519 (3)): a rename keeps all three.
-    const st = await fsp.lstat(from, { bigint: true });
-    await this.log.trashed(from, to, shred, { ino: st.ino.toString(), size: Number(st.size), mtimeNs: st.mtimeNs.toString() });
+    // The original's identity (file number, time of birth) before it moves, on the line written before the rename
+    // (R519 (3), R526); none when the file system gives no time of birth.
+    const identity = await identityOf(from, "trash-before");
+    await this.log.trashed(from, to, shred, identity);
     await renameWithRetry(from, to);
     this.trashed.push(to);
     if (shred) this.shred.push(to);
+    // Recorded only where it is seen to hold (R526): the kept copy is looked at once more; where the identity did not
+    // survive the rename (or cannot be seen), a second line for the same move says so, after the step, as a completion
+    // line is written.
+    if (identity) {
+      const after = await identityOf(to, "trash-after").catch(() => undefined);
+      if (after?.ino !== identity.ino || after.birthtimeNs !== identity.birthtimeNs) await this.log.identityNotKept(from, to);
+    }
   }
 
   record(type: EntityType, id: string, before: object | null, after: object | null): void {

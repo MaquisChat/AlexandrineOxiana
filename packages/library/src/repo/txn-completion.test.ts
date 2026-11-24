@@ -136,8 +136,8 @@ describe("R519 (2): files written inside a folder the change created", () => {
   });
 });
 
-describe("R519 (3): a trashed line records the original's identity as the file system gives it", () => {
-  it("file number (bigint as a string), size, and time of last modification in nanoseconds (as a string)", async () => {
+describe("R519 (3), R526: a trashed line records the original's identity as the file system gives it", () => {
+  it("file number and time of birth in nanoseconds (bigints as strings), no size or time of last writing (R526)", async () => {
     const p = await project(false);
     const rel = `${p.folder}/kept.txt`;
     await writeFile(fromRel(lib.root, rel), "the original\n");
@@ -146,7 +146,7 @@ describe("R519 (3): a trashed line records the original's identity as the file s
       await tx.trash(rel);
     });
     const t = m.entries[0] as Extract<MarkerEntry, { kind: "trashed" }>;
-    expect(t).toMatchObject({ kind: "trashed", from: rel, ino: st.ino.toString(), size: Number(st.size), mtimeNs: st.mtimeNs.toString() });
+    expect(t).toEqual({ kind: "trashed", from: rel, to: t.to, ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() });
     expect(markerProblem(m, m.txn)).toBeNull();
   });
 });
@@ -157,7 +157,9 @@ describe("the reader checks the new fields (an older build ignores them)", () =>
   const at = (entries: unknown[]) => markerProblem({ ...head, entries }, head.txn);
   it("accepts a completion line and a trashed line with an identity", () => {
     expect(at([{ kind: "created", path: "Projects/P/a", sha256: H, complete: true }])).toBeNull();
-    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "12345678901234567890", size: 3, mtimeNs: "1795511903096443559" }])).toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "12345678901234567890", birthtimeNs: "1795511903096443559" }])).toBeNull();
+    // R526: the line saying the identity was not kept by the rename.
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, noIdentity: true }])).toBeNull();
   });
   it("a marker with only the known fields is accepted (the control for the refusals below)", () => {
     expect(at([{ kind: "created", path: "Projects/P/a", sha256: H }])).toBeNull();
@@ -165,8 +167,10 @@ describe("the reader checks the new fields (an older build ignores them)", () =>
   it("refuses a completion line without a hash, or one whose flag is not true; an identity that is not whole numbers", () => {
     expect(at([{ kind: "created", path: "Projects/P/a", complete: true }])).not.toBeNull();
     expect(at([{ kind: "created", path: "Projects/P/a", sha256: H, complete: "yes" }])).not.toBeNull();
-    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: 5, size: 3, mtimeNs: "1" }])).not.toBeNull();
-    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "5", size: -1, mtimeNs: "1" }])).not.toBeNull();
-    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "5", size: 3, mtimeNs: "1.5" }])).not.toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: 5, birthtimeNs: "1" }])).not.toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "5" }])).not.toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "5", birthtimeNs: "1.5" }])).not.toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, noIdentity: false }])).not.toBeNull();
+    expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, noIdentity: true, ino: "5", birthtimeNs: "1" }])).not.toBeNull();
   });
 });

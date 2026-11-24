@@ -666,6 +666,10 @@ async function handPutCase(seq: Op[], startExists: boolean, cut: number, how: Ha
       await rename(join(v.tmp, "hand.txt"), abs);
     }
     const copies = await keptCopies(v, m);
+    // R526: the first roll-back put the researcher's original back (only a first line trashing the original, undone
+    // last, does), and the person wrote over it in place: it is still the original (same file number and time of
+    // birth), edited. The roll-back is then complete, with the edit at the path.
+    const editedOriginal = how === "written over in place" && startExists && seq[0] === "trash" && cut === m.entries.length;
     let second: { copies: Map<string, string>; causes: string } | undefined;
     for (const run of ["second", "third"]) {
       await reopen(v);
@@ -674,6 +678,10 @@ async function handPutCase(seq: Op[], startExists: boolean, cut: number, how: Ha
       if (now?.toString() !== HAND) failures.push(`${where}, the hand-put file is ${now === null ? "gone" : `now ${JSON.stringify(now.toString())}`}`);
       if (v.repo.integrityWarnings.some((x) => x.kind === "invalid-txn-marker")) failures.push(`${where}, the marker was found invalid`);
       if (v.repo.integrityWarnings.some((x) => x.kind === "changed-outside-before-rollback")) failures.push(`${where}, an outside change was said not kept`);
+      if (editedOriginal) {
+        if ((await markerNames(v)).length !== 0) failures.push(`${where}, the original edited in place is not taken for the original (incomplete)`);
+        continue;
+      }
       if ((await markerNames(v)).length !== 1) {
         failures.push(`${where}, reported complete with the hand-put file at the path`);
         continue;
