@@ -94,6 +94,26 @@ def test_the_pin_check_fails_the_build_and_says_which_package(tmp_path, capsys):
     assert "every package in the bundle (1) is pinned by constraints-macos-arm64.txt at the version installed" in capsys.readouterr().out
 
 
+def test_pins_for_packages_the_bundle_does_not_hold_are_named_on_one_line_without_failing(tmp_path, capsys):
+    c = tmp_path / "constraints-macos-arm64.txt"
+    c.write_text("packaging==26.4\nold-thing==1.0\nGone_Too==2.0\n")
+    assert manifest.report_pins([{"name": "packaging", "version": "26.4"}], c) == 0
+    out = capsys.readouterr().out
+    assert "constraints note: constraints-macos-arm64.txt also pins 2 package(s) the bundle does not hold: Gone_Too, old-thing" in out
+    c.write_text("packaging==26.4\n")
+    assert manifest.report_pins([{"name": "packaging", "version": "26.4"}], c) == 0
+    assert "constraints note" not in capsys.readouterr().out
+
+
+def test_a_constraints_file_that_names_a_package_twice_is_refused(tmp_path, capsys):
+    with pytest.raises(ValueError, match=r"the constraints file names pyyaml twice \(PyYAML==6\.0\.4, pyyaml==6\.0\.3\)"):
+        manifest.check_pinned([{"name": "PyYAML", "version": "6.0.4"}], "PyYAML==6.0.4\npyyaml==6.0.3\n")
+    c = tmp_path / "constraints-macos-arm64.txt"
+    c.write_text("pydantic_core==2.50.5\nPydantic-Core==2.50.5\n")
+    assert manifest.report_pins([{"name": "pydantic_core", "version": "2.50.5"}], c) == 1
+    assert "the constraints file names pydantic-core twice" in capsys.readouterr().err
+
+
 def run_main_pins_complete(tmp_path, monkeypatch, constraints_text: str) -> int:
     """manifest.main() with --pins-complete on a one-package bundle (packaging, as this venv has it);
     the licence folder and the native libraries are stubbed: only the checks and the exit code count."""

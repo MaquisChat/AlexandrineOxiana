@@ -81,6 +81,12 @@ test("constraints files: names and pins, comments and blank lines ignored", () =
   assert.throws(() => parseConstraints("rawpy>=0.25\n"), /exact pin/);
 });
 
+test("a constraints file that names one package twice is refused, naming it (R506 M3)", () => {
+  // PEP 503: PyYAML and pyyaml are one package; pip refuses such a file too.
+  assert.throws(() => parseConstraints("PyYAML==6.0.4\nrawpy==0.28.0\npyyaml==6.0.3\n"), /the constraints file names pyyaml twice \(PyYAML==6\.0\.4, pyyaml==6\.0\.3\)/);
+  assert.throws(() => parseConstraints("pydantic_core==2.50.5\nPydantic.Core==2.50.5\n"), /names pydantic-core twice/);
+});
+
 test("a package named in the constraints loses its direct pin; others keep theirs", () => {
   const deps = ["faster-whisper==1.2.1", "rawpy==0.28.0", "ocrmypdf==17.14.1", "numpy>=2.1,<3", "pillow_heif==1.8.1"];
   const c = parseConstraints("rawpy==0.25.1\nOCRmyPDF==17.12.1\nonnxruntime==1.23.2\n");

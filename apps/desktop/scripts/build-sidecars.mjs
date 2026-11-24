@@ -103,14 +103,17 @@ export function parseArgs(argv) {
 const canonical = (name) => name.toLowerCase().replace(/[-_.]+/g, "-");
 const reqName = (req) => canonical(req.trim().split(/[\s<>=!~[;(]/, 1)[0]);
 
-/** Constraint lines by canonical package name. Every line must be an exact `name==version` pin. */
+/** Constraint lines by canonical package name. Every line must be an exact `name==version` pin, and
+ *  no package may be named twice (PEP 503 names: PyYAML and pyyaml are one; pip refuses it too, R506 M3). */
 export function parseConstraints(text) {
   const out = new Map();
   for (const raw of text.split("\n")) {
     const line = raw.replace(/#.*/, "").trim();
     if (!line) continue;
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\s*==\s*[^\s,;]+$/.test(line)) throw new Error(`constraints must be exact pins (name==version): ${line}`);
-    out.set(reqName(line), line);
+    const name = reqName(line);
+    if (out.has(name)) throw new Error(`the constraints file names ${name} twice (${out.get(name)}, ${line})`);
+    out.set(name, line);
   }
   return out;
 }

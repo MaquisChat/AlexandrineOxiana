@@ -267,28 +267,52 @@ def _same_version(a: str, b: str) -> bool:
         return a == b
 
 
-def check_pinned(packages: list[dict], constraints_text: str) -> list[str]:
-    """Bundled packages that a complete pin set does not pin at the version installed (empty when
-    none, FR-730). Names compare as pip compares them; a line for a package that is not in the
-    bundle (never installed, or a build tool) is not a problem."""
-    pins = {}
+def read_pins(constraints_text: str) -> dict[str, tuple[str, str]]:
+    """A constraints file's pins: canonical name -> (name as written, version). A package named twice
+    (after PEP 503 normalisation: `PyYAML` and `pyyaml` are one) is refused with a ValueError that
+    names it, as pip refuses it (R506 M3)."""
+    pins: dict[str, tuple[str, str]] = {}
+    lines: dict[str, str] = {}
     for raw in constraints_text.splitlines():
         line = raw.split("#", 1)[0].strip()
         if line:
             name, _, version = line.partition("==")
-            pins[canonical(name.strip())] = version.strip()
+            key = canonical(name.strip())
+            if key in pins:
+                raise ValueError(f"the constraints file names {key} twice ({lines[key]}, {line})")
+            pins[key] = (name.strip(), version.strip())
+            lines[key] = line
+    return pins
+
+
+def check_pinned(packages: list[dict], constraints_text: str) -> list[str]:
+    """Bundled packages that a complete pin set does not pin at the version installed (empty when
+    none, FR-730). Names compare as pip compares them; a line for a package that is not in the
+    bundle (never installed, or a build tool) is not a problem (unused_pins names them)."""
+    pins = read_pins(constraints_text)
     problems = []
     for p in packages:
         pin = pins.get(canonical(p["name"]))
         if pin is None:
             problems.append(f"{p['name']} {p['version']} is in the bundle, but the constraints file does not name it")
-        elif not _same_version(p["version"], pin):
-            problems.append(f"{p['name']} {p['version']} is in the bundle, but the constraints file pins it at {pin}")
+        elif not _same_version(p["version"], pin[1]):
+            problems.append(f"{p['name']} {p['version']} is in the bundle, but the constraints file pins it at {pin[1]}")
     return problems
 
 
+def unused_pins(packages: list[dict], constraints_text: str) -> list[str]:
+    """The packages the constraints file pins and the bundle does not hold, as the file writes them."""
+    held = {canonical(p["name"]) for p in packages}
+    return [name for key, (name, _) in sorted(read_pins(constraints_text).items()) if key not in held]
+
+
 def report_pins(packages: list[dict], constraints: Path) -> int:
-    problems = check_pinned(packages, constraints.read_text(encoding="utf-8"))
+    text = constraints.read_text(encoding="utf-8")
+    try:
+        problems = check_pinned(packages, text)
+    except ValueError as e:
+        print(f"constraints check FAILED: {e}", file=sys.stderr)
+        return 1
     if problems:
         print(f"constraints check FAILED: {len(problems)} package(s) in the bundle not pinned by {constraints.name} "
               "at the version installed (change the file deliberately, services/media-worker/README.md)", file=sys.stderr)
@@ -296,6 +320,9 @@ def report_pins(packages: list[dict], constraints: Path) -> int:
             print(f"  {p}", file=sys.stderr)
         return 1
     print(f"constraints check: every package in the bundle ({len(packages)}) is pinned by {constraints.name} at the version installed")
+    unused = unused_pins(packages, text)
+    if unused:  # a note, not a failure (R506 M2): pip ignores a pin for a package it never installs
+        print(f"constraints note: {constraints.name} also pins {len(unused)} package(s) the bundle does not hold: {', '.join(unused)}")
     return 0
 
 

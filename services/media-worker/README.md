@@ -185,7 +185,9 @@ that a pin set resolves to wheels for that Mac. Linux builds (CI's `worker-bundl
    `node apps/desktop/scripts/build-sidecars.mjs --resolve-for macos-arm64`.
 3. Run the Mac build. A changed file makes a new build venv. The log's `pin set: macos-arm64` line
    names the file, and the `constraints check:` line says every package of the bundle is pinned
-   by it; a package the file misses, or another version, fails the build and names it.
+   by it; a package the file misses, or another version, fails the build and names it. A
+   `constraints note:` line names the packages the file pins and the bundle no longer holds (not a
+   failure): remove their lines. A file that names one package twice is refused.
 4. The build's `sidecar-manifest.json` (the artefact `worker-bundle-report-macos-apple-silicon`)
    shows the result: each package with its version, and `constraints` with the file's SHA-256.
 
