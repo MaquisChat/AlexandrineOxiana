@@ -205,7 +205,16 @@ export class TxnLog {
 /** Best effort: keeps going past failures, and reports whether every step succeeded. */
 export async function undoEntries(root: string, entries: MarkerEntry[]): Promise<boolean> {
   let ok = true;
+  let steps = 0;
+  /** Test seam (R47): the roll-back is cut off here, as by a crash. */
+  const cut = (): boolean => {
+    if (process.env.NODE_ENV !== "test" || seams.stopUndoAfter !== steps) return false;
+    seams.stopUndoAfter = undefined;
+    return true;
+  };
   for (const e of [...entries].reverse()) {
+    if (cut()) return false;
+    steps++;
     try {
       if (seams.failUndo === e.kind) throw new Error(`simulated undo failure (${e.kind})`);
       if (e.kind === "created") await fsp.rm(fromRel(root, e.path), { force: true });
@@ -232,6 +241,7 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       ok = false;
     }
   }
+  if (cut()) return false;
   return ok;
 }
 
