@@ -290,9 +290,19 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
     const transcriptVersions = async () => (await app.api<{ versions: Version[] }>("GET", `/projects/${projectId}/sources/${video!.source.id}/transcripts`)).body.versions;
     const storedSegments = async (versionId: string) =>
       (await app.api<{ segments: Array<{ text: string; flags: string[] | null; edit?: string }> }>("GET", `/projects/${projectId}/sources/${video!.source.id}/transcripts/${versionId}`)).body.segments;
-    /** An allowed, audited derivation of transcript asset `id` (how a stored transcript version is audited). */
+    /**
+     * An allowed, audited derivation that stored transcript asset `id`: the entry is the asset's own, or — a run's two
+     * files are stored in one governed change with one entry (FR-393, R464 c) — names the asset among its files.
+     */
     const derivationAudited = async (id: string) =>
-      expect((await auditLog(app, projectId)).filter((e) => e.entity?.type === "asset" && e.entity.id === id && e.details?.op === "asset.derive" && e.decision?.result === "allow"), `the storing of transcript ${id} is audited`).toHaveLength(1);
+      expect(
+        (await auditLog(app, projectId)).filter((e) => {
+          if (e.entity?.type !== "asset" || e.details?.op !== "asset.derive" || e.decision?.result !== "allow") return false;
+          const files: unknown = e.details.files;
+          return e.entity.id === id || (Array.isArray(files) && files.some((f) => (f as { asset?: unknown } | null)?.asset === id));
+        }),
+        `the storing of transcript ${id} is audited`,
+      ).toHaveLength(1);
     let firstRun: string[] = [];
     const versionPicker = () => page.getByRole("combobox", { name: "Version" });
     const segments = () => page.getByRole("list", { name: "Transcript segments" }).getByRole("listitem");
