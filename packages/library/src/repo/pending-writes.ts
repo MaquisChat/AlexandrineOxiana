@@ -362,6 +362,33 @@ function closable(core: RepoCore, i: MarkerInspection): boolean {
   return a !== undefined && CLOSABLE_ROLLBACK.has(stateOf(a));
 }
 
+/**
+ * R528 M7: a place whose file could not be put back, as the close's audit entry records it: the source's id and the
+ * file's role in it (as the project's audit entries record a file: ids and kinds, never a name), never the path, which
+ * holds the source's folder name and so its short title (an audit log is exported and shown on its own). The role is
+ * read from where the file stands in the source's folder (`original/`, `derived/`, its record, its annotations, the
+ * folder itself), so it is known while an encrypted project is locked; a place outside every source is "other".
+ */
+function auditedPlace(st: ProjectState, path: string): { source?: string; role: string } {
+  const hit = [...st.sources].find(([, f]) => path === f || path.startsWith(`${f}/`));
+  if (!hit) return { role: "other" };
+  const [source, folder] = hit;
+  const rest = path === folder ? "" : path.slice(folder.length + 1);
+  const role =
+    rest === ""
+      ? "folder"
+      : rest.startsWith("original/")
+        ? "original"
+        : rest.startsWith("derived/")
+          ? "derived"
+          : rest === "source.json" || rest === "source.json.enc"
+            ? "record"
+            : rest === "annotations.json" || rest === "annotations.json.enc"
+              ? "annotations"
+              : "other";
+  return { source, role };
+}
+
 /** What closing would leave as lost: each path whose original cannot be put back, what is there now, and its source. */
 async function lostOf(core: RepoCore, i: MarkerInspection): Promise<NonNullable<PendingWrite["lost"]>> {
   const st = core.projects.get(i.projectId);
@@ -418,7 +445,7 @@ export async function closePendingWrite(core: RepoCore, txn: string, projectId: 
     }
     if (await keptCopiesLeft(core.root, m)) throw new PendingWriteIncompleteError(txn, CLOSE_COPIES_LEFT_TEXT);
     const gone = undone.causes.filter((c) => c.kind === "kept-copy-gone");
-    const notPutBack = gone.map((c) => c.path);
+    const notPutBack = gone.map((c) => auditedPlace(st, c.path));
     maybeCrash("before-audit");
     const trimmed = await trimTornAuditLine(core, m.projectFolder);
     const held = await appendResolve(

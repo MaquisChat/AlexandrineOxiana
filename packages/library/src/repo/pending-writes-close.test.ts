@@ -193,7 +193,9 @@ describe("R509: closing a change whose undo can never complete", () => {
     expect(await text(rel)).toBe(OWN);
     const resolve = (await auditOf()).filter((e) => e.action === "txn.resolve");
     expect(resolve).toHaveLength(1);
-    expect(resolve[0]!.details).toMatchObject({ txn: m.txn, choice: "close", notPutBack: [rel] });
+    // R528 M7: the source's id and the file's role, never a path (it holds the source's folder name, and so its title).
+    expect(resolve[0]!.details).toEqual({ txn: m.txn, choice: "close", status: "uncommitted", steps: m.entries.length, notPutBack: [{ source: sid, role: "other" }] });
+    expect(JSON.stringify(resolve[0])).not.toContain(folder.split("/").at(-1)!);
     expect(resolve[0]!.decision).toEqual({ result: "allow" });
     const mine = repo.integrityWarnings.filter((w) => w.projectId === pid);
     expect(mine.map((w) => w.kind)).toEqual(["interrupted-change-closed"]);
@@ -207,6 +209,22 @@ describe("R509: closing a change whose undo can never complete", () => {
     expect(await text(rel)).toBe(OWN);
     expect(repo.integrityWarnings.filter((w) => w.projectId === pid).map((w) => [w.kind, w.rollback])).toEqual([["interrupted-change-closed", "unconfirmed"]]);
     await repo.mutate(pid, STORE, async (tx) => tx.writeFile(`${folder}/after-2.txt`, "and another\n"));
+  });
+
+  it("R528 M7 (probe P4): a source's original lost, then closed: the audit entry records the source and the file's role, not its path", async () => {
+    const original = (await repo.getSource(pid, sid)).assets.find((a) => a.role === "original")!.path;
+    const m = await crashed(async (tx) => {
+      await tx.trash(original);
+    });
+    await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { recursive: true, force: true });
+    await reopen();
+    // The list still names the place (R503 d): the researcher has to find it.
+    expect((await repo.pendingWrites())[0]).toMatchObject({ canClose: true, lost: [{ path: original, now: "nothing", sourceId: sid }] });
+    await repo.closePendingWrite(m.txn, pid);
+    const [entry] = (await auditOf()).filter((e) => e.action === "txn.resolve");
+    expect(entry!.details).toEqual({ txn: m.txn, choice: "close", status: "uncommitted", steps: 1, notPutBack: [{ source: sid, role: "original" }] });
+    expect(JSON.stringify(entry)).not.toContain("Annotated");
+    expect(JSON.stringify(entry)).not.toContain(original);
   });
 
   it("R527: nothing at the place: closed, and its warning says the file is lost (no state), now and at the next opening", async () => {
