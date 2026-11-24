@@ -430,3 +430,25 @@ describe("R519 (3) (R509 M1, M2): where the kept copy of a trashed original is g
     });
   });
 });
+
+describe("R47: the roll-back's look seam (seams.failLook) does nothing outside NODE_ENV=test", () => {
+  it("under test the look fails (could-not-look, nothing deleted); under production the same undo removes the change's file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ao-r519seam-"));
+    const env = process.env.NODE_ENV;
+    try {
+      const rel = "Projects/P/half.bin";
+      await mkdir(fromRel(root, "Projects/P"), { recursive: true });
+      await writeFile(fromRel(root, rel), "half of a cop");
+      seams.failLook = rel;
+      expect(await undoEntries(root, [{ kind: "created", path: rel }])).toEqual({ ok: false, causes: [{ kind: "could-not-look", path: rel }] });
+      expect(await readFile(fromRel(root, rel), "utf8")).toBe("half of a cop");
+      process.env.NODE_ENV = "production";
+      expect(await undoEntries(root, [{ kind: "created", path: rel }])).toEqual({ ok: true, causes: [] });
+      expect(await readFile(fromRel(root, rel)).catch(() => null)).toBeNull();
+    } finally {
+      process.env.NODE_ENV = env;
+      seams.failLook = undefined;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
