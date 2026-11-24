@@ -3104,6 +3104,27 @@ describe("FR-736: an interrupted change whose undo is not complete, as the servi
     expect(states).toHaveLength(2);
   });
 
+  it("R533 (3): a close asked of a completed change, or of one whose record cannot be read, is refused in words true of it", async () => {
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    repoSeams.crashAt = "before-marker-delete";
+    try {
+      expect((await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } })).status).toBe(500);
+    } finally {
+      repoSeams.crashAt = undefined;
+    }
+    const [done] = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<{ txn: string; status: string }>;
+    expect(done).toMatchObject({ status: "committed" });
+    const a = await call({ method: "POST", url: `/libraries/pending-writes/${done!.txn}/close`, body: { projectId: pid } });
+    expect([a.status, a.json.error.message]).toEqual([409, "This change was completed, so it cannot be closed; it can only be kept."]);
+    const txn = "019a7000-0000-7000-8000-0000000000d2";
+    await writeFile(join(path, ".tmp", `txn-${txn}.json`), "{ not json");
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    const b = await call({ method: "POST", url: `/libraries/pending-writes/${txn}/close`, body: { projectId: "*" } });
+    expect([b.status, b.json.error.message]).toEqual([409, "Its record cannot be read safely, so nothing it names can be undone or kept."]);
+  });
+
   it("R509: the list offers to close it, with what is lost; closing is for the app's own token, names its project, and unblocks the project", async () => {
     const { pid, txn, rel } = await lostOriginal();
     const [listed] = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;

@@ -181,6 +181,14 @@ describe("pending writes (R27)", () => {
     const [pw] = await repo.pendingWrites();
     expect(pw).toMatchObject({ status: "committed", canKeep: true, canRollBack: false });
     await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteChoiceError);
+    // R533 (3): a close by the route is refused in words true of a completed change (it can only be kept).
+    const closed = await repo.closePendingWrite(pw!.txn, pid).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(closed).toBeInstanceOf(PendingWriteChoiceError);
+    expect((closed as Error).message).toBe("This change was completed, so it cannot be closed; it can only be kept.");
+    expect(await markers()).toHaveLength(1);
     await repo.resolvePendingWrite(pw!.txn, "keep");
     expect(await markers()).toEqual([]);
     expect(repo.listSourceIds(pid)).toHaveLength(1);
@@ -199,6 +207,13 @@ describe("pending writes (R27)", () => {
     expect(list).toEqual([expect.objectContaining({ txn, projectId: "*", status: "invalid", canKeep: false, canRollBack: false })]);
     await expect(repo.resolvePendingWrite(txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteChoiceError);
     await expect(repo.resolvePendingWrite(txn, "keep")).rejects.toBeInstanceOf(PendingWriteChoiceError);
+    // R533 (3): a close by the route is refused with the sentence the choices give (its record cannot be read).
+    const closed = await repo.closePendingWrite(txn, "*").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(closed).toBeInstanceOf(PendingWriteChoiceError);
+    expect((closed as Error).message).toBe("Its record cannot be read safely, so nothing it names can be undone or kept.");
     expect(await markers()).toHaveLength(1);
     expect(pid).toBeTruthy();
   });
