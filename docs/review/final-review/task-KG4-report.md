@@ -78,3 +78,75 @@ FR-732 (2), FR-725, FR-726: no researcher-visible sentence changed. FR-725 chang
 - Not run: `lint:css` and `lint:colours`. No screen or style was changed; only the reader's pure text-joining function.
 
 minor (deferred): a full-width space at the very end of a page's quote is still trimmed before pages are joined (`normaliseQuote`'s `trim()`).
+
+## Fix round (R507)
+
+The fix round has three commits on `kg-4-exports-reader`. The head is now `203f236`, and `git status --short` is empty.
+
+### I1 (FR-732 point 1): `e8d20ad`
+**What changed** (`packages/library/src/export/project-export.ts`):
+- A new basis, `anchorMissingElsewhere`, in `DestroyedBasis` and `DESTROYED_NOTE`, about lines 129–170.
+- The choice is made in `exportInner`, about lines 468–482.
+
+**How the note is chosen:**
+- "This computer's" is said when the record is missing or unreadable now (the check's current problem), or when the log holds an `audit.anchor-missing` entry recorded by this device (`repoProjectInfo(...).device`) after the latest `project.restored` entry.
+- In every other case the note gives the dates of the recorded entries and claims nothing about this computer. The dates are `formatModified(at, tz).slice(0, 10)`, the project's local `YYYY-MM-DD`, written as the restore and the backup write dates. Several dates are written as "A and B" or "A, B and C".
+
+**Both kinds of entry in one log:** I chose one note, this computer's. It is true, and it covers the same files. Two notes would count the same files twice, and the earlier loss adds nothing the reader can act on.
+
+**Tests** (`restore-governed.test.ts`):
+- "R507 b, probe P1a" (an entry from another computer; the same library back on the recording computer gives the plain case);
+- "R507 b, probe P1b" (a restored copy);
+- "R507 b: a loss recorded before the restore and this computer's own loss after it".
+
+P1a and P1b failed first: they wrote "this computer's". The both-kinds test and the plain case passed before and after, as expected. Each test asserts the whole sentence.
+
+**Sentences:**
+- **This computer (unchanged words):**
+  - "1 file is not included. It is marked as destroyed, but this computer's record of where the project's audit log ends was missing or could not be read, so the app cannot confirm that the log is complete or that the file was destroyed."
+  - "N files are not included. They are marked as destroyed, but this computer's record of where the project's audit log ends was missing or could not be read, so the app cannot confirm that the log is complete or that they were destroyed."
+- **Another computer, or before the latest restore (new):**
+  - "1 file is not included. It is marked as destroyed, but on 2026-12-02 a computer that kept this project's audit log found its record of where the log ends missing or unreadable, so the app cannot confirm that the log is complete or that the file was destroyed."
+  - "N files are not included. They are marked as destroyed, but on 2026-12-02 a computer that kept this project's audit log found its record of where the log ends missing or unreadable, so the app cannot confirm that the log is complete or that they were destroyed."
+  - With several dates: "on 2026-12-02 and 2026-12-05 …".
+
+**Why "a computer that kept this project's audit log"** and not the ruling's "had this project open": in a restored copy, the computer was the original project's. The copy's log holds that log's lines, so "kept this project's audit log" is true in both cases. If "had this project open" is preferred, the review can judge it.
+
+### M1 (FR-725): `4b87cab`
+**What changed** (`packages/ui/src/reader/geometry.ts`):
+- New constants `SENTENCE_END` and `CLOSING`, about lines 135–140.
+- A negative lookbehind added to the third branch of `CJK_LINE_BREAK`, about line 152.
+
+**Rule:** a digit run at a line's end is not joined to a number on the next line when the run directly follows a sentence's end, with any closing brackets or quotes after that end.
+- Sentence-closing marks chosen: 。 ． ！ ？ and the half-width ｡ (U+3002, U+FF0E, U+FF01, U+FF1F, U+FF61).
+- Closing brackets and quotes that may follow them: 」 』 ） 】 〕 〉 》 〙 〛 ” ’ ＂.
+
+**Test:** `geometry.test.ts`, "R507 c…". It covers 。 ． ？ ！ 」 ｡, a split number (also after 」 that ends no sentence), `joinQuotes`, and a Latin control. It failed first with "研究した。12020年には".
+
+**Checked against 579bdcd:** I put that commit's `geometry.ts` back temporarily (`git show` into the file, then `git checkout --`). Every sentence-end case gave exactly the asserted output, with a space. Only the split-number join failed there, as expected, since that is FR-725's addition.
+
+**Still joins:** "記録3" / "4人が". No sentence end comes before the 3, and the ruling joins a plain split number.
+
+### M2 (FR-725 point 1): `203f236`
+**What changed** (`packages/ui/src/reader/geometry.ts`, `normaliseQuote`, first step, about line 167): at a line's end that holds a full-width space, that space alone is kept. The break and the ordinary white space around it are removed. Results:
+- "研究　" / "method" gives "研究　method";
+- "研究 　" / "方法" gives "研究　方法";
+- "研究 　 " / "method" gives "研究　method".
+
+Ordinary spaces at a line's end are still one space; there are Latin controls for this.
+
+**Test:** "R507 d…" failed first with "研究 method".
+
+No sentence of the app changed in M1 or M2: they change only how a new highlight's quote is joined.
+
+### Runs (single files, `nice -n 10`)
+- `@ao/library`:
+  - `src/export/restore-governed.test.ts`: Tests 72 passed (72);
+  - `src/export/project-export-anchors-locked.test.ts` with `src/export/project-export.test.ts`: Tests 20 passed (20).
+- `@ao/ui`:
+  - `src/reader/geometry.test.ts`: Tests 24 passed (24);
+  - `src/reader/textCheck.test.ts`: Tests 13 passed (13);
+  - `src/screens/Reader.test.tsx`: Tests 59 passed (59).
+- Typecheck: `@ao/library` and `@ao/ui` both exit 0.
+- End-to-end: `@ao/ui build` built in 4.68 s, then `e2e/reader-highlights.spec.ts --project=chromium --trace off`: 22 passed (2.7m).
+- Not run: `lint:css` and `lint:colours` (no screen file changed).
