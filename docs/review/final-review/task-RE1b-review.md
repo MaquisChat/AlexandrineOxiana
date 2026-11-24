@@ -149,3 +149,74 @@ The `rollback-incomplete` banner ("…was undone when the library opened, so not
 - **What is never said:** that a file at that place blocks the undo.
 
 None of these is false in a way that loses data. Nothing tells the researcher to delete anything, and no instruction reaches the kept trash copy. The researcher ends up stuck, but loses nothing. They should still be told what blocks the roll-back, and the banner should stop claiming "nothing half-saved was kept". I recommend listing both.
+
+## Third look (R493)
+
+Head 435bc78. Two commits: 0cacb9f..435bc78. The worktree is clean.
+
+**Verdict for `re-1b-core` as a whole: APPROVED WITH SMALL POINTS.** C1 is fixed.
+
+### What I ran
+Each test file was run alone:
+- `rollback-rerun`: 7/7
+- `rollback-own-writes`: 14/14
+- `sources-read-race`: 13/13
+- `pending-writes`: 22/22
+- `repo.test`: 61/61
+- `integrity-confirm`: 5/5
+- `seams-inert`: 3/3
+
+I then took the fix out. Only the line `if (done.has(i)) continue;` was removed, so the test seam still works. The run gave 4/7 failing:
+- the Q1 test and the crash-in-reopen test;
+- 11 enumeration cases per run, all "reported complete with the path gone". These are exactly the trash-then-create/append families: [trash,create], [trash,append], [trash,create,trash|replace], [trash,append,trash|replace|append], [append,trash,create|append].
+
+Afterwards `txn.ts` was restored with `git checkout`. No probe file was needed.
+
+### Points
+
+**1. Q1 and the crash during the reopen's own roll-back: fixed.**
+- The annotations are back byte for byte, and the source reads "first" and "second".
+- No marker is left.
+- A second and a third reopen leave the same state.
+
+**2. The rule as built.** I confirm it by reading.
+- Every forward step records its line before it acts.
+- Only the following remove trash copies, and none of them while a marker stands:
+  - the commit purge (after the marker is gone);
+  - the sweep (only with no marker left);
+  - a committed marker's finish (never rolled back);
+  - `retention.strayCopies` (skips trash with a live marker).
+- `removeMarker` never touches trash.
+- A move refuses while any marker stands (`move.ts:322`).
+
+Edge cases:
+- **A hand-deleted trash copy (Minor, M10).** Later lines at that path are now skipped. For [trash, create], this keeps the change's own written bytes at the path, and the outcome is reported "rolled-back" with no warning. Before the fix, the path was emptied. The original was already lost by the hand deletion either way, so nothing more is lost. But the change's half-written content now stands as if it were the earlier state.
+- **When the existence check throws.** The later lines are skipped and the roll-back is marked incomplete, so the marker is kept. That is the safe direction.
+- **The folder case (Minor, M11; a latent hole).** `dir` lines at the trashed folder's own path are skipped, which is right. But a file inside a folder that was trashed and then made again gets a "replaced" line once it is written a second time: `TxnLog.replaced` does not check `inNewDir`. That line is not at the same path, so it is not skipped. On a re-run after the original folder was put back, it would write the change's first write over the original file.
+  - The only caller that trashes a folder is `deleteSourceInTx` (`sources.ts:898`). The folder name carries the source id, and I found no change that makes the same folder again afterwards.
+  - So it is unreachable today, and I agree it can be listed. The direction for the fix: skip lines at or under the trashed path.
+
+**3. The enumeration is a real proof, within its scope.**
+- It uses the real `repo.mutate`, `tx.trash`, `tx.writeFile` and `tx.appendLine`, on real files.
+- It cuts the first roll-back after every step, including after all steps (the Q1 crash shape).
+- It runs a second roll-back to the end, and then a third.
+- It asserts that each case either ends "complete and byte for byte as before" or ends incomplete with the marker and its copies kept.
+
+The loosening (a trash copy may be gone if something is at its path) lets no loss through:
+- With the fix, nothing later at that path is undone again.
+- An earlier line, if refused as unverifiable, does not run.
+- So the trash copy's content is what stands at the path, and in the append cases the original can still be recovered from the kept backups.
+
+Two weaknesses:
+- That alternative checks only that something is present at the path, not that it is the copy's bytes.
+- The enumeration covers one file path only: no folders, no `dir` lines, so M11 is not exercised.
+
+Both are Minor and need no action now.
+
+**4. Yes, there is a caller that appends to and rewrites the same file in one change.**
+- In `find/queue-store.ts:677-699`, a torn last line of the Find queue is cut by `tx.writeFile`, which records "replaced". The same change then calls `tx.appendLine` on the same file. That is the [replace, append] shape.
+- It reaches "refused as unverifiable" only when a torn line meets an undo that fails, or a cut after the undo.
+- Nothing is lost then, but the project is blocked.
+- It is rare and real, so listing it is right. All other appends go to logs and journals that are never rewritten in the same change.
+
+**5. The earlier guarantees of this branch still hold** (the runs above).
