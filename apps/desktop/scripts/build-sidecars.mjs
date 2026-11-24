@@ -16,9 +16,15 @@
 // Work files: apps/desktop/.build/ (a build venv per pin set, PyInstaller's work folder).
 //
 // Pin sets: the default pins of services/media-worker/pyproject.toml, or those plus a constraints
-// file. A package named in the constraints file is pinned by it even where pyproject.toml pins it
-// directly. On an Intel Mac, packaging/constraints-macos-x86_64.txt is used unless
-// `--constraints none` is given. Every dependency must come as a wheel (--only-binary=:all:).
+// file. On an Intel Mac packaging/constraints-macos-x86_64.txt is used, on an Apple-silicon Mac
+// packaging/constraints-macos-arm64.txt, unless `--constraints none` is given. A constraints file that is
+// not a complete pin set (the Intel file, or any file given by hand with `--constraints <file>`, even a
+// copy of the Apple-silicon file at another path) overrides pyproject.toml's direct pins for the
+// packages it names, and the bundle is not checked against it. The Apple-silicon file is a
+// COMPLETE pin set (FR-730, R503 j): it names every package of the bundle; pyproject.toml's direct pins
+// are kept (a direct pin and its constraint that differ stop pip), and manifest.py --pins-complete
+// fails the build when a package in the bundle is not named there or has another version.
+// Every dependency must come as a wheel (--only-binary=:all:).
 //
 // Needs Python 3.12+ ($PYTHON, else python3.13 / python3.12 / python3) and network access to PyPI.
 // `--smoke` runs services/media-worker/packaging/smoke_test.py, which needs ffmpeg, ffprobe and
@@ -36,12 +42,15 @@ const PACKAGING = join(WORKER, "packaging");
 const BUILD = join(DESKTOP, ".build");
 const OUT = join(DESKTOP, "sidecars");
 const INTEL_CONSTRAINTS = join(PACKAGING, "constraints-macos-x86_64.txt");
+export const ARM64_CONSTRAINTS = join(PACKAGING, "constraints-macos-arm64.txt");
+/** Constraints files that name every package of the bundle (FR-730): checked against the bundle. */
+const COMPLETE_PIN_SETS = new Set([ARM64_CONSTRAINTS]);
 // The same list as `ABSENCES` in packaging/smoke_test.py (scripts/build-sidecars.test.mjs checks). gallery-dl is
 // not one: it is not inside the worker (R152), and the smoke run checks that a capture needing it names it.
 export const SMOKE_ABSENCES = ["model", "clip", "dng", "ffmpeg", "tesseract"];
 const RESOLVE_TARGETS = {
   "macos-x86_64": { platform: "macosx_15_0_x86_64", constraints: INTEL_CONSTRAINTS },
-  "macos-arm64": { platform: "macosx_15_0_arm64", constraints: undefined },
+  "macos-arm64": { platform: "macosx_15_0_arm64", constraints: ARM64_CONSTRAINTS },
 };
 
 // ---------- pure helpers (tested in scripts/build-sidecars.test.mjs) ----------
@@ -55,7 +64,13 @@ export function targetTriple(platform = process.platform, arch = process.arch) {
 }
 
 export function defaultConstraints(platform = process.platform, arch = process.arch) {
-  return platform === "darwin" && arch === "x64" ? INTEL_CONSTRAINTS : undefined;
+  if (platform !== "darwin") return undefined;
+  return arch === "x64" ? INTEL_CONSTRAINTS : arch === "arm64" ? ARM64_CONSTRAINTS : undefined;
+}
+
+/** Whether a constraints file names every package of the bundle (FR-730). */
+export function isCompletePinSet(file) {
+  return file !== undefined && COMPLETE_PIN_SETS.has(resolve(file));
 }
 
 export function parseArgs(argv) {
@@ -90,14 +105,17 @@ export function parseArgs(argv) {
 const canonical = (name) => name.toLowerCase().replace(/[-_.]+/g, "-");
 const reqName = (req) => canonical(req.trim().split(/[\s<>=!~[;(]/, 1)[0]);
 
-/** Constraint lines by canonical package name. Every line must be an exact `name==version` pin. */
+/** Constraint lines by canonical package name. Every line must be an exact `name==version` pin, and
+ *  no package may be named twice (PEP 503 names: PyYAML and pyyaml are one; pip refuses it too, R506 M3). */
 export function parseConstraints(text) {
   const out = new Map();
   for (const raw of text.split("\n")) {
     const line = raw.replace(/#.*/, "").trim();
     if (!line) continue;
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\s*==\s*[^\s,;]+$/.test(line)) throw new Error(`constraints must be exact pins (name==version): ${line}`);
-    out.set(reqName(line), line);
+    const name = reqName(line);
+    if (out.has(name)) throw new Error(`the constraints file names ${name} twice (${out.get(name)}, ${line})`);
+    out.set(name, line);
   }
   return out;
 }
@@ -105,6 +123,19 @@ export function parseConstraints(text) {
 /** The requirements to install: a dependency named in `constraints` loses its own version (the constraint pins it). */
 export function applyConstraints(requirements, constraints) {
   return requirements.map((r) => (constraints.has(reqName(r)) ? reqName(r) : r));
+}
+
+/** What pip is asked for under the pin set `c`: a complete pin set keeps pyproject.toml's direct pins
+ *  as they are, so that a direct pin and its constraint that differ stop pip (FR-730); another set
+ *  overrides them (applyConstraints). */
+export function installRequirements(requirements, c) {
+  return c.complete ? requirements : applyConstraints(requirements, c.map);
+}
+
+/** manifest.py's arguments for a new build; a complete pin set adds the check of the bundle against it. */
+export function manifestArgs({ bundle, triple, out, c }) {
+  return ["--bundle", bundle, "--target", triple, "--pin-set", c.name,
+    ...(c.file ? ["--constraints", c.file] : []), ...(c.complete ? ["--pins-complete"] : []), "--out", out];
 }
 
 // ---------- running things ----------
@@ -128,16 +159,24 @@ function findPython() {
   const candidates = process.env.PYTHON ? [process.env.PYTHON] : win ? ["py -3.13", "py -3.12", "python"] : ["python3.13", "python3.12", "python3"];
   for (const cmd of candidates) {
     const [exe, ...args] = cmd.split(" ");
-    const r = spawnSync(exe, [...args, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"], { encoding: "utf8" });
+    const r = spawnSync(exe, [...args, "-c", "import platform; print(platform.python_version())"], { encoding: "utf8" });
     if (r.status !== 0) continue;
-    const [maj, min] = r.stdout.trim().split(".").map(Number);
-    if (maj === 3 && min >= 12) return { exe, args, version: `${maj}.${min}` };
+    const full = r.stdout.trim();
+    const [maj, min] = full.split(".").map(Number);
+    // `version` (3.13) for pip's --python-version; `full` (3.13.17) for the venv stamp.
+    if (maj === 3 && min >= 12) return { exe, args, version: `${maj}.${min}`, full };
   }
   throw new Error(`No Python 3.12+ found (tried: ${candidates.join(", ")}). Set PYTHON.`);
 }
 
 const venvPython = (venv) => join(venv, process.platform === "win32" ? "Scripts\\python.exe" : "bin/python");
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
+
+/** What a build venv is made from: Python's full version (its patch release ships in the bundle with
+ *  its standard library, R506 M4), pyproject.toml and the constraints file. A change makes it again. */
+export function venvStamp(python, pyproject, constraints) {
+  return [python.full, sha256(pyproject), constraints ? sha256(constraints) : "", "v1"].join("\0");
+}
 
 /** A build venv for this pin set, recreated when pyproject.toml, the constraints or Python change. */
 function ensureVenv(python, name, stampParts, clean) {
@@ -160,11 +199,11 @@ function workerRequirements(py) {
 }
 
 function loadConstraints(file) {
-  if (!file) return { file: undefined, map: new Map(), name: "default" };
+  if (!file) return { file: undefined, map: new Map(), name: "default", complete: false };
   const path = resolve(file);
   if (!existsSync(path)) throw new Error(`constraints file not found: ${file}`);
   const name = path === INTEL_CONSTRAINTS ? "macos-x86_64" : relative(PACKAGING, path).replace(/^constraints-|\.txt$/g, "").replace(/[^A-Za-z0-9_.-]/g, "_");
-  return { file: path, map: parseConstraints(readFileSync(path, "utf8")), name };
+  return { file: path, map: parseConstraints(readFileSync(path, "utf8")), name, complete: isCompletePinSet(path) };
 }
 
 const PIP = ["-m", "pip", "--disable-pip-version-check"];
@@ -172,9 +211,9 @@ const PIP = ["-m", "pip", "--disable-pip-version-check"];
 function resolveFor(python, target) {
   const { platform, constraints } = RESOLVE_TARGETS[target];
   const c = loadConstraints(constraints);
-  const { py } = ensureVenv(python, "resolve", [python.version, "resolve"], false);
+  const { py } = ensureVenv(python, "resolve", [python.full, "resolve"], false);
   const { deps, packaging } = workerRequirements(py);
-  const reqs = applyConstraints([...deps, ...packaging], c.map);
+  const reqs = installRequirements([...deps, ...packaging], c);
   const dir = join(BUILD, `resolve-${target}`);
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
@@ -223,11 +262,11 @@ function symlinks(dir, base = dir, out = []) {
 function build(python, opts, triple, bundle) {
   const c = loadConstraints(opts.constraints === "none" ? undefined : opts.constraints ?? defaultConstraints());
   const pyproject = readFileSync(join(WORKER, "pyproject.toml"));
-  const v = ensureVenv(python, c.name, [python.version, sha256(pyproject), c.file ? sha256(readFileSync(c.file)) : "", "v1"], opts.clean);
+  const v = ensureVenv(python, c.name, [venvStamp(python, pyproject, c.file ? readFileSync(c.file) : undefined)], opts.clean);
   console.log(`pin set: ${c.name}${c.file ? ` (${relative(REPO, c.file)})` : ""}; build venv: ${relative(REPO, v.venv)}${v.fresh ? " (new)" : " (reused)"}`);
   if (v.fresh) {
     const { deps, packaging } = workerRequirements(v.py);
-    run(v.py, [...PIP, "install", "--only-binary=:all:", ...(c.file ? ["-c", c.file] : []), ...applyConstraints([...deps, ...packaging], c.map)]);
+    run(v.py, [...PIP, "install", "--only-binary=:all:", ...(c.file ? ["-c", c.file] : []), ...installRequirements([...deps, ...packaging], c)]);
   }
   // The worker itself, from this checkout, every time (its code is not part of the venv stamp).
   run(v.py, [...PIP, "install", "--quiet", "--no-deps", "--force-reinstall", WORKER]);
@@ -241,8 +280,7 @@ function build(python, opts, triple, bundle) {
   rmSync(bundle, { recursive: true, force: true });
   mkdirSync(OUT, { recursive: true });
   renameSync(join(dist, "ao-worker"), bundle);
-  run(v.py, ["-I", join(PACKAGING, "manifest.py"), "--bundle", bundle, "--target", triple, "--pin-set", c.name,
-    ...(c.file ? ["--constraints", c.file] : []), "--out", join(bundle, "sidecar-manifest.json")]);
+  run(v.py, ["-I", join(PACKAGING, "manifest.py"), ...manifestArgs({ bundle, triple, out: join(bundle, "sidecar-manifest.json"), c })]);
   console.log(`\nbuilt ${relative(REPO, bundle)} in ${((Date.now() - t0) / 1000).toFixed(0)} s; ${mb(sizeOf(bundle))} on disk. Largest items:`);
   for (const i of largestItems(bundle)) console.log(`  ${mb(i.bytes).padStart(9)}  ${i.path}`);
   console.log(`  ${symlinks(bundle).length} symbolic links inside (--skip-build --list-symlinks lists them)`);

@@ -64,6 +64,7 @@ import {
   projectCollectionsAndTags,
   projectPolicy,
   recoveryPendingProjects,
+  recoveryPendingReason,
   readFindQueueDetailedIn,
   readFindQueueIn,
   repoLibrary,
@@ -76,7 +77,7 @@ import { FIND_BROWSER_PAGE_MAX, FIND_LIBRARY_TEXT, FIND_LINK_TEXT, LIBRARY_FILE_
 import { idsOf, libraryAddressFor, whereToGetIt, WHERE_URL_MAX, type LibraryAccess } from "./where.js";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
-import type { AcquiredFrom, SourceFile } from "@ao/core";
+import type { AcquiredFrom, Asset, SourceFile } from "@ao/core";
 import { heldWaitingCountIn, holdMismatchedFileIn, removeFindEntryIn, resolveHeldFileIn } from "../repo/repo.js";
 import { originalsReach } from "../repo/linked-file.js";
 import { FIND_HELD_MAX, HeldFileEntryGoneError, HeldFileLimitError, HeldFileSourceHasFileError, sourceHasFile, type HeldFileFacts } from "../repo/review.js";
@@ -187,6 +188,11 @@ export function cleanAcquiredAddress(raw: string): string {
   const out = u.href;
   return out.length <= 2000 ? out : "";
 }
+
+/** R503 g: the reasons of a "no open copy" entry that rests for want of a copy (none: no copy was found). */
+const WANTING_COPY_NO_OPEN: ReadonlySet<string | undefined> = new Set([undefined, "not-this-file", "copy-some-unreachable", "copy-not-downloaded", "library-unfinished"]);
+/** R503 g: the reasons of the copy part's "failed" (a record made) that rest for want of a copy: a passing fault. */
+const WANTING_COPY_FAILED: ReadonlySet<string | undefined> = new Set(["unreachable", "unexpected"]);
 
 /** Task F11: the states of the free-copy part of an entry's life (an entry with its record made, and no file yet). */
 const COPY_STATES: ReadonlySet<FindState> = new Set(["record-complete", "looking-for-copy", "fetching"]);
@@ -378,9 +384,12 @@ export interface HandedFile {
 /**
  * R328 e: what the queue's view needs of a record, and nothing more — the work as "Where to get it" and a library
  * address use it (its id, title, type, DOI and ISBNs, and the one creator's name the catalogue's query takes), whether
- * the record has a file, and the two facts the store of a file is asked with.
+ * the record has a file, and the two facts the store of a file is asked with. R534 c: and its originals, which the
+ * opening's pass (`judgeResting`, R483 a, R503 g) judges by the Missing files rule (`originalsReach`: an `lstat` of each
+ * linked one, made anew each time — only the record is not read again), so that the pass and the view read a record
+ * once between them.
  */
-type RecordFacts = { work: WorkCandidate; hasFile: boolean; store: StoreFacts };
+type RecordFacts = { work: WorkCandidate; hasFile: boolean; store: StoreFacts; originals: readonly Asset[] };
 
 function factsOf(sf: SourceFile): RecordFacts {
   const w = workOfSourceFile(sf);
@@ -392,6 +401,7 @@ function factsOf(sf: SourceFile): RecordFacts {
     work: { id: w.id, title: w.title, creators: creator ? [creator] : [], type: w.type, identifiers: w.identifiers, providers: [] },
     hasFile: sourceHasFile(sf),
     store: { identifiable: prov.identifiable, ...(prov.legal.basis ? { legalBasis: prov.legal.basis } : {}) },
+    originals: sf.assets.filter((a) => a.role === "original" && a.status !== "destroyed"),
   };
 }
 
@@ -407,6 +417,12 @@ export const RECORD_FACTS_MAX = 4 * FIND_QUEUE_MAX;
 interface RecordFactsCache {
   get(projectId: string, sourceId: string, stamp: string): RecordFacts | undefined;
   set(projectId: string, sourceId: string, stamp: string, facts: RecordFacts): void;
+  /**
+   * R534 c: the facts at `stamp` — kept ones, or one read by `read` shared by every caller asking while it is under
+   * way (the opening's pass and a read of the queue at the same time read a record once). What a read brings is kept
+   * only if its project was not dropped (locked) or the cache cleared (closed) meanwhile.
+   */
+  load(projectId: string, sourceId: string, stamp: string, read: () => Promise<RecordFacts>): Promise<RecordFacts>;
   dropProject(projectId: string): void;
   clear(): void;
 }
@@ -416,6 +432,8 @@ function createRecordFactsCache(max = RECORD_FACTS_MAX): RecordFactsCache {
   /** Every key kept, in the order of its last use (`projectId \0 sourceId`): the bound. */
   const order = new Map<string, [string, string]>();
   const key = (p: string, id: string) => `${p}\u0000${id}`;
+  /** Reads under way (`load`), by `projectId \0 sourceId \0 stamp`. */
+  const pending = new Map<string, { projectId: string; read: Promise<RecordFacts> }>();
   const forget = (p: string, id: string) => {
     byProject.get(p)?.delete(id);
     if (byProject.get(p)?.size === 0) byProject.delete(p);
@@ -444,12 +462,37 @@ function createRecordFactsCache(max = RECORD_FACTS_MAX): RecordFactsCache {
         forget(oldest![0], oldest![1]);
       }
     },
+    load(p, id, stamp, read) {
+      const hit = this.get(p, id, stamp);
+      if (hit) return Promise.resolve(hit);
+      const k = `${key(p, id)}\u0000${stamp}`;
+      const under = pending.get(k);
+      if (under) return under.read;
+      const mine: { projectId: string; read: Promise<RecordFacts> } = { projectId: p, read: Promise.resolve(undefined as never) };
+      mine.read = read().then(
+        (facts) => {
+          if (pending.get(k) === mine) {
+            pending.delete(k);
+            this.set(p, id, stamp, facts);
+          }
+          return facts;
+        },
+        (err: unknown) => {
+          if (pending.get(k) === mine) pending.delete(k);
+          throw err;
+        },
+      );
+      pending.set(k, mine);
+      return mine.read;
+    },
     dropProject(p) {
       for (const id of [...(byProject.get(p)?.keys() ?? [])]) forget(p, id);
+      for (const [k, v] of [...pending]) if (v.projectId === p) pending.delete(k);
     },
     clear() {
       byProject.clear();
       order.clear();
+      pending.clear();
     },
   };
 }
@@ -501,20 +544,14 @@ export async function libraryChancesOf(
     throw err;
   }
   for (const [i, e] of resting.entries()) {
-    let facts: RecordFacts | undefined;
+    let facts: RecordFacts;
     const stamp = cache ? stamps[i] : undefined;
     if (cache && stamp === null) continue; // the record is not there (deleted)
-    if (cache && stamp) facts = cache.get(projectId, e.sourceId!, stamp);
-    if (!facts) {
-      let sf: SourceFile;
-      try {
-        sf = await repo.getSource(projectId, e.sourceId!);
-      } catch (err) {
-        if (err instanceof NotFoundError) continue;
-        throw err;
-      }
-      facts = factsOf(sf);
-      if (cache && stamp) cache.set(projectId, e.sourceId!, stamp, facts);
+    try {
+      facts = cache && stamp ? await cache.load(projectId, e.sourceId!, stamp, async () => factsOf(await repo.getSource(projectId, e.sourceId!))) : factsOf(await repo.getSource(projectId, e.sourceId!));
+    } catch (err) {
+      if (err instanceof NotFoundError) continue;
+      throw err;
     }
     const work = facts.work;
     const ids = idsOf(work);
@@ -590,7 +627,7 @@ export interface FindRunnerDeps {
 
 /** Why the runner does nothing for a project now. */
 export type FindStoppedFor = {
-  code: "rules-unreadable" | "queue-unreadable" | "read-only" | "recovery-pending" | "unexpected" | "index-not-ready";
+  code: "rules-unreadable" | "queue-unreadable" | "read-only" | "recovery-pending" | "reopen-pending" | "unexpected" | "index-not-ready";
 };
 
 export interface FindRunner {
@@ -676,8 +713,11 @@ export interface FindRunner {
    * At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry, and (F11) every entry in the free
    * copy's part — "record-complete" (its source without a file), "looking-for-copy", and "fetching" (which resumes as
    * "looking-for-copy": a download is never resumed).
+   * R534 c: the promise settles (it never rejects) once the opening's pass that judges the resting entries (R483 a,
+   * R503 g) has ended — or at once when there is none (closed, read-only, locked, the rules unreadable). A lock or a
+   * close ends the pass, and so settles it. It does not wait for the work the opening queues.
    */
-  resume(projectId: string): void;
+  resume(projectId: string): Promise<void>;
   /** At lock (together with the lock) or close: nothing more is written for the project; its work in flight is let go. */
   stop(projectId: string): void;
   /** At close: settles within FIND_STOP_SETTLE_MS whatever is in flight, acts already inside their turn included (R245). */
@@ -1528,7 +1568,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       return true;
     }
     if (err instanceof RecoveryPendingError) {
-      block(pid, "recovery-pending");
+      block(pid, err.reason === "reopen" ? "reopen-pending" : "recovery-pending");
       return true;
     }
     if (err instanceof FindQueueUnreadableError) {
@@ -2619,6 +2659,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
 
   /** R470 a: an entry resting for want of its linked file, without the researcher's "Get a copy for this source". */
   const restsForLink = (e: FindEntry): boolean => e.state === "record-complete" && e.reason?.code === LINKED_MISSING.code && !e.copyDespiteLink;
+  /**
+   * R503 g (FR-728): an entry of a record that RESTS for want of a copy, without the researcher's pick: "no open copy"
+   * (none found; "Not this file"; some services unreachable; a copy found but not downloaded; a fetch in the sign-in
+   * window not finished), or the copy part's "failed" for a passing fault (unreachable, unexpected — "Try again" looks
+   * for a copy again). Not: one the record of which was removed; one a rule, a setting or a missing key or legal basis
+   * stops (the researcher acts in another way, and the copy part judges those anew when they are woken); a found file
+   * waiting for the researcher's check (R301); any state being worked on. "record-complete" entries are queued in the
+   * copy part at every opening, which finds a file of their source by itself.
+   */
+  const restsWantingCopy = (e: FindEntry): boolean =>
+    !!e.sourceId &&
+    !e.copyDespiteLink &&
+    ((e.state === "no-open-copy" && WANTING_COPY_NO_OPEN.has(e.reason?.code)) || (e.state === "failed" && WANTING_COPY_FAILED.has(e.reason?.code)));
 
   /**
    * R483 a: at a project's opening (the library opened, the project unlocked: `resume`), each entry that RESTS with
@@ -2634,6 +2687,10 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
    * One resting so whose record has no original any more, or was deleted, goes through the ordinary resume, as it did
    * before R483 a: queued in the copy part like any record without a file (which then looks for a copy, or says the
    * record was removed). An "in your library" entry whose record has no file any more is left as it is (never woken).
+   * R503 g (FR-728): an entry resting for want of a copy (`restsWantingCopy`) whose record now has a file that can be
+   * reached (stored, or linked and found by the Missing files rule) rests "in your library", as "Try again" and the copy
+   * part would leave it (attempts back to 0; reason, offers and next try dropped); otherwise it is left as it is. Its
+   * line is written once: at the next opening it is an "in your library" entry, which stays so while its file is there.
    */
   /** The copy part's ordinary resume of an entry (as `resume` queues it). */
   function ordinary(pid: string, e: FindEntry): void {
@@ -2649,19 +2706,27 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     for (const e of q.values()) {
       if (!live()) return;
       const inLibrary = e.state === "in-library" && !e.copyDespiteLink;
-      if (!e.sourceId || (!inLibrary && !restsForLink(e))) continue;
+      const forLink = restsForLink(e);
+      const wanting = restsWantingCopy(e);
+      if (!e.sourceId || (!inLibrary && !forLink && !wanting)) continue;
       let reach: Awaited<ReturnType<typeof originalsReach>>;
       try {
-        reach = await guard(r, repo.getSource(pid, e.sourceId).then((sf) => originalsReach(root, sf)));
+        // R534 c (R328 e): the record is read through the view's cache — only when its file changed since it was last
+        // read, and once between this pass and a read of the queue — and its linked originals are judged anew.
+        const sid = e.sourceId;
+        const stamp = sourceRecordStampIn(repo, pid, sid);
+        if (stamp === null) throw new NotFoundError("source", sid);
+        reach = await guard(r, records.load(pid, sid, stamp, async () => factsOf(await repo.getSource(pid, sid))).then((f) => originalsReach(root, { assets: f.originals })));
       } catch (err) {
         if (err instanceof Abandoned) throw err;
         // R488 a: a deleted record's entry resting for its link goes on as at any resume (it says the record was removed).
-        if (!inLibrary && err instanceof NotFoundError) ordinary(pid, e);
+        if (forLink && err instanceof NotFoundError) ordinary(pid, e);
         continue; // otherwise its record cannot be read now: left as it is
       }
-      if (!inLibrary && reach === "none") ordinary(pid, e); // R488 a: no original any more: the ordinary resume
+      if (forLink && reach === "none") ordinary(pid, e); // R488 a: no original any more: the ordinary resume
       else if (inLibrary && reach === "linked-missing") moves.push({ from: e, to: { state: "record-complete", reason: LINKED_MISSING }, drop: ["nextTryAt", "offers"] });
-      else if (!inLibrary && reach === "reachable") moves.push({ from: e, to: { state: "in-library" }, drop: ["nextTryAt", "reason", "offers"] });
+      else if (forLink && reach === "reachable") moves.push({ from: e, to: { state: "in-library" }, drop: ["nextTryAt", "reason", "offers"] });
+      else if (wanting && reach === "reachable") moves.push({ from: e, to: { state: "in-library", attempts: 0 }, drop: ["nextTryAt", "reason", "offers"] });
     }
     if (!moves.length || !live()) return;
     await inTurn(r, pid, live, async () => {
@@ -2676,15 +2741,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     });
   }
 
-  function resume(projectId: string): void {
-    if (closed || readOnly()) return;
+  function resume(projectId: string): Promise<void> {
+    if (closed || readOnly()) return Promise.resolve();
     let unlocked: boolean;
     try {
       unlocked = repo.isUnlocked(projectId);
     } catch {
-      return; // not a project of this library
+      return Promise.resolve(); // not a project of this library
     }
-    if (!unlocked) return;
+    if (!unlocked) return Promise.resolve();
+    // R534 c: settled when the opening's pass has ended, or when the opening ends without one.
+    let judged: Promise<void> | undefined;
+    let opened!: () => void;
+    const settled = new Promise<void>((res) => (opened = res));
     blocked.delete(projectId);
     const r = runOf(projectId);
     r.signalStop(); // the previous generation's work is let go at once
@@ -2698,7 +2767,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     const p = (async () => {
       if (recoveryPendingProjects(repo).includes(projectId)) {
         // Its writes wait for the library to be reopened (N2).
-        if (alive(projectId, gen)) block(projectId, "recovery-pending");
+        if (alive(projectId, gen)) block(projectId, recoveryPendingReason(repo, projectId) === "reopen" ? "reopen-pending" : "recovery-pending");
         return;
       }
       if ((await projectPolicy(repo, projectId)) === null) {
@@ -2733,7 +2802,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         if (!(err instanceof Abandoned)) debug(`find: the resting entries could not be judged (${errName(err)})`);
       });
       inflight.add(judging);
-      void judging.finally(() => inflight.delete(judging));
+      judged = judging.finally(() => inflight.delete(judging));
+      void judged.finally(opened);
       // F11: the free copy's part goes on (a "fetching" entry resumes as "looking-for-copy": a download is never resumed).
       // An entry resting for want of its linked file, with no pick, is judged by `judgeResting` alone (R483 a).
       for (const e of q.values()) {
@@ -2790,8 +2860,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           if (alive(projectId, gen)) block(projectId, "unexpected");
         }
       })
-      .finally(() => inflight.delete(p));
+      .finally(() => {
+        inflight.delete(p);
+        if (!judged) opened();
+      });
     inflight.add(p);
+    return settled;
   }
 
   function stop(projectId: string): void {

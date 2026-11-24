@@ -56,12 +56,23 @@ export class GovernanceViolationError extends Error {
  * could not be undone or whose marker is unresolved, or an audit log that could not be repaired
  * or appended to when the library was opened. The library's integrity warnings say which.
  */
+export type RecoveryPendingReason = "interrupted-change" | "reopen";
+
 export class RecoveryPendingError extends Error {
   override name = "RecoveryPendingError";
-  constructor(readonly projectId: string) {
+  constructor(
+    readonly projectId: string,
+    /**
+     * R528 M3: what holds the project: an interrupted change not resolved yet (`interrupted-change`), or a problem that
+     * is recorded, and writes resume, only when the library is opened again (`reopen`: an audit append that failed at the
+     * opening, or a change resolved past an audit log that does not match this computer's record of it, R131 d).
+     */
+    readonly reason: RecoveryPendingReason = "interrupted-change",
+  ) {
     super(
-      `Project ${projectId} refuses changes: an earlier change could not be fully undone, or its audit log could not be repaired when the library was opened. ` +
-        "Check the library's integrity warnings, then reopen the library",
+      // FR-736: no advice to reopen, which cannot help while what holds the project stands; the warnings say what does.
+      `Project ${projectId} refuses changes until an interrupted change is resolved or its audit log is repaired. ` +
+        "The library's integrity warnings say which, and what to do.",
     );
   }
 }
@@ -92,6 +103,8 @@ export class PendingWriteIncompleteError extends Error {
   constructor(
     readonly txn: string,
     message: string,
+    /** What kept each path from being undone, when known (R519): a cause and the library-relative path. */
+    readonly causes: ReadonlyArray<{ kind: string; path: string }> = [],
   ) {
     super(message);
   }

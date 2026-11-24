@@ -32,7 +32,7 @@ import { GovernanceViolationError, InvalidInputError, KeyFileChangedError, Polic
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
-import { lockPurges, type Manifest, type ProjectJson, type ProjectState, type RepoCore } from "./state.js";
+import { lockPurges, pendingReason, type Manifest, type ProjectJson, type ProjectState, type RepoCore } from "./state.js";
 
 export interface CreateProjectInput {
   name: string;
@@ -243,7 +243,7 @@ async function unlockNow(core: RepoCore, projectId: string, secret: string, lock
   const asked = lockAsksAtRequest ?? core.lockAsks.get(projectId) ?? 0;
   const overtaken = () => (core.lockAsks.get(projectId) ?? 0) !== asked;
   // Unlocking is audited; that append must wait until the interrupted write is resolved.
-  if (st.recoveryPending && core.library.mode === "read-write") throw new RecoveryPendingError(projectId);
+  if (st.recoveryPending && core.library.mode === "read-write") throw new RecoveryPendingError(projectId, pendingReason(st));
   const file = await readKeyFile(core, st);
   let key: Uint8Array;
   try {
@@ -332,7 +332,7 @@ export async function issueRecoveryCode(core: RepoCore, projectId: string, passp
   core.assertWritable();
   const st = core.state(projectId);
   if (!core.encrypted(st)) throw new InvalidInputError("This project is not encrypted, so it has no recovery code");
-  if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+  if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
   core.assertUnlocked(st);
   if (typeof passphrase !== "string" || passphrase === "") throw new InvalidInputError("Enter the project's passphrase");
 

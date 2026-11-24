@@ -181,6 +181,14 @@ describe("pending writes (R27)", () => {
     const [pw] = await repo.pendingWrites();
     expect(pw).toMatchObject({ status: "committed", canKeep: true, canRollBack: false });
     await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteChoiceError);
+    // R533 (3): a close by the route is refused in words true of a completed change (it can only be kept).
+    const closed = await repo.closePendingWrite(pw!.txn, pid).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(closed).toBeInstanceOf(PendingWriteChoiceError);
+    expect((closed as Error).message).toBe("This change was completed, so it cannot be closed; it can only be kept.");
+    expect(await markers()).toHaveLength(1);
     await repo.resolvePendingWrite(pw!.txn, "keep");
     expect(await markers()).toEqual([]);
     expect(repo.listSourceIds(pid)).toHaveLength(1);
@@ -199,6 +207,13 @@ describe("pending writes (R27)", () => {
     expect(list).toEqual([expect.objectContaining({ txn, projectId: "*", status: "invalid", canKeep: false, canRollBack: false })]);
     await expect(repo.resolvePendingWrite(txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteChoiceError);
     await expect(repo.resolvePendingWrite(txn, "keep")).rejects.toBeInstanceOf(PendingWriteChoiceError);
+    // R533 (3): a close by the route is refused with the sentence the choices give (its record cannot be read).
+    const closed = await repo.closePendingWrite(txn, "*").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(closed).toBeInstanceOf(PendingWriteChoiceError);
+    expect((closed as Error).message).toBe("Its record cannot be read safely, so nothing it names can be undone or kept.");
     expect(await markers()).toHaveLength(1);
     expect(pid).toBeTruthy();
   });
@@ -218,6 +233,12 @@ describe("pending writes: an unverifiable change is never acted on (R131 a, b)",
   it("P3: chain before the change does not verify (torn audit line): no choice is offered, roll-back is refused and nothing changes", async () => {
     const { repo, pid } = await unverifiableOnReopen("torn-audit");
     expect(repo.integrityWarnings.map((w) => w.kind)).toContain("txn-recovery-skipped-audit-unverifiable");
+    // R529: the command line's detail says what the banner says: never a retry (it is refused every time); a backup is the way.
+    const w = repo.integrityWarnings.find((x) => x.kind === "txn-recovery-skipped-audit-unverifiable")!;
+    expect(w.detail.startsWith(
+      "an interrupted change was not rolled back because the audit log cannot be trusted to show it was uncommitted; the marker is kept, and restoring the project from a backup made before the change is the way to undo it (transaction ",
+    )).toBe(true);
+    expect(w.detail).not.toMatch(/retried|tried again/u);
     const [pw] = await repo.pendingWrites();
     expect(pw).toMatchObject({ projectId: pid, status: "unverifiable", canKeep: false, canRollBack: false });
     expect(pw!.detail).toMatch(/audit/);
@@ -225,6 +246,15 @@ describe("pending writes: an unverifiable change is never acted on (R131 a, b)",
     const before = await logBytes(repo, pid);
     await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteChoiceError);
     await expect(repo.resolvePendingWrite(pw!.txn, "keep")).rejects.toBeInstanceOf(PendingWriteChoiceError);
+    // R532 M5 (b): a close by the route is refused in words true of it (it cannot be rolled back either).
+    const closed = await repo.closePendingWrite(pw!.txn, pid).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(closed).toBeInstanceOf(PendingWriteChoiceError);
+    expect((closed as Error).message).toBe(
+      "This change cannot be closed: the app can neither undo it nor close it safely. Restoring a backup made before the change is the way.",
+    );
     expect(await logBytes(repo, pid)).toEqual(before);
     expect(await markers()).toHaveLength(1);
     await expect(add(repo, pid, "Still blocked")).rejects.toBeInstanceOf(RecoveryPendingError);
@@ -405,9 +435,27 @@ describe("pending writes: the resolve is durable before it acts (R131 c, d)", ()
     expect(await anchorOf(pid)).toEqual(anchor);
     expect((await audit(repo, pid)).filter((e) => e.action === "txn.resolve")).toHaveLength(1);
     // Writes would move the anchor: they wait for the next open, which records the mismatch first.
-    await expect(add(repo, pid, "Not yet")).rejects.toBeInstanceOf(RecoveryPendingError);
+    const err = await add(repo, pid, "Not yet").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(RecoveryPendingError);
+    // R528 M3: held for another reason than an interrupted change: reopening the library is the way, and is said.
+    expect((err as RecoveryPendingError).reason).toBe("reopen");
+    // R530: its warning is a kind of its own, which says to open the library again (not the anchor kind's sentence).
+    expect(repo.integrityWarnings.filter((w) => w.projectId === pid)).toEqual([
+      {
+        projectId: pid,
+        kind: "interrupted-change-resolved-reopen",
+        detail: expect.stringMatching(
+          /^an interrupted change was resolved, but audit event \d+ differs from the recorded head; the audit log changed outside the app; this is recorded the next time the library is opened, and this project refuses changes until then: close the library and open it again$/u,
+        ),
+      },
+    ]);
     const again = await reopen();
     expect((await audit(again, pid)).map((e) => e.action)).toContain("audit.anchor-mismatch");
+    // Recorded at the opening: the anchor's own warning says it from then on, and this one is gone.
+    expect(again.integrityWarnings.filter((w) => w.projectId === pid).map((w) => w.kind)).toEqual(["head-mismatch"]);
     await add(again, pid, "After");
   });
 

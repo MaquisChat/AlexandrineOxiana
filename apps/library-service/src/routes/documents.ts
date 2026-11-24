@@ -25,17 +25,16 @@
  * R470 b (FR-490): `GET /projects/:id/review/:itemId/held-file/document` serves, the same way, the file Find and acquire
  * holds for one pending entry, to be looked at before the researcher decides (its own handler below).
  */
-import { Readable } from "node:stream";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { InvalidInputError, KeyNotAvailableError, NotFoundError, PathEscapeError, ProjectLockedError, isPdfMime, openAssetContent, openHeldFileContent, type AssetContent, type HeldFileContent, type StoredContent } from "@ao/library";
 import { DOCUMENT_RANGE_MAX_BYTES, READER_PDF_MAX_BYTES } from "@ao/shared";
 import { SHELL_ORIGINS } from "../auth.js";
 import { ApiError, badRequest, notFound, toApiError } from "../errors.js";
-import { parseRange, sendContent } from "../media.js";
-import { paramsOf, projectParam, type Ctx } from "./util.js";
+import { guarded, parseRange, readGuard, sendContent } from "../media.js";
 
-/** How much each guarded read takes (as the library's own stream does). */
-const SLICE = 64 * 1024;
+/** The guard of every read lives with the stream it guards (media.ts), shared with the picture route (FR-739). */
+export { guarded };
+import { paramsOf, projectParam, type Ctx } from "./util.js";
 
 const askForRange = (): ApiError => badRequest("Ask for a byte range.");
 const cannotShow = (): ApiError => badRequest("This file cannot be shown here.");
@@ -43,7 +42,6 @@ const missing = (): ApiError => new ApiError(404, "NOT_FOUND", "The file of this
 const unreadable = (): ApiError => new ApiError(409, "CONFLICT", "This file could not be read. The library's integrity check can tell more.");
 const unsafe = (): ApiError => badRequest("This file could not be opened safely.");
 const tooLarge = (): ApiError => new ApiError(413, "PAYLOAD_TOO_LARGE", "This PDF is larger than 512 MB, too large to open in the app.");
-const closedMeanwhile = (): ApiError => new ApiError(409, "CONFLICT", "The library was closed while this file was being read.");
 /** R470 b: the one answer for "no held file here", whatever the reason (it tells nothing more). */
 const noHeldFile = (): ApiError => notFound("That file");
 const locked = (): ApiError => new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
@@ -90,35 +88,6 @@ export function openFailure(err: unknown): ApiError {
   // There but unreadable (permission, too many open files, an I/O error): never "missing".
   if (typeof code === "string" && /^E[A-Z0-9]+$/.test(code)) return unreadable();
   return toApiError(err);
-}
-
-/**
- * `c` with every read checked by `ok` before and after it (so no byte read after a lock leaves),
- * and its range stream made of those checked reads.
- */
-export function guarded<T extends StoredContent>(c: T, ok: () => void): T {
-  const read = async (position: number, length: number): Promise<Buffer> => {
-    ok();
-    const b = await c.read(position, length);
-    ok();
-    return b;
-  };
-  return {
-    ...c,
-    read,
-    range(start, end) {
-      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= c.size) throw new RangeError("range outside the file");
-      async function* gen(): AsyncGenerator<Buffer> {
-        for (let at = start; at <= end; ) {
-          const n = Math.min(SLICE, end - at + 1);
-          yield await read(at, n);
-          at += n;
-        }
-      }
-      return Readable.from(gen(), { objectMode: false, highWaterMark: SLICE });
-    },
-    close: () => c.close(),
-  };
 }
 
 export function registerDocuments(app: FastifyInstance, ctx: Ctx): void {
@@ -168,10 +137,7 @@ export function registerDocuments(app: FastifyInstance, ctx: Ctx): void {
    * against it (416), then one answer of at most DOCUMENT_RANGE_MAX_BYTES. Closes the file on every refusal.
    */
   const serve = async (req: FastifyRequest, reply: FastifyReply, s: ReturnType<Ctx["state"]["requireSession"]>, projectId: string, opened: StoredContent, range: string): Promise<FastifyReply> => {
-    const c = guarded(opened, () => {
-      if (state.session !== s) throw closedMeanwhile();
-      if (!s.repo.isUnlocked(projectId)) throw new ProjectLockedError(projectId);
-    });
+    const c = guarded(opened, readGuard(state, s, projectId));
     if (c.size > max) {
       await c.close();
       throw tooLarge();

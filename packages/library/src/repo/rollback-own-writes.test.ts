@@ -1,10 +1,11 @@
 /**
- * R484 a (R473 I1 3): when the library is reopened after a change whose roll-back did not finish, the files that
- * change named are judged against the state before its first step and the change's own writes: the app's own
- * writes are never recorded as "changed outside the app"; a real outside edit is recorded once; the state before
- * the change is put back in every case. In-process roll-backs are made to fail with the NODE_ENV=test seam (R47).
+ * R484 a (R473 I1 3), as corrected by R519: when the library is reopened after a change whose roll-back did not finish,
+ * the app's own writes are never taken for changes outside the app, and the state before the change is put back. A
+ * real outside edit of a file the change named is never put back over (R519): the file stays as it is, the roll-back
+ * stays incomplete with the cause and the path, and once the researcher moves the file away the next reopen puts the
+ * earlier state back. In-process roll-backs are made to fail with the NODE_ENV=test seam (R47).
  */
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
@@ -64,7 +65,7 @@ const STORE = { action: "store" as const, store: { identifiable: false, hasLocat
 const note = (sourceId: string, body: string): Annotation => ({ id: newId(), sourceId, kind: "note", anchors: [], body, author: "tester", createdAt: NOW });
 const withNotes = (sf: SourceFile, bodies: string[]): SourceFile => ({ ...sf, annotations: bodies.map((b) => note(sf.source.id, b)) });
 
-const OUTSIDE = new Set(["changed-outside-before-rollback", "annotations-hash-mismatch"]);
+const OUTSIDE = new Set(["annotations-hash-mismatch"]);
 const outside = () => repo.integrityWarnings.filter((w) => OUTSIDE.has(w.kind)).map((w) => [w.kind, w.file]);
 const markers = async () => (await readdir(join(lib.root, ".tmp")).catch(() => [] as string[])).filter((n) => /^txn-.*\.json$/u.test(n));
 const reopen = async () => {
@@ -87,6 +88,23 @@ async function editSourceByHand(): Promise<void> {
   const sf = JSON.parse(await sourceJson()) as SourceFile;
   sf.source.title.variants[0]!.value = "Retitled by hand";
   await writeFile(join(lib.root, folder, "source.json"), JSON.stringify(sf));
+}
+
+/**
+ * R519: the file edited by hand (`rel`, holding `bytes`) is left exactly as it is, the marker kept, the roll-back
+ * incomplete with that one cause and path; no "changed outside … not kept" (nothing was lost). Then the researcher
+ * moves the file away, and the next reopen puts the earlier state back.
+ */
+async function handEditKeptThenMovedAway(rel: string, bytes: string, sourceBefore: string): Promise<void> {
+  expect(await readFile(join(lib.root, rel), "utf8")).toBe(bytes);
+  expect(await markers()).toHaveLength(1);
+  expect(outside()).toEqual([]);
+  expect(repo.integrityWarnings.filter((w) => w.kind === "rolled-back-incomplete-write").flatMap((w) => w.causes ?? [])).toEqual([{ kind: "hand-changed-file", path: rel }]);
+  await rename(join(lib.root, rel), join(tmp, "moved-away"));
+  expect(await readFile(join(tmp, "moved-away"), "utf8")).toBe(bytes);
+  await reopen();
+  expect(outside()).toEqual([]);
+  await earlierStateBack(sourceBefore);
 }
 
 beforeEach(async () => {
@@ -145,7 +163,11 @@ async function trashedThenWrittenThenFailed(): Promise<void> {
   expect(await markers()).toHaveLength(1);
 }
 
-/** 54b9f25's case: a file is trashed, then written again at the same path by the same change; its undo fails. */
+/**
+ * 54b9f25's case: a file is trashed, then written again at the same path by the same change; its undo fails at the
+ * "created" step. The trashed step then finds the change's own bytes at the path (R519 (1)): removed, the original put
+ * back; the marker is kept, since a step failed.
+ */
 async function trashedThenWrittenAgainThenFailed(rel: string): Promise<void> {
   seams.failUndo = "created";
   await expect(
@@ -159,6 +181,18 @@ async function trashedThenWrittenAgainThenFailed(rel: string): Promise<void> {
   expect(await markers()).toHaveLength(1);
 }
 
+/** The same change cut off by a crash before its audit entry: nothing undone, the file written again still at the path. */
+async function trashedThenWrittenAgainThenCrashed(rel: string): Promise<void> {
+  seams.crashAt = "before-audit";
+  await expect(
+    repo.mutate(pid, STORE, async (tx) => {
+      await tx.trash(rel);
+      await tx.writeFile(rel, "written again by the change\n");
+    }),
+  ).rejects.toBeInstanceOf(SimulatedCrash);
+  expect(await markers()).toHaveLength(1);
+}
+
 describe("R484 a: the app's own writes are never recorded as changed outside the app", () => {
   it("P1: a source written twice by the failed change; the reopen records no outside change and puts the earlier state back", async () => {
     const before = await sourceJson();
@@ -169,13 +203,13 @@ describe("R484 a: the app's own writes are never recorded as changed outside the
     await earlierStateBack(before);
   });
 
-  it("P1 with a real edit of source.json meanwhile: recorded exactly once, and the earlier state is put back", async () => {
+  it("P1 with a real edit of source.json meanwhile: left as edited, incomplete with its cause (R519); moved away, the earlier state is put back", async () => {
     const before = await sourceJson();
     await writtenTwiceThenFailed();
     await editSourceByHand();
+    const edited = await sourceJson();
     await reopen();
-    expect(outside()).toEqual([["changed-outside-before-rollback", `${folder}/source.json`]]);
-    await earlierStateBack(before);
+    await handEditKeptThenMovedAway(`${folder}/source.json`, edited, before);
   });
 
   it("P2: a trashed original the failed roll-back already put back, then a source write; the reopen records nothing outside", async () => {
@@ -188,13 +222,13 @@ describe("R484 a: the app's own writes are never recorded as changed outside the
     await earlierStateBack(before);
   });
 
-  it("P2 with a real edit of source.json meanwhile: recorded exactly once, and the earlier state is put back", async () => {
+  it("P2 with a real edit of source.json meanwhile: left as edited, incomplete with its cause (R519); moved away, the earlier state is put back", async () => {
     const before = await sourceJson();
     await trashedThenWrittenThenFailed();
     await editSourceByHand();
+    const edited = await sourceJson();
     await reopen();
-    expect(outside()).toEqual([["changed-outside-before-rollback", `${folder}/source.json`]]);
-    await earlierStateBack(before);
+    await handEditKeptThenMovedAway(`${folder}/source.json`, edited, before);
   });
 
   it("the reverse order: trashed, then written again by the change itself; the reopen records nothing outside", async () => {
@@ -202,23 +236,23 @@ describe("R484 a: the app's own writes are never recorded as changed outside the
     await writeFile(join(lib.root, rel), "before the change\n");
     const before = await sourceJson();
     await trashedThenWrittenAgainThenFailed(rel);
-    expect(await readFile(join(lib.root, rel), "utf8")).toBe("written again by the change\n");
+    expect(await readFile(join(lib.root, rel), "utf8")).toBe("before the change\n");
     await reopen();
     expect(outside()).toEqual([]);
     expect(await readFile(join(lib.root, rel), "utf8")).toBe("before the change\n");
     await earlierStateBack(before);
   });
 
-  it("the reverse order with a real edit of the file written again: recorded exactly once, and the earlier state is put back", async () => {
+  it("the reverse order with a real edit of the file written again: left as edited, incomplete with its cause (R519); moved away, the original is put back", async () => {
     const rel = `${folder}/notes.txt`;
     await writeFile(join(lib.root, rel), "before the change\n");
     const before = await sourceJson();
-    await trashedThenWrittenAgainThenFailed(rel);
+    await trashedThenWrittenAgainThenCrashed(rel);
+    expect(await readFile(join(lib.root, rel), "utf8")).toBe("written again by the change\n");
     await writeFile(join(lib.root, rel), "edited by hand\n");
     await reopen();
-    expect(outside()).toEqual([["changed-outside-before-rollback", rel]]);
+    await handEditKeptThenMovedAway(rel, "edited by hand\n", before);
     expect(await readFile(join(lib.root, rel), "utf8")).toBe("before the change\n");
-    await earlierStateBack(before);
   });
 
   describe("a crash during the reopen's own roll-back, then a second reopen", () => {
@@ -242,7 +276,7 @@ describe("R484 a: the app's own writes are never recorded as changed outside the
       const [name] = await markers();
       const m = JSON.parse(await readFile(join(lib.root, ".tmp", name!), "utf8")) as TxnMarker;
       expect(m.entries.filter((e) => e.kind === "replaced").length).toBeGreaterThanOrEqual(4); // two writes of each of the two files
-      expect(await undoEntries(lib.root, m.entries.slice(pick(m)))).toBe(true);
+      expect((await undoEntries(lib.root, m.entries.slice(pick(m)))).ok).toBe(true);
       await meanwhile();
       lib = await openLibrary(lib.root, mkDeps());
       repo = await repoFor();
@@ -270,35 +304,36 @@ describe("R484 a: the app's own writes are never recorded as changed outside the
       await earlierStateBack(before);
     });
 
-    it("cut, then a real edit of source.json before the second reopen: recorded exactly once, and the earlier state is put back", async () => {
+    it("cut, then a real edit of source.json before the second reopen: left as edited, incomplete with its cause (R519); moved away, the earlier state is put back", async () => {
       const before = await sourceJson();
       await crashedChange();
-      await rollBackCutFrom(afterFirstSourceWrite, editSourceByHand);
-      expect(outside()).toEqual([["changed-outside-before-rollback", `${folder}/source.json`]]);
-      await earlierStateBack(before);
+      let edited = "";
+      await rollBackCutFrom(afterFirstSourceWrite, async () => {
+        await editSourceByHand();
+        edited = await sourceJson();
+      });
+      await handEditKeptThenMovedAway(`${folder}/source.json`, edited, before);
     });
   });
 });
 
-describe("R484 b, R479 a: a file the unfinished change named, changed by hand before the reopen, is recorded as changed-outside-before-rollback", () => {
+describe("R484 b, R479 a, as corrected by R519: a file the unfinished change named, changed by hand before the reopen, is left as it is, never put back over", () => {
   it("a hand-edited source record", async () => {
     const before = await sourceJson();
     await writtenTwiceThenFailed();
     await editSourceByHand();
+    const edited = await sourceJson();
     await reopen();
-    expect(repo.integrityWarnings.filter((w) => w.kind === "changed-outside-before-rollback")).toEqual([
-      { projectId: pid, kind: "changed-outside-before-rollback", file: `${folder}/source.json`, detail: expect.any(String) },
-    ]);
-    await earlierStateBack(before);
+    await handEditKeptThenMovedAway(`${folder}/source.json`, edited, before);
   });
 
-  it("a hand-edited annotations file: the same kind, not the warning that says annotations are shown as they are now", async () => {
+  it("a hand-edited annotations file: left as it is, and not the warning that says annotations are shown as they are now", async () => {
     const before = await sourceJson();
     await writtenTwiceThenFailed();
-    await writeFile(join(lib.root, folder, "annotations.json"), JSON.stringify([note(sid, "edited by someone")]));
+    const edited = JSON.stringify([note(sid, "edited by someone")]);
+    await writeFile(join(lib.root, folder, "annotations.json"), edited);
     await reopen();
-    expect(outside()).toEqual([["changed-outside-before-rollback", `${folder}/annotations.json`]]);
-    await earlierStateBack(before);
+    await handEditKeptThenMovedAway(`${folder}/annotations.json`, edited, before);
   });
 });
 

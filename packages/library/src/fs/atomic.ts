@@ -47,25 +47,43 @@ const RETRY_DELAYS_MS = [20, 40, 80, 160, 320];
  * hold files open there, making rename fail with EPERM/EACCES/EBUSY. We retry
  * up to 5 times (20 → 320 ms backoff, ~620 ms in all), only on win32 or when a
  * test sets `force`. Elsewhere those codes are real permission errors. Also
- * used for directory renames (trash, rollback, project staging).
+ * used for directory renames (trash, rollback, project staging), and for reading
+ * the anchors file (`readMaybeWithRetry`, FR-732 2).
  */
 export const _renameRetry = {
   force: false,
   sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
-export async function renameWithRetry(from: string, to: string): Promise<void> {
+/** Runs `op`, trying again on a file briefly held by another program, as above (the one wait-and-retry). */
+async function withHeldFileRetry<T>(op: () => Promise<T>): Promise<T> {
   const retry = process.platform === "win32" || _renameRetry.force;
   for (let attempt = 0; ; attempt++) {
     try {
-      await fsp.rename(from, to);
-      return;
+      return await op();
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code ?? "";
       const delay = RETRY_DELAYS_MS[attempt];
       if (!retry || !RETRY_CODES.has(code) || delay === undefined) throw err;
       await _renameRetry.sleep(delay);
     }
+  }
+}
+
+export async function renameWithRetry(from: string, to: string): Promise<void> {
+  await withHeldFileRetry(() => fsp.rename(from, to));
+}
+
+/**
+ * Reads a whole file, or null when there is none, with the same retry as `renameWithRetry` for a file briefly held
+ * by another program (FR-732 2: the anchors file, which a scanner or sync client may hold while an export reads it).
+ */
+export async function readMaybeWithRetry(path: string): Promise<Buffer | null> {
+  try {
+    return await withHeldFileRetry(() => fsp.readFile(path));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
   }
 }
 
@@ -184,13 +202,14 @@ export interface CopyOptions {
 /**
  * Atomically copies `src` to `dest`, optionally through `transform`.
  * Returns the SHA-256 (hex) and byte count of the source content, i.e. the
- * plaintext when `transform` encrypts.
+ * plaintext when `transform` encrypts, and `storedSha256`, the SHA-256 of the
+ * bytes as written to `dest`, hashed as they are written.
  */
 export async function copyFileAtomic(
   src: string,
   dest: string,
   opts: CopyOptions = {},
-): Promise<{ sha256: string; bytes: number }> {
+): Promise<{ sha256: string; bytes: number; storedSha256: string }> {
   // R454: every stream below is made, given its error listeners and consumed with NO `await` in between. The source
   // starts reading (and failing: a missing file, a lock, a damaged or foreign file) as soon as it is made; an `await`
   // there lets that error arrive with no listener — an uncaught exception, which stops the service — and leaves the
@@ -210,6 +229,8 @@ export async function copyFileAtomic(
     throw err;
   }
   const hash = createHash("sha256");
+  /** Of the bytes as written to `dest` (after `transform`), in the same pass (R519 (2)): differs from `hash` when encrypting. */
+  const stored = createHash("sha256");
   let bytes = 0;
   const hasher = new Transform({
     transform(chunk: Buffer, _enc, cb) {
@@ -235,6 +256,7 @@ export async function copyFileAtomic(
     out = opts.transform ? opts.transform(hashed) : hashed;
     if (out !== hashed) hashed.on("error", (err) => out.destroy(err));
     for await (const chunk of out as AsyncIterable<Uint8Array>) {
+      stored.update(chunk);
       for (let off = 0; off < chunk.length; ) {
         off += (await fh.write(chunk, off)).bytesWritten;
       }
@@ -246,7 +268,7 @@ export async function copyFileAtomic(
     await fh.close();
     fh = undefined;
     await commit(tmp, dest);
-    return { sha256: hash.digest("hex"), bytes };
+    return { sha256: hash.digest("hex"), bytes, storedSha256: stored.digest("hex") };
   } catch (err) {
     raw?.destroy();
     source?.destroy();

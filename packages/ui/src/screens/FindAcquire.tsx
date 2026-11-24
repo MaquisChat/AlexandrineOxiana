@@ -1704,6 +1704,17 @@ function ProjectQueue(props: {
         if (live() && ticket && address) {
           libTicket.current = { entryId: e.id, ticket };
           opened = await openWindow(ticket, address, how.kind, live);
+          if (opened && !live()) {
+            // FR-734 (2), R503 i: the row left the screen (the screen was left, the project or the library changed)
+            // while the shell was opening the window; the window the shell then opened is nobody's here, so it is
+            // closed — with THIS open's ticket, so that the shell never closes a newer window (R477 b, R489).
+            endedTickets.current.add(ticket);
+            if (libTicket.current?.ticket === ticket) libTicket.current = null;
+            void shellWithin(shell.closeLibraryWindow(ticket));
+            // R510 I1: and the start is cancelled at the service, as for a window that did not open (below, also when
+            // the screen is gone): otherwise the runner's one sign-in ticket stays held and every start is refused.
+            opened = false;
+          }
           // R356 b: from here on, a read started now or later is one asked after the start's answer.
           if (opened && libTicket.current?.ticket === ticket) libTicket.current.after = clock.current;
         }

@@ -8,9 +8,11 @@
 import * as fsp from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { sealEvent, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
-import { renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
+import { readMaybeWithRetry, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { SimulatedCrash, seams } from "./seams.js";
-import { appendDurable, assertContained, readMaybe, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
+import { appendDurable, assertContained, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
+import type { IncompleteRollback } from "@ao/shared";
+import type { UndoCause } from "./txn.js";
 
 export const AUDIT_SEGMENT_SIZE = 10_000;
 const SEGMENT = /^(\d{4,})\.jsonl$/;
@@ -54,10 +56,17 @@ export interface IntegrityWarning {
     | "source-change-unfinished"
     /** The same, in a library opened without changes: it can be put back only when opened for changes (R473 I1). */
     | "source-change-unfinished-read-only"
-    /** A roll-back at open found a file it names changed outside the app meanwhile; it was put back all the same (R473 I1 3). */
-    | "changed-outside-before-rollback"
     /** Files destroyed under the retention rule could not be overwritten yet; retried on each open (R94). */
     | "destroy-incomplete"
+    /** R509: the researcher closed an interrupted change whose undo could never complete; what it removed is lost. */
+    | "interrupted-change-closed"
+    /**
+     * R530: an interrupted change was resolved while the project's audit log does not match this computer's record of
+     * it (R131 d): the next opening records that first, and the project refuses changes until then.
+     */
+    | "interrupted-change-resolved-reopen"
+    /** FR-729: the record of recovery's warnings kept until dismissed could not be read; set aside when writable. */
+    | "recovery-warnings-set-aside"
     /** A staged recovery-code key file that is not the committed one was removed, not activated (R148). */
     | "recovery-staging-discarded"
     /** A staged recovery-code key file was left in place, not activated: the audit log does not verify (R148). */
@@ -67,6 +76,17 @@ export interface IntegrityWarning {
   file?: string;
   /** Size of the incomplete line in bytes, for the two incomplete-line kinds. */
   bytes?: number;
+  /** An incomplete roll-back (`rolled-back-incomplete-write`): what kept each path from being undone (R519). */
+  causes?: UndoCause[];
+  /**
+   * FR-736: an undo that is not complete (`rolled-back-incomplete-write`, or `incomplete-write-pending` for a recorded
+   * choice to roll back): its state, which chooses the words the researcher is told. Absent: the undo was complete.
+   * R527: on `interrupted-change-closed`, "unconfirmed" where something stood at every place whose file could not be
+   * put back (its sentence then never says the file is lost).
+   */
+  rollback?: IncompleteRollback;
+  /** FR-729: kept with the library until the researcher dismisses it (`dismissRecoveryWarning`); its id there. */
+  keptId?: string;
 }
 
 /** Segment file names in `dir`, oldest first (empty when the folder is missing). */
@@ -277,7 +297,8 @@ export class AnchorStore {
 
   /** Throws AnchorsUnreadableError when the file exists but is unparseable or the wrong shape. */
   async readAll(): Promise<Anchors> {
-    const raw = await readMaybe(this.path);
+    // A file briefly held by another program is waited for, as a held rename is (FR-732 2).
+    const raw = await readMaybeWithRetry(this.path);
     if (!raw) return {};
     let j: unknown;
     try {

@@ -418,6 +418,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const readBefore = useRef(false);
   /** R313 e: after a decision was given up and the queue read again, focus goes back to that file's heading. */
   const refocusAfterRead = useRef<string | null>(null);
+  /**
+   * R513 (I1): when focus went somewhere at once and is to move again once the read lands (a look closed during the
+   * read), the element the first move put it on. The second move happens only if focus is still there, or on the page
+   * body (R513 N1): focus is never taken from where the researcher has put it meanwhile (a control inside the screen, or anything outside it). Null when
+   * the move after the read is R313 e's own (a given-up decision, whose focus was judged when it was recorded).
+   */
+  const refocusOnlyFrom = useRef<Element | null>(null);
   /** The message that nothing is waiting: focus goes there after the last decision. */
   const emptyNote = useRef<HTMLParagraphElement>(null);
 
@@ -474,8 +481,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     [pump],
   );
 
+  /** The unlock form's place (its field takes focus when a lock found during the visit leaves focus nowhere, FR-739 4). */
+  const unlockRef = useRef<HTMLDivElement>(null);
+  /** Moved on when a lock is found after the queue was shown in this visit. */
+  const [lockFound, setLockFound] = useState(0);
   /** The project was locked: everything read from it is forgotten, and the unlock form shown. */
   const forget = useCallback(() => {
+    if (readBefore.current) setLockFound((n) => n + 1);
     gen.current++;
     pool.current.live = false;
     arrived.current = new Map();
@@ -542,9 +554,14 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         readBefore.current = true;
         setItems(list);
         const back = refocusAfterRead.current;
+        const from = refocusOnlyFrom.current;
         refocusAfterRead.current = null;
+        refocusOnlyFrom.current = null;
         // R313 e: back to that file's heading; its card is still in its place (R319 b), whether or not it still waits.
-        if (back) setFileFocus({ to: laidRef.current?.items.some((i) => i.id === back) ? back : ":title" });
+        // R513 (I1, N1): after a look closed during the read, only if focus is still where that close put it, or on the
+        // page (nowhere: never left there, FR-739 2) — never taken from any other element the researcher put it on.
+        const active = document.activeElement;
+        if (back && (!from || active === from || !active || active === document.body)) setFileFocus({ to: laidRef.current?.items.some((i) => i.id === back) ? back : ":title" });
         // A waiting file is shown in full in its own section; the panel shows the first of the others.
         setCurrent(list.find((i) => !isFound(i))?.id ?? null);
         // Titles come with the items; only items sent without one need their record for the list. A waiting file's
@@ -595,6 +612,17 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       up.clear();
     };
   }, [projectId]);
+
+  /**
+   * FR-739 (4): a lock found during the visit (a read, a decision, with or without a look open) takes away what had focus:
+   * focus goes to what the screen now offers, the unlock's field (as Find and acquire does, R262 N5 a, R281 b) — never the
+   * page. A researcher whose focus is still on something there (the screen's heading, a link) keeps it.
+   */
+  useEffect(() => {
+    if (!lockFound) return;
+    const active = document.activeElement;
+    if (!active || active === document.body) unlockRef.current?.querySelector<HTMLElement>("input")?.focus();
+  }, [lockFound]);
 
   // The project's name, for the unlock form.
   useEffect(() => {
@@ -852,7 +880,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     // R487 a: back to a card's own "Look at the file" (the control as it is now; never the stand-in, which has none).
     const lookBack = t.startsWith(LOOK_BACK) ? fileCards.current.get(t.slice(LOOK_BACK.length))?.querySelector<HTMLElement>(".ao-review__file-look button:not([tabindex])") : undefined;
     if (t.startsWith(LOOK_BACK)) {
-      if (lookBack && lookBack !== document.activeElement) lookBack.focus();
+      // FR-739 (2): the control not there at this moment (the queue being read again): the card's heading, else the
+      // screen's heading — as for any target that is gone — never the page.
+      if (lookBack) {
+        if (lookBack !== document.activeElement) lookBack.focus();
+      } else (fileHeads.current.get(t.slice(LOOK_BACK.length)) ?? title.current)?.focus();
+      // R513 (I1): a move still to come once the read lands happens only from where this one put focus.
+      if (refocusAfterRead.current === t.slice(LOOK_BACK.length) && refocusOnlyFrom.current) refocusOnlyFrom.current = document.activeElement;
       return;
     }
     const el =
@@ -924,7 +958,10 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       setHeldErrors((cur) => ({ ...cur, [item.id]: HELD_NO_ANSWER_TEXT }));
       const active = document.activeElement;
       const card = fileCards.current.get(item.id);
-      if (!active || active === document.body || (!!card && card.contains(active))) refocusAfterRead.current = item.id;
+      if (!active || active === document.body || (!!card && card.contains(active))) {
+        refocusAfterRead.current = item.id;
+        refocusOnlyFrom.current = null;
+      }
       setReadKey((k) => k + 1);
     }, HELD_DECISION_TIMEOUT_MS);
     outstanding.current.set(cancel, timer);
@@ -1031,6 +1068,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const list = itemsRef.current;
     const ended = laidRef.current?.ended ?? {};
     if (!ended[at.item.id] && (!list || list.some((x) => x.id === at.item.id))) {
+      // FR-739 (2): the queue is being read again (its card is not there meanwhile): once the read lands, focus goes to
+      // that card's heading, as after a given-up decision (R313 e); until then to the screen's heading (below).
+      // R513 (I1): that second move only if focus is still where this close puts it (set when it is put there, below).
+      if (!list) {
+        refocusAfterRead.current = at.item.id;
+        refocusOnlyFrom.current = title.current;
+      }
       setFileFocus({ to: `${LOOK_BACK}${at.item.id}` });
       return;
     }
@@ -1093,14 +1137,16 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         ))}
       </div>
       {locked && (
-        <UnlockProject
-          api={libApi}
-          project={{ id: projectId, name: projectName }}
-          onUnlocked={() => {
-            setLocked(false);
-            setReadKey((k) => k + 1);
-          }}
-        />
+        <div ref={unlockRef}>
+          <UnlockProject
+            api={libApi}
+            project={{ id: projectId, name: projectName }}
+            onUnlocked={() => {
+              setLocked(false);
+              setReadKey((k) => k + 1);
+            }}
+          />
+        </div>
       )}
       {!locked && items === null && !error && <p role="status">Loading…</p>}
       {!locked && items !== null && items.length === 0 && (

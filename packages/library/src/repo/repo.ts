@@ -50,7 +50,7 @@ import {
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
 import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, auditedReason, auditedReasonIn, hasSealedReason, openLibraryReason, readLibraryReasonLines, readProjectReasons, reasonKey, reasonMatches, reasonView } from "./audit-reasons.js";
-import type { AuditReasonView } from "@ao/shared";
+import { type AuditReasonView } from "@ao/shared";
 import { authorizeOnly, decide, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import {
   RECOVERY_CODE_UNSHOWN_WARNING,
@@ -86,15 +86,16 @@ import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
 import { hasSettledCaptureEntries, hasUnlistedConflicts, heldFileToLook, heldWaitingCount, holdMismatchedFile, readReviewEntries, removeFindEntryWithHeld, resolveHeldFile, reviewedAfterWithdrawal, type HoldInput, type ReviewEntry } from "./review.js";
 import { readWatchOrigins, readWatchRegister, recordWatchedFiles, type WatchRegisterEntry } from "./watch-register.js";
-import { appendFindEntries, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
+import { appendFindEntries, mendFindQueueTail, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
 import type { FindEntry } from "../find/types.js";
 import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
-import { RepoCore, loadProjects, type ProjectState, type RepoOptions } from "./state.js";
+import { RepoCore, loadProjects, pendingReason, type ProjectState, type RepoOptions } from "./state.js";
 import { loadPseudonyms, participantCodeOf } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "./errors.js";
-import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
+import { dismissKeptWarning, keepRecoveryWarnings } from "./kept-warnings.js";
+import { closePendingWrite, completeRecordedResolves, incompleteDetail, pendingWrites, resolvePendingWrite, stateOf, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { inspectMarkers, isOrphanBackup, markerPaths, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import {
   adoptRestoredProject as adoptRestoredIn,
@@ -413,6 +414,18 @@ export class Repo {
   resolvePendingWrite(txn: string, choice: PendingWriteChoice): Promise<{ txn: string; choice: PendingWriteChoice; projectId: string }> {
     return resolvePendingWrite(this.core, txn, choice);
   }
+  /**
+   * R509 (FR-736): closes, as it is, an interrupted change of `projectId` whose undo can never complete (the kept copy
+   * of a file it removed is gone): decided by the project's rules, audited as `txn.resolve` (choice `close`), nothing
+   * deleted; the project takes changes again. Writable libraries only.
+   */
+  closePendingWrite(txn: string, projectId: string): Promise<{ txn: string; projectId: string }> {
+    return closePendingWrite(this.core, txn, projectId);
+  }
+  /** FR-729: dismisses, for good, a warning kept with the library (its `keptId`). Writable libraries only. */
+  dismissRecoveryWarning(id: string): Promise<void> {
+    return dismissKeptWarning(this.core, id);
+  }
   listWorkspaceTags(): Promise<Tag[]> {
     return workspaceTags(this.core);
   }
@@ -549,10 +562,12 @@ const RECOVERY_WARNINGS: Partial<Record<RecoveryOutcome, { kind: IntegrityWarnin
     kind: "rolled-back-incomplete-write",
     text: "a change interrupted before it was audited could only be partly rolled back; the marker is kept and recovery is retried on the next open",
   },
+  // FR-736: the detail of an incomplete undo says its state (the command line prints it); see `incompleteDetail` (pending-writes.ts).
   invalid: { kind: "invalid-txn-marker", text: "a write-ahead marker is unreadable or points outside its project; it was kept and nothing was changed" },
   "skipped-audit-unverifiable": {
     kind: "txn-recovery-skipped-audit-unverifiable",
-    text: "an interrupted change was not rolled back because the audit log cannot be trusted to show it was uncommitted; the marker is kept",
+    // R529: as the banner says it: never retried with any other outcome; a backup made before the change is the way.
+    text: "an interrupted change was not rolled back because the audit log cannot be trusted to show it was uncommitted; the marker is kept, and restoring the project from a backup made before the change is the way to undo it",
   },
   "resolve-incomplete": {
     kind: "incomplete-write-pending",
@@ -636,26 +651,29 @@ export async function openRepoInternal(
         if (r.projectId === "*" || folder === null) unattributed = true;
         if (r.paths) noteUnfinished(r.projectId, r.paths);
       }
-      // Files the roll-back found changed outside the app meanwhile: put back all the same, and said (R473 I1 3). An
-      // annotations file too gets this kind (R484 b): the roll-back overwrote it, so it is not "shown as it is now".
-      for (const file of r.changedOutside ?? []) {
-        core.integrityWarnings.push({
-          projectId: r.projectId,
-          kind: "changed-outside-before-rollback",
-          detail: `A file was changed outside the app while an interrupted change waited to be undone; the state before that change was put back (transaction ${r.txn})`,
-          file,
-        });
-      }
       const w = RECOVERY_WARNINGS[r.outcome];
+      // FR-736: an undo not complete, at this opening or for a choice to roll back recorded earlier (its latest attempt
+      // was made just now, by completeRecordedResolves), carries its state; the list of interrupted changes its causes.
+      if (r.outcome === "rollback-incomplete") {
+        core.rollbackAttempts.set(r.txn, { causes: r.causes ?? [], stepFailed: r.stepFailed === true, ...(r.copyKept ? { copyKept: true as const } : {}) });
+      }
+      const attempt = r.outcome === "rollback-incomplete" || r.outcome === "resolve-incomplete" ? core.rollbackAttempts.get(r.txn) : undefined;
+      const rollback = attempt ? stateOf(attempt) : undefined;
       if (w) {
+        const text = r.outcome === "rollback-incomplete" && rollback ? incompleteDetail(rollback, "open") : w.text;
         core.integrityWarnings.push({
           projectId: r.projectId,
           kind: w.kind,
-          detail: `${w.text} (transaction ${r.txn}${r.detail ? `: ${r.detail}` : ""})`,
+          detail: `${text} (transaction ${r.txn}${r.detail ? `: ${r.detail}` : ""})`,
+          // R519: what kept the roll-back from completing, path by path (the list of interrupted changes shows them).
+          ...(attempt?.causes.length ? { causes: attempt.causes } : {}),
+          ...(rollback ? { rollback } : {}),
         });
       }
     }
     await sweep(core);
+    // FR-729: what recovery did is said until dismissed, at this opening and every later one.
+    await keepRecoveryWarnings(core, true, core.integrityWarnings.slice());
   } else {
     const markers = await pendingMarkers(core.root);
     // Not acted on here (no writes): the changes they name stay half done until a writable open (R473 I1).
@@ -669,6 +687,8 @@ export async function openRepoInternal(
         detail: `${markers} interrupted change(s) will be finished or rolled back when the library is opened read-write`,
       });
     }
+    // FR-729: the warnings kept from earlier openings are shown; nothing is written here.
+    await keepRecoveryWarnings(core, false, []);
   }
   const isPending = (p: { id: string; rel: string }) => pendingIds.has(p.id) || pendingFolders.has(folderKey(p.rel) ?? "");
 
@@ -697,8 +717,12 @@ export async function openRepoInternal(
     // An unresolved marker blocks writes. Its integrity findings are kept in memory only: appending
     // an event or moving the anchor could change what recovery decides on a later open. A line that
     // is still incomplete blocks them too: nothing can be appended after it.
-    const blocked = isPending({ id: st.project.id, rel: st.rel }) || (writable && lines.some((l) => !l.trimmed));
+    const pending = isPending({ id: st.project.id, rel: st.rel });
+    const blocked = pending || (writable && lines.some((l) => !l.trimmed));
     if (blocked) st.recoveryPending = true;
+    // R532 M5 (a): held only by a line whose trim failed here (no interrupted change holds it): the next opening tries
+    // again, and a refused write says so (its warning says the line is tidied up when the library is next opened).
+    if (blocked && !pending && !unattributed && lines.some((l) => !l.trimmed && l.error !== undefined)) st.reopenToResume = true;
     if (unfinished.has(st.project.id)) st.unfinished = new Set(unfinished.get(st.project.id));
     const anchor = anchors[core.anchorKey(st.project.id)];
     const problem = checkAnchor(events, verify, anchor, core.device);
@@ -761,6 +785,7 @@ export async function openRepoInternal(
     } catch (err) {
       if (err instanceof SimulatedCrash) throw err; // test seam: the process died here
       st.recoveryPending = true;
+      st.reopenToResume = true;
       core.integrityWarnings.push({
         projectId: st.project.id,
         kind: "audit-append-failed-at-open",
@@ -835,7 +860,7 @@ export async function appendLibraryEvent(
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
-    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
     // Idempotent per move: a move completed after a crash does not record the same step twice.
     if (details.moveId !== undefined) {
       const events = await AuditStore.read(st.audit.dir);
@@ -862,7 +887,7 @@ export async function appendRefusalEvent(repo: Repo, projectId: string, action: 
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
-    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
     const at = core.clock().toISOString();
     await core.auditNow(st, {
       ...core.auditBase(st, at),
@@ -1133,6 +1158,15 @@ export function importChange<T>(
   opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook; auditDetails?: Record<string, unknown> },
 ): Promise<T> {
   return runImportChange(cores.get(repo)!, projectId, reqs, fn, opts);
+}
+
+/**
+ * Package-internal (Bulk Import): before a change that may remove a source holding a found file (a duplicate's
+ * "merge" or "skip", an undo's removal), the Find queue's torn last line is cut by a change of its own, so the
+ * removal's line for the queue entry is always written (R503 a, R505 b).
+ */
+export function mendFindQueue(repo: Repo, projectId: string): Promise<void> {
+  return mendFindQueueTail(cores.get(repo)!, projectId);
 }
 
 /** Package-internal (Bulk Import): the project's collections and tags (project.json). */
@@ -1440,6 +1474,12 @@ export function recoveryPendingProjects(repo: Repo): string[] {
   return [...cores.get(repo)!.projects.values()].filter((s) => s.recoveryPending).map((s) => s.project.id);
 }
 
+/** R528 M3: why a project refuses changes (see `RecoveryPendingError.reason`); undefined when it takes them. */
+export function recoveryPendingReason(repo: Repo, projectId: string): "interrupted-change" | "reopen" | undefined {
+  const st = cores.get(repo)!.projects.get(projectId);
+  return st?.recoveryPending ? pendingReason(st) : undefined;
+}
+
 /** Package-internal (backups, R90 b): what a backup sees of its project while it holds the write queue. */
 export interface ProjectQueueContext {
   /** Library root (absolute). */
@@ -1475,7 +1515,7 @@ export function withProjectQueue<T>(repo: Repo, projectId: string, fn: (ctx: Pro
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
-    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
     core.assertUnlocked(st);
     return fn({
       root: core.root,

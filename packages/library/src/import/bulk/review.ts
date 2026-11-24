@@ -16,7 +16,7 @@ import { BIBLIO_FIELDS, biblioOf, newId, primary, recheckSourceFile, type FieldE
 import { NotFoundError, isLockedRefusal } from "../../repo/errors.js";
 import type { ReviewEntry } from "../../repo/review.js";
 import { storeRequest } from "../../repo/sources.js";
-import { importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
+import { importChange, mendFindQueue, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
 import type { LookupResult } from "../../lookup/index.js";
 import { PRIVATE_MODE, appendJournal, fileName, findBatch, readJournal, runListeners, type JournalEntry } from "./batch.js";
 import { zoteroKeysOf } from "../../repo/tombstones.js";
@@ -157,6 +157,9 @@ export async function decideReview(repo: Repo, projectId: string, itemId: string
   const projectRel = repo.getProject(projectId).folder;
   const root = repoLibrary(repo).root;
   let journaled: JournalEntry | undefined;
+  // "merge" and "skip" remove the item's source, which may write a queue entry's line: a torn last line of the
+  // queue is cut first, by a change of its own (R503 a, R505 b).
+  if (d.action === "merge" || d.action === "skip") await mendFindQueue(repo, projectId);
   await importChange(
     repo,
     projectId,

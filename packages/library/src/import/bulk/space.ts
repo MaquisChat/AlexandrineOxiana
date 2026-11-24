@@ -79,9 +79,12 @@ export function fitSentence(copyBytes: number, dbBytes: number, freeBytes: numbe
 export const DISK_FULL_NOTE = "The import stopped because the disk is full. Free some space, then resume the import.";
 /**
  * R436 d (correcting R413 c): the note of a batch that stopped with its project refusing every write because a change
- * could not be undone, whatever error stopped it. Reopening the library finishes that undo.
+ * could not be undone, whatever error stopped it. FR-736: reopening does not finish an undo that a file in the way or a
+ * lost copy holds; the library's warning about it says what does. R530: true of every hold (an interrupted change, or one
+ * lifted only by opening the library again). Its ending ", then resume the import." is what a resumed run drops it by.
  */
-export const RECOVERY_NOTE = "The import stopped because an earlier change in this project could not be undone. Close and reopen the library, then resume the import.";
+export const RECOVERY_NOTE =
+  "The import stopped because this project takes no changes until a problem is resolved. Do what the warning on the library's main screen says, then resume the import.";
 /** R436 d: the same after a full disk (or a quota): the change the full disk stopped is the one that could not be undone. */
 export const DISK_FULL_UNDONE_NOTE =
   "The import stopped because the disk is full, and its last change could not be undone. Free some space, close and reopen the library, then resume the import.";

@@ -3003,6 +3003,227 @@ describe("screens integration (R118): resolve a pending write (R27)", () => {
   });
 });
 
+describe("FR-736: an interrupted change whose undo is not complete, as the service says it", () => {
+  beforeEach(() => start());
+
+  /** A change that trashed an original and stopped before its audit entry; the copy the app kept of it is gone. */
+  async function lostOriginal(): Promise<{ path: string; pid: string; folder: string; txn: string; rel: string }> {
+    const { mkdir } = await import("node:fs/promises");
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const folder = (await call({ url: "/projects" })).json.projects[0].folder as string;
+    const txn = "019a7000-0000-7000-8000-0000000000d1";
+    const rel = `${folder}/kept.txt`;
+    const auditLines = (await readFile(join(path, folder, "audit", "0001.jsonl"), "utf8")).trim().split("\n").length;
+    await mkdir(join(path, ".tmp"), { recursive: true });
+    await writeFile(
+      join(path, ".tmp", `txn-${txn}.json`),
+      JSON.stringify({ formatVersion: 1, txn, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: auditLines, entries: [{ kind: "trashed", from: rel, to: `.tmp/trash-${txn}-0`, ino: "1", birthtimeNs: "1" }] }),
+    );
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    return { path, pid, folder, txn, rel };
+  }
+
+  it("the list names what is in the way with its place in the library; the warnings say the state, never a path", async () => {
+    const { path, txn, rel } = await lostOriginal();
+    const list = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;
+    expect(list).toEqual([expect.objectContaining({ txn, status: "uncommitted", canRollBack: true, rollback: "lost", causes: [{ kind: "kept-copy-gone", path: rel }] })]);
+    expect(JSON.stringify(list)).not.toContain(path);
+    const integrity = (await call({ url: "/libraries/integrity" })).json.integrityWarnings as Array<Record<string, unknown>>;
+    const w = integrity.find((x) => x.kind === "rolled-back-incomplete-write")!;
+    expect(w).toMatchObject({ project: "Study", state: "lost" });
+    expect(JSON.stringify(integrity)).not.toContain("kept.txt");
+    expect(Object.keys(w)).not.toContain("causes");
+  });
+
+  it("R533 (1): could-not-look carries whether what could not be read is the kept copy or the place", async () => {
+    const { path, txn, rel } = await lostOriginal();
+    const copy = `.tmp/trash-${txn}-0`;
+    await writeFile(join(path, copy), "the original\n");
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    repoSeams.failLook = copy;
+    try {
+      expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+      const list = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;
+      expect(list).toEqual([expect.objectContaining({ txn, rollback: "could-not-read", causes: [{ kind: "could-not-look", path: rel, copyUnread: true }] })]);
+      await rm(join(path, copy));
+      expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+      repoSeams.failLook = rel;
+      expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+      const again = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;
+      expect(again).toEqual([expect.objectContaining({ txn, causes: [{ kind: "could-not-look", path: rel }] })]);
+    } finally {
+      repoSeams.failLook = undefined;
+    }
+  });
+
+  it("R527: something stands at the place: the list's cause says so, and the warning's state is unconfirmed (never lost)", async () => {
+    const { path, txn, rel } = await lostOriginal();
+    await writeFile(join(path, rel), "a file at the place\n");
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    const list = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;
+    expect(list).toEqual([expect.objectContaining({ txn, rollback: "unconfirmed", causes: [{ kind: "kept-copy-gone", path: rel, somethingThere: true }] })]);
+    const integrity = (await call({ url: "/libraries/integrity" })).json.integrityWarnings as Array<Record<string, unknown>>;
+    expect(integrity.find((x) => x.kind === "rolled-back-incomplete-write")).toMatchObject({ state: "unconfirmed" });
+  });
+
+  it("\"Roll it back\" answers with the state's sentence, marked; a write is refused without advice to reopen", async () => {
+    const { pid, txn } = await lostOriginal();
+    const back = await call({ method: "POST", url: `/libraries/pending-writes/${txn}/resolve`, body: { choice: "roll-back" } });
+    expect([back.status, back.json.error]).toEqual([
+      409,
+      // R528 M5: the answer names the next step, the close the list then offers.
+      {
+        code: "CONFLICT",
+        message: "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back. You can now close the change as it is from the list.",
+        reason: "rollback-incomplete",
+      },
+    ]);
+    const write = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } });
+    expect([write.status, write.json.error.message]).toEqual([409, "This project takes no changes until an interrupted change is resolved. The warning on the library's main screen says what to do."]);
+  });
+
+  it("R528 I2: a refused \"Roll it back\" or close publishes the library's state, so that the banner follows the list", async () => {
+    const { txn, pid, path, folder } = await lostOriginal();
+    // What the opening published is out of the way first.
+    await svc.state.idle();
+    const states: Array<{ integrityWarnings: Array<{ kind: string; state?: string }> }> = [];
+    svc.state.events.subscribe((e) => {
+      if (e.type === "library.state") states.push(e.data as (typeof states)[number]);
+    });
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${txn}/resolve`, body: { choice: "roll-back" } })).status).toBe(409);
+    await svc.state.idle();
+    expect(states).toHaveLength(1);
+    expect(states[0]!.integrityWarnings.find((w) => w.kind === "rolled-back-incomplete-write")).toMatchObject({ state: "lost" });
+    // A close refused (named with the right project, but the project's rules cannot be read): published too.
+    await writeFile(join(path, folder, "governance.yaml"), "identifiability: [not: valid");
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${txn}/close`, body: { projectId: pid } })).status).toBe(403);
+    await svc.state.idle();
+    expect(states).toHaveLength(2);
+  });
+
+  it("R533 (3): a close asked of a completed change, or of one whose record cannot be read, is refused in words true of it", async () => {
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    repoSeams.crashAt = "before-marker-delete";
+    try {
+      expect((await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } })).status).toBe(500);
+    } finally {
+      repoSeams.crashAt = undefined;
+    }
+    const [done] = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<{ txn: string; status: string }>;
+    expect(done).toMatchObject({ status: "committed" });
+    const a = await call({ method: "POST", url: `/libraries/pending-writes/${done!.txn}/close`, body: { projectId: pid } });
+    expect([a.status, a.json.error.message]).toEqual([409, "This change was completed, so it cannot be closed; it can only be kept."]);
+    const txn = "019a7000-0000-7000-8000-0000000000d2";
+    await writeFile(join(path, ".tmp", `txn-${txn}.json`), "{ not json");
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    const b = await call({ method: "POST", url: `/libraries/pending-writes/${txn}/close`, body: { projectId: "*" } });
+    expect([b.status, b.json.error.message]).toEqual([409, "Its record cannot be read safely, so nothing it names can be undone or kept."]);
+  });
+
+  it("R509: the list offers to close it, with what is lost; closing is for the app's own token, names its project, and unblocks the project", async () => {
+    const { pid, txn, rel } = await lostOriginal();
+    const [listed] = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;
+    expect(listed).toMatchObject({ txn, canClose: true, lost: [{ path: rel, now: "nothing" }] });
+    // The browser extension's token never reaches it.
+    const p = await call({ method: "POST", url: "/extension/pair" });
+    const EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+    const c = await svc.app.inject({ method: "POST", url: "/extension/pair/confirm", headers: { origin: EXT, "content-type": "application/json" }, payload: JSON.stringify({ code: p.json.code }) });
+    const ext = await svc.app.inject({
+      method: "POST",
+      url: `/libraries/pending-writes/${txn}/close`,
+      headers: { authorization: `Bearer ${c.json().token as string}`, origin: EXT, "content-type": "application/json" },
+      payload: JSON.stringify({ projectId: pid }),
+    });
+    expect(ext.statusCode).toBe(403);
+    // Named with another project, or with none: refused, nothing changed.
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${txn}/close`, body: { projectId: "019a7000-0000-7000-8000-0000000000ee" } })).status).toBe(404);
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${txn}/close`, body: {} })).status).toBe(400);
+    expect((await call({ url: "/libraries/pending-writes" })).json.pendingWrites).toHaveLength(1);
+    const closed = await call({ method: "POST", url: `/libraries/pending-writes/${txn}/close`, body: { projectId: pid } });
+    expect([closed.status, closed.json]).toEqual([200, { txn, projectId: pid }]);
+    expect((await call({ url: "/libraries/pending-writes" })).json.pendingWrites).toEqual([]);
+    const integrity = (await call({ url: "/libraries/integrity" })).json.integrityWarnings as Array<Record<string, unknown>>;
+    expect(integrity.filter((w) => w.projectId === pid).map((w) => w.kind)).toEqual(["interrupted-change-closed"]);
+    expect((await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } })).status).toBe(200);
+  });
+});
+
+describe("R530: a change resolved while its audit log does not match this computer's record, as the service says it", () => {
+  beforeEach(() => start());
+
+  it("the status lists a warning of its own kind; a write is refused with the sentence for a project held until the library is opened again", async () => {
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const folder = (await call({ url: "/projects" })).json.projects[0].folder as string;
+    // A plainly uncommitted change (its marker matches the audit log) whose undo at the opening failed part-way, so the
+    // project is held; then an anchor that names the change's start with a different event there.
+    const txn = "019a7000-0000-7000-8000-0000000000e1";
+    const lines = (await readFile(join(path, folder, "audit", "0001.jsonl"), "utf8")).trim().split("\n").length;
+    await mkdir(join(path, ".tmp"), { recursive: true });
+    await writeFile(
+      join(path, ".tmp", `txn-${txn}.json`),
+      JSON.stringify({ formatVersion: 1, txn, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: lines, entries: [{ kind: "created", path: `${folder}/half-written.txt` }] }),
+    );
+    await writeFile(join(path, folder, "half-written.txt"), "half");
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    repoSeams.failUndo = "created";
+    try {
+      expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    } finally {
+      repoSeams.failUndo = undefined;
+    }
+    const anchors = join(tmp, "config", "audit-anchors.json");
+    const raw = JSON.parse(await readFile(anchors, "utf8")) as { anchors: Record<string, { seq: number; hash: string }> };
+    const key = Object.keys(raw.anchors).find((k) => k.endsWith(`/${pid}`))!;
+    raw.anchors[key]!.hash = "0".repeat(64);
+    await writeFile(anchors, JSON.stringify(raw));
+    const r = await call({ method: "POST", url: `/libraries/pending-writes/${txn}/resolve`, body: { choice: "roll-back" } });
+    expect(r.status, r.body).toBe(200);
+    const integrity = (await call({ url: "/libraries/integrity" })).json.integrityWarnings as Array<Record<string, unknown>>;
+    expect(integrity.filter((w) => w.projectId === pid).map((w) => [w.kind, w.project])).toEqual([["interrupted-change-resolved-reopen", "Study"]]);
+    const write = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } });
+    expect([write.status, write.json.error.message]).toEqual([409, "This project takes no changes until the library is opened again. The warning on the library's main screen says why."]);
+  });
+});
+
+describe("FR-729: recovery's warnings, kept with the library until dismissed, as the service says them", () => {
+  beforeEach(() => start());
+
+  it("a change undone at the opening: its warning carries its id, is said again after a close and reopen, and once dismissed is gone for good", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const folder = (await call({ url: "/projects" })).json.projects[0].folder as string;
+    const txn = "019a7000-0000-7000-8000-0000000000e1";
+    const auditLines = (await readFile(join(path, folder, "audit", "0001.jsonl"), "utf8")).trim().split("\n").length;
+    await mkdir(join(path, ".tmp"), { recursive: true });
+    await writeFile(join(path, ".tmp", `txn-${txn}.json`), JSON.stringify({ formatVersion: 1, txn, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: auditLines, entries: [{ kind: "created", path: `${folder}/half.txt` }] }));
+    await writeFile(join(path, folder, "half.txt"), "half");
+    const reopen = async () => {
+      expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+      expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    };
+    const keptOf = async () => ((await call({ url: "/libraries/integrity" })).json.integrityWarnings as Array<Record<string, unknown>>).filter((w) => w.keptId !== undefined);
+    await reopen();
+    const [w] = await keptOf();
+    expect(w).toMatchObject({ projectId: pid, project: "Study", kind: "rolled-back-incomplete-write", keptId: expect.any(String) });
+    await reopen();
+    // The same warning (its detail, which no screen shows, says it was kept from an earlier opening).
+    expect(await keptOf()).toEqual([{ ...w, detail: expect.any(String) }]);
+    expect((await call({ method: "POST", url: `/libraries/recovery-warnings/019a7000-0000-7000-8000-0000000000ff/dismiss` })).status).toBe(404);
+    const gone = await call({ method: "POST", url: `/libraries/recovery-warnings/${w!.keptId as string}/dismiss` });
+    expect([gone.status, gone.json]).toEqual([200, { dismissed: true }]);
+    expect(await keptOf()).toEqual([]);
+    await reopen();
+    expect(await keptOf()).toEqual([]);
+  });
+});
+
 describe("Task 46b D2 (R137): a library row's needsReview means an item waits in the import review queue", () => {
   beforeEach(() => start());
 

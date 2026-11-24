@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { SMOKE_ABSENCES, applyConstraints, defaultConstraints, parseArgs, parseConstraints, targetTriple } from "../apps/desktop/scripts/build-sidecars.mjs";
+import { ARM64_CONSTRAINTS, SMOKE_ABSENCES, applyConstraints, defaultConstraints, installRequirements, isCompletePinSet, manifestArgs, parseArgs, parseConstraints, targetTriple, venvStamp } from "../apps/desktop/scripts/build-sidecars.mjs";
 
 test("target triples follow Tauri's sidecar names", () => {
   assert.equal(targetTriple("darwin", "arm64"), "aarch64-apple-darwin");
@@ -31,10 +31,47 @@ test("--allow-missing names absences the smoke test may skip; nothing is allowed
   assert.equal(parseArgs(["--list-symlinks", "--skip-build"]).listSymlinks, true);
 });
 
-test("the Intel constraints file is chosen by default on an Intel Mac only", () => {
+test("each Mac takes its own constraints file by default; Linux and Windows none", () => {
   assert.match(defaultConstraints("darwin", "x64"), /constraints-macos-x86_64\.txt$/);
-  assert.equal(defaultConstraints("darwin", "arm64"), undefined);
+  // FR-730 (R503 j): Apple Silicon's pin set names every package of the bundle.
+  assert.equal(defaultConstraints("darwin", "arm64"), ARM64_CONSTRAINTS);
+  assert.match(ARM64_CONSTRAINTS, /services\/media-worker\/packaging\/constraints-macos-arm64\.txt$/);
   assert.equal(defaultConstraints("linux", "x64"), undefined);
+  assert.equal(defaultConstraints("win32", "x64"), undefined);
+});
+
+test("Apple Silicon's constraints file is a complete pin set: the build checks the bundle against it and keeps the direct pins", () => {
+  assert.equal(isCompletePinSet(ARM64_CONSTRAINTS), true);
+  assert.equal(isCompletePinSet(defaultConstraints("darwin", "x64")), false);
+  assert.equal(isCompletePinSet(undefined), false);
+  const deps = ["faster-whisper==1.2.1", "rawpy==0.28.0"];
+  const full = { file: ARM64_CONSTRAINTS, map: parseConstraints("rawpy==0.28.0\nfaster-whisper==1.2.1\n"), complete: true };
+  // A complete set does not override pyproject.toml: a direct pin and its constraint that disagree stop pip.
+  assert.deepEqual(installRequirements(deps, full), deps);
+  assert.deepEqual(installRequirements(deps, { ...full, complete: false }), ["faster-whisper", "rawpy"]);
+  const args = manifestArgs({ bundle: "/b", triple: "aarch64-apple-darwin", out: "/b/sidecar-manifest.json", c: { ...full, name: "macos-arm64" } });
+  assert.deepEqual(args.slice(-5), ["--constraints", ARM64_CONSTRAINTS, "--pins-complete", "--out", "/b/sidecar-manifest.json"]);
+  assert.ok(args.includes("--pin-set") && args[args.indexOf("--pin-set") + 1] === "macos-arm64");
+  const partial = manifestArgs({ bundle: "/b", triple: "x", out: "/o", c: { file: "/i.txt", map: new Map(), name: "macos-x86_64", complete: false } });
+  assert.ok(!partial.includes("--pins-complete") && partial.includes("/i.txt"));
+  assert.ok(!manifestArgs({ bundle: "/b", triple: "x", out: "/o", c: { file: undefined, map: new Map(), name: "default", complete: false } }).includes("--constraints"));
+});
+
+test("Apple Silicon's constraints file pins every direct dependency at pyproject.toml's own version", () => {
+  const pins = parseConstraints(readFileSync(ARM64_CONSTRAINTS, "utf8"));
+  const pyproject = readFileSync(new URL("../services/media-worker/pyproject.toml", import.meta.url), "utf8");
+  const block = /^dependencies = \[([\s\S]*?)^\]/m.exec(pyproject)[1];
+  const direct = [...block.matchAll(/^\s*"([^"]+)"/gm)].map((m) => m[1]);
+  assert.ok(direct.length >= 9);
+  const canon = (n) => n.toLowerCase().replace(/[-_.]+/g, "-");
+  for (const d of direct) {
+    const [name, version] = d.split("==");
+    const pin = pins.get(canon(name));
+    assert.ok(pin, `${name} is not in the constraints file`);
+    assert.equal(pin.split("==")[1].trim(), version, `${name}: pyproject.toml pins ${version}, the constraints file ${pin}`);
+  }
+  // Build 10's bundle held 56 packages; every one is named.
+  assert.ok(pins.size >= 56);
 });
 
 test("constraints files: names and pins, comments and blank lines ignored", () => {
@@ -42,6 +79,12 @@ test("constraints files: names and pins, comments and blank lines ignored", () =
   assert.deepEqual([...c.keys()], ["onnxruntime", "pikepdf", "rawpy"]);
   assert.equal(c.get("pikepdf"), "PikePDF == 10.13.0.post1");
   assert.throws(() => parseConstraints("rawpy>=0.25\n"), /exact pin/);
+});
+
+test("a constraints file that names one package twice is refused, naming it (R506 M3)", () => {
+  // PEP 503: PyYAML and pyyaml are one package; pip refuses such a file too.
+  assert.throws(() => parseConstraints("PyYAML==6.0.4\nrawpy==0.28.0\npyyaml==6.0.3\n"), /the constraints file names pyyaml twice \(PyYAML==6\.0\.4, pyyaml==6\.0\.3\)/);
+  assert.throws(() => parseConstraints("pydantic_core==2.50.5\nPydantic.Core==2.50.5\n"), /names pydantic-core twice/);
 });
 
 test("a package named in the constraints loses its direct pin; others keep theirs", () => {
@@ -60,4 +103,13 @@ test("the build script and the smoke test agree on the absences a smoke run may 
   assert.ok(!names.includes("gallery-dl"));
   // the CI invocation passes no wheel and no allowance: the smoke run must pass as it is
   assert.doesNotMatch(smoke, /res\.missing\([^)]*"gallery-dl"/);
+});
+
+test("the build venv is made again when Python's patch release changes, not only its minor version (R506 M4)", () => {
+  const py = (full) => ({ version: "3.13", full });
+  const a = venvStamp(py("3.13.17"), Buffer.from("pyproject"), Buffer.from("pins"));
+  assert.equal(venvStamp(py("3.13.17"), Buffer.from("pyproject"), Buffer.from("pins")), a);
+  assert.notEqual(venvStamp(py("3.13.18"), Buffer.from("pyproject"), Buffer.from("pins")), a);
+  assert.notEqual(venvStamp(py("3.13.17"), Buffer.from("pyproject"), Buffer.from("pins2")), a);
+  assert.notEqual(venvStamp(py("3.13.17"), Buffer.from("pyproject"), undefined), a);
 });

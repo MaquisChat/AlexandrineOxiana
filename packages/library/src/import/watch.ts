@@ -439,6 +439,18 @@ export class FolderNotAnsweringError extends Error {
 }
 
 /**
+ * FR-741 (R503 m): a researcher's act asked of a running watch that stopped before the act ran; nothing was done. A kind
+ * of FolderNotAnsweringError (every place that refuses on one refuses on it too), told apart so that it is said as what
+ * happened.
+ */
+export class WatchStoppedError extends FolderNotAnsweringError {
+  constructor() {
+    super();
+    this.name = "WatchStoppedError";
+  }
+}
+
+/**
  * One watched folder's file-system calls: one at a time (the next waits for the previous to SETTLE, not
  * merely to time out), each with a time limit. A call unanswered after `timeoutMs` makes the gate "stuck":
  * that call's caller and every waiting caller get FolderNotAnsweringError, the abort signal given to
@@ -869,6 +881,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let noCollection = false;
   /** The register cannot be read (nothing new comes in) or written (tried again): the folder's state says so. */
   let registerProblem: string | null = null;
+  /** FR-741: why the register's last write failed, while lines are still unwritten (an act refuses with it). */
+  let flushError: unknown;
   /**
    * Verdicts for readings whose content was found to be what the register already says (a change of time alone,
    * A8): no line is written, and the file is not hashed again for that reading while this watch runs.
@@ -975,6 +989,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         try {
           await deps.repo.recordWatchedFiles(projectId, watchId!, batch);
         } catch (err) {
+          flushError = err;
           deps.debug?.(`watched folder: the register could not be written now (${err instanceof Error ? err.name : "error"})`);
           if (!(err instanceof ProjectLockedError) && !(err instanceof ReadOnlyLibraryError) && registerProblem !== WATCH_REASONS.registerUnreadable) {
             registerProblem = WATCH_REASONS.registerUnwritable;
@@ -984,6 +999,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
           return;
         }
         unwritten.splice(0, batch.length);
+        if (unwritten.length === 0) flushError = undefined;
         if (registerProblem === WATCH_REASONS.registerUnwritable && unwritten.length === 0) {
           registerProblem = null;
           touch();
@@ -2540,8 +2556,11 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         if (gate.stuck) return rejectJob(new FolderNotAnsweringError()); // never queued behind a call that does not answer
         jobs.push(async () => {
           try {
-            if (stopped) throw new FolderNotAnsweringError();
+            if (stopped) throw new WatchStoppedError();
             await flush();
+            // FR-741: lines that could not be written: the act says why (a full disk, a lock…) before it reads the
+            // register, which would otherwise not know the file; nothing is done.
+            if (persist && unwritten.length > 0 && flushError !== undefined) throw flushError;
             resolveJob(await fn(io));
           } catch (err) {
             rejectJob(err);

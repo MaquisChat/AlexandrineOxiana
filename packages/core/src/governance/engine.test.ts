@@ -362,6 +362,10 @@ describe("other actions", () => {
   it.each(["delete", "view", "share"] as const)("allows %s", (action) => {
     expect(evaluate(cfg(), req({ action }))).toEqual({ result: "allow", warnings: [] });
   });
+  // R509 (FR-736): closing an interrupted change whose undo can never complete deletes nothing; every profile allows it.
+  it.each(["", "profiles: [hipaa]", "profiles: [irb]", "profiles: [gdpr]"])("allows close-change (%s)", (yaml) => {
+    expect(evaluate(cfg(yaml), req({ action: "close-change" })).result).toBe("allow");
+  });
 });
 
 describe("effective policy and failure", () => {

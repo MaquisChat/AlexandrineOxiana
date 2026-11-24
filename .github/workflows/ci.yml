@@ -42,8 +42,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: System tools for the media worker (proxies, OCR)
         # scripts/ci-apt-install.sh downloads with a time limit and, if the runner's mirror is slow, down or
-        # unresolvable, retries once from mirrors.edge.kernel.org (two tries must fit in the step's limit).
-        timeout-minutes: 10
+        # unresolvable, retries from mirrors.edge.kernel.org and then from archive.ubuntu.com (three tries must fit in the step's limit).
+        timeout-minutes: 15
         run: |
           bash scripts/ci-apt-install.sh tesseract-ocr ghostscript ffmpeg
       - run: pnpm install --frozen-lockfile
@@ -190,7 +190,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: System packages (web view libraries, WebKitWebDriver, Xvfb, xdotool, ffmpeg)
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           # With their recommended packages (the web view's GL and portal pieces). GStreamer's plugins play
           # the launch check's audio and H.264 video in the web view; ffmpeg makes those files.
@@ -306,7 +306,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Tools the smoke test hands to the worker (no ghostscript, as on a Mac)
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           bash scripts/ci-apt-install.sh --no-install-recommends tesseract-ocr ffmpeg
       - name: Pinned test fixtures

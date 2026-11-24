@@ -96,10 +96,36 @@ for (const [name, outcome] of [["fails", "fail"], ["runs out of time", "timeout"
   });
 }
 
-test("both downloads fail: the script fails and nothing is installed", { skip }, () => {
-  const t = run(["pkg"], { downloads: ["fail", "fail"] });
+const primary = MIRRORS.split("\n")
+  .map((l) => (l.includes("packages.microsoft.com") ? l : l.replace(/^.*$/, l ? "http://archive.ubuntu.com/ubuntu/" : "")))
+  .join("\n");
+
+for (const [name, second] of [["fails", "fail"], ["runs out of time", "timeout"]]) {
+  test(`the first download fails and the second ${name}: Ubuntu's own archive, update again, third download, install`, { skip }, () => {
+    const t = run(["pkg"], { downloads: ["fail", second, "ok"] });
+    assert.equal(t.r.status, 0, t.r.stderr);
+    assert.match(t.r.stdout, /::warning::The runner's package mirror failed or was too slow; using mirrors\.edge\.kernel\.org for this run\./);
+    assert.match(t.r.stdout, /::warning::.*mirrors\.edge\.kernel\.org.*archive\.ubuntu\.com/);
+    assert.equal(t.mirrors, primary);
+    assert.equal(t.sources, primary);
+    assert.ok(t.mirrors.includes("https://packages.microsoft.com/ubuntu/24.04/prod"));
+    const kinds = t.calls.map((c) => (c.startsWith("apt-get update") ? "update" : c.startsWith("timeout 120") ? "try1" : c.startsWith("timeout 300") ? "try2" : c.includes("--download-only") ? "dl" : c.startsWith("apt-get install") ? "install" : c));
+    assert.deepEqual(kinds.filter((k) => k !== "dl"), ["update", "try1", "update", "try2", "update", "try2", "install"]);
+    assert.equal(t.calls.filter((c) => c.startsWith("timeout ")).length, 3);
+  });
+}
+
+test("all three downloads fail: the script fails and nothing is installed", { skip }, () => {
+  const t = run(["pkg"], { downloads: ["fail", "fail", "fail"] });
   assert.notEqual(t.r.status, 0);
+  assert.equal(t.calls.filter((c) => c.startsWith("timeout ")).length, 3);
   assert.ok(!t.calls.some((c) => c.startsWith("apt-get install -y") && !c.includes("--download-only")), t.calls.join("\n"));
+});
+
+test("names that do not resolve and the first two downloads fail: the third try is Ubuntu's own archive", { skip }, () => {
+  const t = run(["pkg"], { resolves: false, downloads: ["fail", "fail", "ok"] });
+  assert.equal(t.r.status, 0, t.r.stderr);
+  assert.equal(t.mirrors, primary);
 });
 
 test("names that do not resolve: files are rewritten before the first update", { skip }, () => {

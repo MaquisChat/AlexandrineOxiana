@@ -22,6 +22,7 @@ import {
   reconnect,
   relinkMissing,
   ReadOnlyLibraryError,
+  acceptMovePlan,
   scrubPaths,
   type IntegritySample,
   type Library,
@@ -277,15 +278,41 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     // The screen's own id for this request: a failure is kept under it, so that a screen that lost
     // its connection can tell its own move's failure from an earlier one (R379).
     const attempt = optStr(b, "attempt", 64) ?? null;
-    // From here every change is refused (503 MOVE_IN_PROGRESS) and background work waits (R102 N2).
+    // From here every change is refused (503 MOVE_IN_PROGRESS, R102 N2); background work waits once the plan is
+    // accepted and the move starts stopping work for itself (planningMove, R513 M1).
     // An earlier failure is kept until this move has its own outcome (R399 c).
     state.moving = true;
+    state.planningMove = true;
     try {
       // Changes already being made finish first (this request is one of the in-flight ones, R106 I1).
       for (let waited = 0; state.inFlightMutating() > 1; waited += 25) {
         if (waited >= 60_000) throw new ApiError(409, "CONFLICT", "Some changes are still being made. Try the move again in a moment.");
         await new Promise((r) => setTimeout(r, 25));
       }
+      const moveOpts = { deps: state.deps, excludeProjectIds, sourceRepo: s.repo, tz: state.tz };
+      // R503 l (FR-733): the move accepts its own plan BEFORE anything is stopped for it, a running transcription
+      // included: a move refused at its plan (a destination that is not empty, a project whose rules forbid the place…)
+      // leaves every piece of work as it was, and is answered as executeMove's refusals are (a line of the stream, kept as
+      // the last failed move). executeMove takes its plan again after the stop below, so what the work changed meanwhile
+      // (a transcription that finished and stored its transcript) is what is copied. Planning twice walks the library once
+      // more: one to two seconds for 50,000 files on a local disk, more on a network disk — accepted (R513 M3), since a
+      // move of that size takes minutes and the second plan is what keeps the copy list true after the stop.
+      try {
+        await ctx.beforeMovePlan?.();
+        await acceptMovePlan(s.lib, dest, { ...moveOpts, env: await defaultLocationEnv() });
+      } catch (err) {
+        state.moving = false;
+        state.roots.add(dest);
+        const write = ndjson(reply);
+        const body = ndjsonError(ctx, err);
+        state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
+        await write(body);
+        reply.raw.end();
+        return;
+      }
+      await ctx.afterMovePlan?.();
+      // R513 M1: accepted — from here no background work starts until the move ends (nothing was skipped before).
+      state.planningMove = false;
       let paused: Awaited<ReturnType<typeof state.quiesce>>;
       try {
         paused = await state.quiesce(s); // 409 before the stream starts when work cannot pause
@@ -304,12 +331,9 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       try {
         await ctx.beforeExecuteMove?.();
         moved = await executeMove(s.lib, dest, {
-          deps: state.deps,
+          ...moveOpts,
           env: await defaultLocationEnv(),
-          excludeProjectIds,
-          sourceRepo: s.repo,
           ...(s.index ? { index: s.index } : {}),
-          tz: state.tz,
           onProgress: (p) => write({ progress: p }),
         });
       } catch (err) {
@@ -362,6 +386,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       reply.raw.end();
     } finally {
       state.moving = false;
+      state.planningMove = false;
     }
   };
 
@@ -422,8 +447,21 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireSession();
     const names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]));
     const list = await s.repo.pendingWrites();
+    /** The source's title, where it can be read (a locked project's titles cannot: then none). */
+    const titleOf = async (projectId: string, sourceId: string | undefined): Promise<string | undefined> => {
+      if (!sourceId) return undefined;
+      const sf = await s.repo.getSource(projectId, sourceId).catch(() => null);
+      return sf?.source.title.variants[0]?.value;
+    };
+    const lostOf = async (p: (typeof list)[number]) =>
+      Promise.all(
+        (p.lost ?? []).map(async (l) => {
+          const source = await titleOf(p.projectId, l.sourceId);
+          return { path: l.path, now: l.now, ...(source !== undefined ? { source } : {}) };
+        }),
+      );
     return {
-      pendingWrites: list.map((p) => ({
+      pendingWrites: await Promise.all(list.map(async (p) => ({
         txn: p.txn,
         projectId: p.projectId,
         project: p.projectId === "*" ? "library" : (names.get(p.projectId) ?? "a project"),
@@ -432,8 +470,33 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         canRollBack: p.canRollBack,
         steps: p.steps,
         ...(p.detail ? { detail: scrubPaths(p.detail, state.roots) } : {}),
-      })),
+        // FR-736: what keeps its undo from completing, with the library-relative path (R503 d: shown in this list only).
+        ...(p.rollback ? { rollback: p.rollback, causes: (p.causes ?? []).map((c) => ({ kind: c.kind, path: c.path, ...(c.somethingThere ? { somethingThere: true } : {}), ...(c.copyUnread ? { copyUnread: true } : {}) })) } : {}),
+        // R509: it can be closed as it is; what that leaves lost, where, and what is there now.
+        canClose: p.canClose,
+        ...(p.canClose ? { lost: await lostOf(p) } : {}),
+      }))),
     };
+  });
+
+  // R509 (FR-736): an interrupted change whose undo can never complete, closed as it is by the researcher's choice. The
+  // app's own token only (the extension's reaches none of these routes); named with the project the screen showed.
+  app.post("/libraries/pending-writes/:txn/close", async (req) => {
+    const s = state.requireWritable();
+    const txn = (req.params as { txn?: string }).txn ?? "";
+    const projectId = str(bodyOf(req), "projectId", 64);
+    let r: Awaited<ReturnType<typeof s.repo.closePendingWrite>>;
+    try {
+      r = await s.repo.closePendingWrite(txn, projectId);
+    } catch (err) {
+      // R528 I2: a refused attempt changed the warnings too (they follow the latest attempt): the banner says what the list says.
+      state.publishState();
+      throw err;
+    }
+    // The index was built with the change half there: rebuilt in the background, as after a roll-back.
+    state.startIndexRebuild(s, true);
+    state.publishState();
+    return r;
   });
 
   app.post("/libraries/pending-writes/:txn/resolve", async (req) => {
@@ -441,11 +504,28 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const txn = (req.params as { txn?: string }).txn ?? "";
     const choice = str(bodyOf(req), "choice", 16);
     if (choice !== "roll-back" && choice !== "keep") throw badRequest('"choice" must be "roll-back" or "keep".');
-    const r = await s.repo.resolvePendingWrite(txn, choice);
+    let r: Awaited<ReturnType<typeof s.repo.resolvePendingWrite>>;
+    try {
+      r = await s.repo.resolvePendingWrite(txn, choice);
+    } catch (err) {
+      // R528 I2: a refused attempt changed the warnings too (they follow the latest attempt): the banner says what the list says.
+      state.publishState();
+      throw err;
+    }
     // The index was built with the change half there (or, kept, without it): rebuild it in the background.
     state.startIndexRebuild(s, true);
     state.publishState();
     return r;
+  });
+
+  // FR-729: a warning recovery raised, kept with the library until the researcher dismisses it; dismissed for good. Not
+  // in a read-only library (it writes nothing there).
+  app.post("/libraries/recovery-warnings/:id/dismiss", async (req) => {
+    const s = state.requireWritable();
+    const id = (req.params as { id?: string }).id ?? "";
+    await s.repo.dismissRecoveryWarning(id);
+    state.publishState();
+    return { dismissed: true };
   });
 
   app.post("/libraries/relink", async (req) => {

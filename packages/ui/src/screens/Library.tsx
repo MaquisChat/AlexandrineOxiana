@@ -140,6 +140,25 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       setNoticeGone((n) => n + 1);
     },
   );
+  // FR-729: a warning kept with the library, dismissed for good: one request each; the banner goes, focus stays in the banners.
+  const dismissing = useRef(new Set<string>());
+  const [warningError, setWarningError] = useState<string | null>(null);
+  const dismissWarning = (id: string) => {
+    if (dismissing.current.has(id)) return;
+    dismissing.current.add(id);
+    setWarningError(null);
+    api.libraries.dismissWarning(id).then(
+      () => {
+        dismissing.current.delete(id);
+        setState((s) => ({ ...s, integrityWarnings: (s.integrityWarnings ?? []).filter((w) => w.keptId !== id) }));
+        setNoticeGone((n) => n + 1);
+      },
+      (err: unknown) => {
+        dismissing.current.delete(id);
+        setWarningError(errorText(err, "The warning could not be dismissed."));
+      },
+    );
+  };
   /** A dialog shows a recovery code not yet confirmed: a library close waits for it. */
   const holdClose = useRef(false);
   /** The library closed while that code was on screen. */
@@ -237,14 +256,24 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   });
   const recheckEvent = useRef(recheck.onEvent);
   recheckEvent.current = recheck.onEvent;
+  /** How many times the event stream below has connected again after dropping (R515 N2: the recheck asks again). */
+  const [reconnects, setReconnects] = useState(0);
 
   // ---- service events: library state, index progress, background jobs ----
   useEffect(() => {
     const ac = new AbortController();
     let retry: ReturnType<typeof setTimeout> | undefined;
+    let streams = 0;
     const listen = async () => {
+      const again = streams++ > 0;
+      let first = true;
       try {
         for await (const e of api.events({ signal: ac.signal })) {
+          // A stream after a drop is open once its first event (the fresh state) arrives: what was missed is asked for.
+          if (first) {
+            first = false;
+            if (again) setReconnects((n) => n + 1);
+          }
           if (e.type === "library.state" && e.data && typeof e.data === "object") {
             const d = e.data as LibraryState;
             if (d.open === false) {
@@ -611,7 +640,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               New recovery code…
             </button>
           )}
-          {project && !locked && <RecheckProjectButton control={recheck} projectId={project.id} readOnly={readOnly} />}
+          {project && !locked && <RecheckProjectButton control={recheck} projectId={project.id} readOnly={readOnly} reconnects={reconnects} />}
           {!locked && !readOnly && project && (
             <a href={importHref(project.id)} onClick={(e) => follow(e, importHref(project.id))}>
               Import
@@ -711,11 +740,17 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               variant={b}
               onResolve={() => setResolving({ from: document.activeElement instanceof HTMLElement ? document.activeElement : null })}
               onDismiss={dismissNotice}
+              {...(readOnly ? {} : { onDismissWarning: dismissWarning })}
             />
           ))}
           {noticeError && (
             <p role="alert" className="ao-warning">
               {noticeError}
+            </p>
+          )}
+          {warningError && (
+            <p role="alert" className="ao-warning">
+              {warningError}
             </p>
           )}
         </div>

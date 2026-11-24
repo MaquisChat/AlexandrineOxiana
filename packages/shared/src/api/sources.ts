@@ -55,7 +55,8 @@ export const CONFIRMABLE_IDENTIFIER_KEYS: readonly string[] = ["doi", "isbn", "i
 /**
  * A linked file of a source record as the service sends it: its library-relative path only (R132). R480 e: in the
  * answer of `GET /projects/:id/sources/:sid` (the one source the reader reads; never a list route), `missing: true`
- * when the file cannot be found now by the Missing files rule (nothing at its path). Absent: there, or not judged (other
+ * when the file cannot be found now by the Missing files rule (R503 f, R510: nothing at its path, any symbolic link at
+ * its path — whether or not it leads to a file — or a folder there; a file the app cannot read through). Absent: there, or not judged (other
  * routes, an older service). The reader opens the first PDF that is not missing.
  */
 export interface LinkedFileView {
@@ -79,6 +80,7 @@ export interface SourceRecordExtras {
 // - `POST /projects/:id/sources/:sid/recheck` (no body)           → the source record (+ SourceRecordExtras)
 // - `POST /projects/:id/recheck` (no body)                        → ProjectRecheckResponse; then
 //   `job.progress` events of kind "recheck" (RecheckProgressEvent, R99)
+// - `GET /projects/:id/recheck`                                  → ProjectRecheckState (FR-717)
 // - `POST /jobs/retry` JobsRetryRequest                           → JobsRetryResponse (R84)
 
 /** `POST /projects/:id/recheck`: the job runs in the background. */
@@ -86,6 +88,15 @@ export interface ProjectRecheckResponse {
   jobId: string;
   /** Sources to recheck. */
   total: number;
+}
+
+/**
+ * `GET /projects/:id/recheck` (FR-717): the project's recheck running now, with its progress as of its last event, or
+ * null. A screen that comes back to the library asks it, so a running recheck is shown (and not started twice) before
+ * its next event.
+ */
+export interface ProjectRecheckState {
+  running: { jobId: string; done: number; total: number } | null;
 }
 
 /** A `job.progress` event of a project recheck: after each source, and once more when finished (with the tallies). */

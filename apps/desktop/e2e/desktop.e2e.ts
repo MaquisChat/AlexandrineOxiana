@@ -7,7 +7,8 @@
  * it did not pass. One scenario, as a person would go through it:
  *
  *   the window shows the library chooser → a library is created at a typed folder → a project is created in the New
- *   project dialog → a PDF is attached with "Choose files…" through the native file dialog → the
+ *   project dialog → its rules are set to allow no metadata lookups (Governance and records; R544 b: nothing in this
+ *   test asks a public service) → a PDF is attached with "Choose files…" through the native file dialog → the
  *   library lists the source → a typed path field (Appearance, "Font file path") is filled with its
  *   "Choose file…" through the native file dialog (D12) → what the service persisted is on disk (the stored copy, the original
  *   untouched, the audit entry) → the window is closed → no process of the app is left, and nothing
@@ -115,6 +116,35 @@ test("the built Linux app: create a library and a project, attach a file through
       const projects = await d.byRole("navigation", "Projects");
       const listed = await d.byRole("button", PROJECT, { within: projects });
       await until("the new project to be selected", 10_000, async () => (await s.execute<string | null>("return arguments[0].getAttribute('aria-current')", [s.element(listed)])) === "true");
+    });
+
+    // R544 b: the project's rules allow no metadata lookups, set as a researcher sets them, so that bringing the file in
+    // asks no public service (Crossref, OpenAlex, Open Library, the Library of Congress). Under the default rules the
+    // service asks them over the internet and waits out a "too many requests" answer for up to a minute per request
+    // (CI run 283); this test must not depend on a public service, with or without the no-network namespace.
+    await test.step("the project's rules: no metadata lookups (Governance and records → Processing location), saved", async () => {
+      await s.click(await d.byRole("link", "Governance and records"));
+      const processing = await d.byRole("region", "Processing location", { timeoutMs: 30_000 });
+      const field = await d.byRole("textbox", "Metadata lookups", { within: processing });
+      const services = await until("the rules to be shown", 30_000, async () => {
+        const v = await s.property(field, "value");
+        return typeof v === "string" && v !== "" ? v : undefined;
+      });
+      expect(services).toBe("crossref, openalex, openlibrary, loc");
+      // Emptied as a person does (the caret is at the end), then Return, which commits the field.
+      await s.sendKeys(field, "\uE003".repeat(services.length) + "\uE007");
+      await until("the field to be empty", 10_000, async () => (await s.property(field, "value")) === "");
+      const save = await d.byRole("button", "Save changes");
+      await until("“Save changes” to be offered", 10_000, async () => (await s.property(save, "disabled")) === false);
+      await s.click(save);
+      // Saved: the project's own rules file says so (a stricter rule asks for no reason).
+      const rulesFile = join(libraryPath, "Projects", PROJECT, "governance.yaml");
+      await until("the rules to be saved without metadata lookups", 30_000, () => existsSync(rulesFile) && /^\s+metadata_lookup: \[\]$/mu.test(readFileSync(rulesFile, "utf8")));
+      await until("nothing left to save", 10_000, async () => (await s.property(save, "disabled")) === true);
+      await s.click(await d.byRole("link", "Back to library"));
+      await d.byRole("heading", LIBRARY, { level: 1, timeoutMs: 30_000 });
+      const listed = await d.byRole("button", PROJECT, { within: await d.byRole("navigation", "Projects") });
+      await until("the project to be selected again", 10_000, async () => (await s.execute<string | null>("return arguments[0].getAttribute('aria-current')", [s.element(listed)])) === "true");
     });
 
     const pdf = join(d.filesDir, PDF_NAME);

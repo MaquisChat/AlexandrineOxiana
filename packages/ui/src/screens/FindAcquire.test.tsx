@@ -26,7 +26,7 @@ import {
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { findApi } from "../api/find";
 import { routeFor } from "../App";
 import { PATHS } from "../navigation";
@@ -3772,6 +3772,59 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
       expect(posts("/library/cancel")).toHaveLength(1);
       expect(note("late shell")).toBe(NOT_OPENED);
+    });
+
+    // ---- FR-734 point 2 (R503 i): a row that leaves while its request to open the window is out ----
+
+    for (const how of ["unmount", "project"] as const) {
+      it(`FR-734 (2): the row leaves (${how}) while the shell's open is out; the shell then answers that it opened the window: the page closes THAT window, once, with its ticket, and cancels the start at the service, once (R510 I1)`, async () => {
+        const e = serveOne("leaves meanwhile");
+        const answer = held<boolean>();
+        onTestFinished(() => answer.release(false));
+        fake.shell!.openLibraryWindow.mockReturnValue(answer.p);
+        const view = show();
+        await waitFor(() => expect(rows()).toHaveLength(1));
+        fireEvent.click(btn("leaves meanwhile", "Get through my library"));
+        await waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));
+        expect(fake.shell!.openLibraryWindow.mock.calls[0]![0]).toBe(TICKET);
+        if (how === "unmount") view.unmount();
+        else {
+          fireEvent.change(screen.getByRole("combobox", { name: "Project" }), { target: { value: PID_OTHER } });
+          await waitFor(() => expect(reads(PID_OTHER)).toBeGreaterThan(0));
+        }
+        await quiet();
+        // Whatever was asked before the answer (a close of a window not yet built), every close carries the open's ticket.
+        const before = fake.shell!.closeLibraryWindow.mock.calls.length;
+        act(() => answer.release(true));
+        await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(before + 1));
+        await quiet();
+        expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(before + 1);
+        expect(fake.shell!.closeLibraryWindow.mock.calls.every((c) => c[0] === TICKET)).toBe(true);
+        expect(fake.shell!.closeLibraryWindow.mock.calls.at(-1)).toEqual([TICKET]);
+        if (how === "unmount") expect(before).toBe(0);
+        // R510 I1: the start is cancelled at the service (its one sign-in ticket is freed), once; the entry no longer waits.
+        await waitFor(() => expect(posts("/library/cancel")).toHaveLength(1));
+        await quiet();
+        expect(posts("/library/cancel")).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/library/cancel`, body: undefined }]);
+        expect(now(e).state).not.toBe("waiting-sign-in");
+      });
+    }
+
+    it("FR-734 (2), the reverse: a row still on the screen when the shell answers that it opened the window keeps its window (no close), and waits", async () => {
+      const e = serveOne("stays meanwhile");
+      const answer = held<boolean>();
+      onTestFinished(() => answer.release(false));
+      fake.shell!.openLibraryWindow.mockReturnValue(answer.p);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      fireEvent.click(btn("stays meanwhile", "Get through my library"));
+      await waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(now(e).state).toBe("waiting-sign-in"));
+      act(() => answer.release(true));
+      await waitFor(() => expect(stateOf("stays meanwhile")).toBe("Waiting for you in the sign-in window"));
+      await quiet();
+      expect(fake.shell!.closeLibraryWindow).not.toHaveBeenCalled();
+      expect(posts("/library/cancel")).toHaveLength(0);
     });
 
     it("FR-561: an open given up on that the shell carries out only after a newer start opened its window does not close the newer window (R477 b: the page's close carries the OLDER ticket, which the shell refuses)", async () => {

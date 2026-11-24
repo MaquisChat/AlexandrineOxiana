@@ -4,11 +4,11 @@
  * queue's items, for the desktop app only (R96, R116); a second capture of an address still waiting
  * or being captured in the same project is refused in plain words.
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { WorkerJobError, WorkerToolError, deviceDeps, type Deps, type JobResult, type WorkerClient, type WorkerJob } from "@ao/library";
 import type { CaptureQueueDetail, CaptureQueueListResponse } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
@@ -468,9 +468,9 @@ describe("a locked project (Task 63 fix round 1: I1, I2; R30, R50, R142)", () =>
 });
 
 describe("a lock ends a project's running captures for good (fix round 2: I3, R116)", () => {
-  async function running(encrypted = true): Promise<{ pid: string; queueId: string; worker: ReturnType<typeof gatedWorker>; events: Array<{ type: string; data: any }> }> {
+  async function running(encrypted = true, over: Partial<ServiceOptions> = {}): Promise<{ pid: string; queueId: string; worker: ReturnType<typeof gatedWorker>; events: Array<{ type: string; data: any }> }> {
     const worker = gatedWorker();
-    await start({ worker, autoStartWorker: false });
+    await start({ worker, autoStartWorker: false, ...over });
     await openLibrary();
     const pid = await project(encrypted ? "Secret" : "Plain", encrypted);
     const events: Array<{ type: string; data: any }> = [];
@@ -614,23 +614,73 @@ describe("a lock ends a project's running captures for good (fix round 2: I3, R1
     await svc.state.idle();
   });
 
-  it("a move ends an encrypted project's queue; it is not continued on the moved library", async () => {
-    const { pid, queueId, worker, events } = await running();
-    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
-    worker.release();
-    const moved = await moving;
+  it("a move ends an encrypted project's queue; it is not continued on the moved library (R534 b: nothing of it begins after the move's stop)", async () => {
+    // Since FR-733 (R503 l, R513 M1) a queue may go on while the move's plan is taken; what must hold is that nothing of it
+    // begins after the move stops running work, nothing of it reports during the copy, and it is ended, not carried on.
+    // The first link is held so that it is still downloading when the plan is accepted and when the stop reaches it.
+    let atPlan: number | undefined;
+    let atStop: number | undefined;
+    let atCopy: number | undefined;
+    const mine = () => events.filter((e) => e.type === "capture.progress" && e.data.queueId === queueId);
+    const { pid, queueId, worker, events } = await running(true, {
+      afterMovePlan: async () => void (atPlan = worker.calls.length),
+      beforeExecuteMove: async () => void (atCopy = mine().length),
+    });
+    // The stop: the move's drain marks running work to stop before it returns; the held download is let go only then.
+    const drain = svc.state.drainWork.bind(svc.state);
+    const spy = vi.spyOn(svc.state, "drainWork").mockImplementation((ms, which) => {
+      const drained = drain(ms, which);
+      if (atStop === undefined) {
+        atStop = worker.calls.length;
+        worker.release();
+      }
+      return drained;
+    });
+    onTestFinished(() => spy.mockRestore());
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
     expect(moved.body).toContain('"done":true');
+    // The first link was still downloading when the plan was accepted and when the stop came.
+    expect(atPlan).toBe(1);
+    expect(atStop).toBe(1);
+    expect(atCopy).toBeDefined();
+    // During the copy and the switch nothing of the queue reported but its end at the close.
+    expect(mine().slice(atCopy).map((e) => e.data.error)).toEqual([expect.stringMatching(/^LibraryClosedError/)]);
     expect((await unlock(pid)).status).toBe(200);
     await svc.state.idle();
+    // No download began after the stop, and none on the moved library.
+    expect(worker.calls).toHaveLength(atStop!);
     expect(worker.calls).toHaveLength(1);
-    const mine = events.filter((e) => e.type === "capture.progress" && e.data.queueId === queueId);
-    // At most the link that was downloading when the move began reports its outcome (before the close).
-    expect(mine.filter((e) => e.data.outcome).length).toBeLessThanOrEqual(1);
-    expect(mine.at(-1)!.data.error).toMatch(/^LibraryClosedError/);
+    // At most the link that was downloading when the move stopped work reports its outcome (before the close).
+    expect(mine().filter((e) => e.data.outcome).length).toBeLessThanOrEqual(1);
+    expect(mine().at(-1)!.data.error).toMatch(/^LibraryClosedError/);
     expect(svc.state.captureQueue(queueId)).toBeUndefined();
     expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
     expect((await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT2] } })).status).toBe(200);
     await svc.state.idle();
+  });
+
+  it("R503 l (FR-733): a move refused at its plan stops nothing: an encrypted project's queue captures its remaining links in the library still open", async () => {
+    let planned = false;
+    const { pid, queueId, worker, events } = await running(true, { afterMovePlan: async () => void (planned = true) });
+    const drain = vi.spyOn(svc.state, "drainWork");
+    onTestFinished(() => drain.mockRestore());
+    // A destination that already holds someone else's file: the move is refused at its plan.
+    const dest = join(tmp, "Full");
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, "notes.txt"), "someone else's file");
+    const refused = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    expect(JSON.parse(refused.body.trim().split("\n").at(-1)!)).toHaveProperty("error");
+    expect(refused.body).not.toContain('"done":true');
+    expect(planned).toBe(false);
+    // Nothing was stopped: the queue is still running, its first link still downloading.
+    expect(drain).not.toHaveBeenCalled();
+    expect(svc.state.captureQueues.detail(pid, queueId)).toMatchObject({ finished: false });
+    worker.release();
+    await svc.state.idle();
+    expect(worker.calls).toHaveLength(3);
+    expect(svc.state.captureQueues.detail(pid, queueId)).toMatchObject({ finished: true, done: 3 });
+    expect(events.filter((e) => e.type === "capture.progress" && e.data.queueId === queueId && e.data.error)).toHaveLength(0);
+    expect(svc.state.session!.lib.root).toBe(join(tmp, "Lib"));
   });
 
   it("N5: the lock asks the in-flight download to stop; the project's captures are accepted again without waiting for it; nothing of it is published", async () => {

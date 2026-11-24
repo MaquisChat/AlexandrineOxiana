@@ -130,7 +130,8 @@ describe("atomic file writes", () => {
       const data = randomBytes(2.5 * 1024 * 1024);
       await writeFile(src, data);
       const r = await copyFileAtomic(src, dest);
-      expect(r).toEqual({ sha256: sha256(data), bytes: data.length });
+      // R534 a: a plain copy stores the content as it is, so the hash as stored is the content's.
+      expect(r).toEqual({ sha256: sha256(data), bytes: data.length, storedSha256: sha256(data) });
       expect((await readFile(dest)).equals(data)).toBe(true);
       expect((await readdir(dir)).sort()).toEqual(["dest.bin", "src.bin"]);
     });
@@ -142,7 +143,7 @@ describe("atomic file writes", () => {
       await realFs.symlink(target, link);
       await expect(copyFileAtomic(link, join(dir, "dest.bin"), { noFollow: true })).rejects.toMatchObject({ code: "ELOOP" });
       expect((await readdir(dir)).sort()).toEqual(["link.bin", "target.bin"]);
-      expect(await copyFileAtomic(target, join(dir, "ok.bin"), { noFollow: true })).toEqual({ sha256: sha256(Buffer.from("secret")), bytes: 6 });
+      expect(await copyFileAtomic(target, join(dir, "ok.bin"), { noFollow: true })).toEqual({ sha256: sha256(Buffer.from("secret")), bytes: 6, storedSha256: sha256(Buffer.from("secret")) });
     });
 
     it("with a transform, hashes the source plaintext and writes the transformed bytes", async () => {
@@ -155,10 +156,12 @@ describe("atomic file writes", () => {
       const r = await copyFileAtomic(src, dest, {
         transform: (r) => r.pipe(encryptStream(key, keyId)),
       });
-      expect(r).toEqual({ sha256: sha256(data), bytes: data.length });
       const written = await readFile(dest);
+      // R534 a: the hash as stored is of the TRANSFORMED bytes as written to disk, not of the source's.
+      expect(r).toEqual({ sha256: sha256(data), bytes: data.length, storedSha256: sha256(written) });
       expect(written.equals(data)).toBe(false);
       expect(sha256(written)).not.toBe(r.sha256);
+      expect(r.storedSha256).not.toBe(r.sha256);
 
       const back: Buffer[] = [];
       const d = decryptStream(() => key);
@@ -174,7 +177,8 @@ describe("atomic file writes", () => {
       const src = join(dir, "empty");
       await writeFile(src, "");
       const r = await copyFileAtomic(src, join(dir, "empty2"));
-      expect(r).toEqual({ sha256: sha256(Buffer.alloc(0)), bytes: 0 });
+      // R534 a: the hash as stored of an empty file is the hash of nothing.
+      expect(r).toEqual({ sha256: sha256(Buffer.alloc(0)), bytes: 0, storedSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" });
     });
 
     it("leaves dest untouched and no temp file when the source is missing", async () => {

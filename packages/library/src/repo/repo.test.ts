@@ -828,7 +828,8 @@ describe("crash recovery (write-ahead marker)", () => {
     expect(await markers()).toHaveLength(1);
 
     const again = await repoFor();
-    expect(again.integrityWarnings).toEqual([{ projectId: pid, kind: "rolled-back-incomplete-write", detail: expect.any(String) }]);
+    // FR-729: the warning is kept with the library until dismissed (its id); R527: its record is not in .tmp.
+    expect(again.integrityWarnings).toEqual([{ projectId: pid, kind: "rolled-back-incomplete-write", detail: expect.any(String), keptId: expect.any(String) }]);
     expect(await readdir(join(dir, "Sources"))).toEqual([]);
     expect(again.listSourceIds(pid)).toEqual([]);
     expect(await readFile(join(dir, "changes/2026-11.jsonl"), "utf8")).toBe(changesBefore);
@@ -923,7 +924,8 @@ describe("crash recovery (write-ahead marker)", () => {
     await expect(r2.deleteSource(pid, sf.source.id)).rejects.toBeInstanceOf(SimulatedCrash);
     expect(await readdir(join(dir, "Sources"))).toEqual([]);
     const r3 = await repoFor();
-    expect(r3.integrityWarnings.map((w) => w.kind)).toEqual(["rolled-back-incomplete-write"]);
+    // FR-729: the first opening's warning is kept until dismissed, beside this opening's.
+    expect(r3.integrityWarnings.map((w) => w.kind)).toEqual(["rolled-back-incomplete-write", "rolled-back-incomplete-write"]);
     expect(await readFile(jsonPath, "utf8")).toBe(before);
     expect((await r3.getSource(pid, sf.source.id)).source.id).toBe(sf.source.id);
     expect(await readdir(join(lib.root, ".tmp"))).toEqual([]);
@@ -1060,6 +1062,7 @@ describe("recovery safety (fix round 2)", () => {
     const again = await repoFor();
     expect(kinds(again)).toEqual(["rolled-back-incomplete-write"]);
     expect(await readdir(join(dir, "Sources"))).toEqual([]);
+    // R527: the record of the warning kept until dismissed is at the library's root, not in .tmp.
     expect(await tmpNames()).toEqual([]);
     await expect(again.createCollection(pid, "x")).resolves.toBeDefined();
   });
@@ -1380,6 +1383,8 @@ describe("incomplete audit and change-log lines (fix round 4, R28)", () => {
     expect((await readFile(seg)).equals(auditBefore)).toBe(true);
     await expect(again.createCollection(q.id, "x")).resolves.toBeDefined();
     await expect(again.createCollection(pid, "x")).rejects.toBeInstanceOf(RecoveryPendingError);
+    // R528 M3, R530: held until the library is opened again (the service then says so, and points to its warning).
+    await expect(again.createCollection(pid, "x")).rejects.toMatchObject({ reason: "reopen" });
     await expect(denied(again)).rejects.toBeInstanceOf(RecoveryPendingError);
   });
 

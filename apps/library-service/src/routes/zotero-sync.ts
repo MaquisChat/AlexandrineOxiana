@@ -348,7 +348,7 @@ export class ZoteroSyncHolder {
    */
   obstacleTo(state: ServiceState, link: ZoteroSyncLink): "busy" | "held" | undefined {
     const s = state.session;
-    if (!s?.index || s.lib.mode !== "read-write" || state.moving || state.shuttingDown) return "held";
+    if (!s?.index || s.lib.mode !== "read-write" || state.startsHeld || state.shuttingDown) return "held";
     try {
       s.repo.getProject(link.projectId);
     } catch {

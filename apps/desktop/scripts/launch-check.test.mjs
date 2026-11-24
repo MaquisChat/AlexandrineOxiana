@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { appProcesses, capLines, CLOSING_WINDOW_TITLE, closingWindowProblems, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
+import { appleEventScripts, appRunningSkip, quitCrashSuspected, quitSkipLine, quitSummaryLine, printedAfterEvent, sigtermStopProblems, skippedQuitVerdict, SIGTERM_STOP_LIMIT_MS, bundleIdOf, orderlyQuitProblems, QUIT_EVENT_LIMIT_MS, quitEventVerdict, appProcesses, capLines, CLOSING_WINDOW_TITLE, closingWindowProblems, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -32,6 +32,13 @@ describe("parseShellLine", () => {
     assert.deepEqual(parseShellLine("AO_SHELL_CLOSING"), { kind: "closing" });
     assert.deepEqual(parseShellLine("AO_SHELL_RELAUNCH_REQUESTED"), { kind: "relaunch-requested" });
     assert.deepEqual(parseShellLine("AO_SHELL_RELAUNCHING"), { kind: "relaunching" });
+    assert.deepEqual(parseShellLine("AO_SHELL_QUIT orderly"), { kind: "quit", how: "orderly" });
+    assert.deepEqual(parseShellLine("AO_SHELL_QUIT now"), { kind: "quit", how: "now" });
+    for (const other of ["AO_SHELL_QUIT", "AO_SHELL_QUIT later", "AO_SHELL_QUIT orderly "]) assert.equal(parseShellLine(other), null, other);
+    // M5 (R511): whether the shell's quit hook was installed (a Mac, test mode).
+    assert.deepEqual(parseShellLine("AO_SHELL_QUIT_HOOK installed"), { kind: "quit-hook", installed: true });
+    assert.deepEqual(parseShellLine("AO_SHELL_QUIT_HOOK not installed"), { kind: "quit-hook", installed: false });
+    for (const other of ["AO_SHELL_QUIT_HOOK", "AO_SHELL_QUIT_HOOK yes", "AO_SHELL_QUIT_HOOK installed "]) assert.equal(parseShellLine(other), null, other);
     for (const other of ["AO_SHELL_TITLE Alexandrine Oxiana", "[service] {}", "AO_SHELL_SERVICE pid=1 port=2", ""]) assert.equal(parseShellLine(other), null, other);
   });
 
@@ -736,5 +743,157 @@ describe("the shell's trace of the sign-in window (Task MAC7)", () => {
     assert.match(libraryProbeProblems({ ...LIBRARY_GOOD, ipc: { ...EXPECTED_LIBRARY_WINDOW_IPC, "library.take": "allowed" } }, { fallback: true }).join("\n"), /library\.take is allowed, expected denied/);
     assert.deepEqual(libraryProbeProblems(LIBRARY_GOOD, { fallback: false }), []);
     assert.deepEqual(libraryProbeProblems(null, { fallback: true }), ["the sign-in window's probe reported nothing", "no page started in the sign-in window: the shell opened the check's page itself (its fallback), and the probe reported nothing even there"]);
+  });
+});
+
+describe("scenario Q: quit by Apple event (a Mac only; FR-731, R503 h)", () => {
+  it("takes the bundle id from tauri.conf.json, refusing anything that could break out of an AppleScript string", () => {
+    assert.equal(bundleIdOf(JSON.parse(readFileSync(TAURI_CONF, "utf8"))), "org.alexandrineoxiana.desktop");
+    for (const bad of [undefined, "", 'org.x" to quit', "org x", "org.x\\", "-org"]) assert.throws(() => bundleIdOf({ identifier: bad }), /not a bundle identifier/, String(bad));
+  });
+
+  it("asks whether the app runs (no event, nothing launched), then sends the quit Apple event Cmd-Q's terminate: also answers", () => {
+    assert.deepEqual(appleEventScripts("org.alexandrineoxiana.desktop"), {
+      running: ["-e", 'application id "org.alexandrineoxiana.desktop" is running'],
+      quit: ["-e", 'tell application id "org.alexandrineoxiana.desktop" to quit'],
+    });
+  });
+
+  it("skips, with the reason, when the system does not see the app as running under its bundle id; goes on when it does", () => {
+    assert.equal(appRunningSkip({ ok: true, out: "true\n" }), null);
+    assert.match(appRunningSkip({ ok: true, out: "false\n" }), /does not see the app as running under its bundle id/);
+    assert.match(appRunningSkip({ ok: false, out: "execution error: Can’t get application id \"x\". (-1728)", reason: "exit 1" }), /could not tell whether the app runs: .*-1728.*exit 1/);
+    assert.match(appRunningSkip({ ok: false, out: "", reason: "not found (spawn osascript ENOENT)" }), /could not tell whether the app runs: not found/);
+  });
+
+  it("judges the app whenever the quit reached it (its quit line, or it exited), whatever osascript said", () => {
+    for (const osascript of [{ ok: true, out: "" }, { ok: false, out: "execution error: User canceled. (-128)", reason: "exit 1" }, { ok: false, out: "", reason: "timed out after 30 s", timedOut: true }, { ok: false, out: "Not authorized to send Apple events to Alexandrine Oxiana. (-1743)", reason: "exit 1" }]) {
+      assert.deepEqual(quitEventVerdict({ reached: true, osascript }), { check: true }, JSON.stringify(osascript));
+    }
+  });
+
+  it("skips, with the reason, when the request could not be made for a reason outside the app: no permission, no answer, the app not found", () => {
+    assert.match(quitEventVerdict({ reached: false, osascript: { ok: false, out: "", reason: "timed out after 30 s", timedOut: true } }).skip, new RegExp(`no answer within ${QUIT_EVENT_LIMIT_MS / 1000} s.*permission`));
+    assert.match(quitEventVerdict({ reached: false, osascript: { ok: false, out: "execution error: Not authorized to send Apple events to Alexandrine Oxiana. (-1743)", reason: "exit 1" } }).skip, /did not permit osascript to send Apple events.*-1743/);
+    assert.match(quitEventVerdict({ reached: false, osascript: { ok: false, out: "execution error: Alexandrine Oxiana got an error: Application isn’t running. (-600)", reason: "exit 1" } }).skip, /could not find the running app.*-600/);
+    assert.match(quitEventVerdict({ reached: false, osascript: { ok: false, out: "execution error: Can’t get application id \"org.x\". (-10814)", reason: "exit 1" } }).skip, /could not find the running app.*-10814/);
+    assert.match(quitEventVerdict({ reached: false, osascript: { ok: false, out: "", reason: "not found (spawn osascript ENOENT)" } }).skip, /osascript could not be run: not found/);
+  });
+
+  it("fails when the event was delivered and the app did nothing", () => {
+    for (const osascript of [{ ok: true, out: "" }, { ok: false, out: "execution error: User canceled. (-128)", reason: "exit 1" }, { ok: false, out: "some other error (-1708)", reason: "exit 1" }]) {
+      const v = quitEventVerdict({ reached: false, osascript });
+      assert.equal(v.check, undefined);
+      assert.equal(v.skip, undefined);
+      assert.match(v.problem, /neither took the quit nor exited/, JSON.stringify(osascript));
+    }
+  });
+
+
+  // M1 (R511): a skip after the quit event is never "not checked" for an app that hangs at the quit.
+  it("judges a stop by SIGTERM as B does: the shell ended within the limit, the helpers stopped cleanly", () => {
+    const clean = [{ kind: "stopped", how: "clean" }];
+    assert.deepEqual(sigtermStopProblems({ code: 0, signal: null }, clean), []);
+    assert.deepEqual(sigtermStopProblems({ code: null, signal: "SIGTERM" }, clean), []);
+    assert.deepEqual(sigtermStopProblems({ code: "timeout" }, []), [`the shell did not end within ${SIGTERM_STOP_LIMIT_MS / 1000} s of SIGTERM`, "the helpers were not reported stopped"]);
+    assert.deepEqual(sigtermStopProblems({ code: 0 }, [{ kind: "stopped", how: "forced" }]), ["the helpers were stopped forced, not cleanly"]);
+  });
+
+  it("keeps a skip only when the app then ended cleanly on SIGTERM; an app that does not end fails (it may hang at the quit); an answer is judged as before", () => {
+    const noAnswer = quitEventVerdict({ reached: false, osascript: { ok: false, out: "", reason: "timed out after 30 s", timedOut: true } });
+    assert.deepEqual(skippedQuitVerdict(noAnswer, []), noAnswer, "no answer, and the shell ends cleanly on SIGTERM: skipped, its checks passed");
+    const hung = skippedQuitVerdict(noAnswer, ["Q (quit by Apple event), stopped by SIGTERM instead: the shell did not end within 120 s of SIGTERM"]);
+    assert.equal(hung.skip, undefined);
+    assert.match(hung.problem, /^the app neither answered the quit Apple event nor ended cleanly on SIGTERM afterwards: it may hang at the quit \(osascript had no answer.*; .*did not end within 120 s of SIGTERM\)$/);
+    for (const v of [{ check: true }, { problem: "the quit Apple event was sent (osascript: answered) but the shell neither took the quit nor exited" }]) {
+      assert.deepEqual(skippedQuitVerdict(v, []), v);
+      assert.deepEqual(skippedQuitVerdict(v, ["x"]), v);
+    }
+  });
+
+  it("says whether the shell printed anything after the quit event was sent", () => {
+    assert.equal(printedAfterEvent([], ""), "the shell printed nothing after the event was sent");
+    assert.equal(printedAfterEvent(["AO_SHELL_QUIT orderly"], ""), 'the shell printed 1 line after the event was sent (the last: "AO_SHELL_QUIT orderly")');
+    assert.equal(printedAfterEvent(["a", "b"], "oops\n"), 'the shell printed 2 lines after the event was sent (the last: "b"), and 5 characters on its standard error');
+    assert.equal(printedAfterEvent([], "x"), "the shell printed nothing on its output after the event was sent, and 1 character on its standard error");
+    assert.equal(printedAfterEvent(["y".repeat(500)], "").length < 300, true);
+  });
+
+
+  // M2 (R511, R505 e): a skip of Q reads like every other skip, and one closing line says whether Q ran.
+  it("prints a skip of Q with the prefix every other skip uses", () => {
+    assert.equal(quitSkipLine("Q (quit by Apple event)", "osascript had no answer within 30 s"), "launch-check: skip Q (quit by Apple event): osascript had no answer within 30 s\n");
+    assert.equal(quitSkipLine("Q (quit by Apple event during a slowed quit)", "for the reason above"), "launch-check: skip Q (quit by Apple event during a slowed quit): for the reason above\n");
+  });
+
+  it("ends with one line, its prefix found nowhere else, that says whether Q ran, was skipped (and why), failed or was not reached (N2, R514)", () => {
+    const A = "Q (quit by Apple event)";
+    const S = "Q (quit by Apple event during a slowed quit)";
+    const P = "launch-check: scenario Q result: ";
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }, { label: S, state: "passed" }]), `${P}ran (2 of 2 runs quit the app by Apple event and were checked)\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "skipped", reason: "osascript had no answer within 30 s" }, { label: S, state: "skipped", reason: "for the reason above" }]), `${P}SKIPPED (osascript had no answer within 30 s): the Mac's own Quit was not checked\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }, { label: S, state: "skipped", reason: "osascript had no answer within 30 s" }]), `${P}SKIPPED in part (${A} ran and was checked; ${S}: osascript had no answer within 30 s)\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "failed" }, { label: S, state: "passed" }]), `${P}FAILED (${A}): see its FAIL lines above\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "skipped", reason: "r" }, { label: S, state: "failed" }]), `${P}FAILED (${S}): see its FAIL lines above\n`);
+    // A run that threw never reads as "ran": it failed, with what ended it.
+    assert.equal(quitSummaryLine([{ label: A, state: "failed", reason: "it did not finish: timed out after 180 s waiting for the page's probe" }]), `${P}FAILED (${A}: it did not finish: timed out after 180 s waiting for the page's probe): see its FAIL lines above\n`);
+    // Not reached: an earlier scenario ended the check (its error), or none was given.
+    assert.equal(quitSummaryLine([], { reached: false, error: "B (shell stopped with SIGTERM): timed out after 60 s waiting for the window\n--- the shell's output (end) ---" }), `${P}not reached (the check ended before scenario Q: B (shell stopped with SIGTERM): timed out after 60 s waiting for the window)\n`);
+    assert.equal(quitSummaryLine([], { reached: false }), `${P}not reached (the check ended before scenario Q)\n`);
+    assert.equal(quitSummaryLine([], { reached: true, error: "tauri.conf.json's identifier undefined is not a bundle identifier" }), `${P}FAILED (scenario Q did not finish: tauri.conf.json's identifier undefined is not a bundle identifier)\n`);
+    assert.equal(quitSummaryLine([]), `${P}SKIPPED (no run of Q was made): the Mac's own Quit was not checked\n`);
+    // KG-6 m3 (R517): a run that threw before it began (in scenario() or startShell) leaves fewer outcomes than planned: FAILED, never "ran", and the planned count is the one counted.
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }], { planned: 2, threw: true, error: "spawn failed\nmore" }), `${P}FAILED (scenario Q did not finish: spawn failed)\n`);
+    // A thrown falsy value (0, "") still counts as thrown.
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }], { planned: 2, threw: true, error: "0" }), `${P}FAILED (scenario Q did not finish: 0)\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }], { planned: 2, threw: true, error: "" }), `${P}FAILED (scenario Q did not finish)\n`);
+    assert.equal(quitSummaryLine([], { planned: 2, threw: true, error: "" }), `${P}FAILED (scenario Q did not finish)\n`);
+    // Every planned run has an outcome and nothing threw: the count is of the planned runs.
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }, { label: S, state: "passed" }], { planned: 2, threw: false }), `${P}ran (2 of 2 runs quit the app by Apple event and were checked)\n`);
+    // KG-6 m5 (R517): the check's own set-up failed before any scenario.
+    assert.equal(quitSummaryLine([], { reached: false, setupFailed: true, threw: true, error: "Missing the app's program.\nmore" }), `${P}not reached (the check's set-up failed: Missing the app's program.)\n`);
+    // Unique: no other line the check prints starts the same way (the crash diagnosis prints "launch-check: Q (…): the shell exited …").
+    const src = readFileSync(new URL("./launch-check.mjs", import.meta.url), "utf8");
+    assert.equal(src.split("scenario Q result:").length - 1, 1, "the prefix is written once, in quitSummaryLine");
+  });
+
+  const ev = (...kinds) => kinds.map((k) => (typeof k === "string" ? { kind: k } : k));
+  const HOOK = { kind: "quit-hook", installed: true };
+  const ORDERLY = ev(HOOK, { kind: "quit", how: "orderly" }, "closing", { kind: "stopped", how: "clean" });
+
+  it("accepts the orderly quit: the quit taken the orderly way, the close begun, the helpers stopped cleanly, exit 0", () => {
+    assert.deepEqual(orderlyQuitProblems(ORDERLY, 0), []);
+  });
+
+  it("names a quit that skipped the orderly path (the app's old way: no quit line, no close, exit 0), one answered at once, an unclean stop, a wrong exit", () => {
+    assert.deepEqual(orderlyQuitProblems([HOOK], 0), [
+      "the quit did not reach the shell's quit handler (no AO_SHELL_QUIT line): the app ended without its orderly path",
+      "the orderly close never began (no AO_SHELL_CLOSING line)",
+      "the helpers were not reported stopped",
+    ]);
+    assert.deepEqual(orderlyQuitProblems(ev(HOOK, { kind: "quit", how: "now" }), 0), ['the shell answered the quit "now", not the orderly way', "the orderly close never began (no AO_SHELL_CLOSING line)", "the helpers were not reported stopped"]);
+    assert.deepEqual(orderlyQuitProblems(ev(HOOK, { kind: "quit", how: "orderly" }, "closing", { kind: "stopped", how: "forced" }), 0), ["the helpers were stopped forced, not cleanly"]);
+    assert.deepEqual(orderlyQuitProblems(ORDERLY, 1), ["the shell exited 1, not 0"]);
+    assert.deepEqual(orderlyQuitProblems(ORDERLY, "timeout"), ["the shell exited timeout, not 0"]);
+    assert.deepEqual(orderlyQuitProblems([...ORDERLY, { kind: "stopped", how: "clean" }, { kind: "relaunching" }], 0), ["the helpers were stopped 2 times", "the app started again"]);
+  });
+
+  it("examines a crash when the shell ended at the quit without its quit line, or by a signal (M6, R511)", () => {
+    const quit = { kind: "quit", how: "orderly" };
+    assert.equal(quitCrashSuspected({ code: 0, signal: null }, [quit]), false, "the orderly end");
+    assert.equal(quitCrashSuspected({ code: 0, signal: null }, []), true, "ended without its quit line");
+    assert.equal(quitCrashSuspected({ code: null, signal: "SIGSEGV" }, [quit]), true, "ended by a signal");
+    assert.equal(quitCrashSuspected({ code: null, signal: "SIGABRT" }, []), true);
+    assert.equal(quitCrashSuspected({ code: "timeout" }, []), false, "not ended: nothing to examine");
+    assert.equal(quitCrashSuspected({ code: 1, signal: null }, [quit]), false, "an exit code is judged, not a crash");
+  });
+
+  it("names a quit hook that was not installed instead of the generic sentence, and a shell that did not say (M5, R511)", () => {
+    assert.deepEqual(orderlyQuitProblems([{ kind: "quit-hook", installed: false }], 0), [
+      "the shell's quit hook was not installed (AO_SHELL_QUIT_HOOK not installed): without it the quit cannot go the orderly way",
+      "the orderly close never began (no AO_SHELL_CLOSING line)",
+      "the helpers were not reported stopped",
+    ]);
+    assert.deepEqual(orderlyQuitProblems(ORDERLY.filter((e) => e.kind !== "quit-hook"), 0), ["the shell did not say whether its quit hook was installed (no AO_SHELL_QUIT_HOOK line)"]);
   });
 });

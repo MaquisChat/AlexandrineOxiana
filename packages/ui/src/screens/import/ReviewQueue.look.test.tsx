@@ -12,7 +12,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ReviewItem } from "../../api/import";
 import { LOOK_NO_TEXT_SENTENCE, NO_TEXT_SENTENCE } from "../../reader/PdfPages";
 import { PdfOpenError, type PdfHandle } from "../../reader/pdfjs";
@@ -403,6 +403,177 @@ describe("R487 a: a look and the card's own decision", () => {
     await waitFor(() => expect(document.activeElement).toBe(empty));
     expect(reachable(document.activeElement!)).toBe(true);
     expect(document.activeElement).not.toBe(card(RECORD).querySelector("h4"));
+  });
+
+  /**
+   * FR-739 (2, 4): a look opened on OTHER's card while RECORD's "Use this file" is out; that decision is then given up
+   * (R313 e), so the queue is read again — and that read is HELD BACK until `releaseRead` (or answers `readAnswer`). Every
+   * held promise is released when the test ends, whatever its end.
+   */
+  async function lookDuringSlowReread(readAnswer: (items: ReviewItem[]) => Response, opts: { outside?: boolean; sourceId?: string } = {}) {
+    let decided!: () => void;
+    const decision = new Promise<void>((r) => (decided = r));
+    let releaseRead: () => void = () => {};
+    let readGate: Promise<void> | null = null;
+    onTestFinished(() => {
+      decided();
+      releaseRead();
+    });
+    const items = [held(7, "pdf"), held(8, "pdf", OTHER)];
+    const o = setup(items);
+    o.extra!.push(
+      http.get(`${SERVICE}/projects/:id/review`, async () => {
+        // The queue as first read; the read again after the give-up is held back, then answers `readAnswer`.
+        if (!readGate) return HttpResponse.json({ items, total: items.length, offset: 0, limit: 500 });
+        await readGate;
+        return readAnswer(items);
+      }),
+      http.post(`${SERVICE}/review/:itemId/held-file`, async () => {
+        await decision;
+        return HttpResponse.json({ decided: true });
+      }),
+    );
+    const m = mockService(o);
+    const queue = <ReviewQueue client={m.client} projectId={P1} {...(opts.sourceId ? { sourceId: opts.sourceId } : {})} />;
+    render(
+      opts.outside ? (
+        <>
+          <button type="button">Elsewhere in the app</button>
+          {queue}
+        </>
+      ) : (
+        queue
+      ),
+    );
+    await screen.findByRole("button", { name: `Look at the file for ${named(OTHER)}` });
+    passGuard();
+    const t = Date.now();
+    vi.useRealTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    vi.setSystemTime(t);
+    try {
+      // RECORD's decision goes out; OTHER's look is opened while it is out.
+      fireEvent.click(use(RECORD));
+      fireEvent.click(lookAt(OTHER));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(screen.getByRole("dialog", { name: `Look at the file: ${OTHER}` })).toBeTruthy();
+      // No answer in 60 seconds: given up, and the queue read again — held back.
+      readGate = new Promise<void>((r) => (releaseRead = r));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+    } finally {
+      vi.useRealTimers();
+      vi.useFakeTimers({ toFake: ["Date"] });
+    }
+    // The read is under way: the found files' section is gone while it is.
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Files found for records" })).toBeNull());
+    return { releaseRead: () => releaseRead(), user: userEvent.setup() };
+  }
+
+  it("FR-739 (2): Close during a slow re-read, after a given-up decision on ANOTHER card: focus on the screen's heading, never the page; once the read lands, on the looked-at card's heading", async () => {
+    const s = await lookDuringSlowReread((items) => HttpResponse.json({ items, total: items.length, offset: 0, limit: 500 }));
+    const dialog = screen.getByRole("dialog");
+    await s.user.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    // The card is not there while the queue is read: the screen's heading takes focus, never the page.
+    const heading = screen.getByRole("heading", { level: 1, name: "Review queue" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    // The read lands: back to the card that was looked at (its heading, R313 e), which still waits.
+    s.releaseRead();
+    await waitFor(() => expect(document.activeElement).toBe(card(OTHER).querySelector("h4")));
+    expect(reachable(document.activeElement!)).toBe(true);
+  });
+
+  // R513 (I1): the second move (to the card's heading, once the read lands) happens only if focus is still where the first
+  // move put it (the screen's heading); focus is never taken from where the researcher has put it meanwhile.
+  it("R513 (I1): Close during a slow re-read, then focus moved to a control OUTSIDE the screen: when the read lands, focus stays on that control", async () => {
+    const s = await lookDuringSlowReread((items) => HttpResponse.json({ items, total: items.length, offset: 0, limit: 500 }), { outside: true });
+    await s.user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const heading = screen.getByRole("heading", { level: 1, name: "Review queue" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    const elsewhere = screen.getByRole("button", { name: "Elsewhere in the app" });
+    elsewhere.focus();
+    expect(document.activeElement).toBe(elsewhere);
+    s.releaseRead();
+    // The read has landed (its cards are back, the looked-at one with its heading); focus is where the researcher put it.
+    await screen.findByRole("heading", { name: "Files found for records" });
+    await waitFor(() => expect(card(OTHER).querySelector("h4")).toBeTruthy());
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
+  // R513 N1: focus on the page body when the read lands (the researcher has not put it anywhere): it moves to the card's
+  // heading — focus is never left on the page (FR-739 2).
+  it("R513 (N1): Close during a slow re-read, then focus falls to the page body: when the read lands, focus goes to the looked-at card's heading", async () => {
+    const s = await lookDuringSlowReread((items) => HttpResponse.json({ items, total: items.length, offset: 0, limit: 500 }));
+    await s.user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const heading = screen.getByRole("heading", { level: 1, name: "Review queue" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    heading.blur();
+    expect(document.activeElement).toBe(document.body);
+    s.releaseRead();
+    await waitFor(() => expect(document.activeElement).toBe(card(OTHER).querySelector("h4")));
+    expect(reachable(document.activeElement!)).toBe(true);
+  });
+
+  it("R513 (I1): Close during a slow re-read, then focus moved to another control INSIDE the screen: when the read lands, focus stays there", async () => {
+    const s = await lookDuringSlowReread((items) => HttpResponse.json({ items, total: items.length, offset: 0, limit: 500 }), { sourceId: "s8" });
+    await s.user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const heading = screen.getByRole("heading", { level: 1, name: "Review queue" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    const inside = within(screen.getByRole("main")).getByRole("link", { name: "Show every entry waiting in this project" });
+    inside.focus();
+    expect(document.activeElement).toBe(inside);
+    s.releaseRead();
+    await screen.findByRole("heading", { name: "Files found for records" });
+    await waitFor(() => expect(card(OTHER).querySelector("h4")).toBeTruthy());
+    expect(document.activeElement).toBe(inside);
+  });
+
+  it("FR-739 (4): the re-read finds the project locked while a look is open: the look closes and focus goes to the unlock's field, never the page", async () => {
+    const s = await lookDuringSlowReread(() => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "x" } }, { status: 423 }));
+    s.releaseRead();
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const field = await screen.findByLabelText("Passphrase or recovery code");
+    await waitFor(() => expect(document.activeElement).toBe(field));
+  });
+
+  it("FR-739 (4): the same without a look: a decision given up, the re-read finds the project locked — focus goes to the unlock's field", async () => {
+    let decided!: () => void;
+    const decision = new Promise<void>((r) => (decided = r));
+    onTestFinished(() => decided());
+    let lockedNow = false;
+    const items = [held(7, "pdf")];
+    const o = setup(items);
+    o.extra!.push(
+      http.get(`${SERVICE}/projects/:id/review`, () =>
+        lockedNow ? HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "x" } }, { status: 423 }) : HttpResponse.json({ items, total: items.length, offset: 0, limit: 500 }),
+      ),
+      http.post(`${SERVICE}/review/:itemId/held-file`, async () => {
+        await decision;
+        return HttpResponse.json({ decided: true });
+      }),
+    );
+    const m = mockService(o);
+    render(<ReviewQueue client={m.client} projectId={P1} />);
+    await screen.findByRole("button", { name: `Use this file for ${NAMED}` });
+    passGuard();
+    const t = Date.now();
+    vi.useRealTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    vi.setSystemTime(t);
+    try {
+      use(RECORD).focus();
+      fireEvent.click(use(RECORD));
+      lockedNow = true;
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+    } finally {
+      vi.useRealTimers();
+      vi.useFakeTimers({ toFake: ["Date"] });
+    }
+    const field = await screen.findByLabelText("Passphrase or recovery code");
+    await waitFor(() => expect(document.activeElement).toBe(field));
   });
 
   // R492 c: a "not found" while the card STILL waits (the held file gone from disk; nothing reads the queue again on it):

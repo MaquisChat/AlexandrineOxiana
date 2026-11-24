@@ -5,7 +5,15 @@
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
 import { useRef, useState, type ReactNode } from "react";
-import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, ZOTERO_SYNC_SENTENCES, isDeviceNoticeKind, oldCopiesPendingText, type DeviceNoticeKind } from "@ao/shared";
+import {
+  DESTRUCTION_OLD_COPIES_PENDING_WARNING,
+  INCOMPLETE_ROLLBACK_BANNER,
+  ZOTERO_SYNC_SENTENCES,
+  isDeviceNoticeKind,
+  oldCopiesPendingText,
+  type DeviceNoticeKind,
+  type IncompleteRollback,
+} from "@ao/shared";
 import { errorText, type IntegrityWarning, type LibraryState } from "../api/library";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
@@ -23,9 +31,20 @@ export type BannerVariant =
   /**
    * `detail` is accepted for the record but never shown (R114 I1). `oldCopies`: for
    * `destruction-old-copies-pending`, the sentence that fits and the old copies' places, shown under
-   * it (R409 d). `count`: how many warnings of this kind in this project the banner stands for (R484 f).
+   * it (R409 d). `count`: how many warnings of this kind in this project the banner stands for (R484 f). `state`: an
+   * interrupted change whose undo is not complete, by its state (FR-736): its sentence, and "Resolve…".
    */
-  | { kind: "warning"; warning: string; project: string; detail?: string; oldCopies?: { text: string; places: string[] }; count?: number }
+  | {
+      kind: "warning";
+      warning: string;
+      project: string;
+      detail?: string;
+      oldCopies?: { text: string; places: string[] };
+      count?: number;
+      state?: IncompleteRollback;
+      /** FR-729: kept with the library until dismissed ("Dismiss"). */
+      keptId?: string;
+    }
   /** This computer's own notice (Task 68, R154, R178): fixed words by kind; goes by "Got it". */
   | { kind: "notice"; notice: DeviceNoticeKind };
 
@@ -80,7 +99,9 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   "rolled-back-incomplete-write": (p) => `An interrupted change in ${p} was undone when the library opened, so nothing half-saved was kept.`,
   "invalid-txn-marker": (p) => `A note left by an interrupted change in ${p} could not be read. It was kept aside and nothing was changed.`,
   "incomplete-write-pending": (p) => `An interrupted change in ${p} could not be finished or undone yet. It is tried again when the library is next opened with write access.`,
-  "txn-recovery-skipped-audit-unverifiable": (p) => `An interrupted change in ${p} was left as it is, because its audit log could not be checked first. It is tried again on the next open.`,
+  // R529: refused every time (never "tried again"); no act is offered for it: a backup made before the change is the way.
+  "txn-recovery-skipped-audit-unverifiable": (p) =>
+    `An interrupted change in ${p} was left as it is, because its audit log could not be checked first. The app cannot undo it safely. Restoring a backup made before the change is the way to undo it.`,
   "trimmed-incomplete-audit-line": (p) => `The last entry of an audit log in ${p} was cut off by a crash and has been removed. The removal is recorded.`,
   "incomplete-audit-line-pending": (p) => `The last entry of an audit log in ${p} was cut off by a crash. It is tidied up when the library is next opened with write access.`,
   "audit-append-failed-at-open": (p) => `A check made while opening ${p} could not be recorded in the audit log, so changes to ${p} are off until the library is opened again.`,
@@ -91,17 +112,26 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   "annotations-hash-mismatch": (p) => `Some annotations in ${p} were changed outside the app. They are shown as they are now.`,
   // R473 I1, R484 f: sources whose change did not finish and whose roll-back failed, for as long as the roll-back
   // waits; one banner per project ("this source" is said only for the source itself, in the library's own sentence).
+  // FR-736: never "close the library and open it again", which cannot help while a file is in the way: the list says.
+  // R528 M5: never "yet", untrue of a change that can never be undone completely.
   "source-change-unfinished": (p, n) =>
     n === 1
-      ? `A change to a source in ${p} did not finish and could not be undone. Close the library and open it again to put it back.`
-      : `Changes to ${n} sources in ${p} did not finish and could not be undone. Close the library and open it again to put them back.`,
+      ? `A change to a source in ${p} did not finish and could not be undone. Choose “Resolve…” to see what can be done.`
+      : `Changes to ${n} sources in ${p} did not finish and could not be undone. Choose “Resolve…” to see what can be done.`,
   "source-change-unfinished-read-only": (p, n) =>
     n === 1
       ? `A change to a source in ${p} did not finish and could not be undone. It can be put back only when the library is opened for changes.`
       : `Changes to ${n} sources in ${p} did not finish and could not be undone. They can be put back only when the library is opened for changes.`,
-  // R479 a, R484 b: a file an unfinished change named, changed by hand before the reopen undid that change.
-  "changed-outside-before-rollback": (p) =>
-    `A file in ${p} was changed outside the app while a change the app had not finished was waiting to be undone. When the library opened, the app undid its unfinished change, and the outside change to that file was not kept.`,
+  // R509: an interrupted change closed as it was, by the researcher's choice; the path is in the audit log only (R503 d).
+  "interrupted-change-closed": (p) =>
+    `An interrupted change in ${p} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone: that file is lost. The closing is recorded in the audit log of ${p}.`,
+  // R530: resolved while the audit log does not match this computer's record of it: the next opening records that, and
+  // the project takes no changes until then (the anchor kinds' sentences say why, not what to do).
+  "interrupted-change-resolved-reopen": (p) =>
+    `An interrupted change in ${p} was resolved, but ${p}'s audit log may have been changed outside the app. The app records this the next time the library is opened, and changes to ${p} are off until then: close the library and open it again.`,
+  // FR-729: the record of recovery's warnings kept until dismissed could not be read (set aside when writable).
+  "recovery-warnings-set-aside": () =>
+    "The library's record of earlier warnings about interrupted changes could not be read, so some of those warnings may not be shown again. The damaged record is kept in the library's work folder.",
   "destroy-incomplete": (p) =>
     `A destruction of raw data in ${p} did not finish: some files could not be overwritten yet. They are kept out of the project and overwriting is tried again each time the library opens.`,
   "protocol-manifest-unreadable": (p) => `The sealed list of protocol document names in ${p} could not be read. The documents themselves are unchanged; check the verification report.`,
@@ -129,8 +159,19 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   [DESTRUCTION_OLD_COPIES_PENDING_WARNING]: () => "Old copies of this library, left by a move, still hold data that was destroyed here.",
 };
 
+/** R527: a change closed as it was, where something stood at each place whose file could not be put back. */
+const CLOSED_UNCONFIRMED = (p: string) =>
+  `An interrupted change in ${p} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone; the app could not confirm that what is at its place is that file. The closing is recorded in the audit log of ${p}.`;
+
+/** The kinds that stand for an interrupted change whose undo may be incomplete; with a `state`, it is (FR-736). */
+const ROLLBACK_KINDS: ReadonlySet<string> = new Set(["rolled-back-incomplete-write", "incomplete-write-pending"]);
+
 /** The sentence for a warning kind; an unknown kind gets a generic sentence (never the detail). */
-export function warningText(kind: string, project: string, count = 1): string {
+export function warningText(kind: string, project: string, count = 1, state?: IncompleteRollback): string {
+  // FR-736: an undo that is not complete says its state, in the library's shared sentence.
+  if (state && ROLLBACK_KINDS.has(kind) && Object.hasOwn(INCOMPLETE_ROLLBACK_BANNER, state)) return INCOMPLETE_ROLLBACK_BANNER[state](project);
+  // R527: a change closed where something stood at the place: never "that file is lost".
+  if (kind === "interrupted-change-closed" && state === "unconfirmed") return CLOSED_UNCONFIRMED(project);
   const known = Object.hasOwn(WARNINGS, kind) ? WARNINGS[kind] : undefined;
   return known ? known(project, count) : `Something in ${project} needs attention. Open the verification report for details.`;
 }
@@ -140,9 +181,9 @@ export function warningText(kind: string, project: string, count = 1): string {
  * start of the sentence no longer turns the whole English sentence round. Each place the name stands is isolated.
  * `count`: how many warnings of this kind in this project the sentence stands for (R484 f).
  */
-function warningSentence(kind: string, project: string, count = 1): ReactNode {
+function warningSentence(kind: string, project: string, count = 1, state?: IncompleteRollback): ReactNode {
   const mark = "\u0000";
-  return warningText(kind, mark, count)
+  return warningText(kind, mark, count, state)
     .split(mark)
     .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={i}>{project}</UserText>, part]));
 }
@@ -165,7 +206,7 @@ function text(v: BannerVariant): string {
     case "index-failed":
       return "The library's search index could not be rebuilt, so sources and search may be incomplete. Your sources are safe in the library folder.";
     case "warning":
-      return v.oldCopies?.text ?? warningText(v.warning, v.project, v.count);
+      return v.oldCopies?.text ?? warningText(v.warning, v.project, v.count, v.state);
     case "notice":
       return NOTICE_TEXT[v.notice];
   }
@@ -224,15 +265,29 @@ export function DeviceNoticeBanners({ notices, onDismiss, error }: { notices: Li
   );
 }
 
-/** Warnings about an interrupted change the researcher can resolve by hand (R27). */
-export const RESOLVABLE_WARNINGS: ReadonlySet<string> = new Set(["incomplete-write-pending", "invalid-txn-marker", "txn-recovery-skipped-audit-unverifiable"]);
+/**
+ * Warnings about an interrupted change the researcher can resolve by hand (R27); also, by FR-736, a source whose change
+ * did not finish, and any interrupted change whose undo is not complete (a `state`).
+ */
+export const RESOLVABLE_WARNINGS: ReadonlySet<string> = new Set(["incomplete-write-pending", "invalid-txn-marker", "txn-recovery-skipped-audit-unverifiable", "source-change-unfinished"]);
 
-export function StatusBanner({ variant, onResolve, onDismiss }: { variant: BannerVariant; onResolve?: () => void; onDismiss?: (notice: DeviceNoticeKind) => void }) {
-  const resolvable = !!onResolve && variant.kind === "warning" && RESOLVABLE_WARNINGS.has(variant.warning);
+export function StatusBanner({
+  variant,
+  onResolve,
+  onDismiss,
+  onDismissWarning,
+}: {
+  variant: BannerVariant;
+  onResolve?: () => void;
+  onDismiss?: (notice: DeviceNoticeKind) => void;
+  /** FR-729: dismisses a warning kept with the library; not given in a read-only library, which writes nothing. */
+  onDismissWarning?: (keptId: string) => void;
+}) {
+  const resolvable = !!onResolve && variant.kind === "warning" && (RESOLVABLE_WARNINGS.has(variant.warning) || (variant.state !== undefined && ROLLBACK_KINDS.has(variant.warning)));
   // Project names and service details are user text, shown with dir=auto; in a warning only the project's name (FR-158).
   return (
     <div role="status" className={`ao-banner ao-banner--${TONE[variant.kind]}`}>
-      {variant.kind === "warning" && !variant.oldCopies ? <span>{warningSentence(variant.warning, variant.project, variant.count)}</span> : <UserText>{text(variant)}</UserText>}
+      {variant.kind === "warning" && !variant.oldCopies ? <span>{warningSentence(variant.warning, variant.project, variant.count, variant.state)}</span> : <UserText>{text(variant)}</UserText>}
       {variant.kind === "warning" && !!variant.oldCopies?.places.length && (
         <ul>
           {variant.oldCopies.places.map((p) => (
@@ -263,6 +318,14 @@ export function StatusBanner({ variant, onResolve, onDismiss }: { variant: Banne
           {" "}
           <button type="button" className="ao-small" aria-label={`Resolve the interrupted change in ${variant.project}…`} onClick={onResolve}>
             Resolve…
+          </button>
+        </>
+      )}
+      {variant.kind === "warning" && variant.keptId !== undefined && onDismissWarning && (
+        <>
+          {" "}
+          <button type="button" className="ao-small" aria-label={`Dismiss this warning about ${variant.project}`} onClick={() => onDismissWarning(variant.keptId!)}>
+            Dismiss
           </button>
         </>
       )}
@@ -314,7 +377,7 @@ export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyR
   const grouped = new Map<string, { count: number }>();
   for (const w of state.integrityWarnings ?? ([] as IntegrityWarning[])) {
     if (!PER_PROJECT.has(w.kind)) {
-      out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail });
+      out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail, ...(w.state ? { state: w.state } : {}), ...(w.keptId ? { keptId: w.keptId } : {}) });
       continue;
     }
     const key = JSON.stringify([w.projectId, w.kind]);

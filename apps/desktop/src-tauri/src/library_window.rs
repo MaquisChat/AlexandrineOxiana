@@ -54,7 +54,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::webview::Cookie;
@@ -1388,7 +1388,9 @@ pub trait Host: Send + Sync {
     /// Builds the window at `url` with the given store (macOS) or an ephemeral one (elsewhere), under
     /// `title`.
     fn create_window(&self, url: &Url, store: [u8; 16], title: &str) -> bool;
-    fn navigate(&self, url: &Url) -> bool;
+    /// Sends the window to `url`. When the navigation has been issued, `issued` runs on the main thread, in that
+    /// same turn (before any later event of the window is delivered there); the call answers once that is done.
+    fn navigate(&self, url: &Url, issued: Box<dyn FnOnce() + Send>) -> bool;
     /// Sets the window's title (R347 b: the shell's alone).
     fn set_title(&self, title: &str);
     /// The window's current address.
@@ -1437,8 +1439,14 @@ struct Inner {
     window_owner: Option<String>,
     /// The ticket of the open whose window is being built (set by `open` before it builds, cleared when that
     /// build answers). A close while it is built ends its ticket and clears `window_owner`, yet its window then
-    /// stands: a newer open that fails meanwhile gives the window back to it (R486 g).
+    /// stands: a newer open that fails meanwhile gives the window back to it (R486 g). One build at a time
+    /// (FR-734, R503 i): an open that would build while this is set waits for that build instead (`open`).
     building: Option<String>,
+    /// The ticket of an open that waits for another open's build (FR-734; M3, R511): until it has sent the window
+    /// to its own address (or builds the window itself), a page loaded or a download asked for in that window is
+    /// the other open's, and starts no fetch under this ticket. Set (or cleared) by every open that takes the
+    /// ticket, so that it never outlives its open into another.
+    waiting: Option<String>,
     /// The kind of start of the open ticket (R347 a). Every ticket starts by `open`, which sets it (for
     /// the window it builds or re-uses, and puts it back when that fails), so no kind outlives its
     /// ticket into another; after a hand-over the window may stay without a ticket, its title still in
@@ -1461,7 +1469,10 @@ struct Inner {
 /// The sign-in window's state in the shell: the open ticket, the fetch, the pause, the store.
 #[derive(Default)]
 pub struct Library {
-    inner: Mutex<Inner>,
+    /// Shared, so that a navigation's `issued` step can end a waiting open's hold on the main thread (N1, R514).
+    inner: Arc<Mutex<Inner>>,
+    /// Signalled when a build answers (`building` cleared): an open waiting for it goes on (FR-734).
+    built: Condvar,
     config: OnceLock<Config>,
 }
 
@@ -1513,13 +1524,23 @@ impl Library {
     /// adds the host the window is opened at to the library's sign-in hosts, which every later ticket
     /// of either kind never fetches from while the window's store lives (R360 a); a link's start adds
     /// none. Anything else answers false and opens nothing.
+    ///
+    /// One window is built at a time (FR-734, R503 i). When another open's window is still being built (a
+    /// close ended that open meanwhile, so its ticket is free), this open does not build a second window
+    /// beside it: it takes the ticket and the window at once, as any newer open does (the older open, when
+    /// its build answers, finds the window taken and answers false), waits for that build to answer, and
+    /// then re-uses the window it made, or builds its own if that build failed. Until its navigation of that
+    /// window to its own address has been issued on the main thread, nothing the window loads or asks to download
+    /// is fetched under its ticket (M3, R511; N1, R514: the page shown is the other open's). The wait holds no lock and
+    /// calls nothing of the host; `open` never runs on the main thread (the command runs it on a thread of
+    /// its own), where the build it waits for is done.
     pub fn open(&self, host: &dyn Host, caller: &str, ticket: &str, url: &str, start: Start) -> bool {
         if caller != MAIN || !valid_ticket(ticket) || host.stopping() {
             return false;
         }
         let Some(url) = window_address(url) else { return false };
-        let reuse = host.window_exists();
-        let (store, title, before) = {
+        let mut reuse = host.window_exists();
+        let (store, mut title, before, waited) = {
             let mut g = self.lock();
             if g.ticket.is_some() {
                 return false;
@@ -1543,17 +1564,25 @@ impl Library {
             }
             g.ticket = Some(ticket.to_string());
             g.window_owner = Some(ticket.to_string());
-            // R486 g: the first of the builds still under way is the one whose window stands.
-            if !reuse && g.building.is_none() {
-                g.building = Some(ticket.to_string());
-            }
+            // R486 g: the first of the builds still under way is the one whose window stands. FR-734: while
+            // one is under way, this open waits for it (below) instead of building a second window.
+            let waited = match (reuse, g.building.clone()) {
+                (true, _) => None,
+                (false, Some(b)) => Some(b),
+                (false, None) => {
+                    g.building = Some(ticket.to_string());
+                    None
+                }
+            };
+            g.waiting = waited.as_ref().map(|_| ticket.to_string());
             g.start = start;
             g.previous = None;
             g.current = None;
             // R360 b: a re-used window keeps the host of the page it shows until the new address
             // commits (`page_shown`); only the words for the kind change at once. A window built anew
-            // shows nothing yet: the asked host.
-            let shown_host = match (reuse, &g.shown_host) {
+            // shows nothing yet: the asked host. A window being built for another open is, for its title,
+            // a re-used one (set again below once it stands).
+            let shown_host = match (reuse || waited.is_some(), &g.shown_host) {
                 (true, Some(h)) => h.clone(),
                 // Not met (a window is only built here, which sets it): never the asked host.
                 (true, None) => "no web address".to_string(),
@@ -1562,10 +1591,56 @@ impl Library {
             let title = titled(&shown_host, start);
             g.shown_host = Some(shown_host);
             g.title = Some(title.clone());
-            (store, title, before)
+            (store, title, before, waited)
         };
+        if let Some(b) = &waited {
+            let g = self.built.wait_while(self.lock(), |g| g.building.as_deref() == Some(b.as_str())).unwrap_or_else(|p| p.into_inner());
+            if g.ticket.as_deref() != Some(ticket) {
+                // A close ended this open while it waited: it answers false and leaves the window, if one stands,
+                // to the open that built it (R489).
+                return false;
+            }
+            drop(g);
+            reuse = host.window_exists();
+            let mut g = self.lock();
+            if g.ticket.as_deref() != Some(ticket) {
+                return false;
+            }
+            // The window that stands keeps the host of the page it shows (R360 b); when that build failed, this
+            // open builds the window itself, the only build under way (no other open can start one while this
+            // open holds the ticket), titled by its own address.
+            let shown_host = match (reuse, g.shown_host.clone()) {
+                (true, Some(h)) => h,
+                (true, None) => "no web address".to_string(),
+                (false, _) => {
+                    g.building = Some(ticket.to_string());
+                    // The window this open builds shows its own address from the start (M3).
+                    g.waiting = None;
+                    title_host(&url)
+                }
+            };
+            title = titled(&shown_host, g.start);
+            g.shown_host = Some(shown_host);
+            g.title = Some(title.clone());
+        }
         let shown = if reuse {
-            let moved = host.navigate(&url);
+            // M3 (R511), N1 (R514): a waiting open's hold ends on the main thread, in the same turn in which its
+            // navigation is issued, so that every event of the old page the main thread delivers before that is
+            // still held. What remains: an event the web view would deliver for the OLD page after the navigation
+            // was issued. By reading WebKit's documented behaviour, a new navigation cancels the old load. On macOS
+            // (WKWebView) it then never reports "finished"; on Linux (WebKitGTK) it may still report "finished", at
+            // the address the window then has. This cannot be shown here.
+            let held = self.inner.clone();
+            let own = ticket.to_string();
+            let moved = host.navigate(
+                &url,
+                Box::new(move || {
+                    let mut g = held.lock().unwrap_or_else(|p| p.into_inner());
+                    if g.waiting.as_deref() == Some(own.as_str()) {
+                        g.waiting = None;
+                    }
+                }),
+            );
             if moved {
                 host.set_title(&title);
             }
@@ -1580,15 +1655,17 @@ impl Library {
             // served before, or else the open whose window was being built (a close meanwhile had cleared its
             // owner) — and to none when no window stands, so that no window is left that its own open's
             // ticketed close cannot close.
+            // FR-734: after waiting for another open's build, the window that stands is that open's.
             let stands = host.window_exists();
             let mut g = self.lock();
             if g.building.as_deref() == Some(ticket) {
                 g.building = None;
+                self.built.notify_all();
             }
             if g.ticket.as_deref() == Some(ticket) {
                 g.ticket = None;
                 let (start, title, shown_host, previous, current, hosts, owner) = before;
-                let owner = if stands { owner.or_else(|| g.building.clone()) } else { None };
+                let owner = if stands { owner.or_else(|| g.building.clone()).or(waited) } else { None };
                 (g.start, g.title, g.shown_host, g.previous, g.current, g.window_owner) = (start, title, shown_host, previous, current, owner);
                 if let (Some(d), Some(hosts)) = (g.device.as_mut(), hosts) {
                     d.sign_in_hosts = hosts;
@@ -1607,6 +1684,7 @@ impl Library {
             let mut g = self.lock();
             if g.building.as_deref() == Some(ticket) {
                 g.building = None;
+                self.built.notify_all();
             }
             if stands && g.window_owner.is_none() {
                 g.window_owner = Some(ticket.to_string());
@@ -1683,20 +1761,26 @@ impl Library {
     }
 
     /// A page of the window finished loading (on the main thread: nothing here blocks). An address
-    /// that looks like a PDF's starts a fetch when a ticket is open, nothing is being fetched and the
-    /// pause is over; a sign-in address never does. Otherwise nothing happens (no event, except the
+    /// that looks like a PDF's starts a fetch when a ticket is open (and its open no longer waits for another
+    /// open's window, M3), nothing is being fetched and the pause is over; a sign-in address never does. Otherwise nothing happens (no event, except the
     /// pause, which is said).
     pub fn page_loaded(&self, host: &dyn Host, url: &Url, now: Instant) {
         let job = {
             let mut g = self.lock();
             g.previous = g.current.replace(url.clone());
-            if g.ticket.is_none() || g.fetching.is_some() || host.stopping() || !looks_like_pdf_address(url) {
+            if g.ticket.is_none() || Self::waiting(&g) || g.fetching.is_some() || host.stopping() || !looks_like_pdf_address(url) {
                 return;
             }
             let previous = g.previous.clone();
             Self::begin(&mut g, url, previous, now)
         };
         self.run_automatic(host, job);
+    }
+
+    /// Whether the open ticket's open still waits for another open's window (M3, R511): the window then shows that
+    /// other open's page, which is never fetched under this ticket.
+    fn waiting(g: &Inner) -> bool {
+        g.waiting.is_some() && g.waiting == g.ticket
     }
 
     /// A fetch the window itself started (a page load or a download): run, or said only when it waits
@@ -1712,14 +1796,15 @@ impl Library {
     /// The window asked to start a download (R331 g; on the main thread: nothing here blocks). The
     /// window's own download is refused (`TauriHost::create_window`); its address is taken as the
     /// PDF's address and goes the same way as a page that reached a PDF's address (`page_loaded`):
-    /// only while a ticket is open, nothing is being fetched and the pause is over, https only, never
+    /// only while a ticket is open (its open not waiting for another open's window, M3), nothing is being
+    /// fetched and the pause is over, https only, never
     /// a sign-in address, at most one file per ticket, and through the one request path (`fetch_pdf`)
     /// with all its rules, the window's current page as its `Referer`. The window has not moved, so
     /// its current page stays as it was. Nothing is said when nothing is fetched, except the pause.
     pub fn download_requested(&self, host: &dyn Host, url: &Url, now: Instant) {
         let job = {
             let mut g = self.lock();
-            if g.ticket.is_none() || g.fetching.is_some() || host.stopping() {
+            if g.ticket.is_none() || Self::waiting(&g) || g.fetching.is_some() || host.stopping() {
                 return;
             }
             let previous = g.current.clone();
@@ -2126,8 +2211,27 @@ impl Host for TauriHost {
         true
     }
 
-    fn navigate(&self, url: &Url) -> bool {
-        self.window().is_some_and(|w| w.navigate(url.clone()).is_ok())
+    fn navigate(&self, url: &Url, issued: Box<dyn FnOnce() + Send>) -> bool {
+        let Some(w) = self.window() else { return false };
+        let url = url.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        // N1 (R514): on the main thread `navigate` issues the navigation at once (tauri-runtime-wry 2.12.3
+        // `send_user_message`, `load_url`), and `issued` runs in that same turn, before the main thread delivers
+        // any later event of the window. Off it, the whole is one task posted to the main thread, waited for here.
+        let task = move || {
+            let ok = w.navigate(url).is_ok();
+            if ok {
+                issued();
+            }
+            let _ = tx.send(ok);
+        };
+        if self.on_main_thread() {
+            task();
+        } else if self.app.run_on_main_thread(task).is_err() {
+            return false;
+        }
+        // A loop that is gone drops the task, and with it the sender: false.
+        rx.recv().unwrap_or(false)
     }
 
     fn set_title(&self, title: &str) {
@@ -3232,6 +3336,11 @@ process.stdout.write(JSON.stringify({{
         removed: AtomicUsize,
         /// Runs once while the window is being built (FR-561: what else happens before an open answers).
         on_create: Mutex<Option<Box<dyn FnOnce(&FakeHost) + Send>>>,
+        /// The next build fails (FR-734: decided as that build starts, whatever another thread does meanwhile).
+        fail_next_build: AtomicBool,
+        /// N1 (R514): a navigation is posted but not yet issued on the main thread; `issue` issues it.
+        defer_issue: AtomicBool,
+        pending_issue: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     }
 
     impl FakeHost {
@@ -3253,6 +3362,9 @@ process.stdout.write(JSON.stringify({{
                 can_stay,
                 removed: AtomicUsize::new(0),
                 on_create: Mutex::default(),
+                fail_next_build: AtomicBool::new(false),
+                defer_issue: AtomicBool::new(false),
+                pending_issue: Mutex::default(),
             }
         }
         fn events(&self) -> Vec<LibraryEvent> {
@@ -3267,6 +3379,13 @@ process.stdout.write(JSON.stringify({{
         fn at(&self, url: &str) {
             *self.current.lock().unwrap() = Some(u(url));
         }
+        /// The main thread reaches the posted navigation and issues it (N1).
+        fn issue(&self) {
+            let pending: Vec<_> = self.pending_issue.lock().unwrap().drain(..).collect();
+            for f in pending {
+                f();
+            }
+        }
     }
 
     impl Host for FakeHost {
@@ -3274,18 +3393,29 @@ process.stdout.write(JSON.stringify({{
             self.exists.load(Ordering::SeqCst)
         }
         fn create_window(&self, url: &Url, store: [u8; 16], title: &str) -> bool {
+            let ok = self.create_ok && !self.fail_next_build.swap(false, Ordering::SeqCst);
             let during = self.on_create.lock().unwrap().take();
             if let Some(f) = during {
                 f(self);
             }
             self.created.lock().unwrap().push((url.clone(), store));
             self.titles.lock().unwrap().push(title.to_string());
-            self.exists.store(self.create_ok, Ordering::SeqCst);
-            self.create_ok
+            self.exists.store(ok, Ordering::SeqCst);
+            ok
         }
-        fn navigate(&self, url: &Url) -> bool {
+        fn navigate(&self, url: &Url, issued: Box<dyn FnOnce() + Send>) -> bool {
+            // With `defer_issue` this answers before `issued` runs, on purpose (the real host answers only once the
+            // navigation is issued): it holds the state "navigation posted, not yet issued" still for a test.
             self.navigated.lock().unwrap().push(url.clone());
-            self.navigate_ok.load(Ordering::SeqCst)
+            let ok = self.navigate_ok.load(Ordering::SeqCst);
+            if ok {
+                if self.defer_issue.load(Ordering::SeqCst) {
+                    self.pending_issue.lock().unwrap().push(issued);
+                } else {
+                    issued();
+                }
+            }
+            ok
         }
         fn set_title(&self, title: &str) {
             self.titles.lock().unwrap().push(title.to_string());
@@ -3555,35 +3685,34 @@ process.stdout.write(JSON.stringify({{
     /// The reviewer's case in the shell (R472): the page gave up on an open (TICKET) and closed what was there
     /// (R342 b, no ticket); a newer open (TICKET2: a later start, or "Test" on Your library) took the window before
     /// the first open answered. The first open answers false and says nothing, so the page's late handler closes
-    /// nothing; a close for the first ticket, late or twice, leaves the newer window alone.
+    /// nothing; a close for the first ticket, late or twice, leaves the newer window alone. (The newer open runs on a
+    /// thread of its own, as the command does: it waits for the first build, FR-734.)
     #[test]
     fn a_late_success_of_an_older_open_answers_false_and_touches_the_newer_window_not() {
         let (lib, host, d) = started("fr561-late-success");
-        let lib = Arc::new(lib);
-        let inner = lib.clone();
-        *host.on_create.lock().unwrap() = Some(Box::new(move |h: &FakeHost| {
-            inner.close(h, "main");
-            assert!(inner.open(h, "main", TICKET2, START, Start::Library));
-        }));
-        assert!(!lib.open(&host, "main", TICKET, START, Start::Library), "the older open answers false");
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
+        assert!(!first, "the older open answers false");
+        assert!(second.answer());
+        let host = &*host;
         let opened: Vec<_> = host.events().into_iter().filter(|e| e.state == State::Opened).collect();
         assert_eq!(opened, vec![LibraryEvent::new(Some(TICKET2), State::Opened)]);
         // The newer open keeps its ticket: its fetch still starts.
-        lib.page_loaded(&host, &u(PDF), Instant::now());
+        lib.page_loaded(host, &u(PDF), Instant::now());
         assert_eq!(host.jobs(), 1);
         assert_eq!(host.jobs.lock().unwrap()[0].ticket, TICKET2);
         // A late close for the older ticket, and the same close again: nothing is closed, nothing ended.
         let asked = host.close_asked.load(Ordering::SeqCst);
-        lib.close_for(&host, "main", Some(TICKET));
-        lib.close_for(&host, "main", Some(TICKET));
+        lib.close_for(host, "main", Some(TICKET));
+        lib.close_for(host, "main", Some(TICKET));
         assert_eq!(host.close_asked.load(Ordering::SeqCst), asked);
         host.exists.store(false, Ordering::SeqCst);
         let n = host.events().len();
-        lib.close_for(&host, "main", Some(TICKET));
+        lib.close_for(host, "main", Some(TICKET));
         assert_eq!(host.events().len(), n, "no window: the newer ticket is not ended either");
         host.exists.store(true, Ordering::SeqCst);
         // Its own close closes it.
-        lib.close_for(&host, "main", Some(TICKET2));
+        lib.close_for(host, "main", Some(TICKET2));
         assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1);
         fs::remove_dir_all(d).unwrap();
     }
@@ -3711,6 +3840,219 @@ process.stdout.write(JSON.stringify({{
         lib.close_for(&host, "main", Some(TICKET));
         assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1);
         assert!(!lib.open(&host, "main", TICKET, START, Start::Library), "the newer ticket is still held");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    // ----- FR-734 (R503 i): the shell builds one sign-in window at a time -----
+
+    const START2: &str = "https://ezproxy.lib.edu/login?url=https://doi.org/10.1/y";
+
+    /// Returns once `ready` holds under the controller's lock (another thread's step has been taken), or fails
+    /// the test after a minute: a wait for a state, not a guess at a time.
+    fn until_locked(lib: &Library, ready: impl Fn(&Inner) -> bool) {
+        let end = Instant::now() + Duration::from_secs(60);
+        while !ready(&lib.lock()) {
+            assert!(Instant::now() < end, "the other thread never reached the state waited for");
+            std::thread::yield_now();
+        }
+    }
+
+    /// The second open's answer, as its thread sends it.
+    struct SecondOpen(std::sync::mpsc::Receiver<bool>);
+
+    impl SecondOpen {
+        /// Waits for the second open's answer at most a minute (M4, R511): a lost wake-up of the waiting open fails
+        /// the test instead of hanging the suite.
+        fn answer(self) -> bool {
+            self.0.recv_timeout(Duration::from_secs(60)).expect("the waiting open never answered within a minute (its wake-up was lost)")
+        }
+    }
+
+    type Second = Arc<Mutex<Option<SecondOpen>>>;
+
+    /// The overlap of R491 B as the page makes it: an open (TICKET) is building its window; the page's close finds
+    /// no window yet and ends that open; the page asks again (TICKET2, on a thread of its own, as the command runs)
+    /// while the build is still under way; `then` runs once that second open holds the ticket, still inside the
+    /// first build. Returns the first open's answer and the second open's answer to come.
+    fn open_during_a_build(lib: &Arc<Library>, host: &Arc<FakeHost>, then: impl FnOnce(&Library, &FakeHost) + Send + 'static) -> (bool, SecondOpen) {
+        let second: Second = Arc::default();
+        let (inner, h2, slot) = (lib.clone(), host.clone(), second.clone());
+        *host.on_create.lock().unwrap() = Some(Box::new(move |h: &FakeHost| {
+            inner.close(h, "main");
+            let (l, hh) = (inner.clone(), h2.clone());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(l.open(&*hh, "main", TICKET2, START2, Start::Library));
+            });
+            *slot.lock().unwrap() = Some(SecondOpen(rx));
+            until_locked(&inner, |g| g.ticket.as_deref() == Some(TICKET2));
+            then(&inner, h);
+        }));
+        let first = lib.open(&**host, "main", TICKET, START, Start::Library);
+        let handle = second.lock().unwrap().take().expect("the second open was started");
+        (first, handle)
+    }
+
+    fn opened(host: &FakeHost) -> Vec<LibraryEvent> {
+        host.events().into_iter().filter(|e| e.state == State::Opened).collect()
+    }
+
+    /// FR-734 (1): the second open does not build a second window beside the one being built (two native windows
+    /// with one label, the shell then losing track of the first): it takes the ticket at once, waits for that build
+    /// and re-uses the window it made; the first open, overtaken, answers false. One window, the newer open's.
+    #[test]
+    fn a_second_open_during_a_build_waits_for_it_and_re_uses_its_window() {
+        let (lib, host, d) = started("fr734-overlap");
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
+        assert!(!first, "the overtaken open answers false");
+        assert!(second.answer(), "the newer open answers true");
+        assert_eq!(host.created.lock().unwrap().len(), 1, "a second window was built while the first was being built");
+        assert_eq!(*host.navigated.lock().unwrap(), vec![u(START2)], "the newer open re-uses the window that was built");
+        assert_eq!(opened(&host), vec![LibraryEvent::new(Some(TICKET2), State::Opened)]);
+        // The window is the newer open's: the older ticket's close leaves it, its own closes it.
+        let asked = host.close_asked.load(Ordering::SeqCst);
+        lib.close_for(&*host, "main", Some(TICKET));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked);
+        lib.close_for(&*host, "main", Some(TICKET2));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// FR-734 (1): when the build waited for fails, the waiting open builds the window itself, after it, titled by
+    /// its own address.
+    #[test]
+    fn an_open_that_waited_for_a_failed_build_builds_the_window_itself() {
+        let (lib, host, d) = started("fr734-failed-first");
+        host.fail_next_build.store(true, Ordering::SeqCst);
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
+        assert!(!first);
+        assert!(second.answer());
+        let created: Vec<Url> = host.created.lock().unwrap().iter().map(|(u, _)| u.clone()).collect();
+        assert_eq!(created, vec![u(START), u(START2)], "the second build came after the first");
+        assert_eq!(host.titles.lock().unwrap().last().cloned(), Some(titled("ezproxy.lib.edu", Start::Library)));
+        assert!(host.window_exists());
+        assert_eq!(opened(&host), vec![LibraryEvent::new(Some(TICKET2), State::Opened)]);
+        let asked = host.close_asked.load(Ordering::SeqCst);
+        lib.close_for(&*host, "main", Some(TICKET2));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// FR-734 (1) with R486 g: the waiting open re-uses the window and fails; the window is then the open's that
+    /// built it, never nobody's, so that open's ticketed close closes it.
+    #[test]
+    fn an_open_that_waited_and_then_failed_leaves_the_window_to_the_open_that_built_it() {
+        let (lib, host, d) = started("fr734-failed-second");
+        host.navigate_ok.store(false, Ordering::SeqCst);
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
+        assert!(!first, "overtaken while it was built");
+        assert!(!second.answer(), "the newer open fails");
+        assert_eq!(host.created.lock().unwrap().len(), 1);
+        assert!(host.window_exists());
+        assert!(opened(&host).is_empty());
+        let asked = host.close_asked.load(Ordering::SeqCst);
+        lib.close_for(&*host, "main", Some(TICKET2));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked, "the failed open's close closed the window");
+        lib.close_for(&*host, "main", Some(TICKET));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1, "the window was left owned by nobody");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// FR-734 (1): a close that ends the waiting open before the build answers: the waiting open answers false and
+    /// does nothing to the window; the window, built after its open was closed, is that open's (R489).
+    #[test]
+    fn an_open_closed_while_it_waits_for_a_build_answers_false_and_touches_nothing() {
+        let (lib, host, d) = started("fr734-closed-waiting");
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |l, h| l.close(h, "main"));
+        assert!(!second.answer(), "the open closed while it waited answers false");
+        assert!(first, "the window built after its open was closed is that open's");
+        assert_eq!(host.created.lock().unwrap().len(), 1);
+        assert!(host.navigated.lock().unwrap().is_empty(), "the ended open moved the window");
+        let closed: Vec<_> = host.events().into_iter().filter(|e| e.state == State::Closed).collect();
+        assert_eq!(closed, vec![LibraryEvent::new(Some(TICKET), State::Closed), LibraryEvent::new(Some(TICKET2), State::Closed)]);
+        let asked = host.close_asked.load(Ordering::SeqCst);
+        lib.close_for(&*host, "main", Some(TICKET2));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked);
+        lib.close_for(&*host, "main", Some(TICKET));
+        assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// The reviewer's probe `p2_first_page_under_second_ticket` (M3, R511; FR-734 point 1): the first open's window
+    /// loads a PDF's page, and asks for a download, while the second open waits for that window's build (before it
+    /// sends the window to its own address). Nothing is fetched under the second open's ticket from the first
+    /// open's page; once the window shows the second open's own address, its own page is fetched as before; the
+    /// first open, overtaken, answers false.
+    #[test]
+    fn a_page_of_the_window_an_open_waits_for_is_never_fetched_under_that_open_s_ticket() {
+        const FIRST_PDF: &str = "https://publisher.example/article/1.pdf";
+        const FIRST_DOWNLOAD: &str = "https://publisher.example/article/1/download";
+        let (lib, host, d) = started("fr734-waiting-fetch");
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |l, h| {
+            let now = Instant::now();
+            h.at(FIRST_PDF);
+            l.page_loaded(h, &u(FIRST_PDF), now);
+            l.download_requested(h, &u(FIRST_DOWNLOAD), now);
+        });
+        assert!(!first, "the overtaken open answers false");
+        assert!(second.answer(), "the waiting open answers true");
+        let jobs = |h: &FakeHost| h.jobs.lock().unwrap().iter().map(|j| (j.ticket.clone(), j.input.url.to_string())).collect::<Vec<_>>();
+        assert_eq!(jobs(&host), vec![], "a fetch started under the waiting open's ticket from the other open's page");
+        assert!(host.events().iter().all(|e| e.state != State::Fetching));
+        assert_eq!(*host.navigated.lock().unwrap(), vec![u(START2)]);
+        // The window now shows the waiting open's own address: its own page is fetched as before.
+        host.at(PDF);
+        lib.page_loaded(&*host, &u(PDF), Instant::now());
+        assert_eq!(jobs(&host), vec![(TICKET2.to_string(), PDF.to_string())]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// The reviewer's probe `p3_old_page_event_after_navigation_sent` (N1, R514): the real host posts the waiting
+    /// open's navigation to the main thread, which may first deliver the old page's load or download events; they
+    /// start no fetch under its ticket. The stand-in host, with `defer_issue`, answers BEFORE `issued` runs, on
+    /// purpose, to hold the state "navigation posted, not yet issued" still; the real host answers only once the
+    /// navigation is issued. Once it is issued, the open's own page is fetched as before.
+    #[test]
+    fn an_old_page_s_event_before_the_waiting_open_s_navigation_is_issued_starts_no_fetch() {
+        const FIRST_PDF: &str = "https://publisher.example/article/1.pdf";
+        const FIRST_DOWNLOAD: &str = "https://publisher.example/article/1/download";
+        let (lib, host, d) = started("fr734-posted-navigation");
+        host.defer_issue.store(true, Ordering::SeqCst);
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
+        assert!(!first);
+        assert!(second.answer());
+        assert_eq!(*host.navigated.lock().unwrap(), vec![u(START2)], "the navigation was posted");
+        let now = Instant::now();
+        host.at(FIRST_PDF);
+        lib.page_loaded(&*host, &u(FIRST_PDF), now);
+        lib.download_requested(&*host, &u(FIRST_DOWNLOAD), now);
+        let jobs = |h: &FakeHost| h.jobs.lock().unwrap().iter().map(|j| (j.ticket.clone(), j.input.url.to_string())).collect::<Vec<_>>();
+        assert_eq!(jobs(&host), vec![], "the old page's event was fetched under the waiting open's ticket");
+        host.issue();
+        host.at(PDF);
+        lib.page_loaded(&*host, &u(PDF), Instant::now());
+        assert_eq!(jobs(&host), vec![(TICKET2.to_string(), PDF.to_string())]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// M3 (R511): when the build the open waited for failed, the open builds the window at its own address, and the
+    /// window's pages are its own from the start.
+    #[test]
+    fn an_open_that_built_the_window_after_waiting_fetches_its_own_page() {
+        let (lib, host, d) = started("fr734-waiting-built");
+        host.fail_next_build.store(true, Ordering::SeqCst);
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
+        assert!(!first);
+        assert!(second.answer());
+        lib.page_loaded(&*host, &u(PDF), Instant::now());
+        assert_eq!(host.jobs.lock().unwrap().iter().map(|j| j.ticket.clone()).collect::<Vec<_>>(), vec![TICKET2.to_string()]);
         fs::remove_dir_all(d).unwrap();
     }
 
@@ -5177,6 +5519,12 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         }
         // The control: the debug build has both (so the stripping above is what removed them).
         assert_eq!(seen_in_debug, (true, true, true));
+        // M5 (R511): the line that says whether the Mac's quit hook was installed is printed by debug builds in
+        // test mode only.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("AO_SHELL_QUIT_HOOK"), "the debug build says whether the quit hook was installed");
+        let released: String = as_released(lib).lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert!(!released.contains("AO_SHELL_QUIT_HOOK"), "lib.rs: a release build would say whether the quit hook was installed");
         // The release build's navigation rule is the plain one, given as it is.
         let released = as_released(include_str!("library_window.rs"));
         assert!(released.contains(".on_navigation(navigation_allowed)"));

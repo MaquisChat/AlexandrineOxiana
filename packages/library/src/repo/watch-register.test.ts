@@ -16,7 +16,7 @@ import { HttpClient } from "../lookup/index.js";
 import { InvalidInputError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
 import type { Repo } from "./repo.js";
 import { SimulatedCrash, openTestRepo, seams, type CrashPoint } from "./testing.js";
-import { WATCH_REGISTER_OP, WatchRegisterUnreadableError, WatchRegisterUnwritableError, type WatchRegisterEntry } from "./watch-register.js";
+import { WATCH_REGISTER_OP, WATCH_REGISTER_REPAIR_OP, WatchRegisterUnreadableError, registerMendSeams, WatchRegisterUnwritableError, type WatchRegisterEntry } from "./watch-register.js";
 
 const GOV = `identifiability:
   containsIdentifiable: false
@@ -54,6 +54,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   seams.crashAt = undefined;
+  registerMendSeams.afterMend = undefined;
   await Promise.all(watches.splice(0).map((w) => w.stop()));
   await lib.close();
   ring.clear();
@@ -247,6 +248,78 @@ describe("the register of a watched folder (Task W3)", () => {
       expect(raw.trim().split("\n")).toHaveLength(2);
       expect([...(await repo.watchRegister(p.id, watchId)).values()]).toEqual([a, b]);
     });
+  }
+
+  it("R503 a: a torn last line and new entries make two audited changes, the cut committed before the append; an intact register one", async () => {
+    const p = await project();
+    const watchId = newId();
+    await repo.recordWatchedFiles(p.id, watchId, [entry("a.pdf")]);
+    await appendFile(registerFile(p, watchId), '{"key":"half');
+    const ops = async () => (await auditEvents(p)).map((e) => e.details?.op).filter((op) => typeof op === "string" && op.startsWith("project.watched-folder."));
+    const before = (await ops()).length;
+    await repo.recordWatchedFiles(p.id, watchId, [entry("b.pdf")]);
+    expect((await ops()).slice(before)).toEqual([WATCH_REGISTER_REPAIR_OP, WATCH_REGISTER_OP]);
+    await repo.recordWatchedFiles(p.id, watchId, [entry("c.pdf")]);
+    expect((await ops()).slice(before + 2)).toEqual([WATCH_REGISTER_OP]);
+    expect([...(await repo.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf", "b.pdf", "c.pdf"]);
+  });
+
+  /*
+   * R509 (M4): the split's crash test. A torn register gets new entries: a crash at each step of the cut's change and of
+   * the add's change, plain and sealed (12 cases), then a reopen. The register is whole (the torn line still there, or
+   * cut, never half); no change is left waiting and nothing is reported changed outside the app or not checkable; a line
+   * is there only when its own change was committed; the add tried again brings no file in twice and loses no origin;
+   * a later write succeeds.
+   */
+  for (const encrypted of [false, true]) {
+    for (const change of ["cut", "add"] as const) {
+      for (const point of ["before-changes", "before-audit", "before-marker-delete"] as CrashPoint[]) {
+        it(`R503 a: a crash at ${point} of the ${change}'s change of a torn register, then a reopen: the register whole, nothing twice, no origin lost (${encrypted ? "sealed" : "plain"})`, async () => {
+          const p = await project(encrypted);
+          const watchId = newId();
+          const a = entry("a.pdf");
+          await repo.recordWatchedFiles(p.id, watchId, [a]);
+          await appendFile(registerFile(p, watchId), '{"key":"half'); // an unclean stop by something else (no newline)
+          const torn = await readFile(registerFile(p, watchId));
+          const whole = torn.subarray(0, torn.lastIndexOf(0x0a) + 1);
+          const b = entry("b.pdf");
+          if (change === "cut") seams.crashAt = point;
+          else registerMendSeams.afterMend = () => void (seams.crashAt = point);
+          await expect(repo.recordWatchedFiles(p.id, watchId, [b])).rejects.toBeInstanceOf(SimulatedCrash);
+          registerMendSeams.afterMend = undefined;
+          expect(seams.crashAt).toBeUndefined();
+          await lib.close();
+          lib = await openLibrary(lib.root, mkDeps());
+          repo = await repoFor();
+          if (encrypted) await repo.unlockProject(p.id, "pw");
+          const kinds = repo.integrityWarnings.filter((x) => x.projectId === p.id).map((x) => x.kind);
+          expect(kinds).not.toContain("txn-recovery-skipped-audit-unverifiable");
+          expect(await txnMarkers()).toEqual([]);
+          const cutKept = change === "add" || point === "before-marker-delete";
+          const addKept = change === "add" && point === "before-marker-delete";
+          const now = await readFile(registerFile(p, watchId));
+          if (addKept) {
+            expect(now.subarray(0, whole.length).equals(whole)).toBe(true);
+            expect(now.length).toBeGreaterThan(whole.length);
+            expect(now[now.length - 1]).toBe(0x0a);
+          } else expect(now.equals(cutKept ? whole : torn)).toBe(true);
+          let reg = await repo.watchRegister(p.id, watchId);
+          expect(reg.get("a.pdf")).toEqual(a);
+          expect(reg.has("b.pdf")).toBe(addKept);
+          // The watch tries the file again only when it is not in the register: brought in once, its origin kept.
+          if (!reg.has("b.pdf")) await repo.recordWatchedFiles(p.id, watchId, [b]);
+          const lines = (await readFile(registerFile(p, watchId), "utf8")).split("\n");
+          expect(lines.pop()).toBe("");
+          expect(lines).toHaveLength(2);
+          reg = await repo.watchRegister(p.id, watchId);
+          expect([...reg.values()]).toEqual([a, b]);
+          // And the register takes a later write.
+          const c = entry("c.pdf");
+          await repo.recordWatchedFiles(p.id, watchId, [c]);
+          expect([...(await repo.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf", "b.pdf", "c.pdf"]);
+        });
+      }
+    }
   }
 
   it("N2: a last line complete but for its newline is skipped by the reader as the writer cuts it", async () => {

@@ -211,6 +211,8 @@ export const FIND_QUEUE_OPS = {
   update: "project.find.update",
   remove: "project.find.remove",
   compact: "project.find.compact",
+  /** R503 a: a torn last line cut by a change of its own, before the change that appends (audited with the bytes cut). */
+  repair: "project.find.repair",
   /**
    * Task F15 (R324 c): the entry's line "waiting-sign-in" — a fetch through the library started on the researcher's
    * press. Governed with the capture of `library_access` besides the queue's own store request; audited with the

@@ -87,7 +87,7 @@ export function registerTools(app: FastifyInstance, ctx: Ctx): void {
   /** After ffmpeg or OCR arrives: retry the open library's failed viewing copies / OCR (they stayed pending). */
   function retryWaitingWork(toolId: ToolId): void {
     const s = state.session;
-    if (!s || s.lib.mode !== "read-write" || state.moving || !s.workerClient) return;
+    if (!s || s.lib.mode !== "read-write" || state.startsHeld || !s.workerClient) return;
     if (toolId !== "ffmpeg" && toolId !== "ocr") return;
     void state.startWork("retry", async () => {
       for (const p of s.repo.listProjects()) {
