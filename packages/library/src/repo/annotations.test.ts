@@ -876,11 +876,11 @@ describe("crash safety (R26)", () => {
     const crash = async () => {
       throw new SimulatedCrash("simulated crash between the annotations file and source.json");
     };
-    for (const change of [
+    for (const [n, change] of [
       () => repo.createAnnotation(f.pid, f.sid, highlight(f, { quote: "second" })),
       () => repo.updateAnnotation(f.pid, f.sid, keep.id, { colorName: "red" }),
       () => repo.deleteAnnotation(f.pid, f.sid, keep.id),
-    ]) {
+    ].entries()) {
       pauseBetweenSourceFilesForTests(crash);
       await expect(change()).rejects.toBeInstanceOf(SimulatedCrash);
       pauseBetweenSourceFilesForTests(undefined);
@@ -888,7 +888,8 @@ describe("crash safety (R26)", () => {
       await reopen();
       expect(await repo.listAnnotations(f.pid, f.sid)).toEqual([keep]);
       await consistent(f);
-      expect(repo.integrityWarnings.map((w) => w.kind)).toEqual(["rolled-back-incomplete-write"]);
+      // FR-729: each opening's warning is kept until dismissed, so the earlier ones are still said.
+      expect(repo.integrityWarnings.map((w) => w.kind)).toEqual(Array<string>(n + 1).fill("rolled-back-incomplete-write"));
     }
   });
 });

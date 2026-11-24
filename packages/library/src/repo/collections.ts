@@ -12,7 +12,7 @@ import { readMaybe } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation, type MutateRequest } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
 import { editSource, readSourceFile, storeRequest } from "./sources.js";
-import type { ProjectState, RepoCore } from "./state.js";
+import { pendingReason, type ProjectState, type RepoCore } from "./state.js";
 
 /** Organizing metadata carries no identifiable data of its own. */
 const ORGANIZE: MutateRequest = { action: "store", store: { identifiable: false, hasLocation: false } };
@@ -312,7 +312,7 @@ export async function createTag(core: RepoCore, scope: string, name: string, col
 function workspaceChangeTargets(core: RepoCore): string[] {
   const ids: string[] = [];
   for (const st of core.projects.values()) {
-    if (st.recoveryPending) throw new RecoveryPendingError(st.project.id);
+    if (st.recoveryPending) throw new RecoveryPendingError(st.project.id, pendingReason(st));
     core.assertUnlocked(st);
     ids.push(st.project.id);
   }

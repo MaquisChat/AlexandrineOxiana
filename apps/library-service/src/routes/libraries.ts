@@ -447,8 +447,21 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireSession();
     const names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]));
     const list = await s.repo.pendingWrites();
+    /** The source's title, where it can be read (a locked project's titles cannot: then none). */
+    const titleOf = async (projectId: string, sourceId: string | undefined): Promise<string | undefined> => {
+      if (!sourceId) return undefined;
+      const sf = await s.repo.getSource(projectId, sourceId).catch(() => null);
+      return sf?.source.title.variants[0]?.value;
+    };
+    const lostOf = async (p: (typeof list)[number]) =>
+      Promise.all(
+        (p.lost ?? []).map(async (l) => {
+          const source = await titleOf(p.projectId, l.sourceId);
+          return { path: l.path, now: l.now, ...(source !== undefined ? { source } : {}) };
+        }),
+      );
     return {
-      pendingWrites: list.map((p) => ({
+      pendingWrites: await Promise.all(list.map(async (p) => ({
         txn: p.txn,
         projectId: p.projectId,
         project: p.projectId === "*" ? "library" : (names.get(p.projectId) ?? "a project"),
@@ -457,8 +470,33 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         canRollBack: p.canRollBack,
         steps: p.steps,
         ...(p.detail ? { detail: scrubPaths(p.detail, state.roots) } : {}),
-      })),
+        // FR-736: what keeps its undo from completing, with the library-relative path (R503 d: shown in this list only).
+        ...(p.rollback ? { rollback: p.rollback, causes: (p.causes ?? []).map((c) => ({ kind: c.kind, path: c.path, ...(c.somethingThere ? { somethingThere: true } : {}) })) } : {}),
+        // R509: it can be closed as it is; what that leaves lost, where, and what is there now.
+        canClose: p.canClose,
+        ...(p.canClose ? { lost: await lostOf(p) } : {}),
+      }))),
     };
+  });
+
+  // R509 (FR-736): an interrupted change whose undo can never complete, closed as it is by the researcher's choice. The
+  // app's own token only (the extension's reaches none of these routes); named with the project the screen showed.
+  app.post("/libraries/pending-writes/:txn/close", async (req) => {
+    const s = state.requireWritable();
+    const txn = (req.params as { txn?: string }).txn ?? "";
+    const projectId = str(bodyOf(req), "projectId", 64);
+    let r: Awaited<ReturnType<typeof s.repo.closePendingWrite>>;
+    try {
+      r = await s.repo.closePendingWrite(txn, projectId);
+    } catch (err) {
+      // R528 I2: a refused attempt changed the warnings too (they follow the latest attempt): the banner says what the list says.
+      state.publishState();
+      throw err;
+    }
+    // The index was built with the change half there: rebuilt in the background, as after a roll-back.
+    state.startIndexRebuild(s, true);
+    state.publishState();
+    return r;
   });
 
   app.post("/libraries/pending-writes/:txn/resolve", async (req) => {
@@ -466,11 +504,28 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const txn = (req.params as { txn?: string }).txn ?? "";
     const choice = str(bodyOf(req), "choice", 16);
     if (choice !== "roll-back" && choice !== "keep") throw badRequest('"choice" must be "roll-back" or "keep".');
-    const r = await s.repo.resolvePendingWrite(txn, choice);
+    let r: Awaited<ReturnType<typeof s.repo.resolvePendingWrite>>;
+    try {
+      r = await s.repo.resolvePendingWrite(txn, choice);
+    } catch (err) {
+      // R528 I2: a refused attempt changed the warnings too (they follow the latest attempt): the banner says what the list says.
+      state.publishState();
+      throw err;
+    }
     // The index was built with the change half there (or, kept, without it): rebuild it in the background.
     state.startIndexRebuild(s, true);
     state.publishState();
     return r;
+  });
+
+  // FR-729: a warning recovery raised, kept with the library until the researcher dismisses it; dismissed for good. Not
+  // in a read-only library (it writes nothing there).
+  app.post("/libraries/recovery-warnings/:id/dismiss", async (req) => {
+    const s = state.requireWritable();
+    const id = (req.params as { id?: string }).id ?? "";
+    await s.repo.dismissRecoveryWarning(id);
+    state.publishState();
+    return { dismissed: true };
   });
 
   app.post("/libraries/relink", async (req) => {

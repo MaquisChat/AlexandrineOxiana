@@ -216,3 +216,190 @@ describe("PendingWritesDialog", () => {
     page.remove();
   });
 });
+
+describe("FR-736: what is in the way of an undo that is not complete", () => {
+  const F = "Projects/Dissertation/sources/Smith <b>2020</b>/kept.txt";
+  const SAYS: Record<string, string> = {
+    "hand-changed-file": `${F} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (it is kept there as it is), then choose “Roll it back”.`,
+    "path-occupied": `A file this change removed cannot be put back at ${F}, because another file is there now. Move that file somewhere outside the library, then choose “Roll it back” to put the removed file back.`,
+    "kept-copy-gone": `The file this change removed from ${F} cannot be put back: the copy the app kept of it is gone, so it is lost.`,
+    "could-not-look": `The app could not read ${F}, so it left it as it is. Make sure the file can be read, then choose “Roll it back”.`,
+  };
+  for (const [kind, said] of Object.entries(SAYS)) {
+    it(`${kind}: said with the file's place in the library, shown as text`, async () => {
+      serve([[pw({ rollback: kind === "kept-copy-gone" ? "lost" : kind === "could-not-look" ? "could-not-read" : "in-the-way", causes: [{ kind, path: F }] })]]);
+      show();
+      const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
+      const item = within(group).getByText((_, el) => el?.tagName === "P" && el.textContent === said);
+      expect(item.querySelector("b")).toBeNull();
+      expect(item.querySelector("bdi, [dir]")?.textContent).toBe(F);
+    });
+  }
+
+  it("R527: kept-copy-gone where something stands at the place: the app cannot confirm it, never \"it is lost\"", async () => {
+    const said = `The file this change removed from ${F} cannot be put back: the copy the app kept of it is gone. Something is at that place now, which may be that file, but the app cannot confirm it, so it left it as it is.`;
+    serve([[pw({ rollback: "unconfirmed", causes: [{ kind: "kept-copy-gone", path: F, somethingThere: true }] })]]);
+    show();
+    const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
+    const item = within(group).getByText((_, el) => el?.tagName === "P" && el.textContent === said);
+    expect(item.querySelector("b")).toBeNull();
+    expect(item.textContent).not.toMatch(/lost/u);
+  });
+
+  it("\"Roll it back\" answered with the undo's state: the library's own sentence, not \"something changed meanwhile\"", async () => {
+    const said = "The change could not be undone completely: a file changed or put there outside the app is in the way. The list shows which file; move it, then choose “Roll it back” again.";
+    serve([[pw({ rollback: "in-the-way", causes: [{ kind: "hand-changed-file", path: F }] })]], () =>
+      HttpResponse.json({ error: { code: "CONFLICT", message: said, reason: "rollback-incomplete" } }, { status: 409 }),
+    );
+    const user = userEvent.setup();
+    show();
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    await user.click(await within(dialog).findByRole("button", { name: "Roll it back" }));
+    await user.click(within(dialog).getByRole("button", { name: "Yes, roll it back" }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toBe(said);
+  });
+});
+
+describe("R528 I1, M2: a copy gone together with something else: the words lead in order", () => {
+  const A = "Projects/Dissertation/sources/Smith 2020/a.txt";
+  const B = "Projects/Dissertation/sources/Smith 2020/b.txt";
+  const D = "Projects/Dissertation/sources/Smith 2020/D";
+  /** The list's lines of the item, in order, as the researcher reads them (its title, status and step count left out). */
+  const lines = (group: HTMLElement) => Array.from(group.querySelectorAll("p")).slice(3).map((p) => p.textContent);
+
+  it("probe P1 (a lost file and a file changed by hand): each cause with its place, then what to do first and the close after it; no close yet", async () => {
+    serve([[pw({ rollback: "lost-and-blocked", causes: [{ kind: "kept-copy-gone", path: A }, { kind: "hand-changed-file", path: B }], canClose: false })]]);
+    show();
+    const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
+    expect(lines(group)).toEqual([
+      `The file this change removed from ${A} cannot be put back: the copy the app kept of it is gone, so it is lost.`,
+      `${B} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (it is kept there as it is), then choose “Roll it back”.`,
+      "Deal with what is named above first, then choose “Roll it back” again. After that, this list says whether the change can be closed as it is.",
+    ]);
+    expect(within(group).getByRole("button", { name: "Roll it back" })).toBeTruthy();
+    expect(within(group).queryByRole("button", { name: "Close this change as it is" })).toBeNull();
+  });
+
+  it("probe P5 (a lost folder, a copy kept inside it that cannot be put back): a backup is the way; no close, and no hint of one", async () => {
+    serve([[pw({ rollback: "lost-copy-stuck", causes: [{ kind: "kept-copy-gone", path: D }], canClose: false })]]);
+    show();
+    const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
+    expect(lines(group)).toEqual([
+      `The file this change removed from ${D} cannot be put back: the copy the app kept of it is gone, so it is lost.`,
+      "The app still keeps a copy of another file of this change, which it cannot put back either, and closing would let that copy go, so this change cannot be closed. The way forward is to restore the project from a backup made before this change.",
+    ]);
+    expect(within(group).queryByRole("button", { name: "Close this change as it is" })).toBeNull();
+    expect(within(group).queryByText("You can close this change as it is.")).toBeNull();
+  });
+});
+
+describe("R509: closing, as it is, a change whose undo can never complete", () => {
+  const F = "Projects/Dissertation/sources/Smith 2020/kept <i>1</i>.txt";
+  const LOST = pw({ rollback: "lost", causes: [{ kind: "kept-copy-gone", path: F }], canClose: true, lost: [{ path: F, now: "a file", source: "Smith <b>2020</b>" }] });
+  const QUESTION = `Close this change as it is? What it removed from ${F} cannot be put back. It belonged to the source Smith <b>2020</b>. A file is at that place now; it stays as it is. Closing deletes nothing. The project takes changes again, and a warning about what could not be put back stays until you dismiss it.`;
+  function serveClose(answer?: () => Response) {
+    const posted: unknown[] = [];
+    let calls = 0;
+    server.use(
+      http.get(url("/libraries/pending-writes"), () => HttpResponse.json({ pendingWrites: calls++ === 0 ? [LOST] : [] })),
+      http.post(url("/libraries/pending-writes/:txn/close"), async ({ request, params }) => {
+        posted.push({ txn: params.txn, body: await request.json() });
+        return answer ? answer() : HttpResponse.json({ txn: T1, projectId: "p1" });
+      }),
+    );
+    return posted;
+  }
+
+  it("R528 M8: where the app could not look at the place, the question says so (never \"Nothing is at that place now.\")", async () => {
+    server.use(
+      http.get(url("/libraries/pending-writes"), () =>
+        HttpResponse.json({ pendingWrites: [pw({ rollback: "lost", causes: [{ kind: "kept-copy-gone", path: F }], canClose: true, lost: [{ path: F, now: "could-not-look" }] })] }),
+      ),
+    );
+    const user = userEvent.setup();
+    show();
+    await user.click(await screen.findByRole("button", { name: "Close this change as it is" }));
+    expect((document.activeElement as HTMLElement).textContent).toBe(
+      `Close this change as it is? What it removed from ${F} cannot be put back. The app could not look at that place, so it cannot say what is there now; whatever is there stays as it is. Closing deletes nothing. The project takes changes again, and a warning about what could not be put back stays until you dismiss it.`,
+    );
+  });
+
+  it("is offered only where the service allows it, after \"Roll it back\" in the Tab order, and said beside what is lost", async () => {
+    serve([[pw({ rollback: "in-the-way", causes: [{ kind: "hand-changed-file", path: F }], canClose: false })]]);
+    const { unmount } = show();
+    await screen.findByRole("button", { name: "Roll it back" });
+    expect(screen.queryByRole("button", { name: "Close this change as it is" })).toBeNull();
+    unmount();
+    serveClose();
+    const user = userEvent.setup();
+    show();
+    const back = await screen.findByRole("button", { name: "Roll it back" });
+    back.focus();
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Close this change as it is" }));
+    expect(screen.getByText("You can close this change as it is.")).toBeTruthy();
+  });
+
+  it("the confirmation takes the focus on its question, says what is lost and that nothing is deleted; Escape and Cancel give the focus back", async () => {
+    const posted = serveClose();
+    const user = userEvent.setup();
+    show();
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    const open = await within(dialog).findByRole("button", { name: "Close this change as it is" });
+    await user.click(open);
+    const question = document.activeElement as HTMLElement;
+    expect(question.textContent).toBe(QUESTION);
+    expect(question.querySelector("b, i")).toBeNull();
+    await user.keyboard("{Escape}");
+    // Escape takes back the question only: the dialog stays, the focus on the button that asked it.
+    expect(screen.getByRole("dialog", { name: "Interrupted changes" })).toBeTruthy();
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Close this change as it is" }));
+    await user.click(within(dialog).getByRole("button", { name: "Close this change as it is" }));
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Close this change as it is" }));
+    expect(posted).toEqual([]);
+  });
+
+  it("confirmed: one request naming the project, busy meanwhile, then the sentence after closing and the list read again", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const posted = serveClose(() => HttpResponse.json({ txn: T1, projectId: "p1" }));
+    server.use(
+      http.post(url("/libraries/pending-writes/:txn/close"), async ({ request, params }) => {
+        posted.push({ txn: params.txn, body: await request.json() });
+        await held;
+        return HttpResponse.json({ txn: T1, projectId: "p1" });
+      }),
+    );
+    const onResolved = vi.fn();
+    const user = userEvent.setup();
+    show({ onResolved });
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    await user.click(await within(dialog).findByRole("button", { name: "Close this change as it is" }));
+    const yes = within(dialog).getByRole("button", { name: "Yes, close it as it is" });
+    await user.click(yes);
+    await user.click(yes);
+    expect(await within(dialog).findByText("Closing the change…")).toBeTruthy();
+    expect((within(dialog).getByRole("button", { name: "Yes, close it as it is" }) as HTMLButtonElement).disabled).toBe(true);
+    release();
+    const said = await within(dialog).findByText("The change was closed as it is. Nothing was deleted, and the project takes changes again.");
+    expect(said.getAttribute("role")).toBe("status");
+    expect(posted).toEqual([{ txn: T1, body: { projectId: "p1" } }]);
+    expect(onResolved).toHaveBeenCalledTimes(1);
+    expect(await within(dialog).findByText(/Nothing is waiting/)).toBeTruthy();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
+  it("refused: the service's reason as an alert, which takes the focus; the list read again", async () => {
+    serveClose(() => HttpResponse.json({ error: { code: "POLICY_DENIED", message: "This project's rules do not allow that." } }, { status: 403 }));
+    const user = userEvent.setup();
+    show();
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    await user.click(await within(dialog).findByRole("button", { name: "Close this change as it is" }));
+    await user.click(within(dialog).getByRole("button", { name: "Yes, close it as it is" }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toMatch(/rules do not allow that/);
+    await waitFor(() => expect(document.activeElement).toBe(alert));
+  });
+});

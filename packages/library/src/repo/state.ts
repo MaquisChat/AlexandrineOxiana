@@ -20,6 +20,7 @@ import { AnchorStore, AuditStore, type AuditInput, type IntegrityWarning } from 
 import { NotFoundError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
 import { absPath, readMaybe } from "./io.js";
 import type { InternalOptions } from "./seams.js";
+import type { UndoCause } from "./txn.js";
 import type { ReviewItemRow } from "./review.js";
 
 /** Search-index port (Task 12). Called last in a mutation, after files, change log and audit. */
@@ -122,6 +123,12 @@ export interface ProjectState {
    */
   recoveryPending?: boolean;
   /**
+   * R528 M3: what holds it besides an interrupted change is lifted only by opening the library again (an audit append
+   * that failed at the opening; a resolve held at a mismatch of the audit anchor, R131 d). Said only when no marker of
+   * the project is left (`unfinished` empty): an interrupted change is said first.
+   */
+  reopenToResume?: boolean;
+  /**
    * Library-relative paths named by a marker of this project that is not finished or rolled back yet (R473 I1): a
    * change whose roll-back failed here, or a marker found pending at open. Until it is, those files are half changed.
    */
@@ -146,9 +153,30 @@ const inTurn = new AsyncLocalStorage<Turn>();
  */
 export const lockPurges: Array<(core: RepoCore, st: ProjectState) => void> = [];
 
+/**
+ * An attempt to undo an interrupted change that did not complete: its causes, whether a step failed for no cause the undo
+ * could name, and whether a copy of the change is still kept where that chooses the state (R528: `copyKeptOf`).
+ */
+export interface RollbackAttempt {
+  causes: UndoCause[];
+  stepFailed: boolean;
+  copyKept?: true;
+}
+
+/** R528 M3: why a project refuses changes (`recoveryPending`), as the refusal says it. */
+export function pendingReason(st: Pick<ProjectState, "reopenToResume" | "unfinished">): "interrupted-change" | "reopen" {
+  return st.reopenToResume === true && !st.unfinished?.size ? "reopen" : "interrupted-change";
+}
+
 export class RepoCore {
   readonly projects = new Map<string, ProjectState>();
   readonly integrityWarnings: IntegrityWarning[] = [];
+  /**
+   * FR-736: the latest attempt to undo each interrupted change whose undo is not complete, by transaction (at the
+   * opening, a choice recorded earlier, "Roll it back", or the change's own undo in this process): what kept it from
+   * completing. The list of interrupted changes says it; a complete undo takes its entry away.
+   */
+  readonly rollbackAttempts = new Map<string, RollbackAttempt>();
   /** Index failures after a committed mutation (the index is rebuildable; the mutation stands). */
   readonly indexErrors: Array<{ op: string; error: unknown }> = [];
   readonly anchors: AnchorStore;

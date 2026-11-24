@@ -71,7 +71,7 @@ import {
   type SearchSettingsRead,
   writeQueueTurn,
 } from "@ao/library";
-import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent } from "@ao/shared";
+import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent, IncompleteRollback } from "@ao/shared";
 import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, oldCopiesPendingText } from "@ao/shared";
 import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
 
@@ -1774,13 +1774,20 @@ export class ServiceState {
     return writeQueueTurn(s.repo);
   }
 
-  integrityWarnings(s: Session, names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]))): Array<{ projectId: string; project: string; kind: string; detail: string }> {
+  integrityWarnings(
+    s: Session,
+    names = new Map(s.repo.listProjects().map((p) => [p.id, p.name])),
+  ): Array<{ projectId: string; project: string; kind: string; detail: string; state?: IncompleteRollback; keptId?: string }> {
     return [
       ...s.repo.integrityWarnings.map((w) => ({
         projectId: w.projectId,
         project: w.projectId === "*" ? "library" : (names.get(w.projectId) ?? "a project"),
         kind: w.kind,
         detail: scrubPaths(w.detail, this.roots),
+        // FR-736: an undo not complete says its state (never its paths here: those are for the list only, R503 d).
+        ...(w.rollback ? { state: w.rollback } : {}),
+        // FR-729: kept with the library until dismissed (POST /libraries/recovery-warnings/:id/dismiss).
+        ...(w.keptId ? { keptId: w.keptId } : {}),
       })),
       ...(s.sessionWarnings ?? []).map((w) => ({ projectId: "*", project: "library", kind: w.kind, detail: scrubPaths(w.detail, this.roots) })),
     ];

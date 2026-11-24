@@ -64,6 +64,7 @@ import {
   projectCollectionsAndTags,
   projectPolicy,
   recoveryPendingProjects,
+  recoveryPendingReason,
   readFindQueueDetailedIn,
   readFindQueueIn,
   repoLibrary,
@@ -595,7 +596,7 @@ export interface FindRunnerDeps {
 
 /** Why the runner does nothing for a project now. */
 export type FindStoppedFor = {
-  code: "rules-unreadable" | "queue-unreadable" | "read-only" | "recovery-pending" | "unexpected" | "index-not-ready";
+  code: "rules-unreadable" | "queue-unreadable" | "read-only" | "recovery-pending" | "reopen-pending" | "unexpected" | "index-not-ready";
 };
 
 export interface FindRunner {
@@ -1533,7 +1534,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       return true;
     }
     if (err instanceof RecoveryPendingError) {
-      block(pid, "recovery-pending");
+      block(pid, err.reason === "reopen" ? "reopen-pending" : "recovery-pending");
       return true;
     }
     if (err instanceof FindQueueUnreadableError) {
@@ -2723,7 +2724,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     const p = (async () => {
       if (recoveryPendingProjects(repo).includes(projectId)) {
         // Its writes wait for the library to be reopened (N2).
-        if (alive(projectId, gen)) block(projectId, "recovery-pending");
+        if (alive(projectId, gen)) block(projectId, recoveryPendingReason(repo, projectId) === "reopen" ? "reopen-pending" : "recovery-pending");
         return;
       }
       if ((await projectPolicy(repo, projectId)) === null) {

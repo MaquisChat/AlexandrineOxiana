@@ -12,6 +12,7 @@ import type {
   DeviceNotice,
   DeviceNoticeDismissRequest,
   DeviceNoticeKind,
+  IncompleteRollback,
   LibraryFolderRoomRequest,
   LibraryFolderRoomResponse,
   LibrarySuggestedFolderResponse,
@@ -94,6 +95,13 @@ export interface PendingWrite {
   canRollBack: boolean;
   steps: number;
   detail?: string;
+  /** FR-736: its latest undo was not complete: the state, and what is in the way with its library-relative path. */
+  rollback?: IncompleteRollback;
+  /** `somethingThere` (R527, `kept-copy-gone` only): something stands at the place that the app cannot confirm is the file. */
+  causes?: Array<{ kind: string; path: string; somethingThere?: boolean }>;
+  /** R509: it can be closed as it is (its undo can never complete); `lost`: what that leaves lost, and what is there now. */
+  canClose?: boolean;
+  lost?: Array<{ path: string; now: "nothing" | "a file" | "something else" | "could-not-look"; source?: string }>;
 }
 
 export type PendingWriteChoice = "roll-back" | "keep";
@@ -103,6 +111,10 @@ export interface IntegrityWarning {
   project: string;
   kind: string;
   detail: string;
+  /** FR-736: an undo that is not complete, by its state (chooses the banner's sentence); R527: "unconfirmed" on a closed change. */
+  state?: IncompleteRollback;
+  /** FR-729: kept with the library until dismissed: its id there. */
+  keptId?: string;
 }
 
 /** The `library.state` event (LibraryState.libraryState in the service). */
@@ -339,10 +351,14 @@ export function libraryApi(client: ApiClient) {
     pendingWrites: {
       list: async () => (await r<{ pendingWrites: PendingWrite[] }>("GET", "/libraries/pending-writes")).pendingWrites,
       resolve: (txn: string, choice: PendingWriteChoice) => r<{ txn: string; choice: PendingWriteChoice; projectId: string }>("POST", `/libraries/pending-writes/${seg(txn)}/resolve`, { body: { choice } }),
+      /** R509: closes, as it is, a change whose undo can never complete; named with its project. */
+      close: (txn: string, projectId: string) => r<{ txn: string; projectId: string }>("POST", `/libraries/pending-writes/${seg(txn)}/close`, { body: { projectId } }),
     },
     libraries: {
       list: () => r<LibraryList>("GET", "/libraries"),
       /** The researcher's "Got it" for a device-level notice (Task 68): POST /settings/notices/dismiss. */
+      /** FR-729: dismisses, for good, a warning kept with the library. */
+      dismissWarning: (id: string) => r<{ dismissed: true }>("POST", `/libraries/recovery-warnings/${seg(id)}/dismiss`),
       dismissNotice: (kind: DeviceNoticeKind) => r<{ notices: DeviceNotice[] }>("POST", "/settings/notices/dismiss", { body: { kind } satisfies DeviceNoticeDismissRequest }),
       open: (path: string) => r<CurrentLibrary>("POST", "/libraries/open", { body: { path } }),
       create: (path: string, name: string) => r<CurrentLibrary>("POST", "/libraries", { body: { path, name } }),

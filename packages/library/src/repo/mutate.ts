@@ -50,8 +50,9 @@ import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo, type ContainmentCache } from "./io.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
 import { AUDIT_REASONS_FILE, reasonMac, sealedReasonLine } from "./audit-reasons.js";
-import { TxnLog, markerPaths } from "./txn.js";
-import type { IndexSink, ProjectState, RepoCore } from "./state.js";
+import { TxnLog, copyKeptOf, identityOf, markerPaths } from "./txn.js";
+import { incompleteDetail, stateOf } from "./pending-writes.js";
+import { pendingReason, type IndexSink, type ProjectState, type RepoCore } from "./state.js";
 
 /** A policy request without the fields the repository fills in (projectId; actor, now and tz by default). */
 export type MutateRequest = Omit<PolicyRequest, "projectId" | "actor" | "now" | "tz"> &
@@ -239,6 +240,8 @@ class TxImpl implements Tx {
         await this.log.retractDir(first);
         continue;
       }
+      // Made: its completion line records its identity, so that an undo removes only this folder (R526 M2).
+      await this.log.dirMade(first);
       if (first !== abs) await fsp.mkdir(abs, { recursive: true });
       return;
     }
@@ -261,6 +264,9 @@ class TxImpl implements Tx {
     // than the thread-pool round trips of the asynchronous path, with the same guarantees.
     if (bytes.length <= SMALL_FILE_BYTES) await writeSmallFileAtomic(abs, bytes, { mode: opts.mode });
     else await writeFileAtomic(abs, bytes, { mode: opts.mode });
+    // Inside a folder this change created there is no line before the write: its completion line says the file
+    // holds these bytes once they are durable (R503 c 1, R519 (2)).
+    if (this.log.inCreatedDir(abs)) await this.log.completed(abs, sha256);
   }
 
   async copyFile(src: string, rel: string, opts: FileOptions = {}): Promise<{ sha256: string; bytes: number }> {
@@ -274,9 +280,16 @@ class TxImpl implements Tx {
       decode = (r) => r.pipe(decryptStream((id) => (id === keyId ? key : undefined)));
     }
     const nf = opts.noFollow ? { noFollow: true } : {};
-    if (!opts.encrypt) return copyFileAtomic(src, abs, { mode: opts.mode, ...nf, ...(decode ? { decode } : {}) });
-    const { key, keyId } = this.key();
-    return copyFileAtomic(src, abs, { mode: opts.mode, ...nf, ...(decode ? { decode } : {}), transform: (r) => r.pipe(encryptStream(key, keyId)) });
+    let copied: { sha256: string; bytes: number; storedSha256: string };
+    if (!opts.encrypt) copied = await copyFileAtomic(src, abs, { mode: opts.mode, ...nf, ...(decode ? { decode } : {}) });
+    else {
+      const { key, keyId } = this.key();
+      copied = await copyFileAtomic(src, abs, { mode: opts.mode, ...nf, ...(decode ? { decode } : {}), transform: (r) => r.pipe(encryptStream(key, keyId)) });
+    }
+    // The copy is durable (synced and renamed into place): its completion line carries the hash of the bytes as stored,
+    // hashed in the same pass (R503 c 1, R519 (2)). Without it, the file at the path is the change's half-written copy.
+    await this.log.completed(abs, copied.storedSha256);
+    return { sha256: copied.sha256, bytes: copied.bytes };
   }
 
   async appendLine(rel: string, line: string, opts: { mode?: number } = {}): Promise<void> {
@@ -303,10 +316,20 @@ class TxImpl implements Tx {
     await fsp.mkdir(dir, { recursive: true });
     const to = join(dir, `trash-${this.log.id}-${randomBytes(8).toString("hex")}`);
     await assertContained(dir, to);
-    await this.log.trashed(from, to, shred);
+    // The original's identity (file number, time of birth) before it moves, on the line written before the rename
+    // (R519 (3), R526); none when the file system gives no time of birth.
+    const identity = await identityOf(from, "trash-before");
+    await this.log.trashed(from, to, shred, identity);
     await renameWithRetry(from, to);
     this.trashed.push(to);
     if (shred) this.shred.push(to);
+    // Recorded only where it is seen to hold (R526): the kept copy is looked at once more; where the identity did not
+    // survive the rename (or cannot be seen), a second line for the same move says so, after the step, as a completion
+    // line is written.
+    if (identity) {
+      const after = await identityOf(to, "trash-after").catch(() => undefined);
+      if (after?.ino !== identity.ino || after.birthtimeNs !== identity.birthtimeNs) await this.log.identityNotKept(from, to);
+    }
   }
 
   record(type: EntityType, id: string, before: object | null, after: object | null): void {
@@ -432,7 +455,7 @@ export async function authorizeOnly(
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
-    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
     core.assertUnlocked(st);
     const at = core.clock().toISOString();
     const op = opts.op ?? "authorize";
@@ -461,7 +484,7 @@ export async function runMutation<T>(
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
-    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
     core.assertUnlocked(st);
     const now = core.clock();
     const at = now.toISOString();
@@ -522,13 +545,27 @@ export async function runMutation<T>(
       maybeCrash("before-marker-delete");
     } catch (err) {
       if (err instanceof SimulatedCrash) throw err; // tests: the process "died" here
-      if (await log.undo()) {
+      const undone = await log.undo();
+      if (undone.ok) {
         st.audit.head = headBefore;
         await log.finish().catch(() => {});
       } else {
         // Keep the marker so the next open can finish the rollback, and stop writing to this
         // project until then: later writes could otherwise be undone by that recovery.
         st.recoveryPending = true;
+        // FR-736: said at once, with its state, so that the researcher is offered the list of interrupted changes
+        // (the refusal of every later write points to this warning); resolving the change takes it away.
+        const attempt = { causes: undone.causes, stepFailed: undone.stepFailed === true, ...((await copyKeptOf(core.root, log.marker, undone)) ? { copyKept: true as const } : {}) };
+        core.rollbackAttempts.set(log.id, attempt);
+        const state = stateOf(attempt);
+        core.integrityWarnings.push({
+          projectId,
+          kind: "rolled-back-incomplete-write",
+          // R528 M5: the command line's detail is true of the state (never a retry where retrying cannot help).
+          detail: `${incompleteDetail(state, "in-process")} (transaction ${log.id})`,
+          ...(undone.causes.length ? { causes: undone.causes } : {}),
+          rollback: state,
+        });
         // The paths it names stay half changed until then: a read of a source among them says so (R473 I1).
         st.unfinished = new Set([...(st.unfinished ?? []), ...markerPaths(log.marker)]);
         st.audit.head = (await AuditStore.load(st.audit.dir).catch(() => null))?.store.head ?? headBefore;

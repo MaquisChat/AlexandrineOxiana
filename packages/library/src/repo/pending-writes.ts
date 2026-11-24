@@ -23,23 +23,31 @@
  */
 import { createHash } from "node:crypto";
 import { join, posix } from "node:path";
-import { verifyChain, type AuditEvent } from "@ao/core";
+import { evaluate, parseGovernance, verifyChain, type AuditEvent } from "@ao/core";
+import { CLOSABLE_ROLLBACK, CLOSE_COPIES_LEFT_TEXT, ROLLBACK_INCOMPLETE_ANSWER, incompleteRollbackOf, type IncompleteRollback } from "@ao/shared";
 import { AuditStore, auditSegments, checkAnchor, type Head } from "./audit-store.js";
-import { assertContained, incompleteTail, truncateDurable } from "./io.js";
-import { NotFoundError, PendingWriteChoiceError, PendingWriteIncompleteError } from "./errors.js";
+import { assertContained, incompleteTail, readMaybe, truncateDurable } from "./io.js";
+import { NotFoundError, PendingWriteChoiceError, PendingWriteIncompleteError, PolicyDeniedError } from "./errors.js";
+import { appendLibraryAudit } from "./library-audit.js";
+import { keepWarning } from "./kept-warnings.js";
 import { scanIncompleteLines } from "./incomplete-lines.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
-import { loadProjectFolder, type ProjectState, type RepoCore } from "./state.js";
+import { loadProjectFolder, type ProjectState, type RepoCore, type RollbackAttempt } from "./state.js";
 import {
+  copyKeptOf,
   finishCommittedSteps,
+  fromRel,
   inspectMarker,
   inspectMarkers,
+  keptCopiesLeft,
+  lookNow,
   markerPaths,
   recordResolve,
   removeMarker,
   undoEntries,
   type MarkerInspection,
   type MarkerStatus,
+  type UndoCause,
 } from "./txn.js";
 
 export type PendingWriteChoice = "roll-back" | "keep";
@@ -55,6 +63,16 @@ export interface PendingWrite {
   detail?: string;
   /** Steps the marker records. */
   steps: number;
+  /**
+   * FR-736: the latest attempt to undo it was not complete: its state, and what kept each path from being undone with
+   * the library-relative path (R503 d: shown in this list only, for the researcher to find the file).
+   */
+  rollback?: IncompleteRollback;
+  causes?: UndoCause[];
+  /** R509: it can be closed as it is (its undo can never complete); `lost` says what closing leaves lost. */
+  canClose: boolean;
+  /** Each path whose original cannot be put back: what stands there now, and the source it belongs to when known. */
+  lost?: Array<{ path: string; now: "nothing" | "a file" | "something else" | "could-not-look"; sourceId?: string }>;
 }
 
 /** The choices a marker allows (R131 a, b): none for an invalid or unverifiable marker. */
@@ -74,7 +92,7 @@ async function anchorsOf(core: RepoCore): Promise<(projectId: string) => Head | 
 const NO_CHOICE =
   "The app cannot confirm whether this change was finished, so it will change nothing itself. Restoring the project from a backup made before the change is the safe way on.";
 
-function view(i: MarkerInspection, writable: boolean): PendingWrite {
+async function view(core: RepoCore, i: MarkerInspection, writable: boolean): Promise<PendingWrite> {
   const a = writable ? allowed(i) : [];
   const detail = !writable
     ? `${i.detail ? `${i.detail}; ` : ""}this library is open read-only here, so nothing can be resolved (the change may still be in progress on the computer that has the library open)`
@@ -89,13 +107,79 @@ function view(i: MarkerInspection, writable: boolean): PendingWrite {
     canRollBack: a.includes("roll-back"),
     ...(detail ? { detail } : {}),
     steps: i.marker?.entries.length ?? 0,
+    ...incompleteOf(core, i.txn),
+    ...(await closeOf(core, i, writable)),
   };
+}
+
+/** R509: whether it can be closed as it is here, and what that leaves lost. */
+async function closeOf(core: RepoCore, i: MarkerInspection, writable: boolean): Promise<Pick<PendingWrite, "canClose" | "lost">> {
+  if (!writable || !closable(core, i)) return { canClose: false };
+  const lost = await lostOf(core, i);
+  return { canClose: !(await keptCopiesLeft(core.root, i.marker!)), lost };
+}
+
+/** The state of an incomplete attempt to undo a change (R528: the worst thing true of it). */
+export const stateOf = (a: RollbackAttempt): IncompleteRollback => incompleteRollbackOf(a.causes, a.stepFailed, a.copyKept === true);
+
+/**
+ * FR-736, R528 M5: the detail of an incomplete undo (the command line prints it; the screens say the shared sentence of
+ * the state), true of its state: never a retry where retrying cannot help. `origin`: undone at the library's opening, or
+ * the change's own undo in the running app.
+ */
+const DETAIL_AFTER: Record<IncompleteRollback, string> = {
+  "try-again": "; the marker is kept and recovery is retried on the next open",
+  "could-not-read":
+    ", because the app could not read a file; the marker is kept, and recovery is retried on the next open or by rolling it back in the app's list of interrupted changes, which names the file",
+  "in-the-way":
+    ", because a file changed or put there outside the app is in the way; the marker is kept, and the roll-back completes once that file is moved away (the app's list of interrupted changes names it)",
+  lost: ": the copy the app kept of a file it removed is gone, so that file cannot be put back; the marker is kept until the change is closed in the app's list of interrupted changes",
+  // R527: true whether or not something stands at the place (it says nothing of what is there).
+  unconfirmed:
+    ": the copy the app kept of a file it removed is gone, so that file cannot be put back; the marker is kept until the change is closed in the app's list of interrupted changes",
+  "lost-and-blocked":
+    ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the roll-back (the app's list of interrupted changes names it); the marker is kept, and once that is dealt with, that list says whether the change can be closed as it is",
+  "lost-copy-stuck":
+    ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and the app keeps a copy of another file of the change that it cannot put back either; the marker is kept, and restoring the project from a backup made before the change is the way to undo it",
+};
+export const incompleteDetail = (state: IncompleteRollback, origin: "open" | "in-process"): string =>
+  `${origin === "open" ? "a change interrupted before it was audited" : "a change that failed"} could only be partly rolled back${DETAIL_AFTER[state]}`;
+
+/**
+ * R528 I2: records an incomplete attempt to undo `txn` and brings its standing warning up to date with it (the banner
+ * says the state of the latest attempt, as the list does): its state, its causes and, for the command line, its detail.
+ */
+export function noteAttempt(core: RepoCore, txn: string, attempt: RollbackAttempt): void {
+  core.rollbackAttempts.set(txn, attempt);
+  const state = stateOf(attempt);
+  for (const w of core.integrityWarnings) {
+    if (w.rollback === undefined || !w.detail.includes(`transaction ${txn}`)) continue;
+    if (w.kind !== "rolled-back-incomplete-write" && w.kind !== "incomplete-write-pending") continue;
+    w.rollback = state;
+    if (attempt.causes.length) w.causes = attempt.causes;
+    else delete w.causes;
+    if (w.kind === "rolled-back-incomplete-write") {
+      const at = w.detail.indexOf(" (transaction ");
+      const origin = w.detail.startsWith("a change that failed") ? "in-process" : "open";
+      w.detail = `${incompleteDetail(state, origin)}${at >= 0 ? w.detail.slice(at) : ` (transaction ${txn})`}`;
+    }
+  }
+}
+
+/** FR-736: the state and causes of the latest incomplete attempt to undo `txn`, when there was one. */
+function incompleteOf(core: RepoCore, txn: string): Pick<PendingWrite, "rollback" | "causes"> {
+  const a = core.rollbackAttempts.get(txn);
+  return a ? { rollback: stateOf(a), causes: a.causes } : {};
 }
 
 /** Every unresolved interrupted change, with the choices it allows. Reads only (read-only libraries too, with no choices). */
 export function pendingWrites(core: RepoCore): Promise<PendingWrite[]> {
   const writable = core.library.mode === "read-write";
-  return core.serial(async () => (await inspectMarkers(core.root, await anchorsOf(core))).map((i) => view(i, writable)));
+  return core.serial(async () => {
+    const out: PendingWrite[] = [];
+    for (const i of await inspectMarkers(core.root, await anchorsOf(core))) out.push(await view(core, i, writable));
+    return out;
+  });
 }
 
 const folderOf = (rel: string) => posix.normalize(rel.replaceAll("\\", "/")).toLowerCase();
@@ -151,15 +235,21 @@ async function carryOut(
   const rec = m.resolve!;
   if (!i.resolveAudited) {
     maybeCrash("before-changes");
-    const done = choice === "keep" ? await finishCommittedSteps(core.root, m) : await undoEntries(core.root, m.entries);
-    if (!done) {
+    const undone = choice === "keep" ? { ok: await finishCommittedSteps(core.root, m), causes: [] } : await undoEntries(core.root, m.entries);
+    if (!undone.ok) {
+      // FR-736: the answer says the state of the undo; the list says what is in the way, from this attempt.
+      const stepFailed = "stepFailed" in undone && undone.stepFailed === true;
+      const attempt: RollbackAttempt = { causes: undone.causes, stepFailed, ...((await copyKeptOf(core.root, m, { causes: undone.causes, ...(stepFailed ? { stepFailed } : {}) })) ? { copyKept: true as const } : {}) };
+      if (choice === "roll-back") noteAttempt(core, m.txn, attempt);
       throw new PendingWriteIncompleteError(
         m.txn,
         choice === "keep"
           ? "The change could not be finished: files it destroyed could not be overwritten yet. The choice is recorded; try again, or reopen the library."
-          : "The change could not be undone completely: a step failed. The choice is recorded; try again, or reopen the library.",
+          : ROLLBACK_INCOMPLETE_ANSWER[stateOf(attempt)],
+        undone.causes,
       );
     }
+    core.rollbackAttempts.delete(m.txn);
     maybeCrash("before-audit");
     // A txn.resolve line torn by an earlier attempt would refuse every append after it (41a N1).
     const trimmed = await trimTornAuditLine(core, m.projectFolder);
@@ -187,51 +277,234 @@ export async function resolvePendingWrite(core: RepoCore, txn: string, choice: P
     // Set inside the audit step (a closure), so declared without narrowing.
     let held = undefined as ReturnType<typeof checkAnchor> | undefined;
     await carryOut(core, i, choice, async (details) => {
-      // What is in memory was read with the change half there: read the project again from disk (its
-      // sources, project data and audit log, which a rollback truncates back to the change's start).
-      const fresh = await loadProjectFolder(core, st.rel.slice("Projects/".length));
-      if (fresh) Object.assign(st, { project: fresh.st.project, data: fresh.st.data, audit: fresh.st.audit, sources: fresh.st.sources, manifest: fresh.st.manifest });
-      const events = fresh?.events ?? (await AuditStore.read(st.audit.dir));
-      const problem = checkAnchor(events, verifyChain(events as AuditEvent[]), anchorOf(st.project.id), core.device);
-      const at = core.clock().toISOString();
-      await st.audit.append({ ...core.auditBase(st, at), action: "txn.resolve", entity: { type: "project", id: st.project.id }, details });
-      // Never past a mismatch (R131 d): the next open records it first, then anchors again.
-      if (problem) held = problem;
-      else await core.updateAnchor(st, at);
+      held = await appendResolve(core, st, anchorOf, details);
     });
-    // Its warnings are settled.
-    for (let k = core.integrityWarnings.length - 1; k >= 0; k--) if (core.integrityWarnings[k]!.detail.includes(`transaction ${txn}`)) core.integrityWarnings.splice(k, 1);
-    // An incomplete line the rollback removed no longer holds the project (M1).
-    const stillIncomplete = new Set((await scanIncompleteLines(core.root, st.rel, false)).map((l) => l.file));
-    for (let k = core.integrityWarnings.length - 1; k >= 0; k--) {
-      const w = core.integrityWarnings[k]!;
-      if (w.projectId === st.project.id && w.kind === "incomplete-audit-line-pending" && w.file !== undefined && !stillIncomplete.has(w.file)) core.integrityWarnings.splice(k, 1);
-    }
-    if (held) {
-      core.integrityWarnings.push({
-        projectId: st.project.id,
-        kind: held.kind,
-        detail: `${held.detail}; the interrupted change was resolved, and this project takes changes again once the library is reopened, which records this first`,
-      });
-    }
-    // Writes resume unless something else still holds the project.
-    const left = (await inspectMarkers(core.root, () => undefined)).filter((x) => namesProject(x, st));
-    const others = left.length > 0;
-    // Only what the markers still pending name stays half changed; the rest is said no more (R473 I1).
-    st.unfinished = new Set(left.flatMap((x) => (x.marker ? markerPaths(x.marker) : [])));
-    for (let k = core.integrityWarnings.length - 1; k >= 0; k--) {
-      const w = core.integrityWarnings[k]!;
-      const folder = w.file;
-      if (w.projectId === st.project.id && w.kind.startsWith("source-change-unfinished") && folder !== undefined && ![...st.unfinished].some((p) => p === folder || p.startsWith(`${folder}/`))) {
-        core.integrityWarnings.splice(k, 1);
-      }
-    }
-    const otherBlocks = core.integrityWarnings.some(
-      (w) => w.projectId === st.project.id && (w.kind === "incomplete-audit-line-pending" || w.kind === "audit-append-failed-at-open"),
-    );
-    if (!others && !otherBlocks && !held) st.recoveryPending = false;
+    await afterResolved(core, st, txn, held);
     return { txn, choice, projectId: st.project.id };
   });
+}
+
+/**
+ * The `txn.resolve` event in the project's log, once the change is resolved on disk: what is in memory was read with
+ * the change half there, so the project is read again from disk first (its sources, data and audit log, which a
+ * rollback truncates back to the change's start). Returns the anchor problem that holds the anchor (R131 d), if any.
+ */
+async function appendResolve(
+  core: RepoCore,
+  st: ProjectState,
+  anchorOf: (projectId: string) => Head | undefined,
+  details: Record<string, unknown>,
+  decision?: { result: "allow" },
+): Promise<ReturnType<typeof checkAnchor> | undefined> {
+  const fresh = await loadProjectFolder(core, st.rel.slice("Projects/".length));
+  if (fresh) Object.assign(st, { project: fresh.st.project, data: fresh.st.data, audit: fresh.st.audit, sources: fresh.st.sources, manifest: fresh.st.manifest });
+  const events = fresh?.events ?? (await AuditStore.read(st.audit.dir));
+  const problem = checkAnchor(events, verifyChain(events as AuditEvent[]), anchorOf(st.project.id), core.device);
+  const at = core.clock().toISOString();
+  await st.audit.append({ ...core.auditBase(st, at), action: "txn.resolve", entity: { type: "project", id: st.project.id }, ...(decision ? { decision } : {}), details });
+  // Never past a mismatch (R131 d): the next open records it first, then anchors again.
+  if (problem) return problem;
+  await core.updateAnchor(st, at);
+  return undefined;
+}
+
+/** After a change is resolved (or closed): its warnings are settled, and writes resume unless something else holds the project. */
+async function afterResolved(core: RepoCore, st: ProjectState, txn: string, held: ReturnType<typeof checkAnchor> | undefined): Promise<void> {
+  core.rollbackAttempts.delete(txn);
+  // Its warnings are settled.
+  for (let k = core.integrityWarnings.length - 1; k >= 0; k--) if (core.integrityWarnings[k]!.detail.includes(`transaction ${txn}`)) core.integrityWarnings.splice(k, 1);
+  // An incomplete line the rollback removed no longer holds the project (M1).
+  const stillIncomplete = new Set((await scanIncompleteLines(core.root, st.rel, false)).map((l) => l.file));
+  for (let k = core.integrityWarnings.length - 1; k >= 0; k--) {
+    const w = core.integrityWarnings[k]!;
+    if (w.projectId === st.project.id && w.kind === "incomplete-audit-line-pending" && w.file !== undefined && !stillIncomplete.has(w.file)) core.integrityWarnings.splice(k, 1);
+  }
+  if (held) {
+    // R528 M3: the refusal of a write then says that opening the library again is the way. R530: so does its warning,
+    // a kind of its own (the anchor kind's sentence says why, not what to do); the next opening raises the anchor's own.
+    st.reopenToResume = true;
+    core.integrityWarnings.push({
+      projectId: st.project.id,
+      kind: "interrupted-change-resolved-reopen",
+      detail: `an interrupted change was resolved, but ${held.detail}; this is recorded the next time the library is opened, and this project refuses changes until then: close the library and open it again`,
+    });
+  }
+  // Writes resume unless something else still holds the project.
+  const left = (await inspectMarkers(core.root, () => undefined)).filter((x) => namesProject(x, st));
+  const others = left.length > 0;
+  // Only what the markers still pending name stays half changed; the rest is said no more (R473 I1).
+  st.unfinished = new Set(left.flatMap((x) => (x.marker ? markerPaths(x.marker) : [])));
+  for (let k = core.integrityWarnings.length - 1; k >= 0; k--) {
+    const w = core.integrityWarnings[k]!;
+    const folder = w.file;
+    if (w.projectId === st.project.id && w.kind.startsWith("source-change-unfinished") && folder !== undefined && ![...st.unfinished].some((p) => p === folder || p.startsWith(`${folder}/`))) {
+      core.integrityWarnings.splice(k, 1);
+    }
+  }
+  const otherBlocks = core.integrityWarnings.some(
+    (w) => w.projectId === st.project.id && (w.kind === "incomplete-audit-line-pending" || w.kind === "audit-append-failed-at-open"),
+  );
+  if (!others && !otherBlocks && !held) st.recoveryPending = false;
+}
+
+/** R509: why a change cannot be closed as it is (plain words). */
+const NOT_CLOSABLE = "Only a change that can never be undone completely can be closed as it is; this one can still be rolled back.";
+/** R528: a copy is gone, and something the researcher can deal with also stops the undo: that first. */
+const NOT_CLOSABLE_YET =
+  "This change cannot be closed yet: something else still stops its undo. Deal with what the list names first, then choose “Roll it back” again.";
+/**
+ * R509: whether the list offers to close this change as it is: an uncommitted change (no other choice recorded) whose
+ * latest undo was incomplete ONLY for causes that can never pass (the kept copy of a removed file is gone).
+ */
+function closable(core: RepoCore, i: MarkerInspection): boolean {
+  if (i.status !== "uncommitted" || i.resolveAudited || !i.marker) return false;
+  if (i.marker.resolve && i.marker.resolve.choice !== "roll-back") return false;
+  const a = core.rollbackAttempts.get(i.txn);
+  return a !== undefined && CLOSABLE_ROLLBACK.has(stateOf(a));
+}
+
+/**
+ * R528 M7: a place whose file could not be put back, as the close's audit entry records it: the source's id and the
+ * file's role in it (as the project's audit entries record a file: ids and kinds, never a name), never the path, which
+ * holds the source's folder name and so its short title (an audit log is exported and shown on its own). The role is
+ * read from where the file stands in the source's folder (`original/`, `derived/`, its record, its annotations, the
+ * folder itself), so it is known while an encrypted project is locked; a place outside every source is "other".
+ */
+function auditedPlace(st: ProjectState, path: string): { source?: string; role: string } {
+  const hit = [...st.sources].find(([, f]) => path === f || path.startsWith(`${f}/`));
+  if (!hit) return { role: "other" };
+  const [source, folder] = hit;
+  const rest = path === folder ? "" : path.slice(folder.length + 1);
+  const role =
+    rest === ""
+      ? "folder"
+      : rest.startsWith("original/")
+        ? "original"
+        : rest.startsWith("derived/")
+          ? "derived"
+          : rest === "source.json" || rest === "source.json.enc"
+            ? "record"
+            : rest === "annotations.json" || rest === "annotations.json.enc"
+              ? "annotations"
+              : "other";
+  return { source, role };
+}
+
+/** What closing would leave as lost: each path whose original cannot be put back, what is there now, and its source. */
+async function lostOf(core: RepoCore, i: MarkerInspection): Promise<NonNullable<PendingWrite["lost"]>> {
+  const st = core.projects.get(i.projectId);
+  const out: NonNullable<PendingWrite["lost"]> = [];
+  for (const c of core.rollbackAttempts.get(i.txn)?.causes ?? []) {
+    if (c.kind !== "kept-copy-gone") continue;
+    // R528 M8: "nothing" only where the app looked and found nothing; the source named also when the place IS its folder.
+    const now = await lookNow(core.root, c.path);
+    const sourceId = st ? [...st.sources].find(([, f]) => c.path === f || c.path.startsWith(`${f}/`))?.[0] : undefined;
+    out.push({ path: c.path, now, ...(sourceId ? { sourceId } : {}) });
+  }
+  return out;
+}
+
+/**
+ * R509 (FR-736): closes, as it is, an interrupted change whose undo can never complete. Decided by the policy engine
+ * against the project's rules (a refusal, which the project's log cannot take while the change holds it, is recorded
+ * in the library's log); then, as the list's other choice does (R131 c): the choice is recorded in the marker first
+ * (a roll-back, marked `close`, which an older build reads as a roll-back), the undo is run once more (repeatable) so
+ * that everything of the change that CAN be undone is, the `txn.resolve` event is appended with what could not be put
+ * back, and the marker goes. Nothing is deleted: what stands at each path stays, and a copy the app still keeps of
+ * the change refuses the close. The project then takes changes again, and a warning says what was lost.
+ */
+export async function closePendingWrite(core: RepoCore, txn: string, projectId: string): Promise<{ txn: string; projectId: string }> {
+  core.assertWritable();
+  return core.serial(async () => {
+    core.assertWritable();
+    if (typeof txn !== "string" || !TXN.test(txn)) throw new NotFoundError("Interrupted change", String(txn));
+    const present = (await inspectMarkers(core.root, () => undefined)).some((i) => i.txn === txn);
+    if (!present) throw new NotFoundError("Interrupted change", txn);
+    const anchorOf = await anchorsOf(core);
+    const i = await inspectMarker(core.root, txn, anchorOf);
+    // Named with the project the screen showed: never another project's change by a stale or wrong address.
+    if (i.projectId !== projectId) throw new NotFoundError("Interrupted change", txn);
+    if (!closable(core, i)) {
+      // R528 M2: refused in the words of what is true: a copy still kept with nothing left to do, or something to deal with first.
+      const a = core.rollbackAttempts.get(txn);
+      const state = a ? stateOf(a) : undefined;
+      if (state === "lost-copy-stuck") throw new PendingWriteIncompleteError(txn, CLOSE_COPIES_LEFT_TEXT);
+      throw new PendingWriteChoiceError(txn, allowed(i), state === "lost-and-blocked" ? NOT_CLOSABLE_YET : NOT_CLOSABLE);
+    }
+    const m = i.marker!;
+    const st = core.projects.get(m.projectId);
+    if (!st) throw new NotFoundError("Project", m.projectId);
+    if (await keptCopiesLeft(core.root, m)) throw new PendingWriteIncompleteError(txn, CLOSE_COPIES_LEFT_TEXT);
+    await decideClose(core, st, txn);
+    if (!m.resolve?.close) await recordResolve(core.root, m, { choice: "roll-back", status: "uncommitted", at: core.clock().toISOString(), close: true });
+    maybeCrash("before-changes");
+    const undone = await undoEntries(core.root, m.entries);
+    const attempt: RollbackAttempt = { causes: undone.causes, stepFailed: undone.stepFailed === true, ...((await copyKeptOf(core.root, m, undone)) ? { copyKept: true as const } : {}) };
+    const state = undone.ok ? undefined : stateOf(attempt);
+    if (state !== undefined && !CLOSABLE_ROLLBACK.has(state)) {
+      noteAttempt(core, txn, attempt);
+      throw new PendingWriteIncompleteError(txn, ROLLBACK_INCOMPLETE_ANSWER[state], undone.causes);
+    }
+    if (await keptCopiesLeft(core.root, m)) throw new PendingWriteIncompleteError(txn, CLOSE_COPIES_LEFT_TEXT);
+    const gone = undone.causes.filter((c) => c.kind === "kept-copy-gone");
+    const notPutBack = gone.map((c) => auditedPlace(st, c.path));
+    maybeCrash("before-audit");
+    const trimmed = await trimTornAuditLine(core, m.projectFolder);
+    const held = await appendResolve(
+      core,
+      st,
+      anchorOf,
+      { txn, choice: "close", status: "uncommitted", steps: m.entries.length, notPutBack, ...(trimmed ? { trimmedIncompleteLine: trimmed } : {}) },
+      { result: "allow" },
+    );
+    maybeCrash("before-marker-delete");
+    await removeMarker(core.root, m);
+    await afterResolved(core, st, txn, held);
+    // What was lost is said until the researcher dismisses it (FR-729); no path here (R503 d: the audit log names it).
+    // R527: where something stood at every such place, the warning never says the file is lost (its state says so).
+    if (notPutBack.length) {
+      const unconfirmed = incompleteRollbackOf(gone, false) === "unconfirmed";
+      await keepWarning(core, {
+        projectId: st.project.id,
+        kind: "interrupted-change-closed",
+        detail: "an interrupted change was closed as it was; a file it had removed could not be put back",
+        ...(unconfirmed ? { rollback: "unconfirmed" as const } : {}),
+      });
+    }
+    return { txn, projectId: st.project.id };
+  });
+}
+
+/**
+ * The policy engine's decision on closing (`close-change`), against the project's rules as written; a file that cannot
+ * be read or parsed refuses (fail closed). A refusal is recorded in the library's audit log, since the project's own
+ * log cannot take an entry while the interrupted change holds it (an entry after the change's start would make its
+ * undo unverifiable), and thrown; nothing else is written.
+ */
+async function decideClose(core: RepoCore, st: ProjectState, txn: string): Promise<void> {
+  const at = core.clock().toISOString();
+  let decision: { result: "allow" } | { result: "deny"; reason: string };
+  try {
+    const raw = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
+    if (!raw) throw new Error("governance.yaml is missing");
+    const d = evaluate(parseGovernance(raw.toString("utf8")), { action: "close-change", projectId: st.project.id, actor: core.actor, now: at, tz: core.zoneOf(st.project) });
+    decision = d.result === "deny" ? { result: "deny", reason: d.reason } : { result: "allow" };
+  } catch (e) {
+    // Never the error's own message here: it can name an absolute path.
+    decision = { result: "deny", reason: `Policy could not be evaluated (${e instanceof Error ? e.name : "error"})` };
+  }
+  if (decision.result === "allow") return;
+  await appendLibraryAudit(core, {
+    at,
+    actor: core.actor,
+    device: core.device,
+    projectId: st.project.id,
+    action: "close-change",
+    entity: { type: "project", id: st.project.id },
+    decision,
+    details: { op: "txn.close", txn },
+  });
+  throw new PolicyDeniedError(decision.reason, "close-change");
 }
 
 /**

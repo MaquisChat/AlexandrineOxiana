@@ -293,7 +293,6 @@ describe("the register of a watched folder (Task W3)", () => {
           repo = await repoFor();
           if (encrypted) await repo.unlockProject(p.id, "pw");
           const kinds = repo.integrityWarnings.filter((x) => x.projectId === p.id).map((x) => x.kind);
-          expect(kinds).not.toContain("changed-outside-before-rollback");
           expect(kinds).not.toContain("txn-recovery-skipped-audit-unverifiable");
           expect(await txnMarkers()).toEqual([]);
           const cutKept = change === "add" || point === "before-marker-delete";

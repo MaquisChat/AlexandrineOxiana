@@ -39,6 +39,7 @@
  */
 
 /** Where an entry of the queue stands (the library's FindState). */
+import { RECOVERY_PENDING_REOPEN_TEXT, RECOVERY_PENDING_TEXT } from "./interrupted-changes.js";
 export const FIND_STATES = [
   "looking-up",
   "choose",
@@ -146,7 +147,7 @@ export const FIND_REASON_TEXT: Record<FindReasonCode, string> = {
 };
 
 /** Why nothing is done for a project's queue now (the library's FindStoppedFor). */
-export const FIND_STOPPED_CODES = ["rules-unreadable", "queue-unreadable", "read-only", "recovery-pending", "index-not-ready", "index-needs-rebuild", "unexpected"] as const;
+export const FIND_STOPPED_CODES = ["rules-unreadable", "queue-unreadable", "read-only", "recovery-pending", "reopen-pending", "index-not-ready", "index-needs-rebuild", "unexpected"] as const;
 export type FindStoppedCode = (typeof FIND_STOPPED_CODES)[number];
 
 /** The one sentence for each, shown once above the queue. `queue-unreadable` is the queue store's own sentence. */
@@ -154,7 +155,10 @@ export const FIND_STOPPED_TEXT: Record<FindStoppedCode, string> = {
   "rules-unreadable": "This project's rules could not be read, so nothing is looked up.",
   "queue-unreadable": "The Find and acquire queue of this project could not be read. Nothing has been changed.",
   "read-only": "This library is open read-only, so nothing is looked up.",
-  "recovery-pending": "This project is waiting for the library to be reopened before anything can be written.",
+  // FR-736: the service's own refusal, word for word; never "reopen", which cannot help while the cause stands.
+  "recovery-pending": RECOVERY_PENDING_TEXT,
+  // R528 M3: held for a reason that opening the library again lifts.
+  "reopen-pending": RECOVERY_PENDING_REOPEN_TEXT,
   /** Only while a rebuild is really running (R247 b). */
   "index-not-ready": "The library's index is being rebuilt. Looking up starts when it is ready.",
   /** The index cannot be trusted and no rebuild is running (a change could not be indexed; a rebuild failed). R247 b. */

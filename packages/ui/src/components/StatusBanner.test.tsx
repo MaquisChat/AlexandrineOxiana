@@ -174,7 +174,8 @@ describe("StatusBanner", () => {
       "recovery-code-unshown", "recovery-staging-discarded", "recovery-staging-unverifiable",
       "audit-unrecorded", "permissions-not-set", "audit-recorded-late", "refusal-unrecorded",
       "audit-unrecorded-blocked", "attention-unreadable", "audit-waiting",
-      "source-change-unfinished", "source-change-unfinished-read-only", "changed-outside-before-rollback",
+      "source-change-unfinished", "source-change-unfinished-read-only", "interrupted-change-closed", "recovery-warnings-set-aside",
+      "interrupted-change-resolved-reopen",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();
@@ -189,8 +190,9 @@ describe("StatusBanner", () => {
 });
 
 describe("R484 f: changes to sources that did not finish and could not be undone: one banner per project and kind", () => {
-  const ONE = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. Close the library and open it again to put it back.";
-  const SEVERAL = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. Close the library and open it again to put them back.`;
+  // FR-736: no "close the library and open it again", which cannot help while a file is in the way (these asserted it).
+  const ONE = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. Choose “Resolve…” to see what can be done.";
+  const SEVERAL = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. Choose “Resolve…” to see what can be done.`;
   const ONE_RO = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. It can be put back only when the library is opened for changes.";
   const SEVERAL_RO = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. They can be put back only when the library is opened for changes.`;
   const w = (projectId: string, project: string, kind: string, n: number) =>
@@ -230,22 +232,117 @@ describe("R484 f: changes to sources that did not finish and could not be undone
   });
 
   it("the sentence with \"this source\" stays the library's own, for the source itself", () => {
-    expect(SOURCE_CHANGE_UNFINISHED).toBe("A change to this source did not finish and could not be undone. Close the library and open it again to put it back.");
+    expect(SOURCE_CHANGE_UNFINISHED).toBe("A change to this source did not finish and could not be undone. The app's list of interrupted changes says what can be done.");
     expect(SOURCE_CHANGE_UNFINISHED_READ_ONLY).toBe("A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.");
   });
 });
 
-describe("R479 a, R484 b: a file changed outside the app while an unfinished change waited to be undone", () => {
-  const SENTENCE =
-    "A file in Dissertation <b>2</b> was changed outside the app while a change the app had not finished was waiting to be undone. When the library opened, the app undid its unfinished change, and the outside change to that file was not kept.";
-  it("says the ruled sentence on the banner, the project's name shown as text, never the file or the detail", () => {
-    const detail = "transaction 7f3a: /Users/rana/Thesis library/Sources/x/source.json";
-    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: "Dissertation <b>2</b>", kind: "changed-outside-before-rollback", detail }] });
-    render(<StatusBanner variant={b!} />);
+describe("FR-736: an interrupted change whose undo is not complete says the state it is in", () => {
+  const P = "Dissertation <b>2</b>";
+  const SAYS = {
+    "try-again": `An interrupted change in ${P} could not be undone completely: a step failed. Nothing was lost; the app keeps what it needs to finish. Changes to ${P} are off until it is undone. Choose “Resolve…” to try again.`,
+    "in-the-way": `An interrupted change in ${P} could not be undone completely, because a file changed or put there outside the app is in the way. Nothing was lost. Changes to ${P} are off until it is undone. Choose “Resolve…” to see which file to move.`,
+    lost: `An interrupted change in ${P} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. That file is lost. Changes to ${P} are off until you close the change. Choose “Resolve…” to see what was lost.`,
+    // R527: the copy is gone but something stands at the place: never "that file is lost".
+    unconfirmed: `An interrupted change in ${P} cannot be undone completely: the copy the app kept of a file it removed is gone, so the app cannot put that file back. Something is at its place now, which may be that file, but the app cannot confirm it, so it left it as it is. Changes to ${P} are off until you close the change. Choose “Resolve…” to see what is there.`,
+    // R528 M4: a file that could not be read is said so, as in the list, never "a step failed".
+    "could-not-read": `An interrupted change in ${P} could not be undone completely: the app could not read a file. Nothing was lost; the app keeps what it needs to finish. Changes to ${P} are off until it is undone. Choose “Resolve…” to see which file.`,
+    // R528 I1, M2: a copy gone with something else to deal with first; and with a copy kept and nothing left to do.
+    "lost-and-blocked": `An interrupted change in ${P} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, the list says whether the change can be closed as it is. Changes to ${P} are off until then. Choose “Resolve…” to see what to do first.`,
+    "lost-copy-stuck": `An interrupted change in ${P} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. The app still keeps a copy of another file of the change, which it cannot put back either, and closing the change would let that copy go, so it cannot be closed. Changes to ${P} are off. Restoring the project from a backup made before the change is the way to undo it.`,
+  } as const;
+  for (const state of ["try-again", "in-the-way", "lost", "unconfirmed", "could-not-read", "lost-and-blocked", "lost-copy-stuck"] as const) {
+    for (const kind of ["rolled-back-incomplete-write", "incomplete-write-pending"]) {
+      it(`${kind}, ${state}: its sentence, the name as text, never the detail; "Resolve…" opens the list`, async () => {
+        const detail = "transaction 7f3a: Projects/P/sources/x/kept.txt";
+        const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: P, kind, detail, state }] });
+        const onResolve = vi.fn();
+        render(<StatusBanner variant={b!} onResolve={onResolve} />);
+        const status = screen.getByRole("status");
+        expect(status.querySelector("span")!.textContent).toBe(SAYS[state]);
+        expect(status.querySelector("b")).toBeNull();
+        expect(status.textContent).not.toContain("kept.txt");
+        await userEvent.click(screen.getByRole("button", { name: `Resolve the interrupted change in ${P}…` }));
+        expect(onResolve).toHaveBeenCalledTimes(1);
+        cleanup();
+      });
+    }
+  }
+
+  it("R529: a change left as it is because its audit log could not be checked: never \"tried again\"; a backup is the way; only \"Resolve…\" to see it", () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: P, kind: "txn-recovery-skipped-audit-unverifiable", detail: "x" }] });
+    render(<StatusBanner variant={b!} onResolve={() => undefined} onDismissWarning={() => undefined} />);
     const status = screen.getByRole("status");
-    expect(status.textContent).toBe(SENTENCE);
-    expect(status.querySelector("b")).toBeNull();
-    expect(status.textContent).not.toContain("7f3a");
+    expect(status.querySelector("span")!.textContent).toBe(
+      `An interrupted change in ${P} was left as it is, because its audit log could not be checked first. The app cannot undo it safely. Restoring a backup made before the change is the way to undo it.`,
+    );
+    expect(screen.getAllByRole("button").map((x) => x.textContent)).toEqual(["Resolve…"]);
+  });
+
+  it("R530: a change resolved while its audit log does not match this computer's record: what to do (close and open again), the name isolated, nothing to press", () => {
+    const name = "مقابلات هرات";
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: name, kind: "interrupted-change-resolved-reopen", detail: "x" }] });
+    render(<StatusBanner variant={b!} onResolve={() => undefined} onDismissWarning={() => undefined} />);
+    const status = screen.getByRole("status");
+    expect(status.querySelector("span")!.textContent).toBe(
+      `An interrupted change in ${name} was resolved, but ${name}'s audit log may have been changed outside the app. The app records this the next time the library is opened, and changes to ${name} are off until then: close the library and open it again.`,
+    );
+    expect([...status.querySelectorAll("[dir=auto]")].map((el) => el.textContent)).toEqual([name, name, name]);
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("a complete undo keeps its sentence, and offers nothing to resolve", () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: "P", kind: "rolled-back-incomplete-write", detail: "x" }] });
+    render(<StatusBanner variant={b!} onResolve={() => undefined} />);
+    expect(screen.getByRole("status").textContent).toBe("An interrupted change in P was undone when the library opened, so nothing half-saved was kept.");
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("R509: a change closed as it was says what was lost, and where it is recorded, never the file", () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: P, kind: "interrupted-change-closed", detail: "1 file(s) (transaction 7f3a)" }] });
+    render(<StatusBanner variant={b!} onResolve={() => undefined} />);
+    expect(screen.getByRole("status").querySelector("span")!.textContent).toBe(
+      `An interrupted change in ${P} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone: that file is lost. The closing is recorded in the audit log of ${P}.`,
+    );
+    expect(screen.queryByRole("button", { name: /Resolve/ })).toBeNull();
+  });
+
+  it("R527: a change closed as it was, where something stood at the place, never says the file is lost", () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: P, kind: "interrupted-change-closed", detail: "x", state: "unconfirmed" }] });
+    render(<StatusBanner variant={b!} onResolve={() => undefined} />);
+    expect(screen.getByRole("status").querySelector("span")!.textContent).toBe(
+      `An interrupted change in ${P} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone; the app could not confirm that what is at its place is that file. The closing is recorded in the audit log of ${P}.`,
+    );
+    expect(screen.queryByRole("button", { name: /Resolve/ })).toBeNull();
+  });
+
+  it("a source whose change did not finish offers the list, where what can be done is said", async () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: "P", kind: "source-change-unfinished", detail: "x" }] });
+    const onResolve = vi.fn();
+    render(<StatusBanner variant={b!} onResolve={onResolve} />);
+    await userEvent.click(screen.getByRole("button", { name: "Resolve the interrupted change in P…" }));
+    expect(onResolve).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("FR-729: a warning kept with the library until dismissed", () => {
+  const warning = { projectId: "p1", project: "Dissertation <b>2</b>", kind: "rolled-back-incomplete-write", detail: "x", keptId: "019a7000-0000-7000-8000-0000000000k1" };
+  it("offers \"Dismiss\", named for its project, which asks once for its id", async () => {
+    const [b] = bannersFor({ integrityWarnings: [warning] });
+    const onDismissWarning = vi.fn();
+    render(<StatusBanner variant={b!} onDismissWarning={onDismissWarning} />);
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss this warning about Dissertation <b>2</b>" }));
+    expect(onDismissWarning).toHaveBeenCalledWith(warning.keptId);
+    expect(screen.getByRole("status").querySelector("b")).toBeNull();
+  });
+  it("offers nothing to dismiss where the screen gives no way to (a read-only library), nor for a warning not kept", () => {
+    const [b] = bannersFor({ integrityWarnings: [warning] });
+    const { unmount } = render(<StatusBanner variant={b!} />);
+    expect(screen.queryByRole("button")).toBeNull();
+    unmount();
+    const [c] = bannersFor({ integrityWarnings: [{ ...warning, keptId: undefined }] });
+    render(<StatusBanner variant={c!} onDismissWarning={() => undefined} />);
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });
 
