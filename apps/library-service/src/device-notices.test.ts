@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deviceDeps, deviceNoticesIdle, raiseDeviceNotice, type Deps } from "@ao/library";
 import { createService, type LibraryService } from "./server.js";
 
@@ -168,5 +168,71 @@ describe("watched folders that cannot be read when a library opens (review round
     expect(w!.detail).not.toContain(tmp);
     // A session warning, not a stored notice.
     expect((await stateNow()).notices).toEqual([]);
+  });
+});
+
+describe("FR-720: the warning that the watched folders were not started clears when the list can be read again", () => {
+  const GOV = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [manual_upload]\n";
+  const warned = () => (svc!.state.libraryState() as { integrityWarnings: Array<{ kind: string }> }).integrityWarnings.some((w) => w.kind === "watched-folders-unreadable");
+
+  /** A library with two projects, opened while this computer's list of watched folders cannot be read. */
+  async function openedUnreadable(): Promise<string[]> {
+    await start();
+    await openLibrary();
+    const ids: string[] = [];
+    for (const name of ["P", "Q"]) {
+      const p = await call({ method: "POST", url: "/projects", body: { name, governanceYaml: GOV, encryption: { enabled: false } } });
+      expect(p.status, p.body).toBe(200);
+      ids.push(p.json.project.id as string);
+    }
+    await mkdir(join(deps.appConfigDir, "watched-folders.json"));
+    await start();
+    await openLibrary();
+    await svc!.state.idle();
+    expect(warned()).toBe(true);
+    for (const id of ids) expect(svc!.state.session!.watches.has(id)).toBe(false);
+    return ids;
+  }
+
+  it("the next successful read of the list starts every project's watches, the opening's way, and takes the warning away", async () => {
+    const ids = await openedUnreadable();
+    // Still unreadable: the read fails, nothing starts, the warning stays.
+    expect((await call({ url: `/projects/${ids[0]}/watched-folders` })).status).not.toBe(200);
+    await svc!.state.idle();
+    expect(warned()).toBe(true);
+    // Readable again.
+    await rm(join(deps.appConfigDir, "watched-folders.json"), { recursive: true });
+    const states: boolean[] = [];
+    const off = svc!.state.events.subscribe((e) => {
+      if (e.type === "library.state") states.push(warned());
+    });
+    const r = await call({ url: `/projects/${ids[0]}/watched-folders` });
+    await svc!.state.idle(); // the state is published once its warnings are gathered
+    off();
+    expect(r.status, r.body).toBe(200);
+    for (const id of ids) expect(svc!.state.session!.watches.has(id)).toBe(true);
+    expect(warned()).toBe(false);
+    expect(states.at(-1)).toBe(false);
+  });
+
+  it("a start that fails again leaves the warning", async () => {
+    const ids = await openedUnreadable();
+    await rm(join(deps.appConfigDir, "watched-folders.json"), { recursive: true });
+    const real = svc!.state.startWatches.bind(svc!.state);
+    const spy = vi.spyOn(svc!.state, "startWatches").mockImplementation(async (s, projectId) => {
+      if (projectId === ids[1]) throw new Error("the list could not be read again");
+      return real(s, projectId);
+    });
+    const r = await call({ url: `/projects/${ids[0]}/watched-folders` });
+    expect(r.status, r.body).toBe(200);
+    await svc!.state.idle();
+    expect(svc!.state.session!.watches.has(ids[0]!)).toBe(true);
+    expect(svc!.state.session!.watches.has(ids[1]!)).toBe(false);
+    expect(warned()).toBe(true);
+    // The next read tries the one that did not start.
+    spy.mockRestore();
+    expect((await call({ url: `/projects/${ids[1]}/watched-folders` })).status).toBe(200);
+    expect(svc!.state.session!.watches.has(ids[1]!)).toBe(true);
+    expect(warned()).toBe(false);
   });
 });

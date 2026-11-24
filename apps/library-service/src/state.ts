@@ -150,6 +150,8 @@ export interface Session {
    * Rm4): e.g. this computer's watched folders could not be read at open, so none run now.
    */
   sessionWarnings?: Array<{ kind: string; detail: string }>;
+  /** FR-720: the start of the watches that did not start at open, under way after the list could be read again. */
+  watchRestart?: Promise<void>;
   /** Find and acquire's runner (Task F5): one per open read-write library, made at `activate`; see "Find and acquire" below. */
   find?: FindRunner;
   /** The index errors already seen when the index was last known good (Task F5): a new one means it cannot be trusted. */
@@ -935,7 +937,10 @@ export class ServiceState {
     s.unsubscribe.push(proxies.onResult((r) => this.events.publish("job.progress", { kind: "proxy", ...r })));
     s.unsubscribe.push(ocr.onResult((r) => this.events.publish("job.progress", { kind: "ocr", ...r })));
     if (s.lib.mode === "read-write") {
-      for (const p of s.repo.listProjects()) this.track(this.startWatches(s, p.id), "watched folders");
+      void this.startProjectsWatches(
+        s,
+        s.repo.listProjects().map((p) => p.id),
+      );
       // A backup that came due while the app was closed is made now (R99 I7).
       this.startWork("backup", async () => {
         await this.runScheduledBackups();
@@ -974,6 +979,37 @@ export class ServiceState {
       onStatus: (st) => this.onWatchStatus?.(s, projectId, st),
       onWarning: (w) => this.opts.log.warn({ warning: scrubPaths(w, this.roots) }, "watched folders"),
     };
+  }
+
+  /**
+   * Starts the watched folders of these projects, each tracked as background work: at the library's opening (every
+   * project), and again for those that did not start then once this computer's list can be read (FR-720). True when
+   * every one started.
+   */
+  async startProjectsWatches(s: Session, projectIds: string[]): Promise<boolean> {
+    const runs = projectIds.map((id) => this.startWatches(s, id));
+    for (const r of runs) this.track(r, "watched folders");
+    return (await Promise.allSettled(runs)).every((r) => r.status === "fulfilled");
+  }
+
+  /**
+   * FR-720: this computer's list of watched folders was read successfully (the list route). When it could not be read
+   * at the opening, the watches that did not start then are started the opening's way, and once every one has, the
+   * warning that they were not started is taken away; a start that fails again leaves it. One at a time.
+   */
+  async watchedFoldersReadAgain(s: Session): Promise<void> {
+    if (this.session !== s || s.lib.mode !== "read-write" || !s.sessionWarnings?.some((w) => w.kind === WATCHED_FOLDERS_UNREADABLE)) return;
+    if (s.watchRestart) return s.watchRestart;
+    const run = (async () => {
+      const ids = s.repo.listProjects().map((p) => p.id).filter((id) => !s.watches.has(id));
+      if (!(await this.startProjectsWatches(s, ids)) || this.session !== s) return;
+      s.sessionWarnings = (s.sessionWarnings ?? []).filter((w) => w.kind !== WATCHED_FOLDERS_UNREADABLE);
+      this.publishState();
+    })().finally(() => {
+      if (s.watchRestart === run) s.watchRestart = undefined;
+    });
+    s.watchRestart = run;
+    return run;
   }
 
   /** Starts the project's watched folders (all of them; replaces any running). */
