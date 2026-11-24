@@ -7,8 +7,9 @@
 //   service     the library service folder, built with that Node first on PATH, so its native modules
 //               are darwin ones for this architecture and Node ABI
 //   build-info  the folder's build-info.json must name darwin, this architecture and the pinned Node
-//   worker      the packaged media worker (build-sidecars.mjs; the Intel build on its own pin set,
-//               packaging/constraints-macos-x86_64.txt, ADR 0014)
+//   worker      the packaged media worker (build-sidecars.mjs), each Mac on its own pin set: Apple
+//               Silicon on packaging/constraints-macos-arm64.txt (every package of the bundle, FR-730),
+//               Intel on packaging/constraints-macos-x86_64.txt (ADR 0014)
 //   notices     the helpers' notices and licence texts, and notices.mjs with --node <the pinned
 //               release's bin/node> (whose LICENSE ships, ADR 0015)
 //   interface   packages/ui/dist (it embeds the notices)
@@ -47,6 +48,7 @@ const STAGE = join(BUILD, "macos-resources");
 export const STAGE_FROM_TAURI = relative(TAURI, STAGE);
 const OUT = join(DESKTOP, "dist-macos");
 const INTEL_CONSTRAINTS = join(REPO, "services", "media-worker", "packaging", "constraints-macos-x86_64.txt");
+const ARM64_CONSTRAINTS = join(REPO, "services", "media-worker", "packaging", "constraints-macos-arm64.txt");
 const PRODUCT = BASE_CONF.productName;
 const BINARY = BASE_CONF.mainBinaryName;
 
@@ -79,7 +81,7 @@ export function macosTarget(arch) {
     arch,
     ...t,
     node: nodePin("darwin", arch),
-    workerArgs: ["--constraints", arch === "x64" ? INTEL_CONSTRAINTS : "none"],
+    workerArgs: ["--constraints", arch === "x64" ? INTEL_CONSTRAINTS : ARM64_CONSTRAINTS],
     workerBundle: join(SIDECARS, `ao-worker-${t.triple}`),
     dmgName: (version) => `${PRODUCT.replaceAll(" ", "-")}-${version}-${t.label}.dmg`,
   };

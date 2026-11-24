@@ -162,13 +162,34 @@ reads `AO_WORKER_READY port=<n>` from stdout. SIGTERM ends it (exit 0) and its j
 executable also runs `ao-worker -m ocrmypdf …` and `ao-worker -m gallery_dl …`, because the worker
 starts those as `sys.executable -m`, and `ao-worker --self-check`; it refuses anything else.
 
-**Two pin sets (R133):** the default pins in `pyproject.toml`, and the Intel-Mac set in
-`packaging/constraints-macos-x86_64.txt` (older onnxruntime, pikepdf, ocrmypdf, rawpy and
-cryptography, which no longer publish Intel-Mac wheels). On an Intel Mac the build script uses
-the Intel set by default (`--constraints none` to override); `--constraints <file>` selects one
-elsewhere. A package named in a constraints file is pinned by it even where `pyproject.toml` pins
-it directly. Every dependency must be a wheel. `--resolve-for macos-x86_64` (or `macos-arm64`)
-checks on any machine that a pin set resolves to wheels for that Mac.
+**Pin sets (R133, FR-730):** the default pins in `pyproject.toml` (direct dependencies only; what
+they bring with them takes the newest version of the day), the Apple-silicon set in
+`packaging/constraints-macos-arm64.txt` (every package of the bundle at an exact version), and the
+Intel-Mac set in `packaging/constraints-macos-x86_64.txt` (older onnxruntime, pikepdf, ocrmypdf,
+rawpy and cryptography, which no longer publish Intel-Mac wheels). On each Mac the build script
+uses that Mac's set by default (`--constraints none` to override); `--constraints <file>` selects
+one elsewhere. A package named in the Intel file is pinned by it even where `pyproject.toml` pins
+it directly. The Apple-silicon file is complete: `pyproject.toml`'s direct pins stay in force (a
+direct pin that differs from its line stops pip), and after the build `manifest.py --pins-complete`
+fails it when a package in the bundle is not named in the file or has another version there. Every
+dependency must be a wheel. `--resolve-for macos-arm64` (or `macos-x86_64`) checks on any machine
+that a pin set resolves to wheels for that Mac. Linux builds (CI's `worker-bundle` job,
+`pnpm setup:py`) use the default pins.
+
+**Changing a pin** (Apple Silicon; a deliberate act, never a side effect of a rebuild):
+
+1. Edit `packaging/constraints-macos-arm64.txt`: change the package's version (for a direct
+   dependency, change it in `pyproject.toml` too, to the same version); add a line for a package
+   a new version brings with it, remove the line of one no longer in the bundle.
+2. Check on any machine that the set still resolves to wheels for the Mac:
+   `node apps/desktop/scripts/build-sidecars.mjs --resolve-for macos-arm64`.
+3. Run the Mac build. A changed file makes a new build venv. The log's `pin set: macos-arm64` line
+   names the file, and the `constraints check:` line says every package of the bundle is pinned
+   by it; a package the file misses, or another version, fails the build and names it. A
+   `constraints note:` line names the packages the file pins and the bundle no longer holds (not a
+   failure): remove their lines. A file that names one package twice is refused.
+4. The build's `sidecar-manifest.json` (the artefact `worker-bundle-report-macos-apple-silicon`)
+   shows the result: each package with its version, and `constraints` with the file's SHA-256.
 
 **Smoke test** (`packaging/smoke_test.py`, run with `--smoke`): from a temporary folder with a
 clean environment (no venv, no `PYTHONPATH`/`PYTHONHOME`) it checks the self-check, the ready

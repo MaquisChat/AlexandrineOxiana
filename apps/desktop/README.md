@@ -330,12 +330,13 @@ push only its own branch). A
 short first job on Linux decides which downloads to build and refuses a tag that is not a version
 of the app (`scripts/mac-targets.mjs`). For each architecture it:
 
-1. installs the pinned tools: Node.js (the release in `macos/pins.json`), pnpm, Python 3.13,
+1. installs the pinned tools: Node.js (the release in `macos/pins.json`), pnpm, Python 3.13.17 (exactly: it ships in the worker),
    Rust 1.97 and tauri-cli (`pins.json`), with caches keyed on the lock files;
 2. runs `scripts/build-macos.mjs --debug-app`: the pinned Node.js release (downloaded from
    nodejs.org and checked against the SHA-256 in `pins.json` before use), the library service folder
-   (built by that Node, with darwin native modules), the packaged worker (the Intel one on its own
-   pin set, `services/media-worker/packaging/constraints-macos-x86_64.txt`), the notices and licence
+   (built by that Node, with darwin native modules), the packaged worker (each Mac on its own
+   pin set: Apple Silicon on `services/media-worker/packaging/constraints-macos-arm64.txt`, every
+   package of the bundle at an exact version; Intel on `constraints-macos-x86_64.txt`), the notices and licence
    texts, the interface, then Tauri's bundler for the `.app`; it copies Node, the service folder and
    the worker into `Contents/Resources` (`src-tauri/tauri.macos.conf.json`; where
    `src-tauri/src/paths.rs` looks), signs the app as `macos/signing.json` says (today ad hoc), fails
