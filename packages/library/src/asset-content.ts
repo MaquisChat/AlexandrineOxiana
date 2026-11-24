@@ -106,9 +106,11 @@ export async function openHeldFileContent(repo: Repo, projectId: string, reviewI
 }
 
 /**
- * R487 e, R492 a: the project's key, asked for AT the file's opening, not taken before it: a lock asked in between (by
- * the wipe, or by the mark that hides the key from every reader at once, R386 b) refuses the read as locked, and not one
- * byte of the file's content is read under it.
+ * R487 e, R492 a: the project's key, asked for AT the file's opening, not taken before it: a lock asked before or at
+ * the opening (by the wipe, or by the mark that hides the key from every reader at once, R386 b) refuses the read as
+ * locked, and not one byte of the file's content is read under it. A lock asked AFTER the opening does not reach the
+ * open handle (it holds its own copy of the key): a reading under way is ended by the caller — the document and
+ * held-file routes check the lock around every read; a picture already being sent is sent to its end (FR-739).
  */
 function keyAtOpening(repo: Repo, projectId: string): (keyId: string) => Uint8Array | undefined {
   return (id) => {
