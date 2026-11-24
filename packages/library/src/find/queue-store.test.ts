@@ -19,6 +19,7 @@ import {
   appendFindEntries,
   compactFindQueue,
   compactionSeams,
+  mendSeams,
   readFindQueue,
   readFindQueueDetailed,
 } from "./queue-store.js";
@@ -61,6 +62,8 @@ beforeEach(async () => {
 afterEach(async () => {
   seams.crashAt = undefined;
   seams.failAuditAppendFor = undefined;
+  seams.stopUndoAfter = undefined;
+  mendSeams.afterMend = undefined;
   await lib.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
@@ -1182,5 +1185,119 @@ describe("Task F15: what a waiting entry returns to, and the start's own change"
     // Anything but one entry written "waiting-sign-in" is not this change.
     await expect(appendFindEntries(coreOf(), p.id, [{ ...e, state: "no-open-copy" }], "library-start")).rejects.toBeInstanceOf(InvalidInputError);
     await expect(appendFindEntries(coreOf(), p.id, [], "library-start")).rejects.toBeInstanceOf(InvalidInputError);
+  });
+});
+
+describe("R503 a (FR-738): a torn last line is cut by a change of its own, committed before the change that appends", () => {
+  const reopen = async (p: Project, encrypted: boolean, beforeOpen: () => void = () => {}) => {
+    await lib.close();
+    beforeOpen();
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    // A roll-back cut off leaves the project waiting for the next open: its unlock is refused until then.
+    if (encrypted && !(await txnMarkers()).length) await repo.unlockProject(p.id, "pw");
+  };
+  const markerLines = async (): Promise<number> => {
+    const [name] = await txnMarkers();
+    return name ? (JSON.parse(await readFile(join(lib.root, ".tmp", name), "utf8")) as { entries: unknown[] }).entries.length : 0;
+  };
+  /** Where the crash happens: in the cut's change, between the two changes, or in the append's change. */
+  type Where = { change: "cut" | "append"; point: CrashPoint } | { change: "between" };
+  const WHERES: Where[] = [
+    ...(["before-changes", "before-audit", "before-marker-delete"] as CrashPoint[]).flatMap((point): Where[] => [
+      { change: "cut", point },
+      { change: "append", point },
+    ]),
+    { change: "between" },
+  ];
+  const nameOf = (w: Where) => (w.change === "between" ? "between the two changes" : `at ${w.point} of the ${w.change}'s change`);
+
+  for (const encrypted of [false, true]) {
+    it(`a crash at each step, then reopens (the first one's roll-back cut after each of its steps): the queue is whole, the change undone or complete, the project opens (${encrypted ? "sealed" : "plain"})`, async () => {
+      const failures: string[] = [];
+      let cases = 0;
+      for (const where of WHERES) {
+        // -1: the reopen's roll-back runs to its end; k >= 0: it is cut off after k steps, and a second reopen finishes it.
+        for (let cut = -1; ; cut++) {
+          const name = `${nameOf(where)}, reopen's roll-back ${cut < 0 ? "not cut" : `cut after ${cut} step(s)`}`;
+          const p = await project(encrypted);
+          const a = entry(p);
+          await append(p, [a]);
+          await appendFile(queueFile(p), '{"id":"half'); // an unclean stop by something else (no newline)
+          const torn = await readFile(queueFile(p));
+          const whole = torn.subarray(0, torn.lastIndexOf(0x0a) + 1);
+          const b = entry(p);
+          if (where.change === "cut") seams.crashAt = where.point;
+          else if (where.change === "append") mendSeams.afterMend = () => void (seams.crashAt = where.point);
+          else
+            mendSeams.afterMend = () => {
+              throw new SimulatedCrash("simulated crash between the two changes");
+            };
+          const crashed = await append(p, [b]).then(
+            () => null,
+            (err: unknown) => err,
+          );
+          if (!(crashed instanceof SimulatedCrash)) failures.push(`${name}: the change ended without the crash (${crashed === null ? "it finished" : (crashed as Error).name})`);
+          mendSeams.afterMend = undefined;
+          if (seams.crashAt !== undefined) failures.push(`${name}: the crash did not happen`);
+          seams.crashAt = undefined;
+          const lines = await markerLines();
+          if (cut > lines) {
+            await reopen(p, encrypted); // every cut of this crash's roll-back was tried: this last one is only cleared
+            break;
+          }
+          cases++;
+          await reopen(p, encrypted, () => void (cut >= 0 && (seams.stopUndoAfter = cut)));
+          if (cut >= 0 && lines > 0) {
+            if (seams.stopUndoAfter !== undefined) failures.push(`${name}: the reopen's roll-back was not cut`);
+            seams.stopUndoAfter = undefined;
+            await reopen(p, encrypted);
+          }
+          seams.stopUndoAfter = undefined;
+          const kinds = repo.integrityWarnings.filter((w) => w.projectId === p.id).map((w) => w.kind);
+          if (kinds.includes("txn-recovery-skipped-audit-unverifiable")) failures.push(`${name}: the reopen refused to undo the change`);
+          if (kinds.includes("changed-outside-before-rollback")) failures.push(`${name}: the queue file was reported changed outside the app`);
+          if ((await txnMarkers()).length) failures.push(`${name}: a change is still waiting to be undone`);
+          // The queue file is whole: the torn line still there (the cut undone) or gone, never half; the entry there only
+          // when the append's change was committed.
+          const committedCut = where.change !== "cut" || where.point === "before-marker-delete";
+          const committedAppend = where.change === "append" && where.point === "before-marker-delete";
+          const now = await readFile(queueFile(p));
+          const expected = committedCut ? whole : torn;
+          if (committedAppend ? !(now.subarray(0, whole.length).equals(whole) && now.length > whole.length && now[now.length - 1] === 0x0a) : !now.equals(expected)) {
+            failures.push(`${name}: the queue file is ${JSON.stringify(now.toString("latin1").slice(-80))}`);
+          }
+          const q = await read(p);
+          if (q.has(b.id) !== committedAppend) failures.push(`${name}: the new entry is ${q.has(b.id) ? "there" : "not there"}`);
+          if (!q.has(a.id)) failures.push(`${name}: the earlier entry is gone`);
+          // The project opens and takes changes again.
+          const c = entry(p);
+          try {
+            await append(p, [c]);
+            if (!(await read(p)).has(c.id)) failures.push(`${name}: a later entry was not added`);
+          } catch (err) {
+            failures.push(`${name}: a later change was refused (${(err as Error).name})`);
+          }
+          // A committed change is finished at the reopen, not undone: no roll-back to cut, nor without a change.
+          if (cut < 0 && (lines === 0 || where.change === "between" || where.point === "before-marker-delete")) break;
+        }
+      }
+      // Each change's marker holds one line (the cut's "replaced", the add's "append"): an undone crash is tried with its
+      // reopen's roll-back not cut and cut after 0 and 1 steps (4 crashes x 3), a committed one and the one between once.
+      expect(cases).toBe(15);
+      expect(failures).toEqual([]);
+    }, 600_000);
+  }
+
+  it("a torn last line and a new entry make two audited changes: the cut, then the add", async () => {
+    const p = await project();
+    await append(p, [entry(p)]);
+    await appendFile(queueFile(p), '{"id":"half');
+    const before = (await findEvents(p)).length;
+    await append(p, [entry(p)]);
+    expect((await findEvents(p)).slice(before).map((e) => e.details?.op)).toEqual([FIND_QUEUE_OPS.repair, FIND_QUEUE_OPS.add]);
+    // An intact queue: one change, no cut.
+    await append(p, [entry(p)]);
+    expect((await findEvents(p)).slice(before + 2).map((e) => e.details?.op)).toEqual([FIND_QUEUE_OPS.add]);
   });
 });

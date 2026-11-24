@@ -86,7 +86,7 @@ import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
 import { hasSettledCaptureEntries, hasUnlistedConflicts, heldFileToLook, heldWaitingCount, holdMismatchedFile, readReviewEntries, removeFindEntryWithHeld, resolveHeldFile, reviewedAfterWithdrawal, type HoldInput, type ReviewEntry } from "./review.js";
 import { readWatchOrigins, readWatchRegister, recordWatchedFiles, type WatchRegisterEntry } from "./watch-register.js";
-import { appendFindEntries, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
+import { appendFindEntries, mendFindQueueTail, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
 import type { FindEntry } from "../find/types.js";
 import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
 import { RepoCore, loadProjects, type ProjectState, type RepoOptions } from "./state.js";
@@ -1133,6 +1133,15 @@ export function importChange<T>(
   opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook; auditDetails?: Record<string, unknown> },
 ): Promise<T> {
   return runImportChange(cores.get(repo)!, projectId, reqs, fn, opts);
+}
+
+/**
+ * Package-internal (Bulk Import): before a change that may remove a source holding a found file (a duplicate's
+ * "merge" or "skip", an undo's removal), the Find queue's torn last line is cut by a change of its own, so the
+ * removal's line for the queue entry is always written (R503 a, R505 b).
+ */
+export function mendFindQueue(repo: Repo, projectId: string): Promise<void> {
+  return mendFindQueueTail(cores.get(repo)!, projectId);
 }
 
 /** Package-internal (Bulk Import): the project's collections and tags (project.json). */

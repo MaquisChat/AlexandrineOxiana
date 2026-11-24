@@ -87,6 +87,10 @@ export interface TxnMarker {
 const MARKER = /^txn-([0-9a-f-]+)\.json$/;
 const BACKUP = /^txn-([0-9a-f-]+)\.orig-\d+$/;
 
+/** R503 a: the programming error of a transaction asked to both append to a file and rewrite it (its words name no ruling, R509). */
+export const MIXED_WRITE =
+  "A change must not both append to a file and rewrite that same file: if it were interrupted, it could not always be undone. Cut a torn last line in a change of its own, then append in the next.";
+
 export const toRel = (root: string, abs: string): string => relative(root, abs).split(sep).join("/");
 export const fromRel = (root: string, rel: string): string => join(root, ...rel.split("/"));
 
@@ -97,6 +101,9 @@ export class TxnLog {
   private readonly newDirs: string[] = [];
   /** Files already appended to in this transaction: undo truncates them to the first recorded size. */
   private readonly appended = new Set<string>();
+  /** R503 a: every file this transaction appended to, and every file it wrote whole (created or replaced), trash or not. */
+  private readonly appendedEver = new Set<string>();
+  private readonly rewritten = new Set<string>();
   private dirReady = false;
 
   constructor(
@@ -136,8 +143,19 @@ export class TxnLog {
     return this.newDirs.some((d) => rel.startsWith(`${d}/`));
   }
 
+  /**
+   * R503 a: a transaction never both appends to a file and rewrites that same file, in either order (with or without a
+   * trash between): its undo could not always tell where the append began, so a crash would leave a change that is
+   * refused at every opening. A programming error, thrown before the offending step records or writes anything.
+   */
+  private refuseMixed(rel: string, as: "append" | "rewrite"): void {
+    if ((as === "append" ? this.rewritten : this.appendedEver).has(rel)) throw new Error(MIXED_WRITE);
+    (as === "append" ? this.appendedEver : this.rewritten).add(rel);
+  }
+
   async created(abs: string, sha256?: string) {
     const rel = toRel(this.root, abs);
+    this.refuseMixed(rel, "rewrite");
     // A file in a folder this transaction created needs no step of its own.
     if (this.inNewDir(rel)) return;
     await this.add({ kind: "created", path: rel, ...(sha256 ? { sha256 } : {}) });
@@ -145,6 +163,7 @@ export class TxnLog {
 
   /** Copies the current file aside (same mode, so 0600 stays 0600), then records it. */
   async replaced(abs: string, mode: number, sha256?: string) {
+    this.refuseMixed(toRel(this.root, abs), "rewrite");
     await fsp.mkdir(this.dir, { recursive: true });
     const backup = join(this.dir, `txn-${this.id}.orig-${this.backups++}`);
     await copyFileAtomic(abs, backup, { mode });
@@ -185,6 +204,7 @@ export class TxnLog {
 
   async append(u: AppendUndo) {
     const rel = toRel(this.root, u.path);
+    this.refuseMixed(rel, "append");
     // A later append to the same file is covered by the first step (undo truncates to its size).
     if (this.appended.has(rel) || this.inNewDir(rel)) return;
     this.appended.add(rel);
@@ -202,12 +222,27 @@ export class TxnLog {
   }
 }
 
+/** Whether the regular file at `rel` holds bytes one of `later` ("created"/"replaced" lines at that path) wrote. */
+async function ownBytesAt(root: string, rel: string, later: MarkerEntry[]): Promise<boolean> {
+  const hashes = later.flatMap((x) => ((x.kind === "created" || x.kind === "replaced") && x.path === rel && x.sha256 ? [x.sha256] : []));
+  if (!hashes.length) return false;
+  const st = await fsp.lstat(fromRel(root, rel)).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
+    throw err;
+  });
+  if (!st?.isFile()) return false;
+  const now = await sha256File(fromRel(root, rel));
+  return now !== null && hashes.includes(now);
+}
+
 /**
  * Best effort: keeps going past failures, and reports whether every step succeeded. Repeatable (R493): a step already
  * undone is never undone again. A "trashed" line whose trash copy is gone was put back by an earlier run of this
  * roll-back (every step is recorded before it is taken, so a copy never made means the change stopped there, with no
- * later line), and every later line of the marker at that path was undone before it: those lines are skipped, since
- * undoing one again could only remove or overwrite the original put back.
+ * later line), and every later line of the marker at or under that path (R503 b 1) was undone before it: those lines
+ * are skipped, since undoing one again could only remove or overwrite the original put back. Unless the change's own
+ * bytes are still at that path (R503 b 2): then the copy was deleted outside the app, not put back; the lines are
+ * skipped all the same (nothing is deleted) and the roll-back is not complete.
  */
 export async function undoEntries(root: string, entries: MarkerEntry[]): Promise<boolean> {
   let ok = true;
@@ -223,9 +258,18 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       ok = false;
     }
     if (!putBack) continue;
+    // R503 b 2: a copy gone while the change's own bytes (a later line's hash) are still at the path was not put back:
+    // it was deleted outside the app. The roll-back is then not complete (the marker is kept); nothing is deleted.
+    try {
+      if (await ownBytesAt(root, e.from, entries.slice(i + 1))) ok = false;
+    } catch {
+      ok = false;
+    }
     for (let j = i + 1; j < entries.length; j++) {
       const x = entries[j]!;
-      if ((x.kind === "trashed" ? x.from : x.path) === e.from) done.add(j);
+      // R503 b 1: at or under the path (a file inside a folder the change trashed and made again).
+      const p = x.kind === "trashed" ? x.from : x.path;
+      if (p === e.from || p.startsWith(`${e.from}/`)) done.add(j);
     }
   }
   let steps = 0;

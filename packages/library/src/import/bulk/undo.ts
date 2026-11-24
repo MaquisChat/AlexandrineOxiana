@@ -21,7 +21,7 @@
  * folders (trashed through the repository) and the copies a merge added. Linked originals and the
  * user's files outside the library are never touched.
  */
-import { appendLibraryEvent, clearZoteroWebVersion, hasSource, importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
+import { appendLibraryEvent, clearZoteroWebVersion, hasSource, importChange, mendFindQueue, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
 import { encName } from "@ao/core";
 import { decryptBytes, readMaybe } from "../../repo/io.js";
@@ -207,6 +207,8 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
     // Not the user's deletion: no deletion record, so a later run imports the item again (R73). Its
     // pending review entries are read and resolved ("undone") inside this same change (coordinator's
     // ruling 3; fix round 2, N3: an entry queued while the undo runs is not missed).
+    // The removal may write a queue entry's line: a torn last line of the queue is cut first (R503 a, R505 b).
+    await mendFindQueue(repo, projectId);
     await importChange(repo, projectId, { action: "delete" }, (ops) => ops.deleteSource(id, { undo: true }), { op: "source.delete", entity: { type: "source", id } });
     removed.add(id);
   }

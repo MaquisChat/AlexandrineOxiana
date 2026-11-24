@@ -8,7 +8,7 @@
 import { auditedReasonIn } from "./audit-reasons.js";
 import { REQUIRED_FIELDS, newId, type AcquiredFrom, type Asset } from "@ao/core";
 import { FIND_HELD_MAX as SHARED_FIND_HELD_MAX, FIND_REASON_TEXT, HELD_FILE_REVIEW_TEXT, heldFileReviewText } from "@ao/shared";
-import { appendFindLinesInTx, findStateCounts, readFindQueue } from "../find/queue-store.js";
+import { appendFindLinesInTx, findStateCounts, mendFindQueueTail, readFindQueue } from "../find/queue-store.js";
 import { FIND_QUEUE_OPS, type FindEntry } from "../find/types.js";
 import { addOriginalInTx } from "./assets.js";
 import { originalsReach } from "./linked-file.js";
@@ -339,7 +339,9 @@ export async function resolveEntriesOfRemovedSource(core: RepoCore, tx: Tx, sour
 
 /**
  * R282 g (M1): inside the change that removes a source, the line of the queue entry a file was held for: "no-open-copy",
- * reason "record-removed". A queue that cannot be read never stops the source's removal (its line then stays).
+ * reason "record-removed". A queue that cannot be read never stops the source's removal (its line then stays). A torn
+ * last line was cut before this change began, by a change of its own (R503 a, R505 b: every caller that removes a
+ * source mends the queue first), so the line is always written; a queue still torn here refuses the removal.
  */
 async function recordRemovedLine(core: RepoCore, tx: Tx, entryId: string): Promise<void> {
   let next: FindEntry | null;
@@ -348,7 +350,8 @@ async function recordRemovedLine(core: RepoCore, tx: Tx, entryId: string): Promi
   } catch {
     return;
   }
-  if (next && !next.removed) await appendFindLinesInTx(core, tx, "update", [next]);
+  if (!next || next.removed) return;
+  await appendFindLinesInTx(core, tx, "update", [next]);
 }
 
 /** What a caller queues; the entry's id, project, status and time are filled in. */
@@ -612,6 +615,8 @@ export async function holdMismatchedFile(core: RepoCore, projectId: string, inpu
   const held = heldPath(eid, input.facts.kind, core.encrypted(st));
   let reviewId = "";
   let written: FindEntry[] = [];
+  // The queue's line is appended in this change: a torn last line is cut first, by a change of its own (R503 a).
+  await mendFindQueueTail(core, projectId);
   await runMutation(
     core,
     projectId,
@@ -725,6 +730,8 @@ export async function resolveHeldFile(core: RepoCore, projectId: string, reviewI
     // R329 e: the rules are asked about the method the held file itself records (a library's file: library_access).
     const method = heldMethodOf(first.heldFile);
     const sf = await readSourceFile(core, st, first.sourceId);
+    // The queue's line is appended in the change below: a torn last line is cut first, by a change of its own (R503 a).
+    await mendFindQueueTail(core, projectId);
     await runMutation(
       core,
       projectId,
@@ -761,6 +768,7 @@ export async function resolveHeldFile(core: RepoCore, projectId: string, reviewI
     );
     return { entry: line, ...(asset ? { asset } : {}) };
   }
+  await mendFindQueueTail(core, projectId);
   await runMutation(
     core,
     projectId,
@@ -789,6 +797,8 @@ export async function removeFindEntryWithHeld(core: RepoCore, projectId: string,
   core.assertUnlocked(st);
   let written: FindEntry[] = [];
   let resolved: string[] = [];
+  // The queue's line is appended in the change below: a torn last line is cut first, by a change of its own (R503 a).
+  await mendFindQueueTail(core, projectId);
   try {
     await runMutation(
       core,
