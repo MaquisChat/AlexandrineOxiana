@@ -5353,6 +5353,12 @@ server.listen(0, "127.0.0.1", () => process.stdout.write("PORT " + server.addres
         }
         // The control: the debug build has both (so the stripping above is what removed them).
         assert_eq!(seen_in_debug, (true, true, true));
+        // M5 (R511): the line that says whether the Mac's quit hook was installed is printed by debug builds in
+        // test mode only.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("AO_SHELL_QUIT_HOOK"), "the debug build says whether the quit hook was installed");
+        let released: String = as_released(lib).lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert!(!released.contains("AO_SHELL_QUIT_HOOK"), "lib.rs: a release build would say whether the quit hook was installed");
         // The release build's navigation rule is the plain one, given as it is.
         let released = as_released(include_str!("library_window.rs"));
         assert!(released.contains(".on_navigation(navigation_allowed)"));

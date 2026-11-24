@@ -366,7 +366,9 @@ Mac**, with its reason printed: there Tauri restarts a bundled app through Launc
 **Q (quit by Apple event; a Mac only, FR-731)** asks the running app to quit with
 `osascript -e 'tell application id "org.alexandrineoxiana.desktop" to quit'` (AppKit answers that event
 with the same `terminate:` as Cmd-Q and the Dock's Quit) and checks, as A does, that the quit went the
-orderly way (the shell's `AO_SHELL_QUIT orderly`, a clean stop, exit 0, nothing left), then once more
+orderly way (the shell's `AO_SHELL_QUIT orderly`, a clean stop, exit 0, nothing left; the shell says in
+test mode whether its quit hook was installed, `AO_SHELL_QUIT_HOOK installed` or `not installed`, and Q
+names a hook that was not), then once more
 with the slowed stop, as F does, that the closing window was shown. When the event cannot be sent for
 a reason outside the app — macOS does not see the app as running under its bundle id, does not permit
 osascript to send it Apple events, or osascript gets no answer within 30 s (a permission request may be

@@ -35,6 +35,10 @@ describe("parseShellLine", () => {
     assert.deepEqual(parseShellLine("AO_SHELL_QUIT orderly"), { kind: "quit", how: "orderly" });
     assert.deepEqual(parseShellLine("AO_SHELL_QUIT now"), { kind: "quit", how: "now" });
     for (const other of ["AO_SHELL_QUIT", "AO_SHELL_QUIT later", "AO_SHELL_QUIT orderly "]) assert.equal(parseShellLine(other), null, other);
+    // M5 (R511): whether the shell's quit hook was installed (a Mac, test mode).
+    assert.deepEqual(parseShellLine("AO_SHELL_QUIT_HOOK installed"), { kind: "quit-hook", installed: true });
+    assert.deepEqual(parseShellLine("AO_SHELL_QUIT_HOOK not installed"), { kind: "quit-hook", installed: false });
+    for (const other of ["AO_SHELL_QUIT_HOOK", "AO_SHELL_QUIT_HOOK yes", "AO_SHELL_QUIT_HOOK installed "]) assert.equal(parseShellLine(other), null, other);
     for (const other of ["AO_SHELL_TITLE Alexandrine Oxiana", "[service] {}", "AO_SHELL_SERVICE pid=1 port=2", ""]) assert.equal(parseShellLine(other), null, other);
   });
 
@@ -834,22 +838,32 @@ describe("scenario Q: quit by Apple event (a Mac only; FR-731, R503 h)", () => {
   });
 
   const ev = (...kinds) => kinds.map((k) => (typeof k === "string" ? { kind: k } : k));
-  const ORDERLY = ev({ kind: "quit", how: "orderly" }, "closing", { kind: "stopped", how: "clean" });
+  const HOOK = { kind: "quit-hook", installed: true };
+  const ORDERLY = ev(HOOK, { kind: "quit", how: "orderly" }, "closing", { kind: "stopped", how: "clean" });
 
   it("accepts the orderly quit: the quit taken the orderly way, the close begun, the helpers stopped cleanly, exit 0", () => {
     assert.deepEqual(orderlyQuitProblems(ORDERLY, 0), []);
   });
 
   it("names a quit that skipped the orderly path (the app's old way: no quit line, no close, exit 0), one answered at once, an unclean stop, a wrong exit", () => {
-    assert.deepEqual(orderlyQuitProblems([], 0), [
+    assert.deepEqual(orderlyQuitProblems([HOOK], 0), [
       "the quit did not reach the shell's quit handler (no AO_SHELL_QUIT line): the app ended without its orderly path",
       "the orderly close never began (no AO_SHELL_CLOSING line)",
       "the helpers were not reported stopped",
     ]);
-    assert.deepEqual(orderlyQuitProblems(ev({ kind: "quit", how: "now" }), 0), ['the shell answered the quit "now", not the orderly way', "the orderly close never began (no AO_SHELL_CLOSING line)", "the helpers were not reported stopped"]);
-    assert.deepEqual(orderlyQuitProblems(ev({ kind: "quit", how: "orderly" }, "closing", { kind: "stopped", how: "forced" }), 0), ["the helpers were stopped forced, not cleanly"]);
+    assert.deepEqual(orderlyQuitProblems(ev(HOOK, { kind: "quit", how: "now" }), 0), ['the shell answered the quit "now", not the orderly way', "the orderly close never began (no AO_SHELL_CLOSING line)", "the helpers were not reported stopped"]);
+    assert.deepEqual(orderlyQuitProblems(ev(HOOK, { kind: "quit", how: "orderly" }, "closing", { kind: "stopped", how: "forced" }), 0), ["the helpers were stopped forced, not cleanly"]);
     assert.deepEqual(orderlyQuitProblems(ORDERLY, 1), ["the shell exited 1, not 0"]);
     assert.deepEqual(orderlyQuitProblems(ORDERLY, "timeout"), ["the shell exited timeout, not 0"]);
     assert.deepEqual(orderlyQuitProblems([...ORDERLY, { kind: "stopped", how: "clean" }, { kind: "relaunching" }], 0), ["the helpers were stopped 2 times", "the app started again"]);
+  });
+
+  it("names a quit hook that was not installed instead of the generic sentence, and a shell that did not say (M5, R511)", () => {
+    assert.deepEqual(orderlyQuitProblems([{ kind: "quit-hook", installed: false }], 0), [
+      "the shell's quit hook was not installed (AO_SHELL_QUIT_HOOK not installed): without it the quit cannot go the orderly way",
+      "the orderly close never began (no AO_SHELL_CLOSING line)",
+      "the helpers were not reported stopped",
+    ]);
+    assert.deepEqual(orderlyQuitProblems(ORDERLY.filter((e) => e.kind !== "quit-hook"), 0), ["the shell did not say whether its quit hook was installed (no AO_SHELL_QUIT_HOOK line)"]);
   });
 });

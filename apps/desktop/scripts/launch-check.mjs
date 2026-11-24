@@ -89,6 +89,8 @@ export function parseShellLine(line) {
   if (line === "AO_SHELL_RELAUNCHING") return { kind: "relaunching" };
   m = /^AO_SHELL_QUIT (orderly|now)$/.exec(line);
   if (m) return { kind: "quit", how: m[1] };
+  m = /^AO_SHELL_QUIT_HOOK (installed|not installed)$/.exec(line);
+  if (m) return { kind: "quit-hook", installed: m[1] === "installed" };
   m = /^AO_SHELL_LIBRARY (opened|fetching|handed-over|not-a-pdf|failed|closed)$/.exec(line);
   if (m) return { kind: "library", state: m[1] };
   if (line === "AO_SHELL_BROWSER_OPENED") return { kind: "browser-opened" };
@@ -260,7 +262,11 @@ export function printedAfterEvent(lines, err) {
 export function orderlyQuitProblems(events, code) {
   const p = [];
   const quit = events.find((e) => e.kind === "quit");
-  if (!quit) p.push("the quit did not reach the shell's quit handler (no AO_SHELL_QUIT line): the app ended without its orderly path");
+  // M5 (R511): the shell says in test mode whether its quit hook was installed; a hook that was not is named.
+  const hook = events.find((e) => e.kind === "quit-hook");
+  if (!hook) p.push("the shell did not say whether its quit hook was installed (no AO_SHELL_QUIT_HOOK line)");
+  if (!quit && hook?.installed === false) p.push("the shell's quit hook was not installed (AO_SHELL_QUIT_HOOK not installed): without it the quit cannot go the orderly way");
+  else if (!quit) p.push("the quit did not reach the shell's quit handler (no AO_SHELL_QUIT line): the app ended without its orderly path");
   else if (quit.how !== "orderly") p.push(`the shell answered the quit "${quit.how}", not the orderly way`);
   if (!events.some((e) => e.kind === "closing")) p.push("the orderly close never began (no AO_SHELL_CLOSING line)");
   const stopped = events.filter((e) => e.kind === "stopped");
@@ -1564,7 +1570,7 @@ async function main() {
           }
           const { code } = await Promise.race([run.exit, sleep(150_000).then(() => ({ code: "timeout" }))]);
           const qp = orderlyQuitProblems(run.events, code);
-          report(`${label}: the quit went the orderly way: the helpers stop cleanly and the shell exits 0`, qp.length === 0, qp.length ? qp.join("; ") : `osascript ${sent.ok ? "answered" : `said ${firstLine(sent.out) || sent.reason}`}`) || problems.push(...qp.map((x) => `Q: ${x}`));
+          report(`${label}: the quit went the orderly way: the helpers stop cleanly and the shell exits 0`, qp.length === 0, qp.length ? qp.join("; ") : `quit hook installed; osascript ${sent.ok ? "answered" : `said ${firstLine(sent.out) || sent.reason}`}`) || problems.push(...qp.map((x) => `Q: ${x}`));
           if (slow) {
             const cw = closingWindowProblems(run.events, { expect: "shown", closeAt });
             report(`${label}: the closing window "${CLOSING_WINDOW_TITLE}" was shown two seconds after the quit, while the helpers ran`, cw.length === 0, cw.join("; ")) || problems.push(...cw.map((x) => `Q: ${x}`));

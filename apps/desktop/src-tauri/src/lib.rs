@@ -448,7 +448,7 @@ pub fn run() {
     {
         let quit_app = app.handle().clone();
         let quit_shell = shell.clone();
-        quit::install(move |system| {
+        let hook = quit::install(move |system| {
             let answer = quit::on_terminate(system, quit_shell.helpers_stopped.load(Ordering::SeqCst), quit_shell.failed.load(Ordering::SeqCst));
             if test_mode() {
                 println!("AO_SHELL_QUIT {}", answer.word());
@@ -458,6 +458,13 @@ pub fn run() {
             }
             answer
         });
+        // M5 (R511): whether the hook was installed, for the launch check's scenario Q (debug builds in test
+        // mode only); without it a Quit ends the app at once, as before.
+        #[cfg(debug_assertions)]
+        if test_mode() {
+            println!("AO_SHELL_QUIT_HOOK {}", if hook { "installed" } else { "not installed" });
+        }
+        let _ = hook;
     }
     // Closing (the last window closed, or a termination signal): the exit is held back until the
     // helpers are confirmed gone, because ending the event loop releases the single-instance guard
