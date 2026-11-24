@@ -315,6 +315,12 @@ export interface UndoCause {
    * removed (the words then never say that file is lost). Absent: nothing is there, and the file is lost.
    */
   somethingThere?: true;
+  /**
+   * `could-not-look` only (R532 M1): the place of a file the change removed, whose kept copy is gone, could not be looked
+   * at: that file may be lost, so the state speaks of the loss first (never "nothing was lost"); the list names the
+   * place as one the app could not read, and says nothing of what is there.
+   */
+  copyGone?: true;
 }
 /** `ok`: every step undone (or already undone); `causes`: what kept a path from being undone, when known. */
 export interface UndoResult {
@@ -458,9 +464,11 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
   let ok = true;
   const causes: UndoCause[] = [];
   let stepFailed = false;
-  const because = (kind: UndoCauseKind, path: string, somethingThere = false) => {
+  const because = (kind: UndoCauseKind, path: string, somethingThere = false, copyGone = false) => {
     ok = false;
-    if (!causes.some((c) => c.kind === kind && c.path === path)) causes.push({ kind, path, ...(somethingThere ? { somethingThere: true as const } : {}) });
+    if (!causes.some((c) => c.kind === kind && c.path === path)) {
+      causes.push({ kind, path, ...(somethingThere ? { somethingThere: true as const } : {}), ...(copyGone ? { copyGone: true as const } : {}) });
+    }
   };
   const done = new Set<number>();
   /** Paths where something not of the change, or not known to be, was left as it is (R519). */
@@ -469,24 +477,33 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
     // A line that says the identity was not kept is no step of its own: its first line's move (R526).
     if (e.kind !== "trashed" || e.noIdentity) continue;
     let putBack: boolean;
+    let copyUnread = false;
     try {
+      // The look seam (R47, "test" only) reaches the look at the kept copy too (R532 M1).
+      if (process.env.NODE_ENV === "test" && seams.failLook === e.to) throw new Error("simulated read failure");
       putBack = !(await exists(fromRel(root, e.to)));
     } catch {
       // Not known whether it was put back: nothing at that path is undone again, and the roll-back is not complete.
       putBack = true;
+      copyUnread = true;
       because("could-not-look", e.from);
     }
     if (!putBack) continue;
     const earlier = trashedContent(entries, i);
     const id = trashedIdentity(entries, i);
-    if (id === undefined) {
+    if (copyUnread) {
+      // R532 M1: not known whether the kept copy is there: it is never said to be gone, and nothing at, under or above
+      // the place is undone (each would remove or overwrite what may be the original, or what the copy must go back to).
+      blocked.push(e.from);
+    } else if (id === undefined) {
       // An older build's line (no identity), judged as before. R503 b 2: a copy gone while the change's own bytes (a
       // later line's hash) are still at the path was not put back: it was deleted outside the app. The roll-back is
       // then not complete (the marker is kept); nothing is deleted.
       try {
         if (await ownBytesAt(root, e.from, entries.slice(i + 1))) because("kept-copy-gone", e.from, true);
       } catch {
-        because("could-not-look", e.from);
+        // R532 M1: the copy is gone and the place could not be looked at: the file may be lost.
+        because("could-not-look", e.from, false, true);
       }
     } else if (earlier !== "the change's") {
       // R519 (3), R526: the line knows the original's identity (file number, time of birth). What has it at the path IS
@@ -505,7 +522,8 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
           blocked.push(e.from);
         }
       } catch {
-        because("could-not-look", e.from);
+        // R532 M1: the copy is gone and the place could not be looked at: the file may be lost (the loss leads).
+        because("could-not-look", e.from, false, true);
         blocked.push(e.from);
       }
     }

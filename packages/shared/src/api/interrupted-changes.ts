@@ -15,7 +15,8 @@ export type RollbackCauseKind = (typeof ROLLBACK_CAUSE_KINDS)[number];
  * could not read, before a step that failed.
  * - `try-again`: a step failed for no cause the undo could name; trying again may succeed (nothing was lost);
  * - `could-not-read` (R528 M4): the app could not read a file the undo had to judge; once it can, trying again may
- *   succeed (nothing was lost);
+ *   succeed (R532 M1: nothing is said lost or not lost: the file may be the kept copy of one the change removed; where
+ *   that copy is known to be gone and its place could not be read, the state is `lost-and-blocked`);
  * - `in-the-way`: a file changed or put there outside the app stands where the undo must remove or put back a file:
  *   the researcher moves it away, then the roll-back completes (nothing was lost);
  * - `lost`: the copy the app kept of a file the change removed is gone and nothing is at its place: that file can never
@@ -39,8 +40,13 @@ export type IncompleteRollback = "try-again" | "could-not-read" | "in-the-way" |
  * `keptCopiesLeft`), which only matters where a copy is gone and nothing else stops the undo. A cause of a kind this
  * build does not know counts as one that may pass (never closable).
  */
-export function incompleteRollbackOf(causes: ReadonlyArray<{ kind: string; somethingThere?: boolean }>, stepFailed: boolean, copyKept = false): IncompleteRollback {
-  const gone = causes.filter((c) => c.kind === "kept-copy-gone");
+export function incompleteRollbackOf(
+  causes: ReadonlyArray<{ kind: string; somethingThere?: boolean; copyGone?: boolean }>,
+  stepFailed: boolean,
+  copyKept = false,
+): IncompleteRollback {
+  // R532 M1: a place the app could not look at, of a file whose kept copy is gone (`copyGone`), may be a loss: it leads.
+  const gone = causes.filter((c) => c.kind === "kept-copy-gone" || (c.kind === "could-not-look" && c.copyGone === true));
   const inTheWay = causes.some((c) => c.kind === "hand-changed-file" || c.kind === "path-occupied");
   const unread = causes.some((c) => c.kind === "could-not-look");
   const unknown = causes.some((c) => !(ROLLBACK_CAUSE_KINDS as readonly string[]).includes(c.kind));
@@ -63,7 +69,8 @@ export const INCOMPLETE_ROLLBACK_BANNER: Record<IncompleteRollback, (p: string) 
   "try-again": (p) =>
     `An interrupted change in ${p} could not be undone completely: a step failed. Nothing was lost; the app keeps what it needs to finish. Changes to ${p} are off until it is undone. Choose “Resolve…” to try again.`,
   "could-not-read": (p) =>
-    `An interrupted change in ${p} could not be undone completely: the app could not read a file. Nothing was lost; the app keeps what it needs to finish. Changes to ${p} are off until it is undone. Choose “Resolve…” to see which file.`,
+    // R532 M1: says nothing of a loss either way: the file the app could not read may be the kept copy of one it removed.
+    `An interrupted change in ${p} could not be undone completely: the app could not read a file. Changes to ${p} are off until it is undone. Choose “Resolve…” to see which file.`,
   "in-the-way": (p) =>
     `An interrupted change in ${p} could not be undone completely, because a file changed or put there outside the app is in the way. Nothing was lost. Changes to ${p} are off until it is undone. Choose “Resolve…” to see which file to move.`,
   lost: (p) =>

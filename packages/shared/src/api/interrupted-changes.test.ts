@@ -8,13 +8,14 @@
 import { describe, expect, it } from "vitest";
 import { INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_INCOMPLETE_ANSWER, ROLLBACK_LIST_NEXT, incompleteRollbackOf, type IncompleteRollback } from "./interrupted-changes.js";
 
-type Flags = { lost: boolean; unconfirmed: boolean; hand: boolean; occupied: boolean; unread: boolean; failed: boolean; copyKept: boolean };
+/** `unreadGone` (R532 M1): a place the app could not look at, of a file whose kept copy is gone. */
+type Flags = { lost: boolean; unconfirmed: boolean; unreadGone: boolean; hand: boolean; occupied: boolean; unread: boolean; failed: boolean; copyKept: boolean };
 
 /** The state each combination must have, by the ruled order. */
 function expected(f: Flags): IncompleteRollback {
-  const gone = f.lost || f.unconfirmed;
+  const gone = f.lost || f.unconfirmed || f.unreadGone;
   if (gone) {
-    if (f.hand || f.occupied || f.unread || f.failed) return "lost-and-blocked";
+    if (f.hand || f.occupied || f.unread || f.unreadGone || f.failed) return "lost-and-blocked";
     if (f.copyKept) return "lost-copy-stuck";
     return f.lost ? "lost" : "unconfirmed";
   }
@@ -23,17 +24,18 @@ function expected(f: Flags): IncompleteRollback {
   return "try-again";
 }
 
-function causesOf(f: Flags): Array<{ kind: string; path: string; somethingThere?: true }> {
+function causesOf(f: Flags): Array<{ kind: string; path: string; somethingThere?: true; copyGone?: true }> {
   return [
     ...(f.lost ? [{ kind: "kept-copy-gone", path: "a.txt" }] : []),
     ...(f.unconfirmed ? [{ kind: "kept-copy-gone", path: "u.txt", somethingThere: true as const }] : []),
     ...(f.hand ? [{ kind: "hand-changed-file", path: "b.txt" }] : []),
     ...(f.occupied ? [{ kind: "path-occupied", path: "c.txt" }] : []),
     ...(f.unread ? [{ kind: "could-not-look", path: "d.txt" }] : []),
+    ...(f.unreadGone ? [{ kind: "could-not-look", path: "e.txt", copyGone: true as const }] : []),
   ];
 }
 
-const NAMES = ["lost", "unconfirmed", "hand", "occupied", "unread", "failed", "copyKept"] as const;
+const NAMES = ["lost", "unconfirmed", "unreadGone", "hand", "occupied", "unread", "failed", "copyKept"] as const;
 const ALL: Flags[] = Array.from({ length: 2 ** NAMES.length }, (_, n) => Object.fromEntries(NAMES.map((k, i) => [k, (n >> i) % 2 === 1])) as Flags);
 
 describe("R528: every combination of causes gives the banner of the worst thing true", () => {
@@ -48,7 +50,7 @@ describe("R528: every combination of causes gives the banner of the worst thing 
     for (const f of ALL) {
       const s = incompleteRollbackOf(causesOf(f), f.failed, f.copyKept);
       const said = INCOMPLETE_ROLLBACK_BANNER[s]("P");
-      if (f.lost || f.unconfirmed) expect(said, NAMES.filter((k) => f[k]).join("+")).not.toMatch(/Nothing was lost/u);
+      if (f.lost || f.unconfirmed || f.unreadGone) expect(said, NAMES.filter((k) => f[k]).join("+")).not.toMatch(/Nothing was lost/u);
     }
   });
 
@@ -66,7 +68,7 @@ describe("R528: the words of each state, word for word", () => {
       "try-again":
         "An interrupted change in P could not be undone completely: a step failed. Nothing was lost; the app keeps what it needs to finish. Changes to P are off until it is undone. Choose “Resolve…” to try again.",
       "could-not-read":
-        "An interrupted change in P could not be undone completely: the app could not read a file. Nothing was lost; the app keeps what it needs to finish. Changes to P are off until it is undone. Choose “Resolve…” to see which file.",
+        "An interrupted change in P could not be undone completely: the app could not read a file. Changes to P are off until it is undone. Choose “Resolve…” to see which file.",
       "in-the-way":
         "An interrupted change in P could not be undone completely, because a file changed or put there outside the app is in the way. Nothing was lost. Changes to P are off until it is undone. Choose “Resolve…” to see which file to move.",
       lost: "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. That file is lost. Changes to P are off until you close the change. Choose “Resolve…” to see what was lost.",

@@ -4,7 +4,7 @@
  * "test", and neither is exported from the package's entry. Each is shown to be reached under "test" first, so that
  * its silence outside it is the guard's doing.
  */
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation } from "@ao/core";
@@ -83,8 +83,8 @@ describe("R484 c: the new seams are inert outside NODE_ENV=test", () => {
 });
 
 /**
- * R526 M5 (R47): the roll-back's look seam `seams.failLook` has two sites, the look at a file the change wrote (`look`)
- * and the look at a trashed original's identity (`isOriginal`); the identity look `seams.identityLook` (R526) replaces
+ * R526 M5 (R47): the roll-back's look seam `seams.failLook` has three sites, the look at a file the change wrote (`look`),
+ * the look at a trashed original's identity (`isOriginal`) and (R532 M1) the look at its kept copy; the identity look `seams.identityLook` (R526) replaces
  * what the file system gives. Each is reached under "test", and does nothing under "production".
  */
 describe("R526 M5: the roll-back's look seams are inert outside NODE_ENV=test", () => {
@@ -112,7 +112,20 @@ describe("R526 M5: the roll-back's look seams are inert outside NODE_ENV=test", 
     // The kept copy is gone (never made): only the identity look is reached at this path.
     const entries = [{ kind: "trashed" as const, from: R, to: ".tmp/trash-0-0", ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() }];
     seams.failLook = R;
+    // R532 M1: the copy is gone, so the place the app could not look at may hold a loss (`copyGone`).
+    expect(await under("test", () => undoEntries(root, entries))).toEqual({ ok: false, causes: [{ kind: "could-not-look", path: R, copyGone: true }] });
+    expect(await under("production", () => undoEntries(root, entries))).toEqual({ ok: true, causes: [] });
+    expect(await readFile(fromRel(root, R), "utf8")).toBe("the original\n");
+  });
+
+  it("R532 M1: seams.failLook at the look at a trashed original's kept copy: could-not-look under test, the copy put back under production", async () => {
+    const to = ".tmp/trash-0-0";
+    await mkdir(fromRel(root, ".tmp"), { recursive: true });
+    await rename(fromRel(root, R), fromRel(root, to));
+    const entries = [{ kind: "trashed" as const, from: R, to }];
+    seams.failLook = to;
     expect(await under("test", () => undoEntries(root, entries))).toEqual({ ok: false, causes: [{ kind: "could-not-look", path: R }] });
+    expect(await readFile(fromRel(root, to), "utf8")).toBe("the original\n");
     expect(await under("production", () => undoEntries(root, entries))).toEqual({ ok: true, causes: [] });
     expect(await readFile(fromRel(root, R), "utf8")).toBe("the original\n");
   });
