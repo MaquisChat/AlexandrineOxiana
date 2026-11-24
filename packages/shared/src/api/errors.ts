@@ -66,3 +66,17 @@ export const BACKUP_CLOSED_TEXT = {
 export function backupClosedSentence(projectName: string): string {
   return `${BACKUP_CLOSED_TEXT.before}${projectName}${BACKUP_CLOSED_TEXT.after}`;
 }
+
+/**
+ * R551 M6 (in the style of the ruled sentences): an export the library's close cut short: a read through the closed
+ * library is refused, so nothing was exported and nothing is left in the chosen folder.
+ */
+export const EXPORT_CLOSED_TEXT = {
+  before: "The library was closed or went offline before the export of ",
+  after: " was finished, so no export was made. Export it again when the library is open.",
+} as const;
+
+/** The one sentence for an export of `projectName` that a close cancelled. */
+export function exportClosedSentence(projectName: string): string {
+  return `${EXPORT_CLOSED_TEXT.before}${projectName}${EXPORT_CLOSED_TEXT.after}`;
+}

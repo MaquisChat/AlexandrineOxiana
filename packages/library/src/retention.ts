@@ -148,7 +148,8 @@ import {
   type RetentionRetry,
 } from "./export/backup.js";
 import { DESTRUCTION_CERTIFICATE, amendmentNumber } from "./repo/destroy.js";
-import { NotFoundError } from "./repo/errors.js";
+import { LibraryClosedError, NotFoundError } from "./repo/errors.js";
+import { isClosed } from "./library.js";
 import { SimulatedCrash } from "./repo/seams.js";
 import {
   amendProjectDestruction,
@@ -961,10 +962,15 @@ export function resumeDestruction(repo: Repo, projectId: string): Promise<string
 
 async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string): Promise<string[]> {
   const lib = repoLibrary(repo);
-  // Nothing can be recorded in a read-only library, nor read or recorded in a locked project.
-  if (lib.mode !== "read-write" || !repo.isUnlocked(projectId)) return [];
+  // Nothing can be recorded in a read-only library, nor read or recorded in a locked project. Nor in a closed one
+  // (R551 M6): the pass ends there, recording nothing — no finding, no failure, no attempt.
+  if (isClosed(lib) || lib.mode !== "read-write" || !repo.isUnlocked(projectId)) return [];
   const dirRel = `${repo.getProject(projectId).folder}/retention`;
-  const view = await scan(repo, projectId);
+  const view = await scan(repo, projectId).catch((err: unknown) => {
+    if (err instanceof LibraryClosedError) return undefined; // closed while it began: as above
+    throw err;
+  });
+  if (!view) return [];
   const names = await retentionNames(repo, dirRel);
   // The app's own notes as they were found: compared with the audit log, then rewritten from it.
   const found = await destructionNotes(repo, projectId).catch((): Record<string, DestructionNote> => ({}));
@@ -1677,7 +1683,7 @@ async function syncOldCopies(
  */
 export function recordOldCopyDeleted(repo: Repo, projectId: string, id: string): Promise<void> {
   return withProjectMaintenance(repo, projectId, async () => {
-    if (repoLibrary(repo).mode !== "read-write" || !repo.isUnlocked(projectId)) return;
+    if (isClosed(repoLibrary(repo)) || repoLibrary(repo).mode !== "read-write" || !repo.isUnlocked(projectId)) return;
     const view = await scan(repo, projectId);
     if (!view.list.some((a) => a.oldCopies.has(id))) return;
     let holds: boolean | undefined;
