@@ -3,7 +3,7 @@
  * jobs), against the real worker client and a stand-in media worker over HTTP.
  */
 import { createServer, type Server } from "node:http";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
@@ -613,6 +613,95 @@ describe("fix round 1", () => {
     expect(worker.runs).toHaveLength(1);
     const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
     expect(versions).toBe(2);
+  });
+
+  it("R503 l (FR-733): a move refused at its own plan (a destination that is not empty) does not stop the transcription: the move's usual answer, one run, stored once", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true, suspendTimeoutMs: 2_000 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    const dest = join(tmp, "Full");
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, "notes.txt"), "someone else's file");
+    const refused = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    // The move's usual answer for a destination it may not use: a line of its stream, the stream's 200.
+    expect(refused.status).toBe(200);
+    const lines = refused.body.trim().split("\n").map((l) => JSON.parse(l) as Record<string, any>);
+    expect(lines.at(-1)).toEqual({ error: { code: "POLICY_DENIED", message: "The library cannot be moved there.", reason: expect.stringContaining("not empty") } });
+    expect(refused.body).not.toContain('"done":true');
+    expect(refused.body).not.toContain(tmp);
+    expect(await readdir(dest)).toEqual(["notes.txt"]);
+    // The refusal is kept as the last failed move, as before.
+    expect((await call({ url: "/libraries/move/status" })).json).toMatchObject({ running: false, failed: { error: { code: "POLICY_DENIED" } } });
+    expect(worker.runs[0]!.cancelled).toBe(false);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker.runs).toHaveLength(1);
+    expect(worker.runs[0]!.cancelled).toBe(false);
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2); // one run: its WebVTT and its segments file
+  });
+
+  it("R503 l (FR-733): an accepted plan stops the transcription before the first byte is copied (as before)", async () => {
+    worker = await stubWorker();
+    let atCopy: { cancelled: boolean; destThere: boolean } | undefined;
+    const dest = () => join(tmp, "Moved");
+    await start({
+      worker: provider(worker),
+      autoStartWorker: true,
+      suspendTimeoutMs: 2_000,
+      beforeExecuteMove: async () => {
+        atCopy = { cancelled: worker!.runs[0]!.cancelled, destThere: await readdir(dest()).then(() => true, () => false) };
+      },
+    });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest: dest() } })).body).toContain('"done":true');
+    expect(atCopy).toEqual({ cancelled: true, destThere: false });
+  });
+
+  it("R503 l (FR-733): a transcription that FINISHES between the plan and the stop is moved with the library: the move copies what is there after the stop, not a stale list", async () => {
+    worker = await stubWorker();
+    let pid = "";
+    let sid = "";
+    let between = false;
+    await start({
+      worker: provider(worker),
+      autoStartWorker: true,
+      suspendTimeoutMs: 2_000,
+      // Between the plan's acceptance and the stop: the run finishes and its transcript is stored in the library.
+      afterMovePlan: async () => {
+        between = true;
+        worker!.release();
+        await until(async () => (await stateOf(pid, sid))?.status === "done");
+      },
+    });
+    ({ pid } = await library());
+    sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(between).toBe(true);
+    expect(moved.body).toContain('"done":true');
+    // Nothing was left to stop; the run happened once, and its transcript is in the moved library.
+    expect(worker.runs).toHaveLength(1);
+    expect(worker.runs[0]!.cancelled).toBe(false);
+    expect(svc!.state.session!.lib.root).toBe(join(tmp, "Moved"));
+    await svc!.state.idle();
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2);
+    expect(worker.runs).toHaveLength(1);
   });
 
   it("FR-385 (R466 M1): a move that fails after it stopped the transcription starts the run again in the library still open: stored once", async () => {

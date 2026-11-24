@@ -14,6 +14,7 @@ import {
   MoveNotAllowedError,
   MoveVerificationError,
   SimulatedMoveCrash,
+  acceptMovePlan,
   completeMove,
   deleteOldCopy,
   executeMove,
@@ -602,6 +603,75 @@ describe("executeMove", () => {
     expect(reg.find((e) => e.libraryId === oldMeta.libraryId)).toMatchObject({ name: "Lib (remaining projects)", lastKnownPaths: [lib.root] });
     const ev = (await auditOf(dest, a.folder)).at(-1)!;
     expect(ev.details).toMatchObject({ destinationKind: "cloud_folder", projectsMoved: [a.id], projectsExcluded: [b.id] });
+  });
+});
+
+/**
+ * R503 l (FR-733): the move's own plan, accepted (or refused) by its caller BEFORE the caller stops work that still
+ * writes in the library (a running transcription): the same code as executeMove's first steps, writing nothing at the
+ * destination; executeMove then takes its plan again.
+ */
+describe("acceptMovePlan (R503 l, FR-733)", () => {
+  it("refuses as executeMove refuses at its plan, and writes nothing at the destination", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await mkdir(dest);
+    await writeFile(join(dest, "notes.txt"), "mine");
+    await expect(acceptMovePlan(lib, dest, { deps: mkDeps(), env })).rejects.toMatchObject({ name: "MoveNotAllowedError", code: "destination-not-empty" });
+    await expect(acceptMovePlan(lib, lib.root, { deps: mkDeps(), env })).rejects.toMatchObject({ code: "overlap" });
+    await expect(acceptMovePlan(lib, join(tmp, "Fresh"), { deps: mkDeps(), env, excludeProjectIds: ["01ZZZZZZZZZZZZZZZZZZZZZZZZ"] })).rejects.toMatchObject({ code: "unknown-project" });
+    expect(await walkFiles(dest)).toEqual(["notes.txt"]);
+    await expect(stat(join(tmp, "Fresh"))).rejects.toThrow();
+  });
+
+  it("a project whose rules deny the destination: refused and audited in that project once, exactly as executeMove refuses it", async () => {
+    const { lib, repo, b } = await fixture(HIPAA_GOV, true);
+    const macEnv: LocationEnv = { ...env, platform: "darwin" };
+    const dest = join(env.homeDir, "Library/CloudStorage/OneDrive-Contoso/Lib");
+    const before = (await auditOf(lib.root, b.folder)).length;
+    const err = await acceptMovePlan(lib, dest, { deps: mkDeps(), env: macEnv, sourceRepo: repo }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: "MoveNotAllowedError", code: "policy-denied" });
+    const added = (await auditOf(lib.root, b.folder)).slice(before);
+    expect(added.map((e) => e.action)).toEqual(["move"]);
+    expect(added[0]!.decision?.result).toBe("deny");
+    // executeMove's own refusal of the same move: the same error, audited the same way.
+    const err2 = await executeMove(lib, dest, { deps: mkDeps(), env: macEnv, sourceRepo: repo }).catch((e: unknown) => e);
+    expect((err2 as Error).message).toBe((err as Error).message);
+    const added2 = (await auditOf(lib.root, b.folder)).slice(before + 1);
+    expect(added2.map((e) => [e.action, e.decision?.result])).toEqual([["move", "deny"]]);
+    await expect(stat(dest)).rejects.toThrow();
+  });
+
+  it("accepts a plan executeMove goes on with, and writes nothing: no destination folder, no journal, no audit entry", async () => {
+    const { lib, a, b } = await fixture();
+    const dest = join(tmp, "Dest");
+    const auditA = (await auditOf(lib.root, a.folder)).length;
+    const auditB = (await auditOf(lib.root, b.folder)).length;
+    const src = await hashes(lib.root, notLock);
+    await expect(acceptMovePlan(lib, dest, { deps: mkDeps(), env })).resolves.toBeUndefined();
+    await expect(stat(dest)).rejects.toThrow();
+    expect(await hashes(lib.root, notLock)).toEqual(src);
+    expect((await auditOf(lib.root, a.folder)).length).toBe(auditA);
+    expect((await auditOf(lib.root, b.folder)).length).toBe(auditB);
+  });
+
+  it("does not refuse what it cannot judge while work still writes: an in-progress change's marker is left to executeMove (taken after the stop)", async () => {
+    const { lib } = await fixture();
+    await writeFile(join(lib.root, ".tmp", "txn-01JX0000000000000000000000.json"), "{}");
+    await expect(acceptMovePlan(lib, join(tmp, "Dest"), { deps: mkDeps(), env })).resolves.toBeUndefined();
+    // executeMove still refuses it, as before.
+    await expect(executeMove(lib, join(tmp, "Dest"), { deps: mkDeps(), env })).rejects.toMatchObject({ code: "pending-writes" });
+  });
+
+  it("a switch already decided (a crash during it) is accepted without a plan, as executeMove finishes it", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.crashAfter = "register";
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    moveSeams.crashAfter = undefined;
+    // planMove would call the destination not empty; the move itself finishes the switch.
+    await expect(planMove(lib, dest, env)).rejects.toMatchObject({ code: "destination-not-empty" });
+    await expect(acceptMovePlan(lib, dest, { deps: mkDeps(), env })).resolves.toBeUndefined();
   });
 });
 
