@@ -30,7 +30,9 @@
  * With no local title, an identifier found only in the file's text is never the item's own (R57):
  * even when its work's title appears in the text (a citation names its title too), the lookup's
  * values are only offered for review, without the identifier, and the confidence is capped at
- * 0.6. A reference identifier with no reference title needs its work's title in the text.
+ * 0.6; the review says they came from that lookup, no title search is made with their title, and
+ * they are never offered beside an identifier of the item's own reference metadata (FR-123, FR-124).
+ * A reference identifier with no reference title needs its work's title in the text.
  * Title searches (steps 5 and 6) never give identifiers.
  *
  * R55: an identifier taken from the file is written to the draft (and so used for duplicate
@@ -87,6 +89,14 @@ export const MAX_CANDIDATES = 3;
 const MAX_IDENTIFIER_LOOKUPS = 3;
 /** Confidence of an identifier lookup whose title disagrees with the file's own title (R49e). */
 const CONFLICT_CONFIDENCE = 0.6;
+
+/**
+ * The review's sentence for an item whose title and details were looked up from an identifier found
+ * in the file — its text or its metadata fields, never its reference metadata (R57): they may be a
+ * cited work's, so the review says where they came from (FR-123; "in the file", R473 M7).
+ */
+export const LOOKED_UP_FROM_TEXT =
+  "The title and other details shown were looked up from an identifier found in the file, which may belong to a work the file cites rather than to the file itself. Check them against the document before accepting them; the identifier was not recorded.";
 const AGREE = 0.9;
 /** Small words: they do not count towards the three real words a running head or a cut-off title needs (R410 a iii). */
 const SMALL_WORDS = new Set(["a", "an", "the", "of", "in", "on", "at", "by", "for", "from", "to", "and", "or", "with", "de", "la", "le", "les", "du", "des", "el", "los", "las", "y", "e", "der", "die", "das", "und", "il", "lo", "di"]);
@@ -315,6 +325,25 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   const doubts = [...(input.doubts ?? [])];
   /** Upper bound on the final confidence (R58 near match). */
   let cap = 1;
+  /** The title offered from a lookup of an identifier found only in the text (R57; FR-123), if any. */
+  let textLookupTitle: string | undefined;
+  /** The evidence source of that lookup's values (FR-124). */
+  let textLookupSource: EvidenceSource | undefined;
+  /**
+   * FR-124 (R473 I3): once a later step brings the item's own title, every field whose value only
+   * that lookup gave (journal, volume, publisher...) is taken out of the draft: two works are never
+   * mixed in one record. The lookup stays a candidate; its title stays evidence (R49e).
+   */
+  const dropTextLookup = () => {
+    if (!textLookupSource || values.title === textLookupTitle) return;
+    for (const k of KEYS) {
+      if (k === "title") continue;
+      const ev = evidence.get(k);
+      if (!ev?.length || !ev.every((e) => e.source === textLookupSource)) continue;
+      delete (values as Record<string, unknown>)[k];
+      evidence.delete(k);
+    }
+  };
   const done = () => confidence >= AUTO_ACCEPT_THRESHOLD;
 
   const record = (k: keyof Fields, value: unknown, source: EvidenceSource) => {
@@ -483,9 +512,19 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       });
     } else if (ungrounded) {
       // Nothing of the file's own backs the lookup: its values are offered for review, without its
-      // identifiers (unconfirmed), and the confidence is capped at 0.6.
-      const { doi: _d, isbn: _i, issn: _s, ...rest } = fromLookup(ungrounded.r);
-      offer(ungrounded.id.trusted ? idFields(ungrounded, rest) : rest, { kind: "lookup", provider: ungrounded.r.provider }, true);
+      // identifiers (unconfirmed), and the confidence is capped at 0.6. A text identifier's values are
+      // not offered beside an identifier of the item's own reference metadata (whose lookup gave
+      // nothing): they would mix two works in one record; they stay a candidate (FR-124).
+      const mixed = !ungrounded.id.trusted && ids.some((i) => i.trusted);
+      if (!mixed) {
+        const { doi: _d, isbn: _i, issn: _s, ...rest } = fromLookup(ungrounded.r);
+        const source: EvidenceSource = { kind: "lookup", provider: ungrounded.r.provider };
+        offer(ungrounded.id.trusted ? idFields(ungrounded, rest) : rest, source, true);
+        if (!ungrounded.id.trusted) {
+          textLookupTitle = values.title;
+          textLookupSource = source;
+        }
+      }
       confidence = CONFLICT_CONFIDENCE;
       method = { method: "identifier+lookup" };
       unconfirmed = true;
@@ -539,8 +578,11 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     }
   }
 
-  // 6. Title search with the best title known so far.
-  if (!done() && !titleConflict && values.title) {
+  dropTextLookup();
+
+  // 6. Title search with the best title known so far; not with a title looked up from a text
+  //    identifier, which would only find the cited work again (FR-123).
+  if (!done() && !titleConflict && values.title && values.title !== textLookupTitle) {
     const { best, sim } = await search(values.title, firstCreatorName(values.creators));
     if (best && sim >= AGREE) {
       const e: Evidence = { method: "lookup-title-match", titleSimilarity: sim };
@@ -593,7 +635,10 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     report.reasons.push(reason);
   }
   if (titleConflict || unconfirmed) report.overall = "needs-review";
-  if (unconfirmed && !titleConflict) {
+  if (textLookupTitle !== undefined && values.title === textLookupTitle) {
+    // The details shown came from that lookup: the review says so first (FR-123).
+    report.reasons.unshift(LOOKED_UP_FROM_TEXT);
+  } else if (unconfirmed && !titleConflict) {
     report.reasons.push(
       "An identifier found in the file could not be confirmed as this item's own (it may belong to a cited work), so it was not recorded.",
     );

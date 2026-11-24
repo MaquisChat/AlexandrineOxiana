@@ -288,7 +288,7 @@ function RadioGroup<T extends string>({ legend, name, value, options, onChange }
 }
 
 export function AppearanceSettingsScreen() {
-  const { settings, theme, accentApplied, update, retrySave, saveError, saveErrorReason, fonts, fontError } = useAppearance();
+  const { settings, theme, accentApplied, update, retrySave, retryLoad, loadError, saveError, saveErrorReason, fonts, fontError } = useAppearance();
   const id = useId();
   const [userFonts, setUserFonts] = useState<UserFont[]>([]);
   /** The list of added fonts cannot be read (Task 68): its reset is offered. */
@@ -329,6 +329,16 @@ export function AppearanceSettingsScreen() {
   useEffect(() => {
     if (focusTitle > 0) heading.current?.focus();
   }, [focusTitle]);
+  // "Try loading again" goes away with its alert once the settings are read: focus, which was on
+  // it, goes to the screen's heading rather than to the page (FR-155, R468). A failed try keeps
+  // the alert and its button, and focus on it.
+  const retriedLoad = useRef(false);
+  useEffect(() => {
+    if (loadError || !retriedLoad.current) return;
+    retriedLoad.current = false;
+    const at = document.activeElement;
+    if (!at || at === document.body) heading.current?.focus();
+  }, [loadError]);
   const resetAppearance = async () => {
     if (appearanceResetNow.current || !fonts) return;
     appearanceResetNow.current = true;
@@ -496,6 +506,20 @@ export function AppearanceSettingsScreen() {
         />
       </section>
 
+      {loadError && (
+        <div role="alert" className="ao-warning">
+          <p>{loadError}</p>
+          <button
+            type="button"
+            onClick={() => {
+              retriedLoad.current = true;
+              retryLoad();
+            }}
+          >
+            Try loading again
+          </button>
+        </div>
+      )}
       {saveError && (
         <div role="alert" className="ao-warning">
           <p>{saveError}</p>

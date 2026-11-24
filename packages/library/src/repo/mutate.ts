@@ -21,7 +21,7 @@
  *   5. after commit: external audit anchor, in-memory state, trash purge, and
  *      finally the index sink (R22). Failures here never undo the commit.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
@@ -50,7 +50,7 @@ import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo, type ContainmentCache } from "./io.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
 import { AUDIT_REASONS_FILE, reasonMac, sealedReasonLine } from "./audit-reasons.js";
-import { TxnLog } from "./txn.js";
+import { TxnLog, markerPaths } from "./txn.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
 
 /** A policy request without the fields the repository fills in (projectId; actor, now and tz by default). */
@@ -254,8 +254,9 @@ class TxImpl implements Tx {
     const abs = this.core.abs(rel);
     await this.guard(abs);
     const bytes = await this.payload(data, opts);
-    if (await exists(abs)) await this.log.replaced(abs, (await fsp.stat(abs)).mode & 0o777);
-    else await this.log.created(abs);
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    if (await exists(abs)) await this.log.replaced(abs, (await fsp.stat(abs)).mode & 0o777, sha256);
+    else await this.log.created(abs, sha256);
     // Small files (source.json, project.json, batch records) are written synchronously: cheaper
     // than the thread-pool round trips of the asynchronous path, with the same guarantees.
     if (bytes.length <= SMALL_FILE_BYTES) await writeSmallFileAtomic(abs, bytes, { mode: opts.mode });
@@ -528,6 +529,8 @@ export async function runMutation<T>(
         // Keep the marker so the next open can finish the rollback, and stop writing to this
         // project until then: later writes could otherwise be undone by that recovery.
         st.recoveryPending = true;
+        // The paths it names stay half changed until then: a read of a source among them says so (R473 I1).
+        st.unfinished = new Set([...(st.unfinished ?? []), ...markerPaths(log.marker)]);
         st.audit.head = (await AuditStore.load(st.audit.dir).catch(() => null))?.store.head ?? headBefore;
       }
       throw err;

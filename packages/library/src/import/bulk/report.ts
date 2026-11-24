@@ -9,10 +9,12 @@
  * plus an 8-hex HMAC (reportLabel). Reasons and file notes are fixed sentences or the policy's own
  * reason, never a path.
  */
+import { ZOTERO_REPORT_ROWS } from "@ao/shared";
 import { appendLibraryEvent, projectReviewEntries, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
+import { markUndoTarget } from "./merge.js";
 import { createHash } from "node:crypto";
-import { BOOKKEEPING, activeBatches, unsavedStops, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, type GovernanceNote, type ShownState } from "./batch.js";
+import { BOOKKEEPING, activeBatches, unsavedStops, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, undoneBatchIds, type GovernanceNote, type ShownState } from "./batch.js";
 
 export interface ImportReport {
   batchId: string;
@@ -42,6 +44,11 @@ export interface ImportReport {
     backInZotero?: number;
     backInZoteroUpdated?: number;
     goneNotMarked?: number;
+    /**
+     * R474 M7 (present only when not 0): of `goneInZotero`, the sources whose undo would put back the mark an earlier
+     * batch still standing gave them (a deletion over a bin mark), not take the mark off. Counted when the report is read.
+     */
+    goneInZoteroMarkBefore?: number;
     /**
      * Task Z6 (absent in reports written before it): items with a field changed in Zotero and here, waiting for the
      * researcher (an item that also took in other changes is in `updated` too); collections renamed in Zotero that
@@ -102,6 +109,10 @@ export function reportLabel(key: string, secret: string | null | undefined): str
 const droppedNote = (n: number): string[] =>
   n ? [`${n.toLocaleString("en-US")} ${n === 1 ? "annotation" : "annotations"} over the per-source limit (10,000 annotations or 16 MB of text) ${n === 1 ? "was" : "were"} not imported.`] : [];
 
+/** FR-463: sources back in Zotero that were also updated are counted in both rows (R224 a), and this says so. */
+const backUpdatedNote = (n: number): string[] =>
+  n ? [`${n.toLocaleString("en-US")} ${n === 1 ? "source back in Zotero was" : "sources back in Zotero were"} also updated, so ${n === 1 ? "it is" : "they are"} counted twice: as back in Zotero and as updated.`] : [];
+
 /** R393: failures by reason, in the order each reason first occurs, with their items in order. */
 export function failureGroups(failures: ImportReport["failures"]): Array<{ reason: string; items: string[] }> {
   const groups = new Map<string, string[]>();
@@ -134,8 +145,8 @@ function markdown(r: ImportReport): string {
     ...(r.counts.goneAlready ? [`- Still gone from Zotero (marked earlier): ${r.counts.goneAlready}`] : []),
     ...(r.counts.backInZotero ? [`- Back in Zotero: ${r.counts.backInZotero}`] : []),
     // Task Z6: the researcher's value was kept; Zotero's waits beside it in the review queue.
-    ...(r.counts.conflicts ? [`- Changed in Zotero and here — waiting for you: ${r.counts.conflicts}`] : []),
-    ...(r.counts.clearedInZoteroKept ? [`- Cleared in Zotero, kept here: ${r.counts.clearedInZoteroKept}`] : []),
+    ...(r.counts.conflicts ? [`- ${ZOTERO_REPORT_ROWS.conflicts}: ${r.counts.conflicts}`] : []),
+    ...(r.counts.clearedInZoteroKept ? [`- ${ZOTERO_REPORT_ROWS.clearedInZoteroKept}: ${r.counts.clearedInZoteroKept}`] : []),
     ...(r.counts.collectionsRenamed ? [`- Collections renamed in Zotero arrive under their new name; the old one is kept here: ${r.counts.collectionsRenamed}`] : []),
     ...(r.annotationsDeletedHere ? [`- Annotations deleted here — not re-imported: ${r.annotationsDeletedHere}`] : []),
     `- Failed: ${r.counts.failed}`,
@@ -198,6 +209,10 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
   const notesByKey = new Map<string, string[]>();
   for (const e of journal) if (e.notes?.length && !notesByKey.has(e.key)) notesByKey.set(e.key, e.notes);
   const c = countOutcomes(latest.values());
+  // R474 M7: the marks whose undo puts an earlier mark back (as undo does: the newest mark whose batch still stands).
+  const marked = [...latest.values()].filter((e) => e.outcome === "zotero-gone" && e.merge?.availability);
+  const undone = marked.some((e) => e.merge!.availability!.marks?.length) ? await undoneBatchIds(repo, projectId) : new Set<string>();
+  const markBefore = marked.filter((e) => markUndoTarget(e.merge!.availability!, (id) => undone.has(id)).zotero !== undefined).length;
   // Files stored, by item (its first line that stored any); an item that failed or was skipped in review keeps none.
   const filesByKey = new Map<string, { copied: number; linked: number }>();
   for (const e of journal) if (e.files && !filesByKey.has(e.key)) filesByKey.set(e.key, e.files);
@@ -216,7 +231,7 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     state: rec.state === "running" && !activeBatches.has(batchId) ? "interrupted" : rec.state,
     startedAt: rec.startedAt,
     ...(rec.finishedAt ? { finishedAt: rec.finishedAt } : {}),
-    counts: c,
+    counts: { ...c, ...(markBefore ? { goneInZoteroMarkBefore: markBefore } : {}) },
     files,
     failures: [...latest.values()].filter((e) => e.outcome === "failed").map((e) => ({ item: reportLabel(e.key, rec.secret), reason: e.reason ?? "The item could not be imported." })),
     fileNotes: [...notesByKey].flatMap(([key, notes]) => notes.map((note) => ({ item: reportLabel(key, rec.secret), note }))),
@@ -225,7 +240,7 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     annotationsDeletedHere: [...latest.values()].reduce((n, e) => n + (e.annotationsDeletedHere ?? 0), 0),
     governance: rec.governance,
     // R413 b, c: a stop whose record could not be saved still says why.
-    notes: [...rec.notes, ...unsavedNote(rec.notes, batchId), ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
+    notes: [...rec.notes, ...unsavedNote(rec.notes, batchId), ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0)), ...backUpdatedNote(c.backInZoteroUpdated)],
     created: { collectionIds: [...rec.createdCollectionIds], tagIds: [...rec.createdTagIds] },
   };
   return report;

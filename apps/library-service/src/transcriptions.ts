@@ -3,9 +3,15 @@
  * transcription, over the job records of the project's journal.
  *
  * - A transcription is a worker job recorded in its project's job journal under the id the
- *   interface follows; it runs as registered work (`transcription`), so a move waits for it (or is
- *   refused, R106) and a close or shutdown abandons it after the grace period, leaving it pending to
- *   run again at the next open (Task 62, N-5).
+ *   interface follows; it runs as registered work (`transcription`, or `worker-resume` when it is a
+ *   rerun of a pending one). A move stops every one at once, whatever started it, once nothing else
+ *   refuses the move (FR-385; R466 I1, M1), and it stays pending in its project's journal. What
+ *   happens next depends on the move (R466 M2): when the move goes through, it runs again once the
+ *   library is open at its new place — for an encrypted project only once that project is unlocked
+ *   there; when its project was left behind by a split move, it stays with the old copy, now a
+ *   library of its own, and runs when that library is opened; when the move fails after the stop,
+ *   it runs again at once in the library still open. A close or shutdown abandons it, leaving it
+ *   pending to run again at the next open (Task 62, N-5).
  * - At most one per source: `reserve` takes the source synchronously, before anything is awaited,
  *   so of two requests at once exactly one passes; the route then refuses a source whose journal
  *   still holds a pending transcription (from before a restart, or cancelled by a lock, R142).
@@ -59,8 +65,11 @@ interface Live {
   forgotten?: boolean;
 }
 
-/** The state recorded in the journal, for a job this run of the service does not hold. */
-export function fromRecord(rec: JobRecord): TranscriptionJob {
+/**
+ * The state recorded in the journal, for a job this run of the service does not hold. `runningHere`: a worker
+ * client of this process is running it now (a run that went on through a lock and an unlock, R466 M6).
+ */
+export function fromRecord(rec: JobRecord, runningHere = false): TranscriptionJob {
   const model = rec.about?.model;
   const job: TranscriptionJob = {
     jobId: rec.id,
@@ -68,8 +77,8 @@ export function fromRecord(rec: JobRecord): TranscriptionJob {
     sourceId: rec.about?.sourceId ?? "",
     ...(model ? { model } : {}),
     // Pending in the journal and run by no one now (M2): waiting to run again, not "running".
-    status: rec.status === "running" ? "queued" : rec.status,
-    ...(rec.status === "running" || rec.status === "queued" ? { waiting: true } : {}),
+    status: rec.status === "running" ? (runningHere ? "running" : "queued") : rec.status,
+    ...((rec.status === "running" || rec.status === "queued") && !runningHere ? { waiting: true } : {}),
     startedAt: rec.createdAt,
     updatedAt: rec.updatedAt,
   };
@@ -253,7 +262,7 @@ export class Transcriptions {
   }
 
   private progress(l: Live, p: number): void {
-    if (l.forgotten) return;
+    if (l.forgotten && !this.readopt(l)) return;
     if (!this.active(l) || l.ac.signal.aborted) return;
     const percent = Math.max(0, Math.min(100, Math.floor(p * 100)));
     const changed = l.job.status !== "running" || percent > l.percent;
@@ -263,6 +272,25 @@ export class Transcriptions {
     l.job.updatedAt = new Date().toISOString();
     l.percent = percent;
     this.publish(l);
+  }
+
+  /**
+   * A run forgotten at its project's lock that goes on after the unlock (its worker run kept its own copy of the
+   * key, R142) is followed again from its next progress (R466 M6): nothing of it was held while the project was
+   * locked. Only in the library it was started in, and only while its project is unlocked.
+   */
+  private readopt(l: Live): boolean {
+    let unlocked = false;
+    try {
+      unlocked = l.unlocked();
+    } catch {
+      // the project is gone
+    }
+    if (!unlocked || this.state.session?.lib !== l.lib || this.live.has(l.job.jobId)) return false;
+    l.forgotten = false;
+    this.live.set(l.job.jobId, l);
+    this.bySource.set(this.key(l.job.projectId, l.job.sourceId), l.job.jobId);
+    return true;
   }
 
   private stored(l: Live, st: StoredTranscript): void {

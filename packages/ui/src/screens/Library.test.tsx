@@ -1,8 +1,8 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
-import { CURRENT_RW, libraryHandlers, PROJECTS, server, SOURCES, serviceError, testApi, url, useMockService } from "../test/service";
+import { CURRENT_RW, libraryHandlers, PROJECTS, server, SOURCES, TAGS, serviceError, testApi, url, useMockService } from "../test/service";
 import { Library } from "./Library";
 
 useMockService();
@@ -244,7 +244,8 @@ describe("Library screen", () => {
   it("the library state event's warnings appear in plain language", async () => {
     server.use(...libraryHandlers({ state: { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: { p1: ["backup-failed"] } } }));
     renderLibrary();
-    expect(await screen.findByText(/last automatic backup of Dissertation failed/)).toBeTruthy();
+    // The project's name is its own element inside the sentence (FR-158): the banner's whole text is read.
+    await waitFor(() => expect(screen.getAllByRole("status").some((el) => /last automatic backup of Dissertation failed/.test(el.textContent ?? ""))).toBe(true));
   });
 
   it("N3: when an index rebuild finishes the sources are read again, so the 'needs rebuilding' note goes", async () => {
@@ -479,10 +480,63 @@ describe("Library screen", () => {
     const field = screen.getByLabelText("New name for methods");
     await user.clear(field);
     await user.type(field, "method{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" })).getByRole("button", { name: "Rename" }));
     await waitFor(() => expect(calls).toEqual(['PATCH w1 {"name":"method"}']));
     await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));
     await user.click(within(screen.getByRole("group", { name: "Delete workspace tag methods?" })).getByRole("button", { name: "Delete" }));
     await waitFor(() => expect(calls).toEqual(['PATCH w1 {"name":"method"}', "DELETE w1"]));
+  });
+
+  it("a workspace tag change refused because a project is locked says why in plain words, and the tags are read again (FR-165)", async () => {
+    let tagReads = 0;
+    server.use(
+      http.get(url("/projects/:id/tags"), () => {
+        tagReads++;
+        return HttpResponse.json(TAGS);
+      }),
+      http.delete(url("/workspace-tags/:tid"), () =>
+        HttpResponse.json({ error: { code: "CONFLICT", message: "Unlock every encrypted project first (Clinic interviews is locked): a workspace tag can be on sources in any project, so each one records the change." } }, { status: 409 }),
+      ),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    await screen.findByText("Ethnography at Work");
+    await waitFor(() => expect(tagReads).toBe(1));
+    await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));
+    await user.click(within(screen.getByRole("group", { name: "Delete workspace tag methods?" })).getByRole("button", { name: "Delete" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      "Deleting the workspace tag could not be done. Unlock every encrypted project first (Clinic interviews is locked): a workspace tag can be on sources in any project, so each one records the change.",
+    );
+    await waitFor(() => expect(tagReads).toBe(2));
+  });
+
+  it("after a workspace tag's rename is refused, focus is on that tag's Rename button (FR-165, R468)", async () => {
+    let tagReads = 0;
+    server.use(
+      http.get(url("/projects/:id/tags"), () => {
+        tagReads++;
+        return HttpResponse.json(TAGS);
+      }),
+      http.patch(url("/workspace-tags/:tid"), () =>
+        HttpResponse.json({ error: { code: "CONFLICT", message: "Unlock every encrypted project first (Clinic interviews is locked): a workspace tag can be on sources in any project, so each one records the change." } }, { status: 409 }),
+      ),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    await screen.findByText("Ethnography at Work");
+    await waitFor(() => expect(tagReads).toBe(1));
+    await user.click(screen.getByRole("button", { name: "Rename workspace tag methods" }));
+    const field = screen.getByLabelText("New name for methods");
+    await user.clear(field);
+    await user.type(field, "method{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Rename the workspace tag methods to method?" })).getByRole("button", { name: "Rename" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/^Renaming the workspace tag could not be done\. Unlock every encrypted project first/);
+    await waitFor(() => expect(tagReads).toBe(2));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Rename workspace tag methods" }));
   });
 
   it("Resolve… on an interrupted-change banner lists the changes and resolves one by the researcher's choice (R27)", async () => {
@@ -640,6 +694,70 @@ describe("Library screen", () => {
       await new Promise((r) => setTimeout(r, 700));
       expect(screen.queryByText("Old page three")).toBeNull();
       expect(screen.getByText("Zebra one")).toBeTruthy();
+    });
+
+    it("Load more is off between a new search and its first page, so no page is asked for at the old list's offset (FR-152)", async () => {
+      const asked: string[] = [];
+      let release!: () => void;
+      const released = new Promise<void>((r) => (release = r));
+      server.use(
+        http.get(url("/projects/:id/sources"), async ({ request }) => {
+          const q = new URL(request.url).searchParams;
+          asked.push(`${q.get("text") ?? ""}@${q.get("offset") ?? "0"}`);
+          if (q.get("text") === "zebra") {
+            await released;
+            return HttpResponse.json({ total: 4, items: [row(9, "Zebra one"), row(10, "Zebra two")] });
+          }
+          return HttpResponse.json({ total: 3, items: [row(1), row(2)] });
+        }),
+        ...libraryHandlers(),
+      );
+      const user = userEvent.setup();
+      renderLibrary();
+      await screen.findByText("Source 2");
+      await user.type(screen.getByRole("searchbox", { name: "Search sources" }), "zebra");
+      await waitFor(() => expect(asked).toContain("zebra@0"));
+      const more = screen.getByRole("button", { name: "Load more sources" }) as HTMLButtonElement;
+      expect(more.disabled).toBe(true);
+      await user.click(more);
+      expect(asked.filter((a) => a.startsWith("zebra@") && a !== "zebra@0")).toEqual([]);
+      await act(async () => release());
+      expect(await screen.findByText("Zebra one")).toBeTruthy();
+      expect((screen.getByRole("button", { name: "Load more sources" }) as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    // R468 (M5): the guard inside the handler, apart from the button's `disabled` (a click on a
+    // disabled button never reaches the handler, so the handler is called here as React holds it:
+    // a click that arrives before the button is turned off, as one can in a real browser).
+    it("Load more's handler itself asks nothing between a new search and its first page (FR-152, R468)", async () => {
+      const asked: string[] = [];
+      let release!: () => void;
+      const released = new Promise<void>((r) => (release = r));
+      server.use(
+        http.get(url("/projects/:id/sources"), async ({ request }) => {
+          const q = new URL(request.url).searchParams;
+          asked.push(`${q.get("text") ?? ""}@${q.get("offset") ?? "0"}`);
+          if (q.get("text") === "zebra") {
+            await released;
+            return HttpResponse.json({ total: 4, items: [row(9, "Zebra one"), row(10, "Zebra two")] });
+          }
+          return HttpResponse.json({ total: 3, items: [row(1), row(2)] });
+        }),
+        ...libraryHandlers(),
+      );
+      const user = userEvent.setup();
+      renderLibrary();
+      await screen.findByText("Source 2");
+      await user.type(screen.getByRole("searchbox", { name: "Search sources" }), "zebra");
+      await waitFor(() => expect(asked).toContain("zebra@0"));
+      const more = screen.getByRole("button", { name: "Load more sources" });
+      const propsKey = Object.keys(more).find((k) => k.startsWith("__reactProps$"))!;
+      const onClick = (more as unknown as Record<string, { onClick: () => void }>)[propsKey]!.onClick;
+      await act(async () => onClick());
+      expect(asked.filter((a) => a.startsWith("zebra@") && a !== "zebra@0")).toEqual([]);
+      await act(async () => release());
+      expect(await screen.findByText("Zebra one")).toBeTruthy();
+      expect(asked.filter((a) => a.startsWith("zebra@") && a !== "zebra@0")).toEqual([]);
     });
 
     it("after the project was locked: no decrypted rows come back", async () => {

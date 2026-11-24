@@ -31,6 +31,7 @@ import { setSecret } from "../../secrets.js";
 import { ZOTERO_WEB_FILE_NOTES, resumeZoteroWebImport, startZoteroWebImport, zoteroWebAdapter, zoteroWebSince, type ZoteroWebOptions } from "../zotero-web.js";
 import { FakeZotero, guardNetwork } from "../../../tests/zotero/fake-zotero.js";
 import { referenceMetadata } from "../refman.js";
+import { ZOTERO_NOTES } from "../zotero-local.js";
 
 const FAST = 2 ** 10;
 const LOOKUP_FIX = join(dirname(fileURLToPath(import.meta.url)), "../../../tests/fixtures/lookup");
@@ -1728,6 +1729,19 @@ processing:
   }
 
   const batchJson = (p: Project, n: number) => join(lib.root, p.folder, "imports", `batch-${String(n).padStart(4, "0")}`, "batch.json");
+
+  it("FR-132 (R474 I1): the Zotero (web) wizard's summary says that what was taken away in Zotero stays here, once items came in before", async () => {
+    const p = await project(ZGOV);
+    for (const t of ["One", "Two"]) await addWithFile(t);
+    // R474 M5: not before a first import, where no item can come in again.
+    expect((await createBulkImport(deps()).dryRun(p.id, zoteroWebAdapter(web()))).notes).not.toContain(ZOTERO_NOTES.removalsKept("zotero-web"));
+    await (await startZoteroWebImport(deps(), p.id, web())).done;
+    const dry = await createBulkImport(deps()).dryRun(p.id, zoteroWebAdapter(web()));
+    expect(ZOTERO_NOTES.removalsKept("zotero-web")).toBe(
+      "When an item comes in from Zotero again, what was taken away there is not taken away here: a tag taken off, an annotation deleted or a collection the item was taken out of stays as it is here.",
+    );
+    expect(dry.notes).toContain(ZOTERO_NOTES.removalsKept("zotero-web"));
+  });
 
   it("FR-A21 (R392): a Web import's progress carries the stand-in's real total, the dry run's items, and a sync the changed items'", async () => {
     const p = await project(ZGOV);

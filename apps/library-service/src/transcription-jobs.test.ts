@@ -51,6 +51,8 @@ interface StubWorker {
   release(): void;
   instant: boolean;
   postDelayMs: number;
+  /** The progress each poll adds (default 0.25, up to 0.75; with a step set, up to 0.99). */
+  progressStep?: number;
   failWith?: { code: string; message: string; tool?: string };
   onPost?: (run: WorkerRun) => void;
   close(): Promise<void>;
@@ -94,7 +96,7 @@ async function stubWorker(): Promise<StubWorker> {
     run.polls++;
     if (run.cancelled) return send(200, { id: run.id, status: "cancelled", progress: 0.5 });
     if (w.failWith) return send(200, { id: run.id, status: "failed", error: w.failWith });
-    if (!w.instant && (!released || run.polls < 3)) return send(200, { id: run.id, status: "running", progress: Math.min(0.75, run.polls * 0.25) });
+    if (!w.instant && (!released || run.polls < 3)) return send(200, { id: run.id, status: "running", progress: w.progressStep ? Math.min(0.99, run.polls * w.progressStep) : Math.min(0.75, run.polls * 0.25) });
     if (run.type === "audio.transcribe") {
       await mkdir(run.output, { recursive: true });
       await writeFile(join(run.output, "segments.json"), JSON.stringify([{ start: 0, end: 2, text: "Welcome.", lang: "en", flags: ["outside-speech"] }]));
@@ -203,9 +205,12 @@ describe("transcription as a job (Task 62)", () => {
     const job = r.json.job as TranscriptionJob;
     expect(job).toMatchObject({ projectId: pid, sourceId: sid, model: "small", status: "queued" });
     expect(job.jobId).toMatch(/^[0-9a-f-]{36}$/);
-    await until(async () => (await stateOf(pid, sid))?.progress === 0.5);
-    expect(await stateOf(pid, sid)).toMatchObject({ jobId: job.jobId, status: "running", progress: 0.5 });
+    // The stand-in answers 0.25, 0.5, then 0.75 on every later poll until released: 0.5 is only passed through, so the
+    // wait is for the rest at 0.75; the 50 of 100 on the way is asserted among the events.
+    await until(async () => (await stateOf(pid, sid))?.progress === 0.75);
+    expect(await stateOf(pid, sid)).toMatchObject({ jobId: job.jobId, status: "running", progress: 0.75 });
     expect(events.some((e) => e.job.status === "running" && e.done === 50 && e.total === 100 && e.jobId === job.jobId)).toBe(true);
+    expect(events.some((e) => e.job.status === "running" && e.done === 75 && e.total === 100 && e.jobId === job.jobId)).toBe(true);
     worker.release();
     await until(async () => (await stateOf(pid, sid))?.status === "done");
     const done = (await stateOf(pid, sid))!;
@@ -432,9 +437,9 @@ describe("fix round 1", () => {
     const { pid, sid, versions, unlock } = await encryptedRun();
     worker!.instant = true;
     const repo = svc!.state.session!.repo;
-    const original = repo.addDerivedAsset.bind(repo);
+    const original = repo.addDerivedAssets.bind(repo);
     let first = true;
-    repo.addDerivedAsset = (async (...args: Parameters<typeof original>) => {
+    repo.addDerivedAssets = (async (...args: Parameters<typeof original>) => {
       if (first) {
         first = false;
         repo.lockProject(pid);
@@ -538,6 +543,106 @@ describe("fix round 1", () => {
     expect((await stateOf(pid, sid))?.status).toBe("done"); // from the journal
   });
 
+  it("FR-385: a move during a running transcription stops it at once, moves the library, and carries the run on there: stored once", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true, suspendTimeoutMs: 2_000 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    expect(worker.runs[0]!.cancelled).toBe(true);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker.runs.filter((r) => r.type === "audio.transcribe" && !r.cancelled)).toHaveLength(1);
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2); // one run: its WebVTT and its segments file
+  });
+
+  it("R466 I1: a second move while the run the first move carried on is going stops it too, at once: the move goes through, and the run is carried on again: stored once", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true, suspendTimeoutMs: 1_500 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } })).body).toContain('"done":true');
+    // The run carried on in the moved library (a rerun of pending jobs) is going.
+    await until(() => worker!.runs.length === 2 && worker!.runs[1]!.polls > 0);
+    expect(svc!.state.workKinds()).toContain("worker-resume");
+    const second = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved2") } });
+    expect(second.status, second.body).toBe(200);
+    expect(second.body).toContain('"done":true');
+    expect(worker.runs[1]!.cancelled).toBe(true);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker.runs.filter((r) => r.type === "audio.transcribe" && !r.cancelled)).toHaveLength(1);
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2);
+  });
+
+  it("R466 M1: a move refused because other work could not pause does not stop the transcription: it carries on, one run, stored once", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true, suspendTimeoutMs: 300 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    let free!: () => void;
+    const stuck = svc!.state.startWork("stuck", () => new Promise<void>((r) => (free = r)));
+    try {
+      const refused = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+      expect(refused.status).toBe(409);
+    } finally {
+      free();
+      await stuck;
+    }
+    expect(worker.runs[0]!.cancelled).toBe(false);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker.runs).toHaveLength(1);
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2);
+  });
+
+  it("FR-385 (R466 M1): a move that fails after it stopped the transcription starts the run again in the library still open: stored once", async () => {
+    worker = await stubWorker();
+    await start({
+      worker: provider(worker),
+      autoStartWorker: true,
+      suspendTimeoutMs: 2_000,
+      beforeExecuteMove: async () => {
+        throw new Error("the copy could not start");
+      },
+    });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    const failed = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(failed.body).toContain('"error"');
+    expect(worker.runs[0]!.cancelled).toBe(true);
+    await until(() => worker!.runs.length === 2);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker.runs.filter((r) => r.type === "audio.transcribe" && !r.cancelled)).toHaveLength(1);
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2);
+  });
+
   it("M7: a close during a live transcription does not wait out the grace period", async () => {
     worker = await stubWorker();
     await start({ worker: provider(worker!), autoStartWorker: false });
@@ -563,6 +668,33 @@ describe("fix round 1", () => {
     await start();
     await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } });
     expect(await stateOf(pid, sid)).toMatchObject({ status: "queued", waiting: true });
+  });
+
+  it("R466 M6 (FR-392): a run that goes on after a lock and an unlock is shown as running, and the jobs indicator follows it again", async () => {
+    const { pid, sid, versions, unlock } = await encryptedRun();
+    worker!.progressStep = 0.01;
+    const seen: Array<Record<string, unknown>> = [];
+    svc!.state.events.subscribe((e) => {
+      if (e.type === "job.progress" && (e.data as { kind?: string }).kind === "transcription") seen.push(e.data as Record<string, unknown>);
+    });
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(async () => (await stateOf(pid, sid))?.status === "running");
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    await unlock();
+    // The worker's run went on through the lock (its own copy of the key): it is running, not waiting.
+    expect(worker!.runs).toHaveLength(1);
+    expect(worker!.runs[0]!.cancelled).toBe(false);
+    const job = await stateOf(pid, sid);
+    expect(job?.status).toBe("running");
+    expect(job?.waiting).toBeUndefined();
+    // The next progress it reports reaches the jobs indicator with the job again.
+    const from = seen.length;
+    await until(() => seen.slice(from).some((e) => (e.job as { status?: string } | undefined)?.status === "running"));
+    worker!.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker!.runs).toHaveLength(1);
+    expect(await versions()).toBe(2);
   });
 
   it("M10: while the project is locked, events carry nothing of its job", async () => {

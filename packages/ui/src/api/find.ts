@@ -54,6 +54,8 @@ export function findApi(client: ApiClient) {
     addHere: (pid: string, eid: string) => r<FindEntryView>("POST", `${entryPath(pid, eid)}/add-here`),
     /** POST …/:eid/retry (no body). */
     retry: (pid: string, eid: string) => r<FindEntryView>("POST", `${entryPath(pid, eid)}/retry`),
+    /** POST …/:eid/get-copy (no body): R470 a, "Get a copy for this source". */
+    getCopy: (pid: string, eid: string) => r<FindEntryView>("POST", `${entryPath(pid, eid)}/get-copy`),
     /** DELETE …/:eid: out of the queue (a source made for it stays). */
     remove: (pid: string, eid: string) => r<FindRemoveResponse>("DELETE", entryPath(pid, eid)),
     /** GET …/:eid/elsewhere: where a match in another project is, worked out now; null when not known now. */

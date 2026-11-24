@@ -17,8 +17,9 @@ import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { deviceDeps, type Deps } from "@ao/library";
-import { MEDIA_TICKET_PATH, type MediaTicketResponse } from "@ao/shared";
+import { MEDIA_TICKET_IDLE_MS, MEDIA_TICKET_LIFETIME_MS, MEDIA_TICKET_PATH, type MediaTicketResponse } from "@ao/shared";
 import { tinyPng } from "../../../tests/fixtures/generate.mjs";
+import { MEDIA_TICKET_MARKS_MAX } from "./media.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -81,20 +82,20 @@ async function openLibrary(): Promise<void> {
   expect(r.status, r.body).toBe(200);
 }
 
-async function newProject(encrypted = false, name = "Study"): Promise<string> {
-  const r = await call({ method: "POST", url: "/projects", body: { name, governanceYaml: OPEN_GOV, encryption: encrypted ? { enabled: true, passphrase: PASS } : { enabled: false } } });
+async function newProject(encrypted = false, name = "Study", governanceYaml = OPEN_GOV): Promise<string> {
+  const r = await call({ method: "POST", url: "/projects", body: { name, governanceYaml, encryption: encrypted ? { enabled: true, passphrase: PASS } : { enabled: false } } });
   expect(r.status, r.body).toBe(200);
   return r.json.project.id as string;
 }
 
 /** A source with one original made from `file` (through the library, as an import would). */
-async function sourceWith(projectId: string, file: string, type = "audio"): Promise<{ sid: string; aid: string }> {
+async function sourceWith(projectId: string, file: string, type = "audio", identifiable = false): Promise<{ sid: string; aid: string }> {
   const repo = svc.state.session!.repo;
   const sf = await repo.createSource(
     projectId,
     { projectIds: [projectId], type: type as never, title: { variants: [{ lang: "en", kind: "original", value: "Recording" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
     [{ path: file, role: "original", handling: "copy" }],
-    { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable } },
   );
   return { sid: sf.source.id, aid: sf.assets[0]!.id };
 }
@@ -930,5 +931,153 @@ describe("fix round 1 (R140): an error before the first byte", () => {
     expect(r.headers["content-range"]).toBeUndefined();
     expect(r.body).not.toContain(t.path.slice(7));
     quietLogs();
+  });
+});
+
+describe("a stored file found changed while it is played (FR-217, FR-219)", () => {
+  /** Flips a byte `fromEnd` bytes before the end of the stored (encrypted) file. */
+  async function tamperAt(pid: string, sid: string, aid: string, at: (size: number) => number): Promise<void> {
+    const sf = await svc.state.session!.repo.getSource(pid, sid);
+    const abs = join(tmp, "Lib", ...sf.assets.find((a) => a.id === aid)!.path.split("/"));
+    const raw = await readFile(abs);
+    const i = at(raw.length);
+    raw[i] = raw[i]! ^ 0xff;
+    await writeFile(abs, raw);
+  }
+  /** A whole-file GET on the real socket; resolves with the bytes received, however it ends. */
+  function getAll(port: number, path: string): Promise<number> {
+    return new Promise((resolve) => {
+      let got = 0;
+      const req = httpRequest({ host: "127.0.0.1", port, path, method: "GET", headers: { host: `127.0.0.1:${port}` } }, (res) => {
+        res.on("data", (d: Buffer) => (got += d.length));
+        res.on("end", () => resolve(got));
+        res.on("error", () => resolve(got));
+        res.on("aborted", () => resolve(got));
+      });
+      req.on("error", () => resolve(got));
+      req.end();
+    });
+  }
+  const revoke = (path: string) => call({ method: "POST", url: "/media-tickets/revoke", body: { path } });
+
+  it("a change found part-way through a stream: the cut ticket's revoke says FILE_CHANGED (a code, no sentence, no path)", async () => {
+    await start();
+    const port = await svc.listen(0);
+    hostHeader = { host: `127.0.0.1:${port}` };
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(3 * CHUNK)), "video");
+    const t = await ticket(pid, sid, aid);
+    await tamperAt(pid, sid, aid, (n) => n - 100); // in the last chunk: found after the first bytes were sent
+    const got = await getAll(port, t.path);
+    expect(got).toBeGreaterThan(0);
+    expect(got).toBeLessThan(3 * CHUNK);
+    // No wait (R467 M9): the ticket is marked before its stream is cut, and the cut is what ended `getAll`.
+    const r = await revoke(t.path);
+    expect(r.status).toBe(200);
+    expect(r.json).toEqual({ revoked: true, ended: "FILE_CHANGED" });
+    expect(r.body).not.toContain(tmp);
+  });
+
+  it("a change found before the first byte: the same code; a ticket that ended normally carries none", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(3 * CHUNK)), "video");
+    const good = await ticket(pid, sid, aid);
+    expect((await media(good.path, { range: "bytes=0-9" })).status).toBe(206);
+    expect((await revoke(good.path)).json).toEqual({ revoked: true });
+    const t = await ticket(pid, sid, aid);
+    await tamperAt(pid, sid, aid, () => 38 + 10);
+    expect((await media(t.path, { range: "bytes=10-20" })).status).toBe(409);
+    expect((await revoke(t.path)).json).toEqual({ revoked: true, ended: "FILE_CHANGED" });
+  });
+
+  it("a change in the file's header (its first bytes) is marked like a change in its body (M1, R467)", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(3 * CHUNK)), "video");
+    const t = await ticket(pid, sid, aid);
+    await tamperAt(pid, sid, aid, () => 0);
+    const r = await media(t.path, { range: "bytes=0-9" });
+    expect(r.status).toBe(409);
+    const v = await revoke(t.path);
+    expect(v.json).toEqual({ revoked: false, ended: "FILE_CHANGED" });
+    expect(v.body).not.toContain(tmp);
+  });
+  it("a recording the app destroys while it streams is not 'changed outside the app': its stream ends and the revoke says FILE_DESTROYED (M3, R467)", async () => {
+    await start();
+    const port = await svc.listen(0);
+    hostHeader = { host: `127.0.0.1:${port}` };
+    await openLibrary();
+    // An interview due for destruction under the project's retention rule.
+    const gov = `${OPEN_GOV.replace("containsIdentifiable: false", "containsIdentifiable: true\n  pseudonymizeFileNames: false")}retention:\n  rawDataDestroyAfter: 2020-01-01\n`;
+    const pid = await newProject(true, "Study", gov);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(16 * CHUNK)), "video", true);
+    const t = await ticket(pid, sid, aid);
+    let destroyed: { status: number; body: string } | undefined;
+    const got = await new Promise<number>((resolve) => {
+      let n = 0;
+      const req = httpRequest({ host: "127.0.0.1", port, path: t.path, method: "GET", headers: { host: `127.0.0.1:${port}` } }, (res) => {
+        res.on("data", (d: Buffer) => {
+          n += d.length;
+          if (!destroyed) {
+            destroyed = { status: 0, body: "" };
+            // The raw data is destroyed (on the researcher's order) while the recording streams.
+            res.pause();
+            void call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [aid], confirm: true } }).then((r) => {
+              destroyed = { status: r.status, body: r.body };
+              res.resume();
+            });
+          }
+        });
+        res.on("end", () => resolve(n));
+        res.on("error", () => resolve(n));
+        res.on("aborted", () => resolve(n));
+      });
+      req.on("error", () => resolve(n));
+      req.end();
+    });
+    expect(destroyed?.status, destroyed?.body).toBe(200);
+    expect(got).toBeLessThan(16 * CHUNK);
+    const v = await revoke(t.path);
+    expect(v.json).toEqual({ revoked: false, ended: "FILE_DESTROYED" });
+    expect(v.body).not.toContain(tmp);
+  });
+
+  it("the mark outlives the ticket's idle sweep long enough to be read once; it is bounded in time and in number (M2, R467)", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(3 * CHUNK)), "video");
+    const t = await ticket(pid, sid, aid);
+    await tamperAt(pid, sid, aid, () => 38 + 10);
+    expect((await media(t.path, { range: "bytes=10-20" })).status).toBe(409);
+    clock.ms += MEDIA_TICKET_IDLE_MS + 60_000;
+    expect(svc.state.media.live()).toBe(0);
+    expect((await revoke(t.path)).json).toEqual({ revoked: false, ended: "FILE_CHANGED" });
+    // Read once.
+    expect((await revoke(t.path)).json).toEqual({ revoked: false });
+    // In time: no ticket lives longer than its lifetime, so neither does its mark.
+    const late = await ticket(pid, sid, aid);
+    expect((await media(late.path, { range: "bytes=10-20" })).status).toBe(409);
+    clock.ms += MEDIA_TICKET_LIFETIME_MS + 60_000;
+    expect(svc.state.media.live()).toBe(0);
+    expect((await revoke(late.path)).json).toEqual({ revoked: false });
+    // In number: the oldest marks give way.
+    // (Each is swept as idle before the next, so no more than one is live at once.)
+    const first = await ticket(pid, sid, aid);
+    expect((await media(first.path, { range: "bytes=10-20" })).status).toBe(409);
+    let last = first;
+    for (let i = 0; i < MEDIA_TICKET_MARKS_MAX; i++) {
+      clock.ms += MEDIA_TICKET_IDLE_MS + 1000;
+      last = await ticket(pid, sid, aid);
+      expect((await media(last.path, { range: "bytes=10-20" })).status).toBe(409);
+    }
+    clock.ms += MEDIA_TICKET_IDLE_MS + 1000;
+    expect(svc.state.media.live()).toBe(0);
+    expect((await revoke(first.path)).json).toEqual({ revoked: false });
+    expect((await revoke(last.path)).json).toEqual({ revoked: false, ended: "FILE_CHANGED" });
   });
 });

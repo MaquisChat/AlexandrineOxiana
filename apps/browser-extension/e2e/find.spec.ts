@@ -262,7 +262,7 @@ test("a PDF the site does not give a second time (a one-time address): R357 f's 
   const inPopup = await openPopupOn(ONCE_URL);
   await expect.poll(() => inPopup(enabled("Send this tab's PDF")), { timeout: 15_000 }).toBe(true);
   await inPopup(`${button("Send this tab's PDF")}.click()`);
-  await expect.poll(() => inPopup(said), { timeout: 15_000 }).toBe("The site did not give the PDF a second time, so nothing was sent. Download the PDF and add it to the record in the app instead.");
+  await expect.poll(() => inPopup(said), { timeout: 15_000 }).toBe("The file the site gave when the extension read it again does not start as a PDF does, so nothing was sent. Download the PDF and add it to the record in the app instead.");
   expect(fixtures.publisherRequests.filter((r) => r.path === "/once.pdf")).toEqual([
     { path: "/once.pdf", signedIn: true },
     { path: "/once.pdf", signedIn: true },

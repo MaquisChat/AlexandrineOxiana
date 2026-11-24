@@ -50,6 +50,7 @@ import {
   type WatchChoices,
   type WatchFileKind as EngineFileKind,
   type WatchFileProblem,
+  type WatchRegisterEntry,
   type WatchStatus,
   type WatchedFileState as EngineFileState,
 } from "@ao/library";
@@ -341,6 +342,12 @@ export function watchOf(s: Session, projectId: string, wid: string): FolderWatch
   return mine.find((w) => !w.stopped) ?? mine.at(-1);
 }
 
+/** FR-475: the register entries of `sid` as the running watch of `wid` holds them (its lines not yet written included); undefined when none runs or it cannot say. */
+function heldOrigins(s: Session, projectId: string, wid: string, sid: string): WatchRegisterEntry[] | undefined {
+  const held = watchOf(s, projectId, wid);
+  return held && !held.stopped ? held.origins(sid) : undefined;
+}
+
 /** Stops the watch(es) of `wid` (only that folder: the project's other watches keep running). */
 async function stopOne(ctx: Ctx, s: Session, projectId: string, wid: string): Promise<void> {
   const all = s.watches.get(projectId) ?? [];
@@ -458,6 +465,18 @@ async function summaryById(ctx: Ctx, s: Session, projectId: string, wid: string,
 
 const listOrder = (k: WatchedFileListKind) => WATCHED_FILE_LIST_KINDS.indexOf(k);
 const byName = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * R474 M9: a source's origins in the order the register gives them (the library reads the registers by their files'
+ * names, `<watchId>.jsonl`, sorted: `readWatchOrigins`), each folder's lines in their own order; a folder answered
+ * from a running watch's memory takes the place its register will have.
+ */
+export function originsInRegisterOrder<T>(byWatch: ReadonlyMap<string, readonly T[]>): Array<{ watchId: string; entry: T }> {
+  const file = (watchId: string) => `${watchId}.jsonl`;
+  return [...byWatch]
+    .sort(([a], [b]) => (file(a) < file(b) ? -1 : file(a) > file(b) ? 1 : 0))
+    .flatMap(([watchId, entries]) => entries.map((entry) => ({ watchId, entry })));
+}
 
 /** A file the engine lists as not come in, as answered: its reason scrubbed; no size when the size is not known (W4). */
 export function fileItemOf(p: WatchFileProblem, roots: Iterable<string>): WatchedFolderFileItem {
@@ -804,7 +823,18 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     const sid = sourceParam(s, projectId, req);
     const recs = await listWatchedFolders(settingsDeps(s), projectId);
     const origins: WatchedSourceOrigin[] = [];
-    for (const { watchId, entry } of await s.repo.watchOrigins(projectId, sid)) {
+    // FR-475: where the register on disk has no line yet for this source and a folder (they are written in batches,
+    // every few seconds), a running watch answers from its memory: a source opened just after it came in already shows
+    // where it came from. A line on disk is the answer otherwise; the two acts below find the file the same way. In the
+    // register's order.
+    const byWatch = new Map<string, WatchRegisterEntry[]>();
+    for (const { watchId, entry } of await s.repo.watchOrigins(projectId, sid)) byWatch.set(watchId, [...(byWatch.get(watchId) ?? []), entry]);
+    for (const rec of recs) {
+      const mine = rec.dir && !byWatch.has(rec.id) ? heldOrigins(s, projectId, rec.id, sid) : undefined;
+      if (mine?.length) byWatch.set(rec.id, mine);
+    }
+    const found = originsInRegisterOrder(byWatch);
+    for (const { watchId, entry } of found) {
       const rec = recs.find((w) => w.id === watchId);
       const watch = rec?.dir ? watchOf(s, projectId, watchId) : undefined;
       // `presence` (R251): the engine's last judgement of the new version, from its memory — the file is never looked
@@ -834,7 +864,11 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     if (typeof b.watchId !== "string" || b.watchId.length === 0 || b.watchId.length > 64) throw badRequest('"watchId" is required (text).');
     if (b.action !== "bring-in-new-version" && b.action !== "keep-as-it-is") throw badRequest('"action" must be "bring-in-new-version" or "keep-as-it-is".');
     const sid = sourceParam(s, projectId, req);
-    const origin = (await s.repo.watchOrigins(projectId, sid)).find((o) => o.watchId === b.watchId);
+    // R497 c: the file is found as the origin is shown — the register's line on disk, else (FR-475) what the running
+    // watch holds; the act then runs in that watch, which writes its lines before it reads the register.
+    const onDisk = (await s.repo.watchOrigins(projectId, sid)).find((o) => o.watchId === b.watchId);
+    const held = onDisk ? undefined : heldOrigins(s, projectId, b.watchId, sid)?.[0];
+    const origin = onDisk ?? (held ? { watchId: b.watchId, entry: held } : undefined);
     if (!origin) throw notFound("That file of a watched folder");
     const deps = state.watchDeps(s, projectId);
     if (b.action === "keep-as-it-is") {

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The closing window's page (FR-297, R470 c): the desktop shell opens it, in a window of its
+         own, when the app's helpers take more than two seconds to stop after the last window was
+         closed. One sentence, no controls; the shell gives this window no capability and no
+         connection to the service. The same policy as index.html (closingPage.test.ts). -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src http://127.0.0.1:* http://localhost:* blob:; font-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:*; frame-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'" />
+    <title>Closing Alexandrine Oxiana</title>
+    <script type="module" src="/src/closing/closing.ts"></script>
+  </head>
+  <body>
+    <main class="ao-closing">
+      <p>Your library is being closed safely. This can take up to a minute and a half.</p>
+    </main>
+  </body>
+</html>

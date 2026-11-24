@@ -50,6 +50,12 @@ export interface IntegrityWarning {
     | "annotations-unreadable"
     /** A source's annotations file does not match its recorded hash; read as it is (R77). */
     | "annotations-hash-mismatch"
+    /** A source a pending marker names was read: its change did not finish and could not be undone yet (R473 I1). */
+    | "source-change-unfinished"
+    /** The same, in a library opened without changes: it can be put back only when opened for changes (R473 I1). */
+    | "source-change-unfinished-read-only"
+    /** A roll-back at open found a file it names changed outside the app meanwhile; it was put back all the same (R473 I1 3). */
+    | "changed-outside-before-rollback"
     /** Files destroyed under the retention rule could not be overwritten yet; retried on each open (R94). */
     | "destroy-incomplete"
     /** A staged recovery-code key file that is not the committed one was removed, not activated (R148). */
@@ -57,7 +63,7 @@ export interface IntegrityWarning {
     /** A staged recovery-code key file was left in place, not activated: the audit log does not verify (R148). */
     | "recovery-staging-unverifiable";
   detail: string;
-  /** Library-relative file, for the two incomplete-line kinds. */
+  /** Library-relative file (the two incomplete-line kinds, the annotation kinds) or source folder (source-change-unfinished). */
   file?: string;
   /** Size of the incomplete line in bytes, for the two incomplete-line kinds. */
   bytes?: number;

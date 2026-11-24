@@ -422,6 +422,12 @@ export interface FolderWatch {
    * is in another state, it has not been judged yet, or the check could not tell.
    */
   presence(key: string): ContentPresence;
+  /**
+   * FR-475: the register entries of `sourceId` as this watch holds them in memory — lines not yet written included (the
+   * register is written in batches, WATCH_REGISTER_FLUSH_MS). Undefined when the watch cannot say: stopped, or its
+   * register not read (yet, or while the project is locked); the register on disk is then the answer. Reads nothing.
+   */
+  origins(sourceId: string): WatchRegisterEntry[] | undefined;
 }
 
 /** A call on the folder did not answer in time (or the folder is waiting for one that did not). */
@@ -817,6 +823,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let changedWhilePaused = false;
   /** The folder's real path has been checked by this watch (a watch paused from its start has not). */
   let rootChecked = false;
+  /** FR-472: the first look at the folder (its checks and first listing) has not ended yet. */
+  let firstLook = true;
   /** A complete listing has been made (a confirmation seen after it knows which files the researcher saw). */
   let listedOnce = false;
   /**
@@ -1299,7 +1307,9 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       state,
       ...(reason ? { reason } : {}),
       provider,
-      scanning: state !== "paused" && (walk !== null || pending.size > 0),
+      // FR-472: the first look at the folder (its checks, then its listing) counts too, so that a folder whose first
+      // call is still in flight (up to the time limit) is not said to be simply "Watching".
+      scanning: state !== "paused" && (walk !== null || pending.size > 0 || (state === "watching" && firstLook)),
       counts: {
         cameIn: tally.in,
         alreadyInLibrary: tally.known,
@@ -1388,6 +1398,13 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   }
   /** The folder may be usable again: checked, listed, watched and scanned. */
   async function tryResume(): Promise<void> {
+    try {
+      await resumeOnce();
+    } finally {
+      firstLook = false;
+    }
+  }
+  async function resumeOnce(): Promise<void> {
     const bad = await checkRoot();
     rootChecked = true;
     if (bad?.stop) {
@@ -2613,6 +2630,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     } catch (err) {
       if (!(err instanceof FolderNotAnsweringError)) emit({ kind: "error", reason: WATCH_REASONS.watchFailed });
     }
+    firstLook = false;
     if (!stopped) {
       touch();
       loopDone = run();
@@ -2636,6 +2654,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       if (!stopped) void checkCollection().catch(() => {});
     },
     presence: (key) => (stateNow() === "watching" && regReady ? (judgedPresence.get(key) ?? "unknown") : "unknown"),
+    origins: (sourceId) => (stopped || !regReady || !reg ? undefined : [...reg.values()].filter((e) => e.sourceId === sourceId).map((e) => ({ ...e }))),
   };
 }
 

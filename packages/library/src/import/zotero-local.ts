@@ -90,6 +90,14 @@ export const ZOTERO_NOTES = {
     ].filter(Boolean);
     return parts.length ? `Not imported from Zotero: ${parts.join(", ")}.` : undefined;
   },
+  /**
+   * FR-132: an update adds what is new in Zotero and takes nothing away (run.ts `updateInner`); the local import adds
+   * no new collection either (the account sync does, Z6). Said (R474 M5) in the dry run (bulk `dryRun`) when an item would come in again, and in the report of a run that
+   * took an item changed in Zotero; not on a first import, nor at a sync where nothing changed there.
+   */
+  removalsKept: (kind: "zotero-local" | "zotero-web"): string =>
+    "When an item comes in from Zotero again, what was taken away there is not taken away here: a tag taken off, an annotation deleted or a collection the item was taken out of stays as it is here." +
+    (kind === "zotero-local" ? " An item put into another collection in Zotero is not put into it here." : ""),
 } as const;
 
 /** Largest total size of the copied databases (R72). */

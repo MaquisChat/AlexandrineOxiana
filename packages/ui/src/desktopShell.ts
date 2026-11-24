@@ -50,8 +50,11 @@ export interface DesktopShell {
   openLibraryWindow(ticket: string, url: string, from: LibraryWindowFrom): Promise<boolean>;
   /** "Add the PDF showing in the sign-in window": the shell fetches the window's current address. */
   libraryWindowTakePdf(): Promise<boolean>;
-  /** Closes the sign-in window (its ticket ends). */
-  closeLibraryWindow(): Promise<void>;
+  /**
+   * Closes the sign-in window (its ticket ends). R477 b: with `ticket` (the open that made the window), only that open's
+   * window is closed; without one, whatever sign-in window is open.
+   */
+  closeLibraryWindow(ticket?: string): Promise<void>;
   /** "Sign out of my library": the window's cookies and storage are emptied now. */
   signOutOfLibrary(): Promise<boolean>;
   /** "Stay signed in to my library" (macOS only: false elsewhere). */
@@ -103,8 +106,9 @@ async function invokeYes(command: string, args: Record<string, unknown>): Promis
 const libraryWindow = {
   openLibraryWindow: (ticket: string, url: string, from: LibraryWindowFrom) => invokeYes("open_library_window", { ticket, url, from }),
   libraryWindowTakePdf: () => invokeYes("library_window_take_pdf", {}),
-  closeLibraryWindow: async () => {
-    await invokeYes("close_library_window", {});
+  closeLibraryWindow: async (ticket?: string) => {
+    // Only a non-empty ticket is sent: a null or absent one means "whatever is open".
+    await invokeYes("close_library_window", typeof ticket === "string" && ticket !== "" ? { ticket } : {});
   },
   signOutOfLibrary: () => invokeYes("sign_out_of_library", {}),
   setStaySignedIn: (on: boolean) => invokeYes("set_stay_signed_in", { on }),
@@ -132,8 +136,8 @@ export async function openLibraryWindow(ticket: string, url: string, from: Libra
 export async function libraryWindowTakePdf(): Promise<boolean> {
   return inDesktopShell() ? libraryWindow.libraryWindowTakePdf() : false;
 }
-export async function closeLibraryWindow(): Promise<void> {
-  if (inDesktopShell()) await libraryWindow.closeLibraryWindow();
+export async function closeLibraryWindow(ticket?: string): Promise<void> {
+  if (inDesktopShell()) await libraryWindow.closeLibraryWindow(ticket);
 }
 export async function signOutOfLibrary(): Promise<boolean> {
   return inDesktopShell() ? libraryWindow.signOutOfLibrary() : false;

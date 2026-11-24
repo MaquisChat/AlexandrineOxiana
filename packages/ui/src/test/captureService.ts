@@ -53,6 +53,10 @@ export interface CaptureSetup {
   queuesDelayMs?: number;
   /** Answer of GET /projects/:id/captures (default: the queues). */
   queuesAnswer?: () => Response | undefined;
+  /** Per project: the links a lock cut, told with its queues until acknowledged (R464 b). */
+  cutByLock?: Record<string, number>;
+  /** Answer of POST /projects/:id/captures/cut-by-lock/acknowledge (default: forgets the count). */
+  cutAckAnswer?: () => Response | undefined;
 }
 
 export interface CaptureMock {
@@ -86,6 +90,7 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
   let profiles = 0;
   let queues = o.queues ?? [];
   let queueReads = 0;
+  const cut = { ...(o.cutByLock ?? {}) };
   const rec = async (request: Request, path: string) => {
     const text = await request.text();
     let body: unknown;
@@ -141,7 +146,15 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
       queueReads++;
       if (answer) return answer;
       const summaries = queues.filter((q) => q.projectId === params.id).map(({ urls: _u, items: _i, itemsOmitted: _o, ...summary }) => summary);
-      return HttpResponse.json({ queues: summaries });
+      const n = cut[params.id as string];
+      return HttpResponse.json({ queues: summaries, ...(n ? { cutByLock: n } : {}) });
+    }),
+    http.post(url("/projects/:id/captures/cut-by-lock/acknowledge"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/captures/cut-by-lock/acknowledge`);
+      const answer = o.cutAckAnswer?.();
+      if (answer) return answer;
+      delete cut[params.id as string];
+      return HttpResponse.json({ acknowledged: true });
     }),
     http.get(url("/projects/:id/captures/:qid"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/captures/${params.qid as string}`);

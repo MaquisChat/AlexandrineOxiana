@@ -205,7 +205,8 @@ export function OverlapMenu({ at, bounds, items, onChoose, onClose }: OverlapMen
     // Keys pressed in the menu are the menu's (not the page area's).
     e.stopPropagation();
     if (e.key === "Escape" || e.key === "Tab") {
-      if (e.key === "Escape") e.preventDefault();
+      // Tab too: the focus goes back where it was (R145), not on past it.
+      e.preventDefault();
       onClose();
       return;
     }

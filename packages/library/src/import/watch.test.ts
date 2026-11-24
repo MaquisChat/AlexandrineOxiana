@@ -731,6 +731,52 @@ describe("cloud-drive folders: the engine reads nothing it may not (Task W2)", (
     expect(most).toBe(1);
   });
 
+  it("FR-472: while the watch's first call on the folder is in flight, the folder is said to be being looked through", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let asked!: () => void;
+    const inFlight = new Promise<void>((r) => (asked = r));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const realpathS = async (q: string) => {
+      if (q === inbox || q === real) {
+        asked();
+        await held;
+      }
+      return fsp.realpath(q);
+    };
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 60_000, fs: { realpath: realpathS } });
+    await inFlight;
+    expect(w.status()).toMatchObject({ state: "watching", scanning: true });
+    release();
+    await until(() => !w.status().scanning);
+    expect(w.status()).toMatchObject({ state: "watching", scanning: false });
+  });
+
+  it("FR-472: the same while the folder's first listing is in flight", async () => {
+    const p = await project();
+    const real = await realpath(inbox);
+    let asked!: () => void;
+    const inFlight = new Promise<void>((r) => (asked = r));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let first = true;
+    const readdirS = async (d: string) => {
+      if (first && d === real) {
+        first = false;
+        asked();
+        await held;
+      }
+      return fsp.readdir(d, { withFileTypes: true });
+    };
+    const { w } = start(p, { stabilityMs: 200, pollMs: 50, fsTimeoutMs: 60_000, fs: { readdir: readdirS } });
+    await inFlight;
+    expect(w.status()).toMatchObject({ state: "watching", scanning: true });
+    release();
+    await until(() => !w.status().scanning);
+    expect(w.status()).toMatchObject({ state: "watching", scanning: false });
+  });
+
   it("after a call that never answers, no further call is issued on that folder until it settles", async () => {
     const p = await project();
     const real = await realpath(inbox);
@@ -1758,6 +1804,24 @@ describe("the register: where a source came from, and what happened to its file 
     expect(await registerWrites(p)).toBe(writes);
   }, 40_000);
 
+  it("FR-475: a source's origin is told from memory before its register line is written", async () => {
+    const p = await project();
+    const wid = newId();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50, registerFlushMs: 60_000, watchId: wid, attach: realishAttach() });
+    await w.ready;
+    await writeFile(join(inbox, "early.pdf"), "early");
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "early.pdf"));
+    const sid = events.find((e) => e.kind === "imported")!.sourceId!;
+    // The line waits for its timer: nothing is on disk yet, and the watch says where the source came from.
+    expect((await regOf(p, wid)).size).toBe(0);
+    expect(w.origins(sid)).toEqual([expect.objectContaining({ sourceId: sid, file: "early.pdf", state: "in-library" })]);
+    expect(w.origins(newId())).toEqual([]);
+    await w.stop();
+    // Written at stop(); a stopped watch tells nothing (the register on disk is then the answer).
+    expect([...(await regOf(p, wid)).values()]).toEqual([expect.objectContaining({ sourceId: sid, file: "early.pdf", state: "in-library" })]);
+    expect(w.origins(sid)).toBeUndefined();
+  });
+
   it("entries are written in batches of at most 50, and at stop()", async () => {
     const p = await project();
     const wid = newId();
@@ -2451,7 +2515,10 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     await sparse(join(inbox, "flaky.pdf"), 64);
     let fail = true;
     const dl = downloader();
+    /** When each try began. */
+    const tries: number[] = [];
     const fetchContent = async (q: string) => {
+      tries.push(Date.now());
       if (!fail) return dl.fn(q);
       dl.calls.push(q);
       throw Object.assign(new Error("the service is offline"), { code: "EIO" });
@@ -2461,15 +2528,19 @@ describe('pause, resume, and "Download and import them" only when asked (Task W4
     await until(() => w.status().counts.notDownloaded === 1);
     await choose(p, wid, { notDownloaded: "download", confirmedBytes: 1000 });
     await w.refreshChoices();
+    // The problem stays listed while the service fails; the tries go on every 700 ms meanwhile, so how many failed by
+    // the time the wait sees it depends on the machine: they are counted (`failed`), and exactly one try follows.
     await until(() => w.problems(page(10)).items[0]?.kind === "could-not-download");
     expect(w.problems(page(10)).items[0]).toEqual({ file: "flaky.pdf", kind: "could-not-download", reason: withService(WATCH_REASONS.couldNotDownload), bytes: 64 });
-    const t0 = Date.now();
     fail = false;
+    const failed = dl.calls.length;
+    expect(failed).toBeGreaterThanOrEqual(1);
     await until(() => events.some((e) => e.kind === "imported" && e.file === "flaky.pdf"));
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(400);
-    expect(dl.calls).toHaveLength(2);
+    expect(tries.at(-1)! - tries.at(-2)!).toBeGreaterThanOrEqual(400);
+    expect(dl.calls).toHaveLength(failed + 1);
+    expect(tries).toHaveLength(failed + 1);
     expect(w.problems(page(10)).total).toBe(0);
-    expect(await getWatchDownloadCount({ repo, lib }, p.id, wid)).toEqual({ confirmation: 1, fetchedBytes: 128 }); // both tries counted
+    expect(await getWatchDownloadCount({ repo, lib }, p.id, wid)).toEqual({ confirmation: 1, fetchedBytes: 64 * (failed + 1) }); // every try counted
   });
 
   it("a pointer file and a link are never fetched", async () => {

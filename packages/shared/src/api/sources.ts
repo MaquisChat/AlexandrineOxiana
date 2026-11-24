@@ -53,6 +53,17 @@ export interface FieldConfirmRequest {
 export const CONFIRMABLE_IDENTIFIER_KEYS: readonly string[] = ["doi", "isbn", "issn", "url", "platformPostId", "arxiv"];
 
 /**
+ * A linked file of a source record as the service sends it: its library-relative path only (R132). R480 e: in the
+ * answer of `GET /projects/:id/sources/:sid` (the one source the reader reads; never a list route), `missing: true`
+ * when the file cannot be found now by the Missing files rule (nothing at its path). Absent: there, or not judged (other
+ * routes, an older service). The reader opens the first PDF that is not missing.
+ */
+export interface LinkedFileView {
+  libraryRelativePath: string;
+  missing?: true;
+}
+
+/**
  * Added to every source record the service sends (`GET`/`PATCH /projects/:id/sources/:sid`,
  * `PATCH …/fields`, `POST …/recheck`), next to the stored record's own keys. In those records a
  * linked file's absolute path is left out (R132): `assets[].linked` keeps only `libraryRelativePath`.

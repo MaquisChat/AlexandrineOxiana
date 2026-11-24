@@ -30,7 +30,7 @@ import { ACCEPTED_EXTENSIONS, LOCATION_REASON, NOT_DOWNLOADED_REASON, acceptedTy
 import { findSidecars } from "./sidecar.js";
 import { ProxyQueue } from "./proxies.js";
 import { gpsOf, locationTags, proxyStub } from "./proxy-testing.js";
-import { AUTO_ACCEPT_THRESHOLD, mayHaveLocation, resolveItem } from "./resolve.js";
+import { AUTO_ACCEPT_THRESHOLD, LOOKED_UP_FROM_TEXT, mayHaveLocation, resolveItem } from "./resolve.js";
 
 const FAST = 2 ** 10;
 const FIX = join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/lookup");
@@ -842,6 +842,70 @@ describe("review round 2 (R57)", () => {
     expect(sf.source.provenance.identification!.confidence).toBeLessThanOrEqual(0.6);
     const entry = (await reviewEntries(p.id, p.folder)).find((e) => e.sourceId === r!.sourceId)!;
     expect(entry.hints).toContain(`doi:${FIXTURE_DOI}`);
+  });
+
+  it("FR-123: details looked up from a text identifier are said to come from it; no title search is made with the cited work's title", async () => {
+    const p = await project();
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    // A title search with the cited work's title would find that work again.
+    openalex().intercept({ path: searchPath, method: "GET" }).reply(200, fixture("openalex-search.json"), JSON_HEADERS).persist();
+    const lookup = await lookupContextFor(repo, p.id, http);
+    const r = await resolveItem({ path: await put("scan0008.pdf", await scan0008()), mime: "application/pdf" }, { projectId: p.id, patterns: [], lookup });
+    expect(r.draft.title.variants[0]!.value).toBe("Rivers and Memory in Upland Villages");
+    expect(r.evidence.method).toBe("identifier+lookup");
+    expect(r.confidence).toBeLessThanOrEqual(0.6);
+    expect(r.verification.reasons[0]).toBe(LOOKED_UP_FROM_TEXT);
+    // "in the file", not "in the file's text": such an identifier may come from the file's metadata too (R473 M7).
+    expect(LOOKED_UP_FROM_TEXT).toBe(
+      "The title and other details shown were looked up from an identifier found in the file, which may belong to a work the file cites rather than to the file itself. Check them against the document before accepting them; the identifier was not recorded.",
+    );
+    expect(r.verification.reasons).not.toContain("An identifier found in the file could not be confirmed as this item's own (it may belong to a cited work), so it was not recorded.");
+  });
+
+  it("FR-124: a reference DOI whose lookup fails is not mixed with a cited work's details: those are only a candidate", async () => {
+    const p = await project();
+    const OWN = "10.5555/ao.own.missing";
+    crossref().intercept({ path: `/works/${OWN}`, method: "GET" }).reply(404, "Resource not found.").times(1);
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    openalex().intercept({ path: searchPath, method: "GET" }).reply(200, fixture("openalex-search.json"), JSON_HEADERS).persist();
+    const lookup = await lookupContextFor(repo, p.id, http);
+    const r = await resolveItem(
+      { path: await put("scan0008.pdf", await scan0008()), mime: "application/pdf", referenceMetadata: { identifiers: { doi: OWN } } },
+      { projectId: p.id, patterns: [], lookup },
+    );
+    expect(r.draft.identifiers.doi).toBe(OWN);
+    expect(r.draft.title.variants[0]!.value).not.toBe("Rivers and Memory in Upland Villages");
+    expect(r.draft.creators).toEqual([]);
+    expect(r.candidates[0]).toMatchObject({ provider: "crossref", title: "Rivers and Memory in Upland Villages" });
+    expect(r.identifierHints).toEqual([`doi:${FIXTURE_DOI}`]);
+    expect(r.verification.overall).toBe("needs-review");
+    expect(r.confidence).toBeLessThanOrEqual(0.6);
+  });
+
+  it("FR-124 (R473 I3): a sidecar bringing the item's own title takes the cited work's details out of the draft; they stay a candidate", async () => {
+    const p = await project();
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    openalex().intercept({ path: searchPath, method: "GET" }).reply(200, JSON.stringify({ results: [] }), JSON_HEADERS).persist();
+    const lookup = await lookupContextFor(repo, p.id, http);
+    const pdf = await put("scan0008.pdf", await scan0008());
+    const ris = await put("scan0008.ris", "TY  - RPRT\nTI  - Minutes of the reading group\nAU  - Doe, Jane\nPY  - 2024\nER  - \n");
+    const r = await resolveItem({ path: pdf, mime: "application/pdf", sidecarPaths: [ris] }, { projectId: p.id, patterns: [], lookup });
+    expect(r.draft.title.variants[0]!.value).toBe("Minutes of the reading group");
+    expect(r.draft.creators).toEqual([expect.objectContaining({ family: "Doe", given: "Jane" })]);
+    expect(r.draft.issued).toBe("2024");
+    // Nothing that only the cited work's lookup gave is left in the item's own record.
+    expect(r.draft.container).toBeUndefined();
+    expect(r.draft.publisher).toBeUndefined();
+    expect(r.draft).not.toHaveProperty("volume");
+    expect(r.draft).not.toHaveProperty("issue");
+    expect(r.draft).not.toHaveProperty("pages");
+    expect(r.draft).not.toHaveProperty("edition");
+    expect(r.fieldEvidence.filter((e) => e.source.kind === "lookup").map((e) => e.field)).toEqual(["/title"]);
+    expect(r.candidates[0]).toMatchObject({ provider: "crossref", title: "Rivers and Memory in Upland Villages" });
+    expect(r.identifierHints).toEqual([`doi:${FIXTURE_DOI}`]);
+    expect(r.verification.overall).toBe("needs-review");
+    // No value of the lookup is in the draft, so its sentence is not said.
+    expect(r.verification.reasons).not.toContain(LOOKED_UP_FROM_TEXT);
   });
 
   it("C1: scan0008 in a project already holding doi-article.pdf is never its duplicate", async () => {

@@ -68,13 +68,15 @@ import { isProjectLocked, libraryApi } from "../../api/library";
 import { verificationApi, type FieldReview } from "../../api/verification";
 import { yearOf } from "../../api/find";
 import { CodeSwatch } from "../../components/CodeSwatch";
+import { readerApi, heldFileRanges, type ReaderApi } from "../../api/reader";
 import { DialogShell } from "../../components/ReasonDialog";
 import { UserText } from "../../components/UserText";
 import { FieldCheck } from "../../components/VerificationBadge";
 import { inAppLink, PATHS } from "../../navigation";
+import { ReaderScreen, type LookOnly } from "../Reader";
 import { FIELD_LABELS } from "../SourceDetail";
 import { UnlockProject } from "../UnlockProject";
-import { assetName, FilePreview } from "./FilePreview";
+import { assetName, FilePreview, NO_PREVIEW } from "./FilePreview";
 import { count, ErrorNote, errorText, fmt, reportHref, Section, SOURCE_TYPES, typeLabel } from "./shared";
 import {
   PRESS_SHOWN_TEXT,
@@ -158,10 +160,25 @@ export interface ReviewQueueProps {
 export const SOURCE_POOL = 6;
 
 
-/** R313 e: a decision on a waiting file with no answer in this long is given up (the request aborted). */
+/** R313 e: a decision on a waiting file with no answer in this long is given up (its late answer only reads the queue again). */
 export const HELD_DECISION_TIMEOUT_MS = 60_000;
 /** R313 e: said on the card when a decision was given up. */
 export const HELD_NO_ANSWER_TEXT = "The service did not answer. Look at the queue again before deciding.";
+/**
+ * R470 b (FR-490): looking at a held file before deciding — the card's control, the line the look-only reader shows, and
+ * what it says when the held file cannot be shown (R487 c: one sentence true of a file no longer waiting and of one gone
+ * from disk while its entry still waits — the route's one "not found" answers both).
+ */
+export const LOOK_TEXT = "Look at the file";
+export const LOOK_ONLY_NOTICE = "This file has not been added to your library. Use this file, or Not this file, in the review queue.";
+export const LOOK_GONE = "This file can no longer be shown. It is no longer waiting for your decision, or it can no longer be found on this computer.";
+
+/** R487 a: the focus target that means a card's own "Look at the file" (followed by the card's id). */
+const LOOK_BACK = "look:";
+
+/** What a look at held file `reviewId` reads with: the reader's calls (none made in a look) and the file's own ranges. */
+type LookFor = (reviewId: string) => { api: ReaderApi; range: LookOnly["range"] };
+
 /** A waiting file's two controls: their words at rest, and while that decision is out (R318 a). */
 export const HELD_DECIDE_WORDS: Readonly<Record<HeldFileDecision, { idle: string; working: string }>> = {
   attach: { idle: "Use this file", working: "Using this file…" },
@@ -179,11 +196,31 @@ interface FileLayout {
 /** Entries per page when the project's whole queue is read. */
 export const PROJECT_PAGE = 500;
 
-/** What the batch made from folder names (R64): the collections and tags it reports it created (R118). */
-function madeByBatch(id: string, batch: BatchSummary | undefined): boolean {
-  if (!batch?.created || !FOLDER_KINDS.has(batch.kind)) return false;
-  return batch.created.collectionIds.includes(id) || batch.created.tagIds.includes(id);
+/**
+ * What the batch made from folder names (R64): the collections and tags it reports it created (R118). The warning fails
+ * closed (FR-157) once the list of imports is known: an entry from a batch not in it, or from a folder batch that reports
+ * nothing of what it created (an older service), has every collection and tag flagged. Until the list is known (still
+ * being read, or refused, as in a read-only library) nothing is flagged, never every entry (R463 M1).
+ */
+function madeByBatch(id: string, batchId: string | undefined, batch: BatchSummary | undefined, known: boolean): FolderFlag {
+  if (!batchId || !known) return false;
+  if (!batch) return "unrecorded";
+  if (!FOLDER_KINDS.has(batch.kind)) return false;
+  if (!batch.created) return "unrecorded";
+  return batch.created.collectionIds.includes(id) || batch.created.tagIds.includes(id) ? "made" : false;
 }
+
+/**
+ * Why a collection or tag is flagged (R465 a): "made", the import reports it made it from a folder name; "unrecorded",
+ * the app has no record of what the import made (an older import, or one the screen cannot find), so it may have.
+ */
+type FolderFlag = "made" | "unrecorded" | false;
+
+/** The strongest flag among these ids: "made" is said for those; otherwise the hedged sentence. */
+const folderFlagOf = (ids: readonly string[], flag: (id: string) => FolderFlag): FolderFlag => {
+  const flags = ids.map(flag);
+  return flags.includes("made") ? "made" : flags.includes("unrecorded") ? "unrecorded" : false;
+};
 
 /** The group an entry is listed under in the project's queue. */
 /** The group an entry is listed under: the service's, from the library's cause (R176 3); never guessed here from fields. */
@@ -242,6 +279,11 @@ function groupsOf(items: ReviewItem[], batches: BatchSummary[]): Group[] {
 
 export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = PROJECT_PAGE }: ReviewQueueProps) {
   const api = useMemo(() => importApi(client), [client]);
+  /** R470 b: a look at a held file reads the file's own ranges (the reader's other calls are never made in a look). */
+  const lookFor = useMemo<LookFor>(() => {
+    const reader = readerApi(client);
+    return (rid) => ({ api: reader, range: heldFileRanges(client, projectId, rid) });
+  }, [client, projectId]);
   const projectWide = !batchId;
   const [items, setItems] = useState<ReviewItem[] | null>(null);
   const [store, setStore] = useState(recordStore);
@@ -251,6 +293,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   failedRef.current = failed;
   const [policy, setPolicy] = useState<ImportPolicy | null>(null);
   const [batches, setBatches] = useState<BatchSummary[]>([]);
+  /** The list of imports has been read for this project (R463 M1). */
+  const [batchesKnown, setBatchesKnown] = useState(false);
   const batch = batchId ? batches.find((b) => b.batchId === batchId) : undefined;
   const [collections, setCollections] = useState<Collection[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
@@ -282,8 +326,18 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   /** Waiting files (F11, R303): the decision under way on each, the service's sentence for a refused one, where focus goes after one. */
   const [heldBusy, setHeldBusy] = useState<Readonly<Record<string, HeldFileDecision>>>({});
   const heldBusyRef = useRef(new Set<string>());
+  /**
+   * R478: each card's decision request given up at HELD_DECISION_TIMEOUT_MS and still open (FR-529 leaves it open for
+   * its late answer). A card holds at most one: its next decision cancels it first; leaving the queue cancels them all.
+   */
+  const givenUp = useRef(new Map<string, AbortController>());
+  /** R486 e: every decision request still open (inside its 60 seconds or given up), with its give-up timer. */
+  const outstanding = useRef(new Map<AbortController, ReturnType<typeof setTimeout>>());
   const [heldErrors, setHeldErrors] = useState<Readonly<Record<string, string>>>({});
   const [fileFocus, setFileFocus] = useState<{ to: string } | null>(null);
+  /** R470 b, R487 a: the waiting file being looked at, and the title its dialog shows (null when none is). */
+  const [lookAt, setLookAt] = useState<{ item: HeldItem; title: string } | null>(null);
+  const openLook = useCallback((item: HeldItem, title: string) => setLookAt({ item, title }), []);
   /**
    * R319: the found files' section as laid out (null until the queue is first read; again after a lock or for another
    * project). Its cards stay in their places for the whole visit: a decided file keeps its card, a file the service no
@@ -434,8 +488,9 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     setHeldErrors({});
     noticesRef.current = {};
     setHeldNotices({});
-    // Nothing of the found files' section outlives a lock: unlocked, it is laid out afresh.
+    // Nothing of the found files' section outlives a lock: unlocked, it is laid out afresh (and a look is closed).
     putLayout(null);
+    setLookAt(null);
     setStore(recordStore());
     setLocked(true);
   }, []);
@@ -452,6 +507,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     if (laidFor.current !== layoutKey) {
       laidFor.current = layoutKey;
       putLayout(null);
+      setLookAt(null);
     }
     setError(null);
     setItems(null);
@@ -505,7 +561,15 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     api.policy(projectId).then((x) => ok() && setPolicy(x), () => ok() && setPolicy({ pseudonymizeNames: true, encryptionRequired: true }));
     api.collections(projectId).then((c) => ok() && setCollections(c), () => {});
     api.tags(projectId).then((t) => ok() && setTags(t), () => {});
-    api.batches(projectId).then((b) => ok() && setBatches(b), () => {});
+    setBatchesKnown(false);
+    api.batches(projectId).then(
+      (b) => {
+        if (!ok()) return;
+        setBatches(b);
+        setBatchesKnown(true);
+      },
+      () => {},
+    );
     return () => {
       live = false;
       p.live = false;
@@ -516,6 +580,21 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   }, [api, projectId, batchId, sourceId, pageSize, pump, locked, readKey, forget, holdQuiet, putLayout, panelQuiet]);
   // Unmounting moves the generation on: a decision answered after the screen closed changes nothing.
   useEffect(() => () => void gen.current++, []);
+  // R478, R486 e: leaving the queue (unmount, or another project shown) cancels every decision request still open —
+  // given up or still inside its 60 seconds — and clears its give-up timer. The service has the decision already; its
+  // record shows at the next read. A cancelled request's answer or failure changes nothing.
+  useEffect(() => {
+    const open = outstanding.current;
+    const up = givenUp.current;
+    return () => {
+      for (const [c, t] of open) {
+        clearTimeout(t);
+        c.abort();
+      }
+      open.clear();
+      up.clear();
+    };
+  }, [projectId]);
 
   // The project's name, for the unlock form.
   useEffect(() => {
@@ -713,6 +792,27 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
    * (the next in its group, else the one before it, else the first waiting card of the other group; decided and departed
    * cards are skipped), else to the section's heading while other entries wait, else to the message that nothing waits.
    */
+  /**
+   * The next WAITING card after `item` as laid out (the next in its group, else the one before it, else the first of the
+   * other group), by `waiting`; none when no other card waits.
+   */
+  const nextWaiting = (item: ReviewItem, waiting: (x: ReviewItem) => boolean): ReviewItem | undefined => {
+    const laidOut = laidRef.current?.items ?? [];
+    const mine = laidOut.filter((x) => looksRight(x) === looksRight(item));
+    const k = mine.findIndex((x) => x.id === item.id);
+    return mine.slice(k + 1).find(waiting) ?? mine.slice(0, Math.max(0, k)).reverse().find(waiting) ?? laidOut.filter((x) => looksRight(x) !== looksRight(item)).find(waiting);
+  };
+  /**
+   * Where focus goes once `item`'s card has ended, with `list` the queue (as last read) and `ended` the ended cards: the
+   * next waiting card's heading, else the section's heading while other entries wait, else the note that nothing waits.
+   * `fileLeft`'s rule, and a closed look's whose card ended (R492 b).
+   */
+  const focusAfterLeft = (item: ReviewItem, list: readonly ReviewItem[], ended: Readonly<Record<string, unknown>>): string => {
+    const rest = list.filter((x) => x.id !== item.id);
+    const still = new Set(rest.map((x) => x.id));
+    const next = nextWaiting(item, (x) => still.has(x.id) && !ended[x.id]);
+    return next ? next.id : rest.length ? ":section" : ":empty";
+  };
   const fileLeft = (item: ReviewItem, end: FileEnd, said: (n: number) => string) => {
     const list = itemsRef.current ?? [];
     const at = list.findIndex((x) => x.id === item.id);
@@ -724,20 +824,14 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const rest = list.filter((x) => x.id !== item.id);
     const layout = laidRef.current;
     const ended = { ...(layout?.ended ?? {}), [item.id]: end };
-    const still = new Set(rest.map((x) => x.id));
-    const waiting = (x: ReviewItem) => still.has(x.id) && !ended[x.id];
-    const laidOut = layout?.items ?? [];
-    const mine = laidOut.filter((x) => looksRight(x) === looksRight(item));
-    const k = mine.findIndex((x) => x.id === item.id);
-    const next =
-      mine.slice(k + 1).find(waiting) ?? mine.slice(0, Math.max(0, k)).reverse().find(waiting) ?? laidOut.filter((x) => looksRight(x) !== looksRight(item)).find(waiting);
+    const to = focusAfterLeft(item, list, ended);
     itemsRef.current = rest;
     if (layout) putLayout({ ...layout, ended });
     setItems(rest);
     setSelected((s) => s.filter((x) => x !== item.id));
     setHeldErrors((cur) => withoutKey(cur, item.id));
     setStatus(said(at + 1));
-    if (hadFocus) setFileFocus({ to: next ? next.id : rest.length ? ":section" : ":empty" });
+    if (hadFocus) setFileFocus({ to });
   };
   /**
    * R319 c: "Show them" — the section laid out afresh from the queue as last read: decided and departed cards go, the
@@ -755,6 +849,12 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     if (!fileFocus) return;
     const t = fileFocus.to;
     // R313 a: a waiting file's heading, never a control that decides.
+    // R487 a: back to a card's own "Look at the file" (the control as it is now; never the stand-in, which has none).
+    const lookBack = t.startsWith(LOOK_BACK) ? fileCards.current.get(t.slice(LOOK_BACK.length))?.querySelector<HTMLElement>(".ao-review__file-look button:not([tabindex])") : undefined;
+    if (t.startsWith(LOOK_BACK)) {
+      if (lookBack && lookBack !== document.activeElement) lookBack.focus();
+      return;
+    }
     const el =
       t === ":empty" ? emptyNote.current : t === ":title" ? title.current : t === ":section" ? (foundHead.current ?? title.current) : (fileHeads.current.get(t) ?? title.current);
     el?.focus();
@@ -800,16 +900,25 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     }
     heldBusyRef.current.add(item.id);
     notice(item.id, null);
+    // R478: this card's earlier given-up request is cancelled first; its late answer then changes nothing.
+    givenUp.current.get(item.id)?.abort();
+    givenUp.current.delete(item.id);
+    const cancel = new AbortController();
     const g = gen.current;
     setHeldBusy((cur) => ({ ...cur, [item.id]: decision }));
     setHeldErrors((cur) => withoutKey(cur, item.id));
-    // R313 e: no answer in HELD_DECISION_TIMEOUT_MS: the request is aborted, the card usable again and saying so, and
-    // the queue read again (the decision may or may not have been recorded); its late answer changes nothing.
-    const abort = new AbortController();
+    // R313 e: no answer in HELD_DECISION_TIMEOUT_MS: the decision is given up — the card usable again and saying so, and
+    // the queue read again (the decision may or may not have been recorded). The request is left to finish: its late
+    // answer decides nothing here, but the queue is read once more then, so a late record by the service shows at once
+    // (FR-529) — while the file is still listed here (not after a lock, or once another project is shown). It is kept
+    // as the card's given-up request until it answers (R478).
     let late = false;
+    const readLate = () => {
+      if ((itemsRef.current ?? []).some((x) => x.id === item.id)) setReadKey((k) => k + 1);
+    };
     const timer = setTimeout(() => {
       late = true;
-      abort.abort();
+      givenUp.current.set(item.id, cancel);
       heldBusyRef.current.delete(item.id);
       setHeldBusy((cur) => withoutKey(cur, item.id));
       setHeldErrors((cur) => ({ ...cur, [item.id]: HELD_NO_ANSWER_TEXT }));
@@ -818,12 +927,17 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       if (!active || active === document.body || (!!card && card.contains(active))) refocusAfterRead.current = item.id;
       setReadKey((k) => k + 1);
     }, HELD_DECISION_TIMEOUT_MS);
+    outstanding.current.set(cancel, timer);
     try {
       const body: HeldFileDecisionRequest = { projectId, decision };
-      await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body, signal: abort.signal });
+      await client.request<HeldFileDecisionResponse>("POST", `/review/${encodeURIComponent(item.id)}/held-file`, { body, signal: cancel.signal });
+      if (cancel.signal.aborted) return;
+      if (late) readLate();
       if (late || g !== gen.current) return;
       fileLeft(item, decision, (n) => `${FOUND_FILES_TEXT.result[decision]}: ${titleFor(item, n)}`);
     } catch (e) {
+      if (cancel.signal.aborted) return;
+      if (late) readLate();
       if (late || g !== gen.current) return;
       if (isProjectLocked(e)) {
         forget();
@@ -838,6 +952,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       setHeldErrors((cur) => ({ ...cur, [item.id]: e instanceof ApiClientError && e.message ? e.message : errorText(e) }));
     } finally {
       clearTimeout(timer);
+      outstanding.current.delete(cancel);
+      if (givenUp.current.get(item.id) === cancel) givenUp.current.delete(item.id);
       if (!late) {
         heldBusyRef.current.delete(item.id);
         if (g === gen.current) setHeldBusy((cur) => withoutKey(cur, item.id));
@@ -896,6 +1012,30 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const listed = useMemo(() => (projectWide ? (items ?? []).filter((i) => !isFound(i)) : (items ?? [])), [items, projectWide]);
   /** R319: the waiting files the service lists now (by id); those not laid out have arrived during the visit. */
   const waitingIds = useMemo(() => new Set((items ?? []).filter(isFound).map((i) => i.id)), [items]);
+  /**
+   * R487 a (ii): the file looked at no longer waits — decided here, found decided, or no longer listed by the queue as
+   * last read (while the queue is being read again, it is not known yet).
+   */
+  const lookGone = !!lookAt && (!!laid?.ended[lookAt.item.id] || (items !== null && !waitingIds.has(lookAt.item.id)));
+  /**
+   * The look closed (its button or Escape). R492 c: while the card still waits — also after a "not found" in the look (the
+   * held file gone from disk; nothing reads the queue again on it), its controls are still there — focus goes back on its
+   * "Look at the file" (the dialog's own restore does the same, unless the queue was read again meanwhile and the control
+   * is a new one). R492 b: the card ended (decided, or no longer listed by the queue as last read): focus goes by
+   * `fileLeft`'s own rule, as after that card's decision — never the inert stand-in that took the control's place (R319).
+   */
+  const closeLook = () => {
+    const at = lookAt;
+    setLookAt(null);
+    if (!at) return;
+    const list = itemsRef.current;
+    const ended = laidRef.current?.ended ?? {};
+    if (!ended[at.item.id] && (!list || list.some((x) => x.id === at.item.id))) {
+      setFileFocus({ to: `${LOOK_BACK}${at.item.id}` });
+      return;
+    }
+    setFileFocus({ to: focusAfterLeft(at.item, list ?? laidRef.current?.items ?? [], ended) });
+  };
   const arrivedCount = useMemo(() => {
     const laidIds = new Set(laid?.items.map((i) => i.id));
     let k = 0;
@@ -1019,7 +1159,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               collections={collections}
               tags={tags}
               flagTitle={flagging && titleFromFileName(item, shownSource)}
-              flagFolderNames={flagging ? (id: string) => madeByBatch(id, itemBatch(item)) : () => false}
+              flagFolderNames={flagging ? (id: string) => madeByBatch(id, batchId ?? item.batchId, itemBatch(item), batchesKnown) : () => false as const}
               busy={busy}
               onDecide={(d, done) => void decide(item, d, done)}
               onConfirm={(field, value) => confirmField(item, field, value)}
@@ -1066,6 +1206,23 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           onPointedAt={(id) => notice(id, null)}
           onDecide={(i, d, how) => void decideHeld(i, d, how)}
           onShowArrived={layOutAgain}
+          onLook={openLook}
+        />
+      )}
+      {/*
+       * R470 b, R487 a: the look is the screen's, not the card's: the found files' section is gone while the queue is read
+       * again, and the look must outlive that read to see what it says of the file.
+       */}
+      {!locked && lookAt && (
+        <LookDialog
+          key={lookAt.item.id}
+          title={lookAt.title}
+          projectId={projectId}
+          sourceId={lookAt.item.sourceId ?? ""}
+          lookFor={lookFor}
+          reviewId={lookAt.item.id}
+          gone={lookGone}
+          onClose={closeLook}
         />
       )}
     </main>
@@ -1260,6 +1417,8 @@ interface FoundFilesProps {
   onPointedAt(id: string): void;
   onDecide(item: HeldItem, decision: HeldFileDecision, how: PressCheck): void;
   onShowArrived(): void;
+  /** R470 b: "Look at the file" pressed on a card. */
+  onLook(item: HeldItem, title: string): void;
 }
 
 /** What the app's check says of a file, in the app's own words; nothing for a `why` it does not have (R313 f). */
@@ -1288,7 +1447,7 @@ function describeRecord(item: HeldItem, record: SourceFile | undefined): string 
  * and stays). Files that arrive are only counted, on a line in a place kept for it above the groups (laid out whether
  * or not it says anything, so its appearing moves nothing); "Show them" lays the section out afresh.
  */
-function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, failed, notices, pointing, onPointedAt, headRef, cardRef, onDecide, onShowArrived }: FoundFilesProps) {
+function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, failed, notices, pointing, onPointedAt, headRef, cardRef, onDecide, onShowArrived, onLook }: FoundFilesProps) {
   // Re-rendered when a record is read: the names depend on every waiting file's record.
   useSyncExternalStore(store.subscribe, store.version);
   const right = items.filter(looksRight);
@@ -1332,6 +1491,7 @@ function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, secti
               headRef={headRef}
               cardRef={cardRef}
               onDecide={onDecide}
+              onLook={onLook}
             />
           ))}
         </ul>
@@ -1392,6 +1552,8 @@ interface FileCardProps {
   headRef(id: string, el: HTMLHeadingElement | null): void;
   cardRef(id: string, el: HTMLElement | null): void;
   onDecide(item: HeldItem, decision: HeldFileDecision, how: PressCheck): void;
+  /** R470 b: "Look at the file" pressed (with the title its dialog shows). */
+  onLook(item: HeldItem, title: string): void;
 }
 
 /** R322 b: the Creators and Year rows before the record is read, when it has none, and when it could not be read. */
@@ -1406,7 +1568,7 @@ export const RECORD_ROW_TEXT = { reading: "…", none: "—", unread: "This sour
  * "Removing this file…" and looks busy, the other looks unavailable; R318 b: the press renews the quiet); R313 b — a key held down never decides: a repeated keydown
  * (Enter or Space) is cancelled, and so is the click a browser makes of it.
  */
-const FileCard = memo(function FileCard({ item, store, named, end, unread, notice, pointing, onPointedAt, epoch, busy, error, headRef, cardRef, onDecide }: FileCardProps) {
+const FileCard = memo(function FileCard({ item, store, named, end, unread, notice, pointing, onPointedAt, epoch, busy, error, headRef, cardRef, onDecide, onLook }: FileCardProps) {
   const h = item.heldFile;
   const record = useRecord(store, item.sourceId);
   const s = record?.source;
@@ -1538,6 +1700,32 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
         </>
       )}
       {/*
+       * R470 b (FR-490): a found PDF can be looked at before the decision (its control after the two deciding ones, so that Tab from the card's heading still reaches “Use this file” first, R303 b), in the reader's look-only mode; an EPUB (the
+       * reader shows PDFs only) says no preview can be shown. The line keeps its place once the file no longer waits (a
+       * stand-in of the control, never seen), so nothing below it moves (R319).
+       */}
+      {h && (
+        <div className="ao-review__file-look">
+          {h.kind !== "pdf" ? (
+            <p className="ao-import__hint">{NO_PREVIEW}</p>
+          ) : end ? (
+            <p className="ao-review__ghost" aria-hidden="true" inert>
+              <button type="button" tabIndex={-1}>
+                {LOOK_TEXT}
+              </button>
+            </p>
+          ) : (
+            <p>
+              {/* R487 a (i): while this file's own decision is out, busy as its two deciding controls are (aria-disabled,
+                  never disabled, so focus stays), and a press opens nothing. */}
+              <button type="button" aria-label={`${LOOK_TEXT} for ${named}`} aria-disabled={busy ? true : undefined} onClick={() => busy || onLook(item, recordTitle || "Untitled")}>
+                {LOOK_TEXT}
+              </button>
+            </p>
+          )}
+        </div>
+      )}
+      {/*
        * R322 b, R323 c: the line under the two controls — a refusal's or a give-up's sentence, and a press not taken
        * (R323 b: not an alert; the control is described by it while it is shown). Its place is kept on every card from
        * its first showing (two lines of the theme's text), so a sentence shown there moves nothing; a longer one may
@@ -1564,6 +1752,52 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
     </li>
   );
 });
+
+/**
+ * R470 b (FR-490): the held file in the app's reader, LOOK-ONLY, over the screen (the shared dialog shell: focus moves in
+ * — to its heading, so the key that opened it decides nothing — is kept inside, and goes back to "Look at the file" when
+ * it closes; the rest of the screen is inert). The reader reads the held file's own ranges and nothing else: no
+ * highlight, no note, no annotation list, nothing remembered, nothing attached. Its line says what the file is.
+ *
+ * R487 a (ii): once the file no longer waits (`gone`: the queue says so) or is not found (the reader's "not found", at
+ * once or in mid-look), the file is no longer shown — the reader goes, and with it every read of a range — and the line
+ * says LOOK_GONE instead, said once: focus moves to it (as the reader moves focus to a changed state's heading; no live
+ * region), and Shift+Tab from it is kept inside as from the heading. `onClose` is told whether the file had gone.
+ */
+function LookDialog({ title, projectId, sourceId, lookFor, reviewId, gone, onClose }: { title: string; projectId: string; sourceId: string; lookFor: LookFor; reviewId: string; gone: boolean; onClose(): void }) {
+  const id = useId();
+  const heading = useRef<HTMLHeadingElement>(null);
+  const note = useRef<HTMLParagraphElement>(null);
+  const [notFound, setNotFound] = useState(false);
+  const ended = gone || notFound;
+  const look = useMemo(() => lookFor(reviewId), [lookFor, reviewId]);
+  const lookOnly = useMemo<LookOnly>(() => ({ range: look.range, onGone: () => setNotFound(true) }), [look]);
+  useEffect(() => {
+    if (ended) note.current?.focus();
+  }, [ended]);
+  const close = () => onClose();
+  return (
+    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={close} className="ao-review__look" initialFocus={ended ? note : heading}>
+      <h2 id={`${id}-t`} ref={heading} tabIndex={-1}>
+        {`${LOOK_TEXT}: `}
+        <UserText>{title}</UserText>
+      </h2>
+      <p id={`${id}-d`} ref={note} tabIndex={ended ? -1 : undefined} className="ao-review__look-note">
+        {ended ? LOOK_GONE : LOOK_ONLY_NOTICE}
+      </p>
+      {!ended && (
+        <div className="ao-review__look-reader">
+          <ReaderScreen api={look.api} projectId={projectId} sourceId={sourceId} readOnly look={lookOnly} />
+        </div>
+      )}
+      <div className="ao-actions">
+        <button type="button" onClick={close}>
+          Close
+        </button>
+      </div>
+    </DialogShell>
+  );
+}
 
 /**
  * The reason for "Reviewed after the withdrawal" (R176 2) on the shared dialog shell (R145: focus in,
@@ -1731,7 +1965,7 @@ interface ItemPanelProps {
   tags: Tag[];
   flagTitle: boolean;
   /** True for a collection or tag id the batch made from a folder name (R64). */
-  flagFolderNames(id: string): boolean;
+  flagFolderNames(id: string): FolderFlag;
   busy: boolean;
   onDecide(d: ReviewDecision, done: string): void;
   /** A conflicting field's value chosen through the source screen's confirm (R149). */
@@ -1784,8 +2018,8 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
   const title = titleOf(source);
   const inCollections = (s?.collectionIds ?? []).map((id) => collections.find((c) => c.id === id)?.name ?? id);
   const itsTags = (s?.tagIds ?? []).map((id) => ({ id, index: tags.findIndex((t) => t.id === id) + 1, tag: tags.find((t) => t.id === id) }));
-  const folderCollections = (s?.collectionIds ?? []).some(flagFolderNames);
-  const folderTags = (s?.tagIds ?? []).some(flagFolderNames);
+  const folderCollections = folderFlagOf(s?.collectionIds ?? [], flagFolderNames);
+  const folderTags = folderFlagOf(s?.tagIds ?? [], flagFolderNames);
 
   return (
     <div className="ao-review__panel" onPointerMove={(e) => notice && pointing.moved.has(e.nativeEvent) && onPointedAt()}>
@@ -1879,14 +2113,26 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
                   </>
                 )}
               </dl>
-              {folderCollections && (
+              {folderCollections === "made" && (
                 <p className="ao-import__warning">
                   These collection names come from folder names, which can carry participants' names. Check them, and rename the collection or move the item if one names someone.
                 </p>
               )}
-              {folderTags && (
+              {folderCollections === "unrecorded" && (
+                <p className="ao-import__warning">
+                  The app has no record of which collections this import made, so these collection names may come from folder names, which can carry participants' names. Check them, and rename the
+                  collection or move the item if one names someone.
+                </p>
+              )}
+              {folderTags === "made" && (
                 <p className="ao-import__warning">
                   These tag names come from folder names, which can carry participants' names. Check them, and rename or remove a tag that names someone.
+                </p>
+              )}
+              {folderTags === "unrecorded" && (
+                <p className="ao-import__warning">
+                  The app has no record of which tags this import made, so these tag names may come from folder names, which can carry participants' names. Check them, and rename or remove a tag that
+                  names someone.
                 </p>
               )}
               <FilePreview api={api} projectId={projectId} source={source} />

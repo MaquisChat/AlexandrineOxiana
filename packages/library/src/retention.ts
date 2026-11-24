@@ -155,6 +155,7 @@ import {
   appendLibraryEvent,
   auditEventsMentioning,
   destroyProjectAssets,
+  inTurnWithAuditEventsMentioning,
   lookupPolicyInfo,
   repoClock,
   repoLibrary,
@@ -477,10 +478,27 @@ function statusOf(a: Audited): BackupsStepStatus {
 /** Lines of the audit log worth parsing for this: the destruction and backups-step events, and backups made. */
 const NEEDLES = ['"retention.', '"backup.create"'] as const;
 
+/** Test seam (R47): runs after the audit view is taken (`scan`), only while NODE_ENV is "test". */
+export const retentionSeams: { afterScan?: (projectId: string) => Promise<void> } = {};
+
 /** A cheap pass over the audit log for the destructions it records, and whether the log is as this process left it. */
 async function scan(repo: Repo, projectId: string): Promise<{ list: Audited[]; certificateHashes: Set<string>; headMatches: boolean }> {
   const { events, headMatches } = await auditEventsMentioning(repo, projectId, NEEDLES);
+  if (retentionSeams.afterScan && process.env.NODE_ENV === "test") await retentionSeams.afterScan(projectId);
   return { ...auditedDestructions(events), headMatches };
+}
+
+/**
+ * FR-420 (R469 b): a file of the retention folder named like an amendment to `a`'s certificate that the audit log does
+ * not record, looked for again in the write queue's turn, the audit view and the folder read together there: the view
+ * taken before the folder was read misses an amendment the app recorded in between. A locked project: ProjectLockedError.
+ */
+function strayInTurn(repo: Repo, projectId: string, dirRel: string, a: Audited): Promise<string | undefined> {
+  return inTurnWithAuditEventsMentioning(repo, projectId, NEEDLES, async (events) => {
+    const now = auditedDestructions(events).list.find((x) => x.certificateSha256 === a.certificateSha256) ?? a;
+    const known = new Set(now.amendments.map((x) => x.name));
+    return (await retentionNames(repo, dirRel)).find((n) => amendmentNumber(a.certificate, n) !== undefined && !known.has(n));
+  });
 }
 
 // ------------------------------------------------------------------------------------------
@@ -530,7 +548,8 @@ async function onDisk(repo: Repo, projectId: string, dirRel: string, a: Audited,
         : `An amendment to the destruction certificate ("${am.name}") is not the file the audit log recorded: it was changed afterwards.`;
   }
   const known = new Set(a.amendments.map((x) => x.name));
-  const stray = names.find((n) => amendmentNumber(a.certificate, n) !== undefined && !known.has(n));
+  let stray = names.find((n) => amendmentNumber(a.certificate, n) !== undefined && !known.has(n));
+  if (stray) stray = await strayInTurn(repo, projectId, dirRel, a);
   if (stray) problem ??= `"${stray}" is named like an amendment to the destruction certificate "${a.certificate}", but the audit log does not record it.`;
   return { verified, ...(original ? { original } : {}), amendments, ...(problem ? { problem: `${problem} ${FILES_DISAGREE}` } : {}) };
 }

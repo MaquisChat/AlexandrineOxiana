@@ -33,7 +33,7 @@ import { PATHS } from "../navigation";
 import type { LibraryWindowEvent } from "../desktopShell";
 import { fakeShell, type FakeShell } from "../test/desktopShell";
 import { SOURCE_FILE, server, testClient, url, useMockService } from "../test/service";
-import { ACT_SAID_MS, FindAcquire, LIBRARY_CLOSE_WAIT_MS, LIBRARY_SHELL_TIMEOUT_MS, SWITCH_TIMEOUT_MS } from "./FindAcquire";
+import { ACT_SAID_MS, FindAcquire, LIBRARY_CLOSE_WAIT_MS, LIBRARY_SHELL_TIMEOUT_MS, QUEUE_READ_WAIT_MS, SWITCH_TIMEOUT_MS } from "./FindAcquire";
 
 useMockService();
 
@@ -1013,13 +1013,24 @@ describe("FindAcquire: round 3 (R258)", () => {
   it("M8: the project list is read again when the service says a project changed (an unlock)", async () => {
     useService();
     show();
-    await waitFor(() => expect(optionTexts()).toContain("Clinic interviews (locked)"));
+    await waitFor(() => expect(optionTexts()).toContain("\u2068Clinic interviews\u2069 (locked)"));
     await waitFor(() => expect(events.open()).toBe(true));
     events.push(libState("lib-1"));
     server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => ({ ...p, unlocked: true })) })));
     events.push(libState("lib-1"));
     await waitFor(() => expect(optionTexts()).toContain("Clinic interviews"));
-    expect(optionTexts()).not.toContain("Clinic interviews (locked)");
+    expect(optionTexts()).not.toContain("\u2068Clinic interviews\u2069 (locked)");
+  });
+
+  it("a locked project's name is isolated in the picker, so a right-to-left name does not flip \" (locked)\"", async () => {
+    useService();
+    const rtl = "مقابلات العيادة";
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => (p.id === PID_LOCKED ? { ...p, name: rtl } : p)) })));
+    show();
+    const project = (await screen.findByRole("combobox", { name: "Project" })) as HTMLSelectElement;
+    await waitFor(() => expect(within(project).getAllByRole("option").some((o) => o.getAttribute("value") === PID_LOCKED)).toBe(true));
+    const locked = within(project).getAllByRole("option").find((o) => o.getAttribute("value") === PID_LOCKED)!;
+    expect(locked.textContent).toBe(`\u2068${rtl}\u2069 (locked)`);
   });
 
   for (const outcome of ["success", "refusal"] as const) {
@@ -1379,7 +1390,7 @@ describe("FindAcquire: round 4 (R262)", () => {
     server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => (p.id === PID ? { ...p, encrypted: true, unlocked: false } : p)) })));
     queues[PID] = () => refusal(423, "PROJECT_LOCKED", FIND_ROUTE_TEXT.locked, "locked");
     events.push(libState("lib-1"));
-    await waitFor(() => expect(within(project).getAllByRole("option").map((o) => o.textContent)).toContain("Market study (locked)"));
+    await waitFor(() => expect(within(project).getAllByRole("option").map((o) => o.textContent)).toContain("\u2068Market study\u2069 (locked)"));
     expect(await screen.findByRole("heading", { name: /Market study is locked/ })).toBeTruthy();
     expect(project.value).toBe(PID);
   });
@@ -3340,14 +3351,14 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       for (const sp of [...spies, pushState, replaceState]) seen.push(JSON.stringify(sp.mock.calls.map((c) => c.map(String))));
       const all = seen.join("\n");
       for (const secret of [TICKET, LIB_URL, "ezproxy.lib.example.edu", "ao.through.zq7"]) expect(all.includes(secret), secret).toBe(false);
-      // The calls to the shell that carry them — the open, and R342 b's second open — and no other (the take and the
-      // closes, the leftover's and Cancel's, carry nothing).
+      // The calls to the shell that carry them — the open, R342 b's second open, and Cancel's close of the window this
+      // page opened (R477 b: the ticket only) — and no other (the take and the leftover's close carry nothing).
       expect(fake.shell!.openLibraryWindow.mock.calls).toEqual([
         [TICKET, LIB_URL, "library"],
         [TICKET, LIB_URL, "library"],
       ]);
       expect(fake.shell!.libraryWindowTakePdf.mock.calls).toEqual([[]]);
-      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[], []]);
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[], [TICKET]]);
       expect(fake.shell!.openInBrowser).not.toHaveBeenCalled();
       // No request after the start carries them.
       expect(JSON.stringify(calls.filter((c) => !c.path.endsWith("/library/start")))).not.toMatch(/0123456789abcdef0123456789abcdef|ezproxy/u);
@@ -3701,6 +3712,9 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       await user.click(btn("remove me", "Remove from the queue"));
       await waitFor(() => expect(rows()).toHaveLength(1));
       await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      // R477 b: the close is on behalf of the open that made the window — it carries that open's ticket.
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[fake.shell!.openLibraryWindow.mock.calls[0]![0]]]);
+      expect(fake.shell!.closeLibraryWindow.mock.calls[0]![0]).toBe(TICKET);
       for (const s of ["fetching", "handed-over", "closed"] as const) await say({ ticket: TICKET, state: s });
       await quiet();
       expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1);
@@ -3715,6 +3729,7 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       progress(e, "no-open-copy");
       await waitFor(() => expect(stateOf("returned")).toBe("No open copy"));
       await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[TICKET]]);
       const h = heard();
       for (const s of ["fetching", "not-a-pdf", "handed-over", "closed"] as const) await say({ ticket: TICKET, state: s });
       await quiet();
@@ -3746,6 +3761,9 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       // The shell opens the window after all: the page closes it.
       act(() => answer(true));
       await waitFor(() => expect(fake.shell!.closeLibraryWindow).toHaveBeenCalledTimes(1));
+      // R477 b: the close carries THAT open's ticket, so the shell closes only the window that open made.
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[fake.shell!.openLibraryWindow.mock.calls[0]![0]]]);
+      expect(fake.shell!.closeLibraryWindow.mock.calls[0]![0]).toBe(TICKET);
       // Its closing, reported with the ticket, is no row's.
       await say({ ticket: TICKET, state: "closed" });
       await say({ ticket: TICKET, state: "fetching" });
@@ -3754,6 +3772,52 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
       expect(posts("/library/cancel")).toHaveLength(1);
       expect(note("late shell")).toBe(NOT_OPENED);
+    });
+
+    it("FR-561: an open given up on that the shell carries out only after a newer start opened its window does not close the newer window (R477 b: the page's close carries the OLDER ticket, which the shell refuses)", async () => {
+      serveOne("late then newer");
+      let answer!: (v: boolean) => void;
+      // As the shell (FR-561): the newest open owns the window; a close with another ticket closes nothing.
+      let owner: string | null = null;
+      const shell = fake.shell!;
+      shell.openLibraryWindow.mockReturnValueOnce(new Promise<boolean>((r) => (answer = r)));
+      shell.openLibraryWindow.mockImplementation(async (t) => {
+        owner = t;
+        return true;
+      });
+      shell.closeLibraryWindow.mockImplementation(async (t) => {
+        if (t !== undefined && t !== owner) return;
+        const was = owner;
+        owner = null;
+        queueMicrotask(() => shell.libraryWindow({ ticket: was, state: "closed" }));
+      });
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        fireEvent.click(btn("late then newer", "Get through my library"));
+        await vi.advanceTimersByTimeAsync(50);
+        await vi.waitFor(() => expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(LIBRARY_SHELL_TIMEOUT_MS + 500);
+      } finally {
+        vi.useRealTimers();
+      }
+      await waitFor(() => expect(posts("/library/cancel")).toHaveLength(1));
+      await waitFor(() => expect(note("late then newer")).toBe(NOT_OPENED));
+      // A newer start: its window opens for its own ticket, and the row waits.
+      await waitFor(() => expect(btn("late then newer", "Get through my library").getAttribute("aria-busy")).toBeNull());
+      fireEvent.click(btn("late then newer", "Get through my library"));
+      await waitFor(() => expect(stateOf("late then newer")).toBe("Waiting for you in the sign-in window"));
+      expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(2);
+      expect(fake.shell!.openLibraryWindow.mock.calls[1]![0]).toBe(SECOND);
+      // The first open is answered only now: the page asks to close the window THAT open made — with its (older) ticket,
+      // never the newer one and never none — so the newer window is not closed, and its wait goes on.
+      act(() => answer(true));
+      await quiet();
+      expect(fake.shell!.closeLibraryWindow.mock.calls).toEqual([[TICKET]]);
+      expect(owner).toBe(SECOND);
+      expect(posts("/library/cancel")).toHaveLength(1);
+      expect(stateOf("late then newer")).toBe("Waiting for you in the sign-in window");
     });
 
     it("R342 a: no close when the row leaves the wait by the hand-over", async () => {
@@ -3814,6 +3878,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
         [TICKET, LIB_URL, "library"],
       ]);
       expect(shell.closeLibraryWindow).toHaveBeenCalledTimes(1);
+      // The page does not know the leftover's ticket: its close carries none (R477 b).
+      expect(shell.closeLibraryWindow.mock.calls).toEqual([[]]);
       const [first, second] = shell.openLibraryWindow.mock.invocationCallOrder;
       expect(shell.closeLibraryWindow.mock.invocationCallOrder[0]).toBeGreaterThan(first!);
       expect(shell.closeLibraryWindow.mock.invocationCallOrder[0]).toBeLessThan(second!);
@@ -4131,6 +4197,81 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       g.release();
       await waitFor(() => expect(stateOf("one read")).toBe("Waiting for you in the sign-in window"));
       expect(posts("/library/start")).toHaveLength(1);
+    });
+
+    it("FR-558: a read of the queue that never answers keeps no control busy and stops no later read: each is waited for at most QUEUE_READ_WAIT_MS", async () => {
+      serveOne("hung read");
+      let hang = false;
+      server.use(http.get(url(`/projects/${PID}/find`), () => (hang ? new Promise<Response>(() => {}) : HttpResponse.json(queue(current)))));
+      fake.shell!.openLibraryWindow.mockResolvedValue(true);
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await waitFor(() => expect(events.open()).toBe(true));
+      const control = () => row("hung read").querySelector<HTMLElement>('button[data-act="library"]');
+      hang = true;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        // A read asked for by an event never answers…
+        progress(current[0]!, "no-open-copy");
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(reads()).toBe(2);
+        // …and the start's own read after the window opened never answers either.
+        fireEvent.click(control()!);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(fake.shell!.openLibraryWindow).toHaveBeenCalledTimes(1);
+        expect(reads()).toBe(3);
+        await vi.advanceTimersByTimeAsync(QUEUE_READ_WAIT_MS - 1_500);
+        expect(control()!.getAttribute("aria-busy")).toBe("true");
+        await vi.advanceTimersByTimeAsync(1_500);
+      } finally {
+        vi.useRealTimers();
+      }
+      // The start's control is no longer busy.
+      await waitFor(() => expect(control()?.getAttribute("aria-busy") ?? null).toBeNull());
+      // A new ask reads again (the read that never answered holds no later one back).
+      hang = false;
+      progress(current[0]!, "waiting-sign-in");
+      await waitFor(() => expect(stateOf("hung read")).toBe("Waiting for you in the sign-in window"));
+      expect(posts("/library/start")).toHaveLength(1);
+    });
+
+    it("FR-558: a read of the queue given up as never answering is cancelled: across many give-ups no more than one read is open, and the cancel changes nothing on the screen", async () => {
+      serveOne("hung reads");
+      let hang = false;
+      let open = 0;
+      let most = 0;
+      server.use(
+        http.get(url(`/projects/${PID}/find`), ({ request }) => {
+          if (!hang) return HttpResponse.json(queue(current));
+          open++;
+          most = Math.max(most, open);
+          request.signal.addEventListener("abort", () => open--, { once: true });
+          return new Promise<Response>(() => {});
+        }),
+      );
+      show();
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await waitFor(() => expect(events.open()).toBe(true));
+      const before = reads();
+      hang = true;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        for (let k = 1; k <= 8; k++) {
+          // A read asked for by an event never answers, and is given up after QUEUE_READ_WAIT_MS.
+          progress(current[0]!, "no-open-copy");
+          await vi.advanceTimersByTimeAsync(1_000);
+          expect(reads()).toBe(before + k);
+          expect(open).toBe(1);
+          await vi.advanceTimersByTimeAsync(QUEUE_READ_WAIT_MS);
+          expect(open).toBe(0);
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(most).toBe(1);
+      // The cancelled reads changed nothing: the row as it was, and nothing said in alert.
+      expect(stateOf("hung reads")).toBe("No open copy");
+      expect(screen.queryAllByRole("alert")).toEqual([]);
     });
 
     it("R342 j: two presses in the same moment (before the row shows itself busy) send ONE start", async () => {
@@ -5091,5 +5232,105 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
         });
       }
     });
+  });
+});
+
+describe("FindAcquire: rough edges (R460)", () => {
+  it("FR-576: when the service cannot be reached, its sentence is said once, not once for the projects and once for the settings", async () => {
+    useService();
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.error()),
+      http.get(url("/find/screen"), () => HttpResponse.error()),
+    );
+    show();
+    await waitFor(() => expect(calls.filter((c) => c.method === "GET" && (c.path === "/projects" || c.path === "/find/screen"))).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByRole("alert").some((a) => a.textContent === "The library service could not be reached.")).toBe(true));
+    // Both reads have settled: the settings' failure puts the switch back to what is confirmed, and the projects' gives an empty list.
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Project" })).toBeTruthy());
+    expect(screen.getAllByText("The library service could not be reached.")).toHaveLength(1);
+  });
+
+  it("FR-576: when the settings' read and the queue's read both cannot reach the service, its sentence is said once", async () => {
+    useService();
+    let queueFailed!: () => void;
+    const queueRead = new Promise<void>((r) => (queueFailed = r));
+    server.use(
+      http.get(url("/find/screen"), () => HttpResponse.error()),
+      http.get(url("/projects/:id/find"), () => {
+        queueFailed();
+        return HttpResponse.error();
+      }),
+    );
+    show(`?project=${PID}`);
+    await queueRead;
+    // Both failures have been taken: the queue no longer says it is reading (its failure was taken), and the screen's
+    // own alert — the settings', above the queue's heading — says the sentence.
+    await waitFor(() => expect(screen.queryByText("Reading the queue…")).toBeNull());
+    const heading = screen.getByRole("heading", { name: "Queue" });
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("alert").some((a) => a.textContent === "The library service could not be reached." && !!(a.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING)),
+      ).toBe(true),
+    );
+    expect(screen.getAllByText("The library service could not be reached.")).toHaveLength(1);
+  });
+});
+
+describe("FindAcquire: a source whose linked file cannot be found (R470 a; FR-504, FR-527)", () => {
+  const TYPED = "Quillfeather, Zorblatt Grammar of Habitus";
+  const resting = () => entry({ typed: TYPED, sourceId: SID, chosen: "c1", candidates: [cand({ id: "c1" })], state: "record-complete", reason: { code: "linked-file-missing" } });
+
+  it("the row says why in the service's sentence and offers Get a copy for this source, named for the source, before Open and Remove; never Try again", async () => {
+    useService({ queues: { [PID]: queue([resting()]) } });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const r = row(TYPED);
+    expect(r.querySelector(".ao-find__state")?.textContent).toBe("Record complete");
+    expect(r.querySelector(".ao-find__reason")?.textContent).toBe(FIND_REASON_TEXT["linked-file-missing"]);
+    expect(FIND_REASON_TEXT["linked-file-missing"]).toBe("Its linked file cannot be found at the moment; the drive it is on may not be connected.");
+    const controls = [...r.querySelectorAll(".ao-find__actions button, .ao-find__actions a")].map((el) => el.getAttribute("aria-label"));
+    expect(controls).toEqual([`Get a copy for this source: “${TYPED}”`, `Open: “${TYPED}”`, `Remove from the queue: “${TYPED}”`]);
+    expect(within(r).getByRole("button", { name: `Get a copy for this source: “${TYPED}”` }).textContent).toBe("Get a copy for this source");
+    expect(r.textContent).not.toContain("linked-file-missing");
+  });
+
+  it("the press sends one request, with no body, to the entry's own route; the row shows it under way and then follows the answer, focus kept in the row", async () => {
+    const e = resting();
+    useService({ queues: { [PID]: queue([e]) } });
+    const answer = held<void>();
+    server.use(
+      http.post(url(`/projects/${PID}/find/${e.id}/get-copy`), async () => {
+        await answer.p;
+        const next: FindEntryView = { ...e, state: "looking-for-copy", reason: undefined as never, updatedAt: "2026-11-13T11:00:00.000Z" };
+        delete (next as { reason?: unknown }).reason;
+        queues[PID] = queue([next]);
+        return HttpResponse.json(next);
+      }),
+    );
+    const user = userEvent.setup();
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    const h = heard();
+    const button = within(row(TYPED)).getByRole("button", { name: `Get a copy for this source: “${TYPED}”` });
+    await user.click(button);
+    await waitFor(() => expect(button.getAttribute("aria-busy")).toBe("true"));
+    expect(button.textContent).toBe("Asking for a copy…");
+    // A second press while the first is out sends nothing more.
+    await user.click(button);
+    answer.release();
+    await waitFor(() => expect(row(TYPED).querySelector(".ao-find__state")?.textContent).toBe("Looking for a copy"));
+    const sent = calls.filter((c) => c.method === "POST" && c.path.startsWith(`/projects/${PID}/find/`));
+    expect(sent).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/get-copy`, body: undefined }]);
+    expect(row(TYPED).querySelector(".ao-find__reason")).toBeNull();
+    await waitFor(() => expect(row(TYPED).contains(document.activeElement)).toBe(true));
+    expect(h.said.join(" | ")).toContain(`“${TYPED}”: Looking for a copy.`);
+    h.stop();
+  });
+
+  it("in a read-only library the press is not offered as usable", async () => {
+    useService({ queues: { [PID]: queue([resting()], { readOnly: true }) }, mode: "read-only" });
+    show();
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    expect((within(row(TYPED)).getByRole("button", { name: `Get a copy for this source: “${TYPED}”` }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

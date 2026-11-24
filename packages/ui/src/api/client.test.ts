@@ -244,6 +244,63 @@ describe("bytes() — a file's content, with the token in the header (R135 1, Ta
   });
 });
 
+describe("bytes() — a body cut off part-way (FR-350)", () => {
+  /** A body that sends one chunk and then fails, as a connection dropped mid-answer does. */
+  const brokenBody = () =>
+    new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new Uint8Array([1, 2, 3]));
+        c.error(new TypeError("network error"));
+      },
+    });
+  const cut = { status: 0, code: "INTERNAL", message: "The library service's answer was cut off before it finished." };
+
+  it.each([
+    ["with a limit (read in chunks)", { maxBytes: 100 }],
+    ["without a limit (read whole)", {}],
+  ])("%s: said as an answer cut off, not as a service that could not be reached", async (_n, opts) => {
+    const f = fakeFetch(() => new Response(brokenBody(), { status: 200, headers: { "content-type": "image/png" } }));
+    await expect(createClient(BASE, TOKEN, { fetch: f.fetch }).bytes("/x", opts)).rejects.toMatchObject(cut);
+  });
+});
+
+describe("byteRange() and ndjson() — an answer cut off part-way (FR-350, R467 M6)", () => {
+  /** One line, then the connection drops on the next read. */
+  const brokenBody = () => {
+    let n = 0;
+    return new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (n++ === 0) c.enqueue(new TextEncoder().encode('{"a":1}\n'));
+        else c.error(new TypeError("network error"));
+      },
+    });
+  };
+  const cut = { status: 0, code: "INTERNAL", message: "The library service's answer was cut off before it finished." };
+  const unreached = { status: 0, code: "UNAVAILABLE", message: "The library service could not be reached." };
+
+  it("byteRange: a 206 whose body breaks off is said cut off; a request that never got an answer is 'could not be reached'", async () => {
+    const f = fakeFetch(() => new Response(brokenBody(), { status: 206, headers: { "content-range": "bytes 0-99/1000" } }));
+    await expect(createClient(BASE, TOKEN, { fetch: f.fetch }).byteRange("/x", 0, 99)).rejects.toMatchObject(cut);
+    const down = createClient(BASE, TOKEN, { fetch: (() => Promise.reject(new TypeError("network error"))) as typeof fetch });
+    await expect(down.byteRange("/x", 0, 99)).rejects.toMatchObject(unreached);
+  });
+
+  it("ndjson: a stream whose read breaks off is said cut off (after its lines so far); one that never began is 'could not be reached'", async () => {
+    const f = fakeFetch(() => new Response(brokenBody(), { status: 200, headers: { "content-type": "application/x-ndjson" } }));
+    const got: unknown[] = [];
+    const run = async () => {
+      for await (const line of createClient(BASE, TOKEN, { fetch: f.fetch }).ndjson("POST", "/x")) got.push(line);
+    };
+    await expect(run()).rejects.toMatchObject(cut);
+    expect(got).toEqual([{ a: 1 }]);
+    const down = createClient(BASE, TOKEN, { fetch: (() => Promise.reject(new TypeError("network error"))) as typeof fetch });
+    const never = async () => {
+      for await (const _ of down.ndjson("POST", "/x")) void _;
+    };
+    await expect(never()).rejects.toMatchObject(unreached);
+  });
+});
+
 describe("mediaUrl() — the address a media element loads (R135)", () => {
   const TICKET = "Ab3_-".repeat(8) + "xyz"; // 43 base64url characters
   const B64_TOKEN = "Q".repeat(40); // a token that could sit inside a ticket-shaped path

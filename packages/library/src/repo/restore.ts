@@ -643,9 +643,21 @@ export async function adoptRestoredProject(
        * `unverified`: only records the app cannot vouch for name it as destroyed (R182 d).
        */
       const left: Array<{ sourceId: string; assetId: string; destroyedAt: string; unverified?: true }> = [];
+      /**
+       * FR-410 (R365 a): the files of the backup an earlier restore marked destroyed on records the
+       * app could not vouch for (its `project.restored` entries in the backup's own log, which
+       * verified above). They keep that mark in this copy, so an export never states it as fact.
+       */
+      const earlierUnverified = new Set<string>();
+      for (const e of events as AuditEvent[]) {
+        const named = e.action === "project.restored" ? (e.details as { destroyedUnverifiedAssetIds?: unknown } | undefined)?.destroyedUnverifiedAssetIds : undefined;
+        if (Array.isArray(named)) for (const id of named) if (typeof id === "string") earlierUnverified.add(id);
+      }
+      const carriedUnverified: string[] = [];
       for (const [f, raw] of parsedSources) {
         const sf = raw as { source: { id: string }; assets: Array<{ id: string; path: string; sha256: string; status?: string; destroyedAt?: string; linked?: unknown }> };
         for (const a of sf.assets) {
+          if (a.status === "destroyed" && earlierUnverified.has(a.id)) carriedUnverified.push(a.id);
           if (a.status === "destroyed" || a.linked) continue;
           const by = excluding.find((x) => x.byId.has(a.id) || x.bySha256.has(a.sha256));
           if (!by) {
@@ -810,6 +822,11 @@ export async function adoptRestoredProject(
           ...(skipped ? { leftOutDestroyed: skipped } : {}),
           // Left out on records the app cannot vouch for alone: not counted as destroyed (R182 d).
           ...(onUnverified ? { leftOutUnverified: onUnverified } : {}),
+          // The copy's files marked destroyed only on such records, by this restore or an earlier one
+          // (ids only, FR-410, R365 a): an export of the copy does not state their destruction as fact.
+          ...(onUnverified || carriedUnverified.length
+            ? { destroyedUnverifiedAssetIds: [...left.filter((x) => x.unverified).map((x) => x.assetId), ...carriedUnverified].map((id) => ids.get(id) ?? id) }
+            : {}),
           // Projects whose record of destructions the audit log could not vouch for, and what the
           // list of files left out rests on for each (R179).
           ...(notVerified.length ? { destructionsNotVerified: notVerified } : {}),

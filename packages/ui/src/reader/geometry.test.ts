@@ -15,7 +15,7 @@ import { getDocument, type PageViewport, type PDFPageProxy } from "pdfjs-dist/le
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { pdfSortIndex } from "@ao/core/annotations/sortIndex";
 import { buildRotatedCropPdf, buildTwoColumnPdf } from "../../../../tests/fixtures/generate.mjs";
-import { normaliseQuote, pdfRectToBox, selectionToAnchors, selectionToPdfRects, type Box, type DOMRectLike, type PageGeometry } from "./geometry";
+import { joinQuotes, normaliseQuote, pdfRectToBox, selectionToAnchors, selectionToPdfRects, type Box, type DOMRectLike, type PageGeometry } from "./geometry";
 import { canJudge, quoteStillUnder, type TextContent } from "./textCheck";
 
 let task: ReturnType<typeof getDocument>;
@@ -417,5 +417,57 @@ describe("normaliseQuote (Task R10)", () => {
     expect(normaliseQuote("a well-known name")).toBe("a well-known name");
     expect(normaliseQuote("ends with a dash -\n then more")).toBe("ends with a dash - then more");
     expect(normaliseQuote("bell\u0007 rang")).toBe("bell rang");
+  });
+
+  it("joins lines of Chinese or Japanese text with nothing between; mixed text keeps its spaces (FR-454)", () => {
+    expect(normaliseQuote("研究者は資料を\n整理する。")).toBe("研究者は資料を整理する。");
+    expect(normaliseQuote("社会科学的研究\n 方法论")).toBe("社会科学的研究方法论");
+    expect(normaliseQuote("「インタビュー」\nの記録")).toBe("「インタビュー」の記録");
+    expect(normaliseQuote("カタカナの語ー\nテキスト")).toBe("カタカナの語ーテキスト");
+    // Mixed: a line break between Latin and Chinese or Japanese text stays a space.
+    expect(normaliseQuote("the word\n研究 means research")).toBe("the word 研究 means research");
+    expect(normaliseQuote("研究\nmeans research")).toBe("研究 means research");
+    // A space within a line is kept, as are line breaks in Korean (written with spaces).
+    expect(normaliseQuote("東京 大学")).toBe("東京 大学");
+    expect(normaliseQuote("사회 과학\n연구")).toBe("사회 과학 연구");
+  });
+
+  it("R474 M6: a digit meeting Chinese or Japanese across the break, direction and zero-width marks, Bopomofo, and a full-width indent", () => {
+    // A digit beside Chinese or Japanese text: nothing between, either way round.
+    expect(normaliseQuote("第\n3章")).toBe("第3章");
+    expect(normaliseQuote("2024\n年に")).toBe("2024年に");
+    expect(normaliseQuote("第３\n章")).toBe("第３章");
+    // Marks at the break do not block the join (they stay where they were).
+    expect(normaliseQuote("日本‏\n語")).toBe("日本‏語");
+    expect(normaliseQuote("日本​\n​語")).toBe("日本​​語");
+    expect(normaliseQuote("日本\n⁠語")).toBe("日本⁠語");
+    // Bopomofo is Chinese text.
+    expect(normaliseQuote("ㄅ\nㄆ")).toBe("ㄅㄆ");
+    // A full-width space indenting a paragraph's first line is kept.
+    expect(normaliseQuote("終わり。\n　次の段落")).toBe("終わり。　次の段落");
+    // As before: English, Korean, Arabic and Hebrew keep their space; digits beside Latin text too.
+    expect(normaliseQuote("The quick\nbrown  fox")).toBe("The quick brown fox");
+    expect(normaliseQuote("page\n3")).toBe("page 3");
+    expect(normaliseQuote("2024\n2025")).toBe("2024 2025");
+    expect(normaliseQuote("사회\n3장")).toBe("사회 3장");
+    expect(normaliseQuote("البحث\nالعلمي")).toBe("البحث العلمي");
+    expect(normaliseQuote("מחקר\nחברתי")).toBe("מחקר חברתי");
+  });
+});
+
+describe("joinQuotes (FR-454)", () => {
+  it("joins a quote's pages as its lines are joined", () => {
+    expect(joinQuotes(["研究者は資料を", "整理する。"])).toBe("研究者は資料を整理する。");
+    expect(joinQuotes(["the end of one page", "and the next"])).toBe("the end of one page and the next");
+    expect(joinQuotes(["研究", "means"])).toBe("研究 means");
+    expect(joinQuotes(["only one"])).toBe("only one");
+  });
+
+  it("R474 M6: pages join as lines do: a digit beside Chinese or Japanese, marks at the break, Bopomofo", () => {
+    expect(joinQuotes(["第", "3章"])).toBe("第3章");
+    expect(joinQuotes(["日本‏", "語"])).toBe("日本‏語");
+    expect(joinQuotes(["ㄅ", "ㄆ"])).toBe("ㄅㄆ");
+    expect(joinQuotes(["page", "3"])).toBe("page 3");
+    expect(joinQuotes(["البحث", "العلمي"])).toBe("البحث العلمي");
   });
 });

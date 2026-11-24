@@ -106,6 +106,20 @@ describe("Governance settings", () => {
     expect(within(card("Audit log")).getByText(/Required by .*HIPAA/)).toBeTruthy();
   });
 
+  it("FR-156: a profile toggled at once after a raw edit works from the text as typed, not from the rules parsed before it", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: "View governance.yaml" }));
+    const raw = screen.getByRole("textbox", { name: "governance.yaml" }) as HTMLTextAreaElement;
+    // Typed in the editor, then HIPAA ticked before the editor's text is parsed again (300 ms).
+    fireEvent.change(raw, { target: { value: `profiles: [gdpr]\n${YAML}` } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "HIPAA" }));
+    const now = parse(raw.value);
+    expect(now.profiles).toEqual(["gdpr", "hipaa"]);
+    expect(now.encryption.atRest).toBe("required");
+  });
+
   it("setting encryption Optional under HIPAA asks for a reason, and the PUT carries the exception, the reason and the base version", async () => {
     const cap = serve();
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);
@@ -514,7 +528,7 @@ describe("capture methods (D11)", () => {
 
   it("a locked or read-only project shows the methods but cannot change them, and says why", async () => {
     const cap = serve({ yaml: "captureMethods: [manual_upload, browser_capture]\n" });
-    const why = "This project is locked. Unlock it in the library to change its rules.";
+    const why = "This project is locked, so its rules cannot be changed until it is unlocked.";
     render(<GovernanceSettings api={makeApi()} projectId={PID} readOnlyReason={why} />);
     await loaded();
     expect(box(CAPTURE_LABEL.browser_capture).checked).toBe(true);
@@ -531,7 +545,7 @@ describe("capture methods (D11)", () => {
 });
 
 describe("a locked project or a read-only library: nothing on the screen offers a change (Task 64 review M1)", () => {
-  const REASONS = ["This project is locked. Unlock it in the library to change its rules.", "This library is open read-only here, so its rules cannot be changed."];
+  const REASONS = ["This project is locked, so its rules cannot be changed until it is unlocked.", "This library is open read-only here, so its rules cannot be changed."];
   it.each(REASONS)("“%s”: approval documents, time zone and destruction are off, the reason is shown once, and no request is sent", async (why) => {
     const sent: string[] = [];
     serve();
@@ -643,6 +657,78 @@ describe("capture methods, smaller points (Task 64 review)", () => {
     await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
     await waitFor(() => expect((within(card("Capture methods")).getByRole("textbox", { name: /Default legal basis/ }) as HTMLInputElement).value).toBe(""));
     expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // R468 (I2, by its reason): the legal-basis fields go back WITHOUT a remount, so focus stays on the same element.
+  it("a cancelled reason puts the web legal basis back, and focus on the same field (R468)", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = within(card("Capture methods")).getByRole("textbox", { name: /Default legal basis for captures from the web/ }) as HTMLInputElement;
+    await user.type(field, "Public task{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe(""));
+    expect(within(card("Capture methods")).getByRole("textbox", { name: /Default legal basis for captures from the web/ })).toBe(field);
+    expect(document.activeElement).toBe(field);
+  });
+
+  it("a cancelled reason puts the typed-references legal basis back, and focus on the same field (R468)", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const find = () => within(card("How Find and acquire may get works")).getByRole("textbox", { name: /Default legal basis for records made from typed references/ }) as HTMLInputElement;
+    const field = find();
+    await user.type(field, "Legitimate interest{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe(""));
+    expect(find()).toBe(field);
+    expect(document.activeElement).toBe(field);
+  });
+
+  it("a comma-separated list whose reason is cancelled goes back to the saved value (FR-390)", async () => {
+    serve({ yaml: "protocol:\n  platforms: [youtube]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = () => within(card("Protocol record")).getByRole("textbox", { name: "Platforms" }) as HTMLInputElement;
+    expect(field().value).toBe("youtube");
+    await user.type(field(), ", vimeo");
+    await user.tab();
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field().value).toBe("youtube"));
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // R468 (I2): the draft goes back WITHOUT the field being remounted, so focus comes back to the
+  // same element the dialog was opened from (Enter) or that Tab had moved to (the next field).
+  it("a cancelled reason puts the list back and focus on the same field it was opened from, by Enter (FR-390, R468)", async () => {
+    serve({ yaml: "protocol:\n  platforms: [youtube]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = within(card("Protocol record")).getByRole("textbox", { name: "Platforms" }) as HTMLInputElement;
+    await user.type(field, ", vimeo{Enter}");
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe("youtube"));
+    expect(within(card("Protocol record")).getByRole("textbox", { name: "Platforms" })).toBe(field);
+    expect(document.activeElement).toBe(field);
+  });
+
+  it("a cancelled reason puts the list back and focus on the field Tab had moved to (FR-390, R468)", async () => {
+    serve({ yaml: "protocol:\n  platforms: [youtube]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const field = within(card("Protocol record")).getByRole("textbox", { name: "Platforms" }) as HTMLInputElement;
+    const next = within(card("Protocol record")).getByRole("textbox", { name: "Populations" });
+    await user.type(field, ", vimeo");
+    await user.tab();
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe("youtube"));
+    expect(within(card("Protocol record")).getByRole("textbox", { name: "Platforms" })).toBe(field);
+    expect(document.activeElement).toBe(next);
   });
 
   it("the reason dialog shows the typed legal basis as the person's own text, with its own direction (M7)", async () => {
@@ -801,7 +887,7 @@ describe("How Find and acquire may get works (Find and acquire Task F13; R301, R
 
   it("a locked project shows the boxes but cannot change them", async () => {
     serve();
-    render(<GovernanceSettings api={makeApi()} projectId={PID} readOnlyReason="This project is locked. Unlock it in the library to change its rules." />);
+    render(<GovernanceSettings api={makeApi()} projectId={PID} readOnlyReason="This project is locked, so its rules cannot be changed until it is unlocked." />);
     await loaded();
     for (const b of findCard().getAllByRole("checkbox") as HTMLInputElement[]) expect(b.disabled).toBe(true);
     expect((findCard().getByRole("textbox", { name: /Default legal basis/ }) as HTMLInputElement).disabled).toBe(true);

@@ -69,6 +69,7 @@ import {
   searchContactEmail,
   type SearchSettings,
   type SearchSettingsRead,
+  writeQueueTurn,
 } from "@ao/library";
 import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent } from "@ao/shared";
 import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, oldCopiesPendingText } from "@ao/shared";
@@ -234,7 +235,12 @@ export interface WorkControl {
    * and leaves its job pending, to run again at the next open.
    */
   interrupt?: () => void;
+  /** A rerun of pending jobs (`worker-resume`) whose job in hand is a transcription (R466 I1): a move stops it as it stops one. */
+  transcribing?: boolean;
 }
+
+/** A transcription running now, whatever started it: one asked for here, or a rerun of a pending one (R466 I1). */
+const isTranscribing = (w: { kind: string; ctl: WorkControl }): boolean => w.kind === "transcription" || (w.kind === "worker-resume" && w.ctl.transcribing === true);
 
 /** How long a close waits for registered work before abandoning what can be (default; Task 62). */
 export const CLOSE_GRACE_MS = 30_000;
@@ -338,14 +344,29 @@ export class ServiceState {
     return [...this.work.values()].map((w) => w.kind);
   }
 
-  /** Asks every registered item to stop between items and waits for all to end; false if one did not in time. */
-  async drainWork(timeoutMs: number): Promise<boolean> {
-    const items = [...this.work.values()];
+  /** Asks every registered item (those `which` selects) to stop between items and waits for all to end; false if one did not in time. */
+  async drainWork(timeoutMs: number, which: (w: { kind: string; ctl: WorkControl }) => boolean = () => true): Promise<boolean> {
+    const items = [...this.work.values()].filter(which);
     for (const w of items) w.ctl.stopping = true;
     const all = Promise.allSettled(items.map((w) => w.done)).then(() => true);
     const ok = (await withTimeout(all, timeoutMs).catch(() => undefined)) === true;
     if (!ok) for (const w of items) w.ctl.stopping = false; // rolled back: the rest carries on
     return ok;
+  }
+
+  /**
+   * After a move refused before anything was copied (FR-385): the transcriptions its quiesce stopped
+   * stay pending in their journals; once they have ended here, they run again in the library still
+   * open (not awaited by the refusal).
+   */
+  resumeStoppedTranscriptions(s: Session): void {
+    const stopped = [...this.work.values()].filter(isTranscribing).map((w) => w.done);
+    this.track(
+      Promise.allSettled(stopped).then(() => {
+        if (this.session === s && !this.moving) this.resumeWorkerJobs(s);
+      }),
+      "resuming transcriptions after a refused move",
+    );
   }
 
   /** Continues the work stopped for a move, when it belongs to the library open now (R108); the rest waits for its own. */
@@ -415,13 +436,38 @@ export class ServiceState {
       this.captureAborts.get(queueId)?.abort();
       this.events.publish("capture.progress", { queueId, projectId, finished: true, error } satisfies CaptureQueueProgressEvent);
     };
+    let cut = 0;
     for (const [id, q] of this.captures) {
       if (q.projectId !== projectId) continue;
       if (q.finished) this.captures.delete(id);
-      else end(id);
+      else {
+        // The links not captured (the one in flight too: what it brings back is discarded), counted
+        // from the queue's counters before it is ended; no address is read (R464 b).
+        if (why === "lock" && !this.endedCaptures.has(id)) cut += Math.max(0, q.total - q.done);
+        end(id);
+      }
     }
+    if (cut > 0) this.cutByLock.set(projectId, (this.cutByLock.get(projectId) ?? 0) + cut);
     for (const [id, pid] of this.profileRuns) if (pid === projectId) end(id);
     this.captureQueues.forgetProject(projectId);
+  }
+
+  /**
+   * How many links a lock cut from each project's capture queues before they were captured (FR-370,
+   * FR-371; R464 b): a COUNT only, never an address (an encrypted project's addresses leave memory at
+   * its lock: R30, R50, R435), in memory only, until the desktop app's "Got it" or the service ends.
+   * Told with the project's queues, which a locked project does not answer (423).
+   */
+  private readonly cutByLock = new Map<string, number>();
+
+  /** The links a lock cut from `projectId`'s queues and not yet acknowledged, if any. */
+  capturesCutByLock(projectId: string): number | undefined {
+    return this.cutByLock.get(projectId);
+  }
+
+  /** The desktop app's "Got it": the count is forgotten. */
+  acknowledgeCapturesCutByLock(projectId: string): void {
+    this.cutByLock.delete(projectId);
   }
 
   /** Whether the queue or profile run was ended from outside (it then stores, records and publishes nothing). */
@@ -1031,7 +1077,8 @@ export class ServiceState {
     await this.zoteroSync.stop("library-closed");
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
-    if (!(await this.drainWork(ms))) {
+    // A running transcription is not waited for here: it is stopped below, once nothing else refuses the move.
+    if (!(await this.drainWork(ms, (w) => !isTranscribing(w)))) {
       this.zoteroSync.startScheduler(this, s);
       this.restartStoppedWork();
       throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
@@ -1055,6 +1102,17 @@ export class ServiceState {
       this.zoteroSync.startScheduler(this, s);
       this.restartStoppedWork();
       throw new ApiError(409, "CONFLICT", "An import could not be paused in time, so the library was not moved; try again in a moment.");
+    }
+    // The move goes ahead: every transcription running in the library is stopped at once, as at a close
+    // (N-5), whatever started it (FR-385; R466 I1, M1) — one asked for here, or a rerun of a pending one
+    // (after an unlock, a launch, or a move that carried it on). It stays pending in its project's journal;
+    // a write already under way finishes first (the worker client's guarded write). Then it is waited for.
+    for (const w of this.work.values()) if (isTranscribing(w)) w.ctl.interrupt?.();
+    if (!(await this.drainWork(ms))) {
+      this.resumeBatches(paused);
+      this.zoteroSync.startScheduler(this, s);
+      this.restartStoppedWork();
+      throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
     }
     try {
       this.stopBackupScheduler();
@@ -1523,14 +1581,24 @@ export class ServiceState {
     void this.startWork("worker-resume", async (ctl) => {
       // A close abandons the job in hand once its grace period ends (N-5): it stays pending.
       const ac = new AbortController();
-      ctl.interrupt = () => ac.abort(new JobInterruptedError());
+      let interrupted = false;
+      ctl.interrupt = () => {
+        interrupted = true;
+        ac.abort(new JobInterruptedError());
+      };
       await client.resumePending(projectId, {
         shouldStop: () => ctl.stopping,
         signal: ac.signal,
         // A pending transcription runs again with its finish step and is followed like a new one (Task 62).
-        prepare: (rec) => this.transcriptions.rerun(s, rec),
+        prepare: (rec) => {
+          ctl.transcribing = rec.kind === "audio.transcribe"; // the job in hand (R466 I1)
+          return this.transcriptions.rerun(s, rec);
+        },
       });
-      if (ctl.stopping) return (next: Session) => this.resumeWorkerJobs(next, projectId);
+      // Stopped between jobs: carried on in the library open next. Abandoned part-way (a close, a move: R466 I1):
+      // not carried on from here, since the library open next reruns every pending job when its worker is
+      // attached (or, after a refused move, resumeStoppedTranscriptions does), and two reruns at once would race.
+      if (ctl.stopping && !interrupted) return (next: Session) => this.resumeWorkerJobs(next, projectId);
     });
   }
 
@@ -1621,6 +1689,11 @@ export class ServiceState {
     }));
     const unchecked = behind.unchecked;
     return { message: oldCopiesPendingText({ oldCopies, ...(unchecked ? { unchecked: true } : {}) }), destructions: behind.destructions, oldCopies, ...(unchecked ? { unchecked: true as const } : {}) };
+  }
+
+  /** The open library's way into its write queue, for a check that confirms a finding there (FR-420, R469 b). */
+  writeQueueTurn(s: Session): <T>(fn: () => Promise<T>) => Promise<T> {
+    return writeQueueTurn(s.repo);
   }
 
   integrityWarnings(s: Session, names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]))): Array<{ projectId: string; project: string; kind: string; detail: string }> {

@@ -287,6 +287,15 @@ describe("WatchedFolders", () => {
     expect(within(two).queryByText(/came in/)).toBeNull();
   });
 
+  it("FR-476: files whose content was already in the library (a same-content conflict copy) have their line", async () => {
+    useService([folder({ counts: { cameIn: 2, alreadyInLibrary: 1 } }), folder({ id: "w2", label: "Other", counts: { alreadyInLibrary: 3 } }), folder({ id: "w3", label: "None", counts: { cameIn: 1 } })]);
+    show();
+    const one = await screen.findByRole("region", { name: "Fieldwork scans" });
+    expect(within(one).getByText("1 file was already in the library, so it was not brought in again")).toBeTruthy();
+    expect(within(card("Other")).getByText("3 files were already in the library, so they were not brought in again")).toBeTruthy();
+    expect(within(card("None")).queryByText(/already in the library/)).toBeNull();
+  });
+
   it("every state word, and stopped as Not watched with its reason", async () => {
     useService([
       folder({ id: "a", label: "A" }),

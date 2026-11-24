@@ -16,7 +16,7 @@ import { createLibrary, openLibrary, type Library } from "../library.js";
 import type { Repo } from "./index.js";
 import { importChange } from "./repo.js";
 import { pauseBetweenSourceFilesForTests } from "./sources.js";
-import { SimulatedCrash, openTestRepo } from "./testing.js";
+import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
 
 const OPEN_GOV = `identifiability:
   containsIdentifiable: false
@@ -107,6 +107,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   pauseBetweenSourceFilesForTests(undefined);
+  seams.failUndo = undefined;
   await lib.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
@@ -210,3 +211,112 @@ describe("D21: a write cut off between its two files (the process dies)", () => 
     expect(warnings().map((w) => w.kind)).toEqual(["rolled-back-incomplete-write"]);
   });
 });
+
+describe("FR-425: a change whose in-process roll-back failed", () => {
+  it("its own leftover files are not reported as changed outside the app; the next open rolls it back", async () => {
+    pauseBetweenSourceFilesForTests(async () => {
+      throw new Error("the disk refused source.json");
+    });
+    seams.failUndo = "replaced"; // putting the annotations file back fails too
+    await expect(setAnnotations(repo, pid, sid, ["replaced"])).rejects.toThrow("the disk refused source.json");
+    pauseBetweenSourceFilesForTests(undefined);
+    seams.failUndo = undefined;
+    // The new annotations file is on disk beside the old source.json: the app's own half-undone change.
+    await repo.getSource(pid, sid);
+    await repo.getSource(pid, sid);
+    expect(warnings("annotations-hash-mismatch")).toEqual([]);
+    expect(warnings("annotations-unreadable")).toEqual([]);
+    // The next open finishes the roll-back (R26): the pair before the change, and no annotation warning.
+    await lib.close();
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    const sf = await repo.getSource(pid, sid);
+    expect(sf.annotations.map((a) => a.body)).toEqual(["first", "second"]);
+    await consistentOnDisk(sf, folder);
+    expect(warnings().filter((w) => w.kind.startsWith("annotations-"))).toEqual([]);
+  });
+});
+
+describe("R473 I1: while a roll-back waits, only the sources its marker names are spared the outside-change warning", () => {
+  /** The FR-425 set-up: a change of `sid`'s annotations whose in-process roll-back failed. */
+  async function failedRollBack(): Promise<void> {
+    pauseBetweenSourceFilesForTests(async () => {
+      throw new Error("the disk refused source.json");
+    });
+    seams.failUndo = "replaced";
+    await expect(setAnnotations(repo, pid, sid, ["replaced"])).rejects.toThrow("the disk refused source.json");
+    pauseBetweenSourceFilesForTests(undefined);
+    seams.failUndo = undefined;
+  }
+  const UNFINISHED = "A change to this source did not finish and could not be undone. Close the library and open it again to put it back.";
+  const UNFINISHED_READ_ONLY = "A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.";
+
+  it("the probe: another source's annotations changed by hand while the roll-back waits are reported", async () => {
+    const other = await repo.createSource(pid, draft("Other"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() });
+    await setAnnotations(repo, pid, other.source.id, ["a", "b"]);
+    await failedRollBack();
+    const file = join(lib.root, other.source.folder, "annotations.json");
+    const anns = JSON.parse(await readFile(file, "utf8")) as Annotation[];
+    anns[1]!.body = "tampered";
+    await writeFile(file, JSON.stringify(anns));
+    expect((await repo.getSource(pid, other.source.id)).annotations.map((a) => a.body)).toEqual(["a", "tampered"]);
+    expect(warnings("annotations-hash-mismatch")).toMatchObject([{ projectId: pid, file: `${other.source.folder}/annotations.json` }]);
+  });
+
+  it("the source the marker names says the true thing instead, once, for as long as the roll-back waits", async () => {
+    await failedRollBack();
+    await repo.getSource(pid, sid);
+    await repo.getSource(pid, sid);
+    expect(warnings().filter((w) => w.kind.startsWith("annotations-"))).toEqual([]);
+    expect(warnings("source-change-unfinished")).toEqual([{ projectId: pid, kind: "source-change-unfinished", file: folder, detail: UNFINISHED }]);
+    // The next open puts it back: the warning is gone with the roll-back.
+    await lib.close();
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    await repo.getSource(pid, sid);
+    expect(warnings("source-change-unfinished")).toEqual([]);
+  });
+
+  it("in a library opened without changes the marker still names the source, with the read-only sentence; other sources warn", async () => {
+    const other = await repo.createSource(pid, draft("Other"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() });
+    await setAnnotations(repo, pid, other.source.id, ["a"]);
+    await failedRollBack();
+    await rm(join(lib.root, other.source.folder, "annotations.json"));
+    await lib.close();
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await openTestRepo(lib, ring, { clock: () => new Date(NOW), tz: "UTC", actor: "tester", scryptN: 2 ** 10, noHeal: true });
+    await repo.getSource(pid, sid);
+    await repo.getSource(pid, other.source.id);
+    expect(warnings("source-change-unfinished-read-only")).toEqual([{ projectId: pid, kind: "source-change-unfinished-read-only", file: folder, detail: UNFINISHED_READ_ONLY }]);
+    expect(warnings().filter((w) => w.kind.startsWith("annotations-")).map((w) => [w.kind, w.file])).toEqual([["annotations-unreadable", `${other.source.folder}/annotations.json`]]);
+  });
+
+  it("once the researcher rolls the change back, the source is no longer said to be unfinished; a later change outside the app warns", async () => {
+    await failedRollBack();
+    await repo.getSource(pid, sid);
+    const [pending] = await repo.pendingWrites();
+    await repo.resolvePendingWrite(pending!.txn, "roll-back");
+    expect(warnings("source-change-unfinished")).toEqual([]);
+    expect((await repo.getSource(pid, sid)).annotations.map((a) => a.body)).toEqual(["first", "second"]);
+    await rm(join(lib.root, folder, "annotations.json"));
+    await repo.getSource(pid, sid);
+    expect(warnings("source-change-unfinished")).toEqual([]);
+    expect(warnings("annotations-unreadable")).toHaveLength(1);
+  });
+
+  it("a file the marker names, changed by hand meanwhile, is still put back at the reopen, and that is recorded", async () => {
+    await failedRollBack();
+    await writeFile(join(lib.root, folder, "annotations.json"), JSON.stringify([note(sid, "edited by someone")]));
+    await lib.close();
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    const sf = await repo.getSource(pid, sid);
+    expect(sf.annotations.map((a) => a.body)).toEqual(["first", "second"]);
+    await consistentOnDisk(sf, folder);
+    expect(warnings("rolled-back-incomplete-write")).toHaveLength(1);
+    // R484 b: the roll-back overwrote the hand edit, so the annotations are not "shown as they are now".
+    expect(warnings("annotations-hash-mismatch")).toEqual([]);
+    expect(warnings("changed-outside-before-rollback")).toMatchObject([{ projectId: pid, file: `${folder}/annotations.json` }]);
+  });
+});
+

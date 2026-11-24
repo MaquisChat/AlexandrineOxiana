@@ -8,17 +8,55 @@ build `sys.executable` is this program, so it also accepts:
   is not inside the bundle (GPL-2.0-only): it is the copy the tools dialogue downloaded, found in the
   folder `AO_GALLERYDL_LIB` names (download.py sets it), and runs on this bundle's Python, and
 - `ao-worker --self-check`, which imports every native library in the bundle and prints their
-  versions as JSON (used by the smoke test; touches no file and no network).
+  versions as JSON (used by the smoke test; touches no file and no network). Its `tls` item fails
+  unless the downloads' own certificate authorities are inside the bundle and hold with the
+  machine's default paths absent (R476 c).
 
 Anything else is refused with exit code 2, so the program cannot be used as a general interpreter.
 """
 from __future__ import annotations
 
 import multiprocessing
+import os
 import sys
 
 # Modules the worker runs as `sys.executable -m <module>` (ocr.py, download.py).
 CHILD_MODULES = ("ocrmypdf", "gallery_dl")
+
+
+# Paths that cannot exist (/dev/null is not a folder), so OpenSSL finds no default store (R476 c).
+_ABSENT = {"SSL_CERT_FILE": os.devnull + "/ao-absent/cert.pem", "SSL_CERT_DIR": os.devnull + "/ao-absent/certs"}
+
+
+def tls_check() -> str:
+    """The `tls` item of the self-check (R476 c). Raises RuntimeError unless (1) the app's own list
+    of certificate authorities is a file, inside the bundle when frozen, and (2) the context every
+    download uses holds authorities with the machine's default paths absent (as on a Mac that is
+    not the build machine). Returns "<n> authorities from the app's own list"."""
+    from pathlib import Path
+
+    from ao_worker import fetch
+
+    path = fetch._ca_file()
+    if not path or not Path(path).is_file():
+        raise RuntimeError("the app's own list of certificate authorities is missing")
+    if getattr(sys, "frozen", False):
+        bundle = Path(getattr(sys, "_MEIPASS", "")).resolve()
+        if not Path(path).resolve().is_relative_to(bundle):
+            raise RuntimeError("the app's own list of certificate authorities is not inside the app")
+    saved = {k: os.environ.get(k) for k in _ABSENT}
+    try:
+        os.environ.update(_ABSENT)  # OpenSSL reads them when the default store is loaded
+        n = fetch.tls_context().cert_store_stats()["x509_ca"]
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    if n <= 0:
+        raise RuntimeError("the downloads would trust no certificate authority on another computer")
+    return f"{n} authorities from the app's own list"
 
 
 def self_check() -> int:
@@ -47,6 +85,10 @@ def self_check() -> int:
         out["silero-vad"] = "loaded"
     except Exception as e:  # noqa: BLE001
         failed["silero-vad"] = f"{type(e).__name__}: {e}"
+    try:
+        out["tls"] = tls_check()
+    except Exception as e:  # noqa: BLE001
+        failed["tls"] = f"{type(e).__name__}: {e}"
     print(json.dumps({"ok": not failed, "versions": out, "failed": failed}))
     return 0 if not failed else 1
 

@@ -92,6 +92,18 @@ describe("CaptureQueue", () => {
     expect(screen.getByText(/Removed posts were not looked for/)).toBeTruthy();
   });
 
+  it("FR-106: posts that look edited but could not be checked are counted in the summary", () => {
+    let q = profileQueue("q8", "https://www.instagram.com/someone/");
+    q = applyProgress(q, {
+      queueId: "q8",
+      projectId: P,
+      finished: true,
+      report: { status: "completed", listComplete: true, created: 0, duplicates: 0, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, editsNotChecked: 2, items: [] },
+    });
+    render(<CaptureQueue queues={[q]} />);
+    expect(screen.getByText(/2 possible edits could not be checked\. Capture the profile again later to check them\./)).toBeTruthy();
+  });
+
   it("a profile run refused for want of a legal basis explains it", () => {
     let q = profileQueue("q9", "https://www.instagram.com/someone/");
     q = applyProgress(q, {

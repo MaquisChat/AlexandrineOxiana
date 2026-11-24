@@ -30,7 +30,7 @@ import { join } from "node:path";
 import { zoteroKeysOf } from "../../repo/tombstones.js";
 import type { ImportOps } from "../../repo/import-ops.js";
 import { reviewCauseOf } from "../../repo/review.js";
-import { BOOKKEEPING, PRIVATE_MODE, activeBatches, batchDirs, findBatch, readBatchAt, readJournal, writeBatchRecord } from "./batch.js";
+import { BOOKKEEPING, PRIVATE_MODE, activeBatches, findBatch, readJournal, undoneBatchIds, writeBatchRecord } from "./batch.js";
 import { getAt, revertMerge } from "./merge.js";
 import { asEvidence } from "./update.js";
 import { isDeepStrictEqual } from "node:util";
@@ -75,6 +75,11 @@ export interface UndoResult {
      * is counted in `updated` too.
      */
     conflicts?: number;
+    /**
+     * FR-467 (present only when not 0): sources whose "gone from Zotero" mark this undo replaced with the mark they had
+     * before it (a deletion over a bin mark undone: the bin mark is back). Not counted in `unmarked`.
+     */
+    restoredMarks?: number;
   };
   /** What undo left in place because it is in use or was changed since (R61). */
   kept: UndoKept[];
@@ -105,19 +110,6 @@ async function resolveUndoneConflicts(ops: ImportOps, sourceId: string, paths: s
   }
 }
 
-/** The ids of the project's batches whose record says undone (an unreadable record is taken as standing). */
-async function undoneBatchIds(repo: Repo, projectId: string): Promise<Set<string>> {
-  const out = new Set<string>();
-  for (const d of await batchDirs(repo, projectId)) {
-    try {
-      const r = await readBatchAt(repo, projectId, d.name);
-      if (r?.state === "undone") out.add(r.id);
-    } catch {
-      // unreadable: not known to be undone
-    }
-  }
-  return out;
-}
 
 export async function undoBatch(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
   // The batch's slot is taken before anything is awaited (R63): no resume, start or second undo meanwhile.
@@ -148,6 +140,7 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
     const cur = await repo.getSource(projectId, e.mergedInto);
     const p = cur.source.provenance;
     let conflictsOff = false;
+    let markLeft = false;
     const changed = await importChange(
       repo,
       projectId,
@@ -180,6 +173,7 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
         for (const id of r.keptAnnotations) kept.push({ kind: "annotation", id, sourceId: e.mergedInto!, reason: "edited after the import; kept" });
         // Z5: an availability changed since this batch wrote it (a later batch, or the researcher) is left as it is.
         if (r.keptAvailability) kept.push({ kind: "availability", id: "/availability", sourceId: e.mergedInto!, reason: "its availability was changed after this import, so it was left as it is" });
+        markLeft = r.next.source.availability.zotero !== undefined;
         if (r.changed) await ops.writeSource(now, r.next);
         return r.changed;
       },
@@ -189,6 +183,7 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
       revertedMerges++;
       if (e.outcome === "merged") reverted.merged++;
       else if (e.outcome === "updated" || (e.outcome === "zotero-back" && e.contentUpdated)) reverted.updated++;
+      else if (e.outcome === "zotero-gone" && markLeft) reverted.restoredMarks = (reverted.restoredMarks ?? 0) + 1;
       else if (e.outcome === "zotero-gone") reverted.unmarked++;
       else if (e.outcome === "zotero-back") reverted.remarked++;
       if (conflictsOff) reverted.conflicts = (reverted.conflicts ?? 0) + 1;

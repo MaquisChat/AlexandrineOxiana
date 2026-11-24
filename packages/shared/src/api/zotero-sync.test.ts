@@ -102,6 +102,25 @@ describe("status lines (plan Z8 Accept 1)", () => {
     );
   });
 
+  it("FR-477: a started record whose end was never written does not say the app was closed; one the app's closing ended does", () => {
+    const { finishedAt: _f, ...started } = run({ outcome: "stopped", reason: "app-closed" });
+    expect(zoteroSyncStatusLine(started, NOW)).toBe(
+      "The sync started with Zotero at 14:32 today has no recorded end: the app may have been closed during it, or its end could not be saved. It continues next time. Nothing here was changed.",
+    );
+    expect(zoteroSyncStatusLine({ ...started, batchId: "b1" }, NOW)).toContain("has no recorded end");
+    expect(zoteroSyncStatusLine({ ...started, batchId: "b1" }, NOW)).toContain("Some items may already have come in.");
+    expect(zoteroSyncStatusLine(run({ outcome: "stopped", reason: "app-closed" }), NOW)).toBe(
+      "Stopped syncing with Zotero at 14:32 today: The app was closed during the sync; it continues next time. Nothing here was changed.",
+    );
+  });
+
+  it("R474 M8: a record with no end that another process on this computer is still running reads as running", () => {
+    const { finishedAt: _f, ...started } = run({ outcome: "stopped", reason: "app-closed" });
+    expect(zoteroSyncStatusLine({ ...started, runningElsewhere: true }, NOW)).toBe(
+      "A sync with Zotero started at 14:32 today is still running elsewhere on this computer, in the command line or in another copy of the app.",
+    );
+  });
+
   it("a failure's status line never says up to date, and 'nothing has changed' only for an up-to-date run", () => {
     const outcomes: ZoteroSyncRun["outcome"][] = ["finished", "finished-with-problems", "stopped", "failed"];
     for (const outcome of outcomes) {

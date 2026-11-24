@@ -163,6 +163,33 @@ describe("Recheck project (R99)", () => {
     expect(await screen.findByRole("button", { name: "Title: Conflict" })).toBeTruthy();
   });
 
+  it("FR-348: a recheck started before the screen was left and running on is shown again on return, from its next event; no second one is started", async () => {
+    const ev = liveEvents();
+    let starts = 0;
+    server.use(
+      ev.handler,
+      http.post(url("/projects/:id/recheck"), () => {
+        starts++;
+        return HttpResponse.json({ jobId: "job-2", total: 10 });
+      }),
+      ...libraryHandlers(),
+    );
+    ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+    await libraryShown();
+    const button = screen.getByRole("button", { name: "Recheck project" }) as HTMLButtonElement;
+    const status = screen.getByRole("status", { name: "Project recheck" });
+    // The job started on the earlier visit goes on reporting.
+    ev.send("job.progress", { ...progress(3, 10), jobId: "job-old" });
+    await screen.findByText("3 of 10");
+    expect(status.textContent).toBe("Rechecking the project's sources.");
+    expect(button.disabled).toBe(true);
+    await userEvent.setup().click(button);
+    expect(starts).toBe(0);
+    ev.send("job.progress", { ...progress(10, 10, { finished: true, changed: 2, failed: 0 }), jobId: "job-old" });
+    await waitFor(() => expect(status.textContent).toBe("Recheck finished: 2 sources changed."));
+    expect(button.disabled).toBe(false);
+  });
+
   it("a job whose events arrive before its start is answered still finishes (no stuck progress)", async () => {
     const ev = liveEvents();
     server.use(

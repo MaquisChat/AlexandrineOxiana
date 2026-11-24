@@ -48,3 +48,12 @@ export function readerApi(client: ApiClient): ReaderApi {
     deleteAnnotation: (pid, sid, id) => r<AnnotationDeleteResponse>("DELETE", `${src(pid, sid)}/annotations/${seg(id)}`),
   };
 }
+
+/**
+ * R470 b (FR-490): the ranges of a file Find and acquire holds for pending review entry `reviewId` of the project, over
+ * `GET /projects/:id/review/:itemId/held-file/document` — what the reader reads when the researcher LOOKS at a held file
+ * before deciding. Read-only: the route records nothing.
+ */
+export function heldFileRanges(client: ApiClient, projectId: string, reviewId: string): (start: number, end: number, signal?: AbortSignal) => Promise<DocumentRange> {
+  return (start, end, signal) => client.byteRange(`/projects/${seg(projectId)}/review/${seg(reviewId)}/held-file/document`, start, end, signal ? { signal } : {});
+}

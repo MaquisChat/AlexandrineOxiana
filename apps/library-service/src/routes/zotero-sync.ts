@@ -23,8 +23,10 @@ import {
   ZoteroSyncFileBusyError,
   ZoteroSyncFileUnreadableError,
   checkZoteroKey,
+  clearZoteroKeyPauses,
   getSecret,
   ocrQueueFor,
+  peekLock,
   proxyQueueFor,
   readZoteroSyncHistory,
   readZoteroSyncSettings,
@@ -437,7 +439,7 @@ function inProgressId(runs: LibraryRun[], ref: string | undefined): string | und
   if (ref === undefined) return undefined;
   return runs.filter((r) => r.finishedAt === undefined && r.ref === ref).sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0]?.id;
 }
-async function readHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions = {}): Promise<LibraryRun[]> {
+async function readHistory(dir: string, libraryId: string, o: ZoteroSyncFileOptions & { heldElsewhereSince?: string } = {}): Promise<LibraryRun[]> {
   try {
     return await readZoteroSyncHistory(dir, libraryId, o);
   } catch (err) {
@@ -497,13 +499,25 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
   const dir = () => state.deps.appConfigDir;
 
   /** The state, built from this computer's settings and history at request time (point 8). */
+  /**
+   * R474 M8: when another live process of this computer holds the library (the command line, another copy of the app),
+   * the time it opened it: only that process can be running a sync of it, so a record with no end started since is
+   * running there. Undefined when this service holds it, or the holder is on another computer or gone.
+   */
+  async function heldElsewhereSince(s: Session): Promise<string | undefined> {
+    if (s.lib.mode !== "read-only") return undefined;
+    const holder = await peekLock(s.lib.root, state.deps).catch(() => null);
+    return holder && holder.deviceId === state.deps.deviceId && holder.hostname === state.deps.hostname ? holder.openedAt : undefined;
+  }
+
   async function stateOf(s: Session): Promise<ZoteroSyncStateResponse> {
     // R268 M4, R269 c: whether the settings were written by a newer version is said by the library module itself.
     let newer = false;
     let historyNewer = false;
+    const since = await heldElsewhereSince(s);
     const [settings, history, stored] = await Promise.all([
       readSettings(dir(), s.lib.id, { onNewer: () => (newer = true) }),
-      readHistory(dir(), s.lib.id, { onNewer: () => (historyNewer = true) }),
+      readHistory(dir(), s.lib.id, { onNewer: () => (historyNewer = true), ...(since !== undefined ? { heldElsewhereSince: since } : {}) }),
       keyStored(),
     ]);
     const running = holder.running;
@@ -543,23 +557,9 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     };
   }
 
-  /** Whether the key check's answer says the key reads `ref`. */
-  const reads = (a: LibraryKeyAccess, ref: string) => {
-    const [type, id] = ref.split(":");
-    return type === "user" ? a.personal.library && a.userId === id : a.groups.some((g) => g.ref === ref);
-  };
   async function clearRefusals(s: Session, a: LibraryKeyAccess): Promise<void> {
-    const clears = (l: ZoteroSyncLink) => l.paused === "key-refused" || (l.paused === "library-gone" && reads(a, l.ref));
     try {
-      if (!(await readZoteroSyncSettings(dir(), s.lib.id)).links.some(clears)) return;
-      await updateZoteroSyncSettings(dir(), s.lib.id, (cur) => ({
-        ...cur,
-        links: cur.links.map((l) => {
-          if (!clears(l)) return l;
-          const { paused: _p, ...rest } = l;
-          return rest;
-        }),
-      }));
+      await clearZoteroKeyPauses(dir(), s.lib.id, a);
     } catch (err) {
       // A settings file of a newer version, or one that cannot be read: left as it is; the check's answer stands.
       state.opts.log.info({ note: err instanceof Error ? err.name : "error" }, "zotero key check: the pauses could not be cleared");
@@ -678,7 +678,8 @@ export function registerZoteroSync(app: FastifyInstance, ctx: Ctx): void {
     uiOnly(req.caller);
     const s = state.requireSession();
     // R250 b: the run in progress is left out (the state's `running` and the events say it).
-    const all = await readHistory(dir(), s.lib.id);
+    const since = await heldElsewhereSince(s);
+    const all = await readHistory(dir(), s.lib.id, since !== undefined ? { heldElsewhereSince: since } : {});
     const current = inProgressId(all, holder.running?.ref);
     const runs = all.filter((r) => r.id !== current);
     // An encrypted project's counts come from its batch while it is unlocked: for the newest 20 (what the screen shows).

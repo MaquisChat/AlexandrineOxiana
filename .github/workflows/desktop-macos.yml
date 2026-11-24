@@ -282,6 +282,10 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 20
         run: node apps/desktop/scripts/launch-check.mjs --app "$APP_DEBUG"
+      - name: The worker inside the app passes its self-check (its own certificate authorities, R476)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 5
+        run: '"$APP_DEBUG/Contents/Resources/ao-worker/ao-worker" --self-check'
 
       - name: Launch check R (the release app, run from the mounted disk image)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}

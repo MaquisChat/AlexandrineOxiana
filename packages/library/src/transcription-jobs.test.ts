@@ -97,6 +97,42 @@ describe("transcription as a job", () => {
     expect(await c.resumePending(undefined, { prepare: (rec) => transcriptionRerun(kit.repo, rec) })).toEqual([]);
   });
 
+  it("S3 (R486 c): two reruns of one pending job at once: the second is told the job is not its own, never that it failed; one run, stored once", async () => {
+    const p = await makeProject(kit, OPEN_GOV, true);
+    const sf = await audioSource(p);
+    const down = await stubWorker(() => ({ status: "done" }), { closers });
+    await closers.pop()!();
+    const id = randomUUID();
+    const job = await transcriptionJob(kit.repo, p.id, sf.source.id, { model: "small" }, { id });
+    await expect(new WorkerClient({ repo: kit.repo, worker: down, pollMs: 5 }).submit(p.id, job)).rejects.toBeInstanceOf(WorkerUnavailableError);
+    let submitted = 0;
+    const c = await client(async (j) => {
+      submitted++;
+      return transcribe(j);
+    });
+    // Both reruns pass the "running here now?" check before either has prepared its job: each waits in
+    // `prepare` until the other has reached it too, then both go on together.
+    let entered = 0;
+    let both!: () => void;
+    const together = new Promise<void>((r) => (both = r));
+    const ends: Array<{ claimed: boolean; error?: unknown }> = [];
+    const prepare = async (rec: Parameters<typeof transcriptionRerun>[1]) => {
+      if (++entered === 2) both();
+      await together;
+      const extras = await transcriptionRerun(kit.repo, rec);
+      return { ...extras, onEnd: (o: { claimed: boolean; error?: unknown }) => void ends.push({ claimed: o.claimed, ...(o.error !== undefined ? { error: o.error } : {}) }) };
+    };
+    const [a, b] = await Promise.all([c.resumePending(p.id, { prepare }), c.resumePending(p.id, { prepare })]);
+    expect(entered).toBe(2);
+    // One rerun ran it and stored it; the other was told it was not its own, with no error.
+    expect(ends.filter((e) => e.claimed)).toEqual([{ claimed: true }]);
+    expect(ends.filter((e) => !e.claimed)).toEqual([{ claimed: false }]);
+    expect([...a, ...b]).toEqual([{ id, projectId: p.id, result: expect.anything() }]);
+    expect(submitted).toBe(1);
+    expect((await transcriptionRecords(kit.repo, p.id, sf.source.id)).map((x) => x.status)).toEqual(["done"]);
+    expect(transcriptVersions(await kit.repo.getSource(p.id, sf.source.id))).toHaveLength(2);
+  });
+
   it("fix 1 I1: a transcription the rules forbid is refused when the job is built: audited once, nothing recorded", async () => {
     const p = await makeProject(kit, `${OPEN_GOV}processing:\n  transcription: []\n`);
     const sf = await audioSource(p);
@@ -127,7 +163,9 @@ describe("transcription as a job", () => {
   });
 
   for (const how of ["lock", "crash"] as const) {
-    it(`F-1: a ${how} between the two store writes, and a rerun whose words differ: every version's files come from one run`, async () => {
+    // FR-393 (R464 c): the two files are stored in one change, so there is no point between them any more; a
+    // ${how} at the store leaves neither, and the rerun leaves exactly one version of each file.
+    it(`F-1: a ${how} at the store, and a rerun whose words differ: one version of each file, every version's files from one run`, async () => {
       const p = await makeProject(kit, OPEN_GOV, true);
       const sf = await audioSource(p);
       const repo = kit.repo;
@@ -140,10 +178,10 @@ describe("transcription as a job", () => {
         await writeFile(join(job.body.output, "transcript.vtt"), `WEBVTT\n\n${first ? "NOTE flags: outside-speech\n\n" : ""}00:00:00.000 --> 00:00:02.000\n${text}\n`);
         return { status: "done", result: { output: job.body.output, meta: { model: "small", detectedLanguages: ["en"], flaggedCount: first ? 1 : 0 } } };
       };
-      const original = repo.addDerivedAsset.bind(repo);
+      const original = repo.addDerivedAssets.bind(repo);
       let calls = 0;
-      repo.addDerivedAsset = (async (...args: Parameters<typeof original>) => {
-        if (++calls === 2) {
+      repo.addDerivedAssets = (async (...args: Parameters<typeof original>) => {
+        if (++calls === 1) {
           if (how === "lock") repo.lockProject(p.id);
           else throw new JobInterruptedError(); // the process stops here: the journal still says running
         }
@@ -151,8 +189,9 @@ describe("transcription as a job", () => {
       }) as typeof original;
       const job = await transcriptionJob(repo, p.id, sf.source.id, { model: "small" }, { id: randomUUID() });
       await expect((await client(differing)).submit(p.id, job)).rejects.toThrow();
-      repo.addDerivedAsset = original;
+      repo.addDerivedAssets = original;
       if (how === "lock") await repo.unlockProject(p.id, "correct horse battery staple");
+      expect(transcriptVersions(await repo.getSource(p.id, sf.source.id))).toEqual([]); // neither file
       const out = await (await client(differing)).resumePending(p.id, { prepare: (rec) => transcriptionRerun(repo, rec) });
       expect(out.map((x) => x.error)).toEqual([undefined]);
       const versions = transcriptVersions(await repo.getSource(p.id, sf.source.id));
@@ -170,8 +209,8 @@ describe("transcription as a job", () => {
         }
         expect(texts.size).toBe(1); // never two runs' words in one version
       }
-      // The rerun's complete pair is a version of its own.
-      expect([...runsByTime.values()].some((files) => files.length === 2)).toBe(true);
+      // The rerun's complete pair is the one version: one WebVTT and one segments file.
+      expect(versions.map((v) => v.mime).sort()).toEqual(["application/json", "text/vtt"]);
     });
   }
 
@@ -209,7 +248,7 @@ describe("R367: an allowed transcription is audited once, where it runs", () => 
   /** The entries of the processing and of its storing, in order. */
   const ofJob = <E extends { action: string; details?: Record<string, unknown> }>(events: E[]) => events.filter((e) => isProcess(e) || isDerive(e));
 
-  it("allowed and stored: one `process` allow entry naming the job, the recording and the tool, before the two `store` entries; the chain verifies", async () => {
+  it("allowed and stored: one `process` allow entry naming the job, the recording and the tool, before the one `store` entry of both files (FR-393); the chain verifies", async () => {
     const p = await makeProject(kit);
     const sf = await audioSource(p);
     const before = (await auditEvents(kit, p)).length;
@@ -226,7 +265,7 @@ describe("R367: an allowed transcription is audited once, where it runs", () => 
     });
     // Nothing of the content: no path, no parameter, no word of the transcript.
     expect(Object.keys(processed[0]!.details ?? {}).sort()).toEqual(["op", "process"]);
-    expect(events.map((e) => e.action)).toEqual(["process", "store", "store"]);
+    expect(events.map((e) => e.action)).toEqual(["process", "store"]);
     expect(events.filter(isStore).every((e) => (e.details as { op?: string }).op === "asset.derive")).toBe(true);
     expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
   });
@@ -237,15 +276,15 @@ describe("R367: an allowed transcription is audited once, where it runs", () => 
       const sf = await audioSource(p);
       const repo = kit.repo;
       const before = (await auditEvents(kit, p)).length;
-      const original = repo.addDerivedAsset.bind(repo);
-      repo.addDerivedAsset = (async (...args: Parameters<typeof original>) => {
+      const original = repo.addDerivedAssets.bind(repo);
+      repo.addDerivedAssets = (async (...args: Parameters<typeof original>) => {
         if (how === "lock") repo.lockProject(p.id);
         else throw new JobInterruptedError(); // the process stops here: the journal still says running
         return original(...args);
       }) as typeof original;
       const job = await transcriptionJob(repo, p.id, sf.source.id, { model: "small" }, { id: randomUUID() });
       await expect((await client()).submit(p.id, job)).rejects.toThrow();
-      repo.addDerivedAsset = original;
+      repo.addDerivedAssets = original;
       if (how === "lock") await repo.unlockProject(p.id, "correct horse battery staple");
       let events = (await auditEvents(kit, p)).slice(before);
       expect(events.filter(isProcess)).toHaveLength(1);
@@ -253,7 +292,7 @@ describe("R367: an allowed transcription is audited once, where it runs", () => 
       const out = await (await client()).resumePending(p.id, { prepare: (rec) => transcriptionRerun(repo, rec) });
       expect(out.map((x) => x.error)).toEqual([undefined]);
       events = (await auditEvents(kit, p)).slice(before);
-      expect(ofJob(events).map((e) => e.action)).toEqual(["process", "store", "store"]);
+      expect(ofJob(events).map((e) => e.action)).toEqual(["process", "store"]);
       expect((await repo.verifyAudit(p.id)).ok).toBe(true);
     });
   }
@@ -304,7 +343,7 @@ describe("R367: an allowed transcription is audited once, where it runs", () => 
     ]);
     expect([...a, ...b].filter((x) => x.error === undefined)).toHaveLength(1);
     const events = (await auditEvents(kit, p)).slice(before);
-    expect(ofJob(events).map((e) => e.action)).toEqual(["process", "store", "store"]);
+    expect(ofJob(events).map((e) => e.action)).toEqual(["process", "store"]);
   });
 
   it("denied: as before, one deny (at the start), no allow entry, no job", async () => {

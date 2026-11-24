@@ -121,6 +121,11 @@ export interface ProjectState {
    * audit or change-log line could not be trimmed, or an audit append failed while opening.
    */
   recoveryPending?: boolean;
+  /**
+   * Library-relative paths named by a marker of this project that is not finished or rolled back yet (R473 I1): a
+   * change whose roll-back failed here, or a marker found pending at open. Until it is, those files are half changed.
+   */
+  unfinished?: Set<string>;
   /** The project's audit log did not verify when opened: marks cannot be recorded in it (Task 50). */
   auditUnverified?: boolean;
 }

@@ -866,3 +866,40 @@ describe("Capture screen — capture tools", () => {
     expect(alert.textContent).toBe("The downloader tool could not be updated. Try again later.");
   });
 });
+
+describe("Capture screen — what a lock cut (FR-370, FR-371; R464 b)", () => {
+  const MANY =
+    "A lock stopped 3 links in this project from being captured. The links were not kept while the project was locked: add them again to capture them.";
+  const ONE = "A lock stopped 1 link in this project from being captured. The link was not kept while the project was locked: add it again to capture it.";
+  const ACK = `/projects/${P1}/captures/cut-by-lock/acknowledge`;
+
+  it("says how many links a lock cut, as a status, and 'Got it' acknowledges it once and moves focus to the links field", async () => {
+    const { m, user } = await setup({ cutByLock: { [P1]: 3 } });
+    const note = await screen.findByText(MANY);
+    expect(note.closest("[role=status]")).not.toBeNull();
+    const got = screen.getByRole("button", { name: "Got it" });
+    await user.dblClick(got);
+    await waitFor(() => expect(screen.queryByText(MANY)).toBeNull());
+    expect(m.calls.filter((c) => c.method === "POST" && c.path === ACK)).toHaveLength(1);
+    expect(document.activeElement).toBe(links());
+    expect(screen.queryByRole("button", { name: "Got it" })).toBeNull();
+  });
+
+  it("one link: the sentence is in the singular", async () => {
+    await setup({ cutByLock: { [P1]: 1 } });
+    expect(await screen.findByText(ONE)).toBeTruthy();
+  });
+
+  it("nothing is shown when no lock cut anything, or for another project", async () => {
+    await setup({ cutByLock: { [P2]: 4 } });
+    expect(screen.queryByText(/A lock stopped the capture/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Got it" })).toBeNull();
+  });
+
+  it("an acknowledgement that fails keeps the reminder and says so plainly", async () => {
+    const { user } = await setup({ cutByLock: { [P1]: 3 }, cutAckAnswer: () => errorResponse(503, "UNAVAILABLE", "The library service is busy. Try again in a moment.") });
+    await user.click(await screen.findByRole("button", { name: "Got it" }));
+    expect(await screen.findByText(/The library service is busy/)).toBeTruthy();
+    expect(screen.getByText(MANY)).toBeTruthy();
+  });
+});

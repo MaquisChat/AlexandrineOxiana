@@ -165,7 +165,17 @@ export function CollectionTree({ collections, selectedId, onSelect, readOnly = f
             onFocus={() => setFocusId(r.id)}
           >
             {r.id !== undefined && r.hasChildren && (
-              <span aria-hidden="true" className="ao-tree__twisty">
+              // A mouse can expand or collapse here (FR-162); the keyboard uses Left and Right on the
+              // row, so the twisty stays out of the tab order and out of the accessible name.
+              <span
+                aria-hidden="true"
+                className="ao-tree__twisty"
+                onClick={(e) => {
+                  e.stopPropagation(); // toggling is not choosing the collection
+                  setFocusId(r.id);
+                  setOpen(r.id!, collapsed.has(r.id!));
+                }}
+              >
                 {collapsed.has(r.id) ? "▸" : "▾"}
               </span>
             )}

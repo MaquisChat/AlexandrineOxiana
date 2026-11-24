@@ -10,7 +10,7 @@ import { FIXTURE_DOI, FIXTURE_ISBN, buildMobi, buildPdf, buildZip, generateFixtu
 import { docxText } from "./docx.js";
 import { extractHtml } from "./html.js";
 import { extractMobi } from "./mobi.js";
-import { extractPdf } from "./pdf.js";
+import { extractPdf, pdfSeams } from "./pdf.js";
 import { elements } from "./scan.js";
 import { MAX_TEXT_CHARS, UnsafeFileError, extractMetadata, mediaFromTags, shutdownExtractors } from "./index.js";
 
@@ -81,6 +81,57 @@ describe("PDF", () => {
     await writeFile(bad, "%PDF-1.7\nnot really a pdf");
     const x = await extractMetadata(bad, "application/pdf");
     expect(x.identifiers).toEqual({ dois: [], isbns: [], arxiv: [] });
+  });
+});
+
+describe("FR-577: a large PDF is not read whole", () => {
+  /** Page 1 with the title, then pages carrying a large image each (the bulk of the file, beyond the first 3 pages). */
+  async function bulkyPdf(): Promise<Buffer> {
+    const { PDFDocument, PDFName, StandardFonts } = await import("pdf-lib");
+    const doc = await PDFDocument.create({ updateMetadata: false });
+    doc.setTitle("Rivers and Memory in Upland Villages");
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    for (let i = 1; i <= 3; i++) doc.addPage([595, 842]).drawText(`Rivers and Memory in Upland Villages, page ${i}`, { x: 50, y: 780, size: 11, font });
+    for (let i = 0; i < 4; i++) {
+      // 8 MiB of bytes no reader of the first pages needs (an unfiltered image, referenced by a later page only).
+      const bulk = doc.context.register(doc.context.stream(Buffer.alloc(8 * 1024 * 1024, i + 1), { Type: "XObject", Subtype: "Image", Width: 2048, Height: 4096, ColorSpace: "DeviceGray", BitsPerComponent: 8 }));
+      const page = doc.addPage([595, 842]);
+      page.node.set(PDFName.of("Resources"), doc.context.obj({ XObject: { Im0: bulk } }));
+    }
+    return Buffer.from(await doc.save({ useObjectStreams: false }));
+  }
+
+  it("reads only the parts it needs (by range from the file), and still gets the title and the first pages' text", async () => {
+    const p = join(tmp, "bulky.pdf");
+    const bytes = await bulkyPdf();
+    await writeFile(p, bytes);
+    let read = 0;
+    pdfSeams.onRead = (n) => (read += n);
+    try {
+      const x = await extractPdf(p);
+      expect(x.title).toBe("Rivers and Memory in Upland Villages");
+      expect(x.text).toContain("page 3");
+    } finally {
+      delete pdfSeams.onRead;
+    }
+    expect(bytes.length).toBeGreaterThan(32 * 1024 * 1024);
+    expect(read).toBeGreaterThan(0);
+    // Far less than the file: the images beyond the first pages are never read.
+    expect(read).toBeLessThan(bytes.length / 8);
+  });
+
+  it("a file that cannot be read part-way ends as unreadable, without waiting for ever", async () => {
+    const p = join(tmp, "bulky-fails.pdf");
+    await writeFile(p, await bulkyPdf());
+    let calls = 0;
+    pdfSeams.onRead = () => {
+      if (++calls > 1) throw new Error("the disk went away");
+    };
+    try {
+      expect(await extractPdf(p)).toEqual({ readFailed: true });
+    } finally {
+      delete pdfSeams.onRead;
+    }
   });
 });
 

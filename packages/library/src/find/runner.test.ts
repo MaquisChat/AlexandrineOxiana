@@ -4706,9 +4706,14 @@ processing:
         await saveRecord(true);
         const again = await r.retry(p.id, eid);
         expect(again.state).toBe("looking-up");
-        await settled(p, eid);
+        // "record-complete" is only passed through: OpenAlex is on in the file, so the copy part goes on (it offers
+        // nothing here) and the entry rests at "no-open-copy" (CI-278). The wait is for that rest, not the passing state.
+        await until(async () => (await entryOf(p, eid))?.state === "no-open-copy", "the copy part to rest");
         expect(gated.sent.length).toBeGreaterThan(0);
-        expect((await entryOf(p, eid))!.reason?.code).not.toBe("switched-off");
+        const e = (await entryOf(p, eid))!;
+        expect(e.sourceId).toBeTruthy();
+        expect(e.reason).toBeUndefined();
+        expect(changes.filter((c) => c.entryId === eid).map((c) => c.state)).toContain("record-complete");
       });
     });
   });

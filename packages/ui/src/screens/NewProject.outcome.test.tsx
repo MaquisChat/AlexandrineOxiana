@@ -113,6 +113,67 @@ describe("New project dialog: the answer is lost (R134 I1)", () => {
     await waitFor(() => expect(within(nav).getByRole("button", { name: /Clinic follow-up/ }).getAttribute("aria-current")).toBe("true"));
   });
 
+  it("FR-204, FR-205: two new projects with the name sent: the dialog says so and chooses neither", async () => {
+    const twin = { ...NEW_ENC, id: "p5", folder: "Projects/Clinic follow-up 2" };
+    const posted: Posted[] = [];
+    server.use(
+      http.post(url("/projects"), async ({ request }) => {
+        posted.push((await request.json()) as Posted);
+        return HttpResponse.error();
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, ...(posted.length ? [NEW_ENC, twin] : [])] })),
+      ...libraryHandlers(),
+    );
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    const dialog = await openDialog(user);
+    await fillEncrypted(dialog, user);
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    const many = await screen.findByRole("dialog", { name: "More than one project with this name was found" });
+    await waitFor(() => expect(document.activeElement).toBe(within(many).getByRole("heading", { name: "More than one project with this name was found" })));
+    expect(many.textContent).toMatch(/2 projects named “Clinic follow-up” appeared in the library while the answer was lost, so the app cannot tell which one was made here/);
+    expect(many.textContent).toMatch(/opens with the passphrase you just chose/);
+    expect(within(many).queryByRole("button", { name: "Open the project" })).toBeNull();
+    // R461 d: each is listed by its folder's own name (never a path), with its own "Open this one".
+    const listed = within(many).getByRole("list", { name: "Projects with this name" });
+    expect(within(listed).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "The project in the folder “Clinic follow-up” Open this one",
+      "The project in the folder “Clinic follow-up 2” Open this one",
+    ]);
+    expect([...listed.querySelectorAll("[dir=auto]")].map((el) => el.textContent)).toEqual(["Clinic follow-up", "Clinic follow-up 2"]);
+    expect(listed.textContent).not.toMatch(/Projects\//);
+    expect(within(many).getByRole("button", { name: "Open the project in the folder “Clinic follow-up 2”" }).textContent).toBe("Open this one");
+    await user.click(within(many).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(selected.mock.calls.flat().filter((x) => x === "p4" || x === "p5")).toEqual([]);
+    expect(posted).toHaveLength(1);
+  });
+
+  it("FR-204, FR-205: “Open this one” opens the project in that folder", async () => {
+    const twin = { ...NEW_OPEN, id: "p5", folder: "Projects/Tide-line interviews 2" };
+    let posted = 0;
+    server.use(
+      http.post(url("/projects"), () => {
+        posted++;
+        return HttpResponse.error();
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, ...(posted ? [NEW_OPEN, twin] : [])] })),
+      ...libraryHandlers(),
+    );
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    const dialog = await openDialog(user);
+    await fillOpen(dialog, user);
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    const many = await screen.findByRole("dialog", { name: "More than one project with this name was found" });
+    await user.click(within(many).getByRole("button", { name: "Open the project in the folder “Tide-line interviews 2”" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(selected).toHaveBeenLastCalledWith("p5"));
+    expect(posted).toBe(1);
+  });
+
   it("an unencrypted project that was created is said to be created, and selected", async () => {
     const svc = serveLost(NEW_OPEN);
     const selected = vi.fn();
@@ -308,6 +369,82 @@ describe("New project dialog: the recovery code cannot be left unsaved (R134 I2)
     await confirmAndClose(step, user);
     expect(onClosed).toHaveBeenCalled();
   });
+
+  it("FR-194: a library closed while the “found” panel of an encrypted project is open keeps the panel until it is read, then goes back to the chooser", async () => {
+    serveLost(NEW_ENC);
+    const events = controllableEvents();
+    server.use(events.handler);
+    const onClosed = vi.fn();
+    const user = userEvent.setup();
+    render(<Library api={testApi()} current={CURRENT_RW as never} onClosed={onClosed} />);
+    const dialog = await openDialog(user);
+    await fillEncrypted(dialog, user);
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    const found = await screen.findByRole("dialog", { name: "The project was created" });
+    act(() => events.send("library.state", { open: false }));
+    expect(await within(found).findByText("The library was closed while this was open. The project was created; once you have read this, you return to choosing a library.")).toBeTruthy();
+    expect(onClosed).not.toHaveBeenCalled();
+    expect(found.textContent).toMatch(/opens with the passphrase you just chose/);
+    expect(within(found).queryByRole("button", { name: "Open the project" })).toBeNull();
+    await user.click(within(found).getByRole("button", { name: "Back to choosing a library" }));
+    await waitFor(() => expect(onClosed).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("FR-194: the “more than one” panel of an encrypted create holds a library's close too, without “Open this one”; not encrypted, it is not held", async () => {
+    for (const encrypted of [true, false]) {
+      const made = encrypted ? NEW_ENC : NEW_OPEN;
+      const twin = { ...made, id: "p5", folder: `${made.folder} 2` };
+      let posted = 0;
+      server.use(
+        http.post(url("/projects"), () => {
+          posted++;
+          return HttpResponse.error();
+        }),
+        http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, ...(posted ? [made, twin] : [])] })),
+        ...libraryHandlers(),
+      );
+      const events = controllableEvents();
+      server.use(events.handler);
+      const onClosed = vi.fn();
+      const user = userEvent.setup();
+      const view = render(<Library api={testApi()} current={CURRENT_RW as never} onClosed={onClosed} />);
+      const dialog = await openDialog(user);
+      await (encrypted ? fillEncrypted : fillOpen)(dialog, user);
+      await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+      const many = await screen.findByRole("dialog", { name: "More than one project with this name was found" });
+      act(() => events.send("library.state", { open: false }));
+      if (!encrypted) {
+        await waitFor(() => expect(onClosed).toHaveBeenCalledTimes(1));
+        view.unmount();
+        continue;
+      }
+      expect(await within(many).findByText("The library was closed while this was open. The project was created; once you have read this, you return to choosing a library.")).toBeTruthy();
+      expect(onClosed).not.toHaveBeenCalled();
+      expect(many.textContent).toMatch(/opens with the passphrase you just chose/);
+      expect(within(many).queryByRole("button", { name: /Open this one|Open the project in the folder/ })).toBeNull();
+      expect(within(many).queryByRole("button", { name: "Close" })).toBeNull();
+      await user.click(within(many).getByRole("button", { name: "Back to choosing a library" }));
+      await waitFor(() => expect(onClosed).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      view.unmount();
+    }
+  });
+
+  it("FR-194: the “found” panel of a project that is not encrypted does not hold a library's close", async () => {
+    serveLost(NEW_OPEN);
+    const events = controllableEvents();
+    server.use(events.handler);
+    const onClosed = vi.fn();
+    const user = userEvent.setup();
+    render(<Library api={testApi()} current={CURRENT_RW as never} onClosed={onClosed} />);
+    const dialog = await openDialog(user);
+    await fillOpen(dialog, user);
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await screen.findByRole("dialog", { name: "The project was created" });
+    act(() => events.send("library.state", { open: false }));
+    await waitFor(() => expect(onClosed).toHaveBeenCalledTimes(1));
+  });
 });
 
 // ---- Fix round 2: the "cannot tell" state can no longer be left silently ----
@@ -424,6 +561,161 @@ describe("New project dialog: an unknown outcome is never left behind (fix round
     expect(svc.posted).toHaveLength(1);
   });
 
+  it("FR-180: a notice left unsettled does not take a project the dialog then created with the same name for the lost one", async () => {
+    const svc = serveLost(null);
+    svc.listFails = true;
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    await toCannotTell(user, fillOpen);
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(notice().textContent).toMatch(/“Tide-line interviews” may have been created/);
+
+    // The service is back; the notice is left as it is, and the project is created again through the dialog.
+    let made = false;
+    server.use(
+      http.post(url("/projects"), async ({ request }) => {
+        svc.posted.push((await request.json()) as Posted);
+        made = true;
+        return HttpResponse.json({ project: NEW_OPEN });
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, ...(made ? [NEW_OPEN] : [])] })),
+    );
+    const again = await openDialog(user);
+    await fillOpen(again, user);
+    await user.click(within(again).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(svc.posted).toHaveLength(2);
+
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(notice().textContent).toMatch(/“Tide-line interviews” was not created/));
+  });
+
+  it("FR-182: the notice checks again by itself when the service next reports the library's state; one that still fails leaves it as it was", async () => {
+    const svc = serveLost(NEW_ENC);
+    svc.listFails = true;
+    const events = controllableEvents();
+    server.use(events.handler);
+    let lists = 0;
+    server.events.on("request:start", ({ request }) => {
+      if (request.method === "GET" && new URL(request.url).pathname === "/projects") lists++;
+    });
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    await toCannotTell(user, fillEncrypted);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(notice().textContent).toMatch(/“Clinic follow-up” may have been created/));
+    expect(within(notice()).getByRole("button", { name: "Check again" })).toBeTruthy();
+
+    // A state report while the list still cannot be read: checked once, and the notice stays as it was.
+    const before = lists;
+    act(() => events.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} }));
+    await waitFor(() => expect(lists).toBe(before + 1));
+    await waitFor(() => expect(within(notice()).getByRole("button", { name: "Check again" }).hasAttribute("disabled")).toBe(false));
+    expect(notice().textContent).toMatch(/may have been created/);
+    expect(notice().textContent).not.toMatch(/still cannot tell/i);
+
+    // The service answers again: the next report settles it, with no press.
+    svc.listFails = false;
+    act(() => events.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} }));
+    await waitFor(() => expect(notice().textContent).toMatch(/“Clinic follow-up” was created/));
+    expect(svc.posted).toHaveLength(1);
+    server.events.removeAllListeners();
+  });
+
+  it("FR-182 (R463 M8): an automatic re-check that still cannot tell leaves the alert untouched, so it is not announced again", async () => {
+    const svc = serveLost(NEW_ENC);
+    svc.listFails = true;
+    const events = controllableEvents();
+    server.use(events.handler);
+    let lists = 0;
+    server.events.on("request:start", ({ request }) => {
+      if (request.method === "GET" && new URL(request.url).pathname === "/projects") lists++;
+    });
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    await toCannotTell(user, fillEncrypted);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(within(notice()).getByRole("button", { name: "Check again" }).hasAttribute("disabled")).toBe(false));
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(notice().textContent).toMatch(/still cannot tell/i));
+    await waitFor(() => expect(within(notice()).getByRole("button", { name: "Check again" }).hasAttribute("disabled")).toBe(false));
+    const alert = within(notice()).getByRole("alert");
+    const said = alert.textContent;
+    const changes: MutationRecord[] = [];
+    const watch = new MutationObserver((m) => changes.push(...m));
+    watch.observe(notice(), { subtree: true, childList: true, characterData: true, attributes: true });
+
+    // The service is slow to fail, as a real one is: the re-check's read is held, then fails.
+    let fail!: () => void;
+    const held = new Promise<void>((r) => (fail = r));
+    let answered = 0;
+    server.use(
+      http.get(url("/projects"), async () => {
+        await held;
+        queueMicrotask(() => answered++);
+        return HttpResponse.error();
+      }),
+    );
+    const before = lists;
+    act(() => events.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} }));
+    await waitFor(() => expect(lists).toBe(before + 1));
+    fail();
+    await waitFor(() => expect(answered).toBe(1));
+    // The failed read has been handled (its rejection settles before the next task).
+    await act(async () => {});
+    changes.push(...watch.takeRecords());
+    watch.disconnect();
+    expect(within(notice()).getByRole("alert")).toBe(alert);
+    expect(alert.textContent).toBe(said);
+    expect(changes).toEqual([]);
+    expect(svc.posted).toHaveLength(1);
+    server.events.removeAllListeners();
+  });
+
+  it("FR-204, FR-205: two new projects with the name: the notice says so and opens neither", async () => {
+    const svc = serveLost(null);
+    svc.listFails = true;
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    await toCannotTell(user, fillOpen);
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, NEW_OPEN, { ...NEW_OPEN, id: "p6", folder: "Projects/Tide-line interviews 2" }] })));
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(notice().textContent).toMatch(/2 projects named “Tide-line interviews” were found that were not there before, so the app cannot tell which one was made then\./));
+    expect(within(notice()).queryByRole("button", { name: "Open the project" })).toBeNull();
+    // R461 d: listed by folder name only, each with its own "Open this one".
+    const listed = within(notice()).getByRole("list", { name: "Projects with this name" });
+    expect(within(listed).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "The project in the folder “Tide-line interviews” Open this one",
+      "The project in the folder “Tide-line interviews 2” Open this one",
+    ]);
+    expect(listed.textContent).not.toMatch(/Projects\//);
+    await user.click(within(notice()).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("region", { name: "A project that may have been created" })).toBeNull();
+    expect(selected.mock.calls.flat().filter((x) => x === "p3" || x === "p6")).toEqual([]);
+  });
+
+  it("FR-204, FR-205: the notice's “Open this one” opens the project in that folder and removes the notice", async () => {
+    const svc = serveLost(null);
+    svc.listFails = true;
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    await toCannotTell(user, fillOpen);
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, NEW_OPEN, { ...NEW_OPEN, id: "p6", folder: "Projects/Tide-line interviews 2" }] })));
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await user.click(await within(notice()).findByRole("button", { name: "Open the project in the folder “Tide-line interviews 2”" }));
+    await waitFor(() => expect(selected).toHaveBeenLastCalledWith("p6"));
+    expect(screen.queryByRole("region", { name: "A project that may have been created" })).toBeNull();
+  });
+
   it("an unencrypted project: the notice says nothing of a recovery code, and reports one that was not created", async () => {
     const svc = serveLost(null);
     svc.listFails = true;
@@ -442,5 +734,51 @@ describe("New project dialog: an unknown outcome is never left behind (fix round
     await user.click(within(notice()).getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByRole("region", { name: "A project that may have been created" })).toBeNull();
     expect(svc.posted).toHaveLength(1);
+  });
+});
+
+describe("FR-187, FR-188: a first-run hint for rules that ask for what only the researcher can fill in", () => {
+  function serveCreate(project: typeof NEW_OPEN) {
+    let made = false;
+    server.use(
+      http.post(url("/projects"), () => {
+        made = true;
+        return HttpResponse.json({ project });
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, ...(made ? [project] : [])] })),
+      ...libraryHandlers(),
+    );
+  }
+  const hint = () => screen.queryByRole("region", { name: "What the new project still needs" });
+
+  it("a project made with the Funder DMP profile: the library says what is to be filled in under Governance, with a link; Dismiss removes it", async () => {
+    serveCreate({ ...NEW_OPEN, id: "p8", profiles: ["dmp"] });
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    const dialog = await openDialog(user);
+    await fillOpen(dialog, user);
+    await user.click(within(dialog).getByRole("checkbox", { name: "Funder DMP" }));
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const region = await screen.findByRole("region", { name: "What the new project still needs" });
+    expect(region.textContent).toMatch(
+      /^“Tide-line interviews” follows rules that ask for what only you can give: the repository the data will be deposited in, the file formats it will be deposited in and a date for destroying raw data\. Fill them in under Governance; until then, Governance lists them as not met\./,
+    );
+    expect(within(region).getByRole("link", { name: "Open Governance" }).getAttribute("href")).toBe("/governance?project=p8");
+    await user.click(within(region).getByRole("button", { name: "Dismiss" }));
+    expect(hint()).toBeNull();
+  });
+
+  it("a project whose rules ask for nothing of the kind: no hint", async () => {
+    serveCreate({ ...NEW_OPEN, id: "p9", profiles: ["gdpr"] });
+    const user = userEvent.setup();
+    const selected = vi.fn();
+    render(<Routed onSelected={selected} />);
+    const dialog = await openDialog(user);
+    await fillOpen(dialog, user);
+    await user.click(within(dialog).getByRole("checkbox", { name: "GDPR" }));
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(selected).toHaveBeenLastCalledWith("p9"));
+    expect(hint()).toBeNull();
   });
 });

@@ -44,7 +44,7 @@ export {
   openLibrary,
 } from "./library.js";
 export type { Library, LibraryJson, OpenOptions } from "./library.js";
-export { HEARTBEAT_MS, STALE_MS, LockNotWritableError, acquireLock, readLock, releaseLock, startHeartbeat } from "./lock.js";
+export { HEARTBEAT_MS, STALE_MS, LockNotWritableError, acquireLock, peekLock, readLock, releaseLock, startHeartbeat } from "./lock.js";
 export type { LockInfo } from "./lock.js";
 export { classifyLocation, defaultLocationEnv, parseMacMount, parseProcMounts, parseWindowsDrives } from "./location.js";
 export type { Location, LocationEnv, MountInfo } from "./location.js";
@@ -106,6 +106,8 @@ export type {
   RelinkSkipReason,
   WatchOptions,
 } from "./reconnect.js";
+// R480 e: the Missing files rule for one linked file, for the reader's source record.
+export { missingAt } from "./repo/linked-file.js";
 export { addKnownPath, forgetLastOpenLibrary, forgetLibrary, lastOpenLibrary, listLibraries, recordLocation, registerLibrary, rememberLastOpenLibrary, settleDamagedRegistry } from "./registry.js";
 export type { RegistryEntry } from "./registry.js";
 
@@ -122,6 +124,7 @@ export {
   WorkerToolsClient,
   WorkerUnavailableError,
   devWorkerPython,
+  jobRunningHere,
   startWorker,
 } from "./worker-client.js";
 export type {
@@ -234,6 +237,8 @@ export {
   ZoteroSyncFileBusyError,
   ZoteroSyncFileNewerError,
   ZoteroSyncFileUnreadableError,
+  clearZoteroKeyPauses,
+  clearZoteroKeyPausesEverywhere,
   pauseAllZoteroSyncLinks,
   pauseLink,
   readZoteroSyncHistory,
@@ -354,8 +359,8 @@ export {
   readAssetText,
   transcriptVersions,
 } from "./source-actions.js";
-export { isMediaMime, isPdfMime, isPictureMime, openAssetContent } from "./asset-content.js";
-export type { AssetContent } from "./asset-content.js";
+export { isMediaMime, isPdfMime, isPictureMime, openAssetContent, openHeldFileContent } from "./asset-content.js";
+export type { AssetContent, HeldFileContent, StoredContent } from "./asset-content.js";
 export { addTranscriptVersion, parseVtt, readTranscript } from "./transcript-segments.js";
 export { TRANSCRIBE_KIND, recordingOf, transcriptionJob, transcriptionRecords, transcriptionRerun } from "./transcription-jobs.js";
 export type { StoredTranscript, TranscriptionParams } from "./transcription-jobs.js";

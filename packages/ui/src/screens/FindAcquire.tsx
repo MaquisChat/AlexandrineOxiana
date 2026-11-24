@@ -165,6 +165,12 @@ export const SWITCH_TIMEOUT_MS = 60_000;
 export const LIBRARY_SHELL_TIMEOUT_MS = 60_000;
 /** R342 b: how long a start waits for the shell to report a leftover window closed before it asks the shell once more. */
 export const LIBRARY_CLOSE_WAIT_MS = 5_000;
+/**
+ * FR-558: a read of the queue is waited for at most this long by what waits on it (a row's control, the next read asked
+ * for); a read that never answers then keeps no control busy and holds no later read back. It is cancelled then (R472):
+ * a late answer is not taken, and the next read shows what it would have.
+ */
+export const QUEUE_READ_WAIT_MS = 60_000;
 
 /**
  * F15's start and cancel (apps/library-service/src/routes/your-library.ts), as their handlers take them: no body. Ids
@@ -815,7 +821,9 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
             {!projectId && <option value="">{projects ? "No project" : "Reading the projects…"}</option>}
             {list.map((p) => (
               <option key={p.id} value={p.id} dir="auto">
-                {p.unlocked ? p.name : `${p.name} (locked)`}
+                {/* An <option> holds no element: the name is isolated with U+2068 FIRST STRONG ISOLATE and U+2069 POP
+                    DIRECTIONAL ISOLATE, so a right-to-left name does not flip " (locked)" (as R463 M7 does elsewhere). */}
+                {p.unlocked ? p.name : `\u2068${p.name}\u2069 (locked)`}
               </option>
             ))}
           </select>
@@ -865,7 +873,8 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
           <UserText>{settingsError}</UserText>
         </p>
       )}
-      {projectsError && (
+      {/* The same sentence (the service cannot be reached) is said once, not for the settings and again for the projects. */}
+      {projectsError && projectsError !== screenError && (
         <p role="alert" className="ao-error">
           <UserText>{projectsError}</UserText>
         </p>
@@ -887,6 +896,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
           onStoredCheck={onStoredCheck}
           onUnlocked={readProjects}
           waitForSwitch={waitForSwitch}
+          saidAbove={screenError}
         />
       )}
     </main>
@@ -977,8 +987,10 @@ function ProjectQueue(props: {
   onUnlocked: () => void;
   /** A change of "Check everything I have" still out: an add waits for it (R272 a). */
   waitForSwitch: () => Promise<SwitchResult> | undefined;
+  /** FR-576: the sentence the screen already says above the queue (its settings could not be read), not said again. */
+  saidAbove?: string | undefined;
 }) {
-  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch } = props;
+  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch, saidAbove } = props;
   /** The desktop shell's bridge (F16); undefined outside the desktop app. */
   const shell = useMemo(() => desktopShell(), []);
   const projectId = project.id;
@@ -1321,16 +1333,16 @@ function ProjectQueue(props: {
     setLocked(true);
   }, [setDialog]);
 
-  /** One read of the queue (it may overlap another; the numbers keep the order). */
-  const readOnce = useCallback(async (): Promise<void> => {
+  /** One read of the queue (it may overlap another; the numbers keep the order). A read cancelled by `signal` changes nothing. */
+  const readOnce = useCallback(async (signal?: AbortSignal): Promise<void> => {
     const start = ++clock.current;
     const g = gen.current;
     try {
-      const r = await api.queue(projectId);
-      if (!alive.current || g !== gen.current) return;
+      const r = await api.queue(projectId, signal ? { signal } : {});
+      if (!alive.current || g !== gen.current || signal?.aborted) return;
       applyQueue(r, start);
     } catch (err) {
-      if (!alive.current || g !== gen.current || start < metaSeq.current) return;
+      if (!alive.current || g !== gen.current || signal?.aborted || start < metaSeq.current) return;
       metaSeq.current = start;
       if (isProjectLocked(err)) {
         markLocked();
@@ -1351,6 +1363,28 @@ function ProjectQueue(props: {
   }, [api, projectId, applyQueue, markLocked]);
 
   readOnceRef.current = readOnce;
+  /**
+   * One read, waited for at most QUEUE_READ_WAIT_MS (FR-558). A read given up then is cancelled (R472), so that reads
+   * that never answer do not pile up against the web view's few connections to the service; the next read shows what
+   * it would have.
+   */
+  const readWaited = useCallback(async (): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cancel = new AbortController();
+    try {
+      await Promise.race([
+        readOnce(cancel.signal),
+        new Promise<void>((r) => {
+          timer = setTimeout(() => {
+            cancel.abort();
+            r();
+          }, QUEUE_READ_WAIT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }, [readOnce]);
   const readNow = useCallback(() => void readOnce(), [readOnce]);
   /**
    * A read asked for by an event (or after an act), coalesced: it starts EVENT_COALESCE_MS after the first ask (asks
@@ -1373,13 +1407,13 @@ function ProjectQueue(props: {
           if (!alive.current || g !== gen.current || soon.current !== mark) return;
           mark.again = false;
           lastSoon.current = Date.now();
-          await readOnce();
+          await readWaited();
         } while (mark.again && alive.current && g === gen.current && soon.current === mark);
       } finally {
         if (soon.current === mark) soon.current = null;
       }
     })();
-  }, [readOnce]);
+  }, [readWaited]);
 
   // ---- at load, and when the switch changed: read now (where matches elsewhere are is asked again) ----
   const firstSwitch = useRef(true);
@@ -1550,7 +1584,8 @@ function ProjectQueue(props: {
     if (libTicket.current?.ticket === ticket) libTicket.current = null;
     if (endedTickets.current.has(ticket)) return;
     endedTickets.current.add(ticket);
-    if (shell) void shellWithin(shell.closeLibraryWindow());
+    // R477 b: the close carries the ticket of the open that made the window, so it never closes a newer one.
+    if (shell) void shellWithin(shell.closeLibraryWindow(ticket));
   };
   // The ticket is held only while its row waits. Once the row was seen waiting and no longer does (the service returned
   // it: the ticket's end, a lock, a save of the rules), or it is gone (removed here), the window is closed — unless the
@@ -1600,7 +1635,12 @@ function ProjectQueue(props: {
         if (libTicket.current?.ticket === ticket) libTicket.current = null;
         p.then(
           (late) => {
-            if (late === true) void shellWithin(shell.closeLibraryWindow());
+            // FR-561 (R472, R477 b): the shell is the guard — the close carries THIS open's ticket, and the shell closes
+            // a sign-in window only on behalf of the open that made it, so a late answer never ends a newer window's
+            // wait (one started here, after the screen was left and opened again, or by "Test" on Your library). The
+            // page keeps no second guard of its own: one would only keep this open's window standing whenever the page
+            // held a newer ticket, and the shell refuses the close for an older ticket by itself.
+            if (late === true) void shellWithin(shell.closeLibraryWindow(ticket));
           },
           () => {},
         );
@@ -1612,6 +1652,7 @@ function ProjectQueue(props: {
     if (first !== "refused") return first;
     if (!live()) return false;
     const closed = nextClosed(LIBRARY_CLOSE_WAIT_MS);
+    // The leftover's ticket is not the page's to know: this close carries none (R477 b).
     void shellWithin(shell.closeLibraryWindow());
     if (!(await closed) || !live()) return false;
     return (await ask()) === true;
@@ -1676,7 +1717,7 @@ function ProjectQueue(props: {
         // press of a double click finds the row waiting and sends nothing.
         // The row's change that read shows is said as any row's change is.
         acting.current.delete(e.id);
-        if (live()) await readOnce();
+        if (live()) await readWaited();
         return;
       }
       // Not opened (refused twice, failed, or no answer in time): the page forgets the ticket, and the entry goes back.
@@ -1878,6 +1919,9 @@ function ProjectQueue(props: {
         return;
       case "retry":
         void run(e, "retry", () => api.retry(projectId, e.id));
+        return;
+      case "get-copy":
+        void run(e, "get-copy", () => api.getCopy(projectId, e.id));
         return;
       case "remove":
         void remove(e);
@@ -2227,7 +2271,8 @@ function ProjectQueue(props: {
       )}
 
       <h2 id={`${ids}-queue`}>Queue</h2>
-      {loadError && !entries?.length && (
+      {/* FR-576: the same sentence (the service cannot be reached) is said once, not by the screen and again here. */}
+      {loadError && loadError !== saidAbove && !entries?.length && (
         <p role="alert" className="ao-error">
           <UserText>{loadError}</UserText>
         </p>

@@ -99,8 +99,8 @@ function portPair(name: string, sender: PortLike["sender"]): { tab: FakePort; bg
 interface FakeTab {
   url: string | undefined;
   contentType: string;
-  /** The file the tab's fetch answers with, or a Response factory. */
-  file?: Uint8Array | (() => Response);
+  /** The file the tab's fetch answers with, or a Response factory (given the fetch's init, its signal among it). */
+  file?: Uint8Array | ((init?: RequestInit) => Response);
   /** The browser refuses the injection (its own pages, Firefox's PDF viewer). */
   noScript?: boolean;
   /** The script is injected but never connects. */
@@ -109,15 +109,27 @@ interface FakeTab {
   length?: number | null;
 }
 
-/** A body that yields `file` in chunks of `chunk` bytes, counting what was pulled; `stallAfter` stops yielding. */
+/**
+ * A body that yields `file` in chunks of `chunk` bytes, counting what was pulled; `stallAfter` stops yielding.
+ * `follow(signal)` makes it behave as a real fetch's body does when the fetch's signal is aborted: the body is errored
+ * with an AbortError (a read waiting on it ends) and the reading is stopped (`aborted`; the publisher's end is closed).
+ */
 function streamOf(file: Uint8Array, o: { chunk?: number; stallAfter?: number } = {}) {
   const chunk = o.chunk ?? 64 * 1024;
   let at = 0;
-  const seen = { pulled: 0, cancelled: false };
+  let ended = false;
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const seen = { pulled: 0, cancelled: false, aborted: false };
   const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
     pull(c) {
       if (o.stallAfter !== undefined && at >= o.stallAfter) return new Promise<void>(() => undefined);
-      if (at >= file.length) return c.close();
+      if (at >= file.length) {
+        ended = true;
+        return c.close();
+      }
       const part = file.subarray(at, Math.min(at + chunk, file.length));
       at += part.length;
       seen.pulled = at;
@@ -125,10 +137,18 @@ function streamOf(file: Uint8Array, o: { chunk?: number; stallAfter?: number } =
       return undefined;
     },
     cancel() {
+      ended = true;
       seen.cancelled = true;
     },
   });
-  return { body, seen };
+  const follow = (signal: AbortSignal | null | undefined) =>
+    signal?.addEventListener("abort", () => {
+      if (ended) return;
+      ended = true;
+      seen.aborted = true;
+      controller!.error(new DOMException("This operation was aborted", "AbortError"));
+    });
+  return { body, seen, follow };
 }
 
 const pdfBytes = (n: number, fill = 0x41) => {
@@ -171,7 +191,7 @@ function rig(tabs: Record<number, FakeTab>, o: { post?: FinderDeps["post"]; wait
             contentType: tab.contentType,
             fetch: (async (url: string, init?: RequestInit) => {
               r.fetches.push({ url: String(url), init });
-              if (typeof tab.file === "function") return tab.file();
+              if (typeof tab.file === "function") return tab.file(init);
               const s = streamOf(tab.file ?? new Uint8Array(), {});
               r.streams.push(s.seen);
               const headers = new Headers({ "content-type": "application/pdf" });
@@ -236,7 +256,8 @@ describe("the extension's numbers and the service's sentences are the service's 
   it("R357's own sentences, exactly", () => {
     expect(FIND_TEXT.userInfo).toBe("This tab's address holds a user name or password, so its file cannot be sent.");
     expect(FIND_TEXT.tooLong).toBe("This tab's address is too long for the app, so its file cannot be sent.");
-    expect(FIND_TEXT.notGivenAgain).toBe("The site did not give the PDF a second time, so nothing was sent. Download the PDF and add it to the record in the app instead.");
+    // FR-588: true also for a PDF whose %PDF- mark is not at its first byte, not only for a page the second time.
+    expect(FIND_TEXT.notGivenAgain).toBe("The file the site gave when the extension read it again does not start as a PDF does, so nothing was sent. Download the PDF and add it to the record in the app instead.");
     expect(FIND_TEXT.noAnswer).toBe("The app's answer did not arrive, and the work is no longer waiting for a PDF from this browser. The app shows what became of it.");
     expect(FIND_TEXT.unknown).toBe("The app's answer did not arrive, and whether the work is still waiting could not be read. Open this popup again to see.");
   });
@@ -244,7 +265,9 @@ describe("the extension's numbers and the service's sentences are the service's 
   it("the extension's own sentences are R348's and the dispatch's; none says a file was added (R301)", () => {
     expect(FIND_TEXT.notHttps).toBe("This tab's address is not https, so its file cannot be sent.");
     expect(FIND_TEXT.notShowingPdf).toBe("This tab is not showing a PDF. Open the PDF itself, then try again.");
-    expect(FIND_TEXT.notAllowed).toBe("This browser does not let the extension read this tab, so its PDF cannot be sent.");
+    // FR-584: true also for a tab closed or changed mid-way and for a browser that does not let the script in; it ends
+    // with what the researcher can do next (R466 M5).
+    expect(FIND_TEXT.notAllowed).toBe("The extension could not read this tab, so its PDF cannot be sent: this browser did not let it read the page, or the tab was closed or changed page meanwhile. Open the PDF in a tab again and press “Send this tab's PDF” again, or download the PDF and add it to the record in the app.");
     expect(FIND_TEXT.couldNotSend).toBe("The PDF could not be sent. The work is still waiting — try again.");
     // "Add it to the record" (R357 f) asks the researcher to do it; no sentence says a file WAS added.
     for (const s of [...Object.values(FIND_TEXT), ...Object.values(FIND_SERVICE_TEXT)]) expect(s).not.toMatch(/\badded\b|\badds\b|\bwas add/i);
@@ -543,6 +566,15 @@ describe("sending the tab's PDF: the whole way with the real tab script, a fake 
     expect(r.posts).toEqual([]);
   });
 
+  it("a PDF whose %PDF- mark is not at its first byte: the same sentence, which does not claim the site refused a second time (FR-588); nothing sent", async () => {
+    const file = new Uint8Array([0x0a, ...new TextEncoder().encode("%PDF-1.7\n%%EOF\n")]);
+    const r = rig({ 7: { url: PAGE, contentType: "application/pdf", file } });
+    expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_TEXT.notGivenAgain });
+    expect(FIND_TEXT.notGivenAgain).not.toMatch(/second time/);
+    await Promise.all(r.scripts);
+    expect(r.posts).toEqual([]);
+  });
+
   it("an empty file, or one shorter than five bytes, read again from a tab showing a PDF: R357 f's sentence", async () => {
     for (const file of [new Uint8Array(0), new TextEncoder().encode("%PDF")]) {
       const r = rig({ 7: { url: PAGE, contentType: "application/pdf", file } });
@@ -589,7 +621,9 @@ describe("sending the tab's PDF: the whole way with the real tab script, a fake 
     await Promise.all(r.scripts);
     expect(pieces(r.tabPorts[0]!).length).toBe(200);
     expect(r.posts).toEqual([]);
-  }, 60_000);
+    // Its honest work is 200 pieces of 1 MiB, each turned to base64, copied and read back (the limit is the service's
+    // and the piece the protocol's, so neither can be smaller): 40 s on one busy core, so a limit of 120 s.
+  }, 120_000);
 
   it("a script that sends more than the limit anyway: the background stops reading past the limit (its own count)", async () => {
     const r = rig({ 7: { url: PAGE, contentType: "application/pdf", silent: true } });
@@ -623,12 +657,24 @@ describe("sending the tab's PDF: the whole way with the real tab script, a fake 
   });
 
   it("a tab whose file stops arriving: the wait for a piece ends, the tab's reading is stopped, nothing sent", async () => {
+    // One whole piece arrives, then the file stops: the tab's next read never ends by itself. The piece wait is set
+    // well above the first piece's honest work (its base64 and its copy, tens of milliseconds; more on a busy machine),
+    // so the wait that ends is the one for the SECOND piece, as asserted below, never the first.
     const file = pdfBytes(3 * 1024 * 1024);
-    const s = streamOf(file, { stallAfter: 1024 * 1024 + 64 * 1024 });
-    const r = rig({ 7: { url: PAGE, contentType: "application/pdf", file: () => new Response(s.body) } }, { waits: { piece: 50 } });
+    const stallAfter = FIND_PIECE_BYTES + 64 * 1024;
+    const s = streamOf(file, { stallAfter });
+    const file7 = (init?: RequestInit) => {
+      s.follow(init?.signal);
+      return new Response(s.body);
+    };
+    const r = rig({ 7: { url: PAGE, contentType: "application/pdf", file: file7 } }, { waits: { piece: 1_000 } });
     expect(await r.finder.send(7, TICKET)).toEqual({ sentence: FIND_TEXT.couldNotRead });
+    expect(pieces(r.tabPorts[0]!)).toHaveLength(1);
+    expect(r.bgPorts[0]!.sent.filter((m) => (m as { t?: string }).t === "more")).toHaveLength(2);
+    expect(s.seen.pulled).toBe(stallAfter);
+    // The background's disconnect aborts the tab's fetch; its read ends and the script ends.
     await Promise.all(r.scripts);
-    expect(s.seen.cancelled).toBe(true);
+    expect(s.seen.aborted).toBe(true);
     expect(r.tabPorts[0]!.messages.size).toBe(0);
     expect(r.posts).toEqual([]);
   });

@@ -33,7 +33,9 @@ describe("fitCaptureBody (POST /capture/browser takes at most 32 MB)", () => {
     expect(r.body.extracted.mediaUrls).toEqual(base.extracted.mediaUrls);
     expect(utf8Bytes(r.body)).toBeLessThanOrEqual(MAX_BODY_BYTES);
     expect(r.notes.join(" ")).toMatch(/HTML/);
-  });
+    // Its honest work is measuring bodies of 31.5 MB (the limit is the service's): 2.5 to 2.9 s on one busy core, so
+    // a limit of 15 s.
+  }, 15_000);
 
   it("then drops the extracted media links", () => {
     const mediaUrls = Array.from({ length: 50 }, (_, i) => `https://news.example/${"a".repeat(MB)}${i}`);
@@ -44,11 +46,20 @@ describe("fitCaptureBody (POST /capture/browser takes at most 32 MB)", () => {
     expect(r.body.extracted.caption).toBe("c");
     expect(utf8Bytes(r.body)).toBeLessThanOrEqual(MAX_BODY_BYTES);
     expect(r.notes.join(" ")).toMatch(/media/);
-  });
+    // Its honest work is measuring bodies over 32 MB again and again (the limit is the service's; 16 links instead of
+    // 50 costs the same): 3 s on one busy core, so a limit of 15 s.
+  }, 15_000);
 
   it("refuses locally, with a clear message, when even the screenshot and fields are too big", () => {
     const body = { ...base, screenshotPng: "A".repeat(33 * MB) };
-    expect(() => fitCaptureBody(body)).toThrow(CaptureTooLargeError);
-    expect(() => fitCaptureBody(body)).toThrow(/too large/);
+    // One fitting, its error read whole (each fitting of 33 MB is the test's whole cost).
+    let thrown: unknown;
+    try {
+      fitCaptureBody(body);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(CaptureTooLargeError);
+    expect((thrown as Error).message).toMatch(/too large/);
   });
 });

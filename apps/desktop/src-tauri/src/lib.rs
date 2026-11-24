@@ -13,8 +13,10 @@
 //! service's standard input is closed (it shuts down cleanly and stops the worker), and the shell
 //! waits until both are gone, forcing the stop after SHUTDOWN_GRACE. If the shell is killed outright
 //! (SIGKILL, a crash), the closed pipe stops the service, and the service's closed pipe stops the
-//! worker (R155 rule 3).
+//! worker (R155 rule 3). If the helpers have not gone two seconds after the close began, a small
+//! window of the app's own says that the library is being closed (`closing`, FR-297, R470 c).
 
+pub mod closing;
 pub mod connection;
 pub mod grant;
 pub mod helper_env;
@@ -311,11 +313,13 @@ async fn library_window_take_pdf(app: AppHandle, window: tauri::WebviewWindow) -
     detached(move || shell.library.take_pdf(&library_host(&app, &shell), &label, std::time::Instant::now())).await.unwrap_or(false)
 }
 
+/// `close_library_window(ticket?)`: with the ticket of the open that made the window, only that
+/// window is closed (FR-561, R472); without one, whatever sign-in window is open (`Library::close_for`).
 #[tauri::command]
-async fn close_library_window(app: AppHandle, window: tauri::WebviewWindow) {
+async fn close_library_window(app: AppHandle, window: tauri::WebviewWindow, ticket: Option<String>) {
     let Some(shell) = app.try_state::<Arc<Shell>>().map(|s| s.inner().clone()) else { return };
     let label = window.label().to_string();
-    detached(move || shell.library.close(&library_host(&app, &shell), &label)).await;
+    detached(move || shell.library.close_for(&library_host(&app, &shell), &label, ticket.as_deref())).await;
 }
 
 #[tauri::command]
@@ -380,16 +384,20 @@ fn on_termination_signals(app: AppHandle) {
 }
 
 /// Debug builds with NODE_ENV=test: `close` on standard input closes the main window, exactly as
-/// the window's close button does.
+/// the window's close button does; `close-closing-window` does the same to the closing window.
 fn test_commands(app: AppHandle) {
     std::thread::spawn(move || {
         use std::io::BufRead;
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
-            if line.trim() == "close" {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.close();
-                }
+            // `close-closing-window`: the closing window's close button (FR-297).
+            let label = match line.trim() {
+                "close" => "main",
+                "close-closing-window" => closing::LABEL,
+                _ => continue,
+            };
+            if let Some(w) = app.get_webview_window(label) {
+                let _ = w.close();
             }
         }
     });
@@ -452,12 +460,29 @@ pub fn run() {
             }
             let app = app.clone();
             let shell = loop_shell.clone();
+            let began = std::time::Instant::now();
             std::thread::spawn(move || {
-                // The sign-in window closes and its store is emptied unless kept (on this thread:
-                // the event loop still runs); the inbox is emptied once the service is gone.
-                shell.library.at_quit(&library_host(&app, &shell));
-                stop_helpers(&shell);
-                empty_library_inbox(&shell);
+                let (gone_tx, gone_rx) = std::sync::mpsc::channel::<()>();
+                let stopping_app = app.clone();
+                let stopping_shell = shell.clone();
+                let stopper = std::thread::spawn(move || {
+                    // The sign-in window closes and its store is emptied unless kept (off the main
+                    // thread: the event loop still runs); the inbox is emptied once the service is gone.
+                    stopping_shell.library.at_quit(&library_host(&stopping_app, &stopping_shell));
+                    stop_helpers(&stopping_shell);
+                    empty_library_inbox(&stopping_shell);
+                    let _ = gone_tx.send(());
+                });
+                // FR-297 (R470 c): not gone within closing::AFTER, the closing window is shown, and
+                // the wait goes on exactly as before; the window goes with the app below.
+                let gone = !matches!(gone_rx.recv_timeout(closing::AFTER), Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+                if closing::due(began.elapsed(), gone, shell.failed.load(Ordering::SeqCst)) {
+                    closing::open(&app, test_mode());
+                }
+                // A stop that panicked ends here, as it did when it ran on this thread.
+                if stopper.join().is_err() {
+                    return;
+                }
                 shell.helpers_stopped.store(true, Ordering::SeqCst);
                 if shell.relaunch.load(Ordering::SeqCst) {
                     if test_mode() {

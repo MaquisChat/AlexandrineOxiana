@@ -22,3 +22,9 @@ export function UserText({ children, as: Tag = "span", lang, className, "data-te
     </Tag>
   );
 }
+
+/**
+ * Text from outside put where an element cannot go (an `<option>`): wrapped in the Unicode isolate marks (FSI … PDI), so
+ * a right-to-left name keeps its own direction and does not move what follows it (R463 M7, as FR-158 does with UserText).
+ */
+export const isolated = (text: string): string => `\u2068${text}\u2069`;

@@ -14,7 +14,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS, speechToolId, type TranscribeRequest, type TranscriptionJobResponse } from "@ao/shared";
-import { ProjectLockedError, cancelPendingJob, transcriptionRecords } from "@ao/library";
+import { ProjectLockedError, cancelPendingJob, jobRunningHere, transcriptionRecords } from "@ao/library";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import { busyError, fromRecord } from "../transcriptions.js";
 import type { Session } from "../state.js";
@@ -31,7 +31,7 @@ export function registerTranscription(app: FastifyInstance, ctx: Ctx): void {
     const live = state.transcriptions.current(projectId, sourceId, s.lib);
     if (live) return live;
     const rec = (await transcriptionRecords(s.repo, projectId, sourceId)).at(-1);
-    return rec ? fromRecord(rec) : null;
+    return rec ? fromRecord(rec, jobRunningHere(rec.id)) : null;
   }
 
   /** The speech model is installed, as far as the optional tools list knows (409 TOOL_NOT_INSTALLED when it says not). */

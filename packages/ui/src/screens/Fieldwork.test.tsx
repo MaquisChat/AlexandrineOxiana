@@ -271,10 +271,136 @@ describe("Fieldwork", () => {
     const offer = await within(c).findByRole("group", { name: "Re-attach the signed form of P-001?" });
     expect(offer.textContent).toMatch(/detached from this consent record before/);
     expect(db.calls.filter((x) => x.body?.reattach)).toHaveLength(0);
+    // FR-168: the offer takes focus (once the request has ended), and names the file it would re-attach, as the person's text.
+    await waitFor(() => expect(document.activeElement).toBe(offer));
+    expect(offer.textContent).toMatch(/^“consent P-001\.pdf” was detached from this consent record before\./);
+    expect(offer.querySelector("[dir=auto]")?.textContent).toBe("consent P-001.pdf");
+    expect(offer.textContent).not.toContain("/Users");
     const user = userEvent.setup();
     await user.click(within(offer).getByRole("button", { name: "Re-attach the form" }));
     await waitFor(() => expect(db.calls.at(-1)).toMatchObject({ method: "POST", body: { path: "/Users/ana/consent P-001.pdf", reattach: true } }));
     expect(await within(c).findByText(/Signed form attached/)).toBeTruthy();
+  });
+
+  describe("FR-160: a form attached by mistake can be detached, with a reason, after a confirmation naming the form and the record", () => {
+    const FORM = "0190f0f0-0000-7000-8000-0000000000aa";
+    function withForm() {
+      const pid0 = id();
+      db.participants.push({ id: pid0, code: "P-001", consentIds: [] });
+      const cid = id();
+      db.consents.push({ id: cid, participantId: pid0, scope: "Audio", date: "2026-03-14", documentAssetId: FORM });
+      server.use(
+        http.patch(P("/consents/:fid"), async ({ request, params }) => {
+          const b = (await request.json()) as any;
+          db.calls.push({ method: "PATCH", path: `/consents/${String(params.fid)}`, body: b });
+          const c = db.consents.find((x) => x.id === params.fid);
+          if (b.documentAssetId === null) {
+            c.detachedAssetIds = [c.documentAssetId];
+            delete c.documentAssetId;
+          }
+          return HttpResponse.json(c);
+        }),
+      );
+      return cid;
+    }
+
+    it("confirmed: one PATCH with the reason; the form is no longer attached and a form can be dropped again", async () => {
+      const cid = withForm();
+      render(<Fieldwork api={makeApi()} projectId={PID} />);
+      const c = await screen.findByRole("region", { name: "Consent records" });
+      const user = userEvent.setup();
+      await user.click(await within(c).findByRole("button", { name: "Detach the signed form of P-001…" }));
+      const dialog = screen.getByRole("dialog", { name: "Detach the signed form" });
+      expect(dialog.textContent).toMatch(/The signed form attached to the consent record of P-001 \(“Audio”, 2026-03-14\) will be detached from it\./);
+      const reason = within(dialog).getByRole("textbox", { name: /Reason/ });
+      expect(document.activeElement).toBe(reason);
+      const go = within(dialog).getByRole("button", { name: "Detach the form" }) as HTMLButtonElement;
+      expect(go.disabled).toBe(true);
+      await user.type(reason, "   ");
+      expect(go.disabled).toBe(true);
+      expect(db.calls).toHaveLength(0);
+      await user.type(reason, "The form of another participant");
+      await user.click(go);
+      await waitFor(() => expect(db.calls).toEqual([{ method: "PATCH", path: `/consents/${cid}`, body: { documentAssetId: null, detachReason: "The form of another participant" } }]));
+      expect(await within(c).findByText(/Drop the signed consent form here/)).toBeTruthy();
+      expect(within(c).queryByText("Signed form attached.")).toBeNull();
+      expect(screen.getByRole("status", { name: "Fieldwork result" }).textContent).toMatch(/The signed form was detached/);
+      expect(screen.queryByRole("dialog")).toBeNull();
+      // R463 M3: focus goes to the control that attaches a form to this record, not to the page.
+      await waitFor(() => expect(document.activeElement).toBe(within(c).getByRole("textbox", { name: "Or add the form by its full path" })));
+    });
+
+    it("R463 M2: a form detached meanwhile elsewhere: the screen says nothing was changed and shows the record as it is", async () => {
+      const cid = withForm();
+      server.use(
+        http.patch(P("/consents/:fid"), async ({ request }) => {
+          db.calls.push({ method: "PATCH", path: `/consents/${cid}`, body: await request.json() });
+          return HttpResponse.json({ error: { code: "VALIDATION", message: "That form was no longer attached. Nothing was changed." } }, { status: 400 });
+        }),
+      );
+      render(<Fieldwork api={makeApi()} projectId={PID} />);
+      const c = await screen.findByRole("region", { name: "Consent records" });
+      const user = userEvent.setup();
+      await user.click(await within(c).findByRole("button", { name: "Detach the signed form of P-001…" }));
+      // Detached from another window meanwhile.
+      delete db.consents[0].documentAssetId;
+      const dialog = screen.getByRole("dialog", { name: "Detach the signed form" });
+      await user.type(within(dialog).getByRole("textbox", { name: /Reason/ }), "Wrong form");
+      await user.click(within(dialog).getByRole("button", { name: "Detach the form" }));
+      expect(await screen.findByText("That form was no longer attached. Nothing was changed.")).toBeTruthy();
+      expect(await within(c).findByText(/Drop the signed consent form here/)).toBeTruthy();
+      expect(screen.queryByText(/The signed form was detached/)).toBeNull();
+      // n1: focus goes to the control that attaches a form to this record, not to the page.
+      await waitFor(() => expect(document.activeElement).toBe(within(c).getByRole("textbox", { name: "Or add the form by its full path" })));
+    });
+
+    it("n2: a detach whose reload fails leaves no pending focus: a later reload does not move focus by itself", async () => {
+      withForm();
+      let failNext = false;
+      server.use(
+        http.get(P("/consents"), () => {
+          if (failNext) {
+            failNext = false;
+            return HttpResponse.json({ error: { code: "INTERNAL", message: "The fieldwork records could not be loaded." } }, { status: 500 });
+          }
+          return HttpResponse.json({ consents: db.consents, complete: true });
+        }),
+      );
+      render(<Fieldwork api={makeApi()} projectId={PID} />);
+      const c = await screen.findByRole("region", { name: "Consent records" });
+      const user = userEvent.setup();
+      await user.click(await within(c).findByRole("button", { name: "Detach the signed form of P-001…" }));
+      const dialog = screen.getByRole("dialog", { name: "Detach the signed form" });
+      await user.type(within(dialog).getByRole("textbox", { name: /Reason/ }), "Wrong form");
+      failNext = true;
+      await user.click(within(dialog).getByRole("button", { name: "Detach the form" }));
+      await waitFor(() => expect(db.calls.some((x) => x.method === "PATCH")).toBe(true));
+      await waitFor(() => expect(failNext).toBe(false));
+      await screen.findByRole("alert");
+      expect(within(c).queryByText(/Drop the signed consent form here/)).toBeNull();
+      const addP = within(section("Participants")).getByRole("button", { name: "Add participant" }) as HTMLButtonElement;
+      await waitFor(() => expect(addP.disabled).toBe(false));
+      await user.click(addP);
+      await within(section("Participants")).findByText("P-001");
+      expect(await within(c).findByText(/Drop the signed consent form here/)).toBeTruthy();
+      await waitFor(() => expect(addP.disabled).toBe(false));
+      expect(document.activeElement).not.toBe(within(c).getByRole("textbox", { name: "Or add the form by its full path" }));
+      expect(document.activeElement).toBe(addP);
+    });
+
+    it("cancelled: nothing is sent, the form stays attached, focus is back on the button", async () => {
+      withForm();
+      render(<Fieldwork api={makeApi()} projectId={PID} />);
+      const c = await screen.findByRole("region", { name: "Consent records" });
+      const user = userEvent.setup();
+      const button = await within(c).findByRole("button", { name: "Detach the signed form of P-001…" });
+      await user.click(button);
+      await user.click(within(screen.getByRole("dialog", { name: "Detach the signed form" })).getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(button);
+      expect(within(c).getByText("Signed form attached.")).toBeTruthy();
+      expect(db.calls).toHaveLength(0);
+    });
   });
 
   it("the re-attach offer can be declined: nothing is sent", async () => {

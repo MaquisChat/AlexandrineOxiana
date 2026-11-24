@@ -1,6 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import { SOURCE_CHANGE_UNFINISHED, SOURCE_CHANGE_UNFINISHED_READ_ONLY } from "@ao/shared";
 import { StatusBanner, bannersFor, volumeOf, warningText } from "./StatusBanner";
 
 describe("device-level notices (Task 68)", () => {
@@ -55,9 +56,10 @@ describe("device-level notices (Task 68)", () => {
 
   it("watched folders that could not be read at open: a plain warning for this session (review round 2, Rm4)", () => {
     const t = warningText("watched-folders-unreadable", "library");
-    expect(t).toMatch(/list of watched folders could not be read when this library was opened/);
-    expect(t).toMatch(/files put in them are not imported/);
-    expect(t).toMatch(/Open the library again/);
+    // R465 b (FR-413): a statement about the opening, which stays true when a folder is added or retried later.
+    expect(t).toBe(
+      "This computer's list of watched folders could not be read when this library was opened, so its watched folders were not started then. Files put in them are not imported until they run. Open the library again to start them all.",
+    );
     expect(t).not.toMatch(/needs attention/);
   });
 
@@ -149,6 +151,20 @@ describe("StatusBanner", () => {
     expect(t).not.toContain("7f3a");
   });
 
+  it("FR-158: a right-to-left project name is isolated on its own; the English sentence keeps its direction", () => {
+    const name = "مقابلات هرات";
+    render(<StatusBanner variant={{ kind: "warning", warning: "retention-due", project: name }} />);
+    const banner = screen.getByRole("status");
+    expect(banner.textContent).toBe(`${name} has reached its retention date. Review which raw data must now be destroyed or kept.`);
+    // Only the name is laid out by its own direction: nothing around the sentence takes it from its first letter.
+    const isolated = [...banner.querySelectorAll("[dir=auto]")];
+    expect(isolated.map((el) => el.textContent)).toEqual([name]);
+    // A name named twice in one sentence is isolated each time.
+    cleanup();
+    render(<StatusBanner variant={{ kind: "warning", warning: "audit-append-failed-at-open", project: name }} />);
+    expect([...screen.getByRole("status").querySelectorAll("[dir=auto]")].map((el) => el.textContent)).toEqual([name, name]);
+  });
+
   it("every warning kind the service emits has its own sentence", () => {
     const kinds = [
       "chain-broken", "head-mismatch", "truncated", "empty", "anchor-missing", "anchors-unreadable", "rolled-back-incomplete-write",
@@ -158,6 +174,7 @@ describe("StatusBanner", () => {
       "recovery-code-unshown", "recovery-staging-discarded", "recovery-staging-unverifiable",
       "audit-unrecorded", "permissions-not-set", "audit-recorded-late", "refusal-unrecorded",
       "audit-unrecorded-blocked", "attention-unreadable", "audit-waiting",
+      "source-change-unfinished", "source-change-unfinished-read-only", "changed-outside-before-rollback",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();
@@ -169,6 +186,67 @@ describe("StatusBanner", () => {
     expect(seen.size).toBe(kinds.length);
   });
 
+});
+
+describe("R484 f: changes to sources that did not finish and could not be undone: one banner per project and kind", () => {
+  const ONE = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. Close the library and open it again to put it back.";
+  const SEVERAL = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. Close the library and open it again to put them back.`;
+  const ONE_RO = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. It can be put back only when the library is opened for changes.";
+  const SEVERAL_RO = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. They can be put back only when the library is opened for changes.`;
+  const w = (projectId: string, project: string, kind: string, n: number) =>
+    Array.from({ length: n }, (_, i) => ({ projectId, project, kind, detail: `Sources/folder ${i}: the library's own sentence` }));
+  /** What the researcher reads on each banner, rendered (the project's name as text). */
+  const shown = (warnings: ReturnType<typeof w>) =>
+    bannersFor({ integrityWarnings: warnings }).map((b) => {
+      const { container, unmount } = render(<StatusBanner variant={b} />);
+      const t = container.textContent ?? "";
+      expect(container.querySelector("i")).toBeNull();
+      unmount();
+      return t;
+    });
+
+  it("one source: one banner, a source in the project", () => {
+    expect(shown(w("p1", "Dissertation <i>1</i>", "source-change-unfinished", 1))).toEqual([ONE]);
+    expect(shown(w("p1", "Dissertation <i>1</i>", "source-change-unfinished-read-only", 1))).toEqual([ONE_RO]);
+  });
+
+  it("several sources: one banner with their number", () => {
+    expect(shown(w("p1", "Dissertation <i>1</i>", "source-change-unfinished", 3))).toEqual([SEVERAL(3, "Dissertation <i>1</i>")]);
+    expect(shown(w("p1", "Dissertation <i>1</i>", "source-change-unfinished-read-only", 2))).toEqual([SEVERAL_RO(2, "Dissertation <i>1</i>")]);
+  });
+
+  it("both kinds in one project: one banner for each", () => {
+    expect(shown([...w("p1", "Dissertation <i>1</i>", "source-change-unfinished", 2), ...w("p1", "Dissertation <i>1</i>", "source-change-unfinished-read-only", 1)])).toEqual([
+      SEVERAL(2, "Dissertation <i>1</i>"),
+      ONE_RO,
+    ]);
+  });
+
+  it("two projects: one banner for each, beside the other warnings in their place", () => {
+    const other = { projectId: "p2", project: "Fieldwork", kind: "rolled-back-incomplete-write", detail: "x" };
+    expect(
+      shown([...w("p1", "Dissertation <i>1</i>", "source-change-unfinished", 1), other, ...w("p2", "Fieldwork", "source-change-unfinished", 4), ...w("p1", "Dissertation <i>1</i>", "source-change-unfinished", 1)]),
+    ).toEqual([SEVERAL(2, "Dissertation <i>1</i>"), "An interrupted change in Fieldwork was undone when the library opened, so nothing half-saved was kept.", SEVERAL(4, "Fieldwork")]);
+  });
+
+  it("the sentence with \"this source\" stays the library's own, for the source itself", () => {
+    expect(SOURCE_CHANGE_UNFINISHED).toBe("A change to this source did not finish and could not be undone. Close the library and open it again to put it back.");
+    expect(SOURCE_CHANGE_UNFINISHED_READ_ONLY).toBe("A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.");
+  });
+});
+
+describe("R479 a, R484 b: a file changed outside the app while an unfinished change waited to be undone", () => {
+  const SENTENCE =
+    "A file in Dissertation <b>2</b> was changed outside the app while a change the app had not finished was waiting to be undone. When the library opened, the app undid its unfinished change, and the outside change to that file was not kept.";
+  it("says the ruled sentence on the banner, the project's name shown as text, never the file or the detail", () => {
+    const detail = "transaction 7f3a: /Users/rana/Thesis library/Sources/x/source.json";
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: "Dissertation <b>2</b>", kind: "changed-outside-before-rollback", detail }] });
+    render(<StatusBanner variant={b!} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe(SENTENCE);
+    expect(status.querySelector("b")).toBeNull();
+    expect(status.textContent).not.toContain("7f3a");
+  });
 });
 
 describe("R409 d: old copies of the library still holding destroyed data", () => {

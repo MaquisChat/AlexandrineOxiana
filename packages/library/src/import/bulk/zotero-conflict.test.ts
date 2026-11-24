@@ -27,6 +27,7 @@ import { confirmField } from "../../source-actions.js";
 import { startZoteroWebImport, type ZoteroWebOptions } from "../zotero-web.js";
 import { FakeZotero, guardNetwork } from "../../../tests/zotero/fake-zotero.js";
 import { createBulkImport, type BatchResult } from "./index.js";
+import { ZOTERO_REPORT_ROWS } from "@ao/shared";
 
 const FAST = 2 ** 10;
 const U = "user:42";
@@ -186,7 +187,7 @@ describe("a field changed in Zotero and here (Z6)", () => {
     expect(lines.at(-1)).toMatchObject({ outcome: "zotero-conflict", conflictsQueued: 1, sourceId: id });
     const report = await bulk().batchReport(p.id, batchId);
     expect(report.counts).toMatchObject({ conflicts: 1, updated: 0 });
-    expect(await reportMd(p, 2)).toContain("- Changed in Zotero and here — waiting for you: 1");
+    expect(await reportMd(p, 2)).toContain(`- ${ZOTERO_REPORT_ROWS.conflicts}: 1`);
     const upd = (await auditEvents(p)).filter((e) => opOf(e) === "import.update");
     // One governed change (one txn), whose policy events (capture and store) each say what it queued.
     expect(new Set(upd.map((e) => (e.details as { txn: string }).txn)).size).toBe(1);
@@ -210,7 +211,9 @@ describe("a field changed in Zotero and here (Z6)", () => {
     expect((await journal(p, 2)).at(-1)).toMatchObject({ outcome: "updated", conflictsQueued: 1 });
     const md = await reportMd(p, 2);
     expect(md).toContain("- Updated from a newer version: 1");
-    expect(md).toContain("- Changed in Zotero and here — waiting for you: 1");
+    // R474 M4: the row says that it overlaps, so the rows are not read as adding up to more than the items.
+    expect(ZOTERO_REPORT_ROWS.conflicts).toBe("Changed in Zotero and here — waiting for you (also counted in another row when other changes came in too)");
+    expect(md).toContain(`- ${ZOTERO_REPORT_ROWS.conflicts}: 1`);
     expect((await bulk().batchReport(p.id, batchId)).keptFields).toEqual([]);
   });
 
@@ -722,7 +725,8 @@ describe("fix round 1 (R236)", () => {
       expect((await repo.getSource(p.id, id)).source.volume).toBe("3");
       expect(await pending(p, id)).toEqual([]);
       expect((await bulk().batchReport(p.id, batchId)).counts).toMatchObject({ clearedInZoteroKept: 1 });
-      expect(await reportMd(p, 2)).toContain("- Cleared in Zotero, kept here: 1");
+      expect(ZOTERO_REPORT_ROWS.clearedInZoteroKept).toBe("Cleared in Zotero, kept here (also counted in another row)");
+      expect(await reportMd(p, 2)).toContain(`- ${ZOTERO_REPORT_ROWS.clearedInZoteroKept}: 1`);
       // Another change in Zotero: the clearing was noticed once; nothing more is counted.
       z.editItem(U, key, { extra: "touched" });
       const next = await run(p);

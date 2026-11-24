@@ -110,6 +110,22 @@ function requirementText(p: Profile): string {
   return `Requires ${listOf(all)}.${tail}`;
 }
 
+/**
+ * FR-187, FR-188: what a new project's profiles ask for that only the researcher can give (a value to be present, as the
+ * Funder DMP's repository, formats and raw-data destruction date), in plain words; the rules themselves are not changed.
+ */
+export function stillToFillIn(profiles: readonly string[] | undefined): string[] {
+  const out: string[] = [];
+  for (const { id } of PROFILES) {
+    if (!profiles?.includes(id)) continue;
+    for (const r of PROFILE_REQUIREMENTS[id]) if (r.kind === "present") out.push(CONTROL_WORDS[r.control] ?? r.control);
+  }
+  return [...new Set(out)];
+}
+
+/** "a, b and c" (for the library's hint). */
+export const listInWords = (items: string[]) => listOf(items);
+
 /** The service refused because the rules need encryption (GovernanceViolationError in createProject). */
 const needsEncryption = (err: unknown) => err instanceof ApiClientError && err.code === "VALIDATION" && /enable encryption/i.test(err.message);
 
@@ -127,12 +143,18 @@ export interface NewProjectProps {
   /** Where focus goes when the dialog closes (the button that opened it), worked out at closing time. */
   returnFocusTo?: () => HTMLElement | null | undefined;
   /**
-   * Whether a recovery code is on screen and not yet confirmed (R134): the library screen then keeps
-   * the dialog even if the library is closed underneath, and tells it with `libraryClosed`.
+   * Whether a recovery code is on screen and not yet confirmed (R134), or the "found" panel of an encrypted project
+   * (FR-194): the library screen then keeps the dialog even if the library is closed underneath, and tells it with
+   * `libraryClosed`.
    */
   onRecoveryPending?: (pending: boolean) => void;
-  /** The library was closed while the recovery code was on screen. */
+  /** The library was closed while the recovery code (or an encrypted project's "found" panel) was on screen. */
   libraryClosed?: boolean;
+  /**
+   * FR-194 (R461 b): the create whose outcome is being checked or cannot be told, or null once it is settled or the
+   * dialog closes; a library closed meanwhile leaves the chooser a notice about it.
+   */
+  onUncertain?: (create: UnresolvedCreate | null) => void;
 }
 
 type Field = "name" | "pass" | "again";
@@ -146,6 +168,33 @@ export interface UnresolvedCreate {
 
 /** New projects with that name since `before`: what a lost create may have made. */
 export const madeSince = (projects: ProjectSummary[], u: UnresolvedCreate): ProjectSummary[] => projects.filter((x) => !u.before.has(x.id) && x.name === u.name);
+
+/** The last part of a project's folder inside the library: its own name, never a path (R461 d). */
+export const folderName = (folder: string) => folder.split(/[\\/]/).filter(Boolean).at(-1) ?? folder;
+
+/**
+ * FR-204, FR-205 (R461 d): new projects with the same name, told apart by their folder's own name, each with its own
+ * "Open this one" (named for its folder).
+ */
+export function SameNamedProjects({ projects, onOpen }: { projects: ProjectSummary[]; onOpen?: ((project: ProjectSummary) => void) | undefined }) {
+  return (
+    <ul aria-label="Projects with this name" className="ao-plain-list">
+      {projects.map((p) => (
+        <li key={p.id}>
+          The project in the folder “<UserText>{folderName(p.folder)}</UserText>”
+          {onOpen && (
+            <>
+              {" "}
+              <button type="button" className="ao-small" aria-label={`Open the project in the folder “${folderName(p.folder)}”`} onClick={() => onOpen(p)}>
+                Open this one
+              </button>
+            </>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 /** The service's limit on a passphrase (routes/projects.ts, UTF-16 units like maxLength). */
 const PASSPHRASE_MAX = 1024;
@@ -161,7 +210,7 @@ type Uncertain = "checking" | "cannot-tell";
 
 export { LEAVE_REFUSED } from "../components/RecoveryCodeStep";
 
-export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecoveryPending, libraryClosed }: NewProjectProps) {
+export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecoveryPending, libraryClosed, onUncertain }: NewProjectProps) {
   const id = useId();
   const [name, setName] = useState("");
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -179,6 +228,11 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   const [uncertain, setUncertain] = useState<Uncertain | null>(null);
   /** A project found after a lost answer: created, but its recovery code was never shown. */
   const [found, setFound] = useState<ProjectSummary | null>(null);
+  /**
+   * FR-204, FR-205: more than one new project with the name sent appeared (one may have been made elsewhere): said, and
+   * none is chosen as the one made here.
+   */
+  const [foundMany, setFoundMany] = useState<{ name: string; encrypted: boolean; projects: ProjectSummary[] } | null>(null);
   /** What a lost answer is checked against: the name sent and the projects listed before sending. */
   const pendingCheck = useRef<UnresolvedCreate | null>(null);
   /** A name already in use, waiting for "Create another" or "Change the name". */
@@ -220,8 +274,26 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   }, [host]);
 
   useEffect(() => {
-    if (found) foundHeading.current?.focus();
-  }, [found]);
+    if (found || foundMany) foundHeading.current?.focus();
+  }, [found, foundMany]);
+
+  // FR-194 (R461 a): the "found" panel of an encrypted project is the only place that says its recovery code was never
+  // shown and the passphrase is the only way in, so a library closed underneath waits for it, as at the recovery code.
+  const holdRef = useRef(onRecoveryPending);
+  holdRef.current = onRecoveryPending;
+  const uncertainRef = useRef(onUncertain);
+  uncertainRef.current = onUncertain;
+  useEffect(() => {
+    uncertainRef.current?.(uncertain ? pendingCheck.current : null);
+  }, [uncertain]);
+  useEffect(() => () => uncertainRef.current?.(null), []);
+  // The "more than one" panel of an encrypted create says the same, so it is held as well.
+  const foundEncrypted = !!found?.encrypted || !!foundMany?.encrypted;
+  useEffect(() => {
+    if (!foundEncrypted) return;
+    holdRef.current?.(true);
+    return () => holdRef.current?.(false);
+  }, [foundEncrypted]);
 
   const requirement = encryptionRequirement({ profiles, identifiable });
   const mandatory = requirement.required || serviceNeedsEncryption;
@@ -260,7 +332,8 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
       const fresh = madeSince(now, p);
       pendingCheck.current = null;
       setUncertain(null);
-      if (fresh.length) setFound(fresh[fresh.length - 1]!);
+      if (fresh.length > 1) setFoundMany({ name: p.name, encrypted: p.encrypted, projects: fresh });
+      else if (fresh.length) setFound(fresh[0]!);
       else show("The library service did not answer, and the project was not created, so nothing was changed. You can create it again.", encrypt ? "pass" : undefined);
     } catch {
       setUncertain("cannot-tell");
@@ -408,6 +481,33 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
             </p>
             <p className="ao-newproject__warning">Without the passphrase or this recovery code, no one can open this project — not you, and not anyone who helps you.</p>
           </RecoveryCodeStep>
+        ) : foundMany ? (
+          <>
+            <h2 id={titleId} ref={foundHeading} tabIndex={-1}>
+              More than one project with this name was found
+            </h2>
+            <p>
+              {foundMany.projects.length} projects named “<UserText>{foundMany.name}</UserText>” appeared in the library while the answer was lost, so the app cannot tell which one was made here: another
+              may have been made elsewhere, in another window.
+            </p>
+            {/* Once the library is closed (an encrypted create is held, FR-194), no project can be opened here. */}
+            <SameNamedProjects projects={foundMany.projects} onOpen={foundMany.encrypted && libraryClosed ? undefined : onCreated} />
+            {foundMany.encrypted && (
+              <p className="ao-newproject__warning">
+                The one made here opens with the passphrase you just chose; its recovery code could not be shown and cannot be shown again. Once it is open, choose “New recovery code…” on the library screen to get a recovery code you can save.
+              </p>
+            )}
+            {foundMany.encrypted && libraryClosed && (
+              <p role="status" className="ao-newproject__warning">
+                The library was closed while this was open. The project was created; once you have read this, you return to choosing a library.
+              </p>
+            )}
+            <div className="ao-row ao-newproject__actions">
+              <button type="button" onClick={() => onCancel()}>
+                {foundMany.encrypted && libraryClosed ? "Back to choosing a library" : "Close"}
+              </button>
+            </div>
+          </>
         ) : found ? (
           <>
             <h2 id={titleId} ref={foundHeading} tabIndex={-1}>
@@ -421,6 +521,11 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
                 <p className="ao-newproject__warning">
                   The project opens with the passphrase you just chose. Keep that passphrase safe: for now it is the only way to open the project. Once the project is open, choose “New recovery code…” on the library screen to get a recovery code you can save.
                 </p>
+                {libraryClosed && (
+                  <p role="status" className="ao-newproject__warning">
+                    The library was closed while this was open. The project was created; once you have read this, you return to choosing a library.
+                  </p>
+                )}
               </>
             ) : (
               <p>
@@ -428,8 +533,9 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
               </p>
             )}
             <div className="ao-row ao-newproject__actions">
+              {/* The library screen leaves for the chooser when the library was closed underneath. */}
               <button type="button" onClick={() => onCreated(found)}>
-                Open the project
+                {found.encrypted && libraryClosed ? "Back to choosing a library" : "Open the project"}
               </button>
             </div>
           </>

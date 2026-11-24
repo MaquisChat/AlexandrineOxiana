@@ -51,6 +51,7 @@ import {
   type CaptureProfileRequest,
   type CaptureQueueDetail,
   type CaptureQueueListResponse,
+  type CaptureCutByLockAcknowledged,
   type CaptureQueueProgressEvent,
   type CaptureQueueSummary,
   type CaptureRequestOptions,
@@ -234,6 +235,8 @@ const OUTCOME_TEXT: Record<string, string> = {
   CAPTURE_FAILED: "Something went wrong while saving this link. Nothing was saved.",
   // The media helper's own job codes.
   TOOL_DOWNLOAD_FAILED: "A tool could not be downloaded. Check the internet connection, then install it again from the Optional tools screen.",
+  TOOL_DOWNLOAD_UNTRUSTED:
+    "A tool could not be downloaded because the secure connection to its publisher could not be verified. A VPN, a security program or a network that inspects secure connections can cause this: try again without it, or on another network, from the Optional tools screen.",
   TOOL_CHECKSUM_MISMATCH: "The downloader tool that was fetched did not match its published checksum, so it was not installed. Try again later.",
   TOOL_UPDATE_FAILED: "The downloader tool could not be updated. Try again later.",
   TOOL_MISSING: "A tool this capture needs is not installed on this computer. Install it from the Optional tools screen.",
@@ -602,8 +605,10 @@ export function captureApi(client: ApiClient) {
       const body: AcknowledgeRequest = { kind: "cookies" };
       return (await r<AcknowledgeResponse>("POST", `/projects/${pid(projectId)}/acknowledge`, { body })).acknowledgements;
     },
-    /** The project's running and recent capture queues (summaries; Task 63). */
-    queues: async (projectId: string): Promise<CaptureQueueSummary[]> => (await r<CaptureQueueListResponse>("GET", `/projects/${pid(projectId)}/captures`)).queues,
+    /** The project's running and recent capture queues (summaries; Task 63), and the count of links a lock cut (R464 b). */
+    queues: (projectId: string) => r<CaptureQueueListResponse>("GET", `/projects/${pid(projectId)}/captures`),
+    /** The researcher's "Got it" for the links a lock cut (R464 b). */
+    acknowledgeCutByLock: (projectId: string) => r<CaptureCutByLockAcknowledged>("POST", `/projects/${pid(projectId)}/captures/cut-by-lock/acknowledge`),
     /** One queue with its items' outcomes. */
     queue: (projectId: string, queueId: string) => r<CaptureQueueDetail>("GET", `/projects/${pid(projectId)}/captures/${encodeURIComponent(queueId)}`),
     toolVersions: async () => (await r<CaptureToolVersionsResponse>("GET", "/tools/versions")).versions,

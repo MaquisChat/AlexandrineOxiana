@@ -117,6 +117,8 @@ describe("declarations shared by the service and the interface (Task 47)", () =>
       "copy-no-legal-basis",
       // F15 (R324 b): found waiting in the sign-in window at start-up with nothing kept to return to.
       "library-unfinished",
+      // R470 a: a source whose linked file cannot be found (the offer "Get a copy for this source").
+      "linked-file-missing",
     ]);
     expect(FIND_REASON_TEXT["copy-some-unreachable"]).toBe("Some services could not be reached, so a free copy may still exist. “Try again” looks again.");
     expect(FIND_REASON_TEXT["copy-not-downloaded"]).toBe("A free copy was found, but it could not be downloaded just now. Try again later, or open one of the links.");

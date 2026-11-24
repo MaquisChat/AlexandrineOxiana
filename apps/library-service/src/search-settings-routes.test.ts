@@ -56,6 +56,8 @@ let requests: Array<{ origin: string; path: string; method: string; headers: Rec
 const errorBodies: string[] = [];
 /** Delay (ms) of Crossref's answers (a test held open). */
 let crossrefDelay = 0;
+/** While set, Crossref's answers wait for it (a test held open until the test lets it go). */
+let crossrefHold: Promise<void> | undefined;
 /** The status of Elicit's answers (200: nothing found). */
 let elicitStatus = 200;
 /** R297 c: OpenAlex answers that its daily allowance is spent to every request that carries no key. */
@@ -81,6 +83,7 @@ function mockServices(): void {
     .intercept({ path: (p: string) => p.startsWith("/works?"), method: "GET" })
     .reply(async (o) => {
       if (crossrefDelay) await new Promise((r) => setTimeout(r, crossrefDelay));
+      if (crossrefHold) await crossrefHold;
       return json({ status: "ok", message: { items: String(o.path).includes("Zorblatt") ? [ZORBLATT] : [] } });
     })
     .persist();
@@ -108,6 +111,7 @@ beforeEach(async () => {
   events = [];
   requests = [];
   crossrefDelay = 0;
+  crossrefHold = undefined;
   elicitStatus = 200;
   oaSpentWithoutKey = false;
   secrets = useMemorySecrets();
@@ -742,13 +746,18 @@ describe("Test (R290 g)", () => {
 
   it("a second test of one source is refused while the first runs; another source may be tested meanwhile", async () => {
     await start();
-    crossrefDelay = 400;
+    // The first test's answer is held until the checks below are done (not merely delayed: a wait that overran a
+    // delay would find the first test already over).
+    let release!: () => void;
+    crossrefHold = new Promise<void>((r) => (release = r));
     const first = call({ method: "POST", url: "/settings/search-sources/record/crossref/test" });
     await until(async () => requests.length > 0, "the first test's request");
     const second = await call({ method: "POST", url: "/settings/search-sources/record/crossref/test" });
     expect(second.status).toBe(409);
     expect(second.json.error.message).toBe(SEARCH_SETTINGS_TEXT.testRunning);
     expect((await call({ method: "POST", url: "/settings/search-sources/record/openalex/test" })).status).toBe(200);
+    crossrefHold = undefined;
+    release();
     expect((await first).json).toEqual({ ok: true, sentence: SEARCH_TEST_TEXT.answered });
     expect((await call({ method: "POST", url: "/settings/search-sources/record/crossref/test" })).status).toBe(200);
   });

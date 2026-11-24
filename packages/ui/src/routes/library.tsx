@@ -6,7 +6,7 @@
  * library, the browser's Back, a link) returns to that project (41b2 I1). The first-use tools
  * question is placed on the open library's screen only, never over the chooser (Task 48c, D9).
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ApiClient } from "../api/client";
 import { libraryApi, type CurrentLibrary, type LibraryEntry, type LibraryList } from "../api/library";
 import { toolsApi } from "../api/tools";
@@ -19,8 +19,11 @@ import { LibraryNotFound } from "../screens/LibraryNotFound";
 
 export const LIBRARY_PATHS = [PATHS.library, PATHS.libraryAlias] as const;
 
-/** How often the screen checks again while the last library is still being opened (I1). */
-const REOPEN_CHECK_MS = 2_000;
+/**
+ * When the screen checks again while the last library is still being opened (I1): after 2, 4 and 8
+ * seconds, then every 15 seconds until it opens or the researcher chooses (Ruling R469 a, FR-368).
+ */
+const REOPEN_CHECK_MS = [2_000, 4_000, 8_000, 15_000] as const;
 export const isLibraryPath = (path: string): boolean => (LIBRARY_PATHS as readonly string[]).includes(normalisePath(path));
 
 type View =
@@ -76,13 +79,21 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
     };
   }, [api, viewOf]);
 
-  // While the last library is still being opened, check again every 2 s (I1). An answer that comes
-  // after the researcher chose something else (the view changed, or the screen went away) is dropped.
+  // While the last library is still being opened, check again, less and less often (I1, R469 a). An
+  // answer that comes after the researcher chose something else (the view changed, or the screen went
+  // away) is dropped. `checks` counts the checks made for this library, so each wait is the next one.
   const reopeningId = view.kind === "chooser" ? view.reopening?.libraryId : undefined;
+  const checks = useRef<{ libraryId?: string; made: number }>({ made: 0 });
   useEffect(() => {
-    if (!reopeningId) return;
+    if (!reopeningId) {
+      checks.current = { made: 0 };
+      return;
+    }
+    if (checks.current.libraryId !== reopeningId) checks.current = { libraryId: reopeningId, made: 0 };
+    const delay = REOPEN_CHECK_MS[Math.min(checks.current.made, REOPEN_CHECK_MS.length - 1)];
     let live = true;
     const timer = setTimeout(() => {
+      checks.current.made++;
       api.libraries
         .list()
         .then((r) => {
@@ -92,7 +103,7 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
         })
         // Not answered: keep checking (a new view object re-arms this effect).
         .catch(() => live && setView((v) => (v.kind === "chooser" && v.reopening ? { ...v } : v)));
-    }, REOPEN_CHECK_MS);
+    }, delay);
     return () => {
       live = false;
       clearTimeout(timer);

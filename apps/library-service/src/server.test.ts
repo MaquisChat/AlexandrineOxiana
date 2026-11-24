@@ -4,7 +4,7 @@
  * service's entry point.
  */
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -30,6 +30,7 @@ import {
   type JobResult,
   type WorkerClient,
   type WorkerJob,
+  writeQueueTurn,
 } from "@ao/library";
 import { existsSync } from "node:fs";
 import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
@@ -521,6 +522,89 @@ describe("background work (R96 carry-overs)", () => {
     expect(r.json.report).toMatchObject({ missing: [], mismatched: [] });
     const state = svc.state.libraryState();
     expect(state).toMatchObject({ open: true, integrityWarnings: [], projectWarnings: { [pid]: [] } });
+  });
+
+  it("FR-420: GET /libraries/integrity confirms a finding in the write queue's turn: a change in progress gives none", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc.state.session!.repo;
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "report", title: { variants: [{ lang: "en", kind: "original", value: "Paper" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: await fixturePdf(), role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+    const file = join(svc.state.session!.lib.root, ...sf.assets[0]!.path.split("/"));
+    // A change holds the write queue and has the file out of its place for the moment (as a change moves a file
+    // aside before it writes the record): read outside the queue, it looks missing.
+    let release!: () => void;
+    let holding!: () => void;
+    const held = new Promise<void>((r) => (holding = r));
+    const change = writeQueueTurn(repo)(async () => {
+      await rename(file, `${file}.aside`);
+      holding();
+      await new Promise<void>((r) => (release = r));
+      await rename(`${file}.aside`, file);
+    });
+    await held;
+    // The route's way into the queue, observed: the check asks for a turn once it has found the file missing.
+    const state = svc.state as unknown as { writeQueueTurn(s: unknown): <T>(fn: () => Promise<T>) => Promise<T> };
+    const own = state.writeQueueTurn.bind(state);
+    let asked!: () => void;
+    const askedTurn = new Promise<void>((r) => (asked = r));
+    state.writeQueueTurn = (s) => {
+      const turn = own(s);
+      return (fn) => (asked(), turn(fn));
+    };
+    const answer = call({ url: "/libraries/integrity?sample=full" });
+    // Without the queue the answer comes while the change is still in progress, and says the file is missing.
+    await Promise.race([askedTurn, answer]);
+    release();
+    await change;
+    const r = await answer;
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.report).toMatchObject({ missing: [], mismatched: [] });
+  });
+
+  it("R491 C b: GET /libraries/integrity ended by a close answers 409 with its own sentence, not the read-only one", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc.state.session!.repo;
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "report", title: { variants: [{ lang: "en", kind: "original", value: "Paper" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: await fixturePdf(), role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+    // A real finding, so that the check asks for the write queue's turn to confirm it.
+    await rm(join(svc.state.session!.lib.root, ...sf.assets[0]!.path.split("/")));
+    const state = svc.state as unknown as { writeQueueTurn(s: unknown): <T>(fn: () => Promise<T>) => Promise<T>; closeLibrary(): Promise<void> };
+    const own = state.writeQueueTurn.bind(state);
+    let closedNow!: () => void;
+    const closed = new Promise<void>((r) => (closedNow = r));
+    let asked!: () => void;
+    const askedTurn = new Promise<void>((r) => (asked = r));
+    // The library is closed while the check waits for its turn.
+    state.writeQueueTurn = (s) => {
+      const turn = own(s);
+      return async (fn) => {
+        asked();
+        await closed;
+        return turn(fn);
+      };
+    };
+    const answer = call({ url: "/libraries/integrity?sample=full" });
+    await askedTurn;
+    await state.closeLibrary();
+    closedNow();
+    const r = await answer;
+    expect(r.status, r.body).toBe(409);
+    expect(r.json.error).toMatchObject({
+      code: "CONFLICT",
+      message: "The check was stopped because the library was closed or moved. Open the library again and run the check again.",
+    });
   });
 
   it("closing the library cancels running work, disposes of its queues and releases the lock", async () => {
@@ -1970,6 +2054,57 @@ describe("review round 2: library move (R102 N1–N3)", () => {
     const done = await moving;
     expect(done.body).toContain('"done":true');
     expect((await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [pdfs[0]] } })).status).toBe(200);
+  });
+
+  it("while a move runs: a change to this app's own settings or pairings is refused in words that say so, not as if it were in the library (FR-329)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inMove = new Promise<void>((r) => (entered = r));
+    await start({ beforeExecuteMove: async () => (entered(), gate) });
+    await openNewLibrary();
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    await inMove;
+    const DEVICE = "While the library is being moved, this app changes nothing, not even its own settings or its list of paired browsers. Try again when the move has finished.";
+    try {
+      for (const [method, url] of [["DELETE", "/settings/fonts/f1"], ["DELETE", "/secrets/zotero-api-key"], ["DELETE", "/extension/pairings/p1"]] as const) {
+        const r = await call({ method, url });
+        expect(r.status).toBe(503);
+        expect(r.json.error).toEqual({ code: "MOVE_IN_PROGRESS", message: DEVICE });
+      }
+    } finally {
+      release();
+    }
+    expect((await moving).body).toContain('"done":true');
+  });
+
+  it("while a move runs: each route is refused in the words true of it, and a route that writes nothing is not refused (FR-329, R466 M4)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inMove = new Promise<void>((r) => (entered = r));
+    await start({ beforeExecuteMove: async () => (entered(), gate) });
+    await openNewLibrary();
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    await inMove;
+    const DEVICE = "While the library is being moved, this app changes nothing, not even its own settings or its list of paired browsers. Try again when the move has finished.";
+    const TOOLS = "While the library is being moved, this app installs, updates and removes no tools, and stops none being installed. Try again when the move has finished.";
+    try {
+      // The Find screen's choices are remembered on this computer, not in the library.
+      const screenChoice = await call({ method: "PUT", url: "/find/screen", body: {} });
+      expect([screenChoice.status, screenChoice.json.error]).toEqual([503, { code: "MOVE_IN_PROGRESS", message: DEVICE }]);
+      // The optional tools are on this computer.
+      for (const [method, url] of [["POST", "/tools/yt-dlp/install"], ["POST", "/tools/update"], ["POST", "/tools/jobs/j1/cancel"]] as const) {
+        const r = await call({ method, url });
+        expect([url, r.status, r.json.error]).toEqual([url, 503, { code: "MOVE_IN_PROGRESS", message: TOOLS }]);
+      }
+      // Working out a library's address from a link writes nothing: it is answered as at any other time.
+      const derive = await call({ method: "POST", url: "/settings/your-library/derive", body: { link: "https://example.org/" } });
+      expect(derive.status, derive.body).toBe(200);
+    } finally {
+      release();
+    }
+    expect((await moving).body).toContain('"done":true');
   });
 
   it("quiesce fails (an import cannot pause): what it paused resumes, the library carries on, 409", async () => {

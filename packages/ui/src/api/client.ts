@@ -127,6 +127,10 @@ function checkToken(token: string): void {
 }
 
 const unreachable = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: "The library service could not be reached." });
+/** Said of an answer that began and then broke off (FR-350); also said by the reader (R481 a). */
+export const ANSWER_CUT_OFF = "The library service's answer was cut off before it finished.";
+/** An answer that began and then broke off: the service was reached, so it is not said to be out of reach (FR-350). */
+const cutOff = (): ApiClientError => new ApiClientError(0, { code: "INTERNAL", message: ANSWER_CUT_OFF });
 const unexpected = (status: number): ApiClientError =>
   new ApiClientError(status, { code: "INTERNAL", message: `The library service answered with something unexpected (HTTP ${status}).` });
 
@@ -349,7 +353,8 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
           chunk = await Promise.race([reader.read(), aborted]);
         } catch (err) {
           if (o.signal?.aborted) return;
-          throw err instanceof ApiClientError ? err : unreachable();
+          // The answer had begun (R467 M6): a read that breaks off is a cut-off, as in bytes().
+          throw err instanceof ApiClientError ? err : cutOff();
         }
         if (chunk === "aborted" || o.signal?.aborted) return;
         if (chunk.done) break;
@@ -367,7 +372,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       }
       buf += decoder.decode();
       if (buf.trim()) {
-        throw new ApiClientError(0, { code: "INTERNAL", message: "The library service's answer was cut off before it finished." });
+        throw cutOff();
       }
     } finally {
       if (onAbort) o.signal?.removeEventListener("abort", onAbort);
@@ -445,7 +450,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
           blob = await res.blob();
         } catch (err) {
           if (o.signal?.aborted) throw err;
-          throw unreachable();
+          throw cutOff();
         }
         if (o.maxBytes !== undefined && blob.size > o.maxBytes) throw tooLarge();
         return blob;
@@ -468,7 +473,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
         }
       } catch (err) {
         if (err instanceof ApiClientError || o.signal?.aborted) throw err;
-        throw unreachable();
+        throw cutOff();
       }
       return new Blob(parts as BlobPart[], { type });
     })();
@@ -528,7 +533,8 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
         }
       } catch (err) {
         if (err instanceof ApiClientError || o.signal?.aborted) throw err;
-        throw unreachable();
+        // The 206 had begun (R467 M6): a body that breaks off is a cut-off, as in bytes().
+        throw cutOff();
       }
     }
     if (got !== length) throw mismatch();

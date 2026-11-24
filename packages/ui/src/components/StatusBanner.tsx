@@ -4,8 +4,8 @@
  * library's integrity warnings and projects' standing warnings. Warning codes are never shown as
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
-import { useRef, useState } from "react";
-import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, isDeviceNoticeKind, oldCopiesPendingText, type DeviceNoticeKind } from "@ao/shared";
+import { useRef, useState, type ReactNode } from "react";
+import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, ZOTERO_SYNC_SENTENCES, isDeviceNoticeKind, oldCopiesPendingText, type DeviceNoticeKind } from "@ao/shared";
 import { errorText, type IntegrityWarning, type LibraryState } from "../api/library";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
@@ -23,9 +23,9 @@ export type BannerVariant =
   /**
    * `detail` is accepted for the record but never shown (R114 I1). `oldCopies`: for
    * `destruction-old-copies-pending`, the sentence that fits and the old copies' places, shown under
-   * it (R409 d).
+   * it (R409 d). `count`: how many warnings of this kind in this project the banner stands for (R484 f).
    */
-  | { kind: "warning"; warning: string; project: string; detail?: string; oldCopies?: { text: string; places: string[] } }
+  | { kind: "warning"; warning: string; project: string; detail?: string; oldCopies?: { text: string; places: string[] }; count?: number }
   /** This computer's own notice (Task 68, R154, R178): fixed words by kind; goes by "Got it". */
   | { kind: "notice"; notice: DeviceNoticeKind };
 
@@ -44,13 +44,12 @@ export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
   "watched-folders-list-set-aside":
     "This computer's list of watched folders was damaged and was set aside, so some watched folders on this computer may have stopped: files put in those folders are not imported. The damaged list is kept beside the app's settings.",
   "libraries-list-set-aside":
-    "This computer's list of libraries was damaged and was set aside. Your libraries themselves are untouched: open each one again from its folder with “Open library”. The damaged list is kept beside the app's settings.",
+    "This computer's list of libraries was damaged and was set aside. Any libraries it could still read are listed as before. Your libraries themselves are untouched. A library missing from the list can be opened again from its folder with “Open library”. The damaged list is kept beside the app's settings.",
   "approved-folders-list-set-aside":
     "This computer's list of folders approved for imports was damaged and was set aside. An import will ask again before it uses files from a folder outside the one you import from. The damaged list is kept beside the app's settings.",
   "watched-folder-choices-set-aside":
     "This computer's choices for its watched folders were damaged and were set aside. Folders whose choices could not be kept went back to the defaults: they are watched, not paused, and files that are not downloaded to this Mac are left alone. The damaged file is kept beside the app's settings.",
-  "zotero-sync-settings-set-aside":
-    "This computer's Zotero sync settings could not be read and were set aside. Automatic sync is off until you set it up again. Nothing in your library has changed.",
+  "zotero-sync-settings-set-aside": ZOTERO_SYNC_SENTENCES.settingsSetAside,
   "zotero-sync-settings-newer":
     "These sync settings were written by a newer version of the app. Update the app to change them. Until then, automatic sync with Zotero is off on this computer. Nothing in your library has changed.",
 };
@@ -64,10 +63,10 @@ const READ_ONLY_REASONS: Record<string, string> = {
 /**
  * Plain-language text for every warning the service raises (R114 I1): the library's integrity
  * warnings (packages/library/src/repo/audit-store.ts IntegrityWarning kinds) and the projects'
- * standing warnings. `p` is the project's name ("library" for library-wide ones). The service's
- * detail is never shown: it can carry ids, paths and transaction names.
+ * standing warnings. `p` is the project's name ("library" for library-wide ones); `n`, for the kinds shown once
+ * per project, how many there are. The service's detail is never shown: it can carry ids, paths and transaction names.
  */
-const WARNINGS: Record<string, (p: string) => string> = {
+const WARNINGS: Record<string, (p: string, n: number) => string> = {
   "chain-broken": (p) => `The audit log of ${p} does not hold together: an entry was changed or removed outside the app. Your sources are unchanged; check the verification report.`,
   "head-mismatch": (p) => `The audit log of ${p} does not match the record this computer keeps of it. It may have been changed outside the app; check the verification report.`,
   truncated: (p) => `The audit log of ${p} is shorter than this computer's record of it: recent entries may have been removed outside the app.`,
@@ -75,8 +74,9 @@ const WARNINGS: Record<string, (p: string) => string> = {
   "anchor-missing": (p) => `The audit log may have been changed outside the app (${p}): this computer has no record to check it against. It is checked from now on.`,
   "anchors-unreadable": () => "This computer's record of the audit logs could not be read, so they could not be checked this time. Nothing in the library was changed.",
   // For this session only (Task 68 round 2, Rm4): the service could not read this computer's watched folders at open.
+  // Said of the opening (R465 b), so it stays true when a folder added or retried later does run.
   "watched-folders-unreadable": () =>
-    "This computer's list of watched folders could not be read when this library was opened, so its watched folders are not running now: files put in them are not imported. Open the library again to try again.",
+    "This computer's list of watched folders could not be read when this library was opened, so its watched folders were not started then. Files put in them are not imported until they run. Open the library again to start them all.",
   "rolled-back-incomplete-write": (p) => `An interrupted change in ${p} was undone when the library opened, so nothing half-saved was kept.`,
   "invalid-txn-marker": (p) => `A note left by an interrupted change in ${p} could not be read. It was kept aside and nothing was changed.`,
   "incomplete-write-pending": (p) => `An interrupted change in ${p} could not be finished or undone yet. It is tried again when the library is next opened with write access.`,
@@ -89,6 +89,19 @@ const WARNINGS: Record<string, (p: string) => string> = {
     `The record of deleted items in ${p} could not be read. It was set aside; deleting still works, but re-importing from Zotero is paused until the record is reset.`,
   "annotations-unreadable": (p) => `Some annotations in ${p} could not be read. The sources still open; the annotations that could not be read are not shown.`,
   "annotations-hash-mismatch": (p) => `Some annotations in ${p} were changed outside the app. They are shown as they are now.`,
+  // R473 I1, R484 f: sources whose change did not finish and whose roll-back failed, for as long as the roll-back
+  // waits; one banner per project ("this source" is said only for the source itself, in the library's own sentence).
+  "source-change-unfinished": (p, n) =>
+    n === 1
+      ? `A change to a source in ${p} did not finish and could not be undone. Close the library and open it again to put it back.`
+      : `Changes to ${n} sources in ${p} did not finish and could not be undone. Close the library and open it again to put them back.`,
+  "source-change-unfinished-read-only": (p, n) =>
+    n === 1
+      ? `A change to a source in ${p} did not finish and could not be undone. It can be put back only when the library is opened for changes.`
+      : `Changes to ${n} sources in ${p} did not finish and could not be undone. They can be put back only when the library is opened for changes.`,
+  // R479 a, R484 b: a file an unfinished change named, changed by hand before the reopen undid that change.
+  "changed-outside-before-rollback": (p) =>
+    `A file in ${p} was changed outside the app while a change the app had not finished was waiting to be undone. When the library opened, the app undid its unfinished change, and the outside change to that file was not kept.`,
   "destroy-incomplete": (p) =>
     `A destruction of raw data in ${p} did not finish: some files could not be overwritten yet. They are kept out of the project and overwriting is tried again each time the library opens.`,
   "protocol-manifest-unreadable": (p) => `The sealed list of protocol document names in ${p} could not be read. The documents themselves are unchanged; check the verification report.`,
@@ -117,10 +130,25 @@ const WARNINGS: Record<string, (p: string) => string> = {
 };
 
 /** The sentence for a warning kind; an unknown kind gets a generic sentence (never the detail). */
-export function warningText(kind: string, project: string): string {
+export function warningText(kind: string, project: string, count = 1): string {
   const known = Object.hasOwn(WARNINGS, kind) ? WARNINGS[kind] : undefined;
-  return known ? known(project) : `Something in ${project} needs attention. Open the verification report for details.`;
+  return known ? known(project, count) : `Something in ${project} needs attention. Open the verification report for details.`;
 }
+
+/**
+ * A warning's sentence with only the project's name laid out by its own direction (FR-158): a right-to-left name at the
+ * start of the sentence no longer turns the whole English sentence round. Each place the name stands is isolated.
+ * `count`: how many warnings of this kind in this project the sentence stands for (R484 f).
+ */
+function warningSentence(kind: string, project: string, count = 1): ReactNode {
+  const mark = "\u0000";
+  return warningText(kind, mark, count)
+    .split(mark)
+    .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={i}>{project}</UserText>, part]));
+}
+
+/** Kinds the library records once per source folder, shown once per project with their number (R484 f). */
+const PER_PROJECT: ReadonlySet<string> = new Set(["source-change-unfinished", "source-change-unfinished-read-only"]);
 
 function text(v: BannerVariant): string {
   switch (v.kind) {
@@ -137,7 +165,7 @@ function text(v: BannerVariant): string {
     case "index-failed":
       return "The library's search index could not be rebuilt, so sources and search may be incomplete. Your sources are safe in the library folder.";
     case "warning":
-      return v.oldCopies?.text ?? warningText(v.warning, v.project);
+      return v.oldCopies?.text ?? warningText(v.warning, v.project, v.count);
     case "notice":
       return NOTICE_TEXT[v.notice];
   }
@@ -201,10 +229,10 @@ export const RESOLVABLE_WARNINGS: ReadonlySet<string> = new Set(["incomplete-wri
 
 export function StatusBanner({ variant, onResolve, onDismiss }: { variant: BannerVariant; onResolve?: () => void; onDismiss?: (notice: DeviceNoticeKind) => void }) {
   const resolvable = !!onResolve && variant.kind === "warning" && RESOLVABLE_WARNINGS.has(variant.warning);
-  // Project names and service details are user text: shown with dir=auto inside the sentence.
+  // Project names and service details are user text, shown with dir=auto; in a warning only the project's name (FR-158).
   return (
     <div role="status" className={`ao-banner ao-banner--${TONE[variant.kind]}`}>
-      <UserText>{text(variant)}</UserText>
+      {variant.kind === "warning" && !variant.oldCopies ? <span>{warningSentence(variant.warning, variant.project, variant.count)}</span> : <UserText>{text(variant)}</UserText>}
       {variant.kind === "warning" && !!variant.oldCopies?.places.length && (
         <ul>
           {variant.oldCopies.places.map((p) => (
@@ -282,7 +310,22 @@ export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyR
     out.push({ kind: "index-rebuilding", ...p });
   } else if (idx?.state === "failed") out.push({ kind: "index-failed" });
   else if (ctx.index && ctx.index.done < ctx.index.total) out.push({ kind: "index-rebuilding", ...ctx.index });
-  for (const w of state.integrityWarnings ?? ([] as IntegrityWarning[])) out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail });
+  /** The banner standing for each project's warnings of a kind shown once per project (R484 f), by project and kind. */
+  const grouped = new Map<string, { count: number }>();
+  for (const w of state.integrityWarnings ?? ([] as IntegrityWarning[])) {
+    if (!PER_PROJECT.has(w.kind)) {
+      out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail });
+      continue;
+    }
+    const key = JSON.stringify([w.projectId, w.kind]);
+    const seen = grouped.get(key);
+    if (seen) seen.count += 1;
+    else {
+      const b = { kind: "warning" as const, warning: w.kind, project: w.project, count: 1 };
+      grouped.set(key, b);
+      out.push(b);
+    }
+  }
   for (const [pid, list] of Object.entries(state.projectWarnings ?? {})) {
     for (const w of list) {
       const project = ctx.projectNames?.[pid] ?? "a project";

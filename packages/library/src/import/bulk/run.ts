@@ -147,6 +147,7 @@ import { folderId, importOverlapsLibrary, insideFolder, insideLibrary, libraryRe
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
+import { ZOTERO_NOTES } from "../zotero-local.js";
 import { DISK_FULL_NOTE, DISK_FULL_UNDONE_NOTE, NoRoomError, RECOVERY_NOTE, fileMargin, fitSentence, freeRoom, isDiskFull, rememberScan, rememberedScan, spaceMargin, zoteroCopyBytes, zoteroDataDir, type ScanApprovals } from "./space.js";
 import { capAnnotations, conflictVerification, planAnnotations, planBackfill, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
@@ -452,6 +453,8 @@ export interface BatchResult {
   batchId: string;
   state: BatchState;
   counts: BatchCounts;
+  /** FR-512: the run was stopped (state `failed`) by the project's rules refusing a change; absent otherwise. */
+  deniedByRules?: true;
 }
 
 export interface BatchHandle {
@@ -747,6 +750,8 @@ class Run {
   private readonly latest: Map<string, JournalEntry>;
   private readonly createdIds: Set<string>;
   private readonly denies = new Map<string, number>();
+  /** FR-512: this run was stopped by a rules refusal. */
+  private deniedByRules = false;
   private workDir: string | null = null;
   /** File notes per item key (ScanItem.fileNotes), added to the item's journal line. */
   private fileNotes = new Map<string, string[]>();
@@ -1086,6 +1091,8 @@ class Run {
               ? err.reason
               : stoppedNote(causeOf(err)),
         );
+        // FR-512: a stop the rules caused is told to whoever waits for the batch (the Zotero sync says so).
+        if ((err instanceof BatchRefusedError && err.denied) || err instanceof PolicyDeniedError) this.deniedByRules = true;
         // R393 a, b: the stopping error's kind is kept with the batch and logged with the program's stack.
         if (!(err instanceof ProjectLockedError || err instanceof BatchRefusedError || err instanceof PolicyDeniedError)) this.rec.stopCause = causeOf(err);
         this.deps.debug?.(`bulk import stopped: ${errorForLog(err)}`);
@@ -1130,7 +1137,7 @@ class Run {
       active.delete(this.rec.id);
       this.feed.end();
     }
-    this.settle({ batchId: this.rec.id, state, counts: this.counts() });
+    this.settle({ batchId: this.rec.id, state, counts: this.counts(), ...(this.deniedByRules && state === "failed" ? { deniedByRules: true as const } : {}) });
   }
 
   /** Processes one item (null: queued in the current group); never throws for item-level problems (they become `failed`). */
@@ -1162,6 +1169,9 @@ class Run {
             return (await this.backfillOnly(item, k.sourceId, target)) ?? this.queue({ key: item.key, outcome: "unchanged", sourceId: k.sourceId }, target?.assets);
           }
           await this.flush(); // the source may be in the current group
+          // FR-132 (R474 M5): an item changed in Zotero comes in again, so what was taken away there may not be here.
+          const kind = this.rec.source.kind;
+          if (kind === "zotero-local" || kind === "zotero-web") this.note(ZOTERO_NOTES.removalsKept(kind));
           return await this.update(item, k.sourceId);
         }
         // Deleted here after an earlier import: stays deleted unless the options say otherwise (R73).
@@ -2753,10 +2763,13 @@ export async function dryRun(
     const secret = randomBytes(32).toString("hex");
     const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))], secret, await approvalHashes(secret, opts.approveOutside));
     const inLibrary = await libraryFileTest(repo, dir, adapter.kind);
+    const known = adapter.kind === "zotero-local" || adapter.kind === "zotero-web" ? await knownVersions(repo, projectId, adapter.kind) : undefined;
+    let seenAgain = false;
     for await (const scanned of scan) {
       let item = scanned;
       if (item.gone) continue; // gone at its source: nothing to import
       summary.items++;
+      if (item.version && known?.has(item.version.id)) seenAgain = true;
       if (item.unreadable) {
         summary.unreadable.push({ path: item.key, reason: item.unreadable });
         continue;
@@ -2837,6 +2850,9 @@ export async function dryRun(
       else if (seenSha.has(sha)) summary.likelyDuplicates++;
       seenSha.add(sha);
     }
+    // FR-132 (R474 I1, M5): the wizard's summary of either Zotero import says what an import does not take away,
+    // when an item would come in again (not before a first import).
+    if (seenAgain && (adapter.kind === "zotero-local" || adapter.kind === "zotero-web")) summary.notes.push(ZOTERO_NOTES.removalsKept(adapter.kind));
     await spaceOfScan(repo, projectId, adapter, summary, linkedBytes, opts.approveOutside);
   } finally {
     if (made) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});

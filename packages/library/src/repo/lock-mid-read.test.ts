@@ -43,7 +43,7 @@ import { appendJobRecords, readJobJournal, refreshJobRows, type JobRecord } from
 import { HttpClient } from "../lookup/index.js";
 import { checkIntegrity, relinkMissing } from "../reconnect.js";
 import { readAssetText, transcriptVersions } from "../source-actions.js";
-import { openAssetContent } from "../asset-content.js";
+import { openAssetContent, openHeldFileContent } from "../asset-content.js";
 import { readTranscript } from "../transcript-segments.js";
 import { TRANSCRIBE_KIND, transcriptionRecords } from "../transcription-jobs.js";
 import { ProjectLockedError } from "./errors.js";
@@ -61,6 +61,7 @@ import {
   readFindQueueDetailedIn,
   readFindQueueIn,
   appendFindEntriesIn,
+  holdMismatchedFileIn,
   importChange,
 } from "./repo.js";
 import { openingSeam } from "./testing.js";
@@ -137,6 +138,8 @@ interface Ctx {
   /** The project's sealed backup (in Backups/) and a copy of it outside the library (restored by the restore row). */
   backupFile: string;
   backupCopy: string;
+  /** R470 b: the review entry of a file Find and acquire holds for the researcher's decision (sealed at rest). */
+  heldReview: string;
 }
 
 interface Row {
@@ -165,6 +168,17 @@ interface Row {
 }
 
 let c: Ctx;
+/**
+ * R487 e: the lock asked during the reading running now — at an opening (`after` false: before that opening's key is
+ * asked for) or a microtask after one — or undefined while none has been. Read by rows that count what comes after it.
+ */
+let lockAsked: { after: boolean } | undefined;
+/** R487 e: a marker in the later part of the held PDF: never handed back once a lock was asked before its key was. */
+const HELD_MARKER = "R487e-the-later-part-of-the-held-file";
+/** R487 e: the held file is read as the route reads it, slice by slice. */
+const HELD_SLICE = 64 * 1024;
+/** R492 a: a marker in the later part of the first source's stored PDF: never handed back once a lock was asked before its key was. */
+const ASSET_MARKER = "R492a-the-later-part-of-the-stored-file";
 
 /** Comparable form: Maps and Sets as sorted arrays, bytes as their SHA-256, errors as name and message. */
 function norm(v: unknown): unknown {
@@ -226,9 +240,11 @@ async function cold(row: Row, lockAt?: number): Promise<{ outcome: { ok: unknown
     lockAt === undefined ? undefined : () => `${row.name}: the reading did not end within ${WHOLE_MS / 1000} s (${lock ? `the lock landed at opening ${lockAt}` : "the lock had not landed yet"})`,
   );
   if (lockAt === undefined) limit.arm(`${row.name}: the reading did not end`);
+  lockAsked = undefined;
   openingSeam.onOpen = () => {
     openings++;
     if (openings === lockAt) {
+      lockAsked = { after: false };
       lock = c.kit.repo.lockProject(c.p.id);
       lock.catch(() => {});
       limit.arm(`${row.name}: the reading did not end`, ` after the lock landed at opening ${lockAt}`);
@@ -356,6 +372,7 @@ async function exercise(row: Row): Promise<void> {
     const ask = () => {
       limit.arm(`${row.name}: the reading did not end`, ` after the lock landed at opening ${n}${pt.after ? " (a microtask after it)" : ""}${pt.mark ? " (mark)" : ""}`);
       const size = c.kit.ring.size;
+      lockAsked = { after: pt.after };
       lock = c.kit.repo.lockProject(c.p.id);
       lock.catch(() => {});
       // The mark path: the key is not wiped at once (it is answered only to the change in progress, which for a
@@ -379,6 +396,7 @@ async function exercise(row: Row): Promise<void> {
           seen = openings;
         }, 500)
       : undefined;
+    lockAsked = undefined;
     openingSeam.onOpen = () => {
       openings++;
       if (openings === n) {
@@ -433,6 +451,7 @@ async function exercise(row: Row): Promise<void> {
     await row.prepare?.(c);
     const againLimit = hangLimit();
     againLimit.arm(`${row.name}: the reading after the unlock did not end`, ` (lock point ${n})`);
+    lockAsked = undefined;
     try {
       const again = norm(await againLimit.race(row.run(c)));
       if (JSON.stringify(again) !== JSON.stringify(want)) problems.push(`${tag}: after the unlock, a different result: ${JSON.stringify(again).slice(0, 600)}`);
@@ -467,7 +486,9 @@ async function build(): Promise<Ctx> {
   const sources: SourceFile[] = [];
   // Sources with stored files (PDFs); one is identifiable (its creators pseudonymised).
   for (let i = 0; i < 3; i++) {
-    const f = await scratchFile(kit, `paper-${i}.pdf`, PDF(i));
+    const bytes = Buffer.from(PDF(i), "latin1");
+    if (i === 0) bytes.write(ASSET_MARKER, bytes.length - 256, "latin1");
+    const f = await scratchFile(kit, `paper-${i}.pdf`, bytes);
     sources.push(
       await addSource(kit, p, {
         title: `Paper ${i}`,
@@ -552,6 +573,24 @@ async function build(): Promise<Ctx> {
     attempts: 0,
   }));
   await appendFindEntriesIn(kit.repo, p.id, entries, "add");
+  // R470 b: a file held for a record without a file, waiting for the researcher's decision (sealed, as every held file here).
+  const wanting = await kit.repo.createSource(
+    p.id,
+    { projectIds: [], type: "article-journal", title: mt("Wanting a file"), creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+    [],
+    { provenance: { captureMethod: "manual_upload", capturedAt: kit.clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+  );
+  const waiting: FindEntry = { ...entries[0]!, id: newId(), state: "fetching", sourceId: wanting.source.id };
+  await appendFindEntriesIn(kit.repo, p.id, [waiting], "add");
+  const heldBytes = Buffer.from(PDF(3 * 1024 * 1024), "latin1");
+  heldBytes.write(HELD_MARKER, heldBytes.length - 4096, "latin1");
+  const heldPdf = await scratchFile(kit, "held.pdf", heldBytes);
+  const { reviewId: heldReview } = await holdMismatchedFileIn(kit.repo, p.id, {
+    entry: { ...waiting, state: "needs-check", reason: { code: "file-other-doi" } },
+    sourceId: wanting.source.id,
+    fromPath: heldPdf,
+    facts: { why: "other-doi", kind: "pdf", bytes: 1, acquired: { method: "free_copy", via: "service", service: "arxiv", address: "https://arxiv.org/pdf/2101.00001", at: kit.clock.now.toISOString(), tool: { name: "find-and-acquire", version: "0" }, access: "public" } },
+  });
   // A watched folder's register.
   const watchId = newId();
   await kit.repo.recordWatchedFiles(p.id, watchId, [reg(0, sources[1]!.source.id), reg(1, sources[2]!.source.id), reg(2, newId())]);
@@ -616,6 +655,7 @@ async function build(): Promise<Ctx> {
     other,
     backupFile: basename(made.path),
     backupCopy,
+    heldReview,
   };
   ctx.sources = [];
   for (const id of kit.repo.listSourceIds(p.id).sort()) ctx.sources.push(await kit.repo.getSource(p.id, id));
@@ -642,12 +682,43 @@ const ROWS: Row[] = [
   { name: "readTranscript", where: "transcript-segments.ts:305", run: async () => readTranscript(c.kit.repo, c.p.id, c.talk.source.id, transcriptVersions(c.talk)[0]!.id) },
   { name: "readAssetText (the transcript)", where: "source-actions.ts:122 (decrypt :132)", run: async () => readAssetText(c.kit.repo, c.p.id, c.talk.source.id, transcriptVersions(c.talk)[0]!.id) },
   {
+    // R492 a: as the held file's row (R487 e): a lock asked at any opening of the reading (by the wipe or the mark),
+    // before the file's key is asked for, lets not one byte of its content through: counted, and the marker in its
+    // later part must never come back. A lock asked after the last opening finds the key already taken: the reading
+    // under way may end as unlocked here; the service's guard of every read stops it there.
     name: "openAssetContent (a whole stored PDF)",
-    where: "asset-content.ts:58 (open :100)",
+    where: "asset-content.ts (openAssetContent → openStored)",
     run: async () => {
       const a = await openAssetContent(c.kit.repo, c.p.id, c.pdf.source.id, c.pdf.assets[0]!.id, () => true);
+      const lockedFirst = lockAsked !== undefined && !lockAsked.after;
       try {
-        return await a.read(0, a.size);
+        const parts: Buffer[] = [];
+        for (let at = 0; at < a.size; at += HELD_SLICE) parts.push(await a.read(at, Math.min(HELD_SLICE, a.size - at)));
+        const got = Buffer.concat(parts);
+        if (lockedFirst) throw new Error(`${got.length} bytes of the stored file's content came back after the lock${got.includes(ASSET_MARKER) ? ", its later part (the marker) included" : ""}`);
+        return got;
+      } finally {
+        await a.close();
+      }
+    },
+  },
+  {
+    // R470 b: a file Find and acquire holds, looked at before the researcher decides (the held-file route's reading).
+    // R487 e: a lock asked at any opening of the look (by the wipe or the mark), before the file's key is asked for,
+    // lets not one byte of its content through: counted, and the marker in its later part must never come back. A lock
+    // asked after the last opening finds the file's key already taken: the reading under way may end as unlocked here;
+    // the route's guard of every read stops it there (held-file-document.test.ts, "a lock in the middle of a read").
+    name: "openHeldFileContent (a whole held PDF, looked at)",
+    where: "asset-content.ts (openHeldFileContent → openStored)",
+    run: async () => {
+      const a = await openHeldFileContent(c.kit.repo, c.p.id, c.heldReview);
+      const lockedFirst = lockAsked !== undefined && !lockAsked.after;
+      try {
+        const parts: Buffer[] = [];
+        for (let at = 0; at < a.size; at += HELD_SLICE) parts.push(await a.read(at, Math.min(HELD_SLICE, a.size - at)));
+        const got = Buffer.concat(parts);
+        if (lockedFirst) throw new Error(`${got.length} bytes of the held file's content came back after the lock${got.includes(HELD_MARKER) ? ", its later part (the marker) included" : ""}`);
+        return got;
       } finally {
         await a.close();
       }

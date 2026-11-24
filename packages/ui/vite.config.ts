@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
 // The list of pdf.js's shipped files, shared with the desktop build's licence texts (R165).
@@ -58,4 +59,13 @@ export function copyPdfJsAssets(): Plugin {
 export default defineConfig({
   plugins: [react(), dropCspInDev(), copyPdfJsAssets()],
   server: { host: "127.0.0.1", strictPort: true },
+  // Two pages: the app, and the desktop shell's closing window (closing.html; FR-297, R470 c).
+  build: {
+    rollupOptions: {
+      input: {
+        main: fileURLToPath(new URL("./index.html", import.meta.url)),
+        closing: fileURLToPath(new URL("./closing.html", import.meta.url)),
+      },
+    },
+  },
 });

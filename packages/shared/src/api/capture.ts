@@ -11,6 +11,9 @@
  * - `GET /projects/:id/captures/:queueId` → CaptureQueueDetail: one queue with its items' outcomes.
  *   404 for a queue of another project, an unknown one, or one no longer kept.
  * - Both refuse a locked project (423 PROJECT_LOCKED).
+ * - `POST /projects/:id/captures/cut-by-lock/acknowledge` → CaptureCutByLockAcknowledged: the
+ *   researcher's "Got it" for `cutByLock` (FR-370, FR-371; R464 b); the count is forgotten. Desktop
+ *   app only; refuses a locked project (423) as the reads do.
  *
  * A finished queue stays readable for CAPTURE_QUEUE_KEEP_MS after it ended, and the service keeps at
  * most CAPTURE_QUEUES_KEPT finished queues (the oldest finished go first). Running queues are always
@@ -20,6 +23,16 @@
  * Starting a capture of an address that is still waiting or being captured in a running queue of the
  * same project is refused: 409 CONFLICT with reason CAPTURE_RUNNING (R146; Task 63).
  */
+
+/**
+ * The count of a profile run's possible caption edits that could not be checked (FR-106), said one
+ * way wherever it is shown: the command line, the capture queue and the run's report file (R473 M6).
+ */
+export function editsNotCheckedText(n: number): string {
+  return n === 1
+    ? "1 possible edit could not be checked. Capture the profile again later to check it."
+    : `${n} possible edits could not be checked. Capture the profile again later to check them.`;
+}
 
 /** How long a finished queue stays readable (1 hour). */
 export const CAPTURE_QUEUE_KEEP_MS = 60 * 60_000;
@@ -69,6 +82,8 @@ export interface CaptureRunReport {
   newlyUnavailable: number;
   reappeared: number;
   edited: number;
+  /** Posts whose caption looks edited but could not be checked (FR-106); absent from older reports. */
+  editsNotChecked?: number;
   errorCode?: string;
   /** The library's own sentence for a stopped or paused run. */
   reason?: string;
@@ -105,6 +120,15 @@ export interface CaptureQueueDetail extends CaptureQueueSummary {
 
 export interface CaptureQueueListResponse {
   queues: CaptureQueueSummary[];
+  /**
+   * How many links a lock of this project stopped before they were captured, not yet acknowledged
+   * (R464 b). Only the count: the addresses were not kept while the project was locked. Absent when none.
+   */
+  cutByLock?: number;
+}
+
+export interface CaptureCutByLockAcknowledged {
+  acknowledged: true;
 }
 
 // ---- starting a capture (Task 47: one declaration for the service and the interface) ----

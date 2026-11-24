@@ -7,7 +7,7 @@ import { BASE as SERVICE, mockService, PSEUDONYMISING_GOVERNANCE, server, type S
 import { renderToStaticMarkup } from "react-dom/server";
 import { HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_WHY_TEXT } from "@ao/shared";
 import { FilePreview } from "./FilePreview";
-import { DECIDE_SETTLE_MS, HELD_DECISION_TIMEOUT_MS, ReviewQueue } from "./ReviewQueue";
+import { DECIDE_SETTLE_MS, HELD_DECISION_TIMEOUT_MS, HELD_NO_ANSWER_TEXT, ReviewQueue } from "./ReviewQueue";
 import { SCROLL_SETTLE_MS } from "./pressGuard";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -213,6 +213,10 @@ describe("Review queue", () => {
   });
 
   describe("pseudonymised projects (R64)", () => {
+    const HEDGED_COLLECTIONS =
+      "The app has no record of which collections this import made, so these collection names may come from folder names, which can carry participants' names. Check them, and rename the collection or move the item if one names someone.";
+    const HEDGED_TAGS =
+      "The app has no record of which tags this import made, so these tag names may come from folder names, which can carry participants' names. Check them, and rename or remove a tag that names someone.";
     const made = idAt("2026-11-11T10:05:00.000Z", 1); // created by the batch
     const older = idAt("2026-10-01T09:00:00.000Z", 2); // existed before it
     const madeTag = idAt("2026-11-11T10:06:00.000Z", 3);
@@ -283,6 +287,60 @@ describe("Review queue", () => {
       const preview = await screen.findByRole("region", { name: "Imported record" });
       await within(preview).findByText("Amina Rahimi");
       expect(within(preview).queryByText(/collection names come from folder names/i)).toBeNull();
+    });
+
+    it("FR-157: a folder batch from an older service that reports nothing it created flags its collections and tags (fails closed)", async () => {
+      const { created: _c, ...olderBatch } = BATCH;
+      setup({ ...flagged, batches: [olderBatch], sources: { s1: source(1, "Interview 3", { collectionIds: [older], tagIds: [madeTag] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      // R465 a: no record of what it made, so the sentence is hedged, never that the names DO come from folder names.
+      expect(await within(preview).findByText(HEDGED_COLLECTIONS)).toBeTruthy();
+      expect(within(preview).getByText(HEDGED_TAGS)).toBeTruthy();
+      expect(within(preview).queryByText(/^These (collection|tag) names come from folder names/)).toBeNull();
+    });
+
+    it("FR-157: a batch the screen does not know (not in the list of imports it read) flags them too", async () => {
+      setup({ ...flagged, batches: [], sources: { s1: source(1, "Interview 3", { collectionIds: [older], tagIds: [] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      expect(await within(preview).findByText(HEDGED_COLLECTIONS)).toBeTruthy();
+      expect(within(preview).queryByText(/^These collection names come from folder names/)).toBeNull();
+    });
+
+    it("R465 a: an import that reports what it created keeps the asserting sentence, for exactly those", async () => {
+      setup({ ...flagged, sources: { s1: source(1, "Interview 3", { collectionIds: [made, older], tagIds: [madeTag] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      expect(
+        await within(preview).findByText("These collection names come from folder names, which can carry participants' names. Check them, and rename the collection or move the item if one names someone."),
+      ).toBeTruthy();
+      expect(within(preview).getByText("These tag names come from folder names, which can carry participants' names. Check them, and rename or remove a tag that names someone.")).toBeTruthy();
+      expect(within(preview).queryByText(HEDGED_COLLECTIONS)).toBeNull();
+      expect(within(preview).queryByText(HEDGED_TAGS)).toBeNull();
+    });
+
+    it("FR-157 (R463 M1): the list of imports could not be read (a read-only library): no folder-name warning on any entry", async () => {
+      let answered!: () => void;
+      const refused = new Promise<void>((r) => (answered = r));
+      setup({ ...flagged, batchesRefused: true, onBatchesAnswered: () => answered(), sources: { s1: source(1, "Interview 3", { collectionIds: [made, older], tagIds: [madeTag] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      await refused;
+      // The refusal has been handled (its promise settles before the next task).
+      await act(async () => {});
+      expect(within(preview).queryByText(/collection names come from folder names/i)).toBeNull();
+      expect(within(preview).queryByText(/tag names come from folder names/i)).toBeNull();
+    });
+
+    it("FR-157 (R463 M1): no folder-name warning before the list of imports is known; once known, the batch's own are flagged", async () => {
+      let release!: () => void;
+      const batchesHeld = new Promise<void>((r) => (release = r));
+      setup({ ...flagged, batchesHeld, sources: { s1: source(1, "Interview 3", { collectionIds: [made, older], tagIds: [] }) } });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Chapter 2");
+      expect(within(preview).queryByText(/collection names come from folder names/i)).toBeNull();
+      release();
+      expect(await within(preview).findByText(/collection names come from folder names/i)).toBeTruthy();
     });
 
     it("does not flag them when names are not pseudonymised", async () => {
@@ -886,7 +944,8 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     for (const t of ["Right One", "Right Two", RECORD, "Doubted Two"]) {
       await waitFor(() => expect(within(card(t)).getByRole("button", { name: `Use this file for ${t} (Smith, 2020)` })).toBeTruthy());
       const buttons = within(card(t)).getAllByRole("button");
-      expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual([`Use this file for ${t} (Smith, 2020)`, `Not this file for ${t} (Smith, 2020)`]);
+      // R470 b: and, after them, "Look at the file" — it decides nothing.
+      expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual([`Use this file for ${t} (Smith, 2020)`, `Not this file for ${t} (Smith, 2020)`, `Look at the file for ${t} (Smith, 2020)`]);
     }
     // No control in the section is about more than one file.
     for (const el of within(section).queryAllByRole("button")) expect(el.getAttribute("aria-label") ?? el.textContent).not.toMatch(/\ball\b|every|selected/iu);
@@ -1141,8 +1200,8 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
       expect(u.getAttribute("aria-busy")).toBe("true");
       await vi.advanceTimersByTimeAsync(1_500);
     } finally {
-      vi.useRealTimers();
-      vi.useFakeTimers({ toFake: ["Date"] });
+      // From the time the clock shows (as in giveUp): never back 60 seconds, behind a quiet held at the give-up.
+      refake(["Date"]);
     }
     await waitFor(() => expect(reads()).toBeGreaterThan(readsBefore));
     await waitFor(() => expect(within(card(RECORD)).getByText("The service did not answer. Look at the queue again before deciding.")).toBeTruthy());
@@ -1159,6 +1218,168 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     fireEvent.click(use(RECORD));
     await waitFor(() => expect(heldCalls).toHaveLength(2));
   });
+
+  it("FR-529: a decision given up at 60 seconds that the service records later shows as soon as the service answers, without waiting for the next read", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const o = project();
+    let list = o.projectReview![P1]!;
+    let listReads = 0;
+    o.extra = [
+      http.get(`${SERVICE}/projects/:id/review`, () => {
+        listReads++;
+        return HttpResponse.json({ items: list, total: list.length, offset: 0, limit: 500 });
+      }),
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        await gate;
+        // The service records the decision late: the file no longer waits.
+        list = list.filter((x) => x.id !== params.itemId);
+        return HttpResponse.json({ decided: true });
+      }),
+    ];
+    open(o);
+    await ready(RECORD);
+    const reads = () => listReads;
+    refake(["setTimeout", "clearTimeout", "Date"]);
+    try {
+      fireEvent.click(use(RECORD));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+    } finally {
+      vi.useRealTimers();
+      vi.useFakeTimers({ toFake: ["Date"] });
+    }
+    await waitFor(() => expect(within(card(RECORD)).getByText("The service did not answer. Look at the queue again before deciding.")).toBeTruthy());
+    const readsAfterGiveUp = reads();
+    expect(use(RECORD)).toBeTruthy();
+    // The late answer: the queue is read again by itself, and the card says what the service now holds.
+    release();
+    await waitFor(() => expect(within(card(RECORD)).getByText("No longer waiting.")).toBeTruthy());
+    expect(reads()).toBe(readsAfterGiveUp + 1);
+    expect(noUse(RECORD)).toBeNull();
+    expect(heldCalls).toHaveLength(1);
+  });
+
+  /** R478: the held-file decisions' requests, each open until it answers or its signal aborts. */
+  const openDecisions = () => {
+    const st = { open: 0, most: 0, aborted: 0, gates: [] as Array<() => void> };
+    const handler = http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+      heldCalls.push({ id: params.itemId as string, body: await request.json() });
+      st.open++;
+      st.most = Math.max(st.most, st.open);
+      request.signal.addEventListener(
+        "abort",
+        () => {
+          st.open--;
+          st.aborted++;
+        },
+        { once: true },
+      );
+      await new Promise<void>((r) => st.gates.push(r));
+      return HttpResponse.json({ decided: true });
+    });
+    return { st, handler };
+  };
+  const giveUp = async (title: string) => {
+    refake(["setTimeout", "clearTimeout", "Date"]);
+    try {
+      fireEvent.click(use(title));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+    } finally {
+      // Back to a faked Date only, from the time the clock shows: never back to the real time, 60 seconds earlier — a
+      // quiet the re-read held at the give-up's time would then outlast passGuard().
+      refake(["Date"]);
+    }
+    await waitFor(() => expect(within(card(title)).getByText(HELD_NO_ANSWER_TEXT)).toBeTruthy());
+  };
+
+  it("R478: a card holds at most one given-up decision: a new press on it cancels the earlier request first, whose late answer then changes nothing", async () => {
+    const o = project();
+    let listReads = 0;
+    const list = o.projectReview![P1]!;
+    const { st, handler } = openDecisions();
+    o.extra = [
+      http.get(`${SERVICE}/projects/:id/review`, () => {
+        listReads++;
+        return HttpResponse.json({ items: list, total: list.length, offset: 0, limit: 500 });
+      }),
+      handler,
+    ];
+    open(o);
+    await ready(RECORD);
+    await giveUp(RECORD);
+    // FR-529: the given-up request stays open.
+    expect(st.open).toBe(1);
+    await waitFor(() => expect(listReads).toBeGreaterThan(1));
+    const readsAfterGiveUp = listReads;
+    passGuard();
+    fireEvent.click(use(RECORD));
+    await waitFor(() => expect(heldCalls).toHaveLength(2));
+    // The first request was cancelled before the second was sent: never two open for the card.
+    await waitFor(() => expect(st.aborted).toBe(1));
+    expect(st.open).toBe(1);
+    expect(st.most).toBe(1);
+    // The first's late answer (the service lets it go) changes nothing: no read, no alert, the card still waits.
+    st.gates[0]!();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(listReads).toBe(readsAfterGiveUp);
+    expect(screen.queryAllByRole("alert")).toEqual([]);
+    // The card still waits for its second decision (its control busy).
+    expect(card(RECORD).querySelector('button[aria-busy="true"]')).not.toBeNull();
+  });
+
+  it("R478: leaving the review queue cancels every given-up decision's request", async () => {
+    const o = project();
+    const { st, handler } = openDecisions();
+    o.extra = [handler];
+    const { unmount } = render(<ReviewQueue client={mockService(o).client} projectId={P1} />);
+    await ready(RECORD);
+    await giveUp(RECORD);
+    expect(st.open).toBe(1);
+    unmount();
+    expect(st.aborted).toBe(1);
+    expect(st.open).toBe(0);
+  });
+
+  for (const how of ["unmounted", "shown another project"] as const) {
+    it(`R486 e: a decision still inside its 60 seconds is cancelled when the review queue is ${how}, and no give-up timer is left`, async () => {
+      const P2 = "0190a000-0000-7000-8000-0000000000f2";
+      const o = project();
+      o.projectReview = { ...o.projectReview, [P2]: [] };
+      const { st, handler } = openDecisions();
+      o.extra = [handler];
+      const client = mockService(o).client;
+      const view = render(<ReviewQueue client={client} projectId={P1} />);
+      await ready(RECORD);
+      const rejected: unknown[] = [];
+      const onRejection = (r: unknown) => rejected.push(r);
+      process.on("unhandledRejection", onRejection);
+      refake(["setTimeout", "clearTimeout", "Date"]);
+      try {
+        fireEvent.click(use(RECORD));
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(st.open).toBe(1);
+        if (how === "unmounted") view.unmount();
+        else view.rerender(<ReviewQueue client={client} projectId={P2} />);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(st.aborted).toBe(1);
+        expect(st.open).toBe(0);
+        // No give-up timer is left: past the 60 seconds nothing more happens.
+        if (how === "unmounted") expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS * 11);
+        expect(st.open).toBe(0);
+        expect(st.aborted).toBe(1);
+        if (how === "unmounted") expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        vi.useFakeTimers({ toFake: ["Date"] });
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      process.off("unhandledRejection", onRejection);
+      expect(rejected).toEqual([]);
+      if (how === "shown another project") expect(screen.queryByText(HELD_NO_ANSWER_TEXT)).toBeNull();
+    });
+  }
 
   it("R313 f: a why of __proto__, toString or constructor shows no advice and breaks nothing", async () => {
     const o = project();
@@ -1520,7 +1741,8 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     const cards = () => [...section().querySelectorAll<HTMLElement>(".ao-review__file")];
     const titles = () => cards().map((c) => c.querySelector("h4")?.textContent);
     /** A card's controls as a person reaches them (by role: a hidden, inert stand-in is none). */
-    const controls = (el: HTMLElement) => within(el).queryAllByRole("button");
+    // The deciding controls (R470 b: "Look at the file", which decides nothing, is not one of them).
+    const controls = (el: HTMLElement) => within(el).queryAllByRole("button").filter((b) => !(b.getAttribute("aria-label") ?? "").startsWith("Look at the file"));
 
     it("R319 a: after Use this file the card stays in its place with the result in words and no deciding control; the next card has not moved", async () => {
       const { user } = open(mixed());
