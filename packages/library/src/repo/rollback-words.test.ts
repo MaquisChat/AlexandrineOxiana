@@ -111,7 +111,7 @@ async function crashed(fn: (tx: Tx) => Promise<void>): Promise<TxnMarker> {
 }
 
 /** The four states the undo can be left in at a reopen, each with the case that makes it. */
-const CASES: Array<{ name: string; state: "try-again" | "in-the-way" | "lost"; causes: (rel: string) => Array<{ kind: string; path: string }>; make: () => Promise<{ rel: string; before?: () => void }> }> = [
+const CASES: Array<{ name: string; state: "try-again" | "in-the-way" | "lost" | "unconfirmed"; causes: (rel: string) => Array<{ kind: string; path: string; somethingThere?: true }>; make: () => Promise<{ rel: string; before?: () => void }> }> = [
   {
     name: "a file the change wrote, changed by hand (hand-changed-file)",
     state: "in-the-way",
@@ -140,7 +140,23 @@ const CASES: Array<{ name: string; state: "try-again" | "in-the-way" | "lost"; c
     },
   },
   {
-    name: "a trashed original whose kept copy is gone (kept-copy-gone)",
+    // R527: a file stands at the place: the app cannot confirm it is not the original, so it never says "lost".
+    name: "a trashed original whose kept copy is gone, a file at its place (kept-copy-gone)",
+    state: "unconfirmed",
+    causes: (rel) => [{ kind: "kept-copy-gone", path: rel, somethingThere: true }],
+    make: async () => {
+      const rel = `${folder}/kept.txt`;
+      await writeFile(fromRel(lib.root, rel), ORIGINAL);
+      const m = await crashed(async (tx) => {
+        await tx.trash(rel);
+        await tx.writeFile(rel, "the change's own file\n");
+      });
+      await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { recursive: true, force: true });
+      return { rel };
+    },
+  },
+  {
+    name: "a trashed original whose kept copy is gone, nothing at its place (kept-copy-gone)",
     state: "lost",
     causes: (rel) => [{ kind: "kept-copy-gone", path: rel }],
     make: async () => {
@@ -151,6 +167,7 @@ const CASES: Array<{ name: string; state: "try-again" | "in-the-way" | "lost"; c
         await tx.writeFile(rel, "the change's own file\n");
       });
       await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { recursive: true, force: true });
+      await rm(fromRel(lib.root, rel));
       return { rel };
     },
   },
@@ -205,7 +222,7 @@ describe("FR-736: an incomplete undo at the opening carries its state", () => {
   }
 
   it("a recorded choice to roll back that cannot be completed at the next opening: its warning and the list keep the state", async () => {
-    const c = CASES[2]!;
+    const c = CASES[3]!;
     await c.make();
     await reopen();
     const [pw] = await repo.pendingWrites();

@@ -76,6 +76,8 @@ export interface IntegrityWarning {
   /**
    * FR-736: an undo that is not complete (`rolled-back-incomplete-write`, or `incomplete-write-pending` for a recorded
    * choice to roll back): its state, which chooses the words the researcher is told. Absent: the undo was complete.
+   * R527: on `interrupted-change-closed`, "unconfirmed" where something stood at every place whose file could not be
+   * put back (its sentence then never says the file is lost).
    */
   rollback?: IncompleteRollback;
   /** FR-729: kept with the library until the researcher dismisses it (`dismissRecoveryWarning`); its id there. */

@@ -578,11 +578,15 @@ const RECOVERY_WARNINGS: Partial<Record<RecoveryOutcome, { kind: IntegrityWarnin
  * FR-736: the detail of an undo left incomplete at the opening, by its state (the command line prints it; the screens say
  * the shared sentence of the state). Never a retry where retrying cannot help.
  */
+const LOST_DETAIL =
+  "a change interrupted before it was audited could only be partly rolled back: the copy the app kept of a file it removed is gone, so that file cannot be put back; the marker is kept until the change is closed in the app's list of interrupted changes";
 const INCOMPLETE_DETAIL: Record<IncompleteRollback, string> = {
   "try-again": RECOVERY_WARNINGS["rollback-incomplete"]!.text,
   "in-the-way":
     "a change interrupted before it was audited could only be partly rolled back, because a file changed or put there outside the app is in the way; the marker is kept, and the roll-back completes once that file is moved away (the app's list of interrupted changes names it)",
-  lost: "a change interrupted before it was audited could only be partly rolled back: the copy the app kept of a file it removed is gone, so that file cannot be put back; the marker is kept until the change is closed in the app's list of interrupted changes",
+  lost: LOST_DETAIL,
+  // R527: true whether or not something stands at the place (it says nothing of what is there).
+  unconfirmed: LOST_DETAIL,
 };
 
 /** Reads the anchors; an unreadable file is reported, moved aside (when writable) and replaced. */

@@ -40,6 +40,11 @@ export interface KeptWarning {
   projectId: string;
   /** When recovery raised it (ISO). */
   at: string;
+  /**
+   * R527, a closed change only: "unconfirmed" where something stood at every place whose file could not be put back (its
+   * sentence then never says the file is lost). An older reader of this file is this build's own (it was never released).
+   */
+  rollback?: "unconfirmed";
 }
 
 const pathOf = (root: string) => join(root, ".tmp", KEPT_WARNINGS_FILE);
@@ -59,7 +64,8 @@ export async function readKeptWarnings(root: string): Promise<KeptWarning[] | "d
     const out: KeptWarning[] = [];
     for (const w of f.warnings as Array<Partial<KeptWarning> | null>) {
       if (!w || typeof w.id !== "string" || !isId(w.id) || !KEPT_KINDS.has(w.kind!) || typeof w.projectId !== "string" || !isId(w.projectId) || typeof w.at !== "string") return "damaged";
-      out.push({ id: w.id, kind: w.kind!, projectId: w.projectId, at: w.at });
+      if (w.rollback !== undefined && (w.rollback !== "unconfirmed" || w.kind !== "interrupted-change-closed")) return "damaged";
+      out.push({ id: w.id, kind: w.kind!, projectId: w.projectId, at: w.at, ...(w.rollback ? { rollback: w.rollback } : {}) });
     }
     return out;
   } catch {
@@ -73,7 +79,7 @@ async function writeKeptWarnings(root: string, list: KeptWarning[]): Promise<voi
 }
 
 /** The integrity warning a kept one is shown as. */
-const shown = (w: KeptWarning): IntegrityWarning => ({ projectId: w.projectId, kind: w.kind, detail: KEPT_DETAIL[w.kind] ?? "", keptId: w.id });
+const shown = (w: KeptWarning): IntegrityWarning => ({ projectId: w.projectId, kind: w.kind, detail: KEPT_DETAIL[w.kind] ?? "", keptId: w.id, ...(w.rollback ? { rollback: w.rollback } : {}) });
 
 /**
  * At an opening, after recovery: the warnings kept from earlier openings are shown again, and those this opening's
@@ -118,7 +124,7 @@ export async function keepWarning(core: RepoCore, w: IntegrityWarning): Promise<
   core.integrityWarnings.push(w);
   const kept = await readKeptWarnings(core.root);
   if (kept === "damaged") return;
-  const k: KeptWarning = { id: newId(), kind: w.kind, projectId: w.projectId, at: core.clock().toISOString() };
+  const k: KeptWarning = { id: newId(), kind: w.kind, projectId: w.projectId, at: core.clock().toISOString(), ...(w.rollback === "unconfirmed" ? { rollback: w.rollback } : {}) };
   try {
     await writeKeptWarnings(core.root, [...kept, k]);
     w.keptId = k.id;

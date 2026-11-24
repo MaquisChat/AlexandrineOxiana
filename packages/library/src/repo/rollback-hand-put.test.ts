@@ -353,7 +353,8 @@ describe("R519 (3) (R509 M1, M2): where the kept copy of a trashed original is g
         await reopen();
         expect(await text(rel()), run).toBe(g.left);
         expect(await markers(), run).toEqual([`txn-${m.txn}.json`]);
-        expect(causes(), run).toEqual([{ kind: "kept-copy-gone", path: rel() }]);
+        // R527: where something stands at the place, the cause says so (the app cannot confirm it is the original).
+        expect(causes(), run).toEqual([{ kind: "kept-copy-gone", path: rel(), ...(g.left !== null ? { somethingThere: true } : {}) }]);
       }
     });
   }
@@ -385,7 +386,7 @@ describe("R519 (3) (R509 M1, M2): where the kept copy of a trashed original is g
     await reopen();
     expect(await text(rel())).toBe(ORIGINAL);
     expect(await markers()).toEqual([`txn-${m.txn}.json`]);
-    expect(causes()).toEqual([{ kind: "kept-copy-gone", path: rel() }]);
+    expect(causes()).toEqual([{ kind: "kept-copy-gone", path: rel(), somethingThere: true }]);
   });
 
   describe("at the level of the marker's lines", () => {
@@ -422,7 +423,7 @@ describe("R519 (3) (R509 M1, M2): where the kept copy of a trashed original is g
       expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
       expect(await readFile(fromRel(root, R), "utf8")).toBe(HAND);
       await writeFile(fromRel(root, R), own);
-      expect(await undoEntries(root, entries)).toEqual({ ok: false, causes: [{ kind: "kept-copy-gone", path: R }] });
+      expect(await undoEntries(root, entries)).toEqual({ ok: false, causes: [{ kind: "kept-copy-gone", path: R, somethingThere: true }] });
       expect(await readFile(fromRel(root, R), "utf8")).toBe(own);
     });
   });
@@ -539,7 +540,7 @@ describe("R526 I1 (with M3): the original's identity is its file number and its 
       });
       await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { force: true });
       await writeFile(fromRel(lib.root, rel()), HAND);
-      await keptAndIncomplete(rel(), [{ kind: "kept-copy-gone", path: rel() }], m.txn);
+      await keptAndIncomplete(rel(), [{ kind: "kept-copy-gone", path: rel(), somethingThere: true }], m.txn);
     });
   });
 
@@ -567,7 +568,7 @@ describe("R526 I1 (with M3): the original's identity is its file number and its 
         { kind: "trashed", from: R, to: T, ino: st.ino.toString(), birthtimeNs: (st.birthtimeNs - 5_000_000_000n).toString() },
       ];
       for (const run of ["first", "second"]) {
-        expect(await undoEntries(root, entries), run).toEqual({ ok: false, causes: [{ kind: "kept-copy-gone", path: R }] });
+        expect(await undoEntries(root, entries), run).toEqual({ ok: false, causes: [{ kind: "kept-copy-gone", path: R, somethingThere: true }] });
         expect(await readFile(fromRel(root, R), "utf8"), run).toBe("a person's new file, longer than two bytes\n");
       }
     });
@@ -577,7 +578,7 @@ describe("R526 I1 (with M3): the original's identity is its file number and its 
       const st = await stat(fromRel(root, R), { bigint: true });
       // The rename did not keep the time of birth (a file system unlike APFS or ext4): the original at the path no longer matches.
       const entries: MarkerEntry[] = [{ kind: "trashed", from: R, to: T, ino: st.ino.toString(), birthtimeNs: (st.birthtimeNs + 1n).toString() }];
-      expect(await undoEntries(root, entries)).toEqual({ ok: false, causes: [{ kind: "kept-copy-gone", path: R }] });
+      expect(await undoEntries(root, entries)).toEqual({ ok: false, causes: [{ kind: "kept-copy-gone", path: R, somethingThere: true }] });
       expect(await readFile(fromRel(root, R), "utf8")).toBe(ORIGINAL);
       // With the second line written, the same marker is judged as an older build's: the original at its path, done.
       entries.push({ kind: "trashed", from: R, to: T, noIdentity: true });

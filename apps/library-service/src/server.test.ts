@@ -3037,6 +3037,17 @@ describe("FR-736: an interrupted change whose undo is not complete, as the servi
     expect(Object.keys(w)).not.toContain("causes");
   });
 
+  it("R527: something stands at the place: the list's cause says so, and the warning's state is unconfirmed (never lost)", async () => {
+    const { path, txn, rel } = await lostOriginal();
+    await writeFile(join(path, rel), "a file at the place\n");
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    const list = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;
+    expect(list).toEqual([expect.objectContaining({ txn, rollback: "unconfirmed", causes: [{ kind: "kept-copy-gone", path: rel, somethingThere: true }] })]);
+    const integrity = (await call({ url: "/libraries/integrity" })).json.integrityWarnings as Array<Record<string, unknown>>;
+    expect(integrity.find((x) => x.kind === "rolled-back-incomplete-write")).toMatchObject({ state: "unconfirmed" });
+  });
+
   it("\"Roll it back\" answers with the state's sentence, marked; a write is refused without advice to reopen", async () => {
     const { pid, txn } = await lostOriginal();
     const back = await call({ method: "POST", url: `/libraries/pending-writes/${txn}/resolve`, body: { choice: "roll-back" } });

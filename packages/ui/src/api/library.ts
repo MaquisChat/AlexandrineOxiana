@@ -97,7 +97,8 @@ export interface PendingWrite {
   detail?: string;
   /** FR-736: its latest undo was not complete: the state, and what is in the way with its library-relative path. */
   rollback?: IncompleteRollback;
-  causes?: Array<{ kind: string; path: string }>;
+  /** `somethingThere` (R527, `kept-copy-gone` only): something stands at the place that the app cannot confirm is the file. */
+  causes?: Array<{ kind: string; path: string; somethingThere?: boolean }>;
   /** R509: it can be closed as it is (its undo can never complete); `lost`: what that leaves lost, and what is there now. */
   canClose?: boolean;
   lost?: Array<{ path: string; now: "nothing" | "a file" | "something else"; source?: string }>;
@@ -110,7 +111,7 @@ export interface IntegrityWarning {
   project: string;
   kind: string;
   detail: string;
-  /** FR-736: an undo that is not complete, by its state (chooses the banner's sentence). */
+  /** FR-736: an undo that is not complete, by its state (chooses the banner's sentence); R527: "unconfirmed" on a closed change. */
   state?: IncompleteRollback;
   /** FR-729: kept with the library until dismissed: its id there. */
   keptId?: string;

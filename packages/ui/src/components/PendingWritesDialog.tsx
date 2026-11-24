@@ -12,7 +12,7 @@
  */
 import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { ROLLBACK_CAUSE_KINDS, ROLLBACK_CAUSE_TEXT, type RollbackCauseKind } from "@ao/shared";
+import { KEPT_COPY_GONE_UNCONFIRMED_TEXT, ROLLBACK_CAUSE_KINDS, ROLLBACK_CAUSE_TEXT, type RollbackCauseKind } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { errorText, type LibraryApi, type PendingWrite, type PendingWriteChoice } from "../api/library";
 import { UserText } from "./UserText";
@@ -61,10 +61,11 @@ const UNSURE_CONFIRM: Record<PendingWriteChoice, string> = {
  * FR-736 (R503 d): what keeps the undo from completing, cause by cause, with the file's library-relative path — shown
  * here only, through `UserText`, because the researcher has to find the file.
  */
-function causeSentence(kind: string, path: string): ReactNode {
+function causeSentence(kind: string, path: string, somethingThere = false): ReactNode {
   if (!(ROLLBACK_CAUSE_KINDS as readonly string[]).includes(kind)) return null;
   const mark = "\u0000";
-  return ROLLBACK_CAUSE_TEXT[kind as RollbackCauseKind](mark)
+  // R527: the copy is gone but something stands at the place: the app cannot confirm it is the file, never "lost".
+  return (kind === "kept-copy-gone" && somethingThere ? KEPT_COPY_GONE_UNCONFIRMED_TEXT : ROLLBACK_CAUSE_TEXT[kind as RollbackCauseKind])(mark)
     .split(mark)
     .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={i}>{path}</UserText>, part]));
 }
@@ -77,7 +78,7 @@ const NOW_THERE: Record<NonNullable<PendingWrite["lost"]>[number]["now"], string
   "a file": "A file is at that place now; it stays as it is.",
   "something else": "Something else is at that place now; it stays as it is.",
 };
-const CLOSE_ENDS = "Closing deletes nothing. The project takes changes again, and a warning about what was lost stays until you dismiss it.";
+const CLOSE_ENDS = "Closing deletes nothing. The project takes changes again, and a warning about what could not be put back stays until you dismiss it.";
 const CLOSED = "The change was closed as it is. Nothing was deleted, and the project takes changes again.";
 
 /** The close confirmation's question: what cannot be put back (path and source as text), what is there now, and that nothing is deleted. */
@@ -167,7 +168,7 @@ function Item({ pw, readOnly, onChoose, onCloseAsIs }: { pw: PendingWrite; readO
           )}
         </p>
         {(pw.causes ?? []).map((c) => {
-          const said = causeSentence(c.kind, c.path);
+          const said = causeSentence(c.kind, c.path, c.somethingThere === true);
           return said ? <p key={`${c.kind}:${c.path}`}>{said}</p> : null;
         })}
         {pw.canClose === true && <p>{CLOSE_HINT}</p>}

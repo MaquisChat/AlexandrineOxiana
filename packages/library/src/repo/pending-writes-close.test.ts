@@ -141,13 +141,13 @@ describe("R509: which acts the list offers, by cause", () => {
   it("the kept copy gone (never completable): roll back AND close, with what is lost and what is at its place now, and the source", async () => {
     const { m, rel } = await lost();
     expect(await repo.pendingWrites()).toEqual([
-      expect.objectContaining({ txn: m.txn, canRollBack: true, canClose: true, rollback: "lost", lost: [{ path: rel, now: "a file", sourceId: sid }] }),
+      expect.objectContaining({ txn: m.txn, canRollBack: true, canClose: true, rollback: "unconfirmed", lost: [{ path: rel, now: "a file", sourceId: sid }] }),
     ]);
   });
 
   it("nothing at its place now: said so", async () => {
     const { rel } = await lost(async () => rm(fromRel(lib.root, `${folder}/kept.txt`)));
-    expect((await repo.pendingWrites())[0]).toMatchObject({ canClose: true, lost: [{ path: rel, now: "nothing", sourceId: sid }] });
+    expect((await repo.pendingWrites())[0]).toMatchObject({ canClose: true, rollback: "lost", lost: [{ path: rel, now: "nothing", sourceId: sid }] });
   });
 
   it("a file in the way (removable) or a step that may pass: no close", async () => {
@@ -192,13 +192,25 @@ describe("R509: closing a change whose undo can never complete", () => {
     expect(resolve[0]!.decision).toEqual({ result: "allow" });
     const mine = repo.integrityWarnings.filter((w) => w.projectId === pid);
     expect(mine.map((w) => w.kind)).toEqual(["interrupted-change-closed"]);
+    // R527: a file stood at the place: the warning never says the file is lost (its state), now and at the next opening.
+    expect(mine[0]!.rollback).toBe("unconfirmed");
     expect(await repo.pendingWrites()).toEqual([]);
     // The project takes changes again, now and after a reopen.
     await repo.mutate(pid, STORE, async (tx) => tx.writeFile(`${folder}/after.txt`, "a later change\n"));
     await reopen();
     expect(await markers()).toEqual([]);
     expect(await text(rel)).toBe(OWN);
+    expect(repo.integrityWarnings.filter((w) => w.projectId === pid).map((w) => [w.kind, w.rollback])).toEqual([["interrupted-change-closed", "unconfirmed"]]);
     await repo.mutate(pid, STORE, async (tx) => tx.writeFile(`${folder}/after-2.txt`, "and another\n"));
+  });
+
+  it("R527: nothing at the place: closed, and its warning says the file is lost (no state), now and at the next opening", async () => {
+    const { m } = await lost(async () => rm(fromRel(lib.root, `${folder}/kept.txt`)));
+    await repo.closePendingWrite(m.txn, pid);
+    const closed = () => repo.integrityWarnings.filter((w) => w.projectId === pid && w.kind === "interrupted-change-closed");
+    expect(closed().map((w) => w.rollback)).toEqual([undefined]);
+    await reopen();
+    expect(closed().map((w) => w.rollback)).toEqual([undefined]);
   });
 
   it("refused by the project's rules (they cannot be read: fail closed): everything as it was, the refusal in the library's log", async () => {

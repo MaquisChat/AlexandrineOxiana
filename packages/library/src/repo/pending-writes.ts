@@ -326,7 +326,8 @@ function closable(core: RepoCore, i: MarkerInspection): boolean {
   if (i.status !== "uncommitted" || i.resolveAudited || !i.marker) return false;
   if (i.marker.resolve && i.marker.resolve.choice !== "roll-back") return false;
   const a = core.rollbackAttempts.get(i.txn);
-  return !!a && incompleteRollbackOf(a.causes, a.stepFailed) === "lost";
+  const state = a ? incompleteRollbackOf(a.causes, a.stepFailed) : undefined;
+  return state === "lost" || state === "unconfirmed";
 }
 
 /** What closing would leave as lost: each path whose original cannot be put back, what is there now, and its source. */
@@ -373,12 +374,13 @@ export async function closePendingWrite(core: RepoCore, txn: string, projectId: 
     const undone = await undoEntries(core.root, m.entries);
     const attempt = { causes: undone.causes, stepFailed: undone.stepFailed === true };
     const state = undone.ok ? undefined : incompleteRollbackOf(attempt.causes, attempt.stepFailed);
-    if (state !== undefined && state !== "lost") {
+    if (state !== undefined && state !== "lost" && state !== "unconfirmed") {
       core.rollbackAttempts.set(txn, attempt);
       throw new PendingWriteIncompleteError(txn, ROLLBACK_INCOMPLETE_ANSWER[state], undone.causes);
     }
     if (await keptCopiesLeft(core, m)) throw new PendingWriteIncompleteError(txn, COPIES_LEFT);
-    const notPutBack = undone.causes.filter((c) => c.kind === "kept-copy-gone").map((c) => c.path);
+    const gone = undone.causes.filter((c) => c.kind === "kept-copy-gone");
+    const notPutBack = gone.map((c) => c.path);
     maybeCrash("before-audit");
     const trimmed = await trimTornAuditLine(core, m.projectFolder);
     const held = await appendResolve(
@@ -392,7 +394,16 @@ export async function closePendingWrite(core: RepoCore, txn: string, projectId: 
     await removeMarker(core.root, m);
     await afterResolved(core, st, txn, held);
     // What was lost is said until the researcher dismisses it (FR-729); no path here (R503 d: the audit log names it).
-    if (notPutBack.length) await keepWarning(core, { projectId: st.project.id, kind: "interrupted-change-closed", detail: "an interrupted change was closed as it was; a file it had removed could not be put back" });
+    // R527: where something stood at every such place, the warning never says the file is lost (its state says so).
+    if (notPutBack.length) {
+      const unconfirmed = incompleteRollbackOf(gone, false) === "unconfirmed";
+      await keepWarning(core, {
+        projectId: st.project.id,
+        kind: "interrupted-change-closed",
+        detail: "an interrupted change was closed as it was; a file it had removed could not be put back",
+        ...(unconfirmed ? { rollback: "unconfirmed" as const } : {}),
+      });
+    }
     return { txn, projectId: st.project.id };
   });
 }

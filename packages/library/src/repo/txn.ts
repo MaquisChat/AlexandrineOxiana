@@ -310,6 +310,11 @@ export type UndoCauseKind =
 export interface UndoCause {
   kind: UndoCauseKind;
   path: string;
+  /**
+   * `kept-copy-gone` only (R527): something stands at the place, which the undo cannot confirm is the file the change
+   * removed (the words then never say that file is lost). Absent: nothing is there, and the file is lost.
+   */
+  somethingThere?: true;
 }
 /** `ok`: every step undone (or already undone); `causes`: what kept a path from being undone, when known. */
 export interface UndoResult {
@@ -369,15 +374,10 @@ function trashedIdentity(entries: MarkerEntry[], i: number): FileIdentity | unde
 }
 
 /**
- * Whether what is at `rel` has `id` (R519 (3), R526): the same file number and time of birth, which a rename inside the
- * volume, an edit in place and a file added inside a folder all keep; a file made after another was deleted may get its
- * number, never its time of birth. Throws when it cannot look.
+ * What is at `rel` against `id` (R519 (3), R526): nothing; "it", the same file number and time of birth, which a rename
+ * inside the volume, an edit in place and a file added inside a folder all keep (a file made after another was deleted
+ * may get its number, never its time of birth); or something "other". Throws when it cannot look.
  */
-async function isOriginal(root: string, rel: string, id: FileIdentity): Promise<boolean> {
-  return (await identityAt(root, rel, id)) === "it";
-}
-
-/** What is at `rel` against `id`: nothing, the thing with that identity, or something else. Throws when it cannot look. */
 async function identityAt(root: string, rel: string, id: FileIdentity): Promise<"nothing" | "it" | "other"> {
   if (process.env.NODE_ENV === "test" && seams.failLook === rel) throw new Error("simulated read failure");
   const st = await fsp.lstat(fromRel(root, rel), { bigint: true }).catch((err: NodeJS.ErrnoException) => {
@@ -458,9 +458,9 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
   let ok = true;
   const causes: UndoCause[] = [];
   let stepFailed = false;
-  const because = (kind: UndoCauseKind, path: string) => {
+  const because = (kind: UndoCauseKind, path: string, somethingThere = false) => {
     ok = false;
-    if (!causes.some((c) => c.kind === kind && c.path === path)) causes.push({ kind, path });
+    if (!causes.some((c) => c.kind === kind && c.path === path)) causes.push({ kind, path, ...(somethingThere ? { somethingThere: true as const } : {}) });
   };
   const done = new Set<number>();
   /** Paths where something not of the change, or not known to be, was left as it is (R519). */
@@ -484,7 +484,7 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       // later line's hash) are still at the path was not put back: it was deleted outside the app. The roll-back is
       // then not complete (the marker is kept); nothing is deleted.
       try {
-        if (await ownBytesAt(root, e.from, entries.slice(i + 1))) because("kept-copy-gone", e.from);
+        if (await ownBytesAt(root, e.from, entries.slice(i + 1))) because("kept-copy-gone", e.from, true);
       } catch {
         because("could-not-look", e.from);
       }
@@ -499,8 +499,9 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       // incomplete (kept-copy-gone), closable: the safe side; what matches is the original (a rename that does not keep
       // the time of birth gives the original a new one, never another file the recorded one).
       try {
-        if (!(await isOriginal(root, e.from, id))) {
-          because("kept-copy-gone", e.from);
+        const there = await identityAt(root, e.from, id);
+        if (there !== "it") {
+          because("kept-copy-gone", e.from, there === "other");
           blocked.push(e.from);
         }
       } catch {

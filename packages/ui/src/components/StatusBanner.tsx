@@ -152,6 +152,10 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   [DESTRUCTION_OLD_COPIES_PENDING_WARNING]: () => "Old copies of this library, left by a move, still hold data that was destroyed here.",
 };
 
+/** R527: a change closed as it was, where something stood at each place whose file could not be put back. */
+const CLOSED_UNCONFIRMED = (p: string) =>
+  `An interrupted change in ${p} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone; the app could not confirm that what is at its place is that file. The closing is recorded in the audit log of ${p}.`;
+
 /** The kinds that stand for an interrupted change whose undo may be incomplete; with a `state`, it is (FR-736). */
 const ROLLBACK_KINDS: ReadonlySet<string> = new Set(["rolled-back-incomplete-write", "incomplete-write-pending"]);
 
@@ -159,6 +163,8 @@ const ROLLBACK_KINDS: ReadonlySet<string> = new Set(["rolled-back-incomplete-wri
 export function warningText(kind: string, project: string, count = 1, state?: IncompleteRollback): string {
   // FR-736: an undo that is not complete says its state, in the library's shared sentence.
   if (state && ROLLBACK_KINDS.has(kind) && Object.hasOwn(INCOMPLETE_ROLLBACK_BANNER, state)) return INCOMPLETE_ROLLBACK_BANNER[state](project);
+  // R527: a change closed where something stood at the place: never "that file is lost".
+  if (kind === "interrupted-change-closed" && state === "unconfirmed") return CLOSED_UNCONFIRMED(project);
   const known = Object.hasOwn(WARNINGS, kind) ? WARNINGS[kind] : undefined;
   return known ? known(project, count) : `Something in ${project} needs attention. Open the verification report for details.`;
 }

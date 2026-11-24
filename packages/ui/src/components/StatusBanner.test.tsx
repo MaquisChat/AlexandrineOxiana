@@ -242,8 +242,10 @@ describe("FR-736: an interrupted change whose undo is not complete says the stat
     "try-again": `An interrupted change in ${P} could not be undone completely: a step failed. Nothing was lost; the app keeps what it needs to finish. Changes to ${P} are off until it is undone. Choose “Resolve…” to try again.`,
     "in-the-way": `An interrupted change in ${P} could not be undone completely, because a file changed or put there outside the app is in the way. Nothing was lost. Changes to ${P} are off until it is undone. Choose “Resolve…” to see which file to move.`,
     lost: `An interrupted change in ${P} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. That file is lost. Changes to ${P} are off until you close the change. Choose “Resolve…” to see what was lost.`,
+    // R527: the copy is gone but something stands at the place: never "that file is lost".
+    unconfirmed: `An interrupted change in ${P} cannot be undone completely: the copy the app kept of a file it removed is gone, so the app cannot put that file back. Something is at its place now, which may be that file, but the app cannot confirm it, so it left it as it is. Changes to ${P} are off until you close the change. Choose “Resolve…” to see what is there.`,
   } as const;
-  for (const state of ["try-again", "in-the-way", "lost"] as const) {
+  for (const state of ["try-again", "in-the-way", "lost", "unconfirmed"] as const) {
     for (const kind of ["rolled-back-incomplete-write", "incomplete-write-pending"]) {
       it(`${kind}, ${state}: its sentence, the name as text, never the detail; "Resolve…" opens the list`, async () => {
         const detail = "transaction 7f3a: Projects/P/sources/x/kept.txt";
@@ -273,6 +275,15 @@ describe("FR-736: an interrupted change whose undo is not complete says the stat
     render(<StatusBanner variant={b!} onResolve={() => undefined} />);
     expect(screen.getByRole("status").querySelector("span")!.textContent).toBe(
       `An interrupted change in ${P} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone: that file is lost. The closing is recorded in the audit log of ${P}.`,
+    );
+    expect(screen.queryByRole("button", { name: /Resolve/ })).toBeNull();
+  });
+
+  it("R527: a change closed as it was, where something stood at the place, never says the file is lost", () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: P, kind: "interrupted-change-closed", detail: "x", state: "unconfirmed" }] });
+    render(<StatusBanner variant={b!} onResolve={() => undefined} />);
+    expect(screen.getByRole("status").querySelector("span")!.textContent).toBe(
+      `An interrupted change in ${P} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone; the app could not confirm that what is at its place is that file. The closing is recorded in the audit log of ${P}.`,
     );
     expect(screen.queryByRole("button", { name: /Resolve/ })).toBeNull();
   });

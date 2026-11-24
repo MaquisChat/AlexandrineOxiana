@@ -236,6 +236,16 @@ describe("FR-736: what is in the way of an undo that is not complete", () => {
     });
   }
 
+  it("R527: kept-copy-gone where something stands at the place: the app cannot confirm it, never \"it is lost\"", async () => {
+    const said = `The file this change removed from ${F} cannot be put back: the copy the app kept of it is gone. Something is at that place now, which may be that file, but the app cannot confirm it, so it left it as it is.`;
+    serve([[pw({ rollback: "unconfirmed", causes: [{ kind: "kept-copy-gone", path: F, somethingThere: true }] })]]);
+    show();
+    const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
+    const item = within(group).getByText((_, el) => el?.tagName === "P" && el.textContent === said);
+    expect(item.querySelector("b")).toBeNull();
+    expect(item.textContent).not.toMatch(/lost/u);
+  });
+
   it("\"Roll it back\" answered with the undo's state: the library's own sentence, not \"something changed meanwhile\"", async () => {
     const said = "The change could not be undone completely: a file changed or put there outside the app is in the way. The list shows which file; move it, then choose “Roll it back” again.";
     serve([[pw({ rollback: "in-the-way", causes: [{ kind: "hand-changed-file", path: F }] })]], () =>
@@ -254,7 +264,7 @@ describe("FR-736: what is in the way of an undo that is not complete", () => {
 describe("R509: closing, as it is, a change whose undo can never complete", () => {
   const F = "Projects/Dissertation/sources/Smith 2020/kept <i>1</i>.txt";
   const LOST = pw({ rollback: "lost", causes: [{ kind: "kept-copy-gone", path: F }], canClose: true, lost: [{ path: F, now: "a file", source: "Smith <b>2020</b>" }] });
-  const QUESTION = `Close this change as it is? What it removed from ${F} cannot be put back. It belonged to the source Smith <b>2020</b>. A file is at that place now; it stays as it is. Closing deletes nothing. The project takes changes again, and a warning about what was lost stays until you dismiss it.`;
+  const QUESTION = `Close this change as it is? What it removed from ${F} cannot be put back. It belonged to the source Smith <b>2020</b>. A file is at that place now; it stays as it is. Closing deletes nothing. The project takes changes again, and a warning about what could not be put back stays until you dismiss it.`;
   function serveClose(answer?: () => Response) {
     const posted: unknown[] = [];
     let calls = 0;
