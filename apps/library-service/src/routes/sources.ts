@@ -91,8 +91,9 @@ export function sourceRecord(sf: SourceFile, roots: Iterable<string>): SourceFil
 export const SOURCE_REACH_MS = 2000;
 
 /**
- * R480 e: each linked file of ONE source record marked `linked.missing: true` when nothing is at its path now (the
- * Missing files rule, `missingAt`; an error other than "nothing is there" counts as there). Only where one source is
+ * R480 e: each linked file of ONE source record marked `linked.missing: true` when it is missing now by the
+ * Missing files rule (`missingAt`, R503 f, R510: nothing at its path, any symbolic link there, or a folder; an error
+ * other than "nothing is there" — a file not readable for want of permission — counts as there). Only where one source is
  * read (`GET /projects/:id/sources/:sid`), never on a list route. No path is added: the flag only.
  */
 async function withReach<T extends { assets: Asset[] }>(root: string, rec: T): Promise<T> {
