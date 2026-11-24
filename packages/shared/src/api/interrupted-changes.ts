@@ -39,7 +39,7 @@ export const INCOMPLETE_ROLLBACK_BANNER: Record<IncompleteRollback, (p: string) 
 /** In the list of interrupted changes: what is in the way, by cause; `f` is the file's library-relative path. */
 export const ROLLBACK_CAUSE_TEXT: Record<RollbackCauseKind, (f: string) => string> = {
   "hand-changed-file": (f) =>
-    `${f} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (your version is kept there), then choose “Roll it back”.`,
+    `${f} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (it is kept there as it is), then choose “Roll it back”.`,
   "path-occupied": (f) =>
     `A file this change removed cannot be put back at ${f}, because another file is there now. Move that file somewhere outside the library, then choose “Roll it back” to put the removed file back.`,
   "kept-copy-gone": (f) => `The file this change removed from ${f} cannot be put back: the copy the app kept of it is gone, so it is lost.`,

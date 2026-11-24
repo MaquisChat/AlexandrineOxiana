@@ -220,7 +220,7 @@ describe("PendingWritesDialog", () => {
 describe("FR-736: what is in the way of an undo that is not complete", () => {
   const F = "Projects/Dissertation/sources/Smith <b>2020</b>/kept.txt";
   const SAYS: Record<string, string> = {
-    "hand-changed-file": `${F} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (your version is kept there), then choose “Roll it back”.`,
+    "hand-changed-file": `${F} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (it is kept there as it is), then choose “Roll it back”.`,
     "path-occupied": `A file this change removed cannot be put back at ${F}, because another file is there now. Move that file somewhere outside the library, then choose “Roll it back” to put the removed file back.`,
     "kept-copy-gone": `The file this change removed from ${F} cannot be put back: the copy the app kept of it is gone, so it is lost.`,
     "could-not-look": `The app could not read ${F}, so it left it as it is. Make sure the file can be read, then choose “Roll it back”.`,

@@ -915,9 +915,8 @@ const MINE = { name: "mine.txt", bytes: "a person's own file in their own folder
  *   original, put back, they add a file inside it (as the Finder does). Where D holds the change's own folder, the case
  *   does not apply (a file a person adds inside it is R525 (3) b, listed on FR-746) and is counted apart. Afterwards:
  *   what the person made is at D byte for byte; the original with a file added is the original (complete); from an
- *   original, a person's own folder at D leaves the roll-back incomplete with its cause, every kept copy there; with no
- *   original, the roll-back may complete (the change's own folder was removed: R526 M2) or stay incomplete with its
- *   cause and every kept copy there; the third changes nothing.
+ *   original or none, a person's own folder at D leaves the roll-back incomplete with its cause, every kept copy there
+ *   (R527: the undo cannot tell it from the change's own folder under a new identity); the third changes nothing.
  */
 async function folderCase(seq: FOp[], startExists: boolean, cut: number, hand: FolderHand): Promise<{ failures: string[]; lines: number; applies: boolean }> {
   const v = await makeWorld();
@@ -995,8 +994,10 @@ async function folderCase(seq: FOp[], startExists: boolean, cut: number, hand: F
         if (!complete) failures.push(`${where}, incomplete (${JSON.stringify(v.repo.integrityWarnings.flatMap((x) => x.causes ?? []))})`);
         continue;
       }
+      // R527: a person's own folder at D is never "complete", with or without an original: the undo cannot tell it from
+      // the change's own folder under a new identity, so it removes nothing and is not done.
       if (complete) {
-        if (startExists) failures.push(`${where}, reported complete with the researcher's original folder not at D`);
+        failures.push(`${where}, reported complete with ${startExists ? "the researcher's original folder not at D" : "a person's own folder at D"}`);
         continue;
       }
       const left = await keptCopies(v, m);

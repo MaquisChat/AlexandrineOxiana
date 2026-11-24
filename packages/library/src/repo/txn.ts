@@ -295,9 +295,13 @@ export class TxnLog {
 
 /** Why a roll-back left a path as it found it (R519): a cause and the library-relative path, for the words shown. */
 export type UndoCauseKind =
-  /** A file the change wrote (created or replaced) holds bytes that are none of the change's own: changed or put there by hand. */
+  /**
+   * A file the change wrote (created or replaced) holds bytes that are none of the change's own, a folder stands where it
+   * wrote a file, or a folder it made is there with another identity (R527): changed or put there by hand, or not known
+   * to be the change's own.
+   */
   | "hand-changed-file"
-  /** A trashed original cannot be put back: something not of the change stands at its path. */
+  /** A trashed original cannot be put back: something not of the change stands at its path (only there, R527). */
   | "path-occupied"
   /** The copy the app kept of a trashed original is gone, and the original is not at its path: it cannot be put back. */
   | "kept-copy-gone"
@@ -370,13 +374,25 @@ function trashedIdentity(entries: MarkerEntry[], i: number): FileIdentity | unde
  * number, never its time of birth. Throws when it cannot look.
  */
 async function isOriginal(root: string, rel: string, id: FileIdentity): Promise<boolean> {
+  return (await identityAt(root, rel, id)) === "it";
+}
+
+/** What is at `rel` against `id`: nothing, the thing with that identity, or something else. Throws when it cannot look. */
+async function identityAt(root: string, rel: string, id: FileIdentity): Promise<"nothing" | "it" | "other"> {
   if (process.env.NODE_ENV === "test" && seams.failLook === rel) throw new Error("simulated read failure");
   const st = await fsp.lstat(fromRel(root, rel), { bigint: true }).catch((err: NodeJS.ErrnoException) => {
     if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
     throw err;
   });
-  return st !== null && st.ino.toString() === id.ino && st.birthtimeNs.toString() === id.birthtimeNs;
+  if (st === null) return "nothing";
+  return st.ino.toString() === id.ino && st.birthtimeNs.toString() === id.birthtimeNs ? "it" : "other";
 }
+
+/** Whether a "trashed" line after line `i` moves the path of "dir" line `i`, or a folder above it, away. */
+const dirTrashedLater = (entries: MarkerEntry[], i: number): boolean => {
+  const p = (entries[i] as Extract<MarkerEntry, { kind: "dir" }>).path;
+  return entries.some((x, j) => j > i && x.kind === "trashed" && (p === x.from || p.startsWith(`${x.from}/`)));
+};
 
 /**
  * The identity the completion line of "dir" line `i` recorded of the folder the change made (R526 M2): the next "dir"
@@ -506,6 +522,22 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
     because(kind, path);
     blocked.push(path);
   };
+  // R527: a folder the change made, found at its path with ANOTHER identity, cannot be told from the change's own folder
+  // under a new identity (the library copied or restored between the crash and the reopening changes every identity) or
+  // from one a person made again: the undo removes nothing at, under or above it and is NOT done (hand-changed-file, the
+  // folder's path); moved out of the library by the researcher, the roll-back completes. Decided before any line is
+  // undone, so that no file of the change inside it is removed either: nothing is left half-removed. A folder a later
+  // line moves away (a trash at or above it) is judged when its line is reached, once that trash is undone.
+  for (const [i, e] of entries.entries()) {
+    if (e.kind !== "dir" || e.ino !== undefined || done.has(i) || dirTrashedLater(entries, i)) continue;
+    const id = dirIdentity(entries, i);
+    if (id === undefined) continue;
+    try {
+      if ((await identityAt(root, e.path, id)) === "other") block("hand-changed-file", e.path);
+    } catch {
+      block("could-not-look", e.path);
+    }
+  }
   const isBlocked = (p: string) => blocked.some((b) => p === b || p.startsWith(`${b}/`) || b.startsWith(`${p}/`));
   let steps = 0;
   /** Test seam (R47): the roll-back is cut off here, as by a crash. */
@@ -534,9 +566,10 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
           continue;
         }
         if (now.at === "nothing") continue;
-        // R526 M4: a folder stands where the change wrote a file: never the change's own; named, nothing removed.
+        // R526 M4 (R527: changed or put there outside the app): a folder stands where the change wrote a file: never the
+        // change's own; named, nothing removed.
         if (now.at === "folder") {
-          block("path-occupied", e.path);
+          block("hand-changed-file", e.path);
           continue;
         }
         if (knowsBytes(entries, i) && !(now.at === "file" && writeHashes(entries, e.path).includes(now.sha256))) {
@@ -545,19 +578,23 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
         }
         await fsp.rm(fromRel(root, e.path), { force: true });
       } else if (e.kind === "dir") {
-        // R526 M2: with a recorded identity, the folder is removed only when it is the change's own. Anything else there
-        // (a folder a person made again after an earlier undo removed the change's) is left exactly as it is: the step
-        // is done, as it was when that earlier undo removed the change's folder. Without one: as before.
+        // R526 M2 as R527 rules it: with a recorded identity, the folder is removed only when it is the change's own.
+        // Nothing there: done. Anything else (a folder a person made again, or the change's own under a new identity):
+        // left exactly as it is, and NOT done (hand-changed-file). Without an identity: as before.
         const id = dirIdentity(entries, i);
         if (id !== undefined) {
-          let own: boolean;
+          let there: "nothing" | "it" | "other";
           try {
-            own = await isOriginal(root, e.path, id);
+            there = await identityAt(root, e.path, id);
           } catch {
             block("could-not-look", e.path);
             continue;
           }
-          if (!own) continue;
+          if (there === "nothing") continue;
+          if (there === "other") {
+            block("hand-changed-file", e.path);
+            continue;
+          }
         }
         await fsp.rm(fromRel(root, e.path), { recursive: true, force: true });
       }

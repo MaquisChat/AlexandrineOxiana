@@ -5,7 +5,7 @@
  * cause and the library-relative path; once the researcher moves the file away, the roll-back completes.
  */
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
@@ -616,7 +616,7 @@ describe("R526 M2: a folder the change made is removed only when it is the chang
     ]);
   });
 
-  it("probe D: the first undo cut after its steps, a person makes the folder again with a file of theirs: the second undo leaves it exactly, and completes", async () => {
+  it("probe D: the first undo cut after its steps, a person makes the folder again with a file of theirs: the second undo leaves it exactly and is NOT done (hand-changed-file); moved away, the roll-back completes (R527)", async () => {
     // The person's folder is made before the change's is removed (then moved into place), so that it is a folder of its
     // own: one made by hand within the same clock tick, given the freed number, could not be told from the change's.
     await mkdir(join(tmp, "theirs"));
@@ -633,9 +633,40 @@ describe("R526 M2: a folder the change made is removed only when it is the chang
     for (const run of ["second", "third"]) {
       await reopen();
       expect(await text(`${D()}/mine.txt`), run).toBe(HAND);
-      expect(await markers(), run).toEqual([]);
-      expect(causes(), run).toEqual([]);
+      expect(await readdir(fromRel(lib.root, D())), run).toEqual(["mine.txt"]);
+      expect(await markers(), run).toEqual([`txn-${m.txn}.json`]);
+      expect(causes(), run).toEqual([{ kind: "hand-changed-file", path: D() }]);
     }
+    await rename(fromRel(lib.root, D()), join(tmp, "theirs-moved"));
+    await repo.resolvePendingWrite(m.txn, "roll-back");
+    expect(await markers()).toEqual([]);
+    expect(await readFile(join(tmp, "theirs-moved", "mine.txt"), "utf8")).toBe(HAND);
+  });
+
+  it("the reviewer's probe (R527): the library copied between the crash and the reopening (every identity changes): the change's own folder is left whole, nothing is reported done; moved out of the library, “Roll it back” completes", async () => {
+    const m = await crashed(async (tx) => {
+      await tx.mkdir(`${D()}/sub`);
+      await tx.writeFile(`${D()}/f.txt`, "the change's file\n");
+      await tx.copyFile(join(tmp, "src.txt"), `${D()}/c.txt`);
+      await tx.appendLine(`${D()}/log.jsonl`, "{\"a\":1}");
+    });
+    await lib.close();
+    const copyRoot = join(tmp, "Lib-copy");
+    await cp(lib.root, copyRoot, { recursive: true, preserveTimestamps: true });
+    lib = await openLibrary(copyRoot, mkDeps());
+    repo = await repoFor();
+    const tree = async () => (await readdir(fromRel(lib.root, D()))).sort();
+    for (const run of ["first", "second"]) {
+      if (run === "second") await reopen();
+      expect(await tree(), run).toEqual(["c.txt", "f.txt", "log.jsonl", "sub"]);
+      expect(await markers(), run).toEqual([`txn-${m.txn}.json`]);
+      expect(kinds(), run).toContain("rolled-back-incomplete-write");
+      expect(causes(), run).toEqual([{ kind: "hand-changed-file", path: D() }]);
+    }
+    await rename(fromRel(lib.root, D()), join(tmp, "made-moved"));
+    await repo.resolvePendingWrite(m.txn, "roll-back");
+    expect(await markers()).toEqual([]);
+    expect((await readdir(join(tmp, "made-moved"))).sort()).toEqual(["c.txt", "f.txt", "log.jsonl", "sub"]);
   });
 
   it("the ordinary crash: the change's own folder, with its own files in it, is removed", async () => {
@@ -681,20 +712,20 @@ describe("R526 M2: a folder the change made is removed only when it is the chang
       ];
     };
 
-    it("a folder at the path with another identity is left exactly as it is; the step counts as done", async () => {
+    it("a folder at the path with another identity is left exactly as it is; the step is NOT done (hand-changed-file, R527)", async () => {
       const entries = await lines();
       await mkdir(fromRel(root, P));
       await writeFile(fromRel(root, `${P}/mine.txt`), HAND);
       for (const run of ["first", "second"]) {
-        expect(await undoEntries(root, entries), run).toEqual({ ok: true, causes: [] });
+        expect(await undoEntries(root, entries), run).toEqual({ ok: false, causes: [{ kind: "hand-changed-file", path: P }] });
         expect(await readFile(fromRel(root, `${P}/mine.txt`), "utf8"), run).toBe(HAND);
       }
     });
 
-    it("a file at the path is left as it is too; nothing at the path is done", async () => {
+    it("a file at the path is left as it is too, and is not done (hand-changed-file, R527); nothing at the path is done", async () => {
       const entries = await lines();
       await writeFile(fromRel(root, P), HAND);
-      expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
+      expect(await undoEntries(root, entries)).toEqual({ ok: false, causes: [{ kind: "hand-changed-file", path: P }] });
       expect(await readFile(fromRel(root, P), "utf8")).toBe(HAND);
       await rm(fromRel(root, P));
       expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
@@ -709,7 +740,7 @@ describe("R526 M2: a folder the change made is removed only when it is the chang
   });
 });
 
-describe("R526 M4: a folder standing at a created file's path is named (path-occupied), and nothing is removed", () => {
+describe("R526 M4 (as R527 corrects it): a folder standing at a created file's path is named (hand-changed-file), and nothing is removed", () => {
   let root: string;
   const F = "Projects/P/copied.bin";
   beforeEach(async () => {
@@ -726,9 +757,9 @@ describe("R526 M4: a folder standing at a created file's path is named (path-occ
     { name: "a file written whole (its hash on its line)", entries: [{ kind: "created", path: F, sha256: "b".repeat(64) }] },
   ];
   for (const c of cases) {
-    it(`${c.name}: incomplete with path-occupied and the path, the folder and its file kept, at every run`, async () => {
+    it(`${c.name}: incomplete with hand-changed-file and the path, the folder and its file kept, at every run`, async () => {
       for (const run of ["first", "second"]) {
-        expect(await undoEntries(root, c.entries), run).toEqual({ ok: false, causes: [{ kind: "path-occupied", path: F }] });
+        expect(await undoEntries(root, c.entries), run).toEqual({ ok: false, causes: [{ kind: "hand-changed-file", path: F }] });
         expect(await readFile(fromRel(root, `${F}/inside.txt`), "utf8"), run).toBe(HAND);
       }
     });
