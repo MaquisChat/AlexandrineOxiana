@@ -213,6 +213,14 @@ describe("a close while an attach is inside its store turn (FR-749, R546; R247 d
 async function closeWaitsForTheTurn(path: string, pid: string, folder: string, encrypted = false): Promise<void> {
   {
     const repo = svc!.state.session!.repo;
+    // R551 M7: the index (its file is in the library) is closed after the wait and before the lock is released.
+    const index = svc!.state.session!.index!;
+    const closeIndex = index.close.bind(index);
+    let lockAtIndexClose: boolean | undefined;
+    index.close = () => {
+      lockAtIndexClose ??= existsSync(join(path, ".lock"));
+      closeIndex();
+    };
     const file = await pdf("ledger.pdf", "Harbour ledger of 1932");
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
@@ -254,8 +262,10 @@ async function closeWaitsForTheTurn(path: string, pid: string, folder: string, e
     const lines = (await Promise.all(audit.map((f) => readFile(join(path, folder, "audit", f), "utf8")))).join("");
     if (!encrypted) expect(lines).toContain(sid);
     expect(await readFile(join(path, folder, "project.json"), "utf8")).not.toContain("Late");
-    // R551 M7: the change in its turn updated the index too (it was closed after the wait, not before).
+    // R551 M7: the change in its turn updated the index too (it was closed after the wait, not before), and the index
+    // was closed while the lock was still held.
     expect(repo.indexErrors).toEqual([]);
+    expect(lockAtIndexClose).toBe(true);
     await cleanForAnother(path);
   }
 }

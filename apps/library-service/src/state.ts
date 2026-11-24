@@ -1334,13 +1334,19 @@ export class ServiceState {
     // No late lookup answer writes into this library once its lock is released (R247 c).
     s.http.setDiskCache(false);
     // The engine's close waits for the change in its store turn (and a backup in flight) before the lock goes (R247 d);
-    // that change still needs its project's key and updates the index, so both go only after it (R551 M7).
-    await s.lib.close().catch(() => {});
-    try {
-      s.index?.close();
-    } catch {
-      // already closed
-    }
+    // that change still needs its project's key and updates the index, so both go only after it (R551 M7) — the index
+    // before the lock is released (its file is in the library, R247 c), the keys once it is.
+    await s.lib
+      .close({
+        beforeRelease: () => {
+          try {
+            s.index?.close();
+          } catch {
+            // already closed
+          }
+        },
+      })
+      .catch(() => {});
     s.ring.clear();
     this.publishState();
   }

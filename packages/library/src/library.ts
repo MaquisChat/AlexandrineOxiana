@@ -56,7 +56,12 @@ export interface Library {
   appConfigDir: string;
   /** This device's id, from Deps; recorded in audit events and change log entries. */
   deviceId: string;
-  close(): Promise<void>;
+  /**
+   * Refuses every further write, waits for the change in its store turn (and a backup in flight), then releases the
+   * lock (R247 c, d; R546 1). `beforeRelease` runs after that wait and before the release (R551 M7: the index, which
+   * the change still updated, is closed there — its file is in the library). A second call returns the first's promise.
+   */
+  close(opts?: { beforeRelease?: () => void | Promise<void> }): Promise<void>;
 }
 
 export class NotALibraryError extends Error {
@@ -455,7 +460,7 @@ function makeHandle(
     ...(movedTo ? { movedTo } : {}),
     appConfigDir: deps.appConfigDir,
     deviceId: deps.deviceId,
-    close() {
+    close(opts) {
       // R551 M1: a second call (while the first still waits for a change in its turn) is the first call.
       if (ctl.closing) return ctl.closing;
       // R551 M2: a change that closes its own library would wait for itself for ever: refused, and the library stays
@@ -466,6 +471,11 @@ function makeHandle(
       ctl.closed = true;
       ctl.closing = (async () => {
         await Promise.allSettled(ctl.drains.map((d) => d.drain()));
+        try {
+          await opts?.beforeRelease?.();
+        } catch {
+          // the caller's own step; the lock is released all the same
+        }
         await release?.();
       })();
       return ctl.closing;
