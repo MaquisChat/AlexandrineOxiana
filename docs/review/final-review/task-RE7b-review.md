@@ -73,3 +73,84 @@ Direction, which needs your ruling: at opening/unlock, re-judge `in-library` ent
 - **What the service tells the interface today about reachability:**
   - Nothing per file with the source record. `assets[].linked` carries only `libraryRelativePath` (shared `sources.ts:58`), and `status` is only ever `"destroyed"`.
   - Live reachability exists only in `GET /libraries/integrity` (`apps/library-service/src/routes/libraries.ts:378`, `checkIntegrity`: `missing`, `mismatched`, `errors` by asset id). The new `originalsReach` / `missingAt` (`packages/library/src/repo/linked-file.ts`) is the per-source rule to reuse.
+
+## Second look (R483, R480 e)
+
+Commits 2db7dd9..e864fcb (four), read in full: `runner.ts`, `review.ts`, `routes/sources.ts`, `reader.tsx`, the shared type, and the tests.
+
+**Verdict for this round: APPROVE WITH SMALL POINTS.** The standing rules hold at the new opening pass. M2 and M1 are closed, each held by a test that fails without its guard. R480 e is built as ruled. Two Minor points remain (N1, N2), and nothing is Critical or Important.
+
+### What I ran
+- `runner.linked-missing.test.ts`: 21 passed.
+- Service `records.test.ts`: 7 passed. `find-routes.test.ts -t "R483|R470"`: 3 passed.
+- UI `reader.test.tsx`: 13 passed.
+- **Mutations**: I edited the file, ran the one describe, then restored it with `git checkout -- <file>` (no stash).
+  - Removing the pick drop in `copyOn` (`runner.ts:2089`) fails only the "copy part" test of R483 b.
+  - Removing the drop at the copy's end (:2333) fails only the "copy's end" test.
+  - Removing the drop on the hand-over path (:3338) fails only the "hand-over" test.
+  - Removing the drop on "Not this file" (`review.ts:756`) fails the R483 c test.
+- **Probes**: `runner.probeRE7b.test.ts`, probes A and B. It is deleted now, and `git status --short` is empty.
+
+### 1. I1, the opening pass (`judgeResting`, `runner.ts:2634`; called from `resume` at :2719)
+- **It cannot fetch.** Its only writes are `evolve` and `write(…, "update")` in one `inTurn`. The moves are:
+  - `in-library` → `record-complete` / `linked-file-missing`
+  - `record-complete` / `linked-file-missing` (no pick) → `in-library`
+
+  `write` puts an entry into the copy part only for `record-complete` with a source and NO reason (:1215). Both moves carry or leave no such line, so nothing is enqueued. The pass never calls `copyOn`, `lookupContextFor`, the settings or `download`. It never sets the pick, and it skips any entry that gained one meanwhile (the version check plus `cur.copyDespiteLink`).
+- **Counts on the stand-in sources and the fetcher.** Zero in every implementer test: P4, the reverse, an entry with the pick, `not-this-file`, a stored original, two links of which one is there, a deleted source, a locked encrypted project. Zero also in my probe A.
+  - In probe B (300 entries), the single lookup and download came from a separate no-file entry the probe added on purpose. Its old rest was `held-full`, which is resumed as before. None came from the 300.
+- **Callers.** `resume` is the only caller: the library opened and the project unlocked. A locked project returns before the pass (`isUnlocked`).
+  - For an encrypted project only the reverse move is possible (it refuses linked files). That move ends at "in your library" and is harmless.
+- **What changed at opening, and for which entries.** Only entries resting `record-complete` / `linked-file-missing` WITHOUT the pick are no longer sent to the copy part (:2725).
+  - Every other `record-complete` entry is resumed exactly as before: rules reasons, `held-full`, switched off, no reason.
+  - So is an entry with the pick interrupted mid-fetch: it is `looking-for-copy` or `fetching` and so `inCopyPart`.
+  - An entry resting `linked-file-missing` never carries the pick: `getCopy` writes `looking-for-copy` in the same write.
+  - So no press is lost (checked by reading, and by RE-7b's restart test, which still passes).
+- **Written once.** Probe B: after the first opening, a second opening added 0 lines (301 → 301) and 0 lookups. The implementer's test also counts the events.
+- **Cost and failure.**
+  - The pass runs apart: `resume` returned in 0 ms. A copy-part entry of the same project was fetched at 0.8 s, while the pass over 300 resting entries ended at 2.2 s. It reads one source and does one `lstat` per resting entry, sequentially, outside the store turn, and takes the turn once to write.
+  - A failure is caught and logged by name only (:2720). It cannot fail the opening.
+  - `stopAll` waits for it (`inflight`), and the stop signal ends it through `guard`.
+  - A queue of thousands therefore costs seconds of background reading, not a slower opening.
+
+**N1 (Minor) — two resting entries the copy part used to settle at opening are now left saying the linked file cannot be found** (probe A). Before this round, both entries below went through `copyOn` at opening:
+- **An entry resting `linked-file-missing` whose source now has no original at all** (its link was destroyed). `originalsReach` says "none", the pass leaves it, and the copy part no longer runs. Before this round, `copyOn` found no file and looked for a copy, which is ordinary Find behaviour for a record without a file.
+- **An entry resting `linked-file-missing` whose source was deleted.** Before, `copyOn` made it `no-open-copy` / `record-removed`.
+
+Both now stay "Its linked file cannot be found…" and offer "Get a copy for this source". The sentence is untrue for them.
+- The press still recovers both: `copyOn` then looks for a copy, or says the record was removed.
+- No standing rule is touched.
+- Direction:
+  - "none": leave the copy part for these entries (do not skip them at :2725 when the source has no linked original), or have the pass move them back to plain `record-complete`.
+  - Deleted: say `record-removed`, as the copy part did.
+
+### 2. M2 (R483 b)
+Closed. All three ways to "in your library" drop the pick, each with a test that fails without its drop (mutations above).
+
+### 3. M1 (R483 c)
+Closed. `review.ts:756` adds `copyDespiteLink` to the discard's drops and nothing else, and the test fails without it. The state, the reason and "Get through my library" are unchanged.
+
+### 4. R480 e
+- **Where the flag comes from.** `withReach` (`routes/sources.ts:95`) runs only in `GET /projects/:id/sources/:sid` (:214). PATCH, recheck and the list routes still return `record()` without it.
+  - It adds `linked.missing: true` and nothing else: `libraryRelativePath` was already sent. No absolute path; the service test checks the body does not contain the temporary root.
+  - It uses `missingAt`, the same rule as Missing files. An error counts as there.
+- **Which file the reader opens** (`reader.tsx:382`):
+  - an asked asset is opened as asked, missing or not (tested);
+  - then the located one;
+  - then the first PDF not marked missing, so the copy added beside a missing link opens (tested);
+  - then `pdfs[0]`, today's behaviour, when none can be reached or no flag is sent (tested).
+- **The missing file.** It stays in the File list. Choosing it navigates with its `assetId` and shows today's sentence (tested).
+- **ReaderLink and Library.tsx:378.** Both link without an asset, so the reader decides. Unchanged.
+- **Older interface.** The UI does not schema-parse responses. The field is optional and ignored by code that does not read it. `SourcePatch` carries no assets, so the flag is never sent back and stored. An older service sends no flag, so this interface behaves as today.
+
+**N2 (Minor) — one `lstat` per linked asset is added to the reader's source read.** On an unresponsive network mount this can make the reader's "Loading" wait as long as the Missing files check would. I judged this by reading only. No change needed. Note it with FR-727.
+
+### 5. What I approved before
+Nothing broken:
+- RE-7b's tests all pass (21 total).
+- The route, the hold and attach, and the queue-file reading are untouched this round.
+- The press path is unchanged: `getCopy`, then `copyOn`.
+
+### Could only judge by reading
+- That the implementer's eight R483 a tests failed first.
+- An unplugged network volume's `lstat` latency.

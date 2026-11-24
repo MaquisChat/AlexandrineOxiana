@@ -197,3 +197,67 @@ Nothing found. FR-030's plain sentence, FR-106's count, FR-123's guard and FR-41
 - S-M2 and S-M3.
 - Two real processes racing on the libraries list (FR-721).
 - Whether a cut at the end of a BACKUP's log is caught before a restore.
+
+## Third look (R484 B)
+
+Scope: 74ef3ad..4d925cb (RE-1e, four commits). Not looked at: FR-425 and the queue work.
+
+**Verdict: APPROVED WITH SMALL POINTS.** S-I1, S-M1, S-M2 and S-M3 are closed as ruled, each with a test that failed first (by the report and by reading). Three Minor points remain; one asks for a word from the coordinator.
+
+### What I ran
+All at `nice -n 10`. The probe was deleted; `git status --short` is empty.
+
+- **Probes P4, P1 and the S-M2 case are now the implementer's tests:**
+  - P4 (`restore-governed.test.ts:1429`) asserts the `truncated` warning, the `anchor-mismatch` event and `verifyAudit` not ok, then the audit-log sentence;
+  - a cut in the middle (`:1457`);
+  - a mismatch recorded earlier in an otherwise whole log (`:1469`);
+  - P1, the earlier-form entry (`:1486`): the own-rule sentence;
+  - the S-M2 case (`:1505`).
+- **Untouched logs**, probe `restore-governed.probeRE1`:
+  - U1: a project never restored, after an ordinary restart: own-rule sentence;
+  - U2: an encrypted project after a lock and an unlock: own-rule sentence;
+  - U3: a verified restore after a restart: the restored-verified sentence, `verifyAudit` `{ok:true, alteredAt:[]}`.
+  No false "does not hold together" in these.
+- **Anchor conditions**, same probe:
+  - U4: the anchors file lost while the log is untouched;
+  - U5: the anchors file unreadable (junk);
+  - U6: reading the anchors file fails with EBUSY.
+- **Test files:** `restore-governed.test.ts` alone, 63 passed; `registry-notice.test.ts` alone, 7 passed. There is no other registry test file.
+- **Other callers:** `verifiedAuditEvents` is unchanged (`repo.ts` is not in the diff). Its callers in `retention.ts` (595, 960, 984, 1665) and `restore-record.ts:127` get what they got before. Only the export also asks `verifyAudit`.
+
+### Findings (all Minor)
+
+**T-M1 — Once the app has recorded an alteration, the export says the log "does not hold together" for good, even for an untouched log.**
+- `verifyAudit` is not ok for as long as any `audit.anchor-mismatch` or `audit.anchor-missing` event stands in the log (`repo.ts:337-343`).
+- Probe U4: this computer's anchors file was lost (for example, moved aside as corrupt at an open), the log untouched. The opening records `anchor-missing`.
+- From then on every export of that project says "…the project's audit log does not hold together, so the app cannot confirm it." That includes a destruction made LATER in a whole, anchored chain: U4 "later", `verifyAudit {ok:false, alteredAt:[…]}`.
+- This is the safe direction for the destruction, and it is what R484 i says literally. But the sentence asserts something about the log that is not true of it, and it never stops being said.
+- **For the coordinator:**
+  - for an anchor that is missing or unreadable, the sentence is "…the app cannot confirm that the project's audit log is complete, so it cannot confirm it.";
+  - or a destruction recorded after the last recorded alteration, in a chain anchored since, keeps its factual sentence.
+
+**T-M2 — A briefly locked anchors file now makes the whole export fail.**
+- `verifyAudit` rethrows any read error that is not `AnchorsUnreadableError` (`repo.ts:330-334`).
+- Probe U6 (EBUSY): "The export could not be completed (EBUSY)", for any project that holds a destroyed original. Before this round the export did not read the anchors.
+- Direction: in the export, take such an error as "not whole" (the audit-log sentence) rather than fail.
+
+**T-M3 — S-M2's rule rests on the time a record claims, so a residual case goes the UNSAFE way (judged by reading).**
+- For a count-only (legacy) restore, a file left out on UNVERIFIED evidence has as its `destroyedAt` the time that evidence claims (`restore.ts:~667`: `by.byId.get(a.id) ?? by.bySha256.get(a.sha256)`). That evidence may be a certificate file "taken as it is on disk", or another computer's log whose clock runs ahead.
+- If that claimed time is later than the legacy restore entry's own time, the file gets "a verified record in this library shows it was destroyed".
+- This affects only copies restored before FR-410 whose unverified evidence carried a future time. It is narrow, but it is the one remaining case that states as verified what was not.
+- Otherwise the rule is the narrowest the legacy entry allows (it holds only counts and a time). Its other residual — a later restore's verified file destroyed at or before T is called unverified — goes the safe way.
+- Direction: accept it and list it, or treat the legacy restore's unverified files as running "until the next restore entry" rather than "until T".
+
+### Judgements asked
+- **(a) An unreadable anchors file makes every project's notes say `logNotIntact`.** Right in direction, but the sentence blames the log, not the anchor (T-M1). An unreadable file is not an ordinary condition. A read-only library cannot trigger it (the anchors live in this computer's settings). A briefly locked file does not reach this path: it fails the export instead (T-M2).
+- **(b) The M1 test re-anchors its rewritten log.** It still tests what R473 M1 asked: the export's reading of a count-only entry. The re-anchoring only makes the rewrite look like what an older app wrote, and the test now also asserts that `verifyAudit` is ok, so it cannot pass through the audit-log sentence.
+
+### Per point
+
+| Point | Verdict |
+|---|---|
+| S-I1 (8053e16) | Holds: a cut at the end, a cut in the middle and an earlier mismatch all give the audit-log sentence; untouched logs keep their sentences (T-M1, T-M2). |
+| S-M1 (39e54cb) | Holds: P1 gives the own-rule sentence. FR-724 and the same-moment case are named in the function's comment. |
+| S-M2 (4d925cb) | Holds; T-M3 is the residual. |
+| 8e3389e | Holds. A second copy set aside in the same second gets `-1`, and many get `-n` (tested). There is a tiny window between `lstat` and the rename between processes (FR-721's ground). The FR-106 comments are back in place. |
+| Approved before | Unbroken: `restore-governed` 63 and `registry-notice` 7 pass. |

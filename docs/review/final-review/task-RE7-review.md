@@ -93,3 +93,80 @@ Worktree `.claude/worktrees/re-7-find-shell`, branch `re-7-find-shell`, 567d98d.
 - The WebView's connection limit (M3).
 - Whether bulk import's parallel extraction approaches the handle limit (M5).
 - Resident memory inside the real desktop service (the probe measured a Vitest worker).
+
+## Second look (R472, R478)
+
+Scope: 7a8f5ee..834998c, seven commits, by RE-7e; the worktree and branch are the same as in the first review. I ran each probe alone at nice -n 10 on the quiet machine (load 3–6), deleted every probe afterwards, and `git status --short` is empty.
+
+**Verdict for this round: approved with one small point (N1).** Every ruled item holds, and nothing I approved before is broken.
+
+### Findings
+**N1 (Minor) — FR-529 / R478: a decision that is still out when the review queue goes away is never cancelled.**
+- Where: `ReviewQueue.tsx:832-842`.
+- The cleanup that runs when the review queue goes away (`:525-531`) cancels only requests that are already given up and in `givenUp`. A request still inside its 60 s is not cancelled. Its give-up timer is not cleared at unmount either: it fires later and puts the request into `givenUp` of the component that is gone, and nothing ever cancels it.
+- Probe:
+  1. Decide a card.
+  2. After 1 s, `unmount()`.
+  3. Advance the clock 11 minutes.
+  4. Result: `open 1, aborted 0`.
+- When the project changes on the same instance (the route renders it without a key), the timer puts the old project's request into the map. It is cancelled only at the next leave.
+- At most one request per card is left like this, and a press is needed for each, so the bound is still small. But R478's "every open one is cancelled when the review queue goes away" does not hold for these.
+- Direction: in the same cleanup, also cancel the requests still out (keep their controllers too), or clear their timers and cancel them.
+
+**Observation (not a finding) — FR-561 comment, `FindAcquire.tsx:1637-1641`.**
+- The comment says "the shell is the guard". On this branch the shell is not the guard yet: that is RE-7d's `be398d6`.
+- The guard there works as follows. An open that a newer one overtook answers `false`, so this handler never reaches its close. `close_library_window` takes a ticket, but this page still calls it with none. So "closes a sign-in window only on behalf of the open that made it (its ticket)" describes the shell's close *with* a ticket; the protection this page relies on is the overtaken open answering `false`.
+- The comment becomes true once RE-7d is merged. The coordinator may want its wording checked at that merge.
+- The rest of the comment is true. I showed both cases it says the page cannot see in my first review.
+
+### Checked and sound
+**FR-558 (d60f456).**
+- My M3 probe: the repo's own test runs 8 give-ups in a row and counts at most 1 request open; it passes.
+- A cancel while the body is still arriving: the headers come, the body stalls, and the body would have said "not-found". At the give-up the request is cancelled (`open 0, aborted 1`). When the rest of the body is then sent, the row stays "No open copy" and no alert appears.
+- Leaving the screen while a waited read hangs: the read is cancelled when its 60 s end (the timer outlives the unmount), not at once. That is acceptable.
+- The next read after a give-up is not blocked: the existing FR-558 test and the new one each count a fresh read.
+- A cancelled read's rejection is dropped through `signal.aborted` before any `metaSeq` or `loadError` change.
+- By reading: reads that are never waited for (`readNow` at load, after a switch, `:2129`, `:2241`) are still not cancelled. They are not given up either, so they are outside R472.
+
+**FR-529 / R478 (834998c).**
+- The probe kept two cards and decided them as follows: card 1 was given up 3 times and card 2 once.
+  - Each card kept its own open request: 2 open in all, `most` 2.
+  - Card 1's two earlier requests were cancelled: `aborted 2`. The cancel came before each new request was sent.
+  - The late answer of card 1's request that was NOT cancelled still triggers exactly one read at once, and the card leaves. So FR-529 holds.
+  - Releasing the cancelled requests afterwards gives no read.
+  - The only alert is card 2's "The service did not answer…". Nothing says "could not be reached".
+  - An `unhandledRejection` listener heard nothing.
+- `finally` drops a map entry only when it is the request's own (`=== cancel`), so an older request's `finally` never drops a newer request's entry. An aborted request drops its own entry.
+- There is no "use all the files that look right" control in the UI: the only caller of `/review/:id/held-file` is `decideHeld` (`ReviewQueue.tsx:845`), so there is nothing else to bound.
+- The two new tests count cancellations through `request.signal`.
+
+**FR-576 (a59e454).** Probe with the queue's project named in the address. In each case "The library service could not be reached." shows exactly once:
+- only the settings' read fails;
+- only the queue's read fails (it then shows as the queue's alert);
+- both fail.
+
+**FR-557 (3af7d84).** A guard test only. It passes with the code as it is, and it would fail if a "Wait until…" sentence stayed in the polite region or on the page, or were said again, after a failed test or sign-out. The behaviour R472 asks for holds, so it guards.
+
+**FR-577 (d75ef20).** Comments only. Each claim is true, as follows:
+- "One range, about twice the size": my probe of the first review saw 419 MB read in 3 reads, and +874 MB resident.
+- `MAX_PDF_BYTES` bounds it.
+- 100 MB applies to downloads: `fetchFile` gets `maxBytes: FREE_COPY_MAX_BYTES` (`runner.ts:2013`).
+- 200 MB applies to handed-over files, from both the window and the browser: `takeInboxFile` caps at `LIBRARY_FILE_MAX_BYTES`.
+- Nit: `RANGE_CHUNK` "at least this size" is not true of the file's last range, nor of a file smaller than 64 KiB.
+
+**R463 M7 (3099997).** A locked name is now `⁨name⁩ (locked)`, and an unlocked name is left bare. With `dir="auto"` the isolated name no longer sets the option's direction, so " (locked)" stays to its right. The new test uses an Arabic name, and the changed older tests read the new text. How WebKit's native `<select>` draws it I could not see.
+
+### Runs (each file alone, on the quiet machine)
+- `FindAcquire.test.tsx`: **212 passed (212)**, including "Try again … waiting files".
+- `ReviewQueue.test.tsx`: **118 passed (118)**, including "loads titles six at a time" (6.6 s).
+- `YourLibrary.test.tsx`: 51 passed (51).
+
+| Item | Verdict |
+|---|---|
+| FR-558 (cancel at the give-up) | holds |
+| FR-529 / R478 (one open per card, cancelled on leaving) | partly: N1 |
+| FR-576 (both fail / one fails) | holds |
+| FR-557 (guard test) | holds |
+| FR-577 (comments) | holds (a nit about `RANGE_CHUNK`) |
+| FR-561 (comment) | true once RE-7d merges (observation) |
+| R463 M7 | holds |
