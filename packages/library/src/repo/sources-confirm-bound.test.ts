@@ -134,11 +134,17 @@ describe("FR-423: a read with a real mismatch waits for the queue at most CONFIR
     const w = longWrite(s.pid, s.other);
     await w.reached;
     await kit.repo.getSource(s.pid, s.sid);
-    await kit.lib.close();
+    // FR-749 (R546 1): close() now waits for the change in its store turn before the lock goes, so the held write is
+    // released while the close is under way (it used to be released after the close had returned).
+    const closing = kit.lib.close();
     w.release();
+    await closing;
     await w.done.catch(() => {});
-    await queueDrained();
-    expect(runs).toBe(1);
+    // The closed library's queue starts no further turn (R546 1): it is drained once close() has returned.
+    await expect(queueDrained()).rejects.toThrow(/has been closed/);
+    // The confirmation was still waiting for its turn when the library was closed: it never begins (R546 1; it used to
+    // begin, find the library closed and record nothing). Either way nothing is recorded.
+    expect(runs).toBe(0);
     expect(warnings()).toEqual([]);
   });
 
