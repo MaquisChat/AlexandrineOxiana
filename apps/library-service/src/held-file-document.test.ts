@@ -140,6 +140,7 @@ async function snapshot(dir: string): Promise<Record<string, string>> {
 function socketGet(port: number, path: string, headers: Record<string, string>) {
   let res: IncomingMessage | undefined;
   let received = 0;
+  const parts: Buffer[] = [];
   let firstData: () => void = () => {};
   const first = new Promise<void>((r) => (firstData = r));
   let ended: (how: string) => void = () => {};
@@ -148,6 +149,7 @@ function socketGet(port: number, path: string, headers: Record<string, string>) 
     res = r;
     r.on("data", (d: Buffer) => {
       received += d.length;
+      parts.push(d);
       if (received === d.length) {
         r.pause();
         firstData();
@@ -157,7 +159,7 @@ function socketGet(port: number, path: string, headers: Record<string, string>) 
   });
   req.on("error", () => ended("aborted"));
   req.end();
-  return { first, done, status: () => res?.statusCode ?? 0, received: () => received, resume: () => res?.resume() };
+  return { first, done, status: () => res?.statusCode ?? 0, received: () => received, body: () => Buffer.concat(parts), resume: () => res?.resume() };
 }
 
 beforeEach(async () => {
@@ -278,19 +280,31 @@ describe("R470 b: the held file, looked at by ranges", () => {
     plainError(await look(pid, h.rid, "bytes=0-99"), 423, "PROJECT_LOCKED", LOCKED);
   });
 
-  it("a lock in the middle of a read: the read ends, the next range answers as locked", async () => {
+  it("a lock in the middle of a read: no byte of the file's content is read after it — the read is cut, the later part never arrives, the next range answers as locked", async () => {
     await start();
     await openLibrary();
     const pid = await newProject(true);
-    const h = await heldFor(pid, pdfBytes(6 * MiB));
+    // R487 e: a known marker in the later part of the range asked for — read only if a read is made after the lock.
+    const data = pdfBytes(6 * MiB);
+    const MARKER = Buffer.from("R487e-later-part-of-the-held-file-0123456789", "latin1");
+    const markerAt = DOCUMENT_RANGE_MAX_BYTES - 4096;
+    MARKER.copy(data, markerAt);
+    const h = await heldFor(pid, data);
     const port = await svc.listen(0);
     const s = socketGet(port, lookUrl(pid, h.rid), { range: `bytes=0-${DOCUMENT_RANGE_MAX_BYTES - 1}` });
     await s.first;
     expect(s.status()).toBe(206);
-    svc.state.session!.repo.lockProject(pid);
+    // Locked while the answer is under way (its reader paused after the first data): the key is wiped before going on.
+    await svc.state.session!.repo.lockProject(pid);
+    const atLock = s.received();
     s.resume();
-    expect(["end", "aborted"]).toContain(await s.done);
-    expect(s.received()).toBeLessThanOrEqual(DOCUMENT_RANGE_MAX_BYTES);
+    // Cut: never complete — what the service had read before the lock may still arrive (it was in flight), nothing more.
+    expect(await s.done).toBe("aborted");
+    const got = s.body();
+    const afterLock = got.length - atLock;
+    expect(got.equals(data.subarray(0, got.length)), "only the file's own bytes, in order").toBe(true);
+    expect(got.includes(MARKER), `the later part arrived (${got.length} bytes in all, ${afterLock} after the lock)`).toBe(false);
+    expect(got.length).toBeLessThan(markerAt);
     plainError(await call({ url: lookUrl(pid, h.rid), headers: { host: `127.0.0.1:${port}`, range: `bytes=${MiB}-${MiB + 99}` } }), 423, "PROJECT_LOCKED", LOCKED);
   });
 });

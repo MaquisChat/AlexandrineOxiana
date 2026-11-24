@@ -168,6 +168,15 @@ interface Row {
 }
 
 let c: Ctx;
+/**
+ * R487 e: the lock asked during the reading running now — at an opening (`after` false: before that opening's key is
+ * asked for) or a microtask after one — or undefined while none has been. Read by rows that count what comes after it.
+ */
+let lockAsked: { after: boolean } | undefined;
+/** R487 e: a marker in the later part of the held PDF: never handed back once a lock was asked before its key was. */
+const HELD_MARKER = "R487e-the-later-part-of-the-held-file";
+/** R487 e: the held file is read as the route reads it, slice by slice. */
+const HELD_SLICE = 64 * 1024;
 
 /** Comparable form: Maps and Sets as sorted arrays, bytes as their SHA-256, errors as name and message. */
 function norm(v: unknown): unknown {
@@ -229,9 +238,11 @@ async function cold(row: Row, lockAt?: number): Promise<{ outcome: { ok: unknown
     lockAt === undefined ? undefined : () => `${row.name}: the reading did not end within ${WHOLE_MS / 1000} s (${lock ? `the lock landed at opening ${lockAt}` : "the lock had not landed yet"})`,
   );
   if (lockAt === undefined) limit.arm(`${row.name}: the reading did not end`);
+  lockAsked = undefined;
   openingSeam.onOpen = () => {
     openings++;
     if (openings === lockAt) {
+      lockAsked = { after: false };
       lock = c.kit.repo.lockProject(c.p.id);
       lock.catch(() => {});
       limit.arm(`${row.name}: the reading did not end`, ` after the lock landed at opening ${lockAt}`);
@@ -359,6 +370,7 @@ async function exercise(row: Row): Promise<void> {
     const ask = () => {
       limit.arm(`${row.name}: the reading did not end`, ` after the lock landed at opening ${n}${pt.after ? " (a microtask after it)" : ""}${pt.mark ? " (mark)" : ""}`);
       const size = c.kit.ring.size;
+      lockAsked = { after: pt.after };
       lock = c.kit.repo.lockProject(c.p.id);
       lock.catch(() => {});
       // The mark path: the key is not wiped at once (it is answered only to the change in progress, which for a
@@ -382,6 +394,7 @@ async function exercise(row: Row): Promise<void> {
           seen = openings;
         }, 500)
       : undefined;
+    lockAsked = undefined;
     openingSeam.onOpen = () => {
       openings++;
       if (openings === n) {
@@ -436,6 +449,7 @@ async function exercise(row: Row): Promise<void> {
     await row.prepare?.(c);
     const againLimit = hangLimit();
     againLimit.arm(`${row.name}: the reading after the unlock did not end`, ` (lock point ${n})`);
+    lockAsked = undefined;
     try {
       const again = norm(await againLimit.race(row.run(c)));
       if (JSON.stringify(again) !== JSON.stringify(want)) problems.push(`${tag}: after the unlock, a different result: ${JSON.stringify(again).slice(0, 600)}`);
@@ -564,7 +578,9 @@ async function build(): Promise<Ctx> {
   );
   const waiting: FindEntry = { ...entries[0]!, id: newId(), state: "fetching", sourceId: wanting.source.id };
   await appendFindEntriesIn(kit.repo, p.id, [waiting], "add");
-  const heldPdf = await scratchFile(kit, "held.pdf", PDF(3 * 1024 * 1024));
+  const heldBytes = Buffer.from(PDF(3 * 1024 * 1024), "latin1");
+  heldBytes.write(HELD_MARKER, heldBytes.length - 4096, "latin1");
+  const heldPdf = await scratchFile(kit, "held.pdf", heldBytes);
   const { reviewId: heldReview } = await holdMismatchedFileIn(kit.repo, p.id, {
     entry: { ...waiting, state: "needs-check", reason: { code: "file-other-doi" } },
     sourceId: wanting.source.id,
@@ -675,12 +691,21 @@ const ROWS: Row[] = [
   },
   {
     // R470 b: a file Find and acquire holds, looked at before the researcher decides (the held-file route's reading).
+    // R487 e: a lock asked at any opening of the look (by the wipe or the mark), before the file's key is asked for,
+    // lets not one byte of its content through: counted, and the marker in its later part must never come back. A lock
+    // asked after the last opening finds the file's key already taken: the reading under way may end as unlocked here;
+    // the route's guard of every read stops it there (held-file-document.test.ts, "a lock in the middle of a read").
     name: "openHeldFileContent (a whole held PDF, looked at)",
     where: "asset-content.ts (openHeldFileContent → openStored)",
     run: async () => {
       const a = await openHeldFileContent(c.kit.repo, c.p.id, c.heldReview);
+      const lockedFirst = lockAsked !== undefined && !lockAsked.after;
       try {
-        return await a.read(0, a.size);
+        const parts: Buffer[] = [];
+        for (let at = 0; at < a.size; at += HELD_SLICE) parts.push(await a.read(at, Math.min(HELD_SLICE, a.size - at)));
+        const got = Buffer.concat(parts);
+        if (lockedFirst) throw new Error(`${got.length} bytes of the held file's content came back after the lock${got.includes(HELD_MARKER) ? ", its later part (the marker) included" : ""}`);
+        return got;
       } finally {
         await a.close();
       }
