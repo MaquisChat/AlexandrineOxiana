@@ -174,7 +174,7 @@ describe("StatusBanner", () => {
       "recovery-code-unshown", "recovery-staging-discarded", "recovery-staging-unverifiable",
       "audit-unrecorded", "permissions-not-set", "audit-recorded-late", "refusal-unrecorded",
       "audit-unrecorded-blocked", "attention-unreadable", "audit-waiting",
-      "source-change-unfinished", "source-change-unfinished-read-only", "changed-outside-before-rollback",
+      "source-change-unfinished", "source-change-unfinished-read-only",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();
@@ -232,20 +232,6 @@ describe("R484 f: changes to sources that did not finish and could not be undone
   it("the sentence with \"this source\" stays the library's own, for the source itself", () => {
     expect(SOURCE_CHANGE_UNFINISHED).toBe("A change to this source did not finish and could not be undone. Close the library and open it again to put it back.");
     expect(SOURCE_CHANGE_UNFINISHED_READ_ONLY).toBe("A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.");
-  });
-});
-
-describe("R479 a, R484 b: a file changed outside the app while an unfinished change waited to be undone", () => {
-  const SENTENCE =
-    "A file in Dissertation <b>2</b> was changed outside the app while a change the app had not finished was waiting to be undone. When the library opened, the app undid its unfinished change, and the outside change to that file was not kept.";
-  it("says the ruled sentence on the banner, the project's name shown as text, never the file or the detail", () => {
-    const detail = "transaction 7f3a: /Users/rana/Thesis library/Sources/x/source.json";
-    const [b] = bannersFor({ integrityWarnings: [{ projectId: "p1", project: "Dissertation <b>2</b>", kind: "changed-outside-before-rollback", detail }] });
-    render(<StatusBanner variant={b!} />);
-    const status = screen.getByRole("status");
-    expect(status.textContent).toBe(SENTENCE);
-    expect(status.querySelector("b")).toBeNull();
-    expect(status.textContent).not.toContain("7f3a");
   });
 });
 

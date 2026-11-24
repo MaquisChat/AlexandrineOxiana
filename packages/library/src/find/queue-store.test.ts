@@ -1256,7 +1256,6 @@ describe("R503 a (FR-738): a torn last line is cut by a change of its own, commi
           seams.stopUndoAfter = undefined;
           const kinds = repo.integrityWarnings.filter((w) => w.projectId === p.id).map((w) => w.kind);
           if (kinds.includes("txn-recovery-skipped-audit-unverifiable")) failures.push(`${name}: the reopen refused to undo the change`);
-          if (kinds.includes("changed-outside-before-rollback")) failures.push(`${name}: the queue file was reported changed outside the app`);
           if ((await txnMarkers()).length) failures.push(`${name}: a change is still waiting to be undone`);
           // The queue file is whole: the torn line still there (the cut undone) or gone, never half; the entry there only
           // when the append's change was committed.

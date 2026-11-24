@@ -121,7 +121,6 @@ async function keptAndIncomplete(rel: string, want: UndoCause[], txn: string): P
     expect(await text(rel), `${run} reopen`).toBe(HAND);
     expect(await markers(), `${run} reopen`).toEqual([`txn-${txn}.json`]);
     expect(kinds(), `${run} reopen`).toContain("rolled-back-incomplete-write");
-    expect(kinds(), `${run} reopen`).not.toContain("changed-outside-before-rollback");
     expect(causes(), `${run} reopen`).toEqual(want);
     expect((await repo.pendingWrites()).map((x) => x.txn), `${run} reopen`).toEqual([txn]);
   }
@@ -140,7 +139,6 @@ describe("R519: the undo of a created file removes only the change's own bytes",
     expect(await markers()).toEqual([]);
     expect(await text(rel)).toBeNull();
     expect(await readFile(join(tmp, "moved-away.txt"), "utf8")).toBe(HAND);
-    expect(kinds()).not.toContain("changed-outside-before-rollback");
   });
 
   it("a copied file as the change left it: removed, the roll-back complete (the control)", async () => {
@@ -227,7 +225,6 @@ describe("R519: the undo of a replaced file never overwrites bytes that are not 
       expect(await text(rel), run).toBe(edited);
       expect(await markers(), run).toEqual([`txn-${m.txn}.json`]);
       expect(causes(), run).toEqual([{ kind: "hand-changed-file", path: rel }]);
-      expect(kinds(), run).not.toContain("changed-outside-before-rollback");
     }
     // Moved away by the researcher: the earlier record is put back and the roll-back completes.
     await rename(fromRel(lib.root, rel), join(tmp, "edited.json"));
@@ -356,7 +353,6 @@ describe("R519 (3) (R509 M1, M2): where the kept copy of a trashed original is g
         expect(await text(rel()), run).toBe(g.left);
         expect(await markers(), run).toEqual([`txn-${m.txn}.json`]);
         expect(causes(), run).toEqual([{ kind: "kept-copy-gone", path: rel() }]);
-        expect(kinds(), run).not.toContain("changed-outside-before-rollback");
       }
     });
   }

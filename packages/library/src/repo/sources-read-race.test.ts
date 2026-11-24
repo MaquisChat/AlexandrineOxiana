@@ -313,7 +313,6 @@ describe("R473 I1: while a roll-back waits, only the sources its marker names ar
     repo = await repoFor();
     expect(await readFile(join(lib.root, folder, "annotations.json"), "utf8")).toBe(edited);
     expect(warnings("rolled-back-incomplete-write")).toMatchObject([{ projectId: pid, causes: [{ kind: "hand-changed-file", path: `${folder}/annotations.json` }] }]);
-    expect(warnings("changed-outside-before-rollback")).toEqual([]);
     await rm(join(lib.root, folder, "annotations.json"));
     await lib.close();
     lib = await openLibrary(lib.root, mkDeps());

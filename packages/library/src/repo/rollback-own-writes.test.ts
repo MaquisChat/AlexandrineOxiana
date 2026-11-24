@@ -65,7 +65,7 @@ const STORE = { action: "store" as const, store: { identifiable: false, hasLocat
 const note = (sourceId: string, body: string): Annotation => ({ id: newId(), sourceId, kind: "note", anchors: [], body, author: "tester", createdAt: NOW });
 const withNotes = (sf: SourceFile, bodies: string[]): SourceFile => ({ ...sf, annotations: bodies.map((b) => note(sf.source.id, b)) });
 
-const OUTSIDE = new Set(["changed-outside-before-rollback", "annotations-hash-mismatch"]);
+const OUTSIDE = new Set(["annotations-hash-mismatch"]);
 const outside = () => repo.integrityWarnings.filter((w) => OUTSIDE.has(w.kind)).map((w) => [w.kind, w.file]);
 const markers = async () => (await readdir(join(lib.root, ".tmp")).catch(() => [] as string[])).filter((n) => /^txn-.*\.json$/u.test(n));
 const reopen = async () => {
@@ -324,7 +324,6 @@ describe("R484 b, R479 a, as corrected by R519: a file the unfinished change nam
     await editSourceByHand();
     const edited = await sourceJson();
     await reopen();
-    expect(repo.integrityWarnings.filter((w) => w.kind === "changed-outside-before-rollback")).toEqual([]);
     await handEditKeptThenMovedAway(`${folder}/source.json`, edited, before);
   });
 

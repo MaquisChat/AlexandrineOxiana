@@ -99,9 +99,6 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
     n === 1
       ? `A change to a source in ${p} did not finish and could not be undone. It can be put back only when the library is opened for changes.`
       : `Changes to ${n} sources in ${p} did not finish and could not be undone. They can be put back only when the library is opened for changes.`,
-  // R479 a, R484 b: a file an unfinished change named, changed by hand before the reopen undid that change.
-  "changed-outside-before-rollback": (p) =>
-    `A file in ${p} was changed outside the app while a change the app had not finished was waiting to be undone. When the library opened, the app undid its unfinished change, and the outside change to that file was not kept.`,
   "destroy-incomplete": (p) =>
     `A destruction of raw data in ${p} did not finish: some files could not be overwritten yet. They are kept out of the project and overwriting is tried again each time the library opens.`,
   "protocol-manifest-unreadable": (p) => `The sealed list of protocol document names in ${p} could not be read. The documents themselves are unchanged; check the verification report.`,

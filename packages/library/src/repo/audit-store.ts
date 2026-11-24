@@ -55,8 +55,6 @@ export interface IntegrityWarning {
     | "source-change-unfinished"
     /** The same, in a library opened without changes: it can be put back only when opened for changes (R473 I1). */
     | "source-change-unfinished-read-only"
-    /** A roll-back at open found a file it names changed outside the app meanwhile; it was put back all the same (R473 I1 3). */
-    | "changed-outside-before-rollback"
     /** Files destroyed under the retention rule could not be overwritten yet; retried on each open (R94). */
     | "destroy-incomplete"
     /** A staged recovery-code key file that is not the committed one was removed, not activated (R148). */

@@ -278,7 +278,6 @@ describe("R503 b 2 (FR-737): the app's kept copy of a trashed original deleted b
       expect(await markerNames(w), `${run} reopen`).toEqual([`txn-${m.txn}.json`]);
       const mine = w.repo.integrityWarnings.filter((x) => x.projectId === w.pid).map((x) => x.kind);
       expect(mine, `${run} reopen`).toContain("rolled-back-incomplete-write");
-      expect(mine, `${run} reopen`).not.toContain("changed-outside-before-rollback");
       expect(w.repo.integrityWarnings.find((x) => x.kind === "rolled-back-incomplete-write")!.detail).toMatch(/could only be partly rolled back/u);
       expect((await w.repo.pendingWrites()).map((x) => x.txn)).toEqual([m.txn]);
     }
@@ -673,7 +672,6 @@ async function handPutCase(seq: Op[], startExists: boolean, cut: number, how: Ha
       const now = await bytesAt(v, rel);
       if (now?.toString() !== HAND) failures.push(`${where}, the hand-put file is ${now === null ? "gone" : `now ${JSON.stringify(now.toString())}`}`);
       if (v.repo.integrityWarnings.some((x) => x.kind === "invalid-txn-marker")) failures.push(`${where}, the marker was found invalid`);
-      if (v.repo.integrityWarnings.some((x) => x.kind === "changed-outside-before-rollback")) failures.push(`${where}, an outside change was said not kept`);
       if ((await markerNames(v)).length !== 1) {
         failures.push(`${where}, reported complete with the hand-put file at the path`);
         continue;

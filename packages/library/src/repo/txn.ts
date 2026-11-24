@@ -47,8 +47,8 @@ import { assertContained, exists, undoAppend, type AppendUndo } from "./io.js";
 import { seams } from "./seams.js";
 
 /**
- * `sha256` (created, replaced): of the bytes the change wrote there, when it wrote them itself (R473 I1 3): a
- * roll-back that finds the file neither so nor as before the change records that it was changed outside the app.
+ * `sha256` (created, replaced): of the bytes the change wrote there, when it wrote them itself: a roll-back that finds
+ * the file neither so nor as before the change leaves it as it is and is incomplete (R519, R525).
  */
 export type MarkerEntry =
   /**
