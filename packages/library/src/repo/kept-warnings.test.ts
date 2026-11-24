@@ -200,6 +200,51 @@ describe("FR-729: a damaged record never stops the library from opening", () => 
   });
 });
 
+describe("R528 M6: a record written by another build is never lost", () => {
+  const LATER = { id: "019a7000-0000-7000-8000-00000000a001", kind: "a-kind-of-a-later-build", projectId: "019a7000-0000-7000-8000-00000000a002", at: NOW, more: { x: 1 } };
+
+  it("an entry of a kind this build does not know is skipped, and kept in the file when another warning is dismissed", async () => {
+    const { pid, folder } = await project("P");
+    await crashed(pid, folder);
+    await reopen();
+    const [mineKept] = kept();
+    const raw = JSON.parse((await fileText())!) as { formatVersion: number; warnings: unknown[] };
+    await writeFile(fromRel(lib.root, FILE), JSON.stringify({ formatVersion: 1, warnings: [LATER, ...raw.warnings] }));
+    await reopen();
+    // The known one shown, the unknown one not; nothing set aside.
+    expect(kept()).toEqual([mineKept]);
+    expect(repo.integrityWarnings.filter((w) => w.kind === "recovery-warnings-set-aside")).toEqual([]);
+    expect((await readdir(join(lib.root, ".tmp"))).filter((n) => n.startsWith("recovery-warnings.damaged-"))).toEqual([]);
+    await repo.dismissRecoveryWarning(mineKept!.keptId!);
+    expect(kept()).toEqual([]);
+    expect(JSON.parse((await fileText())!)).toEqual({ formatVersion: 1, warnings: [LATER] });
+    // A later opening's new warning is added beside it.
+    await crashed(pid, folder);
+    await reopen();
+    const after = JSON.parse((await fileText())!) as { warnings: Array<{ kind: string }> };
+    expect(after.warnings.map((w) => w.kind)).toEqual(["a-kind-of-a-later-build", "rolled-back-incomplete-write"]);
+    expect(after.warnings[0]).toEqual(LATER);
+  });
+
+  it("a file of a higher format version is left alone, byte for byte: never set aside, never rewritten, nothing dismissed from it", async () => {
+    const { pid, folder } = await project("P");
+    const NEWER = JSON.stringify({ formatVersion: 2, warnings: [{ ...LATER, kind: "rolled-back-incomplete-write", projectId: pid }], somethingNew: true });
+    await writeFile(fromRel(lib.root, FILE), NEWER);
+    // This opening's own recovery raises a warning that would be kept: it is shown, not written.
+    await crashed(pid, folder);
+    await reopen();
+    expect(await fileText()).toBe(NEWER);
+    expect(repo.integrityWarnings.filter((w) => w.kind === "recovery-warnings-set-aside")).toEqual([]);
+    expect((await readdir(join(lib.root, ".tmp"))).filter((n) => n.startsWith("recovery-warnings.damaged-"))).toEqual([]);
+    expect(repo.integrityWarnings.filter((w) => w.projectId === pid && w.kind === "rolled-back-incomplete-write")).toHaveLength(1);
+    expect(kept()).toEqual([]);
+    await expect(repo.dismissRecoveryWarning(LATER.id)).rejects.toBeInstanceOf(NotFoundError);
+    expect(await fileText()).toBe(NEWER);
+    await reopen();
+    expect(await fileText()).toBe(NEWER);
+  });
+});
+
 describe("FR-729: a library open read-only", () => {
   it("shows the kept warnings, writes nothing, offers no dismissal; a damaged record is said and left as it is", async () => {
     const { pid, folder } = await project("P");

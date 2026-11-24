@@ -15,6 +15,10 @@
  * - A file that cannot be read or does not hold a list never stops the library from opening: in a writable library it is
  *   set aside under a name that cannot collide (`recovery-warnings.damaged-<time>-<random>.json`, moved into `.tmp/`, the
  *   library's work folder) and one warning says so; read-only, it is left as it is and the same warning is raised.
+ * - R528 M6: written by another build, it is never lost: an entry of a kind this build does not know (or of a state it does
+ *   not know) is skipped and written back as it was when the file is rewritten; a file of a HIGHER `formatVersion` is
+ *   left alone, byte for byte: nothing of it is shown, nothing is added to it or dismissed from it, and it is never set
+ *   aside (a library shared between two computers on different builds keeps the newer build's record).
  * - An older build ignores the file: nothing of it reads the library's root but `library.json`, the library's audit log
  *   and the folders it knows; its integrity check, like this one, reads only the files the library records (read at
  *   `main`), so neither ever reports this one.
@@ -52,32 +56,53 @@ export interface KeptWarning {
 
 const pathOf = (root: string) => join(root, KEPT_WARNINGS_FILE);
 
-/** The kept warnings; "damaged" when the file is there but cannot be read as a list of them. */
-export async function readKeptWarnings(root: string): Promise<KeptWarning[] | "damaged"> {
+/**
+ * The kept warnings as read: `list`, those this build shows; `others`, entries another build wrote that this one does not
+ * know, written back as they were (R528 M6); `newer`: the file is of a higher format version, left alone (nothing shown,
+ * nothing written). "damaged" when the file is there but cannot be read as a list of them.
+ */
+export interface KeptRecord {
+  list: KeptWarning[];
+  others: unknown[];
+  newer?: true;
+}
+
+export async function readKeptWarnings(root: string): Promise<KeptRecord | "damaged"> {
   let raw: string;
   try {
     raw = await fsp.readFile(pathOf(root), "utf8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT" || (err as NodeJS.ErrnoException).code === "ENOTDIR") return [];
+    if ((err as NodeJS.ErrnoException).code === "ENOENT" || (err as NodeJS.ErrnoException).code === "ENOTDIR") return { list: [], others: [] };
     return "damaged";
   }
   try {
     const f = JSON.parse(raw) as { formatVersion?: unknown; warnings?: unknown };
+    // R528 M6: a later build's format: left alone, never taken for damage.
+    if (typeof f.formatVersion === "number" && Number.isInteger(f.formatVersion) && f.formatVersion > 1) return { list: [], others: [], newer: true };
     if (f.formatVersion !== 1 || !Array.isArray(f.warnings)) return "damaged";
-    const out: KeptWarning[] = [];
+    const list: KeptWarning[] = [];
+    const others: unknown[] = [];
     for (const w of f.warnings as Array<Partial<KeptWarning> | null>) {
-      if (!w || typeof w.id !== "string" || !isId(w.id) || !KEPT_KINDS.has(w.kind!) || typeof w.projectId !== "string" || !isId(w.projectId) || typeof w.at !== "string") return "damaged";
-      if (w.rollback !== undefined && (w.rollback !== "unconfirmed" || w.kind !== "interrupted-change-closed")) return "damaged";
-      out.push({ id: w.id, kind: w.kind!, projectId: w.projectId, at: w.at, ...(w.rollback ? { rollback: w.rollback } : {}) });
+      if (!w || typeof w !== "object" || typeof w.kind !== "string") return "damaged";
+      // R528 M6: a kind (or a state) of another build: skipped, and kept as it is.
+      const knownState = w.rollback === undefined || (w.rollback === "unconfirmed" && w.kind === "interrupted-change-closed");
+      if (!KEPT_KINDS.has(w.kind) || !knownState) {
+        others.push(w);
+        continue;
+      }
+      if (typeof w.id !== "string" || !isId(w.id) || typeof w.projectId !== "string" || !isId(w.projectId) || typeof w.at !== "string") return "damaged";
+      list.push({ id: w.id, kind: w.kind, projectId: w.projectId, at: w.at, ...(w.rollback ? { rollback: w.rollback } : {}) });
     }
-    return out;
+    return { list, others };
   } catch {
     return "damaged";
   }
 }
 
-async function writeKeptWarnings(root: string, list: KeptWarning[]): Promise<void> {
-  await writeSmallFileAtomic(pathOf(root), JSON.stringify({ formatVersion: 1, warnings: list }), { mode: 0o600 });
+/** Writes the record whole: another build's entries first, as they were (R528 M6), then this build's. */
+async function writeKeptWarnings(root: string, rec: KeptRecord, list: KeptWarning[]): Promise<void> {
+  if (rec.newer) throw new Error("a record of a later format is never rewritten");
+  await writeSmallFileAtomic(pathOf(root), JSON.stringify({ formatVersion: 1, warnings: [...rec.others, ...list] }), { mode: 0o600 });
 }
 
 /** The integrity warning a kept one is shown as. */
@@ -91,6 +116,7 @@ const shown = (w: KeptWarning): IntegrityWarning => ({ projectId: w.projectId, k
 export async function keepRecoveryWarnings(core: RepoCore, writable: boolean, raised: IntegrityWarning[]): Promise<void> {
   const kept = await readKeptWarnings(core.root);
   let list: KeptWarning[] = [];
+  let rec: KeptRecord = { list: [], others: [] };
   if (kept === "damaged") {
     let detail = "the record of earlier warnings about interrupted changes could not be read";
     if (writable) {
@@ -106,16 +132,20 @@ export async function keepRecoveryWarnings(core: RepoCore, writable: boolean, ra
     core.integrityWarnings.unshift({ projectId: "*", kind: "recovery-warnings-set-aside", detail });
     // Nothing more is written over a file that could not be set aside.
     if (writable && (await fsp.access(pathOf(core.root)).then(() => true, () => false))) return;
-  } else list = kept;
+  } else {
+    rec = kept;
+    list = kept.list;
+  }
   // Earlier openings' first, in the order they were raised.
   core.integrityWarnings.unshift(...list.map(shown));
-  if (!writable) return;
+  // R528 M6: a later build's record is never written to (this opening's warnings are shown for this session only).
+  if (!writable || rec.newer) return;
   const fresh = raised.filter((w) => KEPT_KINDS.has(w.kind) && w.rollback === undefined && w.keptId === undefined);
   if (!fresh.length) return;
   const at = core.clock().toISOString();
   const added = fresh.map((w) => ({ w, k: { id: newId(), kind: w.kind, projectId: w.projectId, at } satisfies KeptWarning }));
   try {
-    await writeKeptWarnings(core.root, [...list, ...added.map((a) => a.k)]);
+    await writeKeptWarnings(core.root, rec, [...list, ...added.map((a) => a.k)]);
     for (const a of added) a.w.keptId = a.k.id;
   } catch {
     // Not kept this time: shown for this session, as before FR-729; the recovery itself is in the audit log.
@@ -126,10 +156,10 @@ export async function keepRecoveryWarnings(core: RepoCore, writable: boolean, ra
 export async function keepWarning(core: RepoCore, w: IntegrityWarning): Promise<void> {
   core.integrityWarnings.push(w);
   const kept = await readKeptWarnings(core.root);
-  if (kept === "damaged") return;
+  if (kept === "damaged" || kept.newer) return;
   const k: KeptWarning = { id: newId(), kind: w.kind, projectId: w.projectId, at: core.clock().toISOString(), ...(w.rollback === "unconfirmed" ? { rollback: w.rollback } : {}) };
   try {
-    await writeKeptWarnings(core.root, [...kept, k]);
+    await writeKeptWarnings(core.root, kept, [...kept.list, k]);
     w.keptId = k.id;
   } catch {
     // Shown for this session only.
@@ -142,9 +172,9 @@ export async function dismissKeptWarning(core: RepoCore, id: string): Promise<vo
   await core.serial(async () => {
     core.assertWritable();
     const kept = await readKeptWarnings(core.root);
-    const list = kept === "damaged" ? [] : kept;
-    if (typeof id !== "string" || !list.some((w) => w.id === id)) throw new NotFoundError("Warning", String(id));
-    await writeKeptWarnings(core.root, list.filter((w) => w.id !== id));
+    const rec = kept === "damaged" ? { list: [], others: [], newer: true as const } : kept;
+    if (typeof id !== "string" || !rec.list.some((w) => w.id === id)) throw new NotFoundError("Warning", String(id));
+    await writeKeptWarnings(core.root, rec, rec.list.filter((w) => w.id !== id));
     for (let k = core.integrityWarnings.length - 1; k >= 0; k--) if (core.integrityWarnings[k]!.keptId === id) core.integrityWarnings.splice(k, 1);
   });
 }
