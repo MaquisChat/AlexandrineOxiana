@@ -45,9 +45,10 @@
  *    bringing-in). A 429, or a 503 with a wait asked (a readable Retry-After), is not waited for: the call ends at once
  *    with LookupLeftOutError, and the client keeps, per host and in memory only, "not before T" (the time asked, a 429
  *    without one counting as a minute, at most an hour: R411 b). Until T every such call to that host is left out
- *    without anything being sent. A call without the option that meets T waits for it before asking (R411: never
- *    sooner), as it waits for its own Retry-After: at most `maxRetryAfterMs`; its own 429s are handled as before. The
- *    holds are lost when the client goes (the library is closed, the app quits).
+ *    without anything being sent: the hold is looked at just before every send and every retry (R563 I1). Any caller's
+ *    429, or 503 with a wait asked, sets the hold; any 2xx from the host clears it. A call without the option neither
+ *    looks at nor waits for a hold: it is exactly as before (R563 I2). The holds are lost when the client goes (the
+ *    library is closed, the app quits).
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -711,17 +712,6 @@ export class HttpClient {
     if (t !== undefined && this.clock() < t) throw new LookupLeftOutError(host, t);
   }
 
-  /**
-   * R411 for a caller that waits: a host's "not before" is waited for before it is asked — as long as the client waits
-   * for a Retry-After of its own (`maxRetryAfterMs`). The wait is cut short when the library closes (R546 2).
-   */
-  private async awaitHold(host: string): Promise<void> {
-    const t = this.notBefore.get(host);
-    if (t === undefined) return;
-    const wait = Math.min(t - this.clock(), this.maxRetryAfterMs);
-    if (wait > 0) await this.untilClosing(this.sleep(wait));
-  }
-
   private retryDelay(attempt: number, retryAfter: string | undefined): number {
     const ms = retryAfterMs(retryAfter, this.clock());
     if (ms !== undefined) return Math.min(ms, this.maxRetryAfterMs);
@@ -756,9 +746,9 @@ export class HttpClient {
     const target = params.length ? `${url}${url.includes("?") ? "&" : "?"}${params.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&")}` : url;
     let lastError: LookupHttpError | undefined;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      if (!leaveOut) await this.awaitHold(host);
-      // R563 I1: before every retry too (a hold another call set meanwhile); and again just before the send, below.
-      else if (attempt > 0) this.leftOutIfHeld(host);
+      // R563 I1: before every retry too (a hold another call set meanwhile); and again just before the send, below. A
+      // caller without the choice neither looks at nor waits for a hold (R563 I2).
+      if (leaveOut && attempt > 0) this.leftOutIfHeld(host);
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
       try {
         res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) }, leaveOut);
@@ -772,6 +762,8 @@ export class HttpClient {
         lastError = new LookupHttpError(`The metadata service could not be reached${why}`);
       }
       if (res) {
+        // R563 I2: a good answer clears the host's hold, whoever received it: the service is answering again.
+        if (res.status >= 200 && res.status < 300) this.notBefore.delete(host);
         if (res.status === 200) return { status: 200, body: res.body, sent };
         if (res.status === 404 || res.status === 410) return { status: 404, body: null, sent };
         // R556 (2) i, R563 I1: a 429 (a minute when it names no time), or a 503 that asks for a wait, sets the host's

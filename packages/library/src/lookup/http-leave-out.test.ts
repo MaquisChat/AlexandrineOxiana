@@ -3,7 +3,7 @@
  * (`askedToWait: "leave-out"`: the interactive attach and a watched folder's bringing-in) is not made to wait. A 429, or a
  * 503 with a wait asked, ends the call at once with LookupLeftOutError; the client keeps "not before T" for that host in
  * memory, and until T every such call to that host is left out without anything being sent. A caller without the option
- * waits as before, and never asks that host before T either (R411). A 503 without a wait asked is today's failure path.
+ * is as before: it neither looks at nor waits for a hold (R563 I2). A 503 without a wait asked is today's failure path.
  */
 import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -154,34 +154,6 @@ describe("the client: a service that asks to wait is left out (decision 31 b, R5
     expect(count("api.crossref.org")).toBe(2);
   });
 
-  it("a caller without the option that meets a host's 'not before' waits until then before asking (R411): never sooner", async () => {
-    answering(CR, (n) => (n === 1 ? { statusCode: 429, headers: { "retry-after": "45" } } : { statusCode: 200, data: fixture("crossref-work.json") }));
-    const http = client();
-    await expect(http.getJson(CR_URL, LEAVE)).rejects.toBeInstanceOf(LookupLeftOutError);
-    const t = now + 45_000;
-    now += 5_000;
-    await expect(http.getJson(`${CR}/works/10.5555/other`, { cacheKey: "k2" })).resolves.toMatchObject({ message: { DOI } });
-    expect(sleeps).toEqual([40_000]);
-    expect(sent.map((s) => s.at)).toEqual([1_000_000, t]);
-  });
-
-  it("a cut of the client (stop) ends a non-option caller's wait for the hold: nothing is sent", async () => {
-    answering(CR, () => ({ statusCode: 429, headers: { "retry-after": "60" } }));
-    let release!: () => void;
-    const http = new HttpClient({
-      libraryRoot: join(tmp, "Lib"),
-      dispatcher: agent,
-      clock: () => now,
-      sleep: () => new Promise<void>((r) => (release = r)),
-    });
-    await expect(http.getJson(CR_URL, LEAVE)).rejects.toBeInstanceOf(LookupLeftOutError);
-    const waiting = http.getJson(`${CR}/works/10.5555/other`, { cacheKey: "k2" });
-    await new Promise((r) => setImmediate(r));
-    http.stop();
-    await expect(waiting).rejects.toMatchObject({ name: "LookupCancelledError" });
-    release?.();
-    expect(count("api.crossref.org")).toBe(1);
-  });
 });
 
 describe("the providers carry 'left out' (decision 31 b)", () => {
@@ -299,5 +271,71 @@ describe("the hold is looked at just before every send and every retry (decision
     endWait();
     await expect(bulk).resolves.toMatchObject({ message: { DOI } }); // Bulk itself is as before: it waited, then asked
     expect(count("api.crossref.org")).toBe(2);
+  });
+});
+
+/**
+ * R563 I2: callers WITHOUT the choice (Bulk Import, Zotero's batches, Find and acquire) are truly unchanged: they neither
+ * look at nor wait for a hold, and on their own 429 they do exactly what the client did at db8623b. The reference, measured
+ * by driving the db8623b client (`git show db8623b:packages/library/src/lookup/http.ts`) through the same answers on
+ * the same injected clock: ONE lookup (one getJson, the first try and 3 retries) sends 4 requests, at 0, 60, 120 and
+ * 180 s after it starts, sleeping 60 s three times (180 s in all); with 429/Retry-After 60 three times then 200 it
+ * returns the 200's answer; with 429 for ever it fails with "The metadata service answered HTTP 429".
+ */
+describe("callers without the choice are as at db8623b (decision 31 b, R563 I2)", () => {
+  const REF_TIMES = [0, 60_000, 120_000, 180_000];
+  const REF_SLEEPS = [60_000, 60_000, 60_000];
+  const RA60 = { statusCode: 429, headers: { "retry-after": "60" } };
+
+  /** An attach (with the choice) leaves a one-hour hold on Crossref; then a second passes, so no throttle slot is near. */
+  async function holdLeftByAnAttach(http: HttpClient): Promise<void> {
+    await expect(http.getJson(`${CR}/works/10.5555/attach`, { ...LEAVE, cacheKey: "attach" })).rejects.toBeInstanceOf(LookupLeftOutError);
+    now += 1_000;
+    sent = [];
+    sleeps = [];
+  }
+
+  for (const held of [false, true]) {
+    const label = held ? "with a one-hour hold left by an attach" : "with no hold";
+    it(`${label}: 429/Retry-After 60 three times, then 200: requests at 0, 60, 120, 180 s, the answer returned`, async () => {
+      answering(CR, (n) => (n === 1 && held ? { ...RA60, headers: { "retry-after": "3600" } } : n <= (held ? 4 : 3) ? RA60 : { statusCode: 200, data: fixture("crossref-work.json") }));
+      const http = client();
+      if (held) await holdLeftByAnAttach(http);
+      const start = now;
+      await expect(http.getJson(CR_URL, { cacheKey: "bulk" })).resolves.toMatchObject({ message: { DOI } });
+      expect(sent.map((s) => s.at - start)).toEqual(REF_TIMES);
+      expect(sleeps).toEqual(REF_SLEEPS);
+    });
+
+    it(`${label}: 429 for ever: requests at 0, 60, 120, 180 s, then the same failure`, async () => {
+      answering(CR, (n) => (n === 1 && held ? { ...RA60, headers: { "retry-after": "3600" } } : RA60));
+      const http = client();
+      if (held) await holdLeftByAnAttach(http);
+      const start = now;
+      const err = await http.getJson(CR_URL, { cacheKey: "bulk" }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(LookupHttpError);
+      expect((err as LookupHttpError).message).toBe("The metadata service answered HTTP 429");
+      expect(sent.map((s) => s.at - start)).toEqual(REF_TIMES);
+      expect(sleeps).toEqual(REF_SLEEPS);
+    });
+  }
+
+  it("with a one-hour hold left by an attach, a service answering normally: Bulk asks at once, five times, no wait", async () => {
+    answering(CR, (n) => (n === 1 ? { ...RA60, headers: { "retry-after": "3600" } } : { statusCode: 200, data: fixture("crossref-work.json") }));
+    const http = client();
+    await holdLeftByAnAttach(http);
+    for (let i = 1; i <= 5; i++) await http.getJson(`${CR}/works/10.5555/b${i}`, { cacheKey: `b${i}` });
+    expect(sent.length).toBe(5);
+    expect(sleeps.every((ms) => ms < 1_000)).toBe(true); // only the throttle's 200 ms gap between requests (5 a second)
+  });
+
+  it("a 2xx answer clears the host's hold, whoever received it: a call with the choice is then SENT", async () => {
+    answering(CR, (n) => (n === 1 ? { ...RA60, headers: { "retry-after": "3600" } } : { statusCode: 200, data: fixture("crossref-work.json") }));
+    const http = client();
+    await holdLeftByAnAttach(http);
+    await expect(http.getJson(`${CR}/works/10.5555/bulk`, { cacheKey: "bulk" })).resolves.toMatchObject({ message: { DOI } });
+    now += 1_000;
+    await expect(http.getJson(CR_URL, LEAVE)).resolves.toMatchObject({ message: { DOI } });
+    expect(sent.length).toBe(2);
   });
 });
