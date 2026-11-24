@@ -410,7 +410,7 @@ describe("R487 a: a look and the card's own decision", () => {
    * (R313 e), so the queue is read again — and that read is HELD BACK until `releaseRead` (or answers `readAnswer`). Every
    * held promise is released when the test ends, whatever its end.
    */
-  async function lookDuringSlowReread(readAnswer: (items: ReviewItem[]) => Response) {
+  async function lookDuringSlowReread(readAnswer: (items: ReviewItem[]) => Response, opts: { outside?: boolean; sourceId?: string } = {}) {
     let decided!: () => void;
     const decision = new Promise<void>((r) => (decided = r));
     let releaseRead: () => void = () => {};
@@ -434,7 +434,17 @@ describe("R487 a: a look and the card's own decision", () => {
       }),
     );
     const m = mockService(o);
-    render(<ReviewQueue client={m.client} projectId={P1} />);
+    const queue = <ReviewQueue client={m.client} projectId={P1} {...(opts.sourceId ? { sourceId: opts.sourceId } : {})} />;
+    render(
+      opts.outside ? (
+        <>
+          <button type="button">Elsewhere in the app</button>
+          {queue}
+        </>
+      ) : (
+        queue
+      ),
+    );
     await screen.findByRole("button", { name: `Look at the file for ${named(OTHER)}` });
     passGuard();
     const t = Date.now();
@@ -471,6 +481,39 @@ describe("R487 a: a look and the card's own decision", () => {
     s.releaseRead();
     await waitFor(() => expect(document.activeElement).toBe(card(OTHER).querySelector("h4")));
     expect(reachable(document.activeElement!)).toBe(true);
+  });
+
+  // R513 (I1): the second move (to the card's heading, once the read lands) happens only if focus is still where the first
+  // move put it (the screen's heading); focus is never taken from where the researcher has put it meanwhile.
+  it("R513 (I1): Close during a slow re-read, then focus moved to a control OUTSIDE the screen: when the read lands, focus stays on that control", async () => {
+    const s = await lookDuringSlowReread((items) => HttpResponse.json({ items, total: items.length, offset: 0, limit: 500 }), { outside: true });
+    await s.user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const heading = screen.getByRole("heading", { level: 1, name: "Review queue" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    const elsewhere = screen.getByRole("button", { name: "Elsewhere in the app" });
+    elsewhere.focus();
+    expect(document.activeElement).toBe(elsewhere);
+    s.releaseRead();
+    // The read has landed (its cards are back, the looked-at one with its heading); focus is where the researcher put it.
+    await screen.findByRole("heading", { name: "Files found for records" });
+    await waitFor(() => expect(card(OTHER).querySelector("h4")).toBeTruthy());
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
+  it("R513 (I1): Close during a slow re-read, then focus moved to another control INSIDE the screen: when the read lands, focus stays there", async () => {
+    const s = await lookDuringSlowReread((items) => HttpResponse.json({ items, total: items.length, offset: 0, limit: 500 }), { sourceId: "s8" });
+    await s.user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const heading = screen.getByRole("heading", { level: 1, name: "Review queue" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    const inside = within(screen.getByRole("main")).getByRole("link", { name: "Show every entry waiting in this project" });
+    inside.focus();
+    expect(document.activeElement).toBe(inside);
+    s.releaseRead();
+    await screen.findByRole("heading", { name: "Files found for records" });
+    await waitFor(() => expect(card(OTHER).querySelector("h4")).toBeTruthy());
+    expect(document.activeElement).toBe(inside);
   });
 
   it("FR-739 (4): the re-read finds the project locked while a look is open: the look closes and focus goes to the unlock's field, never the page", async () => {

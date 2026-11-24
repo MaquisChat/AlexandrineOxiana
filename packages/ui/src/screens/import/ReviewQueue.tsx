@@ -418,6 +418,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const readBefore = useRef(false);
   /** R313 e: after a decision was given up and the queue read again, focus goes back to that file's heading. */
   const refocusAfterRead = useRef<string | null>(null);
+  /**
+   * R513 (I1): when focus went somewhere at once and is to move again once the read lands (a look closed during the
+   * read), the element the first move put it on. The second move happens only if focus is still there: focus is never
+   * taken from where the researcher has put it meanwhile (a control inside the screen, or anything outside it). Null when
+   * the move after the read is R313 e's own (a given-up decision, whose focus was judged when it was recorded).
+   */
+  const refocusOnlyFrom = useRef<Element | null>(null);
   /** The message that nothing is waiting: focus goes there after the last decision. */
   const emptyNote = useRef<HTMLParagraphElement>(null);
 
@@ -547,9 +554,12 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         readBefore.current = true;
         setItems(list);
         const back = refocusAfterRead.current;
+        const from = refocusOnlyFrom.current;
         refocusAfterRead.current = null;
+        refocusOnlyFrom.current = null;
         // R313 e: back to that file's heading; its card is still in its place (R319 b), whether or not it still waits.
-        if (back) setFileFocus({ to: laidRef.current?.items.some((i) => i.id === back) ? back : ":title" });
+        // R513 (I1): after a look closed during the read, only if focus is still where that close put it.
+        if (back && (!from || document.activeElement === from)) setFileFocus({ to: laidRef.current?.items.some((i) => i.id === back) ? back : ":title" });
         // A waiting file is shown in full in its own section; the panel shows the first of the others.
         setCurrent(list.find((i) => !isFound(i))?.id ?? null);
         // Titles come with the items; only items sent without one need their record for the list. A waiting file's
@@ -873,6 +883,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       if (lookBack) {
         if (lookBack !== document.activeElement) lookBack.focus();
       } else (fileHeads.current.get(t.slice(LOOK_BACK.length)) ?? title.current)?.focus();
+      // R513 (I1): a move still to come once the read lands happens only from where this one put focus.
+      if (refocusAfterRead.current === t.slice(LOOK_BACK.length) && refocusOnlyFrom.current) refocusOnlyFrom.current = document.activeElement;
       return;
     }
     const el =
@@ -944,7 +956,10 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       setHeldErrors((cur) => ({ ...cur, [item.id]: HELD_NO_ANSWER_TEXT }));
       const active = document.activeElement;
       const card = fileCards.current.get(item.id);
-      if (!active || active === document.body || (!!card && card.contains(active))) refocusAfterRead.current = item.id;
+      if (!active || active === document.body || (!!card && card.contains(active))) {
+        refocusAfterRead.current = item.id;
+        refocusOnlyFrom.current = null;
+      }
       setReadKey((k) => k + 1);
     }, HELD_DECISION_TIMEOUT_MS);
     outstanding.current.set(cancel, timer);
@@ -1053,7 +1068,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     if (!ended[at.item.id] && (!list || list.some((x) => x.id === at.item.id))) {
       // FR-739 (2): the queue is being read again (its card is not there meanwhile): once the read lands, focus goes to
       // that card's heading, as after a given-up decision (R313 e); until then to the screen's heading (below).
-      if (!list) refocusAfterRead.current = at.item.id;
+      // R513 (I1): that second move only if focus is still where this close puts it (set when it is put there, below).
+      if (!list) {
+        refocusAfterRead.current = at.item.id;
+        refocusOnlyFrom.current = title.current;
+      }
       setFileFocus({ to: `${LOOK_BACK}${at.item.id}` });
       return;
     }
