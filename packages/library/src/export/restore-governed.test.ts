@@ -1283,6 +1283,9 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     "1 file is not included. It is marked as destroyed, but this computer's record of where the project's audit log ends was missing or could not be read, so the app cannot confirm that the log is complete or that the file was destroyed.";
   const TWO_ANCHOR_MISSING =
     "2 files are not included. They are marked as destroyed, but this computer's record of where the project's audit log ends was missing or could not be read, so the app cannot confirm that the log is complete or that they were destroyed.";
+  // R507 b: the same, when the recorded loss is not this computer's own since the latest restore: when, and nothing of this computer.
+  const ANCHOR_MISSING_ELSEWHERE =
+    "1 file is not included. It is marked as destroyed, but on 2026-12-02 a computer that kept this project's audit log found its record of where the log ends missing or unreadable, so the app cannot confirm that the log is complete or that the file was destroyed.";
   /** Every sentence about destroyed files in an export's notes. */
   const destroyedNotes = (notes: string) => notes.split("\n").filter((l) => /destroyed/u.test(l));
   const exported = async (projectId: string) => {
@@ -1608,6 +1611,48 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     await writeFile(join(kit.tmp, "config", "audit-anchors.json"), "not json at all");
     await kit.reopen();
     expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([ANCHOR_MISSING]);
+  });
+
+  /** A project with one file destroyed, whose record of the log's end this computer then loses (recorded at the reopen). */
+  async function anchorLostAfterDestruction(): Promise<Project> {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    await rm(join(kit.tmp, "config", "audit-anchors.json"));
+    await kit.reopen();
+    expect((await eventsOf(p.id)).filter((e) => e.action === "audit.anchor-missing").map((e) => e.device)).toEqual(["dev-A"]);
+    return p;
+  }
+
+  it("R507 b, probe P1a: the loss recorded by another computer: the library opened on a second one, whose own record never went missing, says when and claims nothing of this computer", async () => {
+    const p = await anchorLostAfterDestruction();
+    later(3 * 24 * HOUR);
+    await kit.reopen({ device: "dev-B" });
+    expect(await kit.repo.verifyAudit(p.id)).toMatchObject({ ok: false, anchored: true, alteredAt: ["2026-12-02T10:00:00.000Z"] });
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([ANCHOR_MISSING_ELSEWHERE]);
+    // On the computer that recorded it, the plain case: this computer's record.
+    await kit.reopen({ device: "dev-A" });
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([ANCHOR_MISSING]);
+  });
+
+  it("R507 b, probe P1b: the loss recorded in the project a copy was restored from, before its backup: the copy's export says when and claims nothing of this computer", async () => {
+    const p = await anchorLostAfterDestruction();
+    later(3 * 24 * HOUR);
+    const r = await restore((await backupProject(kit.repo, p.id)).path);
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([ANCHOR_MISSING_ELSEWHERE]);
+  });
+
+  it("R507 b: a loss recorded before the restore and this computer's own loss after it: one note, this computer's (true, and the files are not counted twice)", async () => {
+    const p = await anchorLostAfterDestruction();
+    later(3 * 24 * HOUR);
+    const r = await restore((await backupProject(kit.repo, p.id)).path);
+    later(HOUR);
+    await rm(join(kit.tmp, "config", "audit-anchors.json"));
+    await kit.reopen();
+    expect((await eventsOf(r.projectId)).filter((e) => e.action === "audit.anchor-missing")).toHaveLength(2);
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([ANCHOR_MISSING]);
   });
 
   it("FR-732 (1): the log changed and the record of its end lost: the log is named", async () => {

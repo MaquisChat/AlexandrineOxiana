@@ -62,6 +62,7 @@ import {
   lookupPolicyInfo,
   projectDataKey,
   projectPseudonymMap,
+  repoProjectInfo,
   pseudonymizesIdentifiable,
   repoLibrary,
   verifiedAuditEvents,
@@ -127,16 +128,19 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
  *   restoredVerified — a restore left it out on a verified record in this library (possibly another project's);
  *   restoredUnverified — a restore left it out on records the app could not verify;
  *   anchorMissing — the log itself holds together, but this computer's record of where it ends (its anchor kept
- *     outside the library) is missing or unreadable, now or when an earlier opening recorded it (`audit.anchor-missing`),
- *     so nothing is stated as fact (FR-732 1);
+ *     outside the library) is missing or unreadable now, or this computer recorded it so (`audit.anchor-missing`)
+ *     after the copy's latest restore, so nothing is stated as fact (FR-732 1, R507 b);
+ *   anchorMissingElsewhere — the same, recorded only by another computer, or before the latest restore (in the
+ *     project the copy was restored from): the note says when, and claims nothing of this computer (R507 b);
  *   logNotIntact — the project's own audit log is not whole (`Repo.verifyAudit`: its chain, its end against the
  *     anchor, no alteration of the log recorded at an earlier opening), so nothing is stated as fact.
  * Both of the last two stand for good once an earlier opening recorded the finding: the log is never rewritten, so
  * the entry that records it stays, and what was written before it cannot be vouched for again (R82).
  */
-type DestroyedBasis = "own" | "ownOrSameContent" | "restoredVerified" | "restoredUnverified" | "anchorMissing" | "logNotIntact";
-const DESTROYED_BASES: DestroyedBasis[] = ["own", "ownOrSameContent", "restoredVerified", "restoredUnverified", "anchorMissing", "logNotIntact"];
-const DESTROYED_NOTE: Record<DestroyedBasis, (n: number) => string> = {
+type DestroyedBasis = "own" | "ownOrSameContent" | "restoredVerified" | "restoredUnverified" | "anchorMissing" | "anchorMissingElsewhere" | "logNotIntact";
+const DESTROYED_BASES: DestroyedBasis[] = ["own", "ownOrSameContent", "restoredVerified", "restoredUnverified", "anchorMissing", "anchorMissingElsewhere", "logNotIntact"];
+/** `on`: for `anchorMissingElsewhere`, the dates of the recorded losses ("2026-12-02", or "2026-12-02 and 2026-12-05"). */
+const DESTROYED_NOTE: Record<DestroyedBasis, (n: number, on: string) => string> = {
   own: (n) => `${plural(n, "file was", "files were")} destroyed under the project's retention rule and ${n === 1 ? "is" : "are"} not included.`,
   ownOrSameContent: (n) =>
     n === 1
@@ -154,6 +158,10 @@ const DESTROYED_NOTE: Record<DestroyedBasis, (n: number) => string> = {
     n === 1
       ? "1 file is not included. It is marked as destroyed, but this computer's record of where the project's audit log ends was missing or could not be read, so the app cannot confirm that the log is complete or that the file was destroyed."
       : `${n} files are not included. They are marked as destroyed, but this computer's record of where the project's audit log ends was missing or could not be read, so the app cannot confirm that the log is complete or that they were destroyed.`,
+  anchorMissingElsewhere: (n, on) =>
+    n === 1
+      ? `1 file is not included. It is marked as destroyed, but on ${on} a computer that kept this project's audit log found its record of where the log ends missing or unreadable, so the app cannot confirm that the log is complete or that the file was destroyed.`
+      : `${n} files are not included. They are marked as destroyed, but on ${on} a computer that kept this project's audit log found its record of where the log ends missing or unreadable, so the app cannot confirm that the log is complete or that they were destroyed.`,
   logNotIntact: (n) =>
     n === 1
       ? "1 file is not included. It is marked as destroyed, but the project's audit log does not hold together, so the app cannot confirm it."
@@ -440,7 +448,9 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
   }
 
   /** Destroyed files by what the project's records say of them (FR-410, R365 a, R473 I2/M1/M5). */
-  const omitted: Record<DestroyedBasis, number> = { own: 0, ownOrSameContent: 0, restoredVerified: 0, restoredUnverified: 0, anchorMissing: 0, logNotIntact: 0 };
+  const omitted: Record<DestroyedBasis, number> = { own: 0, ownOrSameContent: 0, restoredVerified: 0, restoredUnverified: 0, anchorMissing: 0, anchorMissingElsewhere: 0, logNotIntact: 0 };
+  /** The dates of the recorded losses an `anchorMissingElsewhere` note gives. */
+  let lossDates = "";
   /** Read only when there is a destroyed original; before the export folder is made, so a read that fails leaves none (R473 M2). */
   let basisOf: (a: Asset) => DestroyedBasis = () => "own";
   if (allowed.some(({ sf }) => sf.assets.some((a) => a.role === "original" && a.status === "destroyed"))) {
@@ -457,7 +467,21 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
       check !== undefined &&
       (check.problem === undefined || check.problem.kind === "anchor-missing" || check.problem.kind === "anchors-unreadable") &&
       !log.events.some((e) => e.action === "audit.anchor-mismatch");
-    basisOf = log.ok && check?.ok ? destroyedBasis(log.events) : anchorOnly ? () => "anchorMissing" : () => "logNotIntact";
+    let anchorBasis: DestroyedBasis = "anchorMissing";
+    if (log.ok && anchorOnly && check?.problem === undefined) {
+      // Only recorded losses (R507 b): "this computer's" only for one this computer recorded after the latest restore;
+      // otherwise the dates the entries give, and nothing of this computer. Both kinds: the one true note of this
+      // computer, which covers the same files (never two notes for them).
+      const device = repoProjectInfo(repo, projectId).device;
+      const lastRestore = log.events.reduce((at, e, i) => (e.action === "project.restored" ? i : at), -1);
+      const losses = log.events.map((e, i) => ({ e, i })).filter(({ e }) => e.action === "audit.anchor-missing");
+      if (!losses.some(({ e, i }) => e.device === device && i > lastRestore)) {
+        anchorBasis = "anchorMissingElsewhere";
+        const dates = [...new Set(losses.map(({ e }) => formatModified(new Date(e.at), tz).slice(0, 10)))].sort();
+        lossDates = dates.length > 1 ? `${dates.slice(0, -1).join(", ")} and ${dates.at(-1)}` : (dates[0] ?? "");
+      }
+    }
+    basisOf = log.ok && check?.ok ? destroyedBasis(log.events) : anchorOnly ? () => anchorBasis : () => "logNotIntact";
   }
 
   // 2. The export folder (new; never an existing one), written as "<folder>.partial" and renamed
@@ -615,7 +639,7 @@ async function exportInner(repo: Repo, projectId: string, dest: string): Promise
         `${plural(omittedLocated, "file with a location was", "files with a location were")} left out: this project hides locations and no viewing copy without the location exists yet.`,
       );
     }
-    for (const basis of DESTROYED_BASES) if (omitted[basis]) notes.push(DESTROYED_NOTE[basis](omitted[basis]));
+    for (const basis of DESTROYED_BASES) if (omitted[basis]) notes.push(DESTROYED_NOTE[basis](omitted[basis], lossDates));
     if (notes.length) await writeFileAtomic(join(root, "notes.txt"), `${notes.join("\n")}\n`, { mode: 0o600 });
     await renameWithRetry(root, finalRoot);
   } catch (err) {
