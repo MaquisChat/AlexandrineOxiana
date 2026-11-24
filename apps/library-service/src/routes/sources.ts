@@ -283,8 +283,9 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
 
   /**
    * FR-717: the project rechecks running now (by job id), with their progress as of their last event. An entry lives
-   * from the start until the job's last event, or until the job ends without one (the library closed); a job stopped
-   * for a move keeps its entry, because it continues on the moved library.
+   * from the start until the job's last event, or until the job ends without one (the library closed). A job stopped
+   * for a move gives up its entry, so a library whose copy is never opened is not left showing it (R508 M5); its
+   * continuation, when it runs on the moved library, takes the entry up again.
    */
   const rechecks = new Map<string, { projectId: string; done: number; total: number }>();
 
@@ -311,7 +312,13 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
       state.startWork("recheck", async (ctl) => {
         let done = from;
         for (const id of ids.slice(from)) {
-          if (ctl.stopping) return () => run(done);
+          if (ctl.stopping) {
+            rechecks.delete(jobId);
+            return () => {
+              rechecks.set(jobId, entry);
+              void run(done);
+            };
+          }
           const cur = state.session;
           if (!cur) {
             rechecks.delete(jobId);
