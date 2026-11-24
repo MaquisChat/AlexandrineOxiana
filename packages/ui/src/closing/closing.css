@@ -1,0 +1,27 @@
+/* The closing window (closing.html; FR-297, R470 c): one sentence in the middle of a small window. Tokens only. */
+html,
+body {
+  height: 100%;
+}
+
+body {
+  cursor: default;
+  user-select: none;
+}
+
+.ao-closing {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: var(--space-4);
+  background: var(--bg);
+  color: var(--ink);
+  text-align: center;
+}
+
+.ao-closing p {
+  margin: 0;
+  max-width: 32em;
+}

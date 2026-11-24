@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { appProcesses, capLines, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
+import { appProcesses, capLines, CLOSING_WINDOW_TITLE, closingWindowProblems, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -33,6 +33,58 @@ describe("parseShellLine", () => {
     assert.deepEqual(parseShellLine("AO_SHELL_RELAUNCH_REQUESTED"), { kind: "relaunch-requested" });
     assert.deepEqual(parseShellLine("AO_SHELL_RELAUNCHING"), { kind: "relaunching" });
     for (const other of ["AO_SHELL_TITLE Alexandrine Oxiana", "[service] {}", "AO_SHELL_SERVICE pid=1 port=2", ""]) assert.equal(parseShellLine(other), null, other);
+  });
+
+  it("reads the closing window's reports (FR-297, R470 c)", () => {
+    assert.deepEqual(parseShellLine("AO_SHELL_CLOSING_WINDOW title=Closing Alexandrine Oxiana visible=true"), { kind: "closing-window", title: "Closing Alexandrine Oxiana", visible: true });
+    assert.deepEqual(parseShellLine("AO_SHELL_CLOSING_WINDOW title= visible=false"), { kind: "closing-window", title: "", visible: false });
+    assert.deepEqual(parseShellLine("AO_SHELL_CLOSING_PAGE Closing Alexandrine Oxiana"), { kind: "closing-page", title: "Closing Alexandrine Oxiana" });
+    assert.deepEqual(parseShellLine("AO_SHELL_CLOSING_WINDOW_CLOSED"), { kind: "closing-window-closed" });
+    assert.deepEqual(parseShellLine("AO_SHELL_CLOSING_WINDOW_FAILED"), { kind: "closing-window-failed" });
+    for (const other of ["AO_SHELL_CLOSING_WINDOW", "AO_SHELL_CLOSING_WINDOW title=x", "AO_SHELL_CLOSING_PAGE"]) assert.equal(parseShellLine(other), null, other);
+  });
+});
+
+describe("closingWindowProblems (FR-297, R470 c)", () => {
+  const close = 1_000;
+  const ev = (kind, at, extra = {}) => ({ kind, at, ...extra });
+  const shown = (at = close + 2_100, extra = {}) => ev("closing-window", at, { title: CLOSING_WINDOW_TITLE, visible: true, ...extra });
+  const page = (at = close + 2_300, title = CLOSING_WINDOW_TITLE) => ev("closing-page", at, { title });
+
+  it("accepts a window opened after two seconds, while the helpers ran, with its page, and closed by its button before they stopped", () => {
+    const events = [ev("service", 0), ev("window", 10), ev("closing", close + 50), shown(), page(), ev("closing-window-closed", close + 4_000), ev("stopped", close + 10_100, { how: "clean" })];
+    assert.deepEqual(closingWindowProblems(events, { expect: "shown", closeAt: close, closedByButton: true }), []);
+    assert.equal(CLOSING_WINDOW_TITLE, "Closing Alexandrine Oxiana");
+  });
+
+  it("names a window not opened, opened twice or too early, after the stop, with another title, invisible, without its page, or that could not be opened", () => {
+    const base = [ev("closing", close + 50), ev("stopped", close + 10_000, { how: "clean" })];
+    assert.deepEqual(closingWindowProblems(base, { expect: "shown", closeAt: close }), ["the closing window was opened 0 times", `its page did not load (no page title)`]);
+    const twice = [ev("closing", close + 50), shown(), shown(close + 2_500), page(), ev("stopped", close + 10_000)];
+    assert.deepEqual(closingWindowProblems(twice, { expect: "shown", closeAt: close }), ["the closing window was opened 2 times"]);
+    const early = [ev("closing", close + 50), shown(close + 1_500), page()];
+    assert.deepEqual(closingWindowProblems(early, { expect: "shown", closeAt: close }), ["it was opened 1500 ms after the close, before two seconds"]);
+    const late = [ev("closing", close + 50), ev("stopped", close + 2_000), shown(), page()];
+    assert.deepEqual(closingWindowProblems(late, { expect: "shown", closeAt: close }), ["it was opened after the helpers had gone"]);
+    const before = [shown(), ev("closing", close + 2_500), page()];
+    assert.deepEqual(closingWindowProblems(before, { expect: "shown", closeAt: close }), ["it was opened before the close began"]);
+    const other = [ev("closing", close + 50), shown(undefined, { title: "Alexandrine Oxiana", visible: false }), page(undefined, "Alexandrine Oxiana")];
+    assert.deepEqual(closingWindowProblems(other, { expect: "shown", closeAt: close }), ['its title is "Alexandrine Oxiana"', "it is not visible", 'its page did not load (page title "Alexandrine Oxiana")']);
+    const failed = [ev("closing", close + 50), ev("closing-window-failed", close + 2_100)];
+    assert.ok(closingWindowProblems(failed, { expect: "shown", closeAt: close }).includes("the closing window could not be opened"));
+  });
+
+  it("names a close button that changed nothing visible, or a window closed only once the helpers had gone", () => {
+    const notClosed = [ev("closing", close + 50), shown(), page(), ev("stopped", close + 10_000)];
+    assert.deepEqual(closingWindowProblems(notClosed, { expect: "shown", closeAt: close, closedByButton: true }), ["closing it by its close button did not close it"]);
+    const after = [ev("closing", close + 50), shown(), page(), ev("stopped", close + 10_000), ev("closing-window-closed", close + 10_050)];
+    assert.deepEqual(closingWindowProblems(after, { expect: "shown", closeAt: close, closedByButton: true }), ["it was closed only once the helpers had gone"]);
+  });
+
+  it("with none expected, any report of a closing window is a problem", () => {
+    assert.deepEqual(closingWindowProblems([ev("failed", 5, { message: "x" })], { expect: "none" }), []);
+    assert.deepEqual(closingWindowProblems([ev("closing", 1), shown(), page()], { expect: "none" }), ["a closing window was opened (Closing Alexandrine Oxiana)", "a closing page was loaded"]);
+    assert.deepEqual(closingWindowProblems([ev("closing-window-failed", 1)], { expect: "none" }), ["a closing window was tried"]);
   });
 });
 
