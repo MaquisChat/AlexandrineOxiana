@@ -438,6 +438,11 @@ async function destroyRawLocked(repo: Repo, hold: MaintenanceHold, projectId: st
     backupsContaining: containing.length,
     // Of the certificate's JSON (the plaintext, also when it is sealed).
     certificateSha256: res.certificateSha256,
+  }).catch((err: unknown) => {
+    // R560 I2: the destruction's own change has committed (its `retention.destroy` entry, the authority, R147, names the
+    // certificate and its sha256; nothing else reads this report line). Refused because the library is closing, it is not
+    // an error: the destruction is returned as it stands, its backups step pending (cut below, as a step is).
+    if (!(err instanceof LibraryClosedError)) throw err;
   });
   // What the change's own audit event now says of this destruction: the list this call works on.
   const audited = newAudited(projectId, basename(res.certificateRel), res.certificateSha256, res.at, toRemove, unreadable);

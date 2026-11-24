@@ -458,3 +458,92 @@ describe("a change that reaches the engine after its library was closed (FR-749,
     expect(none.json.error).toEqual({ code: "LIBRARY_OFFLINE", message: "No library is open." });
   });
 });
+
+describe("a destruction when the library closes (FR-749, R560 I2)", () => {
+  const RETAIN_GOV = `identifiability:
+  containsIdentifiable: true
+  pseudonymizeFileNames: false
+encryption:
+  atRest: optional
+consent:
+  requireLegalBasis: false
+processing:
+  metadata_lookup: []
+captureMethods: [manual_upload]
+retention:
+  rawDataDestroyAfter: 2020-01-01
+`;
+
+  /** A library with a project whose raw original is due for destruction, and one backup that holds it. */
+  async function due(): Promise<{ path: string; pid: string; assetId: string }> {
+    const { path, pid } = await libraryWithProject(RETAIN_GOV);
+    const file = join(tmp, "consent.pdf");
+    await writeFile(file, "%PDF-1.7\nsigned consent\n%%EOF\n");
+    const sf = await svc!.state.session!.repo.createSource(
+      pid,
+      { projectIds: [], type: "interview", title: { variants: [{ lang: "en", kind: "original", value: "Interview" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: file, role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "0" }, fileHashes: {}, legal: { status: "consented" }, identifiable: true } },
+    );
+    const b = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(b.status, b.body).toBe(200);
+    return { path, pid, assetId: sf.assets[0]!.id };
+  }
+
+  it("the close comes inside the destruction's own change: the answer is the destruction as it stands (200, its backups step pending), never \"nothing was changed\"; nothing changes after the close", async () => {
+    const { path, pid, assetId } = await due();
+    const h = heldSeam();
+    seams.beforeMkdir = async (abs) => {
+      if (abs.endsWith("/retention")) await h.seam();
+    };
+    const destroying = call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [assetId], confirm: true } });
+    await h.inside;
+    const closing = call({ method: "POST", url: "/libraries/close" });
+    await closingBegun();
+    h.release();
+    expect((await closing).status).toBe(200);
+    const afterClose = await snapshot(path);
+    const r = await destroying;
+    expect(r.status, r.body).toBe(200);
+    expect(r.body).not.toContain("LIBRARY_CLOSED");
+    expect(r.body).not.toContain(LIBRARY_CLOSED_TEXT);
+    expect(r.json.status).toBe("pending");
+    expect(r.json.amendments).toEqual([]);
+    expect(r.json.certificate).toMatchObject({ kind: "destruction-certificate", assets: [expect.objectContaining({ assetId })] });
+    expect(existsSync(join(path, r.json.certificateFile))).toBe(true);
+    await svc!.state.idle();
+    expect(await snapshot(path)).toEqual(afterClose);
+    // The next opening finishes the backups step.
+    seams.beforeMkdir = undefined;
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await svc!.state.runScheduledBackups(pid);
+    const list = await call({ url: `/projects/${pid}/retention/certificates` });
+    expect(list.status, list.body).toBe(200);
+    expect(list.json.certificates).toEqual([expect.objectContaining({ certificateFile: r.json.certificateFile, status: "deleted", outstanding: [] })]);
+  });
+
+  it("the close comes before the destruction's change began: 409, \"That library has been closed, so nothing was changed.\" (true there), nothing destroyed", async () => {
+    const { path, pid, assetId } = await due();
+    const repo = svc!.state.session!.repo;
+    const h = heldSeam();
+    const original = repo.getSource.bind(repo);
+    let armed = true;
+    repo.getSource = (async (...a: Parameters<typeof original>) => {
+      if (armed) {
+        armed = false;
+        await h.seam();
+      }
+      return original(...a);
+    }) as typeof original;
+    const destroying = call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [assetId], confirm: true } });
+    await h.inside;
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    const afterClose = await snapshot(path);
+    h.release();
+    const r = await destroying;
+    expect(r.status, r.body).toBe(409);
+    expect(r.json.error).toEqual({ code: "LIBRARY_CLOSED", message: LIBRARY_CLOSED_TEXT });
+    expect(await snapshot(path)).toEqual(afterClose);
+    expect(afterClose.some((l) => l.includes("/retention/destruction-"))).toBe(false);
+  });
+});

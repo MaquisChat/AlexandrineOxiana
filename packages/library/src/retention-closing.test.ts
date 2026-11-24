@@ -17,7 +17,8 @@ import type { AuditEvent, Project, SourceFile } from "@ao/core";
 import { KeyRing } from "./crypto/keys.js";
 import { shredSeams } from "./fs/shred.js";
 import { openLibrary, type Library } from "./library.js";
-import { SimulatedCrash, openTestRepo } from "./repo/testing.js";
+import { SimulatedCrash, openTestRepo, seams } from "./repo/testing.js";
+import { LibraryClosedError } from "./repo/errors.js";
 import type { Repo } from "./repo/repo.js";
 import { backupFailure, backupProject, backupSeams, restoreBackup, type BackupResult } from "./export/backup.js";
 import { addSource, makeKit, makeProject, scratchFile, walk, type Kit } from "./export/test-kit.js";
@@ -455,5 +456,64 @@ describe("the retry record's stamp of an attempt (FR-749, R558 c)", () => {
     const rec = await readDestruction(again.repo, p.id, certificatePath);
     expect(rec).toMatchObject({ status: "deleted", outstanding: [] });
     expect(Object.keys((await stateFile()).retries)).toEqual([]);
+  });
+});
+
+/**
+ * R560 I2: a close that falls between a destruction's own change (which commits: the raw data destroyed, certified, its
+ * `retention.destroy` entry in the audit log) and the report line that follows it in a second turn. The refusal of that
+ * report line by the closing is not an error: the change's own audit entry is the authority (R147); `destroyRaw` returns
+ * the destruction as it stands, its backups step pending, as for a cut step. A close before the change began still
+ * refuses the whole destruction: nothing was changed, and that is true there.
+ */
+describe("a close between a destruction's own change and its report line (FR-749, R560 I2)", () => {
+  afterEach(() => {
+    seams.beforeMkdir = undefined;
+  });
+
+  it("the destruction's change committed: destroyRaw returns it as it stands, pending; nothing changes after close(); the next opening completes the backups step", async () => {
+    const { p, sf, backups } = await withBackups(1);
+    const [a] = backups as [BackupResult];
+    // Held inside the destruction's own change (its retention folder is made there), the library closed from outside.
+    const h = hold();
+    seams.beforeMkdir = async (abs) => {
+      if (abs.endsWith("/retention")) await h.seam();
+    };
+    let closing: Promise<void> | undefined;
+    const began = h.inside.then(() => {
+      closing = kit.lib.close();
+      h.release();
+    });
+    const result = await settle(destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester"), () => closing, began);
+    expect(result).toHaveProperty("ok");
+    const r = (result as { ok: Awaited<ReturnType<typeof destroyRaw>> }).ok;
+    expect(r.status).toBe("pending");
+    expect(r.amendments).toEqual([]);
+    expect((r.certificate.assets as Array<{ assetId: string }>).map((x) => x.assetId)).toEqual([sf.assets[0]!.id]);
+    expect(existsSync(r.certificatePath)).toBe(true);
+    // The change's own entry is in the log; the report line was refused by the close (and is not needed: R147).
+    const all = await events(p);
+    expect(all.filter((e) => (e.details as { op?: string } | undefined)?.op === "retention.destroy")).toHaveLength(1);
+    expect(all.filter((e) => e.action === "retention.destroyed")).toEqual([]);
+    expect(existsSync(a.path)).toBe(true);
+
+    seams.beforeMkdir = undefined;
+    kit.clock.now = new Date(kit.clock.now.getTime() + 60_000);
+    const again = await openAgain();
+    const listed = await listDestructions(again.repo, p.id);
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toMatchObject({ status: "pending", outstanding: [rel(a)] });
+    expect(await resumeDestruction(again.repo, p.id)).toEqual([r.certificatePath]);
+    expect(existsSync(a.path)).toBe(false);
+    expect(await readDestruction(again.repo, p.id, r.certificatePath)).toMatchObject({ status: "deleted", outstanding: [], verified: true });
+  });
+
+  it("a close before the destruction's change began: refused, nothing destroyed, nothing written", async () => {
+    const { p, sf, backups } = await withBackups(1);
+    await kit.lib.close();
+    const before = await snapshot(kit.lib.root);
+    await expect(destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester")).rejects.toBeInstanceOf(LibraryClosedError);
+    expect(await snapshot(kit.lib.root)).toEqual(before);
+    expect(existsSync(backups[0]!.path)).toBe(true);
   });
 });
