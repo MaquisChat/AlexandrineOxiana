@@ -959,6 +959,31 @@ describe("fix round 1 (R140): an error before the first byte", () => {
     quietLogs();
   });
 
+  it("FR-739 (3): a picture or recording sealed under ANOTHER project's key, its project unlocked, is not 'locked': 409, the sentence for a file that cannot be decrypted", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true, "One");
+    const other = await newProject(true, "Two");
+    const png = Buffer.concat([tinyPng(), randomBytes(5000)]);
+    const pic = await sourceWith(pid, await scratch("shot.png", png), "image");
+    const rec = await sourceWith(pid, await scratch("a.mp4", randomBytes(5000)), "video");
+    const theirs = await sourceWith(other, await scratch("theirs.png", png), "image");
+    const at = async (p: string, sid: string, aid: string) => join(tmp, "Lib", ...(await svc.state.session!.repo.getSource(p, sid)).assets.find((a) => a.id === aid)!.path.split("/"));
+    const foreign = await readFile(await at(other, theirs.sid, theirs.aid));
+    await writeFile(await at(pid, pic.sid, pic.aid), foreign);
+    await writeFile(await at(pid, rec.sid, rec.aid), foreign);
+    const CANNOT = "An encrypted file could not be read (damaged, or made with another key).";
+    const r = await call({ url: `/projects/${pid}/sources/${pic.sid}/assets/${pic.aid}/content` });
+    expect([r.status, r.json]).toEqual([409, { error: { code: "CONFLICT", message: CANNOT } }]);
+    const t = await call({ method: "POST", url: ticketUrl(pid, rec.sid, rec.aid) });
+    expect([t.status, t.json]).toEqual([409, { error: { code: "CONFLICT", message: CANNOT } }]);
+    expect(r.body).not.toContain(tmp);
+    quietLogs();
+    // The lock itself answers as before.
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    expect((await call({ url: `/projects/${pid}/sources/${pic.sid}/assets/${pic.aid}/content` })).status).toBe(423);
+  });
+
   it("a lock racing the start of a request: the service's error shape, no bytes", async () => {
     let pid = "";
     await start({

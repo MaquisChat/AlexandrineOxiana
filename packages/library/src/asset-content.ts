@@ -18,6 +18,7 @@ import { constants as fsc } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { Readable } from "node:stream";
 import type { Asset } from "@ao/core";
+import { DecryptionError } from "./crypto/format.js";
 import { openDecryptedHandle, type DecryptedFile } from "./crypto/random-access.js";
 import { absPath, assertContained } from "./repo/io.js";
 import { InvalidInputError, NotFoundError } from "./repo/errors.js";
@@ -109,13 +110,18 @@ export async function openHeldFileContent(repo: Repo, projectId: string, reviewI
  * R487 e, R492 a: the project's key, asked for AT the file's opening, not taken before it: a lock asked before or at
  * the opening (by the wipe, or by the mark that hides the key from every reader at once, R386 b) refuses the read as
  * locked, and not one byte of the file's content is read under it. A lock asked AFTER the opening does not reach the
- * open handle (it holds its own copy of the key): a reading under way is ended by the caller — the document and
- * held-file routes check the lock around every read; a picture already being sent is sent to its end (FR-739).
+ * open handle (it holds its own copy of the key): a reading under way is ended by the caller — the document, held-file
+ * and picture routes check the lock around every read (FR-739).
+ *
+ * FR-739 (R435 d: only a lock is "locked"): a file sealed under another key than this project's, while the project is
+ * unlocked, is not locked — it cannot be read with this project's key: refused as a file that cannot be decrypted
+ * (DecryptionError), as a damaged one is. A locked project still throws ProjectLockedError from `projectDataKey`.
  */
 function keyAtOpening(repo: Repo, projectId: string): (keyId: string) => Uint8Array | undefined {
   return (id) => {
     const k = projectDataKey(repo, projectId);
-    return k && id === k.keyId ? k.key : undefined;
+    if (k && id !== k.keyId) throw new DecryptionError("encrypted file was made with another key");
+    return k ? k.key : undefined;
   };
 }
 
