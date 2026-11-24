@@ -124,6 +124,7 @@ import {
   backupFailureReason,
   backupFilesNow,
   backupProjectHeld,
+  backupStateExists,
   cutByClose,
   destructionNotes,
   forgetMissingBackups,
@@ -752,6 +753,8 @@ async function settleRun(repo: Repo, hold: MaintenanceHold, projectId: string, a
   const act = !opts.observeOnly;
   const before = act ? await retentionRetry(repo, key) : undefined;
   let rec = before;
+  /** No state file before this attempt's stamp (R560 M4): a put-back leaves none. */
+  let stateWasAbsent = false;
   if (act && opts.retry) {
     // Noted before anything is tried, so the back-off holds even if this attempt cannot be recorded — and an attempt
     // that brings the app down is not made again at once at every opening (R147, R558 c): a crash leaves the stamp.
@@ -762,6 +765,7 @@ async function settleRun(repo: Repo, hold: MaintenanceHold, projectId: string, a
       attemptsSinceRecord: (before?.attemptsSinceRecord ?? 0) + 1,
       ...(before?.lastFreshAt ? { lastFreshAt: before.lastFreshAt } : {}),
     };
+    stateWasAbsent = !(await backupStateExists(repo));
     await setRetentionRetry(repo, key, rec).catch(() => {});
   }
   try {
@@ -769,7 +773,8 @@ async function settleRun(repo: Repo, hold: MaintenanceHold, projectId: string, a
   } catch (err) {
     // R554, R558 c: an attempt cut by the library's close does not count: the record is put back to what it was. This
     // write belongs to the step, which the close waits for (R558 a), so it lands before the lock is released.
-    if (err instanceof StepCutByClose && rec !== before) await setRetentionRetry(repo, key, before).catch(() => {});
+    // Where there was no state file before the stamp, none is left (R560 M4).
+    if (err instanceof StepCutByClose && rec !== before) await setRetentionRetry(repo, key, before, { dropIfEmpty: stateWasAbsent }).catch(() => {});
     throw err;
   }
 

@@ -565,23 +565,37 @@ async function readState(dir: string): Promise<BackupState> {
  * already waiting for — and counted in the close's wait while it is being made (`inFlight`), so the file never changes
  * after `close()` resolved.
  */
-function editStateNow(repo: Repo, dir: string, fn: (s: BackupState) => void): Promise<void> {
+function editStateNow(repo: Repo, dir: string, fn: (s: BackupState) => void, dropIfEmpty = false): Promise<void> {
   const lib = repoLibrary(repo);
   // Checked and registered in the same tick: no gap between the check and the close's wait. Work the close already waits
   // for (a backup or a destruction's step begun while the library was open) still finishes its own writes in that wait.
   if (isClosed(lib) && !waitedForByClose(lib)) return Promise.reject(new LibraryClosedError());
-  return inFlight(lib, () => writeState(dir, fn));
+  return inFlight(lib, () => writeState(dir, fn, dropIfEmpty));
 }
 
-async function writeState(dir: string, fn: (s: BackupState) => void): Promise<void> {
+async function writeState(dir: string, fn: (s: BackupState) => void, dropIfEmpty = false): Promise<void> {
   const s = await readState(dir);
   await backupSeams.stateWrite?.();
   fn(s);
+  // R560 M4: a record put back where there was no state file before leaves none, when nothing else is kept in it.
+  if (dropIfEmpty && isEmptyState(s)) {
+    await fsp.rm(join(dir, BACKUPS_STATE), { force: true });
+    return;
+  }
   // Written only when it holds something (R379): a library with no such note keeps the file as before.
   const { oldCopiesUndestroyed, ...rest } = s;
   const out = Object.keys(oldCopiesUndestroyed).length ? s : rest;
   await fsp.mkdir(dir, { recursive: true });
   await writeFileAtomic(join(dir, BACKUPS_STATE), `${JSON.stringify(out, null, 2)}\n`, { mode: 0o600 });
+}
+
+/** Nothing is kept in the state: as a library with no state file reads. */
+const isEmptyState = (s: BackupState): boolean =>
+  [s.owners, s.failures, s.pending, s.undestroyed, s.destructionProblems, s.retries, s.oldCopiesUndestroyed].every((x) => Object.keys(x).length === 0);
+
+/** Package-internal (retention, R560 M4): whether the state file is there now. */
+export async function backupStateExists(repo: Repo): Promise<boolean> {
+  return exists(join(backupsDir(repo), BACKUPS_STATE));
 }
 
 /** The recorded failure of the project's last backup (the warning `backup-failed`), if any. */
@@ -591,10 +605,10 @@ export async function backupFailure(repo: Repo, projectId: string): Promise<Back
 }
 
 /** Edits the state (in the manifest's queue, so writes never interleave). */
-function withState(repo: Repo, fn: (s: BackupState) => void): Promise<void> {
+function withState(repo: Repo, fn: (s: BackupState) => void, opts: { dropIfEmpty?: boolean } = {}): Promise<void> {
   const dir = backupsDir(repo);
   const prev = manifestLocks.get(dir) ?? Promise.resolve();
-  const run = prev.then(() => editStateNow(repo, dir, fn));
+  const run = prev.then(() => editStateNow(repo, dir, fn, opts.dropIfEmpty === true));
   manifestLocks.set(
     dir,
     run.catch(() => {}),
@@ -1250,6 +1264,8 @@ async function backupRun(repo: Repo, projectId: string, opts: BackupOptions, hol
   let made: { entry: BackupEntry; project: Project };
   /** The pending record exists. */
   let recorded = false;
+  /** There was no state file before this backup's pending record (R560 M4). */
+  let stateWasAbsent = false;
   /** The commit could not be confirmed either way: the pending record stays for the audit log to decide. */
   let undecided = false;
   const temps: string[] = [];
@@ -1261,6 +1277,7 @@ async function backupRun(repo: Repo, projectId: string, opts: BackupOptions, hol
     const entity = { type: "project" as const, id: projectId };
     // Recorded first, so an interruption from here on is settled (and shown) later.
     activeOps.add(backupId);
+    stateWasAbsent = !(await exists(join(dir, BACKUPS_STATE)));
     await withState(repo, (s) => {
       s.pending[backupId] = { kind: "create", projectId, at: repoClock(repo)().toISOString() };
     });
@@ -1404,9 +1421,14 @@ async function backupRun(repo: Repo, projectId: string, opts: BackupOptions, hol
       // Nothing was committed (a committed backup does not get here): anything left of it goes.
       const p = (await readState(dir)).pending[backupId];
       if (p?.kind === "create") await discardArchive(dir, p).catch(() => {});
-      await withState(repo, (s) => {
-        delete s.pending[backupId];
-      }).catch(() => {});
+      // R560 M4: cut by the close where there was no state file before: none is left.
+      await withState(
+        repo,
+        (s) => {
+          delete s.pending[backupId];
+        },
+        { dropIfEmpty: stateWasAbsent && cutByClose(err) },
+      ).catch(() => {});
     }
     // R551 I2: cut by a close: neither a success nor a failure is recorded; whoever asked reads the one sentence.
     if (cutByClose(err)) throw err instanceof BackupCancelledError ? err : new BackupCancelledError(projectName);
@@ -1743,11 +1765,15 @@ export async function retentionRetry(repo: Repo, key: string): Promise<Retention
   return Object.hasOwn(r, key) ? r[key] : undefined;
 }
 
-export function setRetentionRetry(repo: Repo, key: string, rec: RetentionRetry | undefined): Promise<void> {
-  return withState(repo, (s) => {
-    if (rec) s.retries[key] = rec;
-    else delete s.retries[key];
-  });
+export function setRetentionRetry(repo: Repo, key: string, rec: RetentionRetry | undefined, opts: { dropIfEmpty?: boolean } = {}): Promise<void> {
+  return withState(
+    repo,
+    (s) => {
+      if (rec) s.retries[key] = rec;
+      else delete s.retries[key];
+    },
+    opts,
+  );
 }
 
 /** Package-internal: an error's message in plain words, paths in the library scrubbed (its class name when it has none). */

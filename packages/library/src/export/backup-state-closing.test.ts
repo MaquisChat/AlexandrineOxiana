@@ -25,6 +25,7 @@ afterEach(async () => {
   retentionSeams.beforeNotes = undefined;
   backupSeams.stateWrite = undefined;
   backupSeams.crashAt = undefined;
+  backupSeams.afterSnapshot = undefined;
   await kit.close().catch(() => {});
 });
 
@@ -205,5 +206,27 @@ describe("the manifest and an interrupted backup once the library is closed (FR-
     const state = JSON.parse(await readFile(statePath(), "utf8")) as { pending: Record<string, unknown>; failures: Record<string, unknown> };
     expect(state.pending).toEqual({});
     expect(Object.keys(state.failures)).toEqual([p.id]);
+  });
+});
+
+/** R560 M4: where there was no state file before, a backup cut by the close takes its pending record back by removing the file again. */
+describe("no state file before a cut (FR-749, R560 M4)", () => {
+  it("a first backup cut by the close: the state file is absent afterwards, as it was before", async () => {
+    const p = await makeProject(kit, GOV, false, "Keels");
+    expect(existsSync(statePath())).toBe(false);
+    const g = gate();
+    backupSeams.afterSnapshot = g.wait;
+    const backingUp = backupProject(kit.repo, p.id).then(
+      () => "made",
+      (e: unknown) => (e instanceof Error ? e.name : String(e)),
+    );
+    await g.inside;
+    const closing = kit.lib.close();
+    g.open();
+    await closing;
+    const afterClose = await snapshot(kit.lib.root);
+    expect(await backingUp).toBe("BackupCancelledError");
+    expect(await snapshot(kit.lib.root)).toEqual(afterClose);
+    expect(existsSync(statePath())).toBe(false);
   });
 });

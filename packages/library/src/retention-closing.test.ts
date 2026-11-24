@@ -10,7 +10,7 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
 import type { AuditEvent, Project, SourceFile } from "@ao/core";
@@ -466,6 +466,35 @@ describe("the retry record's stamp of an attempt (FR-749, R558 c)", () => {
  * the destruction as it stands, its backups step pending, as for a cut step. A close before the change began still
  * refuses the whole destruction: nothing was changed, and that is true there.
  */
+describe("no state file before a cut retry attempt (FR-749, R560 M4)", () => {
+  it("the retry's stamp made the state file; the close cuts the attempt: putting the record back removes the file again", async () => {
+    const { p, sf, backups } = await withBackups(1);
+    const [x] = backups as [BackupResult];
+    // The destruction could remove neither X nor make its fresh backup: a retry later tries both.
+    shredSeams.failFor = (path) => path.endsWith(`/${nameOf(x)}`);
+    backupSeams.failBackup = true;
+    const r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    shredSeams.failFor = undefined;
+    expect(r.status).toBe("pending");
+    // The app's bookkeeping removed by hand (R147: the audit log is the authority; the retry is due at once).
+    const statePath = join(kit.lib.root, "Backups", "backups-state.json");
+    await rm(statePath);
+    kit.clock.now = new Date(kit.clock.now.getTime() + HOUR);
+    const h = hold();
+    backupSeams.afterSnapshot = h.seam;
+    let closing: Promise<void> | undefined;
+    const began = h.inside.then(() => {
+      closing = kit.lib.close();
+      h.release();
+    });
+    const result = await settle(resumeDestruction(kit.repo, p.id), () => closing, began);
+    expect(result).toEqual({ ok: [] });
+    expect(existsSync(statePath)).toBe(false);
+    expect(existsSync(x.path)).toBe(true);
+  });
+});
+
 describe("a close between a destruction's own change and its report line (FR-749, R560 I2)", () => {
   afterEach(() => {
     seams.beforeMkdir = undefined;
