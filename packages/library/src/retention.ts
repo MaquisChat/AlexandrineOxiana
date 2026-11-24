@@ -485,8 +485,11 @@ function statusOf(a: Audited): BackupsStepStatus {
 /** Lines of the audit log worth parsing for this: the destruction and backups-step events, and backups made. */
 const NEEDLES = ['"retention.', '"backup.create"'] as const;
 
-/** Test seam (R47): runs after the audit view is taken (`scan`), only while NODE_ENV is "test". */
-export const retentionSeams: { afterScan?: (projectId: string) => Promise<void> } = {};
+/** Test seams (R47), only while NODE_ENV is "test": after the audit view is taken (`scan`); before a pass writes its notes (R555 4 probes). */
+export const retentionSeams: { afterScan?: (projectId: string) => Promise<void>; beforeNotes?: (which: "destruction" | "old-copies") => Promise<void> } = {};
+const testSeam = async <A>(seam: ((a: A) => Promise<void>) | undefined, a: A) => {
+  if (seam && process.env.NODE_ENV === "test") await seam(a);
+};
 
 /** A cheap pass over the audit log for the destructions it records, and whether the log is as this process left it. */
 async function scan(repo: Repo, projectId: string): Promise<{ list: Audited[]; certificateHashes: Set<string>; headMatches: boolean }> {
@@ -1136,10 +1139,9 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
     // It could not be checked: the notes are not rewritten this time, and the next pass checks again.
     throw firstError ?? err;
   }
-  // R554: written only while the library is open, and waited for by its close.
-  await inFlight(lib, async () => {
-    if (!isClosed(lib)) await setDestructionNotes(repo, projectId, notes).catch(() => {});
-  });
+  // A closed library's state file is not written (R555 4, at its one writer): refused, this is "cannot run now".
+  await testSeam(retentionSeams.beforeNotes, "destruction");
+  await setDestructionNotes(repo, projectId, notes).catch(() => {});
   if (firstError !== undefined) throw firstError;
   return out;
 }
@@ -1730,6 +1732,7 @@ async function syncOldCopies(
   if (leaving.length && !(await logHolds().catch(() => false))) {
     for (const [rel, n] of leaving) notes[rel] = { copies: [...(notes[rel]?.copies ?? []), ...n.copies.filter((c) => !notes[rel]?.copies.some((x) => x.id === c.id))], ...(n.unchecked || notes[rel]?.unchecked ? { unchecked: true as const } : {}) };
   }
+  await testSeam(retentionSeams.beforeNotes, "old-copies");
   await setOldCopiesNotes(repo, projectId, notes).catch(() => {});
   // Records of old copies the app deleted, kept to be looked at (R409 a): dropped once nothing of the library is left there and no destruction names them.
   const lib = repoLibrary(repo);

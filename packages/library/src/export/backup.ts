@@ -76,6 +76,7 @@
  * (`project.backups.automatic`, default on), the project is unlocked, and the last backup is a day
  * old (or there is none).
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -172,6 +173,8 @@ export const backupSeams: {
   beforeCommit?: (hold: MaintenanceHold) => Promise<void>;
   /** Runs before each piece of the zip is written to its temp file (R551 I2 probes: a close in the middle of the zip). */
   zipChunk?: () => Promise<void>;
+  /** Runs inside each write of the state file, before it is written (R555 4 probes: a close while one is being made). */
+  stateWrite?: () => Promise<void>;
 } = {};
 
 function crashPoint(point: BackupCrashPoint): void {
@@ -216,12 +219,35 @@ export function inFlight<T>(lib: Library, run: () => Promise<T>): Promise<T> {
     backupsInFlight.set(lib, mine);
     onClose(lib, { drain: async () => void (await Promise.allSettled([...mine])), holdsTurn: () => false });
   }
-  const p = run();
+  const work: InFlightWork = { lib, beganOpen: !isClosed(lib), live: true };
+  const p = inFlightWork.run(work, run);
   const held = set;
-  const forget = () => void held.delete(p);
+  const forget = () => {
+    work.live = false;
+    held.delete(p);
+  };
   held.add(p);
   p.then(forget, forget);
   return p;
+}
+
+/**
+ * R555 4: the work in flight the current code runs for. Work that began while its library was open is what the close
+ * is waiting for: its own last writes of the state file (a cut backup taking back its pending record; a destruction's
+ * step) land before `close()` resolves. A callback that outlives the work carries this context, so `live` says whether
+ * the work is still running.
+ */
+interface InFlightWork {
+  lib: Library;
+  beganOpen: boolean;
+  live: boolean;
+}
+const inFlightWork = new AsyncLocalStorage<InFlightWork>();
+
+/** True while the current code runs for work of `lib` that the close waits for (begun while the library was open). */
+function waitedForByClose(lib: Library): boolean {
+  const w = inFlightWork.getStore();
+  return w !== undefined && w.lib === lib && w.beganOpen && w.live;
 }
 
 /** A close (or the session's closing) cut the backup: the library refused a step, or the backup saw it between steps. Package-internal (retention, R554). */
@@ -520,9 +546,23 @@ async function readState(dir: string): Promise<BackupState> {
   }
 }
 
-/** Reads, edits and writes the state; the caller holds the manifest's queue. */
-async function editStateNow(dir: string, fn: (s: BackupState) => void): Promise<void> {
+/**
+ * Reads, edits and writes the state; the caller holds the manifest's queue. The one writer of the state file (R555 4):
+ * refused once the library is closed (LibraryClosedError, "cannot run now" for every caller) — except by work the close is
+ * already waiting for — and counted in the close's wait while it is being made (`inFlight`), so the file never changes
+ * after `close()` resolved.
+ */
+function editStateNow(repo: Repo, dir: string, fn: (s: BackupState) => void): Promise<void> {
+  const lib = repoLibrary(repo);
+  // Checked and registered in the same tick: no gap between the check and the close's wait. Work the close already waits
+  // for (a backup or a destruction's step begun while the library was open) still finishes its own writes in that wait.
+  if (isClosed(lib) && !waitedForByClose(lib)) return Promise.reject(new LibraryClosedError());
+  return inFlight(lib, () => writeState(dir, fn));
+}
+
+async function writeState(dir: string, fn: (s: BackupState) => void): Promise<void> {
   const s = await readState(dir);
+  await backupSeams.stateWrite?.();
   fn(s);
   // Written only when it holds something (R379): a library with no such note keeps the file as before.
   const { oldCopiesUndestroyed, ...rest } = s;
@@ -541,7 +581,7 @@ export async function backupFailure(repo: Repo, projectId: string): Promise<Back
 function withState(repo: Repo, fn: (s: BackupState) => void): Promise<void> {
   const dir = backupsDir(repo);
   const prev = manifestLocks.get(dir) ?? Promise.resolve();
-  const run = prev.then(() => editStateNow(dir, fn));
+  const run = prev.then(() => editStateNow(repo, dir, fn));
   manifestLocks.set(
     dir,
     run.catch(() => {}),
@@ -982,7 +1022,7 @@ function reserveName(repo: Repo, backupId: string, wanted: string, tmp?: string)
   return underManifestLock(repo, async () => {
     const taken = await namesIn(dir);
     let out = wanted;
-    await editStateNow(dir, (s) => {
+    await editStateNow(repo, dir, (s) => {
       const reserved = new Set(
         Object.entries(s.pending).flatMap(([id, op]) => (id !== backupId && op.kind === "create" && op.file ? [foldName(op.file)] : [])),
       );
@@ -1421,7 +1461,7 @@ async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise
       const out: string[] = [];
       if (!doomed.length) return out;
       // Recorded before the first removal, so a crash cannot lose the record of it.
-      await editStateNow(dir, (s) => {
+      await editStateNow(repo, dir, (s) => {
         s.pending[pruneId] = { kind: "prune", projectId, at: repoClock(repo)().toISOString(), files: doomed, keep };
       });
       try {
