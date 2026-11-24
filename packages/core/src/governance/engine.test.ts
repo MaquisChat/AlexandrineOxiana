@@ -196,12 +196,21 @@ describe("move", () => {
   it("allows an allowed destination", () => {
     expect(evaluate(cfg(), mv("device")).result).toBe("allow");
   });
+  it("a refusal names neither the project's id nor an internal kind (FR-030): the project's name is shown beside it", () => {
+    const r = denyReason(evaluate(cfg(), mv("cloud")));
+    expect(r).not.toContain("proj-1");
+    expect(r).not.toMatch(/\bcloud\b(?! service)/);
+  });
+  it("R473 M4: a destination whose kind was only guessed is said to be one it may be, in plain words", () => {
+    const r = denyReason(evaluate(cfg(), req({ action: "move", move: { destination: "cloud_folder", uncertain: true } })));
+    expect(r).toBe("The library's new place may be a cloud-synced folder; this project's rules do not allow its data there.");
+  });
   it("denies a destination that is not allowed", () => {
-    expect(denyReason(evaluate(cfg(), mv("cloud")))).toBe("Destination cloud is not permitted for project proj-1");
+    expect(denyReason(evaluate(cfg(), mv("cloud")))).toBe("The library would be moved to a cloud service; this project's rules do not allow its data there.");
   });
   it("denies cloud_folder when it is not in residency.allowed even if the folder is approved", () => {
     const c = cfg("residency: { approvedCloudFolders: [f1] }");
-    expect(denyReason(evaluate(c, mv("cloud_folder", "f1")))).toBe("Destination cloud_folder is not permitted for project proj-1");
+    expect(denyReason(evaluate(c, mv("cloud_folder", "f1")))).toBe("The library would be moved to a cloud-synced folder; this project's rules do not allow its data there.");
   });
   const cloudOk = "residency: { allowed: [device, cloud_folder] }\n";
   it("allows any cloud folder for non-HIPAA when no approved list is set", () => {
@@ -211,17 +220,17 @@ describe("move", () => {
     const c = cfg("residency: { allowed: [device, cloud_folder], approvedCloudFolders: [f1] }");
     expect(c.residency.approvedCloudFolders).toEqual(["f1"]);
     expect(evaluate(c, mv("cloud_folder", "f1")).result).toBe("allow");
-    expect(denyReason(evaluate(c, mv("cloud_folder", "f2")))).toBe("Cloud folder f2 is not on this project's approved list");
+    expect(denyReason(evaluate(c, mv("cloud_folder", "f2")))).toBe("The library would be moved to a cloud-synced folder that is not on this project's list of approved cloud folders.");
   });
   it("under HIPAA denies an unapproved folder and allows an approved one", () => {
     const c = cfg("profiles: [hipaa]\nsharing: { locationMetadata: strip }\nresidency: { allowed: [device, cloud_folder], approvedCloudFolders: [f1] }");
     expect(evaluate(c, mv("cloud_folder", "f1")).result).toBe("allow");
-    expect(denyReason(evaluate(c, mv("cloud_folder", "f2")))).toBe("Cloud folder f2 is not on this project's approved list");
-    expect(denyReason(evaluate(c, mv("cloud_folder")))).toContain("is not on this project's approved list");
+    expect(denyReason(evaluate(c, mv("cloud_folder", "f2")))).toBe("The library would be moved to a cloud-synced folder that is not on this project's list of approved cloud folders.");
+    expect(denyReason(evaluate(c, mv("cloud_folder")))).toBe("The library would be moved to a cloud-synced folder that is not on this project's list of approved cloud folders.");
   });
   it("under HIPAA with no approved folders cloud_folder is not permitted", () => {
     const c = cfg("profiles: [hipaa]\nresidency: { allowed: [device, cloud_folder] }");
-    expect(denyReason(evaluate(c, mv("cloud_folder", "f1")))).toBe("Destination cloud_folder is not permitted for project proj-1");
+    expect(denyReason(evaluate(c, mv("cloud_folder", "f1")))).toBe("The library would be moved to a cloud-synced folder; this project's rules do not allow its data there.");
   });
 });
 
@@ -276,7 +285,7 @@ describe("backup (R125): a full copy of the project written to <Library>/Backups
     expect(evaluate(cfg("encryption: { atRest: optional }"), bk(at("moon"))).result).toBe("deny");
   });
   it("the move rules are unchanged by the shared residency check", () => {
-    expect(denyReason(evaluate(cfg(), req({ action: "move", move: { destination: "network" } })))).toBe("Destination network is not permitted for project proj-1");
+    expect(denyReason(evaluate(cfg(), req({ action: "move", move: { destination: "network" } })))).toBe("The library would be moved to a network drive; this project's rules do not allow its data there.");
   });
 });
 

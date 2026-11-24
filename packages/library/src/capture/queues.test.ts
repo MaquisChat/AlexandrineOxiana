@@ -79,6 +79,7 @@ describe("CaptureQueueRegistry", () => {
       newlyUnavailable: 0,
       reappeared: 0,
       edited: 0,
+      editsNotChecked: 0,
       items: [{ url: IG, status: "created" }],
       errorCode: "RATE_LIMITED",
       reason: "The platform is limiting requests, so the profile capture was paused.",

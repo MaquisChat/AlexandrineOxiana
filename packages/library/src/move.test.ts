@@ -729,7 +729,8 @@ residency:
     expect(plan.destination).toEqual({ kind: "device", certain: false });
     const db = plan.perProject.find((p) => p.projectId === b.id)!.decision;
     expect(db.result).toBe("deny");
-    expect(db.result === "deny" && db.reason).toMatch(/^Destination type could not be determined/);
+    // Said as what it may be, in plain words, with no internal name (R473 M4).
+    expect(db.result === "deny" && db.reason).toBe("The library's new place may be a removable drive; this project's rules do not allow its data there.");
     // A project allowing device and removable but not network is denied too.
     expect(plan.perProject.find((p) => p.projectId === a.id)!.decision.result).toBe("deny");
     const certain = await planMove(lib, join(tmp, "Dest"), env);

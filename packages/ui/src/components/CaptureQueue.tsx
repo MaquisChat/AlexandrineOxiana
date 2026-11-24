@@ -12,6 +12,7 @@
  * can be read again.
  */
 import { useId } from "react";
+import { editsNotCheckedText } from "@ao/shared";
 import { itemExplanation, queueCounts, type CaptureQueueState, type ItemState, type ProfileReport } from "../api/capture";
 import { MissingToolNotice } from "./MissingToolNotice";
 import { UserText } from "./UserText";
@@ -50,10 +51,12 @@ function reportSummary(r: ProfileReport): string {
   if (r.reappeared) parts.push(`${plural(r.reappeared, "post")} back on the platform`);
   if (r.edited) parts.push(`${plural(r.edited, "post")} edited since the last capture`);
   const lead = r.status === "completed" ? "Finished:" : r.status === "paused-rate-limited" ? "Paused:" : "Stopped:";
-  return `${lead} ${parts.join(", ")}.`;
+  // Known posts whose caption looks edited but whose own data could not be fetched (FR-106), said as
+  // the command line and the report file say it (R473 M6).
+  return `${lead} ${parts.join(", ")}.${r.editsNotChecked ? ` ${editsNotCheckedText(r.editsNotChecked)}` : ""}`;
 }
 
-const hasCounts = (r: ProfileReport) => r.created + r.duplicates + r.incomplete + r.failed + r.newlyUnavailable + r.reappeared + r.edited > 0;
+const hasCounts = (r: ProfileReport) => r.created + r.duplicates + r.incomplete + r.failed + r.newlyUnavailable + r.reappeared + r.edited + (r.editsNotChecked ?? 0) > 0;
 
 /** "Of 3 links: 1 done, 1 failed, 1 not known." — only what was seen. */
 function countsLine(q: CaptureQueueState, unit: string): string {

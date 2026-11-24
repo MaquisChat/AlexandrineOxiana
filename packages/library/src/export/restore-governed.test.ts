@@ -14,7 +14,7 @@ import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { strToU8, unzipSync, zipSync } from "fflate";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sealEvent, verifyChain, type AuditEvent, type Project, type SourceFile } from "@ao/core";
 import { shredSeams } from "../fs/shred.js";
 import type { LocationEnv } from "../location.js";
@@ -39,6 +39,7 @@ import {
   type RestoreOptions,
   type RestoreResult,
 } from "./backup.js";
+import { exportProjectOpenFormats } from "./project-export.js";
 import { OPEN_GOV, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./test-kit.js";
 
 type Restored = RestoreResult;
@@ -602,6 +603,20 @@ async function rewriteAudit(p: Project, edit: (e: AuditEvent) => void): Promise<
     return JSON.stringify(sealed);
   });
   await writeFile(join(dir, names[0]!), `${lines.join("\n")}\n`);
+}
+
+/**
+ * After `rewriteAudit`: records the rewritten log's head as its anchor, as the app that wrote it would have, so that
+ * the reopen takes the log as whole (an entry in an earlier form, not a change made outside the app).
+ */
+async function reanchor(p: Project): Promise<void> {
+  const file = join(kit.tmp, "config", "audit-anchors.json");
+  const j = JSON.parse(await readFile(file, "utf8")) as { anchors: Record<string, { seq: number; hash: string }> };
+  const key = Object.keys(j.anchors).find((k) => k.endsWith(`/${p.id}`));
+  expect(key).toBeDefined();
+  const last = (await auditEvents(kit, kit.repo.getProject(p.id))).at(-1)!;
+  j.anchors[key!] = { ...j.anchors[key!], seq: last.seq, hash: last.hash };
+  await writeFile(file, JSON.stringify(j));
 }
 
 /** Changes one entry of the project's audit log on disk (not the last): the chain no longer verifies. Returns how to put it back. */
@@ -1245,5 +1260,307 @@ describe("4. a restored project's warning about inherited backups stands from th
     expect(left).toEqual([d.p.id, copy].sort());
     expect(await projectWarnings(kit.repo, copy)).toContain(WARNING);
     expect(await holdingNotRemoved(kit.repo, copy)).toEqual([rel(d.x)]);
+  });
+});
+
+describe("FR-410: exporting a restored copy states a destruction as fact only where the log vouches for it", () => {
+  /** RETAIN, with identifiable sources exportable, so the export reaches the raw file's source. */
+  const RETAIN_EXPORTABLE = RETAIN.replace("deidentifiedExportsOnly: true", "deidentifiedExportsOnly: false");
+  const notesOf = async (dir: string) => readFile(join(dir, "notes.txt"), "utf8").catch(() => "");
+  // The four sentences (R473 I2, M5): each says no more than its evidence gives.
+  const RESTORED_UNVERIFIED =
+    "1 file is not included. It was left out when this project was restored from a backup, because records the app could not verify name it as destroyed.";
+  const RESTORED_VERIFIED = "1 file is not included. It was left out when this project was restored from a backup, because a verified record in this library shows it was destroyed.";
+  const LOG_NOT_INTACT = "1 file is not included. It is marked as destroyed, but the project's audit log does not hold together, so the app cannot confirm it.";
+  const TWO_UNVERIFIED =
+    "2 files are not included. They were left out when this project was restored from a backup, because records the app could not verify name them as destroyed.";
+  const OWN_RULE = "1 file was destroyed under the project's retention rule and is not included.";
+  /** Every sentence about destroyed files in an export's notes. */
+  const destroyedNotes = (notes: string) => notes.split("\n").filter((l) => /destroyed/u.test(l));
+  const exported = async (projectId: string) => {
+    later(1000);
+    return exportProjectOpenFormats(kit.repo, projectId, join(kit.tmp, `out-${kit.clock.now.getTime()}`));
+  };
+
+  /**
+   * Probe A's set-up: Origin holds two raw files; Bystander's file has the bytes of the first and is
+   * destroyed on a log then damaged; Origin destroys its second after the offline backup was made.
+   */
+  async function mixed(encrypted = false) {
+    const z = await makeProject(kit, RETAIN_EXPORTABLE, encrypted, "Bystander");
+    const zRaw = await rawSource(z);
+    await addSource(kit, z, { title: "something else" });
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, encrypted, "Origin");
+    await rawSource(p);
+    const second = await rawSource(p, "RAW second interview bytes");
+    await keptSource(p);
+    at("2026-12-02T09:59:00.000Z");
+    const made = (await backupProject(kit.repo, p.id)).path;
+    const offline = join(kit.tmp, `Origin offline copy.zip${made.endsWith(".enc") ? ".enc" : ""}`);
+    await writeFile(offline, await readFile(made));
+    at("2026-12-02T10:00:00.000Z");
+    backupSeams.failBackup = true;
+    await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+    await destroyRaw(kit.repo, p.id, [second.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    await breakAudit(z, (l) => l.includes('"op":"retention.destroy"'));
+    return { p, offline };
+  }
+
+  it("a file left out on records nothing vouches for: the export says it was left out at the restore, on records the app could not verify", async () => {
+    const z = await makeProject(kit, RETAIN_EXPORTABLE, false, "Bystander");
+    const zRaw = await rawSource(z); // the same bytes as Origin's raw file
+    await addSource(kit, z, { title: "something else" });
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T09:59:00.000Z");
+    const offline = join(kit.tmp, "Origin offline copy.zip");
+    await writeFile(offline, await readFile((await backupProject(kit.repo, p.id)).path));
+    at("2026-12-02T10:00:00.000Z");
+    backupSeams.failBackup = true;
+    await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    await breakAudit(z, (l) => l.includes('"op":"retention.destroy"'));
+    const r = await restore(offline);
+    expect(r.leftOut).toEqual([expect.objectContaining({ unverified: true })]);
+    // The restore names the copy's file it left out on unverified ground (ids only).
+    expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ destroyedUnverifiedAssetIds: [r.leftOut[0]!.assetId] });
+
+    const out = await exported(r.projectId);
+    expect(destroyedNotes(await notesOf(out.path))).toEqual([RESTORED_UNVERIFIED]);
+    expect(out.omittedFiles).toBe(1);
+
+    // A backup of the copy, restored: the file keeps its mark (an earlier restore named it).
+    later(HOUR);
+    const again = await restore((await backupProject(kit.repo, r.projectId)).path);
+    expect(destroyedNotes(await notesOf((await exported(again.projectId)).path))).toEqual([RESTORED_UNVERIFIED]);
+  });
+
+  it("a file left out on a verified record is said to have been left out at the restore; once the copy's log is damaged nothing is stated as fact", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T09:59:00.000Z");
+    const offline = join(kit.tmp, "Origin offline copy.zip");
+    await writeFile(offline, await readFile((await backupProject(kit.repo, p.id)).path));
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    const r = await restore(offline);
+    expect(r.leftOut).toEqual([expect.not.objectContaining({ unverified: true })]);
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([RESTORED_VERIFIED]);
+
+    // The copy's log changed outside the app: no destruction is stated as fact any more.
+    await breakAudit(kit.repo.getProject(r.projectId), (l) => l.includes('"op":"project.restore"'));
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([LOG_NOT_INTACT]);
+  });
+
+  it("probe A: one file on a verified record beside one on records nothing vouches for, three restores deep: each keeps its own sentence", async () => {
+    const { offline } = await mixed();
+    let r = await restore(offline);
+    expect(r.leftOut).toHaveLength(2);
+    for (let generation = 1; generation <= 3; generation++) {
+      const out = await exported(r.projectId);
+      expect(destroyedNotes(await notesOf(out.path)).sort()).toEqual([RESTORED_VERIFIED, RESTORED_UNVERIFIED].sort());
+      expect(out.omittedFiles).toBe(2);
+      later(HOUR);
+      if (generation < 3) r = await restore((await backupProject(kit.repo, r.projectId)).path);
+    }
+  });
+
+  it("probe C: the same in an encrypted project", async () => {
+    const { offline } = await mixed(true);
+    const r = await restore(offline);
+    const out = await exported(r.projectId);
+    expect(destroyedNotes(await notesOf(out.path)).sort()).toEqual([RESTORED_VERIFIED, RESTORED_UNVERIFIED].sort());
+  });
+
+  it("probe B's ground: the project's own destruction, its log whole, then damaged", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([OWN_RULE]);
+    await breakAudit(p, (l) => l.includes('"op":"retention.destroy"'));
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([LOG_NOT_INTACT]);
+  });
+
+  it("M2: a read of the log that fails leaves no half-made export folder in the destination", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    const dest = join(kit.tmp, "out-m2");
+    await mkdir(dest);
+    const read = vi.spyOn(AuditStore, "read").mockRejectedValue(Object.assign(new Error("I/O error"), { code: "EIO" }));
+    try {
+      await expect(exportProjectOpenFormats(kit.repo, p.id, dest)).rejects.toThrow("The export could not be completed (EIO)");
+    } finally {
+      read.mockRestore();
+    }
+    expect(await readdir(dest)).toEqual([]);
+  });
+
+  it("a file destroyed before the backup was made: its copy's export still says the project's retention rule destroyed it", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    later(HOUR);
+    const r = await restore((await backupProject(kit.repo, p.id)).path);
+    expect(r.leftOut).toEqual([]);
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([OWN_RULE]);
+  });
+
+  /** Removes lines of the project's audit log on disk (the last line, or another): the app finds the log cut. */
+  async function cutAudit(p: Project, pick: (lines: string[]) => number): Promise<AuditEvent> {
+    const dir = join(kit.lib.root, kit.repo.getProject(p.id).folder, "audit");
+    const segment = join(dir, (await readdir(dir)).sort().at(-1)!);
+    const lines = (await readFile(segment, "utf8")).split("\n").filter((l) => l.trim());
+    const i = pick(lines);
+    const [cut] = lines.splice(i, 1);
+    await writeFile(segment, `${lines.join("\n")}\n`);
+    return JSON.parse(cut!) as AuditEvent;
+  }
+
+  it("S-I1 (R484 i), probe P4: the copy's log cut at its end (the restore's entry gone), the library reopened: nothing is stated as fact", async () => {
+    const z = await makeProject(kit, RETAIN_EXPORTABLE, false, "Bystander");
+    const zRaw = await rawSource(z);
+    await addSource(kit, z, { title: "something else" });
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T09:59:00.000Z");
+    const offline = join(kit.tmp, "Origin offline copy.zip");
+    await writeFile(offline, await readFile((await backupProject(kit.repo, p.id)).path));
+    at("2026-12-02T10:00:00.000Z");
+    backupSeams.failBackup = true;
+    await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    await breakAudit(z, (l) => l.includes('"op":"retention.destroy"'));
+    const r = await restore(offline);
+    expect(r.leftOut).toEqual([expect.objectContaining({ unverified: true })]);
+    const copy = kit.repo.getProject(r.projectId);
+    expect((await cutAudit(copy, (lines) => lines.length - 1)).action).toBe("project.restored");
+    await kit.reopen();
+    // What the app knows: the warning, the recorded mismatch, verifyAudit not whole; the chain itself verifies again.
+    expect(kit.repo.integrityWarnings.some((w) => w.projectId === r.projectId && w.kind === "truncated")).toBe(true);
+    expect((await eventsOf(r.projectId)).some((e) => e.action === "audit.anchor-mismatch")).toBe(true);
+    expect(await kit.repo.verifyAudit(r.projectId)).toMatchObject({ ok: false, anchored: true, alteredAt: [expect.any(String)] });
+    expect(verifyChain(await eventsOf(r.projectId)).ok).toBe(true);
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([LOG_NOT_INTACT]);
+  });
+
+  it("S-I1 (R484 i): a line cut from the middle of the project's log, the library reopened: nothing is stated as fact", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    await addSource(kit, p, { title: "added later" });
+    await cutAudit(p, (lines) => lines.findIndex((l) => l.includes('"op":"retention.destroy"')) - 1);
+    await kit.reopen();
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([LOG_NOT_INTACT]);
+  });
+
+  it("S-I1 (R484 i): an anchor mismatch recorded earlier in a log that is otherwise whole: nothing is stated as fact", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([OWN_RULE]);
+    await addSource(kit, p, { title: "added later" });
+    expect((await cutAudit(p, (lines) => lines.length - 1)).action).not.toBe("delete");
+    await kit.reopen();
+    // The log goes on, whole from the reopen: its chain verifies and it ends where the app holds its head.
+    await addSource(kit, p, { title: "added after the reopen" });
+    expect(verifyChain(await eventsOf(p.id)).ok).toBe(true);
+    expect((await kit.repo.verifyAudit(p.id)).alteredAt).toHaveLength(1);
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([LOG_NOT_INTACT]);
+  });
+
+  it("S-M1 (R484 j), probe P1: a file destroyed before the backup, by an entry of the earlier form (no list of files): its copy's export says the project's retention rule destroyed it", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    // The entry as an earlier version of the app wrote it: no list of the files destroyed.
+    await rewriteAudit(p, (e) => {
+      if (e.action === "delete" && detailsOf(e).op === "retention.destroy") delete (e.details as Details).destroyedAssets;
+    });
+    await reanchor(p);
+    await kit.reopen();
+    expect((await kit.repo.verifyAudit(p.id)).ok).toBe(true);
+    later(HOUR);
+    const r = await restore((await backupProject(kit.repo, p.id)).path);
+    expect(r.leftOut).toEqual([]);
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([OWN_RULE]);
+  });
+
+  it("S-M2 (R484 k): after a restore recorded before the files were named, a later restore's file left out on a verified record keeps the verified sentence", async () => {
+    const z = await makeProject(kit, RETAIN_EXPORTABLE, false, "Bystander");
+    const zRaw = await rawSource(z);
+    await addSource(kit, z, { title: "something else" });
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    await rawSource(p);
+    const second = await rawSource(p, "RAW second interview bytes");
+    await rawSource(p, "RAW third interview bytes");
+    await keptSource(p);
+    at("2026-12-02T09:59:00.000Z");
+    const offline = join(kit.tmp, "Origin offline copy.zip");
+    await writeFile(offline, await readFile((await backupProject(kit.repo, p.id)).path));
+    at("2026-12-02T10:00:00.000Z");
+    backupSeams.failBackup = true;
+    await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+    await destroyRaw(kit.repo, p.id, [second.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    await breakAudit(z, (l) => l.includes('"op":"retention.destroy"'));
+    const first = await restore(offline);
+    expect(first.leftOut).toHaveLength(2);
+    const copy = kit.repo.getProject(first.projectId);
+    // The first restore's entry as a restore made before FR-410 wrote it: counts, no list.
+    await rewriteAudit(copy, (e) => {
+      if (e.action === "project.restored") delete (e.details as Details).destroyedUnverifiedAssetIds;
+    });
+    await reanchor(copy);
+    await kit.reopen();
+
+    // A backup of the copy; then the copy destroys its third file; the backup restored leaves that file out on a verified record.
+    later(HOUR);
+    const copyOffline = join(kit.tmp, "Copy offline copy.zip");
+    await writeFile(copyOffline, await readFile((await backupProject(kit.repo, first.projectId)).path));
+    later(HOUR);
+    const third = (await Promise.all(kit.repo.listSourceIds(first.projectId).map((id) => kit.repo.getSource(first.projectId, id)))).find(
+      (sf) => sf.assets[0]!.status !== "destroyed" && sf.source.type === "interview",
+    )!;
+    backupSeams.failBackup = true;
+    await destroyRaw(kit.repo, first.projectId, [third.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    const again = await restore(copyOffline);
+    expect(again.leftOut).toEqual([expect.not.objectContaining({ unverified: true })]);
+    expect(destroyedNotes(await notesOf((await exported(again.projectId)).path)).sort()).toEqual([TWO_UNVERIFIED, RESTORED_VERIFIED].sort());
+  });
+
+  it("M1: a copy restored before the files were named (a count only): its export and a restore of its backup state none of that restore's destructions as fact", async () => {
+    const { offline } = await mixed();
+    const r = await restore(offline);
+    const copy = kit.repo.getProject(r.projectId);
+    // The entry as a restore made before FR-410 wrote it: counts, no list.
+    await rewriteAudit(copy, (e) => {
+      if (e.action === "project.restored") delete (e.details as Details).destroyedUnverifiedAssetIds;
+    });
+    await reanchor(copy);
+    await kit.reopen();
+    expect((await kit.repo.verifyAudit(r.projectId)).ok).toBe(true);
+    expect(verifyChain(await eventsOf(r.projectId)).ok).toBe(true);
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([TWO_UNVERIFIED]);
+    later(HOUR);
+    const again = await restore((await backupProject(kit.repo, r.projectId)).path);
+    expect(destroyedNotes(await notesOf((await exported(again.projectId)).path))).toEqual([TWO_UNVERIFIED]);
   });
 });

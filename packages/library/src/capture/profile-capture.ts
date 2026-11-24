@@ -37,6 +37,7 @@
  */
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
+import { editsNotCheckedText } from "@ao/shared";
 import {
   ImportBatch,
   ImportOptions,
@@ -111,6 +112,11 @@ export interface ProfileCaptureReport {
   /** Posts listed again after being marked unavailable. */
   reappeared: number;
   edited: number;
+  /**
+   * Known posts whose listed caption looks edited but whose own data could not be fetched to check
+   * (the platform refused, or the downloader failed): nothing was stored for them (FR-106).
+   */
+  editsNotChecked: number;
   items: CaptureOutcome[];
   errorCode?: string;
   reason?: string;
@@ -228,6 +234,7 @@ export function createProfileCapture(core: CaptureCore) {
       newlyUnavailable: 0,
       reappeared: 0,
       edited: 0,
+      editsNotChecked: 0,
       items: [],
       ...extra,
       errorCode: code,
@@ -314,6 +321,7 @@ export function createProfileCapture(core: CaptureCore) {
       newlyUnavailable: 0,
       reappeared: 0,
       edited: 0,
+      editsNotChecked: 0,
       items: [],
     };
     let waits = 0;
@@ -615,6 +623,7 @@ export function createProfileCapture(core: CaptureCore) {
           break;
         }
         if (edit === "edited") report.edited++;
+        if (edit === "not-checked") report.editsNotChecked++;
       }
       if (!filtered && plausible && report.status === "completed") {
         for (const id of checked) {
@@ -678,6 +687,7 @@ export function createProfileCapture(core: CaptureCore) {
       newlyUnavailable: r.newlyUnavailable,
       reappeared: r.reappeared,
       edited: r.edited,
+      editsNotChecked: r.editsNotChecked,
       ...(r.errorCode ? { errorCode: r.errorCode } : {}),
     });
     return r;
@@ -868,7 +878,7 @@ export function createProfileCapture(core: CaptureCore) {
     opts: ProfileCaptureOptions,
     check: () => void = () => {},
     signal?: AbortSignal,
-  ): Promise<"edited" | "unchanged" | "policy-changed"> {
+  ): Promise<"edited" | "unchanged" | "not-checked" | "policy-changed"> {
     const root = repoLibrary(repo).root;
     const sf = await repo.getSource(projectId, sourceId);
     const metas = sf.assets
@@ -892,7 +902,8 @@ export function createProfileCapture(core: CaptureCore) {
       signal,
     );
     check(); // ended while it fetched: nothing is stored
-    if (!now) return "unchanged";
+    // The post's own data could not be fetched: the edit is counted as not checked, not passed over silently (FR-106).
+    if (!now) return "not-checked";
     const newCap = captionOf(now);
     const newYtTitle = platform === "youtube" && typeof now.title === "string" ? now.title : undefined;
     if (!differs(captionOf(stored), newCap) && !(platform === "youtube" && differs(stored.title, newYtTitle))) return "unchanged";
@@ -997,6 +1008,7 @@ function reportText(platform: Platform, label: string, r: ProfileCaptureReport, 
     `- No longer available on the platform (newly noticed): ${r.newlyUnavailable}`,
     `- Available again: ${r.reappeared}`,
     `- Captions edited since the last capture: ${r.edited}`,
+    ...(r.editsNotChecked ? [`- ${editsNotCheckedText(r.editsNotChecked)}`] : []),
     "",
     r.listComplete
       ? "The whole profile was listed, so posts missing from it were checked."

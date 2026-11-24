@@ -477,10 +477,11 @@ export async function planMove(lib: Library, destRoot: string, env: LocationEnv,
           now,
           // The project's zone when set, else the computer's (R160 as amended).
           tz: dateRuleZone(p, "protocol", opts.tz),
-          move: { destination: loc.kind, ...(loc.cloudFolderId ? { cloudFolderId: loc.cloudFolderId } : {}) },
+          // A guessed kind is refused in words that say it may be that kind (R473 M4).
+          move: { destination: loc.kind, ...(loc.cloudFolderId ? { cloudFolderId: loc.cloudFolderId } : {}), ...(guessed ? { uncertain: true } : {}) },
         });
         if (d.result === "deny") {
-          decision = guessed ? denyOf(`Destination type could not be determined (it may be ${loc.kind}): ${d.reason}`, d.warnings) : d;
+          decision = d;
           break;
         }
         decision ??= d;

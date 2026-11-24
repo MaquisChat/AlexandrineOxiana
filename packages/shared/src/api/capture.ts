@@ -21,6 +21,16 @@
  * same project is refused: 409 CONFLICT with reason CAPTURE_RUNNING (R146; Task 63).
  */
 
+/**
+ * The count of a profile run's possible caption edits that could not be checked (FR-106), said one
+ * way wherever it is shown: the command line, the capture queue and the run's report file (R473 M6).
+ */
+export function editsNotCheckedText(n: number): string {
+  return n === 1
+    ? "1 possible edit could not be checked. Capture the profile again later to check it."
+    : `${n} possible edits could not be checked. Capture the profile again later to check them.`;
+}
+
 /** How long a finished queue stays readable (1 hour). */
 export const CAPTURE_QUEUE_KEEP_MS = 60 * 60_000;
 /** Finished queues kept by the service at most (all projects together). */
@@ -69,6 +79,8 @@ export interface CaptureRunReport {
   newlyUnavailable: number;
   reappeared: number;
   edited: number;
+  /** Posts whose caption looks edited but could not be checked (FR-106); absent from older reports. */
+  editsNotChecked?: number;
   errorCode?: string;
   /** The library's own sentence for a stopped or paused run. */
   reason?: string;

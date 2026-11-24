@@ -85,6 +85,7 @@ function reportOf(r: ProfileCaptureReport): CaptureRunReport {
     newlyUnavailable: r.newlyUnavailable,
     reappeared: r.reappeared,
     edited: r.edited,
+    editsNotChecked: r.editsNotChecked,
   };
   if (r.profileSourceId !== undefined) out.profileSourceId = r.profileSourceId;
   if (r.batchId !== undefined) out.batchId = r.batchId;
