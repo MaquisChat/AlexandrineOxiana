@@ -462,6 +462,15 @@ describe("normaliseQuote (Task R10)", () => {
     expect(normaliseQuote("the end \nof a line")).toBe("the end of a line");
   });
 
+  it("R507 d: a full-width space at a line's end is kept also before Latin text and after an ordinary space; Latin controls", () => {
+    expect(normaliseQuote("研究　\nmethod")).toBe("研究　method");
+    expect(normaliseQuote("研究 　\n方法")).toBe("研究　方法");
+    expect(normaliseQuote("研究 　 \nmethod")).toBe("研究　method");
+    // Latin controls: ordinary spaces at a line's end are one space, as before.
+    expect(normaliseQuote("the end  \nof a line")).toBe("the end of a line");
+    expect(normaliseQuote("研究 \nmethod")).toBe("研究 method");
+  });
+
   it("FR-725 (2): digits split by the break join when both lines are in a Chinese or Japanese run; Latin text keeps its space", () => {
     expect(normaliseQuote("西暦2023\n2024年に")).toBe("西暦20232024年に");
     expect(normaliseQuote("第12\n3章")).toBe("第123章");

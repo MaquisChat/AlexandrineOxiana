@@ -164,6 +164,9 @@ const CJK_LINE_BREAK = new RegExp(
  */
 export function normaliseQuote(text: string): string {
   return text
+    // R507 d: a line's end holding a full-width space keeps it, and only it, before any text (Latin too), and
+    // also after an ordinary space; the break and the ordinary white space around it go.
+    .replace(/[^\S\n]*\u3000[^\S\n]*\n[^\S\n]*/gu, (w) => w.replace(/[^\u3000]/gu, ""))
     .replace(/(\p{L})[-­‐]\s*\n\s*(?=\p{L})/gu, "$1")
     .replace(CJK_LINE_BREAK, "")
     .replace(/­/gu, "")
