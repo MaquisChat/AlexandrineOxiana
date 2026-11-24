@@ -259,7 +259,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 
 ## 5. What happens next without waiting for you
 
-As of 24 November: the rough-edge fixes are built, tested together and in Mac build 10; they are not yet on `main`, and I will ask you before they go there. Parts 9 and 10 list what I need from you.
+As of 24 November: the rough-edge fixes are built, tested together, in Mac build 10 and on `main` (your word of 24 November). Next I build the known gaps the round found (part 10, at its end). Parts 9 and 10 list what I need from you.
 
 ## 6. Added on 17 November: the last review of the whole branch
 
@@ -371,7 +371,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 ## 9. Added on 23 November: what I need from you
 
-Everything built up to 23 November is on `main`, checked by GitHub and on a Mac. The rough-edge fixes of 24 November are in Mac build 10 and wait for your word before they go to `main` (part 10). What is left is yours. In the order I would do it:
+Everything built up to 23 November is on `main`, checked by GitHub and on a Mac. The rough-edge fixes of 24 November are in Mac build 10 and, by your word, on `main` too (part 10). What is left is yours. In the order I would do it:
 
 - [ ] **1. Install Mac build 10** (part 10 says where: run 13's download). It replaces builds 8 and 9: build 8 could not install any optional tool, build 9 mended that, and build 10 adds the rough-edge fixes.
 - [ ] **2. Undo the import that stopped when the disk filled, then import again** with enough free space, or with "leave the files where they are".
@@ -395,7 +395,8 @@ The 94 rough edges of part 3 are fixed. They were built in seven batches, and a 
 - **Where:** run 13 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45321193812 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon`, unzip it and open the `.dmg` inside. Its SHA-256 is `de3f679d60def4bc9671800025054c31d3fc592661f8950bdd6563f8520999f9`.
 - **It replaces builds 8 and 9.** It contains build 9's download fix and everything below.
 - **It passed every check on GitHub's Mac** (24 November): the app starts, reaches its helpers, and stops cleanly; and the new "Closing Alexandrine Oxiana" window appeared there two seconds into a slowed quit, as it should.
-- **It is not yet in `main`** (the approved version). `main` lacks build 9's download fix and this whole round. **May I merge it?** A yes in the chat is enough; I would wait for GitHub's check of the merged state before calling it done.
+- **It is in `main`** (the approved version) since 24 November, shortly before 11 pm Central on the 23rd: you said "Merge and keep building please". GitHub's check of the merged state is running as I write; I will tell you its result.
+- **What I build next, as you asked:** the known gaps at the end of this part (FR-717 to FR-741), most serious first.
 
 ### What you will notice
 
