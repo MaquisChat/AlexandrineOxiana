@@ -826,15 +826,25 @@ describe("scenario Q: quit by Apple event (a Mac only; FR-731, R503 h)", () => {
     assert.equal(quitSkipLine("Q (quit by Apple event during a slowed quit)", "for the reason above"), "launch-check: skip Q (quit by Apple event during a slowed quit): for the reason above\n");
   });
 
-  it("ends with one line that says whether Q ran, was skipped (and why) or failed", () => {
+  it("ends with one line, its prefix found nowhere else, that says whether Q ran, was skipped (and why), failed or was not reached (N2, R514)", () => {
     const A = "Q (quit by Apple event)";
     const S = "Q (quit by Apple event during a slowed quit)";
-    assert.equal(quitSummaryLine([{ label: A, state: "passed" }, { label: S, state: "passed" }]), "launch-check: Q ran: 2 of 2 runs quit the app by Apple event and were checked\n");
-    assert.equal(quitSummaryLine([{ label: A, state: "skipped", reason: "osascript had no answer within 30 s" }, { label: S, state: "skipped", reason: "for the reason above" }]), "launch-check: Q SKIPPED (osascript had no answer within 30 s): the Mac's own Quit was not checked\n");
-    assert.equal(quitSummaryLine([{ label: A, state: "passed" }, { label: S, state: "skipped", reason: "osascript had no answer within 30 s" }]), `launch-check: Q SKIPPED in part (1 of 2 runs checked; ${S}: osascript had no answer within 30 s)\n`);
-    assert.equal(quitSummaryLine([{ label: A, state: "failed" }, { label: S, state: "passed" }]), `launch-check: Q FAILED (${A}): see its FAIL lines above\n`);
-    assert.equal(quitSummaryLine([{ label: A, state: "skipped", reason: "r" }, { label: S, state: "failed" }]), `launch-check: Q FAILED (${S}): see its FAIL lines above\n`);
-    assert.equal(quitSummaryLine([]), "launch-check: Q SKIPPED (no run of Q was made): the Mac's own Quit was not checked\n");
+    const P = "launch-check: scenario Q result: ";
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }, { label: S, state: "passed" }]), `${P}ran (2 of 2 runs quit the app by Apple event and were checked)\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "skipped", reason: "osascript had no answer within 30 s" }, { label: S, state: "skipped", reason: "for the reason above" }]), `${P}SKIPPED (osascript had no answer within 30 s): the Mac's own Quit was not checked\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }, { label: S, state: "skipped", reason: "osascript had no answer within 30 s" }]), `${P}SKIPPED in part (${A} ran and was checked; ${S}: osascript had no answer within 30 s)\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "failed" }, { label: S, state: "passed" }]), `${P}FAILED (${A}): see its FAIL lines above\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "skipped", reason: "r" }, { label: S, state: "failed" }]), `${P}FAILED (${S}): see its FAIL lines above\n`);
+    // A run that threw never reads as "ran": it failed, with what ended it.
+    assert.equal(quitSummaryLine([{ label: A, state: "failed", reason: "it did not finish: timed out after 180 s waiting for the page's probe" }]), `${P}FAILED (${A}: it did not finish: timed out after 180 s waiting for the page's probe): see its FAIL lines above\n`);
+    // Not reached: an earlier scenario ended the check (its error), or none was given.
+    assert.equal(quitSummaryLine([], { reached: false, error: "B (shell stopped with SIGTERM): timed out after 60 s waiting for the window\n--- the shell's output (end) ---" }), `${P}not reached (the check ended before scenario Q: B (shell stopped with SIGTERM): timed out after 60 s waiting for the window)\n`);
+    assert.equal(quitSummaryLine([], { reached: false }), `${P}not reached (the check ended before scenario Q)\n`);
+    assert.equal(quitSummaryLine([], { reached: true, error: "tauri.conf.json's identifier undefined is not a bundle identifier" }), `${P}FAILED (scenario Q did not finish: tauri.conf.json's identifier undefined is not a bundle identifier)\n`);
+    assert.equal(quitSummaryLine([]), `${P}SKIPPED (no run of Q was made): the Mac's own Quit was not checked\n`);
+    // Unique: no other line the check prints starts the same way (the crash diagnosis prints "launch-check: Q (…): the shell exited …").
+    const src = readFileSync(new URL("./launch-check.mjs", import.meta.url), "utf8");
+    assert.equal(src.split("scenario Q result:").length - 1, 1, "the prefix is written once, in quitSummaryLine");
   });
 
   const ev = (...kinds) => kinds.map((k) => (typeof k === "string" ? { kind: k } : k));

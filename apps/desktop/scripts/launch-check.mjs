@@ -208,18 +208,23 @@ export function quitSkipLine(label, reason) {
 }
 
 /**
- * The one closing line of scenario Q on a Mac (M2, R511; R505 e: whether Q ran must be read in one line),
- * from each run's outcome: {label, state: "passed" | "failed" | "skipped", reason}. A failure wins over a
- * skip; a skip of only some runs says which.
+ * The one closing line of scenario Q on a Mac (M2, R511; N2, R514; R505 e: whether Q ran is read in one line, and
+ * its prefix is printed by no other line), from each run's outcome: {label, state: "passed" | "failed" |
+ * "skipped", reason}. A failure wins over a skip; a run that threw is a failure with what ended it; a skip of
+ * only some runs says what ran. `reached: false`: the check ended before Q (`error`, its first line, says why).
  */
-export function quitSummaryLine(outcomes) {
+export function quitSummaryLine(outcomes, { reached = true, error } = {}) {
+  const prefix = "launch-check: scenario Q result:";
+  if (!reached) return `${prefix} not reached (the check ended before scenario Q${error ? `: ${firstLine(error)}` : ""})\n`;
+  // Q began and threw before any run had an outcome.
+  if (!outcomes.length && error) return `${prefix} FAILED (scenario Q did not finish: ${firstLine(error)})\n`;
   const failed = outcomes.filter((o) => o.state === "failed");
   const skipped = outcomes.filter((o) => o.state === "skipped");
-  const checked = outcomes.length - skipped.length;
-  if (failed.length) return `launch-check: Q FAILED (${failed.map((o) => o.label).join("; ")}): see its FAIL lines above\n`;
-  if (!outcomes.length || !checked) return `launch-check: Q SKIPPED (${skipped[0]?.reason ?? "no run of Q was made"}): the Mac's own Quit was not checked\n`;
-  if (skipped.length) return `launch-check: Q SKIPPED in part (${checked} of ${outcomes.length} runs checked; ${skipped.map((o) => `${o.label}: ${o.reason}`).join("; ")})\n`;
-  return `launch-check: Q ran: ${checked} of ${outcomes.length} runs quit the app by Apple event and were checked\n`;
+  const ran = outcomes.filter((o) => o.state === "passed");
+  if (failed.length) return `${prefix} FAILED (${failed.map((o) => (o.reason ? `${o.label}: ${o.reason}` : o.label)).join("; ")}): see its FAIL lines above\n`;
+  if (!ran.length) return `${prefix} SKIPPED (${skipped[0]?.reason ?? "no run of Q was made"}): the Mac's own Quit was not checked\n`;
+  if (skipped.length) return `${prefix} SKIPPED in part (${ran.map((o) => `${o.label} ran and was checked`).join("; ")}; ${skipped.map((o) => `${o.label}: ${o.reason}`).join("; ")})\n`;
+  return `${prefix} ran (${ran.length} of ${outcomes.length} runs quit the app by Apple event and were checked)\n`;
 }
 
 /** How long B (and Q, where it stops the app that way) waits for the shell to end after SIGTERM. */
@@ -1305,8 +1310,9 @@ async function main() {
     problems.push("the app was already running");
   }
   const bus = startBus();
-  /** Scenario Q's runs on a Mac (null where Q does not run), for its closing line. */
-  let qOutcomes = null;
+  /** Scenario Q's runs on a Mac (null where Q does not exist), for its closing line; and what ended the check, if it threw. */
+  const q = MAC ? { reached: false, outcomes: [] } : null;
+  let ended;
   try {
     const address = await bus.address;
     const worker = workerBin(root);
@@ -1521,9 +1527,10 @@ async function main() {
     if (!MAC) {
       process.stdout.write("launch-check: skip Q (quit by Apple event): the Mac's own Quit (Cmd-Q, the Dock's Quit, a quit Apple event) exists only on macOS\n");
     } else {
+      q.reached = true;
       const scripts = appleEventScripts(bundleIdOf(JSON.parse(readFileSync(TAURI_CONF, "utf8"))));
       let skipped = null;
-      qOutcomes = [];
+      const qOutcomes = q.outcomes;
       for (const [name, slow, label] of [
         ["q", undefined, "Q (quit by Apple event)"],
         ["q-slow", "10000", "Q (quit by Apple event during a slowed quit)"],
@@ -1540,6 +1547,7 @@ async function main() {
         // This run's outcome for the closing line: skipped (with the reason) or else passed unless a problem was found in it.
         const problemsBefore = problems.length;
         let skippedHere = null;
+        let threw = null;
         try {
           const { svc, helpers } = await upAndProbed(run, media, problems);
           // M1 (R511): the app is then stopped the orderly way the check can use, SIGTERM, and that stop is
@@ -1593,20 +1601,29 @@ async function main() {
             closingWindowNote(run);
           }
           await assertGone(label, helpers, dir, problems, 10_000);
+        } catch (err) {
+          threw = err;
+          throw err;
         } finally {
           if (!exited()) killTree(run.child.pid);
-          qOutcomes.push(skippedHere ? { label, state: "skipped", reason: skippedHere } : { label, state: problems.length > problemsBefore ? "failed" : "passed" });
+          // N2 (R514): a run that threw never counts as passed.
+          if (threw) qOutcomes.push({ label, state: "failed", reason: `it did not finish: ${firstLine(threw instanceof Error ? threw.message : threw)}` });
+          else qOutcomes.push(skippedHere ? { label, state: "skipped", reason: skippedHere } : { label, state: problems.length > problemsBefore ? "failed" : "passed" });
         }
       }
     }
+  } catch (err) {
+    ended = err;
+    throw err;
   } finally {
     bus.proc?.kill("SIGTERM");
     const left = stopAppProcesses();
     if (MAC) report("no process of the app is left at the end", left.length === 0, left.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; ")) || problems.push("app processes left");
     rmSync(root, { recursive: true, force: true });
+    // M2 (R511), N2 (R514): on a Mac, one line says whether Q ran, on every path, also when a scenario threw (on
+    // Linux Q's skip line above says it does not exist there).
+    if (q) process.stdout.write(quitSummaryLine(q.outcomes, { reached: q.reached, error: ended === undefined ? undefined : ended instanceof Error ? ended.message : String(ended) }));
   }
-  // M2 (R511): on a Mac, one line says whether Q ran (on Linux its skip line above says it does not exist there).
-  if (qOutcomes) process.stdout.write(quitSummaryLine(qOutcomes));
   finish(problems);
 }
 

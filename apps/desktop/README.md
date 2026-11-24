@@ -379,8 +379,9 @@ it does not, Q fails, because an app that hangs at the quit looks exactly like a
 event delivered that the app does nothing about fails. A shell that ends at the quit without its
 `AO_SHELL_QUIT` line, or by a signal, is examined first as a crash is at the start (the crash report, a
 debugger's backtrace, the bundle). On a Mac the check then prints one line that says
-whether Q ran: `launch-check: Q ran: …`, `launch-check: Q SKIPPED (<reason>): …` (or `SKIPPED in part`), or
-`launch-check: Q FAILED (…)`. On Linux Q is skipped, and says so. Pressing Cmd-Q on a real Mac remains
+whether Q ran, on every path (also when a scenario threw), with a prefix no other line has:
+`launch-check: scenario Q result: ran (…)`, `… SKIPPED (<reason>): …` (or `SKIPPED in part (…)`),
+`… FAILED (…)`, or `… not reached (…)` when the check ended before Q. On Linux Q is skipped, and says so. Pressing Cmd-Q on a real Mac remains
 the owner's check.
 At the start and the end the check looks for any process of any copy of the app (its program, or
 Node.js or the worker from an app's resources) and stops it; one found at the end is a failure. On a
