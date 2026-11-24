@@ -77,6 +77,8 @@ const NOW_THERE: Record<NonNullable<PendingWrite["lost"]>[number]["now"], string
   nothing: "Nothing is at that place now.",
   "a file": "A file is at that place now; it stays as it is.",
   "something else": "Something else is at that place now; it stays as it is.",
+  // R528 M8: the look failed (a permission or I/O error): never "nothing".
+  "could-not-look": "The app could not look at that place, so it cannot say what is there now; whatever is there stays as it is.",
 };
 const CLOSE_ENDS = "Closing deletes nothing. The project takes changes again, and a warning about what could not be put back stays until you dismiss it.";
 const CLOSED = "The change was closed as it is. Nothing was deleted, and the project takes changes again.";

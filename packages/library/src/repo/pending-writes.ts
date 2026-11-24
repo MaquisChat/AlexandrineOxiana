@@ -22,7 +22,6 @@
  * progress is ever listed or touched.
  */
 import { createHash } from "node:crypto";
-import * as fsp from "node:fs/promises";
 import { join, posix } from "node:path";
 import { evaluate, parseGovernance, verifyChain, type AuditEvent } from "@ao/core";
 import { CLOSABLE_ROLLBACK, CLOSE_COPIES_LEFT_TEXT, ROLLBACK_INCOMPLETE_ANSWER, incompleteRollbackOf, type IncompleteRollback } from "@ao/shared";
@@ -41,6 +40,7 @@ import {
   inspectMarker,
   inspectMarkers,
   keptCopiesLeft,
+  lookNow,
   markerPaths,
   recordResolve,
   removeMarker,
@@ -72,7 +72,7 @@ export interface PendingWrite {
   /** R509: it can be closed as it is (its undo can never complete); `lost` says what closing leaves lost. */
   canClose: boolean;
   /** Each path whose original cannot be put back: what stands there now, and the source it belongs to when known. */
-  lost?: Array<{ path: string; now: "nothing" | "a file" | "something else"; sourceId?: string }>;
+  lost?: Array<{ path: string; now: "nothing" | "a file" | "something else" | "could-not-look"; sourceId?: string }>;
 }
 
 /** The choices a marker allows (R131 a, b): none for an invalid or unverifiable marker. */
@@ -395,9 +395,10 @@ async function lostOf(core: RepoCore, i: MarkerInspection): Promise<NonNullable<
   const out: NonNullable<PendingWrite["lost"]> = [];
   for (const c of core.rollbackAttempts.get(i.txn)?.causes ?? []) {
     if (c.kind !== "kept-copy-gone") continue;
-    const s = await fsp.lstat(fromRel(core.root, c.path)).catch(() => null);
-    const sourceId = st ? [...st.sources].find(([, f]) => c.path.startsWith(`${f}/`))?.[0] : undefined;
-    out.push({ path: c.path, now: s === null ? "nothing" : s.isFile() ? "a file" : "something else", ...(sourceId ? { sourceId } : {}) });
+    // R528 M8: "nothing" only where the app looked and found nothing; the source named also when the place IS its folder.
+    const now = await lookNow(core.root, c.path);
+    const sourceId = st ? [...st.sources].find(([, f]) => c.path === f || c.path.startsWith(`${f}/`))?.[0] : undefined;
+    out.push({ path: c.path, now, ...(sourceId ? { sourceId } : {}) });
   }
   return out;
 }

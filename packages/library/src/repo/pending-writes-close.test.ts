@@ -150,6 +150,26 @@ describe("R509: which acts the list offers, by cause", () => {
     ]);
   });
 
+  it("R528 M8: a look at the place that FAILS is never said to find nothing", async () => {
+    const { rel } = await lost(async () => rm(fromRel(lib.root, `${folder}/kept.txt`)));
+    // As a permission or I/O error would (the undo's own look was made at the opening, before this).
+    seams.failLook = rel;
+    expect((await repo.pendingWrites())[0]).toMatchObject({ canClose: true, lost: [{ path: rel, now: "could-not-look", sourceId: sid }] });
+  });
+
+  it("R528 M8: the lost place is the source's own folder: the source is named too", async () => {
+    const record = await readFile(fromRel(lib.root, `${folder}/source.json`));
+    const m = await crashed(async (tx) => {
+      await tx.trash(folder);
+    });
+    await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { recursive: true, force: true });
+    // A folder made again at the place with the source's record in it (the app cannot confirm it is the original).
+    await mkdir(fromRel(lib.root, folder));
+    await writeFile(fromRel(lib.root, `${folder}/source.json`), record);
+    await reopen();
+    expect((await repo.pendingWrites())[0]).toMatchObject({ canClose: true, rollback: "unconfirmed", lost: [{ path: folder, now: "something else", sourceId: sid }] });
+  });
+
   it("nothing at its place now: said so", async () => {
     const { rel } = await lost(async () => rm(fromRel(lib.root, `${folder}/kept.txt`)));
     expect((await repo.pendingWrites())[0]).toMatchObject({ canClose: true, rollback: "lost", lost: [{ path: rel, now: "nothing", sourceId: sid }] });

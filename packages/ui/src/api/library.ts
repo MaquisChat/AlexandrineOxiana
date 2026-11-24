@@ -101,7 +101,7 @@ export interface PendingWrite {
   causes?: Array<{ kind: string; path: string; somethingThere?: boolean }>;
   /** R509: it can be closed as it is (its undo can never complete); `lost`: what that leaves lost, and what is there now. */
   canClose?: boolean;
-  lost?: Array<{ path: string; now: "nothing" | "a file" | "something else"; source?: string }>;
+  lost?: Array<{ path: string; now: "nothing" | "a file" | "something else" | "could-not-look"; source?: string }>;
 }
 
 export type PendingWriteChoice = "roll-back" | "keep";

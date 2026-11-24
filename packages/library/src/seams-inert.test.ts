@@ -14,7 +14,7 @@ import * as entry from "./index.js";
 import { importChange } from "./repo/repo.js";
 import { seams } from "./repo/seams.js";
 import { confirmationSeams } from "./repo/sources.js";
-import { fromRel, identityOf, undoEntries } from "./repo/txn.js";
+import { fromRel, identityOf, lookNow, undoEntries } from "./repo/txn.js";
 import { listDestructions, retentionSeams } from "./retention.js";
 
 const STORE = { action: "store" as const, store: { identifiable: false, hasLocation: false } };
@@ -115,6 +115,12 @@ describe("R526 M5: the roll-back's look seams are inert outside NODE_ENV=test", 
     expect(await under("test", () => undoEntries(root, entries))).toEqual({ ok: false, causes: [{ kind: "could-not-look", path: R }] });
     expect(await under("production", () => undoEntries(root, entries))).toEqual({ ok: true, causes: [] });
     expect(await readFile(fromRel(root, R), "utf8")).toBe("the original\n");
+  });
+
+  it("R528 M8: seams.failLook at the close's look at a lost file's place: could-not-look under test, what is there under production", async () => {
+    seams.failLook = R;
+    expect(await under("test", () => lookNow(root, R))).toBe("could-not-look");
+    expect(await under("production", () => lookNow(root, R))).toBe("a file");
   });
 
   it("seams.identityLook replaces the identity the file system gives under test, never under production", async () => {

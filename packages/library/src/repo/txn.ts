@@ -1002,6 +1002,22 @@ export async function rollBackMarker(root: string, m: TxnMarker): Promise<UndoRe
 }
 
 /**
+ * R528 M8: what stands at a place now, for the close's question: "nothing" only when the app looked and found nothing
+ * there; a look that failed (a permission or I/O error) is "could-not-look", never "nothing". The roll-back's look seam
+ * (`seams.failLook`, honoured only when NODE_ENV is "test", R47) reaches it.
+ */
+export async function lookNow(root: string, rel: string): Promise<"nothing" | "a file" | "something else" | "could-not-look"> {
+  try {
+    if (process.env.NODE_ENV === "test" && seams.failLook === rel) throw new Error("simulated read failure");
+    const s = await fsp.lstat(fromRel(root, rel));
+    return s.isFile() ? "a file" : "something else";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? "nothing" : "could-not-look";
+  }
+}
+
+/**
  * Whether the app still keeps a copy of something of this change that is not back in its place: a trash copy, or a
  * backup of a replaced file whose bytes are not at its path. Removing the marker lets such a copy go (its backups are
  * deleted with it, and the next opening sweeps the trash): closing must delete nothing (R509), so it waits; where nothing

@@ -311,6 +311,20 @@ describe("R509: closing, as it is, a change whose undo can never complete", () =
     return posted;
   }
 
+  it("R528 M8: where the app could not look at the place, the question says so (never \"Nothing is at that place now.\")", async () => {
+    server.use(
+      http.get(url("/libraries/pending-writes"), () =>
+        HttpResponse.json({ pendingWrites: [pw({ rollback: "lost", causes: [{ kind: "kept-copy-gone", path: F }], canClose: true, lost: [{ path: F, now: "could-not-look" }] })] }),
+      ),
+    );
+    const user = userEvent.setup();
+    show();
+    await user.click(await screen.findByRole("button", { name: "Close this change as it is" }));
+    expect((document.activeElement as HTMLElement).textContent).toBe(
+      `Close this change as it is? What it removed from ${F} cannot be put back. The app could not look at that place, so it cannot say what is there now; whatever is there stays as it is. Closing deletes nothing. The project takes changes again, and a warning about what could not be put back stays until you dismiss it.`,
+    );
+  });
+
   it("is offered only where the service allows it, after \"Roll it back\" in the Tab order, and said beside what is lost", async () => {
     serve([[pw({ rollback: "in-the-way", causes: [{ kind: "hand-changed-file", path: F }], canClose: false })]]);
     const { unmount } = show();
