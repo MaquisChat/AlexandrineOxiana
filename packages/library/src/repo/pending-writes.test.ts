@@ -231,6 +231,15 @@ describe("pending writes: an unverifiable change is never acted on (R131 a, b)",
     const before = await logBytes(repo, pid);
     await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteChoiceError);
     await expect(repo.resolvePendingWrite(pw!.txn, "keep")).rejects.toBeInstanceOf(PendingWriteChoiceError);
+    // R532 M5 (b): a close by the route is refused in words true of it (it cannot be rolled back either).
+    const closed = await repo.closePendingWrite(pw!.txn, pid).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(closed).toBeInstanceOf(PendingWriteChoiceError);
+    expect((closed as Error).message).toBe(
+      "This change cannot be closed: the app can neither undo it nor close it safely. Restoring a backup made before the change is the way.",
+    );
     expect(await logBytes(repo, pid)).toEqual(before);
     expect(await markers()).toHaveLength(1);
     await expect(add(repo, pid, "Still blocked")).rejects.toBeInstanceOf(RecoveryPendingError);

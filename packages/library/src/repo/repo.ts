@@ -717,8 +717,12 @@ export async function openRepoInternal(
     // An unresolved marker blocks writes. Its integrity findings are kept in memory only: appending
     // an event or moving the anchor could change what recovery decides on a later open. A line that
     // is still incomplete blocks them too: nothing can be appended after it.
-    const blocked = isPending({ id: st.project.id, rel: st.rel }) || (writable && lines.some((l) => !l.trimmed));
+    const pending = isPending({ id: st.project.id, rel: st.rel });
+    const blocked = pending || (writable && lines.some((l) => !l.trimmed));
     if (blocked) st.recoveryPending = true;
+    // R532 M5 (a): held only by a line whose trim failed here (no interrupted change holds it): the next opening tries
+    // again, and a refused write says so (its warning says the line is tidied up when the library is next opened).
+    if (blocked && !pending && !unattributed && lines.some((l) => !l.trimmed && l.error !== undefined)) st.reopenToResume = true;
     if (unfinished.has(st.project.id)) st.unfinished = new Set(unfinished.get(st.project.id));
     const anchor = anchors[core.anchorKey(st.project.id)];
     const problem = checkAnchor(events, verify, anchor, core.device);

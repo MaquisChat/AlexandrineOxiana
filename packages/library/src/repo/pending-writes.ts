@@ -352,6 +352,9 @@ async function afterResolved(core: RepoCore, st: ProjectState, txn: string, held
 
 /** R509: why a change cannot be closed as it is (plain words). */
 const NOT_CLOSABLE = "Only a change that can never be undone completely can be closed as it is; this one can still be rolled back.";
+/** R532 M5 (b): an unverifiable change can be neither rolled back nor closed (R529): a backup is the way. */
+const NOT_CLOSABLE_UNVERIFIABLE =
+  "This change cannot be closed: the app can neither undo it nor close it safely. Restoring a backup made before the change is the way.";
 /** R528: a copy is gone, and something the researcher can deal with also stops the undo: that first. */
 const NOT_CLOSABLE_YET =
   "This change cannot be closed yet: something else still stops its undo. Deal with what the list names first, then choose “Roll it back” again.";
@@ -435,7 +438,15 @@ export async function closePendingWrite(core: RepoCore, txn: string, projectId: 
       const a = core.rollbackAttempts.get(txn);
       const state = a ? stateOf(a) : undefined;
       if (state === "lost-copy-stuck") throw new PendingWriteIncompleteError(txn, CLOSE_COPIES_LEFT_TEXT);
-      throw new PendingWriteChoiceError(txn, allowed(i), state === "lost-and-blocked" ? NOT_CLOSABLE_YET : state === "lost-and-try-again" ? NOT_CLOSABLE_TRY_AGAIN : NOT_CLOSABLE);
+      const why =
+        i.status === "unverifiable"
+          ? NOT_CLOSABLE_UNVERIFIABLE
+          : state === "lost-and-blocked"
+            ? NOT_CLOSABLE_YET
+            : state === "lost-and-try-again"
+              ? NOT_CLOSABLE_TRY_AGAIN
+              : NOT_CLOSABLE;
+      throw new PendingWriteChoiceError(txn, allowed(i), why);
     }
     const m = i.marker!;
     const st = core.projects.get(m.projectId);
