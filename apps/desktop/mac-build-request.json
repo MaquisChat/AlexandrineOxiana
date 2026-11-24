@@ -1,5 +1,5 @@
 {
-  "request": 9,
+  "request": 10,
   "architectures": "apple-silicon",
-  "note": "Build 7's content (build 5's, with the start-up crash mended: R457) plus the launch check's evidence and fallback for the sign-in window's probe (R458): build 7 started and passed every check but that one, whose probe had no page to run in on a Mac. If every check passes, this is the owner's build: the first with the PDF reader, Zotero account sync, cloud folders, Find and acquire and every fix since build 4."
+  "note": "Build 9's content (the owner's build with the worker's own certificate authorities, R476) plus the whole rough-edges round (R460-R499): the 94 small rough edges of the final review, built in seven batches, each reviewed, joined and verified together. New in this build for the launch check: scenario F, the 'Closing Alexandrine Oxiana' window (FR-297), runs on a Mac for the first time. If every check passes, this is the owner's build and replaces builds 8 and 9."
 }
