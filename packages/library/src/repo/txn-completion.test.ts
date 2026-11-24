@@ -110,7 +110,7 @@ describe("R519 (2): the completion line of a copied file", () => {
 });
 
 describe("R519 (2): files written inside a folder the change created", () => {
-  it("a written file and a copied file each get only a completion line, after the folder's line", async () => {
+  it("a written file and a copied file each get only a completion line, after the folder's line and its completion (R526 M2)", async () => {
     const p = await project(false);
     const dir = `${p.folder}/made`;
     const m = await crashed(p.id, async (tx) => {
@@ -118,8 +118,10 @@ describe("R519 (2): files written inside a folder the change created", () => {
       await tx.writeFile(`${dir}/written.txt`, "written inside\n");
       await tx.copyFile(join(tmp, "src.txt"), `${dir}/copied.txt`);
     });
+    const st = await stat(fromRel(lib.root, dir), { bigint: true });
     expect(m.entries).toEqual([
       { kind: "dir", path: dir },
+      { kind: "dir", path: dir, ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() },
       { kind: "created", path: `${dir}/written.txt`, sha256: sha("written inside\n"), complete: true },
       { kind: "created", path: `${dir}/copied.txt`, sha256: sha(SRC), complete: true },
     ]);
@@ -158,6 +160,8 @@ describe("the reader checks the new fields (an older build ignores them)", () =>
   it("accepts a completion line and a trashed line with an identity", () => {
     expect(at([{ kind: "created", path: "Projects/P/a", sha256: H, complete: true }])).toBeNull();
     expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "12345678901234567890", birthtimeNs: "1795511903096443559" }])).toBeNull();
+    // R526 M2: a folder's completion line.
+    expect(at([{ kind: "dir", path: "Projects/P/d", ino: "12", birthtimeNs: "1795511903096443559" }])).toBeNull();
     // R526: the line saying the identity was not kept by the rename.
     expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, noIdentity: true }])).toBeNull();
   });
@@ -171,6 +175,8 @@ describe("the reader checks the new fields (an older build ignores them)", () =>
     expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "5" }])).not.toBeNull();
     expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, ino: "5", birthtimeNs: "1.5" }])).not.toBeNull();
     expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, noIdentity: false }])).not.toBeNull();
+    expect(at([{ kind: "dir", path: "Projects/P/d", ino: "12" }])).not.toBeNull();
+    expect(at([{ kind: "created", path: "Projects/P/a", ino: "12", birthtimeNs: "1" }])).not.toBeNull();
     expect(at([{ kind: "trashed", from: "Projects/P/a", to: `.tmp/trash-${head.txn}-00`, noIdentity: true, ino: "5", birthtimeNs: "1" }])).not.toBeNull();
   });
 });

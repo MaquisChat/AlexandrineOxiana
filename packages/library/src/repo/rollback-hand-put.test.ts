@@ -602,6 +602,117 @@ describe("R526 I1 (with M3): the original's identity is its file number and its 
   });
 });
 
+describe("R526 M2: a folder the change made is removed only when it is the change's own (its file number and time of birth)", () => {
+  const D = () => `${folder}/made`;
+  /** The change makes a folder and writes a file in it; a crash before its audit entry. */
+  const madeAndWritten = () =>
+    crashed(async (tx) => {
+      await tx.mkdir(D());
+      await tx.writeFile(`${D()}/f.txt`, "the change's file in its folder\n");
+    });
+
+  it("the folder's line is followed, once it is made, by a second dir line with its identity", async () => {
+    const m = await madeAndWritten();
+    const st = await stat(fromRel(lib.root, D()), { bigint: true });
+    expect(m.entries.slice(0, 2)).toEqual([
+      { kind: "dir", path: D() },
+      { kind: "dir", path: D(), ino: st.ino.toString(), birthtimeNs: st.birthtimeNs.toString() },
+    ]);
+  });
+
+  it("probe D: the first undo cut after its steps, a person makes the folder again with a file of theirs: the second undo leaves it exactly, and completes", async () => {
+    // The person's folder is made before the change's is removed (then moved into place), so that it is a folder of its
+    // own: one made by hand within the same clock tick, given the freed number, could not be told from the change's.
+    await mkdir(join(tmp, "theirs"));
+    await writeFile(join(tmp, "theirs", "mine.txt"), HAND);
+    const m = await madeAndWritten();
+    await lib.close();
+    seams.stopUndoAfter = m.entries.length;
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    expect(seams.stopUndoAfter).toBeUndefined();
+    expect(await text(`${D()}/f.txt`)).toBeNull();
+    expect(await markers()).toHaveLength(1);
+    await rename(join(tmp, "theirs"), fromRel(lib.root, D()));
+    for (const run of ["second", "third"]) {
+      await reopen();
+      expect(await text(`${D()}/mine.txt`), run).toBe(HAND);
+      expect(await markers(), run).toEqual([]);
+      expect(causes(), run).toEqual([]);
+    }
+  });
+
+  it("the ordinary crash: the change's own folder, with its own files in it, is removed", async () => {
+    const m = await crashed(async (tx) => {
+      await tx.mkdir(`${D()}/sub`);
+      await tx.writeFile(`${D()}/f.txt`, "the change's file\n");
+      await tx.copyFile(join(tmp, "src.txt"), `${D()}/sub/copied.txt`);
+    });
+    expect(m.entries.filter((e) => e.kind === "dir")).toHaveLength(2);
+    await reopen();
+    expect(await stat(fromRel(lib.root, D())).catch(() => null)).toBeNull();
+    expect(await markers()).toEqual([]);
+    expect(causes()).toEqual([]);
+  });
+
+  it("no time of birth (a stand-in through the identity look): no second line, and the folder's undo is as before", async () => {
+    seams.identityLook = (_at, real) => ({ ino: real.ino, birthtimeNs: 0n });
+    const m = await madeAndWritten();
+    seams.identityLook = undefined;
+    expect(m.entries.filter((e) => e.kind === "dir")).toEqual([{ kind: "dir", path: D() }]);
+    await reopen();
+    expect(await stat(fromRel(lib.root, D())).catch(() => null)).toBeNull();
+    expect(await markers()).toEqual([]);
+  });
+
+  describe("at the level of the marker's lines", () => {
+    let root: string;
+    const P = "Projects/P/D";
+    beforeEach(async () => {
+      root = await mkdtemp(join(tmpdir(), "ao-r526dir-"));
+      await mkdir(fromRel(root, "Projects/P"), { recursive: true });
+    });
+    afterEach(async () => {
+      await rm(root, { recursive: true, force: true });
+    });
+    const lines = async (): Promise<MarkerEntry[]> => {
+      await mkdir(fromRel(root, P));
+      const st = await stat(fromRel(root, P), { bigint: true });
+      await rm(fromRel(root, P), { recursive: true });
+      return [
+        { kind: "dir", path: P },
+        { kind: "dir", path: P, ino: st.ino.toString(), birthtimeNs: (st.birthtimeNs - 5_000_000_000n).toString() },
+      ];
+    };
+
+    it("a folder at the path with another identity is left exactly as it is; the step counts as done", async () => {
+      const entries = await lines();
+      await mkdir(fromRel(root, P));
+      await writeFile(fromRel(root, `${P}/mine.txt`), HAND);
+      for (const run of ["first", "second"]) {
+        expect(await undoEntries(root, entries), run).toEqual({ ok: true, causes: [] });
+        expect(await readFile(fromRel(root, `${P}/mine.txt`), "utf8"), run).toBe(HAND);
+      }
+    });
+
+    it("a file at the path is left as it is too; nothing at the path is done", async () => {
+      const entries = await lines();
+      await writeFile(fromRel(root, P), HAND);
+      expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
+      expect(await readFile(fromRel(root, P), "utf8")).toBe(HAND);
+      await rm(fromRel(root, P));
+      expect(await undoEntries(root, entries)).toEqual({ ok: true, causes: [] });
+    });
+
+    it("without a recorded identity (an older build's line): the folder is removed as before", async () => {
+      await mkdir(fromRel(root, P));
+      await writeFile(fromRel(root, `${P}/f`), "x");
+      expect(await undoEntries(root, [{ kind: "dir", path: P }])).toEqual({ ok: true, causes: [] });
+      expect(await stat(fromRel(root, P)).catch(() => null)).toBeNull();
+    });
+  });
+});
+
 describe("R47: the roll-back's look seam (seams.failLook) does nothing outside NODE_ENV=test", () => {
   it("under test the look fails (could-not-look, nothing deleted); under production the same undo removes the change's file", async () => {
     const root = await mkdtemp(join(tmpdir(), "ao-r519seam-"));

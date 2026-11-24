@@ -239,6 +239,8 @@ class TxImpl implements Tx {
         await this.log.retractDir(first);
         continue;
       }
+      // Made: its completion line records its identity, so that an undo removes only this folder (R526 M2).
+      await this.log.dirMade(first);
       if (first !== abs) await fsp.mkdir(abs, { recursive: true });
       return;
     }

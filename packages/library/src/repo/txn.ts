@@ -59,7 +59,13 @@ export type MarkerEntry =
    */
   | { kind: "created"; path: string; sha256?: string; complete?: true }
   | { kind: "replaced"; path: string; backup: string; mode: number; sha256?: string }
-  | { kind: "dir"; path: string }
+  /**
+   * `ino`, `birthtimeNs` (R526 M2): a completion line, a second "dir" line for the path written once the folder is made,
+   * with its identity (only where the file system gives a time of birth). The undo removes the folder only when what is
+   * at the path has that identity: one a person made again after an earlier undo removed the change's is left. An older
+   * reader ignores the fields and undoes the second line as the first (`rm -r`, the second finding nothing).
+   */
+  | { kind: "dir"; path: string; ino?: string; birthtimeNs?: string }
   /**
    * `shred`: destroyed, not deleted (R90 d): overwritten before it is removed once committed. `ino`, `birthtimeNs`
    * (R519 (3) as corrected by R526): the original's identity when it was trashed, its file number and its time of birth
@@ -215,6 +221,12 @@ export class TxnLog {
     await this.add({ kind: "created", path: toRel(this.root, abs), sha256, complete: true });
   }
 
+  /** The completion line of a folder this transaction just made (R526 M2): its identity, when there is one to record. */
+  async dirMade(abs: string) {
+    const identity = await identityOf(abs, "dir-made").catch(() => undefined);
+    if (identity) await this.add({ kind: "dir", path: toRel(this.root, abs), ...identity });
+  }
+
   async createdDir(abs: string) {
     const rel = toRel(this.root, abs);
     if (this.inNewDir(rel)) return;
@@ -358,6 +370,21 @@ async function isOriginal(root: string, rel: string, id: FileIdentity): Promise<
   return st !== null && st.ino.toString() === id.ino && st.birthtimeNs.toString() === id.birthtimeNs;
 }
 
+/**
+ * The identity the completion line of "dir" line `i` recorded of the folder the change made (R526 M2): the next "dir"
+ * line at that path, before a trash at or above it; undefined when there is none (an older build's line, no time of
+ * birth, or a crash between the folder and its completion line).
+ */
+function dirIdentity(entries: MarkerEntry[], i: number): FileIdentity | undefined {
+  const e = entries[i] as Extract<MarkerEntry, { kind: "dir" }>;
+  for (let j = i + 1; j < entries.length; j++) {
+    const x = entries[j]!;
+    if (x.kind === "dir" && x.path === e.path) return x.ino !== undefined && x.birthtimeNs !== undefined ? { ino: x.ino, birthtimeNs: x.birthtimeNs } : undefined;
+    if (x.kind === "trashed" && (e.path === x.from || e.path.startsWith(`${x.from}/`))) return undefined;
+  }
+  return undefined;
+}
+
 /** The hashes the change recorded for what it wrote at `rel` ("created", completion and "replaced" lines). */
 const writeHashes = (entries: MarkerEntry[], rel: string): string[] =>
   entries.flatMap((x) => ((x.kind === "created" || x.kind === "replaced") && x.path === rel && x.sha256 ? [x.sha256] : []));
@@ -484,6 +511,7 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
     steps++;
     if (done.has(i)) continue;
     if (e.kind === "trashed" && e.noIdentity) continue; // its first line undoes the move (R526)
+    if (e.kind === "dir" && e.ino !== undefined) continue; // a completion line: its first line removes the folder (R526 M2)
     const at = e.kind === "trashed" ? e.from : e.path;
     if (isBlocked(at)) continue; // left for the researcher, with the line that found it (the roll-back is not complete)
     try {
@@ -502,7 +530,23 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
           continue;
         }
         await fsp.rm(fromRel(root, e.path), { force: true });
-      } else if (e.kind === "dir") await fsp.rm(fromRel(root, e.path), { recursive: true, force: true });
+      } else if (e.kind === "dir") {
+        // R526 M2: with a recorded identity, the folder is removed only when it is the change's own. Anything else there
+        // (a folder a person made again after an earlier undo removed the change's) is left exactly as it is: the step
+        // is done, as it was when that earlier undo removed the change's folder. Without one: as before.
+        const id = dirIdentity(entries, i);
+        if (id !== undefined) {
+          let own: boolean;
+          try {
+            own = await isOriginal(root, e.path, id);
+          } catch {
+            block("could-not-look", e.path);
+            continue;
+          }
+          if (!own) continue;
+        }
+        await fsp.rm(fromRel(root, e.path), { recursive: true, force: true });
+      }
       else if (e.kind === "replaced") {
         const backup = fromRel(root, e.backup);
         if (!(await exists(backup))) continue;
@@ -607,6 +651,10 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
       case "created":
       case "dir":
         if (!under(en.path, pf)) return `${en.kind} path outside the project`;
+        // A folder's identity (R526 M2): whole or absent, on a "dir" line only.
+        if (en.ino !== undefined || en.birthtimeNs !== undefined) {
+          if (en.kind !== "dir" || !isDigits(en.ino) || !isDigits(en.birthtimeNs)) return "bad entry";
+        }
         if (en.sha256 !== undefined && (en.kind === "dir" || !isSha(en.sha256))) return "bad entry";
         if (en.complete !== undefined && (en.kind === "dir" || en.complete !== true || en.sha256 === undefined)) return "bad entry";
         break;
