@@ -11,6 +11,7 @@ import { sealEvent, verifyChain, type AuditEvent, type AuditVerifyResult } from 
 import { renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { SimulatedCrash, seams } from "./seams.js";
 import { appendDurable, assertContained, readMaybe, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
+import type { UndoCause } from "./txn.js";
 
 export const AUDIT_SEGMENT_SIZE = 10_000;
 const SEGMENT = /^(\d{4,})\.jsonl$/;
@@ -67,6 +68,8 @@ export interface IntegrityWarning {
   file?: string;
   /** Size of the incomplete line in bytes, for the two incomplete-line kinds. */
   bytes?: number;
+  /** An incomplete roll-back (`rolled-back-incomplete-write`): what kept each path from being undone (R519). */
+  causes?: UndoCause[];
 }
 
 /** Segment file names in `dir`, oldest first (empty when the folder is missing). */

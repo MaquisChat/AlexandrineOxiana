@@ -92,6 +92,8 @@ export class PendingWriteIncompleteError extends Error {
   constructor(
     readonly txn: string,
     message: string,
+    /** What kept each path from being undone, when known (R519): a cause and the library-relative path. */
+    readonly causes: ReadonlyArray<{ kind: string; path: string }> = [],
   ) {
     super(message);
   }

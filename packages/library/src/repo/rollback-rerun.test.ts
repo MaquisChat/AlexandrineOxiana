@@ -187,10 +187,10 @@ describe("R493: the cut seam is inert outside NODE_ENV=test (R47)", () => {
     try {
       process.env.NODE_ENV = "production";
       seams.stopUndoAfter = 0;
-      expect(await undoEntries(tmpdir(), [])).toBe(true);
+      expect((await undoEntries(tmpdir(), [])).ok).toBe(true);
       expect(seams.stopUndoAfter).toBe(0);
       process.env.NODE_ENV = "test";
-      expect(await undoEntries(tmpdir(), [])).toBe(false);
+      expect((await undoEntries(tmpdir(), [])).ok).toBe(false);
       expect(seams.stopUndoAfter).toBeUndefined();
     } finally {
       process.env.NODE_ENV = env;
@@ -233,7 +233,7 @@ describe("R503 b 1 (FR-737): a step at or UNDER a trashed path that was put back
           await undoEntries(root, entries);
           seams.stopUndoAfter = undefined;
           for (const run of ["second", "third"]) {
-            const ok = await undoEntries(root, entries);
+            const { ok } = await undoEntries(root, entries);
             const name = `${shape.name}, first roll-back cut after ${cut} step(s), the ${run} roll-back`;
             if (!ok) failures.push(`${name}: reported incomplete`);
             for (const f of ["a.txt", "sub/b.txt"]) {
@@ -395,7 +395,7 @@ async function runCase(seq: Op[], startExists: boolean, cut: number, legacy = fa
       // The steps and the marker as an older build left them (it took the shape the transaction now refuses), then
       // its in-process roll-back, cut as by a crash.
       const entries = await legacySteps(v, rel, seq);
-      if (await undoEntries(v.lib.root, entries)) failures.push(`${name}: the cut roll-back reported complete`);
+      if ((await undoEntries(v.lib.root, entries)).ok) failures.push(`${name}: the cut roll-back reported complete`);
     } else {
       await expect(
         v.repo.mutate(v.pid, STORE, async (tx) => {

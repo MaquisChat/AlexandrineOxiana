@@ -534,7 +534,7 @@ export async function runMutation<T>(
       maybeCrash("before-marker-delete");
     } catch (err) {
       if (err instanceof SimulatedCrash) throw err; // tests: the process "died" here
-      if (await log.undo()) {
+      if ((await log.undo()).ok) {
         st.audit.head = headBefore;
         await log.finish().catch(() => {});
       } else {

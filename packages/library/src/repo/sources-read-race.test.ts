@@ -304,19 +304,25 @@ describe("R473 I1: while a roll-back waits, only the sources its marker names ar
     expect(warnings("annotations-unreadable")).toHaveLength(1);
   });
 
-  it("a file the marker names, changed by hand meanwhile, is still put back at the reopen, and that is recorded", async () => {
+  it("a file the marker names, changed by hand meanwhile, is left as it is at the reopen, the roll-back incomplete with its cause (R519); moved away, it is put back", async () => {
     await failedRollBack();
-    await writeFile(join(lib.root, folder, "annotations.json"), JSON.stringify([note(sid, "edited by someone")]));
+    const edited = JSON.stringify([note(sid, "edited by someone")]);
+    await writeFile(join(lib.root, folder, "annotations.json"), edited);
+    await lib.close();
+    lib = await openLibrary(lib.root, mkDeps());
+    repo = await repoFor();
+    expect(await readFile(join(lib.root, folder, "annotations.json"), "utf8")).toBe(edited);
+    expect(warnings("rolled-back-incomplete-write")).toMatchObject([{ projectId: pid, causes: [{ kind: "hand-changed-file", path: `${folder}/annotations.json` }] }]);
+    expect(warnings("changed-outside-before-rollback")).toEqual([]);
+    await rm(join(lib.root, folder, "annotations.json"));
     await lib.close();
     lib = await openLibrary(lib.root, mkDeps());
     repo = await repoFor();
     const sf = await repo.getSource(pid, sid);
     expect(sf.annotations.map((a) => a.body)).toEqual(["first", "second"]);
     await consistentOnDisk(sf, folder);
-    expect(warnings("rolled-back-incomplete-write")).toHaveLength(1);
-    // R484 b: the roll-back overwrote the hand edit, so the annotations are not "shown as they are now".
+    expect(warnings("rolled-back-incomplete-write").flatMap((w) => w.causes ?? [])).toEqual([]);
     expect(warnings("annotations-hash-mismatch")).toEqual([]);
-    expect(warnings("changed-outside-before-rollback")).toMatchObject([{ projectId: pid, file: `${folder}/annotations.json` }]);
   });
 });
 

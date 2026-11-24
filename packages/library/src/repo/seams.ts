@@ -34,6 +34,8 @@ export const seams: {
    * kept), then clears itself. Honoured only when NODE_ENV is "test" (R47).
    */
   stopUndoAfter?: number;
+  /** Makes the roll-back's look at this library-relative path fail, as a permission or I/O error would (R519; until cleared). */
+  failLook?: string;
   /** Runs after a new folder is recorded in the marker and before it is created (a racing writer, R62). */
   beforeMkdir?: (abs: string) => Promise<void>;
   /** Makes every audit append for this project id fail (until cleared). */

@@ -151,13 +151,14 @@ async function carryOut(
   const rec = m.resolve!;
   if (!i.resolveAudited) {
     maybeCrash("before-changes");
-    const done = choice === "keep" ? await finishCommittedSteps(core.root, m) : await undoEntries(core.root, m.entries);
-    if (!done) {
+    const undone = choice === "keep" ? { ok: await finishCommittedSteps(core.root, m), causes: [] } : await undoEntries(core.root, m.entries);
+    if (!undone.ok) {
       throw new PendingWriteIncompleteError(
         m.txn,
         choice === "keep"
           ? "The change could not be finished: files it destroyed could not be overwritten yet. The choice is recorded; try again, or reopen the library."
           : "The change could not be undone completely: a step failed. The choice is recorded; try again, or reopen the library.",
+        undone.causes,
       );
     }
     maybeCrash("before-audit");

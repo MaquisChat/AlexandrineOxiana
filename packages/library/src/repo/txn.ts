@@ -243,8 +243,8 @@ export class TxnLog {
     await this.add({ kind: "append", path: rel, prevSize: u.prevSize, created: u.created });
   }
 
-  /** Undoes every recorded step in reverse. Returns false if any step failed. */
-  undo(): Promise<boolean> {
+  /** Undoes every recorded step in reverse; `ok` is false if any step failed or was left (R519). */
+  undo(): Promise<UndoResult> {
     return undoEntries(this.root, this.marker.entries);
   }
 
@@ -254,30 +254,92 @@ export class TxnLog {
   }
 }
 
-/** Whether the regular file at `rel` holds bytes one of `later` ("created"/"replaced" lines at that path) wrote. */
-async function ownBytesAt(root: string, rel: string, later: MarkerEntry[]): Promise<boolean> {
-  const hashes = later.flatMap((x) => ((x.kind === "created" || x.kind === "replaced") && x.path === rel && x.sha256 ? [x.sha256] : []));
-  if (!hashes.length) return false;
+/** Why a roll-back left a path as it found it (R519): a cause and the library-relative path, for the words shown. */
+export type UndoCauseKind =
+  /** A file the change wrote (created or replaced) holds bytes that are none of the change's own: changed or put there by hand. */
+  | "hand-changed-file"
+  /** A trashed original cannot be put back: something not of the change stands at its path. */
+  | "path-occupied"
+  /** The copy the app kept of a trashed original is gone, and the original is not at its path: it cannot be put back. */
+  | "kept-copy-gone"
+  /** What is at the path could not be looked at (permission, I/O): nothing there was touched. */
+  | "could-not-look";
+export interface UndoCause {
+  kind: UndoCauseKind;
+  path: string;
+}
+/** `ok`: every step undone (or already undone); `causes`: what kept a path from being undone, when known. */
+export interface UndoResult {
+  ok: boolean;
+  causes: UndoCause[];
+}
+
+/** What is at a path: nothing, a regular file (with the hash of its bytes), or something else. Throws when it cannot be looked at. */
+type Look = { at: "nothing" } | { at: "file"; sha256: string } | { at: "other" };
+async function look(root: string, rel: string): Promise<Look> {
+  if (process.env.NODE_ENV === "test" && seams.failLook === rel) throw new Error("simulated read failure");
   const st = await fsp.lstat(fromRel(root, rel)).catch((err: NodeJS.ErrnoException) => {
     if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
     throw err;
   });
-  if (!st?.isFile()) return false;
-  const now = await sha256File(fromRel(root, rel));
-  return now !== null && hashes.includes(now);
+  if (!st) return { at: "nothing" };
+  if (!st.isFile()) return { at: "other" };
+  const sha256 = await sha256File(fromRel(root, rel));
+  return sha256 === null ? { at: "nothing" } : { at: "file", sha256 };
+}
+
+/** The hashes the change recorded for what it wrote at `rel` ("created", completion and "replaced" lines). */
+const writeHashes = (entries: MarkerEntry[], rel: string): string[] =>
+  entries.flatMap((x) => ((x.kind === "created" || x.kind === "replaced") && x.path === rel && x.sha256 ? [x.sha256] : []));
+
+/** Whether the regular file at `rel` holds bytes one of `later` ("created"/"replaced" lines at that path) wrote. */
+async function ownBytesAt(root: string, rel: string, later: MarkerEntry[]): Promise<boolean> {
+  const hashes = writeHashes(later, rel);
+  if (!hashes.length) return false;
+  const now = await look(root, rel);
+  return now.at === "file" && hashes.includes(now.sha256);
 }
 
 /**
- * Best effort: keeps going past failures, and reports whether every step succeeded. Repeatable (R493): a step already
- * undone is never undone again. A "trashed" line whose trash copy is gone was put back by an earlier run of this
- * roll-back (every step is recorded before it is taken, so a copy never made means the change stopped there, with no
- * later line), and every later line of the marker at or under that path (R503 b 1) was undone before it: those lines
- * are skipped, since undoing one again could only remove or overwrite the original put back. Unless the change's own
- * bytes are still at that path (R503 b 2): then the copy was deleted outside the app, not put back; the lines are
- * skipped all the same (nothing is deleted) and the roll-back is not complete.
+ * Whether the change knows the bytes of the file "created" line `i` wrote: the line's own hash (a file written whole,
+ * atomically) or its completion line's (R519 (2)), the next completion line at that path before anything else of the
+ * change at or above it. A created line with neither is a copy cut off: whatever is at the path is the change's own.
  */
-export async function undoEntries(root: string, entries: MarkerEntry[]): Promise<boolean> {
+function knowsBytes(entries: MarkerEntry[], i: number): boolean {
+  const e = entries[i] as Extract<MarkerEntry, { kind: "created" }>;
+  if (e.sha256) return true;
+  for (let j = i + 1; j < entries.length; j++) {
+    const x = entries[j]!;
+    if (x.kind === "created" && x.path === e.path) return x.complete === true;
+    if (x.kind === "trashed" && (e.path === x.from || e.path.startsWith(`${x.from}/`))) return false;
+    if (x.kind !== "trashed" && x.path === e.path) return false;
+  }
+  return false;
+}
+
+/**
+ * Best effort: keeps going past failures, and reports whether every step succeeded, with the causes it knows. Repeatable
+ * (R493): a step already undone is never undone again. A "trashed" line whose trash copy is gone was put back by an
+ * earlier run of this roll-back (every step is recorded before it is taken, so a copy never made means the change
+ * stopped there, with no later line), and every later line of the marker at or under that path (R503 b 1) was undone
+ * before it: those lines are skipped, since undoing one again could only remove or overwrite the original put back.
+ * Unless the change's own bytes are still at that path (R503 b 2): then the copy was deleted outside the app, not put
+ * back; the lines are skipped all the same (nothing is deleted) and the roll-back is not complete.
+ *
+ * R519: never deletes, overwrites or moves a file it can tell is not the change's own. A "created" line's file is
+ * removed only when it holds bytes the change recorded at that path, or when the change recorded none for it (its copy
+ * was cut off: a half-written file of its own); a "replaced" line's backup is put back only over nothing, over bytes the
+ * change wrote at that path, or over bytes it kept aside there (put back already). Otherwise the file stays as it is,
+ * the path is "blocked": no earlier line at, under or above it is undone either (each would remove or overwrite it),
+ * and the roll-back is incomplete with the cause and the path. Moved away by the researcher, the next run completes.
+ */
+export async function undoEntries(root: string, entries: MarkerEntry[]): Promise<UndoResult> {
   let ok = true;
+  const causes: UndoCause[] = [];
+  const because = (kind: UndoCauseKind, path: string) => {
+    ok = false;
+    if (!causes.some((c) => c.kind === kind && c.path === path)) causes.push({ kind, path });
+  };
   const done = new Set<number>();
   for (const [i, e] of entries.entries()) {
     if (e.kind !== "trashed") continue;
@@ -287,15 +349,15 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
     } catch {
       // Not known whether it was put back: nothing at that path is undone again, and the roll-back is not complete.
       putBack = true;
-      ok = false;
+      because("could-not-look", e.from);
     }
     if (!putBack) continue;
     // R503 b 2: a copy gone while the change's own bytes (a later line's hash) are still at the path was not put back:
     // it was deleted outside the app. The roll-back is then not complete (the marker is kept); nothing is deleted.
     try {
-      if (await ownBytesAt(root, e.from, entries.slice(i + 1))) ok = false;
+      if (await ownBytesAt(root, e.from, entries.slice(i + 1))) because("kept-copy-gone", e.from);
     } catch {
-      ok = false;
+      because("could-not-look", e.from);
     }
     for (let j = i + 1; j < entries.length; j++) {
       const x = entries[j]!;
@@ -304,6 +366,13 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       if (p === e.from || p.startsWith(`${e.from}/`)) done.add(j);
     }
   }
+  /** Paths where something not of the change was left as it is (R519). */
+  const blocked: string[] = [];
+  const block = (kind: UndoCauseKind, path: string) => {
+    because(kind, path);
+    blocked.push(path);
+  };
+  const isBlocked = (p: string) => blocked.some((b) => p === b || p.startsWith(`${b}/`) || b.startsWith(`${p}/`));
   let steps = 0;
   /** Test seam (R47): the roll-back is cut off here, as by a crash. */
   const cut = (): boolean => {
@@ -313,16 +382,53 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
   };
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i]!;
-    if (cut()) return false;
+    if (cut()) return { ok: false, causes };
     steps++;
     if (done.has(i)) continue;
+    const at = e.kind === "trashed" ? e.from : e.path;
+    if (isBlocked(at)) continue; // left for the researcher, with the line that found it (the roll-back is not complete)
     try {
       if (seams.failUndo === e.kind) throw new Error(`simulated undo failure (${e.kind})`);
-      if (e.kind === "created") await fsp.rm(fromRel(root, e.path), { force: true });
-      else if (e.kind === "dir") await fsp.rm(fromRel(root, e.path), { recursive: true, force: true });
+      if (e.kind === "created") {
+        let now: Look;
+        try {
+          now = await look(root, e.path);
+        } catch {
+          block("could-not-look", e.path);
+          continue;
+        }
+        if (now.at === "nothing") continue;
+        if (knowsBytes(entries, i) && !(now.at === "file" && writeHashes(entries, e.path).includes(now.sha256))) {
+          block("hand-changed-file", e.path);
+          continue;
+        }
+        await fsp.rm(fromRel(root, e.path), { force: true });
+      } else if (e.kind === "dir") await fsp.rm(fromRel(root, e.path), { recursive: true, force: true });
       else if (e.kind === "replaced") {
         const backup = fromRel(root, e.backup);
-        if (await exists(backup)) await writeFileAtomic(fromRel(root, e.path), await fsp.readFile(backup), { mode: e.mode });
+        if (!(await exists(backup))) continue;
+        if (e.sha256) {
+          // A line of an older build carries no hash: judged as before (put back).
+          let now: Look;
+          let kept: string[];
+          try {
+            now = await look(root, e.path);
+            kept = [];
+            for (const x of entries) {
+              if (x.kind !== "replaced" || x.path !== e.path) continue;
+              const h = await sha256File(fromRel(root, x.backup));
+              if (h !== null) kept.push(h);
+            }
+          } catch {
+            block("could-not-look", e.path);
+            continue;
+          }
+          if (now.at === "other" || (now.at === "file" && !writeHashes(entries, e.path).includes(now.sha256) && !kept.includes(now.sha256))) {
+            block("hand-changed-file", e.path);
+            continue;
+          }
+        }
+        await writeFileAtomic(fromRel(root, e.path), await fsp.readFile(backup), { mode: e.mode });
       } else if (e.kind === "trashed") {
         const to = fromRel(root, e.to);
         if (await exists(to)) {
@@ -342,8 +448,8 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       ok = false;
     }
   }
-  if (cut()) return false;
-  return ok;
+  if (cut()) return { ok: false, causes };
+  return { ok, causes };
 }
 
 export async function removeMarker(root: string, m: TxnMarker): Promise<void> {
@@ -468,8 +574,8 @@ export interface RecoveryResult {
   projectId: string;
   /** Not finished or rolled back: the paths the (readable) marker names, which stay half changed until it is (R473 I1). */
   paths?: string[];
-  /** Rolled back: the files it found changed outside the app meanwhile (R473 I1 3), which it put back all the same. */
-  changedOutside?: string[];
+  /** Not completely rolled back: what kept each path from being undone, when known (R519). */
+  causes?: UndoCause[];
   /** The marker's `projectFolder` as written, when it has one (it may be a different project's folder). */
   projectFolder?: string;
   txn: string;
@@ -662,12 +768,12 @@ export async function recordResolve(root: string, m: TxnMarker, rec: ResolveReco
 
 /**
  * Undoes every step of an uncommitted transaction in reverse (partially appended change-log and
- * audit lines included), then removes the marker. Returns false, keeping the marker, when a step failed.
+ * audit lines included), then removes the marker. Not ok, keeping the marker, when a step failed or was left (R519).
  */
-export async function rollBackMarker(root: string, m: TxnMarker): Promise<boolean> {
-  if (!(await undoEntries(root, m.entries))) return false;
-  await removeMarker(root, m);
-  return true;
+export async function rollBackMarker(root: string, m: TxnMarker): Promise<UndoResult> {
+  const r = await undoEntries(root, m.entries);
+  if (r.ok) await removeMarker(root, m);
+  return r;
 }
 
 /** The library-relative paths a marker names (the files and folders its change touched). */
@@ -685,58 +791,6 @@ const sha256File = async (abs: string): Promise<string | null> => {
     throw err;
   }
 };
-
-/**
- * R473 I1 3, R484 a: the files a marker names that are, before it is rolled back, neither as they were before its
- * change nor as the change itself left them: changed outside the app meanwhile. A path is judged as a whole, never
- * line by line: against the state before its FIRST line (absent before a "created", the backup copy of a "replaced")
- * and the bytes the change wrote there, its LAST write's above all; an earlier write of the change counts as its own
- * too, since a roll-back cut off half-way (in the running app, or a crash during the reopen's) leaves one there. A
- * trashed path whose trash copy is gone was put back by the app's own roll-back; one whose copy is still in the trash
- * and that something not of the change fills is never listed: the roll-back leaves it and stays incomplete. Only what the marker
- * can tell is judged: a path whose last write the change recorded no hash for (a copied file) is not. The roll-back
- * puts the earlier state back all the same; the caller records these. Reads only.
- */
-export async function changedSinceMarker(root: string, m: TxnMarker): Promise<string[]> {
-  /** Each path the change wrote or trashed, with the indices of its lines in order. */
-  const lines = new Map<string, number[]>();
-  m.entries.forEach((e, k) => {
-    const p = e.kind === "trashed" ? e.from : e.kind === "created" || e.kind === "replaced" ? e.path : null;
-    if (p !== null) lines.set(p, [...(lines.get(p) ?? []), k]);
-  });
-  const out: string[] = [];
-  for (const [p, ks] of lines) {
-    try {
-      const own = ks.map((k) => m.entries[k]!);
-      const trashes = own.filter((e): e is Extract<MarkerEntry, { kind: "trashed" }> => e.kind === "trashed");
-      let putBack = false;
-      for (const t of trashes) if (!(await exists(fromRel(root, t.to)))) putBack = true;
-      if (putBack) continue; // the app's own roll-back moved it back (R484 a)
-      const lastTrash = ks.filter((k) => m.entries[k]!.kind === "trashed").at(-1);
-      const writes = own.filter((e): e is Extract<MarkerEntry, { kind: "created" | "replaced" }> => e.kind === "created" || e.kind === "replaced");
-      const lastWrite = ks.filter((k) => m.entries[k]!.kind !== "trashed").at(-1);
-      if (lastTrash !== undefined) {
-        // Something there again is the change's own only when a later step of it wrote at or under that path.
-        const refilled = m.entries.slice(lastTrash + 1).some((x) => x.kind !== "trashed" && (x.path === p || x.path.startsWith(`${p}/`)));
-        // Not refilled by the change: something there now is not put back over (the roll-back stays incomplete, its
-        // marker and trash copy kept, R491 C a), so "the outside change was not kept" would be untrue: not listed here.
-        if (!refilled) continue;
-        if (lastWrite === undefined || lastWrite < lastTrash) continue; // refilled by a step that records no hash
-      }
-      if (!writes.at(-1)?.sha256) continue;
-      const now = await sha256File(fromRel(root, p));
-      if (now === null) continue; // absent: as before a "created", or in the trash; nothing is claimed
-      if (writes.some((w) => w.sha256 === now)) continue; // as the change wrote it
-      let before = false;
-      for (const w of writes) if (w.kind === "replaced" && now === (await sha256File(fromRel(root, w.backup)))) before = true;
-      if (before) continue; // as before the change (or a write of it a later line kept aside): put back already
-      out.push(p);
-    } catch {
-      // Unreadable now: the roll-back says what it can; nothing is claimed here.
-    }
-  }
-  return out;
-}
 
 /**
  * Finishes or rolls back every transaction marker left by a crash. Writable
@@ -770,10 +824,11 @@ export async function recoverTransactions(
       out.push({ ...where, paths: markerPaths(m), outcome: "skipped-audit-unverifiable", ...(i.detail ? { detail: i.detail } : {}) });
       continue;
     }
-    const changedOutside = await changedSinceMarker(root, m);
-    const also = changedOutside.length ? { changedOutside } : {};
-    if (await rollBackMarker(root, m)) out.push({ projectId: m.projectId, txn: m.txn, outcome: "rolled-back", ...also });
-    else out.push({ ...where, paths: markerPaths(m), outcome: "rollback-incomplete", ...also });
+    // R519: a file found changed outside the app is never put back over (it is left, with its cause), so nothing of an
+    // outside change is lost silently: there is no "changed outside, not kept" to report any more.
+    const r = await rollBackMarker(root, m);
+    if (r.ok) out.push({ projectId: m.projectId, txn: m.txn, outcome: "rolled-back" });
+    else out.push({ ...where, paths: markerPaths(m), outcome: "rollback-incomplete", ...(r.causes.length ? { causes: r.causes } : {}) });
   }
   return out;
 }
