@@ -23,6 +23,11 @@
  * Read-only library: a notice says so; no control that makes or changes anything is enabled (the
  * making controls come with Tasks R9 to R11 and read `readOnly`).
  *
+ * Look-only (`look`, R470 b, FR-490): a file Find and acquire holds for the researcher's decision, read through the
+ * held file's own ranges. Nothing of the source's annotations is asked for or shown, no highlight or note can be made
+ * (no making control, no key that makes one, no annotation list), nothing is remembered and nothing is sent but the
+ * ranges read: the toolbar and the pages only, under the caller's own line saying what the file is.
+ *
  * Highlights (Task R8): once the document is open, the source's annotations are asked for once, and
  * those of this file (A4) are drawn on each drawn page by HighlightLayer. Whether a highlight's
  * quote still matches the text under it is worked out from each drawn page's text as PdfPages read
@@ -140,6 +145,16 @@ export function ReaderStateView({ heading, sentence, focus = false, children }: 
   );
 }
 
+/** R470 b: a file to LOOK at only — its bytes by ranges from a route of its own (a held file). */
+export interface LookOnly {
+  range(start: number, end: number, signal?: AbortSignal): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
+  /**
+   * Called once the file is no longer there ("not found", at the first range or in mid-look): the holder of the look
+   * stops showing it and says so in its own words (R487 a).
+   */
+  onGone(): void;
+}
+
 export interface ReaderScreenProps {
   api: ReaderApi;
   projectId: string;
@@ -162,6 +177,8 @@ export interface ReaderScreenProps {
   /** Called once when the words are no longer needed (matched, or the document ended), so that whoever held them lets go. */
   onFindDone?(): void;
   readOnly: boolean;
+  /** R470 b: look-only, at a file that is not a source's (its own ranges); `assetId` is then not used. */
+  look?: LookOnly;
   /** The source's availability, said with a missing file. */
   availability?: SourceAvailability;
   /**
@@ -213,7 +230,12 @@ export const FIND_NOT_CARRIED = "Your search was not carried over, so all annota
 /** Said when the annotation the address names is not in the source (Task R12). */
 export const ANNOTATION_GONE = "That highlight or note is no longer there.";
 
-export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, findWords, onFindDone, preloadedAnnotations, readOnly, availability, onProjectInDoubt }: ReaderScreenProps) {
+export function ReaderScreen({ api, projectId, sourceId, assetId: storedAssetId, annotationId, findWords, onFindDone, preloadedAnnotations, readOnly: libraryReadOnly, look, availability, onProjectInDoubt }: ReaderScreenProps) {
+  // R470 b: a look makes nothing — every making path sees a read-only reader with no file of the source.
+  const assetId = look ? undefined : storedAssetId;
+  const readOnly = libraryReadOnly || look !== undefined;
+  const lookRef = useRef(look);
+  lookRef.current = look;
   const [phase, setPhase] = useState<Phase>({ kind: "opening" });
   const [page, setPage] = useState(1);
   const [scale, setScale] = useState(1);
@@ -290,6 +312,8 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
   const fail = useCallback((s: { state: ReaderStateKind; sentence: string }) => {
     attempts.current++;
     setPhase({ kind: "failed", ...s, attempt: attempts.current });
+    // R487 a: a look whose file is no longer there is ended by whoever holds it (its own sentence, not the source's).
+    if (s.state === "missing") lookRef.current?.onGone();
   }, []);
 
   /** A 423 while open (A11): locked, by the same path as a refused range (A7, A9): destroyed at once, never reused. */
@@ -312,7 +336,10 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
 
   const open = useCallback(
     async (password?: string) => {
-      if (!assetId) return;
+      const looking = lookRef.current;
+      if (!assetId && !looking) return;
+      const aid = assetId ?? "";
+      const range = looking ? (start: number, end: number, signal?: AbortSignal) => looking.range(start, end, signal) : (start: number, end: number, signal?: AbortSignal) => apiRef.current.documentRange(projectId, sourceId, aid, start, end, signal);
       const g = ++gen.current;
       abort.current?.abort();
       close();
@@ -320,14 +347,13 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
       abort.current = ac;
       setPhase({ kind: "opening" });
       const stale = () => g !== gen.current;
-      const api = apiRef.current;
       let lastRangeError: unknown;
       try {
-        const first = await api.documentRange(projectId, sourceId, assetId, 0, FIRST_RANGE_END, ac.signal);
+        const first = await range(0, FIRST_RANGE_END, ac.signal);
         if (stale()) return;
         if (first.total > READER_PDF_MAX_BYTES) return fail({ state: "too-large", sentence: READER_STATES["too-large"].sentence });
         const transport = createRangeTransport({ bytes: first.bytes, total: first.total }, (start, end, signal) =>
-          api.documentRange(projectId, sourceId, assetId, start, end, signal).catch((e: unknown) => {
+          range(start, end, signal).catch((e: unknown) => {
             lastRangeError = e;
             throw e;
           }),
@@ -410,7 +436,8 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
   // R8: the annotations, asked for once a document is open (and again on "Try again"); the request is
   // aborted, and a late answer dropped, when the document ends or the list is asked for again.
   useEffect(() => {
-    if (!handle) return;
+    // R470 b: a look asks nothing of the source's annotations.
+    if (!handle || lookRef.current) return;
     let on = true;
     const ac = new AbortController();
     const alive = () => on && current.current === handle && !handle.dead;
@@ -579,6 +606,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
 
   const renderOverlay = useCallback(
     (pageIndex: number, viewport: Parameters<typeof HighlightLayer>[0]["viewport"]) => {
+      if (lookRef.current) return null;
       noteViewport(pageIndex, viewport);
       noteViewportHere(pageIndex, viewport);
       const list = drafts.length > 0 ? [...(fileAnnotations ?? []), ...drafts] : fileAnnotations;
@@ -784,12 +812,14 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
 
   const onAreaKey = (e: KeyboardEvent<HTMLDivElement>) => {
     if (typing(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
-    if (e.key === "Escape" && making.cancel()) {
+    // R470 b: a look has no making keys (S, N, the keyboard's selection); Escape is left to whoever holds the look.
+    const looking = lookRef.current !== undefined;
+    if (!looking && e.key === "Escape" && making.cancel()) {
       e.preventDefault();
       return;
     }
     // Task R11: S, N, and the keyboard's selection (Shift+arrows, Enter, Escape).
-    if (keyboard.onKey(e)) {
+    if (!looking && keyboard.onKey(e)) {
       e.preventDefault();
       return;
     }
@@ -835,7 +865,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
     void open(password);
   };
 
-  if (!assetId) return <ReaderStateView heading="No PDF" sentence="This source has no PDF that can be shown here." />;
+  if (!assetId && !look) return <ReaderStateView heading="No PDF" sentence="This source has no PDF that can be shown here." />;
 
   if (phase.kind === "failed") {
     const { heading } = READER_STATES[phase.state];
@@ -853,6 +883,8 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
               <button type="submit">Open</button>
             </form>
           ) : offerFor(phase.state) === "library" ? (
+            // A look is held by a screen that unlocks the project itself: nothing to go to from here.
+            look ? null : 
             <LibraryLink projectId={projectId} />
           ) : offerFor(phase.state) === "open-again" ? (
             <button type="button" onClick={() => void open()}>
@@ -876,7 +908,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
   const pct = `${Math.round(scale * 100)}%`;
   return (
     <div className="ao-reader-page-screen">
-      {readOnly && (
+      {libraryReadOnly && !look && (
         <p role="note" className="ao-reader-notice">
           {READ_ONLY_NOTICE}
         </p>
@@ -973,18 +1005,18 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, annotationId, 
             Rotate view
           </button>
         </span>
-        {keyboard.buttons}
+        {!look && keyboard.buttons}
       </div>
-      {keyboard.reasons}
-      {keyboard.help}
+      {!look && keyboard.reasons}
+      {!look && keyboard.help}
       <div className="ao-reader-body">
         <div className={keyboard.placing ? "ao-reader-area ao-reader-area--placing" : "ao-reader-area"} ref={area} onKeyDown={onAreaKey} onScrollCapture={making.onScroll}>
-          <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={renderOverlay} onPageText={onPageText} />
-          {making.floating}
-          {making.notices}
-          {keyboard.notices}
+          <PdfPages handle={handle} scale={scale * CSS_PX_PER_POINT} rotation={rotation} currentPage={page} onPageChange={(n) => goTo(n, false)} renderOverlay={renderOverlay} onPageText={onPageText} look={look !== undefined} />
+          {!look && making.floating}
+          {!look && making.notices}
+          {!look && keyboard.notices}
         </div>
-        {(annotations !== undefined || annotationsError !== undefined) && (
+        {!look && assetId !== undefined && (annotations !== undefined || annotationsError !== undefined) && (
           <AnnotationList
             {...(keyboard.readOnlyReasonId !== undefined ? { readOnlyReasonId: keyboard.readOnlyReasonId } : {})}
             annotations={annotations ?? []}

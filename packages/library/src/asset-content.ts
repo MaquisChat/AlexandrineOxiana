@@ -10,6 +10,9 @@
  * unknown assets (NotFoundError), an asset the caller does not accept (InvalidInputError), and a
  * stored file that is a symbolic link or resolves outside the library (PathEscapeError). Errors
  * never carry the file's absolute path.
+ *
+ * R470 b (FR-490): a file Find and acquire holds for the researcher's decision is read by the same code
+ * (`openHeldFileContent`), to be looked at before "Use this file" / "Not this file"; nothing is recorded.
  */
 import { constants as fsc } from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -18,7 +21,7 @@ import type { Asset } from "@ao/core";
 import { openDecryptedHandle, type DecryptedFile } from "./crypto/random-access.js";
 import { absPath, assertContained } from "./repo/io.js";
 import { InvalidInputError, NotFoundError } from "./repo/errors.js";
-import { projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
+import { heldFileToLookIn, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
 
 /** Recorded types the media route serves (R135 3): audio and video only. */
 const MEDIA_MIME = /^(audio|video)\/[a-z0-9][a-z0-9.+-]{0,126}$/;
@@ -37,8 +40,8 @@ export const isPdfMime = (mime: string): boolean => mime === "application/pdf";
 /** How much is read (and decrypted) per step of a stream. */
 const SLICE = 64 * 1024;
 
-export interface AssetContent {
-  asset: Asset;
+/** A stored file opened for reading by ranges (a source's file, or a held file looked at). */
+export interface StoredContent {
   /** The recorded type. */
   mime: string;
   /** Plaintext size in bytes. */
@@ -49,6 +52,15 @@ export interface AssetContent {
   read(position: number, length: number): Promise<Buffer>;
   /** Releases the file (and wipes the decryption key copy); any stream still reading then fails. Idempotent. */
   close(): Promise<void>;
+}
+
+export interface AssetContent extends StoredContent {
+  asset: Asset;
+}
+
+/** R470 b: a file Find and acquire holds for the researcher's decision, opened to be looked at. */
+export interface HeldFileContent extends StoredContent {
+  kind: "pdf" | "epub";
 }
 
 /**
@@ -63,6 +75,7 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
   // An encrypted file needs the project's key: a locked project is refused before anything is opened.
   const key = asset.encrypted ? projectDataKey(repo, projectId) : null;
   if (asset.encrypted && !key) throw new InvalidInputError("this file is encrypted but the project is not");
+  // R492 a: and the key is asked for again AT the file's opening (keyAtOpening, as for a held file, R487 e), for every caller.
   let abs: string;
   if (asset.linked) {
     abs = asset.linked.absolutePath;
@@ -71,6 +84,44 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
     abs = absPath(root, asset.path);
     await assertContained(root, abs);
   }
+  return { asset, ...(await openStored(abs, key && keyAtOpening(repo, projectId), asset.mime, () => new NotFoundError("Asset", assetId))) };
+}
+
+/**
+ * R470 b (FR-490): opens the file Find and acquire holds for pending review entry `reviewId` of the project, to be LOOKED
+ * at before the researcher decides — by the same reading code as a stored file (decrypted chunk by chunk, never whole,
+ * no plaintext written). Nothing is recorded or audited. Refused: a locked project (ProjectLockedError); no such held
+ * file — an unknown entry, one of another project, one that holds none or is decided, a held file gone — NotFoundError.
+ * The caller must close() it.
+ */
+export async function openHeldFileContent(repo: Repo, projectId: string, reviewId: string): Promise<HeldFileContent> {
+  const h = await heldFileToLookIn(repo, projectId, reviewId);
+  const key = h.encrypted ? projectDataKey(repo, projectId) : null;
+  if (h.encrypted && !key) throw new InvalidInputError("this file is encrypted but the project is not");
+  const root = repoLibrary(repo).root;
+  const abs = absPath(root, h.rel);
+  await assertContained(root, abs);
+  const mime = h.kind === "pdf" ? "application/pdf" : "application/epub+zip";
+  return { kind: h.kind, ...(await openStored(abs, key && keyAtOpening(repo, projectId), mime, () => new NotFoundError("Held file", reviewId))) };
+}
+
+/**
+ * R487 e, R492 a: the project's key, asked for AT the file's opening, not taken before it: a lock asked in between (by
+ * the wipe, or by the mark that hides the key from every reader at once, R386 b) refuses the read as locked, and not one
+ * byte of the file's content is read under it.
+ */
+function keyAtOpening(repo: Repo, projectId: string): (keyId: string) => Uint8Array | undefined {
+  return (id) => {
+    const k = projectDataKey(repo, projectId);
+    return k && id === k.keyId ? k.key : undefined;
+  };
+}
+
+/**
+ * Opens the file at `abs` (decrypted with the key `keyOf` gives at its opening, when given; sealed files only); `missing`
+ * is what a file not there is refused as.
+ */
+async function openStored(abs: string, keyOf: ((keyId: string) => Uint8Array | undefined) | null, mime: string, missing: () => Error): Promise<StoredContent> {
   const unsafe = () => new InvalidInputError("this file could not be opened safely");
   let fh: fsp.FileHandle;
   try {
@@ -81,7 +132,7 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ELOOP") throw unsafe();
-    if (code === "ENOENT" || code === "ENOTDIR") throw new NotFoundError("Asset", assetId);
+    if (code === "ENOENT" || code === "ENOTDIR") throw missing();
     // Something other than a regular file that cannot even be opened (a socket): refused as unsafe.
     const st = await fsp.lstat(abs).catch(() => undefined);
     if (st && !st.isFile()) throw unsafe();
@@ -95,9 +146,9 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
     const st = await fh.stat();
     // A FIFO, a device or a folder put in the file's place: refused, never read.
     if (!st.isFile()) throw unsafe();
-    if (key) {
+    if (keyOf) {
       // One decrypted chunk cached: reads for display are sequential (R140 review M8).
-      dec = await openDecryptedHandle(fh, (id) => (id === key.keyId ? key.key : undefined), { cacheChunks: 1 });
+      dec = await openDecryptedHandle(fh, keyOf, { cacheChunks: 1 });
       size = dec.size;
     } else {
       size = st.size;
@@ -122,8 +173,7 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
   };
 
   return {
-    asset,
-    mime: asset.mime,
+    mime,
     size,
     read(position, length) {
       if (!Number.isInteger(position) || !Number.isInteger(length) || position < 0 || length < 0 || position + length > size) throw new RangeError("range outside the file");

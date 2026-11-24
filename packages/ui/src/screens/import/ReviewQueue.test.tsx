@@ -944,7 +944,8 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     for (const t of ["Right One", "Right Two", RECORD, "Doubted Two"]) {
       await waitFor(() => expect(within(card(t)).getByRole("button", { name: `Use this file for ${t} (Smith, 2020)` })).toBeTruthy());
       const buttons = within(card(t)).getAllByRole("button");
-      expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual([`Use this file for ${t} (Smith, 2020)`, `Not this file for ${t} (Smith, 2020)`]);
+      // R470 b: and, after them, "Look at the file" — it decides nothing.
+      expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual([`Use this file for ${t} (Smith, 2020)`, `Not this file for ${t} (Smith, 2020)`, `Look at the file for ${t} (Smith, 2020)`]);
     }
     // No control in the section is about more than one file.
     for (const el of within(section).queryAllByRole("button")) expect(el.getAttribute("aria-label") ?? el.textContent).not.toMatch(/\ball\b|every|selected/iu);
@@ -1739,7 +1740,8 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     const cards = () => [...section().querySelectorAll<HTMLElement>(".ao-review__file")];
     const titles = () => cards().map((c) => c.querySelector("h4")?.textContent);
     /** A card's controls as a person reaches them (by role: a hidden, inert stand-in is none). */
-    const controls = (el: HTMLElement) => within(el).queryAllByRole("button");
+    // The deciding controls (R470 b: "Look at the file", which decides nothing, is not one of them).
+    const controls = (el: HTMLElement) => within(el).queryAllByRole("button").filter((b) => !(b.getAttribute("aria-label") ?? "").startsWith("Look at the file"));
 
     it("R319 a: after Use this file the card stays in its place with the result in words and no deciding control; the next card has not moved", async () => {
       const { user } = open(mixed());
