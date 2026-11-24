@@ -1383,6 +1383,8 @@ describe("incomplete audit and change-log lines (fix round 4, R28)", () => {
     expect((await readFile(seg)).equals(auditBefore)).toBe(true);
     await expect(again.createCollection(q.id, "x")).resolves.toBeDefined();
     await expect(again.createCollection(pid, "x")).rejects.toBeInstanceOf(RecoveryPendingError);
+    // R528 M3, R530: held until the library is opened again (the service then says so, and points to its warning).
+    await expect(again.createCollection(pid, "x")).rejects.toMatchObject({ reason: "reopen" });
     await expect(denied(again)).rejects.toBeInstanceOf(RecoveryPendingError);
   });
 
