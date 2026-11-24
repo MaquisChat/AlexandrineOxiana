@@ -131,6 +131,12 @@ export interface Session {
   index: IndexHandle | undefined;
   /** The one lookup client of this library (R96: shared by attach, Bulk Import and watched folders). */
   http: HttpClient;
+  /**
+   * FR-749 (R546 2, 3): aborted the moment a close of this library begins (the close route, the close inside opening
+   * or creating another library, the service's stop). An attach or a watched folder's bringing-in not yet in its store
+   * turn is then cancelled; with it the lookup client is stopped (`beginClosing`).
+   */
+  closing: AbortController;
   bulk: BulkImport | undefined;
   watches: Map<string, FolderWatch[]>;
   /** Batches started (or resumed) by this service, by id. */
@@ -723,6 +729,7 @@ export class ServiceState {
         keyReady: (h) => this.searchKeyReady(h),
         contactEmailFor: (h) => this.searchEmailForHost(h),
       }),
+      closing: new AbortController(),
       bulk: undefined,
       watches: new Map(),
       watchStarting: new Map(),
@@ -988,6 +995,7 @@ export class ServiceState {
       repo: s.repo,
       http: s.http,
       lib: s.lib,
+      closing: s.closing.signal,
       proxies: proxyQueueFor(s.repo),
       ...(this.opts.watchStabilityMs !== undefined ? { stabilityMs: this.opts.watchStabilityMs, pollMs: Math.max(50, this.opts.watchStabilityMs) } : {}),
       // Task W7: per-file events are no longer published; the folder's status is, as `watch.status` (routes/watched-folders.ts).
@@ -1285,8 +1293,8 @@ export class ServiceState {
     for (const p of s.repo.listProjects()) if (p.encryption.enabled) this.endCaptures(p.id, "close");
     // Find and acquire stops for good, awaited (bounded): its own work and the researcher's acts already in their store
     // turn end first, and any act still waiting for its turn is refused by the runner (R245). So none of its writes
-    // lands after the lock is released.
-    await this.endFind(s);
+    // lands after the lock is released. Then the lookup client sends nothing more (FR-749, R546): see beginClosing.
+    await this.beginClosing(s);
     this.stopBackupScheduler();
     // N-5: the rerun of interrupted jobs starts no further job, and a transcription is asked to stop
     // too; what is still running when the grace period ends is abandoned below.
@@ -1603,6 +1611,19 @@ export class ServiceState {
   }
 
   /** Stops the runner for good and waits for it (bounded: FIND_STOP_SETTLE_MS); `activate` makes a new one. */
+  /**
+   * FR-749 (R546 2, 3; R247 c): the start of every close of the library, and of the service's stop. At once, the session's
+   * closing signal: an attach or a watched folder's bringing-in that has written nothing yet is cancelled (its lookup's
+   * waits cut short; nothing of it is written), and none of their changes begins; a change in its store turn finishes.
+   * Then Find and acquire stops (its runner lets go of its own lookups and records nothing of them), and the session's
+   * lookup client is stopped: it sends nothing more, for any caller (Bulk Import, Find, whatever holds it). Idempotent.
+   */
+  async beginClosing(s: Session): Promise<void> {
+    s.closing.abort();
+    await this.endFind(s);
+    s.http.stop();
+  }
+
   private async endFind(s: Session): Promise<void> {
     const r = s.find;
     s.find = undefined;

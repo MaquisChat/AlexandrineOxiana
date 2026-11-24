@@ -351,7 +351,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     // Only paths the researcher chose: absolute, no NUL, as every other route that takes a path (R379, R96).
     if (paths.some((p) => !isLocalAbsolutePath(p))) throw badRequest('"paths" must be absolute paths.');
     const toSourceId = optStr(b, "toSourceId", 64);
-    const attach = createAttach({ repo: s.repo, http: s.http, proxies: proxyQueueFor(s.repo) });
+    // FR-749 (R546 2): a close that begins while the files are looked up cancels those not yet written.
+    const attach = createAttach({ repo: s.repo, http: s.http, proxies: proxyQueueFor(s.repo), closing: s.closing.signal });
     const items = await attach.attachFiles(projectId, paths, toSourceId ? { toSourceId } : {});
     // PDFs without a text layer are offered for OCR by the import flow; attach leaves that choice to the researcher.
     return { items };

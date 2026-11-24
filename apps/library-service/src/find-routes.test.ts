@@ -993,6 +993,26 @@ describe("other projects and the screen's settings", () => {
 });
 
 describe("R247: the index, the cache, and work under way at a close or a move", () => {
+  it("FR-749 (R546): once the service is closed, the session's lookup client sends nothing more — queued lookups are dropped, none is retried", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    gated.holdAll(); // every request stays in the air
+    await add(pid, ["Reference one about tides", "Reference two about salt", "Reference three about harbours", "Reference four about nets", "Reference five about boats"]);
+    await until(async () => gated.sent.length > 0, "a lookup to be sent");
+    const s = svc!.state.session!;
+    await svc!.close();
+    svc = undefined;
+    const sentAtClose = gated.sent.length;
+    // The requests held in the air are let go; nothing queued behind them, and no retry, goes out afterwards. A retry's
+    // first back-off is half a second: a second is twice that.
+    gated.releaseAll();
+    await sleep(1_000);
+    expect(gated.sent.length).toBe(sentAtClose);
+    await expect(s.http.getJson("https://api.crossref.org/works?query.bibliographic=late", { cacheKey: "late" })).rejects.toThrow(/being closed/);
+    expect(gated.sent.length).toBe(sentAtClose);
+  }, 30_000);
+
   it("(a, b) unlock always resumes; adds wait while the index is rebuilt; an index that needs a rebuild says so and names the control; the queue goes on by itself after a rebuild", async () => {
     let gate: Promise<void> | undefined;
     let open!: () => void;

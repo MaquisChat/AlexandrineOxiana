@@ -53,6 +53,7 @@ import {
   ImmutableProvenanceError,
   InvalidConfirmTokenError,
   InvalidRecoveryCodeError,
+  LibraryClosedError,
   LibraryMovedError,
   LibraryNotWritableError,
   MoveNotAllowedError,
@@ -120,6 +121,9 @@ export function toApiError(err: unknown): ApiError {
   // A source's annotations at a cap (R74 I4): nothing was written (Task R4).
   if (err instanceof AnnotationLimitError) return err.kind === "count" ? new ApiError(409, "CONFLICT", err.message) : new ApiError(413, "PAYLOAD_TOO_LARGE", err.message);
   if (err instanceof ReadOnlyLibraryError) return new ApiError(409, "READ_ONLY", "This library is open read-only, so nothing can be changed.");
+  // FR-749 (R546): the change asked for came after the library's close began; nothing was written. As every request
+  // that arrives once a close has begun (requireSession).
+  if (err instanceof LibraryClosedError) return new ApiError(503, "LIBRARY_OFFLINE", "No library is open.");
   if (err instanceof WrongPassphraseError) return new ApiError(401, "WRONG_PASSPHRASE", "That passphrase is not correct.");
   if (err instanceof InvalidRecoveryCodeError) return new ApiError(401, "WRONG_PASSPHRASE", "That recovery code is not valid.");
   if (err instanceof ProjectLockedError) return new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
