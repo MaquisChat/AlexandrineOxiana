@@ -1275,6 +1275,14 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
   const TWO_UNVERIFIED =
     "2 files are not included. They were left out when this project was restored from a backup, because records the app could not verify name them as destroyed.";
   const OWN_RULE = "1 file was destroyed under the project's retention rule and is not included.";
+  // FR-724: a file the copy cannot tell from one left out at the restore for having the bytes of a destroyed file.
+  const SAME_CONTENT = "1 file is not included. A verified record in this library shows that it, or another file with the same content, was destroyed under a retention rule.";
+  const TWO_SAME_CONTENT = "2 files are not included. Verified records in this library show that they, or other files with the same content, were destroyed under a retention rule.";
+  // FR-732 (1): the record of the log's end that this computer keeps is what is missing, not the log.
+  const ANCHOR_MISSING =
+    "1 file is not included. It is marked as destroyed, but this computer's record of where the project's audit log ends was missing or could not be read, so the app cannot confirm that the log is complete or that the file was destroyed.";
+  const TWO_ANCHOR_MISSING =
+    "2 files are not included. They are marked as destroyed, but this computer's record of where the project's audit log ends was missing or could not be read, so the app cannot confirm that the log is complete or that they were destroyed.";
   /** Every sentence about destroyed files in an export's notes. */
   const destroyedNotes = (notes: string) => notes.split("\n").filter((l) => /destroyed/u.test(l));
   const exported = async (projectId: string) => {
@@ -1403,7 +1411,7 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     expect(await readdir(dest)).toEqual([]);
   });
 
-  it("a file destroyed before the backup was made: its copy's export still says the project's retention rule destroyed it", async () => {
+  it("a file destroyed before the backup was made: its copy's export says a verified record shows that it, or a file with the same content, was destroyed (FR-724)", async () => {
     const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
     const raw = await rawSource(p);
     await keptSource(p);
@@ -1412,7 +1420,8 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     later(HOUR);
     const r = await restore((await backupProject(kit.repo, p.id)).path);
     expect(r.leftOut).toEqual([]);
-    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([OWN_RULE]);
+    // FR-724: matched by its moment alone, it cannot be told from a file left out for having its bytes.
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([SAME_CONTENT]);
   });
 
   /** Removes lines of the project's audit log on disk (the last line, or another): the app finds the log cut. */
@@ -1483,7 +1492,7 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([LOG_NOT_INTACT]);
   });
 
-  it("S-M1 (R484 j), probe P1: a file destroyed before the backup, by an entry of the earlier form (no list of files): its copy's export says the project's retention rule destroyed it", async () => {
+  it("S-M1 (R484 j), probe P1: a file destroyed before the backup, by an entry of the earlier form (no list of files): its copy's export does not describe it as left out by the restore, and says a verified record shows that it, or a file with the same content, was destroyed (FR-724)", async () => {
     const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
     const raw = await rawSource(p);
     await keptSource(p);
@@ -1499,7 +1508,8 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     later(HOUR);
     const r = await restore((await backupProject(kit.repo, p.id)).path);
     expect(r.leftOut).toEqual([]);
-    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([OWN_RULE]);
+    // FR-724: matched by its moment alone, it cannot be told from a file left out for having its bytes.
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([SAME_CONTENT]);
   });
 
   it("S-M2 (R484 k): after a restore recorded before the files were named, a later restore's file left out on a verified record keeps the verified sentence", async () => {
@@ -1544,6 +1554,102 @@ describe("FR-410: exporting a restored copy states a destruction as fact only wh
     const again = await restore(copyOffline);
     expect(again.leftOut).toEqual([expect.not.objectContaining({ unverified: true })]);
     expect(destroyedNotes(await notesOf((await exported(again.projectId)).path)).sort()).toEqual([TWO_UNVERIFIED, RESTORED_VERIFIED].sort());
+  });
+
+  it("FR-724: a file of the backup with the same bytes as one the project destroyed before the backup: the copy's export says only what its records show of each", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await rawSource(p); // the same bytes, in another source: the backup holds it, and the restore leaves it out by its bytes
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    later(HOUR);
+    const r = await restore((await backupProject(kit.repo, p.id)).path);
+    expect(r.leftOut).toEqual([expect.not.objectContaining({ unverified: true })]);
+    // The copy cannot tell the file destroyed from the file left out for having its bytes: it says so of both.
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([TWO_SAME_CONTENT]);
+  });
+
+  it("FR-724: in a restored copy, a file the copy itself destroyed is known by its own id and keeps the own-rule sentence", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    const r = await restore((await backupProject(kit.repo, p.id)).path);
+    later(HOUR);
+    const copied = (await Promise.all(kit.repo.listSourceIds(r.projectId).map((id) => kit.repo.getSource(r.projectId, id)))).find((sf) => sf.source.type === "interview")!;
+    await destroyRaw(kit.repo, r.projectId, [copied.assets[0]!.id], "tester");
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([OWN_RULE]);
+  });
+
+  it("FR-732 (1): this computer's record of the log's end lost, the log untouched: the notes say the record is missing, not that the log does not hold together, also of a destruction made later", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    const second = await rawSource(p, "RAW second interview bytes");
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    await rm(join(kit.tmp, "config", "audit-anchors.json"));
+    await kit.reopen();
+    expect((await eventsOf(p.id)).some((e) => e.action === "audit.anchor-missing")).toBe(true);
+    expect(verifyChain(await eventsOf(p.id)).ok).toBe(true);
+    // A destruction made afterwards, in a log anchored again: the record of the earlier loss stays, so does the sentence.
+    later(HOUR);
+    await destroyRaw(kit.repo, p.id, [second.assets[0]!.id], "tester");
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([TWO_ANCHOR_MISSING]);
+  });
+
+  it("FR-732 (1): this computer's record of the log's end unreadable, the log untouched: the record is named, not the log", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    await writeFile(join(kit.tmp, "config", "audit-anchors.json"), "not json at all");
+    await kit.reopen();
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([ANCHOR_MISSING]);
+  });
+
+  it("FR-732 (1): the log changed and the record of its end lost: the log is named", async () => {
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    const raw = await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T10:00:00.000Z");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    await rm(join(kit.tmp, "config", "audit-anchors.json"));
+    await kit.reopen();
+    await breakAudit(p, (l) => l.includes('"op":"retention.destroy"'));
+    expect(destroyedNotes(await notesOf((await exported(p.id)).path))).toEqual([LOG_NOT_INTACT]);
+  });
+
+  it("FR-732 (3): after a restore recorded before the files were named, a file left out on unverified records that claim a time after that restore is not said to be verified", async () => {
+    const z = await makeProject(kit, RETAIN_EXPORTABLE, false, "Bystander");
+    const zRaw = await rawSource(z);
+    await addSource(kit, z, { title: "something else" });
+    const p = await makeProject(kit, RETAIN_EXPORTABLE, false, "Origin");
+    await rawSource(p);
+    await keptSource(p);
+    at("2026-12-02T09:59:00.000Z");
+    const offline = join(kit.tmp, "Origin offline copy.zip");
+    await writeFile(offline, await readFile((await backupProject(kit.repo, p.id)).path));
+    // The bystander's destruction is recorded with a time after the restore below (a clock that ran ahead); its log is then damaged.
+    at("2026-12-05T10:00:00.000Z");
+    backupSeams.failBackup = true;
+    await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    await breakAudit(z, (l) => l.includes('"op":"retention.destroy"'));
+    at("2026-12-02T11:00:00.000Z");
+    const r = await restore(offline);
+    expect(r.leftOut).toEqual([expect.objectContaining({ unverified: true, destroyedAt: "2026-12-05T10:00:00.000Z" })]);
+    const copy = kit.repo.getProject(r.projectId);
+    // The entry as a restore made before FR-410 wrote it: counts, no list.
+    await rewriteAudit(copy, (e) => {
+      if (e.action === "project.restored") delete (e.details as Details).destroyedUnverifiedAssetIds;
+    });
+    await reanchor(copy);
+    await kit.reopen();
+    expect((await kit.repo.verifyAudit(r.projectId)).ok).toBe(true);
+    expect(destroyedNotes(await notesOf((await exported(r.projectId)).path))).toEqual([RESTORED_UNVERIFIED]);
   });
 
   it("M1: a copy restored before the files were named (a count only): its export and a restore of its backup state none of that restore's destructions as fact", async () => {

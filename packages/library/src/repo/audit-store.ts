@@ -8,9 +8,9 @@
 import * as fsp from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { sealEvent, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
-import { renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
+import { readMaybeWithRetry, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { SimulatedCrash, seams } from "./seams.js";
-import { appendDurable, assertContained, readMaybe, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
+import { appendDurable, assertContained, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
 
 export const AUDIT_SEGMENT_SIZE = 10_000;
 const SEGMENT = /^(\d{4,})\.jsonl$/;
@@ -277,7 +277,8 @@ export class AnchorStore {
 
   /** Throws AnchorsUnreadableError when the file exists but is unparseable or the wrong shape. */
   async readAll(): Promise<Anchors> {
-    const raw = await readMaybe(this.path);
+    // A file briefly held by another program is waited for, as a held rename is (FR-732 2).
+    const raw = await readMaybeWithRetry(this.path);
     if (!raw) return {};
     let j: unknown;
     try {
