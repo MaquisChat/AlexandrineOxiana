@@ -6,12 +6,12 @@
  */
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { lstat, mkdir, rm, symlink } from "node:fs/promises";
+import { copyFile, lstat, mkdir, rm, symlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project, SourceFile } from "@ao/core";
 import { openAssetContent, isMediaMime, isPictureMime } from "./asset-content.js";
-import { CHUNK_SIZE } from "./crypto/format.js";
+import { CHUNK_SIZE, DecryptionError, KeyNotAvailableError } from "./crypto/format.js";
 import { OPEN_GOV, addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
 import { NotFoundError, PathEscapeError, ProjectLockedError } from "./repo/errors.js";
 import { InvalidInputError } from "./repo/errors.js";
@@ -68,6 +68,25 @@ describe("openAssetContent", () => {
     const sf = await mediaSource(p, randomBytes(1000));
     kit.repo.lockProject(p.id);
     await expect(openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true)).rejects.toBeInstanceOf(ProjectLockedError);
+  });
+
+  it("FR-739 (3): a file sealed under ANOTHER project's key, its own project unlocked, is not 'locked': it cannot be read (damaged, or made with another key)", async () => {
+    const p = await makeProject(kit, OPEN_GOV, true, "One");
+    const q = await makeProject(kit, OPEN_GOV, true, "Two");
+    const mine = await mediaSource(p, randomBytes(1000));
+    const theirs = await mediaSource(q, randomBytes(1000));
+    // The other project's sealed file put in this asset's place.
+    await copyFile(join(kit.lib.root, ...theirs.assets[0]!.path.split("/")), join(kit.lib.root, ...mine.assets[0]!.path.split("/")));
+    const err = await openAssetContent(kit.repo, p.id, mine.source.id, mine.assets[0]!.id, () => true).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(DecryptionError);
+    expect(err).not.toBeInstanceOf(KeyNotAvailableError);
+    expect(String((err as Error).message)).not.toContain(kit.lib.root);
+    // The lock itself is unchanged: locked is still "locked".
+    kit.repo.lockProject(p.id);
+    await expect(openAssetContent(kit.repo, p.id, mine.source.id, mine.assets[0]!.id, () => true)).rejects.toBeInstanceOf(ProjectLockedError);
   });
 
   it("an unknown asset, or one the caller does not accept, is refused", async () => {

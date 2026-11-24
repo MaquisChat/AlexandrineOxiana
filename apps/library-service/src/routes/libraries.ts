@@ -22,6 +22,7 @@ import {
   reconnect,
   relinkMissing,
   ReadOnlyLibraryError,
+  acceptMovePlan,
   scrubPaths,
   type IntegritySample,
   type Library,
@@ -277,15 +278,41 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     // The screen's own id for this request: a failure is kept under it, so that a screen that lost
     // its connection can tell its own move's failure from an earlier one (R379).
     const attempt = optStr(b, "attempt", 64) ?? null;
-    // From here every change is refused (503 MOVE_IN_PROGRESS) and background work waits (R102 N2).
+    // From here every change is refused (503 MOVE_IN_PROGRESS, R102 N2); background work waits once the plan is
+    // accepted and the move starts stopping work for itself (planningMove, R513 M1).
     // An earlier failure is kept until this move has its own outcome (R399 c).
     state.moving = true;
+    state.planningMove = true;
     try {
       // Changes already being made finish first (this request is one of the in-flight ones, R106 I1).
       for (let waited = 0; state.inFlightMutating() > 1; waited += 25) {
         if (waited >= 60_000) throw new ApiError(409, "CONFLICT", "Some changes are still being made. Try the move again in a moment.");
         await new Promise((r) => setTimeout(r, 25));
       }
+      const moveOpts = { deps: state.deps, excludeProjectIds, sourceRepo: s.repo, tz: state.tz };
+      // R503 l (FR-733): the move accepts its own plan BEFORE anything is stopped for it, a running transcription
+      // included: a move refused at its plan (a destination that is not empty, a project whose rules forbid the place…)
+      // leaves every piece of work as it was, and is answered as executeMove's refusals are (a line of the stream, kept as
+      // the last failed move). executeMove takes its plan again after the stop below, so what the work changed meanwhile
+      // (a transcription that finished and stored its transcript) is what is copied. Planning twice walks the library once
+      // more: one to two seconds for 50,000 files on a local disk, more on a network disk — accepted (R513 M3), since a
+      // move of that size takes minutes and the second plan is what keeps the copy list true after the stop.
+      try {
+        await ctx.beforeMovePlan?.();
+        await acceptMovePlan(s.lib, dest, { ...moveOpts, env: await defaultLocationEnv() });
+      } catch (err) {
+        state.moving = false;
+        state.roots.add(dest);
+        const write = ndjson(reply);
+        const body = ndjsonError(ctx, err);
+        state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
+        await write(body);
+        reply.raw.end();
+        return;
+      }
+      await ctx.afterMovePlan?.();
+      // R513 M1: accepted — from here no background work starts until the move ends (nothing was skipped before).
+      state.planningMove = false;
       let paused: Awaited<ReturnType<typeof state.quiesce>>;
       try {
         paused = await state.quiesce(s); // 409 before the stream starts when work cannot pause
@@ -304,12 +331,9 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       try {
         await ctx.beforeExecuteMove?.();
         moved = await executeMove(s.lib, dest, {
-          deps: state.deps,
+          ...moveOpts,
           env: await defaultLocationEnv(),
-          excludeProjectIds,
-          sourceRepo: s.repo,
           ...(s.index ? { index: s.index } : {}),
-          tz: state.tz,
           onProgress: (p) => write({ progress: p }),
         });
       } catch (err) {
@@ -362,6 +386,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       reply.raw.end();
     } finally {
       state.moving = false;
+      state.planningMove = false;
     }
   };
 

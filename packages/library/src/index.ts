@@ -62,6 +62,7 @@ export {
   MoveVerificationError,
   completeMove,
   deleteOldCopy,
+  acceptMovePlan,
   executeMove,
   listPendingOldCopies,
   listUnfinishedMoves,

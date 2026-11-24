@@ -314,13 +314,27 @@ async function markerFiles(root: string): Promise<number> {
   return names.filter((n) => /^txn-.*\.json$/i.test(n)).length;
 }
 
-/** Shared refusals of planMove and executeMove. Returns the journal of an interrupted move, if any. */
-async function preflight(lib: Library, destRoot: string, repo?: Repo): Promise<Journal | null> {
+/**
+ * acceptMovePlan met a write-ahead marker: a change still being written by work that runs until the move stops it, or a
+ * change interrupted earlier — it cannot tell which while that work runs. It judges nothing more (R513 M2): the move's
+ * own plan, after the stop, answers in the old order ("pending writes" before the destination and any project's rules).
+ */
+class PlanAfterStop extends Error {}
+
+/**
+ * Shared refusals of planMove and executeMove. Returns the journal of an interrupted move, if any. `checkPending` false
+ * (acceptMovePlan, while work may still be writing): a project left refusing changes by an interrupted change (the
+ * open repo's own state, which running work does not change) still refuses at once, as "pending writes"; a write-ahead
+ * marker ends the early plan with nothing judged (PlanAfterStop), so that no later check is answered before it.
+ */
+async function preflight(lib: Library, destRoot: string, repo?: Repo, checkPending = true): Promise<Journal | null> {
   if (lib.mode !== "read-write") {
     throw new MoveNotAllowedError("read-only", `The library is open read-only${lib.readOnlyReason ? ` (${lib.readOnlyReason})` : ""}; it cannot be moved`);
   }
-  const pending = (await markerFiles(lib.root)) > 0 || (repo !== undefined && recoveryPendingProjects(repo).length > 0);
-  if (pending) {
+  const markers = (await markerFiles(lib.root)) > 0;
+  const recovering = repo !== undefined && recoveryPendingProjects(repo).length > 0;
+  if (markers && !recovering && !checkPending) throw new PlanAfterStop();
+  if (markers || recovering) {
     throw new MoveNotAllowedError("pending-writes", "Some changes were interrupted and are not resolved yet; finish or resolve pending writes first (reopen the library)");
   }
   const src = await realish(lib.root);
@@ -460,7 +474,12 @@ export function candidates(destinations: Location[]): Array<{ loc: Location; gue
  * MoveVerificationError for symbolic links in the library.
  */
 export async function planMove(lib: Library, destRoot: string, env: LocationEnv, opts: PlanOptions = {}): Promise<MovePlan> {
-  await preflight(lib, destRoot, opts.sourceRepo);
+  return planWith(lib, destRoot, env, opts, true);
+}
+
+/** planMove, with or without its check for interrupted changes (see preflight). */
+async function planWith(lib: Library, destRoot: string, env: LocationEnv, opts: PlanOptions, checkPending: boolean): Promise<MovePlan> {
+  await preflight(lib, destRoot, opts.sourceRepo, checkPending);
   const { destination, destinations } = await locate(destRoot, env);
   const now = (opts.now ?? new Date()).toISOString();
   const { projects, movedAway } = await readProjects(lib.root);
@@ -501,31 +520,20 @@ export async function planMove(lib: Library, destRoot: string, env: LocationEnv,
 /** In-memory confirmation tokens → their persisted pending record. */
 const tokens = new Map<string, { pendingId: string; deps: Deps; tz?: string; actor?: string }>();
 
-/**
- * Copies the library to `destRoot`, verifies every file, and switches to it.
- * Resumable: `<dest>/.move-journal.json` records the files copied so far, and
- * a rerun skips those whose destination copy still matches the source. A rerun
- * after a crash during the switch finishes the switch (see completeMove).
- */
-export async function executeMove(lib: Library, destRoot: string, opts: MoveOptions): Promise<MoveResult> {
-  const { deps, env } = opts;
-  const dest = resolve(destRoot);
-  const progress = async (p: MoveProgress) => {
-    await opts.onProgress?.(p);
-  };
-
-  // A switch interrupted by a crash: finish it (the source is closed as the move would have).
+/** A switch interrupted by a crash at `dest`, of this library: the move finishes it, taking no plan. */
+async function finishesSwitch(lib: Library, dest: string, deps: Deps): Promise<boolean> {
   const prior = await readJournal(dest);
-  if (prior?.phase === "switching") {
-    const rec = await getPendingOldCopy(deps, prior.switch!.pendingId);
-    if (prior.libraryId === lib.id || rec?.oldRoot === resolve(lib.root)) {
-      return completeMove(dest, deps, env, { source: lib, tz: opts.tz, actor: opts.actor, destRepo: opts.destRepo });
-    }
-  }
+  if (prior?.phase !== "switching") return false;
+  const rec = await getPendingOldCopy(deps, prior.switch!.pendingId);
+  return prior.libraryId === lib.id || rec?.oldRoot === resolve(lib.root);
+}
 
-  const exclude = [...new Set(opts.excludeProjectIds ?? [])].sort();
-  const plan = await planMove(lib, dest, env, { sourceRepo: opts.sourceRepo, now: deps.clock(), tz: opts.tz, actor: opts.actor });
-  await progress({ phase: "plan", filesDone: 0, fileCount: plan.fileCount, bytesDone: 0, totalBytes: plan.totalBytes });
+/**
+ * The move's refusals of its plan: a project to exclude that is not here; projects whose rules deny it, each audited.
+ * Accepted, the projects moved.
+ */
+async function refuseUnaccepted(lib: Library, dest: string, plan: MovePlan, exclude: string[], opts: MoveOptions): Promise<ProjectPlan[]> {
+  const { deps } = opts;
   const known = new Set(plan.perProject.map((p) => p.projectId));
   const unknown = exclude.filter((id) => !known.has(id));
   if (unknown.length > 0) throw new MoveNotAllowedError("unknown-project", `No such project in this library: ${unknown.join(", ")}`);
@@ -552,6 +560,58 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
       `Some projects may not be moved there (exclude them or choose another destination): ${why}${unrecorded ? " (this refusal could not be recorded in the audit log)" : ""}`,
     );
   }
+  return moved;
+}
+
+/**
+ * R503 l (FR-733): the move's own plan, accepted or refused, for a caller that must stop work still writing in the
+ * library (a running transcription) only once the move is accepted. The same code as executeMove's first steps — a
+ * switch already decided is accepted (the move finishes it); otherwise the plan is taken and refused as executeMove
+ * refuses it (each policy refusal audited in its project), in executeMove's order — and nothing is written at the
+ * destination. Two things it leaves to executeMove, which takes its plan again once that work has stopped: a write-ahead
+ * marker in the library (a change still being written by the running work, or one interrupted earlier: it judges
+ * nothing after it, so that "pending writes" is still answered before the destination and any project's rules, unaudited,
+ * R513 M2), and any failure that is not one of the move's refusals (a file that changed under the plan's walk). A project
+ * left refusing changes by an interrupted change is refused here at once, as executeMove refuses it. Nothing of this
+ * plan is used by executeMove.
+ */
+export async function acceptMovePlan(lib: Library, destRoot: string, opts: MoveOptions): Promise<void> {
+  const { deps, env } = opts;
+  const dest = resolve(destRoot);
+  try {
+    if (await finishesSwitch(lib, dest, deps)) return;
+    const exclude = [...new Set(opts.excludeProjectIds ?? [])].sort();
+    const plan = await planWith(lib, dest, env, { sourceRepo: opts.sourceRepo, now: deps.clock(), tz: opts.tz, actor: opts.actor }, false);
+    await refuseUnaccepted(lib, dest, plan, exclude, opts);
+  } catch (err) {
+    // PlanAfterStop: an interrupted change may be there; the plan after the stop judges it first, as before (R513 M2).
+    if (err instanceof PlanAfterStop) return;
+    if (err instanceof MoveNotAllowedError || err instanceof MoveVerificationError) throw err;
+  }
+}
+
+/**
+ * Copies the library to `destRoot`, verifies every file, and switches to it.
+ * Resumable: `<dest>/.move-journal.json` records the files copied so far, and
+ * a rerun skips those whose destination copy still matches the source. A rerun
+ * after a crash during the switch finishes the switch (see completeMove).
+ */
+export async function executeMove(lib: Library, destRoot: string, opts: MoveOptions): Promise<MoveResult> {
+  const { deps, env } = opts;
+  const dest = resolve(destRoot);
+  const progress = async (p: MoveProgress) => {
+    await opts.onProgress?.(p);
+  };
+
+  // A switch interrupted by a crash: finish it (the source is closed as the move would have).
+  if (await finishesSwitch(lib, dest, deps)) {
+    return completeMove(dest, deps, env, { source: lib, tz: opts.tz, actor: opts.actor, destRepo: opts.destRepo });
+  }
+
+  const exclude = [...new Set(opts.excludeProjectIds ?? [])].sort();
+  const plan = await planMove(lib, dest, env, { sourceRepo: opts.sourceRepo, now: deps.clock(), tz: opts.tz, actor: opts.actor });
+  await progress({ phase: "plan", filesDone: 0, fileCount: plan.fileCount, bytesDone: 0, totalBytes: plan.totalBytes });
+  const moved = await refuseUnaccepted(lib, dest, plan, exclude, opts);
   const excludedFolders = plan.perProject.filter((p) => exclude.includes(p.projectId)).map((p) => p.folder);
   const { movedAway } = await readProjects(lib.root);
   const journal = await preflight(lib, dest, opts.sourceRepo);
