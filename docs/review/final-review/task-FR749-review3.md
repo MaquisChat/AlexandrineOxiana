@@ -105,3 +105,167 @@ No existing assertion needed to change. Test 4's `stateFile()` equality and test
 - probe P-stamp after the mend: `[-1, 0, 0]`.
 
 `git status --short` is empty; all probe files are deleted. Not pushed.
+
+## Fix round (R560): STOPPED at the first probe; nothing mended
+
+As the coordinator instructed, the round stops here because a write landed after the lock's release. I2, M1 and M4 are not built. The branch `fr-749-retry-stamp` is still at cabcce3, and `git status --short` is empty.
+
+The probe is kept outside the worktree at `.superpowers/sdd/PLAN/probe-FR749c-stale-callback.test.ts.txt`. To run it, copy it to `packages/library/src/repo/<name>.test.ts`.
+
+### Stale callbacks: every write was refused
+Setup: inside a change, callbacks were registered on an unawaited promise chain and on a timer. The change ended, `close()` was awaited, and then the callbacks fired. The folder was byte-identical after `close()` and after the callbacks settled.
+
+| attempt | result | refused by |
+|---|---|---|
+| (a) a governed change (`importChange`) | `LibraryClosedError` | the turn start in `repo/state.ts:305` (`enqueue` → `refusesNewChanges()`), which is checked whatever context the caller carries |
+| (a) `writeQueueTurn(repo)(fn)` | `fn` RAN INLINE, without a turn; the append inside `fn` was refused | the inline run comes from `repo/repo.ts:1551`, which checks `holdsTurn()`; the append is refused at the same turn start. The product's only `fn` (`retention.ts` `strayInTurn`) only reads. |
+| (b) `appendLibraryEvent` | `assertWritable` let it through (stale `holdsTurn`); `LibraryClosedError` | `core.serial` → the turn start, `state.ts:305` |
+| a timer firing `importChange` | `LibraryClosedError` | `state.ts:305` |
+
+### Viewing-proxy queue: a write lands after the lock's release (Critical, a hole in R546 (1) and R247 c)
+Probe: a `ProxyQueue` that was not disposed, with a stub worker, and a source with a pending `image.proxy` job. A stale callback calls `q.enqueue(...)` after `close()` resolved.
+
+What the probe saw:
+- At the time of `submit`, with the lock file gone, the library had a new folder `.tmp/worker-proxy-<uuid>`, made by `import/proxies.ts:315` (`fsp.mkdir(work)`), and the worker's output `proxy.jpg` in it. The real media worker writes there too.
+- The job's record was refused, and `pendingProxies` was unchanged.
+- The folder was removed again by the `finally` (`proxies.ts:380`), so the end snapshot equals the one taken after `close()`. The write is transient, but it happened after the release.
+
+Why the queue does not stop it:
+- `ProxyQueue.enqueue` (`:215–216`) checks only `this.worker`.
+- `runJob` checks neither `isClosed` nor the closing signal before it writes.
+
+The stale context plays no part: any enqueue or `resumePending` on an undisposed queue after the close does the same.
+
+In the service the path is narrower, by reading only:
+- `closeLibrary` disposes the queue before `lib.close()` (`apps/library-service/src/state.ts:1323`), which sets `worker = null`. A fresh `proxyQueueFor` queue has no worker, so `enqueue` does nothing.
+- For the service, the hole therefore needs a queue that still has a worker after the close: a caller holding the old queue, or a late `setWorker` on a new queue. I did not prove such a caller.
+- The engine itself does not refuse it, and R546 (1) is a rule of the engine.
+
+Direction, for the coordinator to rule:
+- `runJob` and `runSource` stop before any write once the library is closed or its session closing; the job stays pending.
+- The work folder is made only inside work counted in the close's wait, or the queue is registered with `onClose`.
+
+### Fix round (R560, R562): continued after R562 — built
+
+Branch `fr-749-retry-stamp`, not pushed. Commits on top of cabcce3:
+- a6fb92a (P);
+- bacba58 (I2);
+- b0433c7 (M1);
+- c7332f1 (M4).
+
+`git status --short` is empty. The probe copy at `.superpowers/sdd/PLAN/probe-FR749c-stale-callback.test.ts.txt` is superseded by the permanent test.
+
+**Stale-callback probe, kept as a test.**
+- File: `packages/library/src/repo/closed-library-stale.test.ts`.
+- The callbacks fire after `close()`, from a promise chain and from a timer. Each attempt is refused with `LibraryClosedError` at the turn start (`repo/state.ts:305`):
+  - a governed change;
+  - `appendLibraryEvent`;
+  - `writeQueueTurn`, which runs its function inline; the write inside is refused there.
+- The folder is byte-identical. It passes as it stands; there is nothing to mend.
+
+**P — media queues.**
+- Test: `packages/library/src/import/queues-closed.test.ts`. An undisposed `ProxyQueue` and an undisposed `OcrQueue`, and a job enqueued, resumed or retried after `close()` resolved. It checks:
+  - `.tmp` is watched with `fs.watch` DURING the job, and no `worker-…` entry may appear;
+  - the worker stub is never called;
+  - the folder is byte-identical, the job stays pending, and nothing rejects unhandled.
+- Before the mend: `expected 9 to be +0` (proxy: the worker was asked) and `expected 3 to be +0` (OCR).
+- Mend:
+  - `import/proxies.ts:217`: `enqueue` refuses once the library is closed;
+  - `:304` and `:313`: the job's start returns `PENDING`. The check is made again after the location read, in the same tick as the `mkdir`. `PENDING` is final and never recorded.
+  - `import/ocr.ts:114`: `enqueueMany` queues no run once the library is closed;
+  - `:234`: the job's start returns `PENDING`.
+
+**I2 — a destruction cut between its change and its report line.**
+- Tests:
+  - `retention-closing.test.ts`, "a close between a destruction's own change and its report line". The change is held at its `retention` mkdir and the library closed from outside. `destroyRaw` resolves `pending` with no amendments; the folder is byte-identical; the next opening completes the step (`deleted`, verified). Before the mend: `expected { …(1) } to have property "ok"`. A second test: a close before the change began is still `LibraryClosedError`, with nothing written.
+  - `apps/library-service/src/close-during-attach.test.ts`, the "R560 I2" describe. The route answers 200 with the true state (`pending`), never `LIBRARY_CLOSED` or its sentence; the folder is byte-identical; after reopening, the scheduled pass lists the certificate `deleted`. A close before the change began still answers 409 with "That library has been closed, so nothing was changed." Before the mend: `expected 409 to be 200`.
+- Mend: `retention.ts:438–447`. The report event's refusal with `LibraryClosedError` is caught after the committed change; any other error still throws. The following settle step is cut as before.
+- The route needs no change. `forgetDestroyed` runs only when `destroyRaw` throws, which it no longer does here. The page shows the success path.
+
+**What reads `retention.destroyed`.**
+- `destruction-record.ts:137`: `auditedDestructions` adds its `certificateSha256` to `certificateHashes`.
+- That set is used by `retention.ts` (`scan`, a certificate's `verified`) and by `restore-record.ts:216, 312` (the "earliest form" certificates, those with no `retention.destroy` entry).
+- The change's own `delete`/`retention.destroy` entry adds the same hash (`destruction-record.ts:140`) and is the only thing that creates the destruction's record.
+- Nothing in the UI, the service or core reads the action.
+- **Decided:** the report line stays skipped and is not written later, as for `retention.backups`. The I2 test shows the destruction listed, verified and completed without it.
+
+**M1 — writes under `Backups/` on a closed library.**
+- Tests in `export/backup-state-closing.test.ts`, "the manifest and an interrupted backup once the library is closed":
+  - with the manifest missing, `listBackups` on the closed library lists the backup from memory and writes nothing; the next opening writes the manifest;
+  - with a pending interrupted backup, the temporary file is left and nothing changes; the next opening removes it, clears the record and records `backup-failed`, as before.
+- Before the mend: the folder changed (`…(15)` vs `…(14)`; `…(13)` vs `…(14)`).
+- Mend in `export/backup.ts`:
+  - `:343` `whileOpenOrWaited`: work the close already waits for writes directly; a closed library writes nothing; otherwise the write runs inside `inFlight`, checked and registered in the same tick;
+  - used for every manifest write and the unreadable-manifest rename (`:327`, `:371`, `:386`, `:416`);
+  - and for the whole of `settlePending` (`:1115`).
+
+**M4 — the state file's absence after a cut.**
+- Tests:
+  - `backup-state-closing.test.ts`, "no state file before a cut": a first backup cancelled by the close. The file is absent before and after, and the folder is byte-identical after `close()`.
+  - `retention-closing.test.ts`, "no state file before a cut retry attempt": the state file removed by hand, a retry's fresh backup cut by the close. The file is absent afterwards.
+- Before the mend: `expected true to be false`, twice.
+- Mend:
+  - `export/backup.ts:580`: `writeState` with `dropIfEmpty` removes the file when nothing is left in it. `isEmptyState` and `backupStateExists` are at `:596`.
+  - `withState`, `editStateNow` and `setRetentionRetry` take that option.
+  - The backup notes `stateWasAbsent` before its pending record (`:1267`) and passes it on a cut take-back (`:1430`).
+  - `retention.ts:756` and `:777`: the step notes the absence before its stamp and passes it on the put-back.
+  - A file that existed before, even with empty records, is never removed.
+
+**Not done (as ruled):** M2, M3.
+
+**Runs** (each file alone, `nice -n 10`).
+
+`@ao/library`:
+
+| file | tests |
+|---|---|
+| repo/lock-mid-read | 44 (650 s) |
+| export/backup-closing | 5 |
+| export/backup-governed | 22 |
+| export/backup-manifest-d15 | 13 |
+| export/backup-r138 | 20 |
+| export/backup-read-fails | 1 |
+| export/backup-state-closing | 6 |
+| export/backup | 23 |
+| export/restore-governed | 72 |
+| export/restore-lock-state | 15 |
+| export/retention-check-unmade | 1 |
+| export/retention-r147 | 37 |
+| export/retention-restore | 9 |
+| export/closed-reads | 3 |
+| import/in-library | 32 |
+| index/index | 58 |
+| repo/audit-reasons | 32 |
+| repo/recovery-code | 27 |
+| repo/restore-sealed-purposes | 12 |
+| repo/review-held | 67 |
+| retention-closing | 10 |
+| retention-old-copies | 40 |
+| retention | 23 |
+| retention-confirm | 3 |
+| repo/closed-library | 6 |
+| repo/closed-library-stale | 1 |
+| import/queues-closed | 2 |
+| repo/close-inside-change | 3 |
+| library | 35 |
+| repo/lock-guards | 7 |
+| export/project-export | 18 |
+| service-support | 31 |
+| job-journal-paths | 25 |
+| import/attach | 69 |
+| import/bulk/bulk | 103 |
+| import/watch | 143 |
+| import/attach-closing | 5 |
+| import/zotero-local | 85 |
+| import/device | 28 |
+
+`@ao/library-service`:
+
+| file | tests |
+|---|---|
+| close-during-attach | 13 |
+| fieldwork-governance | 23 |
+| media | 34 |
+| server | 160 (+1 skipped) |
+
+All passed. Typechecks of `@ao/library` and `@ao/library-service` are clean. The UI is unchanged.
