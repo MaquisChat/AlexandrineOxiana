@@ -287,8 +287,20 @@ export class ServiceState {
   readonly tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   private move: PendingMove | undefined;
   private moveFailure: FailedMove | undefined;
-  /** A library move is running: every change is refused (503 MOVE_IN_PROGRESS), background work waits (R102 N2). */
+  /** A library move is running: every change is refused (503 MOVE_IN_PROGRESS) (R102 N2). */
   moving = false;
+  /**
+   * R513 M1: the running move is still waiting for changes in flight or taking its plan, and has stopped nothing yet:
+   * background work starts as at any other time (the stop that follows an accepted plan stops whatever runs then), so
+   * that a move refused at its plan has skipped nothing — a media worker that became ready meanwhile resumes its pending
+   * work at once, as it would without a move. From the plan's acceptance to the move's end no background work starts
+   * (R102 N2, R106 C1).
+   */
+  planningMove = false;
+  /** Background work waits for the move (see planningMove). */
+  get startsHeld(): boolean {
+    return this.moving && !this.planningMove;
+  }
   /**
    * Move requests asked for (marked in the move route's own onRequest hook) and not yet ended or
    * refused: move/status says `running` from the earliest point of the request (R399 b).
@@ -363,7 +375,7 @@ export class ServiceState {
     const stopped = [...this.work.values()].filter(isTranscribing).map((w) => w.done);
     this.track(
       Promise.allSettled(stopped).then(() => {
-        if (this.session === s && !this.moving) this.resumeWorkerJobs(s);
+        if (this.session === s && !this.startsHeld) this.resumeWorkerJobs(s);
       }),
       "resuming transcriptions after a refused move",
     );
@@ -1489,7 +1501,7 @@ export class ServiceState {
   /** Resumes the queue of every unlocked project (or of `projectId`), whatever the index's state (R247 a). */
   resumeFind(s: Session, projectId?: string): void {
     const r = s.find;
-    if (!r || this.moving) return;
+    if (!r || this.startsHeld) return;
     for (const p of s.repo.listProjects()) if ((projectId === undefined || p.id === projectId) && s.repo.isUnlocked(p.id)) r.resume(p.id);
   }
 
@@ -1500,7 +1512,7 @@ export class ServiceState {
   wakeFindAllowance(): void {
     const s = this.session;
     const r = s?.find;
-    if (!s || !r || this.moving) return;
+    if (!s || !r || this.startsHeld) return;
     for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) void r.wakeAllowance(p.id);
   }
 
@@ -1512,7 +1524,7 @@ export class ServiceState {
   wakeFindSettings(): void {
     const s = this.session;
     const r = s?.find;
-    if (!s || !r || this.moving) return;
+    if (!s || !r || this.startsHeld) return;
     for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) void r.wakeSettings(p.id);
   }
 
@@ -1563,8 +1575,8 @@ export class ServiceState {
     s.workerClient = client;
     proxyQueueFor(s.repo).setWorker(client);
     ocrQueueFor(s.repo).setWorker(client);
-    // During a move nothing is resumed: the library open after it resumes (R106 C1).
-    if (s.lib.mode !== "read-write" || this.moving) return;
+    // Once a move is stopping work for itself nothing is resumed: the library open after it resumes (R106 C1, R513 M1).
+    if (s.lib.mode !== "read-write" || this.startsHeld) return;
     this.resumeWorkerJobs(s);
     for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) this.resumeProject(s, p.id);
   }
@@ -1577,7 +1589,7 @@ export class ServiceState {
    */
   resumeWorkerJobs(s: Session, projectId?: string): void {
     const client = s.workerClient;
-    if (!client || s.lib.mode !== "read-write" || this.moving) return;
+    if (!client || s.lib.mode !== "read-write" || this.startsHeld) return;
     void this.startWork("worker-resume", async (ctl) => {
       // A close abandons the job in hand once its grace period ends (N-5): it stays pending.
       const ac = new AbortController();
@@ -1607,7 +1619,7 @@ export class ServiceState {
    * unlock (`workerJobs`) also its pending worker jobs.
    */
   resumeProject(s: Session, projectId: string, opts: { workerJobs?: boolean } = {}): void {
-    if (!s.workerClient || s.lib.mode !== "read-write" || this.moving) return;
+    if (!s.workerClient || s.lib.mode !== "read-write" || this.startsHeld) return;
     this.track(proxyQueueFor(s.repo).resumePending(projectId), "resuming viewing proxies");
     this.track(ocrQueueFor(s.repo).resumePending(projectId), "resuming OCR");
     if (opts.workerJobs) this.resumeWorkerJobs(s, projectId);
@@ -1761,7 +1773,7 @@ export class ServiceState {
   /** One pass of the backup scheduler: every project whose automatic backup is due is backed up. */
   async runScheduledBackups(onlyProjectId?: string): Promise<BackupRun[]> {
     const s = this.session;
-    if (!s || s.lib.mode !== "read-write" || this.moving || this.shuttingDown) return [];
+    if (!s || s.lib.mode !== "read-write" || this.startsHeld || this.shuttingDown) return [];
     const out: BackupRun[] = [];
     let retried = false;
     for (const p of s.repo.listProjects()) {

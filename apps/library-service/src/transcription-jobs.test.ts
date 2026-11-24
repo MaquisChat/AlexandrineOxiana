@@ -704,6 +704,59 @@ describe("fix round 1", () => {
     expect(worker.runs).toHaveLength(1);
   });
 
+  it("R513 M1 (FR-733): the media worker becomes ready while a move's plan is taken; the plan is refused: the transcription left pending runs again at once, stored once", async () => {
+    worker = await stubWorker();
+    // A transcription left pending in the library's journal (the app closed while it ran).
+    await start({ worker: provider(worker), autoStartWorker: true, closeGraceMs: 100 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(async () => (await stateOf(pid, sid))?.status === "running");
+    await svc!.close();
+    const runsBefore = worker.runs.length;
+    // The app again: its media worker becomes ready only when the test says so; the move's plan is held back meanwhile.
+    let workerReady!: () => void;
+    const readyGate = new Promise<void>((r) => (workerReady = r));
+    let planGo!: () => void;
+    const planGate = new Promise<void>((r) => (planGo = r));
+    let planning!: () => void;
+    const inPlan = new Promise<void>((r) => (planning = r));
+    const p = provider(worker);
+    await start({
+      worker: { ...p, start: async () => (await readyGate, p.start()) },
+      autoStartWorker: true,
+      beforeMovePlan: async () => {
+        planning();
+        await planGate;
+      },
+    });
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } })).status).toBe(200);
+    expect(await stateOf(pid, sid)).toMatchObject({ status: "queued", waiting: true });
+    const dest = join(tmp, "Full");
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, "notes.txt"), "someone else's file");
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest } });
+    try {
+      await inPlan;
+      // The worker becomes ready while the plan is being taken.
+      workerReady();
+      await until(() => !!svc!.state.session?.workerClient);
+    } finally {
+      planGo();
+    }
+    const refused = await moving;
+    expect(JSON.parse(refused.body.trim().split("\n").at(-1)!)).toMatchObject({ error: { code: "POLICY_DENIED" } });
+    // The run left pending starts again now, not at the next open or unlock.
+    await until(() => worker!.runs.length === runsBefore + 1);
+    worker.release();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker.runs.filter((r) => r.type === "audio.transcribe" && !r.cancelled)).toHaveLength(1);
+    const versions = ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    expect(versions).toBe(2);
+  });
+
   it("FR-385 (R466 M1): a move that fails after it stopped the transcription starts the run again in the library still open: stored once", async () => {
     worker = await stubWorker();
     await start({

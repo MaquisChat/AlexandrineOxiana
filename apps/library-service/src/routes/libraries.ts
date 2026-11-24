@@ -278,9 +278,11 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     // The screen's own id for this request: a failure is kept under it, so that a screen that lost
     // its connection can tell its own move's failure from an earlier one (R379).
     const attempt = optStr(b, "attempt", 64) ?? null;
-    // From here every change is refused (503 MOVE_IN_PROGRESS) and background work waits (R102 N2).
+    // From here every change is refused (503 MOVE_IN_PROGRESS, R102 N2); background work waits once the plan is
+    // accepted and the move starts stopping work for itself (planningMove, R513 M1).
     // An earlier failure is kept until this move has its own outcome (R399 c).
     state.moving = true;
+    state.planningMove = true;
     try {
       // Changes already being made finish first (this request is one of the in-flight ones, R106 I1).
       for (let waited = 0; state.inFlightMutating() > 1; waited += 25) {
@@ -294,6 +296,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       // the last failed move). executeMove takes its plan again after the stop below, so what the work changed meanwhile
       // (a transcription that finished and stored its transcript) is what is copied.
       try {
+        await ctx.beforeMovePlan?.();
         await acceptMovePlan(s.lib, dest, { ...moveOpts, env: await defaultLocationEnv() });
       } catch (err) {
         state.moving = false;
@@ -306,6 +309,8 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         return;
       }
       await ctx.afterMovePlan?.();
+      // R513 M1: accepted — from here no background work starts until the move ends (nothing was skipped before).
+      state.planningMove = false;
       let paused: Awaited<ReturnType<typeof state.quiesce>>;
       try {
         paused = await state.quiesce(s); // 409 before the stream starts when work cannot pause
@@ -379,6 +384,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       reply.raw.end();
     } finally {
       state.moving = false;
+      state.planningMove = false;
     }
   };
 
