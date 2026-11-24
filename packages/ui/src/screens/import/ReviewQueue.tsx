@@ -474,8 +474,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     [pump],
   );
 
+  /** The unlock form's place (its field takes focus when a lock found during the visit leaves focus nowhere, FR-739 4). */
+  const unlockRef = useRef<HTMLDivElement>(null);
+  /** Moved on when a lock is found after the queue was shown in this visit. */
+  const [lockFound, setLockFound] = useState(0);
   /** The project was locked: everything read from it is forgotten, and the unlock form shown. */
   const forget = useCallback(() => {
+    if (readBefore.current) setLockFound((n) => n + 1);
     gen.current++;
     pool.current.live = false;
     arrived.current = new Map();
@@ -595,6 +600,17 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       up.clear();
     };
   }, [projectId]);
+
+  /**
+   * FR-739 (4): a lock found during the visit (a read, a decision, with or without a look open) takes away what had focus:
+   * focus goes to what the screen now offers, the unlock's field (as Find and acquire does, R262 N5 a, R281 b) — never the
+   * page. A researcher whose focus is still on something there (the screen's heading, a link) keeps it.
+   */
+  useEffect(() => {
+    if (!lockFound) return;
+    const active = document.activeElement;
+    if (!active || active === document.body) unlockRef.current?.querySelector<HTMLElement>("input")?.focus();
+  }, [lockFound]);
 
   // The project's name, for the unlock form.
   useEffect(() => {
@@ -852,7 +868,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     // R487 a: back to a card's own "Look at the file" (the control as it is now; never the stand-in, which has none).
     const lookBack = t.startsWith(LOOK_BACK) ? fileCards.current.get(t.slice(LOOK_BACK.length))?.querySelector<HTMLElement>(".ao-review__file-look button:not([tabindex])") : undefined;
     if (t.startsWith(LOOK_BACK)) {
-      if (lookBack && lookBack !== document.activeElement) lookBack.focus();
+      // FR-739 (2): the control not there at this moment (the queue being read again): the card's heading, else the
+      // screen's heading — as for any target that is gone — never the page.
+      if (lookBack) {
+        if (lookBack !== document.activeElement) lookBack.focus();
+      } else (fileHeads.current.get(t.slice(LOOK_BACK.length)) ?? title.current)?.focus();
       return;
     }
     const el =
@@ -1031,6 +1051,9 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const list = itemsRef.current;
     const ended = laidRef.current?.ended ?? {};
     if (!ended[at.item.id] && (!list || list.some((x) => x.id === at.item.id))) {
+      // FR-739 (2): the queue is being read again (its card is not there meanwhile): once the read lands, focus goes to
+      // that card's heading, as after a given-up decision (R313 e); until then to the screen's heading (below).
+      if (!list) refocusAfterRead.current = at.item.id;
       setFileFocus({ to: `${LOOK_BACK}${at.item.id}` });
       return;
     }
@@ -1093,14 +1116,16 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         ))}
       </div>
       {locked && (
-        <UnlockProject
-          api={libApi}
-          project={{ id: projectId, name: projectName }}
-          onUnlocked={() => {
-            setLocked(false);
-            setReadKey((k) => k + 1);
-          }}
-        />
+        <div ref={unlockRef}>
+          <UnlockProject
+            api={libApi}
+            project={{ id: projectId, name: projectName }}
+            onUnlocked={() => {
+              setLocked(false);
+              setReadKey((k) => k + 1);
+            }}
+          />
+        </div>
       )}
       {!locked && items === null && !error && <p role="status">Loading…</p>}
       {!locked && items !== null && items.length === 0 && (
