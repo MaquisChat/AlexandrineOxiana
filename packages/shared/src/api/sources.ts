@@ -79,6 +79,7 @@ export interface SourceRecordExtras {
 // - `POST /projects/:id/sources/:sid/recheck` (no body)           → the source record (+ SourceRecordExtras)
 // - `POST /projects/:id/recheck` (no body)                        → ProjectRecheckResponse; then
 //   `job.progress` events of kind "recheck" (RecheckProgressEvent, R99)
+// - `GET /projects/:id/recheck`                                  → ProjectRecheckState (FR-717)
 // - `POST /jobs/retry` JobsRetryRequest                           → JobsRetryResponse (R84)
 
 /** `POST /projects/:id/recheck`: the job runs in the background. */
@@ -86,6 +87,15 @@ export interface ProjectRecheckResponse {
   jobId: string;
   /** Sources to recheck. */
   total: number;
+}
+
+/**
+ * `GET /projects/:id/recheck` (FR-717): the project's recheck running now, with its progress as of its last event, or
+ * null. A screen that comes back to the library asks it, so a running recheck is shown (and not started twice) before
+ * its next event.
+ */
+export interface ProjectRecheckState {
+  running: { jobId: string; done: number; total: number } | null;
 }
 
 /** A `job.progress` event of a project recheck: after each source, and once more when finished (with the tallies). */

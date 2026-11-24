@@ -40,6 +40,11 @@ describe("verification API (Task 34d)", () => {
     expect(paths).toEqual(["/projects/p1/sources/s1/recheck", "/projects/p1/recheck"]);
   });
 
+  it("FR-717: asks which recheck of a project is running (GET /projects/:id/recheck)", async () => {
+    server.use(http.get(url("/projects/:id/recheck"), ({ params }) => HttpResponse.json({ running: { jobId: `job-${String(params.id)}`, done: 2, total: 5 } })));
+    expect(await testApi().verification.recheckState("p 1")).toEqual({ running: { jobId: "job-p 1", done: 2, total: 5 } });
+  });
+
   it("retries a source's failed background work with POST /jobs/retry {projectId, sourceId}", async () => {
     let body: unknown;
     server.use(
