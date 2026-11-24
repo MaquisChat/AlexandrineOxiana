@@ -129,8 +129,17 @@ export const CLOSE_COPIES_LEFT_TEXT =
   "This change cannot be closed: the app still keeps a copy of a file it could not put back, and closing would let that copy go. Restoring the project from a backup made before the change is the way to undo it.";
 
 /**
- * A change to a project refused while an earlier problem found at the library's opening holds it (an interrupted change
- * not undone completely, or an audit log that could not be repaired): the service's answer and Find and acquire's.
+ * A change to a project refused while an interrupted change holds it (its undo not complete, at the opening or in the
+ * running app): the service's answer and Find and acquire's (R528 M3: true of an undo that failed in the running app,
+ * and pointing to the one screen that shows the warning).
  */
 export const RECOVERY_PENDING_TEXT =
-  "This project takes no changes until a problem found when the library was opened is resolved. The warning at the top of the library says what to do.";
+  "This project takes no changes until an interrupted change is resolved. The warning on the library's main screen says what to do.";
+
+/**
+ * R528 M3: the same refusal where what holds the project is lifted only by opening the library again (an audit entry
+ * that could not be written at the opening; a change resolved while its audit log does not match this computer's record
+ * of it, which the next opening records first).
+ */
+export const RECOVERY_PENDING_REOPEN_TEXT =
+  "This project takes no changes until the library is opened again. The warning on the library's main screen says why.";

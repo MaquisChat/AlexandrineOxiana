@@ -3061,7 +3061,7 @@ describe("FR-736: an interrupted change whose undo is not complete, as the servi
       },
     ]);
     const write = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } });
-    expect([write.status, write.json.error.message]).toEqual([409, "This project takes no changes until a problem found when the library was opened is resolved. The warning at the top of the library says what to do."]);
+    expect([write.status, write.json.error.message]).toEqual([409, "This project takes no changes until an interrupted change is resolved. The warning on the library's main screen says what to do."]);
   });
 
   it("R528 I2: a refused \"Roll it back\" or close publishes the library's state, so that the banner follows the list", async () => {

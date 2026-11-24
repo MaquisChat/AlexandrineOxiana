@@ -56,7 +56,7 @@ import {
 } from "./runner.js";
 import { DEFAULT_SEARCH_SETTINGS, FIND_QUEUE_MAX, type FindEntry, type FindState, type SearchSettings } from "./types.js";
 import { SEARCH_SOURCES_FILE, readSearchSettings, writeSearchSettings } from "./settings.js";
-import { FIND_LIBRARY_TEXT, FIND_LINK_TEXT, FIND_REASON_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, LIBRARY_FILE_MAX_BYTES, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn } from "@ao/shared";
+import { FIND_LIBRARY_TEXT, FIND_LINK_TEXT, FIND_REASON_TEXT, FIND_STOPPED_TEXT, HELD_FILE_LOOKS_RIGHT_TEXT, LIBRARY_FILE_MAX_BYTES, LIBRARY_PAUSE_MS, LIBRARY_TICKET_MS, libraryReadyIn } from "@ao/shared";
 import type { LibraryAccess } from "./where.js";
 import { checkFileAgainstRecord } from "./file-check.js";
 
@@ -1585,6 +1585,22 @@ describe("last round", () => {
     r.resume(p.id);
     await until(() => r.stoppedFor(p.id) !== null, "the runner to say so");
     expect(r.stoppedFor(p.id)).toEqual({ code: "recovery-pending" });
+    expect(gated.sent).toEqual([]);
+  });
+
+  it("R528 M3: a project held until the library is opened again (an audit entry that failed at the opening): stoppedFor says reopen-pending", async () => {
+    const p = await project();
+    const id = newId();
+    await appendFindEntries(coreOf(), p.id, [{ id, projectId: p.id, typed: LINE, state: "looking-up", createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString(), attempts: 0 }], "add");
+    // As the opening leaves it when an audit append fails there (repo.ts), with no interrupted change.
+    const st = coreOf().projects.get(p.id)!;
+    st.recoveryPending = true;
+    st.reopenToResume = true;
+    const r = runner();
+    r.resume(p.id);
+    await until(() => r.stoppedFor(p.id) !== null, "the runner to say so");
+    expect(r.stoppedFor(p.id)).toEqual({ code: "reopen-pending" });
+    expect(FIND_STOPPED_TEXT["reopen-pending"]).toBe("This project takes no changes until the library is opened again. The warning on the library's main screen says why.");
     expect(gated.sent).toEqual([]);
   });
 

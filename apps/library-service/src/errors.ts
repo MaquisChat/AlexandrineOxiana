@@ -4,7 +4,7 @@
  * one place.
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
-import { RECOVERY_PENDING_TEXT, type ResettableSetting, type ServiceErrorBody, type ServiceErrorCode } from "@ao/shared";
+import { RECOVERY_PENDING_REOPEN_TEXT, RECOVERY_PENDING_TEXT, type ResettableSetting, type ServiceErrorBody, type ServiceErrorCode } from "@ao/shared";
 import {
   AnnotationLimitError,
   AppSettingReadableError,
@@ -178,7 +178,7 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof CustomStyleError) return new ApiError(400, "VALIDATION", err.message);
   if (err instanceof NoMediaError) return new ApiError(400, "VALIDATION", err.message);
   if (err instanceof AcknowledgementRequiredError) return new ApiError(409, "ACKNOWLEDGEMENT_REQUIRED", err.explanation);
-  if (err instanceof RecoveryPendingError) return new ApiError(409, "CONFLICT", RECOVERY_PENDING_TEXT);
+  if (err instanceof RecoveryPendingError) return new ApiError(409, "CONFLICT", err.reason === "reopen" ? RECOVERY_PENDING_REOPEN_TEXT : RECOVERY_PENDING_TEXT);
   if (err instanceof FolderNotEmptyError || err instanceof AlreadyALibraryError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof WrongLibraryError || err instanceof LibraryMovedError || err instanceof CorruptLibraryError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof LibraryNotWritableError) return new ApiError(409, "READ_ONLY", err.message);

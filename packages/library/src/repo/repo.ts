@@ -89,7 +89,7 @@ import { readWatchOrigins, readWatchRegister, recordWatchedFiles, type WatchRegi
 import { appendFindEntries, mendFindQueueTail, readFindQueue, readFindQueueDetailed } from "../find/queue-store.js";
 import type { FindEntry } from "../find/types.js";
 import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
-import { RepoCore, loadProjects, type ProjectState, type RepoOptions } from "./state.js";
+import { RepoCore, loadProjects, pendingReason, type ProjectState, type RepoOptions } from "./state.js";
 import { loadPseudonyms, participantCodeOf } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
@@ -780,6 +780,7 @@ export async function openRepoInternal(
     } catch (err) {
       if (err instanceof SimulatedCrash) throw err; // test seam: the process died here
       st.recoveryPending = true;
+      st.reopenToResume = true;
       core.integrityWarnings.push({
         projectId: st.project.id,
         kind: "audit-append-failed-at-open",
@@ -854,7 +855,7 @@ export async function appendLibraryEvent(
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
-    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
     // Idempotent per move: a move completed after a crash does not record the same step twice.
     if (details.moveId !== undefined) {
       const events = await AuditStore.read(st.audit.dir);
@@ -881,7 +882,7 @@ export async function appendRefusalEvent(repo: Repo, projectId: string, action: 
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
-    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
     const at = core.clock().toISOString();
     await core.auditNow(st, {
       ...core.auditBase(st, at),
@@ -1468,6 +1469,12 @@ export function recoveryPendingProjects(repo: Repo): string[] {
   return [...cores.get(repo)!.projects.values()].filter((s) => s.recoveryPending).map((s) => s.project.id);
 }
 
+/** R528 M3: why a project refuses changes (see `RecoveryPendingError.reason`); undefined when it takes them. */
+export function recoveryPendingReason(repo: Repo, projectId: string): "interrupted-change" | "reopen" | undefined {
+  const st = cores.get(repo)!.projects.get(projectId);
+  return st?.recoveryPending ? pendingReason(st) : undefined;
+}
+
 /** Package-internal (backups, R90 b): what a backup sees of its project while it holds the write queue. */
 export interface ProjectQueueContext {
   /** Library root (absolute). */
@@ -1503,7 +1510,7 @@ export function withProjectQueue<T>(repo: Repo, projectId: string, fn: (ctx: Pro
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
-    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
     core.assertUnlocked(st);
     return fn({
       root: core.root,

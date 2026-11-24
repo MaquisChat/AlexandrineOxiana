@@ -111,10 +111,11 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   // R473 I1, R484 f: sources whose change did not finish and whose roll-back failed, for as long as the roll-back
   // waits; one banner per project ("this source" is said only for the source itself, in the library's own sentence).
   // FR-736: never "close the library and open it again", which cannot help while a file is in the way: the list says.
+  // R528 M5: never "yet", untrue of a change that can never be undone completely.
   "source-change-unfinished": (p, n) =>
     n === 1
-      ? `A change to a source in ${p} did not finish and could not be undone yet. Choose “Resolve…” to see what can be done.`
-      : `Changes to ${n} sources in ${p} did not finish and could not be undone yet. Choose “Resolve…” to see what can be done.`,
+      ? `A change to a source in ${p} did not finish and could not be undone. Choose “Resolve…” to see what can be done.`
+      : `Changes to ${n} sources in ${p} did not finish and could not be undone. Choose “Resolve…” to see what can be done.`,
   "source-change-unfinished-read-only": (p, n) =>
     n === 1
       ? `A change to a source in ${p} did not finish and could not be undone. It can be put back only when the library is opened for changes.`

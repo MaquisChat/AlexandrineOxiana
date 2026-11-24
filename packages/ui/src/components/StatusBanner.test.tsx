@@ -190,8 +190,8 @@ describe("StatusBanner", () => {
 
 describe("R484 f: changes to sources that did not finish and could not be undone: one banner per project and kind", () => {
   // FR-736: no "close the library and open it again", which cannot help while a file is in the way (these asserted it).
-  const ONE = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone yet. Choose “Resolve…” to see what can be done.";
-  const SEVERAL = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone yet. Choose “Resolve…” to see what can be done.`;
+  const ONE = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. Choose “Resolve…” to see what can be done.";
+  const SEVERAL = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. Choose “Resolve…” to see what can be done.`;
   const ONE_RO = "A change to a source in Dissertation <i>1</i> did not finish and could not be undone. It can be put back only when the library is opened for changes.";
   const SEVERAL_RO = (n: number, p: string) => `Changes to ${n} sources in ${p} did not finish and could not be undone. They can be put back only when the library is opened for changes.`;
   const w = (projectId: string, project: string, kind: string, n: number) =>
@@ -231,7 +231,7 @@ describe("R484 f: changes to sources that did not finish and could not be undone
   });
 
   it("the sentence with \"this source\" stays the library's own, for the source itself", () => {
-    expect(SOURCE_CHANGE_UNFINISHED).toBe("A change to this source did not finish and could not be undone yet. The app's list of interrupted changes says what can be done.");
+    expect(SOURCE_CHANGE_UNFINISHED).toBe("A change to this source did not finish and could not be undone. The app's list of interrupted changes says what can be done.");
     expect(SOURCE_CHANGE_UNFINISHED_READ_ONLY).toBe("A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.");
   });
 });

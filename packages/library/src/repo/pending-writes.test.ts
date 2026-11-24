@@ -405,7 +405,13 @@ describe("pending writes: the resolve is durable before it acts (R131 c, d)", ()
     expect(await anchorOf(pid)).toEqual(anchor);
     expect((await audit(repo, pid)).filter((e) => e.action === "txn.resolve")).toHaveLength(1);
     // Writes would move the anchor: they wait for the next open, which records the mismatch first.
-    await expect(add(repo, pid, "Not yet")).rejects.toBeInstanceOf(RecoveryPendingError);
+    const err = await add(repo, pid, "Not yet").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(RecoveryPendingError);
+    // R528 M3: held for another reason than an interrupted change: reopening the library is the way, and is said.
+    expect((err as RecoveryPendingError).reason).toBe("reopen");
     const again = await reopen();
     expect((await audit(again, pid)).map((e) => e.action)).toContain("audit.anchor-mismatch");
     await add(again, pid, "After");

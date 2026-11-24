@@ -320,6 +320,8 @@ async function afterResolved(core: RepoCore, st: ProjectState, txn: string, held
     if (w.projectId === st.project.id && w.kind === "incomplete-audit-line-pending" && w.file !== undefined && !stillIncomplete.has(w.file)) core.integrityWarnings.splice(k, 1);
   }
   if (held) {
+    // R528 M3: the refusal of a write then says that opening the library again is the way.
+    st.reopenToResume = true;
     core.integrityWarnings.push({
       projectId: st.project.id,
       kind: held.kind,

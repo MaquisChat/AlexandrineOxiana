@@ -249,7 +249,7 @@ describe("R473 I1: while a roll-back waits, only the sources its marker names ar
     seams.failUndo = undefined;
   }
   // FR-736: no advice to reopen (this asserted it).
-  const UNFINISHED = "A change to this source did not finish and could not be undone yet. The app's list of interrupted changes says what can be done.";
+  const UNFINISHED = "A change to this source did not finish and could not be undone. The app's list of interrupted changes says what can be done.";
   const UNFINISHED_READ_ONLY = "A change to this source did not finish and could not be undone. It can be put back only when the library is opened for changes.";
 
   it("the probe: another source's annotations changed by hand while the roll-back waits are reported", async () => {

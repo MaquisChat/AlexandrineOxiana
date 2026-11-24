@@ -123,6 +123,12 @@ export interface ProjectState {
    */
   recoveryPending?: boolean;
   /**
+   * R528 M3: what holds it besides an interrupted change is lifted only by opening the library again (an audit append
+   * that failed at the opening; a resolve held at a mismatch of the audit anchor, R131 d). Said only when no marker of
+   * the project is left (`unfinished` empty): an interrupted change is said first.
+   */
+  reopenToResume?: boolean;
+  /**
    * Library-relative paths named by a marker of this project that is not finished or rolled back yet (R473 I1): a
    * change whose roll-back failed here, or a marker found pending at open. Until it is, those files are half changed.
    */
@@ -155,6 +161,11 @@ export interface RollbackAttempt {
   causes: UndoCause[];
   stepFailed: boolean;
   copyKept?: true;
+}
+
+/** R528 M3: why a project refuses changes (`recoveryPending`), as the refusal says it. */
+export function pendingReason(st: Pick<ProjectState, "reopenToResume" | "unfinished">): "interrupted-change" | "reopen" {
+  return st.reopenToResume === true && !st.unfinished?.size ? "reopen" : "interrupted-change";
 }
 
 export class RepoCore {

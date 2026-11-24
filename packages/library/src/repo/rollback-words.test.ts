@@ -268,6 +268,36 @@ describe("FR-736: a change whose own undo fails in the running app", () => {
   });
 });
 
+describe("R528 M5: the command line's detail of a change whose own undo failed is true of its state", () => {
+  it("a step that failed: retried on the next open (true: the opening tries it again)", async () => {
+    seams.failUndo = "created";
+    await expect(
+      repo.mutate(pid, STORE, async (tx) => {
+        await tx.writeFile(`${folder}/written.txt`, "written by the change\n");
+        throw new Error("the change failed");
+      }),
+    ).rejects.toThrow("the change failed");
+    const [w] = mine().filter((x) => x.kind === "rolled-back-incomplete-write");
+    expect(w!.detail).toMatch(/^a change that failed could only be partly rolled back; the marker is kept and recovery is retried on the next open \(transaction [0-9a-f-]+\)$/u);
+  });
+
+  it("a file that could not be read: said so, with where the file is named", async () => {
+    const rel = `${folder}/written.txt`;
+    seams.failLook = rel;
+    await expect(
+      repo.mutate(pid, STORE, async (tx) => {
+        await tx.writeFile(rel, "written by the change\n");
+        throw new Error("the change failed");
+      }),
+    ).rejects.toThrow("the change failed");
+    const [w] = mine().filter((x) => x.kind === "rolled-back-incomplete-write");
+    expect(w!.rollback).toBe("could-not-read");
+    expect(w!.detail).toMatch(
+      /^a change that failed could only be partly rolled back, because the app could not read a file; the marker is kept, and recovery is retried on the next open or by rolling it back in the app's list of interrupted changes, which names the file \(transaction [0-9a-f-]+\)$/u,
+    );
+  });
+});
+
 describe("FR-736: a write refused while the undo is incomplete", () => {
   it("names no reopening, which cannot help while the cause stands", async () => {
     await CASES[2]!.make();
@@ -277,6 +307,8 @@ describe("FR-736: a write refused while the undo is incomplete", () => {
       (e: unknown) => e,
     );
     expect(err).toBeInstanceOf(RecoveryPendingError);
+    // R528 M3: held by an interrupted change (the service then says so, and points to its warning).
+    expect((err as RecoveryPendingError).reason).toBe("interrupted-change");
     expect((err as Error).message).not.toMatch(/reopen/u);
     expect((err as Error).message).toMatch(/integrity warnings say which, and what to do/u);
   });

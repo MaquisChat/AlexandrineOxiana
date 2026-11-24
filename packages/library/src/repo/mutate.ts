@@ -51,8 +51,8 @@ import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLi
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
 import { AUDIT_REASONS_FILE, reasonMac, sealedReasonLine } from "./audit-reasons.js";
 import { TxnLog, copyKeptOf, identityOf, markerPaths } from "./txn.js";
-import { stateOf } from "./pending-writes.js";
-import type { IndexSink, ProjectState, RepoCore } from "./state.js";
+import { incompleteDetail, stateOf } from "./pending-writes.js";
+import { pendingReason, type IndexSink, type ProjectState, type RepoCore } from "./state.js";
 
 /** A policy request without the fields the repository fills in (projectId; actor, now and tz by default). */
 export type MutateRequest = Omit<PolicyRequest, "projectId" | "actor" | "now" | "tz"> &
@@ -455,7 +455,7 @@ export async function authorizeOnly(
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
-    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
     core.assertUnlocked(st);
     const at = core.clock().toISOString();
     const op = opts.op ?? "authorize";
@@ -484,7 +484,7 @@ export async function runMutation<T>(
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
-    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId, pendingReason(st));
     core.assertUnlocked(st);
     const now = core.clock();
     const at = now.toISOString();
@@ -557,12 +557,14 @@ export async function runMutation<T>(
         // (the refusal of every later write points to this warning); resolving the change takes it away.
         const attempt = { causes: undone.causes, stepFailed: undone.stepFailed === true, ...((await copyKeptOf(core.root, log.marker, undone)) ? { copyKept: true as const } : {}) };
         core.rollbackAttempts.set(log.id, attempt);
+        const state = stateOf(attempt);
         core.integrityWarnings.push({
           projectId,
           kind: "rolled-back-incomplete-write",
-          detail: `a change that failed could only be partly rolled back; the marker is kept and recovery is retried on the next open (transaction ${log.id})`,
+          // R528 M5: the command line's detail is true of the state (never a retry where retrying cannot help).
+          detail: `${incompleteDetail(state, "in-process")} (transaction ${log.id})`,
           ...(undone.causes.length ? { causes: undone.causes } : {}),
-          rollback: stateOf(attempt),
+          rollback: state,
         });
         // The paths it names stay half changed until then: a read of a source among them says so (R473 I1).
         st.unfinished = new Set([...(st.unfinished ?? []), ...markerPaths(log.marker)]);
