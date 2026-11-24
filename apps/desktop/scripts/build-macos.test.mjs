@@ -465,6 +465,15 @@ describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
     for (const k of keys) assert.match(k, /'services\/media-worker\/packaging\/constraints-macos-x86_64\.txt', 'services\/media-worker\/packaging\/constraints-macos-arm64\.txt'\)/);
   });
 
+  it("asks for Python 3.13.17 exactly, the patch release Mac build 10 shipped, and keys the build venv's cache on it (R506 M4)", () => {
+    const setup = wf.slice(wf.indexOf("uses: actions/setup-python@"), wf.indexOf("name: Rust"));
+    assert.match(setup, /^ {10}python-version: "3\.13\.17"$/m);
+    assert.doesNotMatch(wf, /python-version: "3\.13"$/m);
+    const keys = wf.split("\n").filter((l) => /desktop-macos-build-\$\{\{ matrix\.runner \}\}/.test(l));
+    assert.equal(keys.length, 2);
+    for (const k of keys) assert.match(k, /-py3\.13\.17-/);
+  });
+
   it("pins every action by full commit id, with its release named (R167 b)", () => {
     const uses = wf.split("\n").filter((l) => /^\s*-?\s*uses:/.test(l));
     assert.ok(uses.length >= 10);

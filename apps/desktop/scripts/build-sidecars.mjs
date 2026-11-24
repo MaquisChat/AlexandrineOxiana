@@ -157,16 +157,24 @@ function findPython() {
   const candidates = process.env.PYTHON ? [process.env.PYTHON] : win ? ["py -3.13", "py -3.12", "python"] : ["python3.13", "python3.12", "python3"];
   for (const cmd of candidates) {
     const [exe, ...args] = cmd.split(" ");
-    const r = spawnSync(exe, [...args, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"], { encoding: "utf8" });
+    const r = spawnSync(exe, [...args, "-c", "import platform; print(platform.python_version())"], { encoding: "utf8" });
     if (r.status !== 0) continue;
-    const [maj, min] = r.stdout.trim().split(".").map(Number);
-    if (maj === 3 && min >= 12) return { exe, args, version: `${maj}.${min}` };
+    const full = r.stdout.trim();
+    const [maj, min] = full.split(".").map(Number);
+    // `version` (3.13) for pip's --python-version; `full` (3.13.17) for the venv stamp.
+    if (maj === 3 && min >= 12) return { exe, args, version: `${maj}.${min}`, full };
   }
   throw new Error(`No Python 3.12+ found (tried: ${candidates.join(", ")}). Set PYTHON.`);
 }
 
 const venvPython = (venv) => join(venv, process.platform === "win32" ? "Scripts\\python.exe" : "bin/python");
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
+
+/** What a build venv is made from: Python's full version (its patch release ships in the bundle with
+ *  its standard library, R506 M4), pyproject.toml and the constraints file. A change makes it again. */
+export function venvStamp(python, pyproject, constraints) {
+  return [python.full, sha256(pyproject), constraints ? sha256(constraints) : "", "v1"].join("\0");
+}
 
 /** A build venv for this pin set, recreated when pyproject.toml, the constraints or Python change. */
 function ensureVenv(python, name, stampParts, clean) {
@@ -201,7 +209,7 @@ const PIP = ["-m", "pip", "--disable-pip-version-check"];
 function resolveFor(python, target) {
   const { platform, constraints } = RESOLVE_TARGETS[target];
   const c = loadConstraints(constraints);
-  const { py } = ensureVenv(python, "resolve", [python.version, "resolve"], false);
+  const { py } = ensureVenv(python, "resolve", [python.full, "resolve"], false);
   const { deps, packaging } = workerRequirements(py);
   const reqs = installRequirements([...deps, ...packaging], c);
   const dir = join(BUILD, `resolve-${target}`);
@@ -252,7 +260,7 @@ function symlinks(dir, base = dir, out = []) {
 function build(python, opts, triple, bundle) {
   const c = loadConstraints(opts.constraints === "none" ? undefined : opts.constraints ?? defaultConstraints());
   const pyproject = readFileSync(join(WORKER, "pyproject.toml"));
-  const v = ensureVenv(python, c.name, [python.version, sha256(pyproject), c.file ? sha256(readFileSync(c.file)) : "", "v1"], opts.clean);
+  const v = ensureVenv(python, c.name, [venvStamp(python, pyproject, c.file ? readFileSync(c.file) : undefined)], opts.clean);
   console.log(`pin set: ${c.name}${c.file ? ` (${relative(REPO, c.file)})` : ""}; build venv: ${relative(REPO, v.venv)}${v.fresh ? " (new)" : " (reused)"}`);
   if (v.fresh) {
     const { deps, packaging } = workerRequirements(v.py);

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { ARM64_CONSTRAINTS, SMOKE_ABSENCES, applyConstraints, defaultConstraints, installRequirements, isCompletePinSet, manifestArgs, parseArgs, parseConstraints, targetTriple } from "../apps/desktop/scripts/build-sidecars.mjs";
+import { ARM64_CONSTRAINTS, SMOKE_ABSENCES, applyConstraints, defaultConstraints, installRequirements, isCompletePinSet, manifestArgs, parseArgs, parseConstraints, targetTriple, venvStamp } from "../apps/desktop/scripts/build-sidecars.mjs";
 
 test("target triples follow Tauri's sidecar names", () => {
   assert.equal(targetTriple("darwin", "arm64"), "aarch64-apple-darwin");
@@ -103,4 +103,13 @@ test("the build script and the smoke test agree on the absences a smoke run may 
   assert.ok(!names.includes("gallery-dl"));
   // the CI invocation passes no wheel and no allowance: the smoke run must pass as it is
   assert.doesNotMatch(smoke, /res\.missing\([^)]*"gallery-dl"/);
+});
+
+test("the build venv is made again when Python's patch release changes, not only its minor version (R506 M4)", () => {
+  const py = (full) => ({ version: "3.13", full });
+  const a = venvStamp(py("3.13.17"), Buffer.from("pyproject"), Buffer.from("pins"));
+  assert.equal(venvStamp(py("3.13.17"), Buffer.from("pyproject"), Buffer.from("pins")), a);
+  assert.notEqual(venvStamp(py("3.13.18"), Buffer.from("pyproject"), Buffer.from("pins")), a);
+  assert.notEqual(venvStamp(py("3.13.17"), Buffer.from("pyproject"), Buffer.from("pins2")), a);
+  assert.notEqual(venvStamp(py("3.13.17"), Buffer.from("pyproject"), undefined), a);
 });
