@@ -1440,6 +1440,11 @@ struct Inner {
     /// stands: a newer open that fails meanwhile gives the window back to it (R486 g). One build at a time
     /// (FR-734, R503 i): an open that would build while this is set waits for that build instead (`open`).
     building: Option<String>,
+    /// The ticket of an open that waits for another open's build (FR-734; M3, R511): until it has sent the window
+    /// to its own address (or builds the window itself), a page loaded or a download asked for in that window is
+    /// the other open's, and starts no fetch under this ticket. Set (or cleared) by every open that takes the
+    /// ticket, so that it never outlives its open into another.
+    waiting: Option<String>,
     /// The kind of start of the open ticket (R347 a). Every ticket starts by `open`, which sets it (for
     /// the window it builds or re-uses, and puts it back when that fails), so no kind outlives its
     /// ticket into another; after a hand-over the window may stay without a ticket, its title still in
@@ -1521,7 +1526,9 @@ impl Library {
     /// close ended that open meanwhile, so its ticket is free), this open does not build a second window
     /// beside it: it takes the ticket and the window at once, as any newer open does (the older open, when
     /// its build answers, finds the window taken and answers false), waits for that build to answer, and
-    /// then re-uses the window it made, or builds its own if that build failed. The wait holds no lock and
+    /// then re-uses the window it made, or builds its own if that build failed. Until it has sent that window to
+    /// its own address, nothing the window loads or asks to download is fetched under its ticket (M3, R511: the
+    /// page shown is the other open's). The wait holds no lock and
     /// calls nothing of the host; `open` never runs on the main thread (the command runs it on a thread of
     /// its own), where the build it waits for is done.
     pub fn open(&self, host: &dyn Host, caller: &str, ticket: &str, url: &str, start: Start) -> bool {
@@ -1564,6 +1571,7 @@ impl Library {
                     None
                 }
             };
+            g.waiting = waited.as_ref().map(|_| ticket.to_string());
             g.start = start;
             g.previous = None;
             g.current = None;
@@ -1603,6 +1611,8 @@ impl Library {
                 (true, None) => "no web address".to_string(),
                 (false, _) => {
                     g.building = Some(ticket.to_string());
+                    // The window this open builds shows its own address from the start (M3).
+                    g.waiting = None;
                     title_host(&url)
                 }
             };
@@ -1613,6 +1623,13 @@ impl Library {
         let shown = if reuse {
             let moved = host.navigate(&url);
             if moved {
+                // M3 (R511): the window has been sent to this open's own address: what it loads from now on is
+                // this open's.
+                let mut g = self.lock();
+                if g.waiting.as_deref() == Some(ticket) {
+                    g.waiting = None;
+                }
+                drop(g);
                 host.set_title(&title);
             }
             moved
@@ -1732,20 +1749,26 @@ impl Library {
     }
 
     /// A page of the window finished loading (on the main thread: nothing here blocks). An address
-    /// that looks like a PDF's starts a fetch when a ticket is open, nothing is being fetched and the
-    /// pause is over; a sign-in address never does. Otherwise nothing happens (no event, except the
+    /// that looks like a PDF's starts a fetch when a ticket is open (and its open no longer waits for another
+    /// open's window, M3), nothing is being fetched and the pause is over; a sign-in address never does. Otherwise nothing happens (no event, except the
     /// pause, which is said).
     pub fn page_loaded(&self, host: &dyn Host, url: &Url, now: Instant) {
         let job = {
             let mut g = self.lock();
             g.previous = g.current.replace(url.clone());
-            if g.ticket.is_none() || g.fetching.is_some() || host.stopping() || !looks_like_pdf_address(url) {
+            if g.ticket.is_none() || Self::waiting(&g) || g.fetching.is_some() || host.stopping() || !looks_like_pdf_address(url) {
                 return;
             }
             let previous = g.previous.clone();
             Self::begin(&mut g, url, previous, now)
         };
         self.run_automatic(host, job);
+    }
+
+    /// Whether the open ticket's open still waits for another open's window (M3, R511): the window then shows that
+    /// other open's page, which is never fetched under this ticket.
+    fn waiting(g: &Inner) -> bool {
+        g.waiting.is_some() && g.waiting == g.ticket
     }
 
     /// A fetch the window itself started (a page load or a download): run, or said only when it waits
@@ -1761,14 +1784,15 @@ impl Library {
     /// The window asked to start a download (R331 g; on the main thread: nothing here blocks). The
     /// window's own download is refused (`TauriHost::create_window`); its address is taken as the
     /// PDF's address and goes the same way as a page that reached a PDF's address (`page_loaded`):
-    /// only while a ticket is open, nothing is being fetched and the pause is over, https only, never
+    /// only while a ticket is open (its open not waiting for another open's window, M3), nothing is being
+    /// fetched and the pause is over, https only, never
     /// a sign-in address, at most one file per ticket, and through the one request path (`fetch_pdf`)
     /// with all its rules, the window's current page as its `Referer`. The window has not moved, so
     /// its current page stays as it was. Nothing is said when nothing is fetched, except the pause.
     pub fn download_requested(&self, host: &dyn Host, url: &Url, now: Instant) {
         let job = {
             let mut g = self.lock();
-            if g.ticket.is_none() || g.fetching.is_some() || host.stopping() {
+            if g.ticket.is_none() || Self::waiting(&g) || g.fetching.is_some() || host.stopping() {
                 return;
             }
             let previous = g.current.clone();
@@ -3902,6 +3926,51 @@ process.stdout.write(JSON.stringify({{
         assert_eq!(host.close_asked.load(Ordering::SeqCst), asked);
         lib.close_for(&*host, "main", Some(TICKET));
         assert_eq!(host.close_asked.load(Ordering::SeqCst), asked + 1);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// The reviewer's probe `p2_first_page_under_second_ticket` (M3, R511; FR-734 point 1): the first open's window
+    /// loads a PDF's page, and asks for a download, while the second open waits for that window's build (before it
+    /// sends the window to its own address). Nothing is fetched under the second open's ticket from the first
+    /// open's page; once the window shows the second open's own address, its own page is fetched as before; the
+    /// first open, overtaken, answers false.
+    #[test]
+    fn a_page_of_the_window_an_open_waits_for_is_never_fetched_under_that_open_s_ticket() {
+        const FIRST_PDF: &str = "https://publisher.example/article/1.pdf";
+        const FIRST_DOWNLOAD: &str = "https://publisher.example/article/1/download";
+        let (lib, host, d) = started("fr734-waiting-fetch");
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |l, h| {
+            let now = Instant::now();
+            h.at(FIRST_PDF);
+            l.page_loaded(h, &u(FIRST_PDF), now);
+            l.download_requested(h, &u(FIRST_DOWNLOAD), now);
+        });
+        assert!(!first, "the overtaken open answers false");
+        assert!(second.answer(), "the waiting open answers true");
+        let jobs = |h: &FakeHost| h.jobs.lock().unwrap().iter().map(|j| (j.ticket.clone(), j.input.url.to_string())).collect::<Vec<_>>();
+        assert_eq!(jobs(&host), vec![], "a fetch started under the waiting open's ticket from the other open's page");
+        assert!(host.events().iter().all(|e| e.state != State::Fetching));
+        assert_eq!(*host.navigated.lock().unwrap(), vec![u(START2)]);
+        // The window now shows the waiting open's own address: its own page is fetched as before.
+        host.at(PDF);
+        lib.page_loaded(&*host, &u(PDF), Instant::now());
+        assert_eq!(jobs(&host), vec![(TICKET2.to_string(), PDF.to_string())]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// M3 (R511): when the build the open waited for failed, the open builds the window at its own address, and the
+    /// window's pages are its own from the start.
+    #[test]
+    fn an_open_that_built_the_window_after_waiting_fetches_its_own_page() {
+        let (lib, host, d) = started("fr734-waiting-built");
+        host.fail_next_build.store(true, Ordering::SeqCst);
+        let (lib, host) = (Arc::new(lib), Arc::new(host));
+        let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
+        assert!(!first);
+        assert!(second.answer());
+        lib.page_loaded(&*host, &u(PDF), Instant::now());
+        assert_eq!(host.jobs.lock().unwrap().iter().map(|j| j.ticket.clone()).collect::<Vec<_>>(), vec![TICKET2.to_string()]);
         fs::remove_dir_all(d).unwrap();
     }
 
