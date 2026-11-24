@@ -3616,7 +3616,7 @@ process.stdout.write(JSON.stringify({{
         let (lib, host) = (Arc::new(lib), Arc::new(host));
         let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
         assert!(!first, "the older open answers false");
-        assert!(second.join().unwrap());
+        assert!(second.answer());
         let host = &*host;
         let opened: Vec<_> = host.events().into_iter().filter(|e| e.state == State::Opened).collect();
         assert_eq!(opened, vec![LibraryEvent::new(Some(TICKET2), State::Opened)]);
@@ -3780,19 +3780,34 @@ process.stdout.write(JSON.stringify({{
         }
     }
 
-    type Second = Arc<Mutex<Option<std::thread::JoinHandle<bool>>>>;
+    /// The second open's answer, as its thread sends it.
+    struct SecondOpen(std::sync::mpsc::Receiver<bool>);
+
+    impl SecondOpen {
+        /// Waits for the second open's answer at most a minute (M4, R511): a lost wake-up of the waiting open fails
+        /// the test instead of hanging the suite.
+        fn answer(self) -> bool {
+            self.0.recv_timeout(Duration::from_secs(60)).expect("the waiting open never answered within a minute (its wake-up was lost)")
+        }
+    }
+
+    type Second = Arc<Mutex<Option<SecondOpen>>>;
 
     /// The overlap of R491 B as the page makes it: an open (TICKET) is building its window; the page's close finds
     /// no window yet and ends that open; the page asks again (TICKET2, on a thread of its own, as the command runs)
     /// while the build is still under way; `then` runs once that second open holds the ticket, still inside the
-    /// first build. Returns the first open's answer and the second open's thread.
-    fn open_during_a_build(lib: &Arc<Library>, host: &Arc<FakeHost>, then: impl FnOnce(&Library, &FakeHost) + Send + 'static) -> (bool, std::thread::JoinHandle<bool>) {
+    /// first build. Returns the first open's answer and the second open's answer to come.
+    fn open_during_a_build(lib: &Arc<Library>, host: &Arc<FakeHost>, then: impl FnOnce(&Library, &FakeHost) + Send + 'static) -> (bool, SecondOpen) {
         let second: Second = Arc::default();
         let (inner, h2, slot) = (lib.clone(), host.clone(), second.clone());
         *host.on_create.lock().unwrap() = Some(Box::new(move |h: &FakeHost| {
             inner.close(h, "main");
             let (l, hh) = (inner.clone(), h2.clone());
-            *slot.lock().unwrap() = Some(std::thread::spawn(move || l.open(&*hh, "main", TICKET2, START2, Start::Library)));
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(l.open(&*hh, "main", TICKET2, START2, Start::Library));
+            });
+            *slot.lock().unwrap() = Some(SecondOpen(rx));
             until_locked(&inner, |g| g.ticket.as_deref() == Some(TICKET2));
             then(&inner, h);
         }));
@@ -3814,7 +3829,7 @@ process.stdout.write(JSON.stringify({{
         let (lib, host) = (Arc::new(lib), Arc::new(host));
         let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
         assert!(!first, "the overtaken open answers false");
-        assert!(second.join().unwrap(), "the newer open answers true");
+        assert!(second.answer(), "the newer open answers true");
         assert_eq!(host.created.lock().unwrap().len(), 1, "a second window was built while the first was being built");
         assert_eq!(*host.navigated.lock().unwrap(), vec![u(START2)], "the newer open re-uses the window that was built");
         assert_eq!(opened(&host), vec![LibraryEvent::new(Some(TICKET2), State::Opened)]);
@@ -3836,7 +3851,7 @@ process.stdout.write(JSON.stringify({{
         let (lib, host) = (Arc::new(lib), Arc::new(host));
         let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
         assert!(!first);
-        assert!(second.join().unwrap());
+        assert!(second.answer());
         let created: Vec<Url> = host.created.lock().unwrap().iter().map(|(u, _)| u.clone()).collect();
         assert_eq!(created, vec![u(START), u(START2)], "the second build came after the first");
         assert_eq!(host.titles.lock().unwrap().last().cloned(), Some(titled("ezproxy.lib.edu", Start::Library)));
@@ -3857,7 +3872,7 @@ process.stdout.write(JSON.stringify({{
         let (lib, host) = (Arc::new(lib), Arc::new(host));
         let (first, second) = open_during_a_build(&lib, &host, |_, _| {});
         assert!(!first, "overtaken while it was built");
-        assert!(!second.join().unwrap(), "the newer open fails");
+        assert!(!second.answer(), "the newer open fails");
         assert_eq!(host.created.lock().unwrap().len(), 1);
         assert!(host.window_exists());
         assert!(opened(&host).is_empty());
@@ -3876,7 +3891,7 @@ process.stdout.write(JSON.stringify({{
         let (lib, host, d) = started("fr734-closed-waiting");
         let (lib, host) = (Arc::new(lib), Arc::new(host));
         let (first, second) = open_during_a_build(&lib, &host, |l, h| l.close(h, "main"));
-        assert!(!second.join().unwrap(), "the open closed while it waited answers false");
+        assert!(!second.answer(), "the open closed while it waited answers false");
         assert!(first, "the window built after its open was closed is that open's");
         assert_eq!(host.created.lock().unwrap().len(), 1);
         assert!(host.navigated.lock().unwrap().is_empty(), "the ended open moved the window");
