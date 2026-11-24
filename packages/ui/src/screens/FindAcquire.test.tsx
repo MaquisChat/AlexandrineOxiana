@@ -3777,8 +3777,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
     // ---- FR-734 point 2 (R503 i): a row that leaves while its request to open the window is out ----
 
     for (const how of ["unmount", "project"] as const) {
-      it(`FR-734 (2): the row leaves (${how}) while the shell's open is out; the shell then answers that it opened the window: the page closes THAT window, once, with its ticket`, async () => {
-        serveOne("leaves meanwhile");
+      it(`FR-734 (2): the row leaves (${how}) while the shell's open is out; the shell then answers that it opened the window: the page closes THAT window, once, with its ticket, and cancels the start at the service, once (R510 I1)`, async () => {
+        const e = serveOne("leaves meanwhile");
         const answer = held<boolean>();
         onTestFinished(() => answer.release(false));
         fake.shell!.openLibraryWindow.mockReturnValue(answer.p);
@@ -3802,6 +3802,11 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
         expect(fake.shell!.closeLibraryWindow.mock.calls.every((c) => c[0] === TICKET)).toBe(true);
         expect(fake.shell!.closeLibraryWindow.mock.calls.at(-1)).toEqual([TICKET]);
         if (how === "unmount") expect(before).toBe(0);
+        // R510 I1: the start is cancelled at the service (its one sign-in ticket is freed), once; the entry no longer waits.
+        await waitFor(() => expect(posts("/library/cancel")).toHaveLength(1));
+        await quiet();
+        expect(posts("/library/cancel")).toEqual([{ method: "POST", path: `/projects/${PID}/find/${e.id}/library/cancel`, body: undefined }]);
+        expect(now(e).state).not.toBe("waiting-sign-in");
       });
     }
 
