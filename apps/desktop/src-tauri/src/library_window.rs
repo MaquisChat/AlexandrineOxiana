@@ -1627,8 +1627,9 @@ impl Library {
             // M3 (R511), N1 (R514): a waiting open's hold ends on the main thread, in the same turn in which its
             // navigation is issued, so that every event of the old page the main thread delivers before that is
             // still held. What remains: an event the web view would deliver for the OLD page after the navigation
-            // was issued. By reading WebKit's documented behaviour, a new navigation cancels the old load, which
-            // then never reports "finished"; this cannot be shown here.
+            // was issued. By reading WebKit's documented behaviour, a new navigation cancels the old load. On macOS
+            // (WKWebView) it then never reports "finished"; on Linux (WebKitGTK) it may still report "finished", at
+            // the address the window then has. This cannot be shown here.
             let held = self.inner.clone();
             let own = ticket.to_string();
             let moved = host.navigate(
@@ -3403,6 +3404,8 @@ process.stdout.write(JSON.stringify({{
             ok
         }
         fn navigate(&self, url: &Url, issued: Box<dyn FnOnce() + Send>) -> bool {
+            // With `defer_issue` this answers before `issued` runs, on purpose (the real host answers only once the
+            // navigation is issued): it holds the state "navigation posted, not yet issued" still for a test.
             self.navigated.lock().unwrap().push(url.clone());
             let ok = self.navigate_ok.load(Ordering::SeqCst);
             if ok {
@@ -4010,9 +4013,10 @@ process.stdout.write(JSON.stringify({{
     }
 
     /// The reviewer's probe `p3_old_page_event_after_navigation_sent` (N1, R514): the real host posts the waiting
-    /// open's navigation to the main thread, which may first deliver the old page's load or download events. Those
-    /// arrive after the open has answered and before the navigation is issued: they start no fetch under its ticket.
-    /// Once the navigation is issued, the open's own page is fetched as before.
+    /// open's navigation to the main thread, which may first deliver the old page's load or download events; they
+    /// start no fetch under its ticket. The stand-in host, with `defer_issue`, answers BEFORE `issued` runs, on
+    /// purpose, to hold the state "navigation posted, not yet issued" still; the real host answers only once the
+    /// navigation is issued. Once it is issued, the open's own page is fetched as before.
     #[test]
     fn an_old_page_s_event_before_the_waiting_open_s_navigation_is_issued_starts_no_fetch() {
         const FIRST_PDF: &str = "https://publisher.example/article/1.pdf";
