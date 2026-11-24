@@ -147,6 +147,16 @@ const inTurn = new AsyncLocalStorage<Turn>();
  */
 export const lockPurges: Array<(core: RepoCore, st: ProjectState) => void> = [];
 
+/**
+ * An attempt to undo an interrupted change that did not complete: its causes, whether a step failed for no cause the undo
+ * could name, and whether a copy of the change is still kept where that chooses the state (R528: `copyKeptOf`).
+ */
+export interface RollbackAttempt {
+  causes: UndoCause[];
+  stepFailed: boolean;
+  copyKept?: true;
+}
+
 export class RepoCore {
   readonly projects = new Map<string, ProjectState>();
   readonly integrityWarnings: IntegrityWarning[] = [];
@@ -155,7 +165,7 @@ export class RepoCore {
    * opening, a choice recorded earlier, "Roll it back", or the change's own undo in this process): what kept it from
    * completing. The list of interrupted changes says it; a complete undo takes its entry away.
    */
-  readonly rollbackAttempts = new Map<string, { causes: UndoCause[]; stepFailed: boolean }>();
+  readonly rollbackAttempts = new Map<string, RollbackAttempt>();
   /** Index failures after a committed mutation (the index is rebuildable; the mutation stands). */
   readonly indexErrors: Array<{ op: string; error: unknown }> = [];
   readonly anchors: AnchorStore;

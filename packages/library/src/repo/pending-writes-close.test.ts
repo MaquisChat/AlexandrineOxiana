@@ -9,6 +9,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditEvent, Provenance, SourceDraft } from "@ao/core";
+import { INCOMPLETE_ROLLBACK_BANNER } from "@ao/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -30,9 +31,9 @@ const STORE = { action: "store" as const, store: { identifiable: false, hasLocat
 const HAND = "a file put here by hand\n";
 const ORIGINAL = "the researcher's original\n";
 const OWN = "the change's own file\n";
-/** Sentence 25: the refusal to close while the app still keeps a copy of the change. */
+/** Sentence 25 (R528 M2: no circle back to "Roll it back"): the refusal to close while the app still keeps a copy of the change. */
 const COPIES_LEFT_TEXT =
-  "This change cannot be closed yet: the app still keeps a copy of a file it could not put back, and closing would let that copy go. Choose “Roll it back” to try again.";
+  "This change cannot be closed: the app still keeps a copy of a file it could not put back, and closing would let that copy go. Restoring the project from a backup made before the change is the way to undo it.";
 
 let tmp: string;
 let lib: Library;
@@ -266,7 +267,21 @@ describe("R509: closing a change whose undo can never complete", () => {
     await rm(fromRel(lib.root, (m.entries[1] as { to: string }).to), { recursive: true, force: true });
     await reopen();
     // The causes name only the folder; the file inside it keeps its copy, which cannot be put back without the folder.
-    expect((await repo.pendingWrites())[0]).toMatchObject({ txn: m.txn, canRollBack: true, canClose: false, causes: [{ kind: "kept-copy-gone", path: dir }] });
+    expect((await repo.pendingWrites())[0]).toMatchObject({ txn: m.txn, canRollBack: true, canClose: false, rollback: "lost-copy-stuck", causes: [{ kind: "kept-copy-gone", path: dir }] });
+    // R528 M2: the banner says what is true and points at no act that is not offered: a backup is the way.
+    const w = repo.integrityWarnings.filter((x) => x.projectId === pid && x.kind === "rolled-back-incomplete-write");
+    expect(w.map((x) => x.rollback)).toEqual(["lost-copy-stuck"]);
+    expect(INCOMPLETE_ROLLBACK_BANNER[w[0]!.rollback!]("P")).toBe(
+      "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. The app still keeps a copy of another file of the change, which it cannot put back either, and closing the change would let that copy go, so it cannot be closed. Changes to P are off. Restoring the project from a backup made before the change is the way to undo it.",
+    );
+    // "Roll it back" answers the same, without sending the researcher round again.
+    const back = await repo.resolvePendingWrite(m.txn, "roll-back").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((back as Error).message).toBe(
+      "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and the app keeps a copy of another file of the change, which it cannot put back either. Restoring the project from a backup made before the change is the way to undo it.",
+    );
     const marker = await readFile(join(lib.root, ".tmp", `txn-${m.txn}.json`), "utf8");
     const err = await repo.closePendingWrite(m.txn, pid).then(
       () => null,

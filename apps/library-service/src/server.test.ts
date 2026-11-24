@@ -3053,7 +3053,12 @@ describe("FR-736: an interrupted change whose undo is not complete, as the servi
     const back = await call({ method: "POST", url: `/libraries/pending-writes/${txn}/resolve`, body: { choice: "roll-back" } });
     expect([back.status, back.json.error]).toEqual([
       409,
-      { code: "CONFLICT", message: "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back.", reason: "rollback-incomplete" },
+      // R528 M5: the answer names the next step, the close the list then offers.
+      {
+        code: "CONFLICT",
+        message: "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back. You can now close the change as it is from the list.",
+        reason: "rollback-incomplete",
+      },
     ]);
     const write = await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "Chapter" } });
     expect([write.status, write.json.error.message]).toEqual([409, "This project takes no changes until a problem found when the library was opened is resolved. The warning at the top of the library says what to do."]);

@@ -12,7 +12,7 @@
  */
 import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { KEPT_COPY_GONE_UNCONFIRMED_TEXT, ROLLBACK_CAUSE_KINDS, ROLLBACK_CAUSE_TEXT, type RollbackCauseKind } from "@ao/shared";
+import { KEPT_COPY_GONE_UNCONFIRMED_TEXT, ROLLBACK_CAUSE_KINDS, ROLLBACK_CAUSE_TEXT, ROLLBACK_LIST_NEXT, type RollbackCauseKind } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { errorText, type LibraryApi, type PendingWrite, type PendingWriteChoice } from "../api/library";
 import { UserText } from "./UserText";
@@ -171,6 +171,8 @@ function Item({ pw, readOnly, onChoose, onCloseAsIs }: { pw: PendingWrite; readO
           const said = causeSentence(c.kind, c.path, c.somethingThere === true);
           return said ? <p key={`${c.kind}:${c.path}`}>{said}</p> : null;
         })}
+        {/* R528 M2: where the causes alone do not say it, the next step: what to deal with first, or that a backup is the way. */}
+        {pw.rollback !== undefined && Object.hasOwn(ROLLBACK_LIST_NEXT, pw.rollback) && <p>{ROLLBACK_LIST_NEXT[pw.rollback]}</p>}
         {pw.canClose === true && <p>{CLOSE_HINT}</p>}
         {!resolvable && <p>The way forward is to restore the project from a backup made before this change.</p>}
         {resolvable && !confirm && !closing && (

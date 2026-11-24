@@ -244,8 +244,13 @@ describe("FR-736: an interrupted change whose undo is not complete says the stat
     lost: `An interrupted change in ${P} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. That file is lost. Changes to ${P} are off until you close the change. Choose “Resolve…” to see what was lost.`,
     // R527: the copy is gone but something stands at the place: never "that file is lost".
     unconfirmed: `An interrupted change in ${P} cannot be undone completely: the copy the app kept of a file it removed is gone, so the app cannot put that file back. Something is at its place now, which may be that file, but the app cannot confirm it, so it left it as it is. Changes to ${P} are off until you close the change. Choose “Resolve…” to see what is there.`,
+    // R528 M4: a file that could not be read is said so, as in the list, never "a step failed".
+    "could-not-read": `An interrupted change in ${P} could not be undone completely: the app could not read a file. Nothing was lost; the app keeps what it needs to finish. Changes to ${P} are off until it is undone. Choose “Resolve…” to see which file.`,
+    // R528 I1, M2: a copy gone with something else to deal with first; and with a copy kept and nothing left to do.
+    "lost-and-blocked": `An interrupted change in ${P} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. Something else also stops the undo, and you can deal with it first: move the file the list names, or try again. After that, you can close the change as it is. Changes to ${P} are off until then. Choose “Resolve…” to see what to do first.`,
+    "lost-copy-stuck": `An interrupted change in ${P} cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. The app still keeps a copy of another file of the change, which it cannot put back either, and closing the change would let that copy go, so it cannot be closed. Changes to ${P} are off. Restoring the project from a backup made before the change is the way to undo it.`,
   } as const;
-  for (const state of ["try-again", "in-the-way", "lost", "unconfirmed"] as const) {
+  for (const state of ["try-again", "in-the-way", "lost", "unconfirmed", "could-not-read", "lost-and-blocked", "lost-copy-stuck"] as const) {
     for (const kind of ["rolled-back-incomplete-write", "incomplete-write-pending"]) {
       it(`${kind}, ${state}: its sentence, the name as text, never the detail; "Resolve…" opens the list`, async () => {
         const detail = "transaction 7f3a: Projects/P/sources/x/kept.txt";

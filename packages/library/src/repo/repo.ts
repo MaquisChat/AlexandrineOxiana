@@ -50,7 +50,7 @@ import {
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
 import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, auditedReason, auditedReasonIn, hasSealedReason, openLibraryReason, readLibraryReasonLines, readProjectReasons, reasonKey, reasonMatches, reasonView } from "./audit-reasons.js";
-import { incompleteRollbackOf, type AuditReasonView, type IncompleteRollback } from "@ao/shared";
+import { type AuditReasonView } from "@ao/shared";
 import { authorizeOnly, decide, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import {
   RECOVERY_CODE_UNSHOWN_WARNING,
@@ -95,7 +95,7 @@ import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "./errors.js";
 import { dismissKeptWarning, keepRecoveryWarnings } from "./kept-warnings.js";
-import { closePendingWrite, completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
+import { closePendingWrite, completeRecordedResolves, incompleteDetail, pendingWrites, resolvePendingWrite, stateOf, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { inspectMarkers, isOrphanBackup, markerPaths, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import {
   adoptRestoredProject as adoptRestoredIn,
@@ -562,7 +562,7 @@ const RECOVERY_WARNINGS: Partial<Record<RecoveryOutcome, { kind: IntegrityWarnin
     kind: "rolled-back-incomplete-write",
     text: "a change interrupted before it was audited could only be partly rolled back; the marker is kept and recovery is retried on the next open",
   },
-  // FR-736: the detail of an incomplete undo says its state (the command line prints it); see INCOMPLETE_DETAIL.
+  // FR-736: the detail of an incomplete undo says its state (the command line prints it); see `incompleteDetail` (pending-writes.ts).
   invalid: { kind: "invalid-txn-marker", text: "a write-ahead marker is unreadable or points outside its project; it was kept and nothing was changed" },
   "skipped-audit-unverifiable": {
     kind: "txn-recovery-skipped-audit-unverifiable",
@@ -572,21 +572,6 @@ const RECOVERY_WARNINGS: Partial<Record<RecoveryOutcome, { kind: IntegrityWarnin
     kind: "incomplete-write-pending",
     text: "the choice made for an interrupted change could not be completed when the library opened; the marker keeps the choice, and it is completed by resolving it again or on the next open",
   },
-};
-
-/**
- * FR-736: the detail of an undo left incomplete at the opening, by its state (the command line prints it; the screens say
- * the shared sentence of the state). Never a retry where retrying cannot help.
- */
-const LOST_DETAIL =
-  "a change interrupted before it was audited could only be partly rolled back: the copy the app kept of a file it removed is gone, so that file cannot be put back; the marker is kept until the change is closed in the app's list of interrupted changes";
-const INCOMPLETE_DETAIL: Record<IncompleteRollback, string> = {
-  "try-again": RECOVERY_WARNINGS["rollback-incomplete"]!.text,
-  "in-the-way":
-    "a change interrupted before it was audited could only be partly rolled back, because a file changed or put there outside the app is in the way; the marker is kept, and the roll-back completes once that file is moved away (the app's list of interrupted changes names it)",
-  lost: LOST_DETAIL,
-  // R527: true whether or not something stands at the place (it says nothing of what is there).
-  unconfirmed: LOST_DETAIL,
 };
 
 /** Reads the anchors; an unreadable file is reported, moved aside (when writable) and replaced. */
@@ -668,11 +653,13 @@ export async function openRepoInternal(
       const w = RECOVERY_WARNINGS[r.outcome];
       // FR-736: an undo not complete, at this opening or for a choice to roll back recorded earlier (its latest attempt
       // was made just now, by completeRecordedResolves), carries its state; the list of interrupted changes its causes.
-      if (r.outcome === "rollback-incomplete") core.rollbackAttempts.set(r.txn, { causes: r.causes ?? [], stepFailed: r.stepFailed === true });
+      if (r.outcome === "rollback-incomplete") {
+        core.rollbackAttempts.set(r.txn, { causes: r.causes ?? [], stepFailed: r.stepFailed === true, ...(r.copyKept ? { copyKept: true as const } : {}) });
+      }
       const attempt = r.outcome === "rollback-incomplete" || r.outcome === "resolve-incomplete" ? core.rollbackAttempts.get(r.txn) : undefined;
-      const rollback = attempt ? incompleteRollbackOf(attempt.causes, attempt.stepFailed) : undefined;
+      const rollback = attempt ? stateOf(attempt) : undefined;
       if (w) {
-        const text = r.outcome === "rollback-incomplete" && rollback ? INCOMPLETE_DETAIL[rollback] : w.text;
+        const text = r.outcome === "rollback-incomplete" && rollback ? incompleteDetail(rollback, "open") : w.text;
         core.integrityWarnings.push({
           projectId: r.projectId,
           kind: w.kind,

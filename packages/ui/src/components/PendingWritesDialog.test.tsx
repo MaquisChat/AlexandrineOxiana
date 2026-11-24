@@ -227,7 +227,7 @@ describe("FR-736: what is in the way of an undo that is not complete", () => {
   };
   for (const [kind, said] of Object.entries(SAYS)) {
     it(`${kind}: said with the file's place in the library, shown as text`, async () => {
-      serve([[pw({ rollback: kind === "kept-copy-gone" ? "lost" : kind === "could-not-look" ? "try-again" : "in-the-way", causes: [{ kind, path: F }] })]]);
+      serve([[pw({ rollback: kind === "kept-copy-gone" ? "lost" : kind === "could-not-look" ? "could-not-read" : "in-the-way", causes: [{ kind, path: F }] })]]);
       show();
       const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
       const item = within(group).getByText((_, el) => el?.tagName === "P" && el.textContent === said);
@@ -258,6 +258,39 @@ describe("FR-736: what is in the way of an undo that is not complete", () => {
     await user.click(within(dialog).getByRole("button", { name: "Yes, roll it back" }));
     const alert = await within(dialog).findByRole("alert");
     expect(alert.textContent).toBe(said);
+  });
+});
+
+describe("R528 I1, M2: a copy gone together with something else: the words lead in order", () => {
+  const A = "Projects/Dissertation/sources/Smith 2020/a.txt";
+  const B = "Projects/Dissertation/sources/Smith 2020/b.txt";
+  const D = "Projects/Dissertation/sources/Smith 2020/D";
+  /** The list's lines of the item, in order, as the researcher reads them (its title, status and step count left out). */
+  const lines = (group: HTMLElement) => Array.from(group.querySelectorAll("p")).slice(3).map((p) => p.textContent);
+
+  it("probe P1 (a lost file and a file changed by hand): each cause with its place, then what to do first and the close after it; no close yet", async () => {
+    serve([[pw({ rollback: "lost-and-blocked", causes: [{ kind: "kept-copy-gone", path: A }, { kind: "hand-changed-file", path: B }], canClose: false })]]);
+    show();
+    const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
+    expect(lines(group)).toEqual([
+      `The file this change removed from ${A} cannot be put back: the copy the app kept of it is gone, so it is lost.`,
+      `${B} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (it is kept there as it is), then choose “Roll it back”.`,
+      "Deal with what is named above first, then choose “Roll it back” again. After that, you can close this change as it is.",
+    ]);
+    expect(within(group).getByRole("button", { name: "Roll it back" })).toBeTruthy();
+    expect(within(group).queryByRole("button", { name: "Close this change as it is" })).toBeNull();
+  });
+
+  it("probe P5 (a lost folder, a copy kept inside it that cannot be put back): a backup is the way; no close, and no hint of one", async () => {
+    serve([[pw({ rollback: "lost-copy-stuck", causes: [{ kind: "kept-copy-gone", path: D }], canClose: false })]]);
+    show();
+    const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
+    expect(lines(group)).toEqual([
+      `The file this change removed from ${D} cannot be put back: the copy the app kept of it is gone, so it is lost.`,
+      "The app still keeps a copy of another file of this change, which it cannot put back either, and closing would let that copy go, so this change cannot be closed. The way forward is to restore the project from a backup made before this change.",
+    ]);
+    expect(within(group).queryByRole("button", { name: "Close this change as it is" })).toBeNull();
+    expect(within(group).queryByText("You can close this change as it is.")).toBeNull();
   });
 });
 

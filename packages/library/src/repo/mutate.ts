@@ -41,7 +41,6 @@ import { decryptStream, encryptStream } from "../crypto/format.js";
 import { copyFileAtomic, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
 import { scrubPaths } from "../app-settings.js";
-import { incompleteRollbackOf } from "@ao/shared";
 
 const SMALL_FILE_BYTES = 256 * 1024;
 import type { AuditInput } from "./audit-store.js";
@@ -51,7 +50,8 @@ import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo, type ContainmentCache } from "./io.js";
 import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
 import { AUDIT_REASONS_FILE, reasonMac, sealedReasonLine } from "./audit-reasons.js";
-import { TxnLog, identityOf, markerPaths } from "./txn.js";
+import { TxnLog, copyKeptOf, identityOf, markerPaths } from "./txn.js";
+import { stateOf } from "./pending-writes.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
 
 /** A policy request without the fields the repository fills in (projectId; actor, now and tz by default). */
@@ -555,14 +555,14 @@ export async function runMutation<T>(
         st.recoveryPending = true;
         // FR-736: said at once, with its state, so that the researcher is offered the list of interrupted changes
         // (the refusal of every later write points to this warning); resolving the change takes it away.
-        const attempt = { causes: undone.causes, stepFailed: undone.stepFailed === true };
+        const attempt = { causes: undone.causes, stepFailed: undone.stepFailed === true, ...((await copyKeptOf(core.root, log.marker, undone)) ? { copyKept: true as const } : {}) };
         core.rollbackAttempts.set(log.id, attempt);
         core.integrityWarnings.push({
           projectId,
           kind: "rolled-back-incomplete-write",
           detail: `a change that failed could only be partly rolled back; the marker is kept and recovery is retried on the next open (transaction ${log.id})`,
           ...(undone.causes.length ? { causes: undone.causes } : {}),
-          rollback: incompleteRollbackOf(attempt.causes, attempt.stepFailed),
+          rollback: stateOf(attempt),
         });
         // The paths it names stay half changed until then: a read of a source among them says so (R473 I1).
         st.unfinished = new Set([...(st.unfinished ?? []), ...markerPaths(log.marker)]);

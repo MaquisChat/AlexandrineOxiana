@@ -43,7 +43,7 @@ import { copyFileAtomic, renameWithRetry, writeFileAtomic, writeSmallFileAtomic 
 import { AuditStore, auditSegments, type Head } from "./audit-store.js";
 import { PathEscapeError } from "./errors.js";
 import { shredPath } from "../fs/shred.js";
-import { assertContained, exists, undoAppend, type AppendUndo } from "./io.js";
+import { assertContained, exists, readMaybe, undoAppend, type AppendUndo } from "./io.js";
 import { seams, type IdentityLookAt } from "./seams.js";
 
 /**
@@ -799,6 +799,8 @@ export interface RecoveryResult {
   causes?: UndoCause[];
   /** Not completely rolled back: a step failed for no cause the undo could name (FR-736). */
   stepFailed?: true;
+  /** Not completely rolled back: a copy of the change is still kept, where that chooses its state (R528, `copyKeptOf`). */
+  copyKept?: true;
   /** The marker's `projectFolder` as written, when it has one (it may be a different project's folder). */
   projectFolder?: string;
   txn: string;
@@ -999,6 +1001,35 @@ export async function rollBackMarker(root: string, m: TxnMarker): Promise<UndoRe
   return r;
 }
 
+/**
+ * Whether the app still keeps a copy of something of this change that is not back in its place: a trash copy, or a
+ * backup of a replaced file whose bytes are not at its path. Removing the marker lets such a copy go (its backups are
+ * deleted with it, and the next opening sweeps the trash): closing must delete nothing (R509), so it waits; where nothing
+ * else stops the undo and its own copy is gone, nothing the researcher can do in the app remains (R528 M2).
+ */
+export async function keptCopiesLeft(root: string, m: Pick<TxnMarker, "entries">): Promise<boolean> {
+  for (const e of m.entries) {
+    if (e.kind === "trashed" && (await exists(fromRel(root, e.to)))) return true;
+    if (e.kind === "replaced") {
+      const backup = await readMaybe(fromRel(root, e.backup));
+      if (backup === null) continue;
+      const now = await readMaybe(fromRel(root, e.path)).catch(() => null);
+      if (now === null || !now.equals(backup)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * R528: whether an incomplete undo's state must know that a copy is still kept (`keptCopiesLeft`): only where a copy is
+ * gone and nothing else stops the undo (it then tells "lost" from "lost-copy-stuck"). A look that fails counts as kept
+ * (the safe side: no close is offered).
+ */
+export async function copyKeptOf(root: string, m: Pick<TxnMarker, "entries">, r: Pick<UndoResult, "causes" | "stepFailed">): Promise<boolean> {
+  if (r.stepFailed || r.causes.length === 0 || !r.causes.every((c) => c.kind === "kept-copy-gone")) return false;
+  return keptCopiesLeft(root, m).catch(() => true);
+}
+
 /** The library-relative paths a marker names (the files and folders its change touched). */
 export function markerPaths(m: Pick<TxnMarker, "entries">): string[] {
   return m.entries.map((e) => (e.kind === "trashed" ? e.from : e.path));
@@ -1051,7 +1082,17 @@ export async function recoverTransactions(
     // outside change is lost silently: there is no "changed outside, not kept" to report any more.
     const r = await rollBackMarker(root, m);
     if (r.ok) out.push({ projectId: m.projectId, txn: m.txn, outcome: "rolled-back" });
-    else out.push({ ...where, paths: markerPaths(m), outcome: "rollback-incomplete", ...(r.causes.length ? { causes: r.causes } : {}), ...(r.stepFailed ? { stepFailed: true as const } : {}) });
+    else {
+      const copyKept = await copyKeptOf(root, m, r);
+      out.push({
+        ...where,
+        paths: markerPaths(m),
+        outcome: "rollback-incomplete",
+        ...(r.causes.length ? { causes: r.causes } : {}),
+        ...(r.stepFailed ? { stepFailed: true as const } : {}),
+        ...(copyKept ? { copyKept: true as const } : {}),
+      });
+    }
   }
   return out;
 }
