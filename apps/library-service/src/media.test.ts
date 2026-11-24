@@ -717,6 +717,53 @@ describe("pictures (R135 1)", () => {
     expect(r.status).toBe(413);
     expect(r.json.error.code).toBe("PAYLOAD_TOO_LARGE");
   });
+
+  it("FR-739 (1): a lock while a picture is being sent cuts it, as the document routes do — nothing read after the lock leaves, the later part never arrives, the next request answers as locked", async () => {
+    await start();
+    const port = await svc.listen(0);
+    hostHeader = { host: `127.0.0.1:${port}` };
+    await openLibrary();
+    const pid = await newProject(true);
+    // A large picture with a known marker in its later part: it arrives only if a read is made after the lock.
+    const png = Buffer.concat([tinyPng(), randomBytes(12 * CHUNK)]);
+    const MARKER = Buffer.from("FR739-the-later-part-of-the-picture-0123456789", "latin1");
+    const markerAt = png.length - 4096;
+    MARKER.copy(png, markerAt);
+    const { sid, aid } = await sourceWith(pid, await scratch("long.png", png), "image");
+    const url = contentUrl(pid, sid, aid);
+    const parts: Buffer[] = [];
+    let res: import("node:http").IncomingMessage | undefined;
+    let firstData: () => void = () => {};
+    const first = new Promise<void>((r) => (firstData = r));
+    let ended: (how: string) => void = () => {};
+    const done = new Promise<string>((r) => (ended = r));
+    const req = httpRequest({ host: "127.0.0.1", port, path: url, method: "GET", headers: { host: `127.0.0.1:${port}`, ...auth } }, (r) => {
+      res = r;
+      r.on("data", (d: Buffer) => {
+        parts.push(d);
+        if (parts.length === 1) {
+          r.pause();
+          firstData();
+        }
+      });
+      r.on("close", () => ended(r.complete ? "end" : "aborted"));
+    });
+    req.on("error", () => ended("aborted"));
+    req.end();
+    await first;
+    expect(res?.statusCode).toBe(200);
+    // Locked while the picture is under way (its reader paused after the first data): the key is wiped before going on.
+    await svc.state.session!.repo.lockProject(pid);
+    res!.resume();
+    // Cut: never complete — what the service had read before the lock may still arrive (it was in flight), nothing more.
+    expect(await done).toBe("aborted");
+    const got = Buffer.concat(parts);
+    expect(got.equals(png.subarray(0, got.length)), "only the picture's own bytes, in order").toBe(true);
+    expect(got.includes(MARKER), `the later part arrived (${got.length} of ${png.length} bytes)`).toBe(false);
+    expect(got.length).toBeLessThan(markerAt);
+    const again = await call({ url });
+    expect([again.status, again.json?.error?.code]).toEqual([423, "PROJECT_LOCKED"]);
+  });
 });
 
 describe("fix round 1 (R140): the token exemption belongs to the media route only", () => {

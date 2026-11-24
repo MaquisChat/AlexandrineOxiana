@@ -44,7 +44,7 @@
  * or in an error message (every message here is fixed text).
  */
 import { createHash, randomBytes } from "node:crypto";
-import { Transform } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { DecryptionError, EncryptionFormatError, KeyNotAvailableError, ProjectLockedError, isMediaMime, isPictureMime, openAssetContent, type AssetContent, type StoredContent } from "@ao/library";
 import {
@@ -355,6 +355,51 @@ function contentHeaders(reply: FastifyReply, mime: string, length: number): void
     .header("Content-Security-Policy", "default-src 'none'; sandbox");
 }
 
+/** How much each guarded read takes (as the library's own stream does). */
+const SLICE = 64 * 1024;
+
+const closedMeanwhile = (): ApiError => new ApiError(409, "CONFLICT", "The library was closed while this file was being read.");
+
+/**
+ * `c` with every read checked by `ok` before and after it (so no byte read after a lock leaves),
+ * and its range stream made of those checked reads.
+ */
+export function guarded<T extends StoredContent>(c: T, ok: () => void): T {
+  const read = async (position: number, length: number): Promise<Buffer> => {
+    ok();
+    const b = await c.read(position, length);
+    ok();
+    return b;
+  };
+  return {
+    ...c,
+    read,
+    range(start, end) {
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= c.size) throw new RangeError("range outside the file");
+      async function* gen(): AsyncGenerator<Buffer> {
+        for (let at = start; at <= end; ) {
+          const n = Math.min(SLICE, end - at + 1);
+          yield await read(at, n);
+          at += n;
+        }
+      }
+      return Readable.from(gen(), { objectMode: false, highWaterMark: SLICE });
+    },
+    close: () => c.close(),
+  };
+}
+
+/**
+ * The check `guarded` makes around every read of a file served to the app (the reader's documents, the held file
+ * looked at, and pictures — FR-739): the same library still open, and the project still unlocked.
+ */
+export function readGuard(state: Ctx["state"], s: ReturnType<Ctx["state"]["requireSession"]>, projectId: string): () => void {
+  return () => {
+    if (state.session !== s) throw closedMeanwhile();
+    if (!s.repo.isUnlocked(projectId)) throw new ProjectLockedError(projectId);
+  };
+}
+
 export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void> }): void {
   const { state } = ctx;
   const tickets = state.media;
@@ -372,7 +417,8 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
     const s = state.requireSession();
     const { projectId, sid, aid } = assetParams(req);
     if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
-    const c = await openAssetContent(s.repo, projectId, sid, aid, (a) => isPictureMime(a.mime));
+    // FR-739: every read checked as the document routes check theirs, so a lock while the picture is sent cuts it.
+    const c = guarded(await openAssetContent(s.repo, projectId, sid, aid, (a) => isPictureMime(a.mime)), readGuard(state, s, projectId));
     if (c.size > pictureMax) {
       await c.close();
       throw new ApiError(413, "PAYLOAD_TOO_LARGE", "This picture is too large to show.");
