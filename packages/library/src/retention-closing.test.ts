@@ -156,8 +156,8 @@ async function settle<T>(start: Promise<T>, closing: () => Promise<void> | undef
   await began;
   await closing();
   const afterClose = await snapshot(kit.lib.root);
+  // Everything settled: the destruction's (or the pass's) own promise.
   const result = await outcome;
-  await new Promise((r) => setTimeout(r, 50));
   expect(await snapshot(kit.lib.root)).toEqual(afterClose);
   return result;
 }

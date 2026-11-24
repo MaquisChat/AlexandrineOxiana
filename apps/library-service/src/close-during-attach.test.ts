@@ -187,7 +187,7 @@ describe("a close while an attach waits on its lookup (FR-749, R546)", () => {
     // everything has settled.
     const afterStop = await snapshot(path);
     expect(afterStop.filter((l) => l.includes("source.json") || l.includes("/original/") || l.includes("review/pending"))).toEqual([]);
-    await new Promise((r) => setTimeout(r, 100));
+    // The attach's answer and the stop are both awaited above: the service has no work left to wait for.
     expect(await snapshot(path)).toEqual(afterStop);
     expect(await pendingMarkers(path)).toBe(0);
     expect(wait.count()).toBe(1);
@@ -288,13 +288,13 @@ function openAlexSwitchable(): { asked: Promise<void>; count: () => number; answ
   return { asked: p, count: () => n, answer: () => void (wait = false) };
 }
 
-/** Waits until the batch has ended and the service let its run go; returns its listed state. */
+/** Waits until the service's background work (the batch's run among it) is idle; returns the batch's listed state. */
 async function settledBatch(pid: string, batchId: string): Promise<string> {
-  for (;;) {
-    const b = ((await call({ url: `/projects/${pid}/imports` })).json.batches as Array<{ batchId: string; state: string }>).find((x) => x.batchId === batchId);
-    if (b && b.state !== "running" && !svc!.state.session?.batches.has(batchId)) return b.state;
-    await new Promise((r) => setTimeout(r, 50));
-  }
+  await svc!.state.idle();
+  const b = ((await call({ url: `/projects/${pid}/imports` })).json.batches as Array<{ batchId: string; state: string }>).find((x) => x.batchId === batchId);
+  expect(b).toBeDefined();
+  expect(svc!.state.session?.batches.has(batchId)).toBe(false);
+  return b!.state;
 }
 
 async function journalLines(path: string): Promise<Array<{ key: string; outcome: string }>> {

@@ -89,9 +89,8 @@ async function closeDuring(start: () => Promise<unknown>, h: ReturnType<typeof h
   h.release();
   await closing;
   const afterClose = await snapshot(root);
+  // Everything settled: the backup's own promise (it ends after its clean-up and its maintenance lock's release).
   const result = await outcome;
-  // Everything settled: the backup's promise, its maintenance lock, any timer it left.
-  await new Promise((r) => setTimeout(r, 50));
   expect(await snapshot(root)).toEqual(afterClose);
   return { result, afterClose };
 }
