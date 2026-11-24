@@ -81,7 +81,7 @@ import {
 import { UnsafeFileError } from "../../extract/errors.js";
 import { extractMetadata } from "../../extract/index.js";
 import type { IndexDb } from "../../index/db.js";
-import { lookupContextFor, providerAllowed, type HttpClient, type LookupContext } from "../../lookup/index.js";
+import { LookupCancelledError, lookupContextFor, providerAllowed, type HttpClient, type LookupContext } from "../../lookup/index.js";
 import { NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError, isLockedRefusal } from "../../repo/errors.js";
 import type { CreateSourceOptions, SourceInputFile } from "../../repo/sources.js";
 import { storeRequest } from "../../repo/sources.js";
@@ -1075,6 +1075,14 @@ class Run {
       }
     } catch (err) {
       if (this.cancelled && (err as Error)?.name === "AbortError") state = "cancelled";
+      // FR-749 (R546 2, 3): the library is being closed and its lookup client let the item's lookup go. The item in
+      // hand is not stored (its record would rest on a lookup that was cut short) and not journaled: the batch is left
+      // paused on disk exactly as a suspend leaves it (R99 I4), and the item is brought in when the batch is resumed.
+      else if (err instanceof LookupCancelledError) {
+        state = "paused";
+        this.suspending = true;
+        await this.checkpoint("paused").catch(() => {});
+      }
       else {
         state = "failed";
         // R436 d: a project left refusing every write (a change could not be undone) is what must be settled first,

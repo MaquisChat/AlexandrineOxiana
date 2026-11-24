@@ -19,7 +19,7 @@ import { locIsbn } from "./loc.js";
 import { openAlexSearch, openAlexWork } from "./openalex.js";
 import { openLibraryIsbn } from "./openlibrary.js";
 
-export { DEFAULT_ATTEMPT_TIMEOUT_MS, DEFAULT_RATE_LIMITS, HttpClient, LookupHttpError, USER_AGENT } from "./http.js";
+export { DEFAULT_ATTEMPT_TIMEOUT_MS, DEFAULT_RATE_LIMITS, HttpClient, LookupCancelledError, LookupHttpError, USER_AGENT } from "./http.js";
 export type { GetOptions, HttpClientOptions } from "./http.js";
 export { isSensitive, lookupContextFor, providerAllowed } from "./context.js";
 export type { LookupContext, LookupResult, Provider } from "./context.js";
