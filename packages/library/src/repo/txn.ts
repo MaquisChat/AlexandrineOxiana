@@ -393,13 +393,22 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
     }
     if (!putBack) continue;
     const earlier = trashedContent(entries, i);
-    if (e.ino !== undefined && earlier !== "the change's") {
+    if (e.ino === undefined) {
+      // An older build's line (no identity), judged as before. R503 b 2: a copy gone while the change's own bytes (a
+      // later line's hash) are still at the path was not put back: it was deleted outside the app. The roll-back is
+      // then not complete (the marker is kept); nothing is deleted.
+      try {
+        if (await ownBytesAt(root, e.from, entries.slice(i + 1))) because("kept-copy-gone", e.from);
+      } catch {
+        because("could-not-look", e.from);
+      }
+    } else if (earlier === "the original") {
       // R519 (3): the line knows the original's identity. A file with it at the path IS the original, put back (or never
       // moved: a crash between the line and its rename), whatever its bytes equal (R509 M1). The change's own file,
       // anything else, or nothing there: the original was not put back and cannot be, the copy being gone (R509 M2).
       // Nothing at the path is deleted or moved, and no line at or under it is undone.
       try {
-        if (!(await isOriginal(root, e, earlier === "changed by the change"))) {
+        if (!(await isOriginal(root, e, false))) {
           because("kept-copy-gone", e.from);
           blocked.push(e.from);
         }
@@ -407,17 +416,22 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
         because("could-not-look", e.from);
         blocked.push(e.from);
       }
-    } else {
-      // An older build's line (no identity), or a copy of what the change itself had made (it holds nothing of the
-      // researcher's, and once the earlier lines are undone nothing at the path has its identity), judged as before.
-      // R503 b 2: a copy gone while the change's own bytes (a later line's hash) are still at the path was not put
-      // back: it was deleted outside the app. The roll-back is then not complete (the marker is kept); nothing is deleted.
+    } else if (earlier === "changed by the change") {
+      // The same, by its file number alone: the original with the change's additions, which their undo, after it is put
+      // back, takes away in place (its size and time change, its number stays).
       try {
-        if (await ownBytesAt(root, e.from, entries.slice(i + 1))) because("kept-copy-gone", e.from);
+        if (!(await isOriginal(root, e, true))) {
+          because("kept-copy-gone", e.from);
+          blocked.push(e.from);
+        }
       } catch {
         because("could-not-look", e.from);
+        blocked.push(e.from);
       }
     }
+    // Else the copy held only what the change itself had made (an earlier line made it whole): put back or deleted by
+    // hand, nothing of the researcher's is lost with it, and the earlier lines' undo (which removes or overwrites only
+    // the change's own bytes) brings the path back to its state before the change. The later lines are skipped (R493).
     for (let j = i + 1; j < entries.length; j++) {
       const x = entries[j]!;
       // R503 b 1: at or under the path (a file inside a folder the change trashed and made again).

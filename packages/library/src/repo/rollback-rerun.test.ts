@@ -611,3 +611,163 @@ describe("R493: every two- and three-step sequence at one path, every cut of the
     }
   }
 });
+
+// ---- R519: the same enumeration with a file put there by hand ------------------------------------------------------
+
+const HAND = "a file a person put here by hand\n";
+type HandPut = "a new file put in its place" | "written over in place";
+
+/** The copies a marker names that exist now (a replaced line's backup, a trashed line's copy), with their bytes. */
+async function keptCopies(v: World, m: TxnMarker): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  for (const e of m.entries) {
+    const copy = e.kind === "replaced" ? e.backup : e.kind === "trashed" ? e.to : null;
+    if (copy === null) continue;
+    const b = await bytesAt(v, copy);
+    if (b !== null) out.set(copy, b.toString("base64"));
+  }
+  return out;
+}
+
+/**
+ * One case: the change takes its steps at one path and fails; its in-process roll-back is cut after `cut` steps (0:
+ * before its first undo); a person then puts a file at the path; the library is reopened (a second roll-back) and
+ * reopened again (a third). R519: the hand-put bytes are at the path, unchanged, after each; the roll-back is incomplete
+ * (the bytes are not the earlier state) with causes at that path, every copy the app kept before the second roll-back
+ * still there, unchanged; the third changes nothing the second left.
+ */
+async function handPutCase(seq: Op[], startExists: boolean, cut: number, how: HandPut): Promise<{ failures: string[]; lines: number }> {
+  const v = await makeWorld();
+  const failures: string[] = [];
+  const name = `[${seq.join(", ")}] from ${startExists ? "a file with original bytes" : "no file"}, first roll-back cut after ${cut} step(s), then ${how}`;
+  try {
+    const rel = `${v.folder}/rerun.txt`;
+    if (startExists) await writeFile(fromRel(v.lib.root, rel), ORIGINAL);
+    seams.stopUndoAfter = cut;
+    await expect(
+      v.repo.mutate(v.pid, STORE, async (tx) => {
+        for (const [i, op] of seq.entries()) {
+          if (op === "trash") await tx.trash(rel);
+          else if (op === "append") await tx.appendLine(rel, `step ${i} appended`);
+          else await tx.writeFile(rel, `step ${i} wrote (${op})\n`);
+        }
+        throw new Error("the change failed");
+      }),
+    ).rejects.toThrow("the change failed");
+    if (seams.stopUndoAfter !== undefined) failures.push(`${name}: the cut did not happen`);
+    seams.stopUndoAfter = undefined;
+    if ((await markerNames(v)).length !== 1) return { failures: [...failures, `${name}: no marker after the cut roll-back`], lines: 0 };
+    const m = await readMarker(v);
+    // The person's act: a new file renamed into place (a new file number), or the file there written over in place.
+    const abs = fromRel(v.lib.root, rel);
+    if (how === "written over in place") await writeFile(abs, HAND);
+    else {
+      await writeFile(join(v.tmp, "hand.txt"), HAND);
+      await rename(join(v.tmp, "hand.txt"), abs);
+    }
+    const copies = await keptCopies(v, m);
+    let second: { copies: Map<string, string>; causes: string } | undefined;
+    for (const run of ["second", "third"]) {
+      await reopen(v);
+      const where = `${name}: after the ${run} roll-back`;
+      const now = await bytesAt(v, rel);
+      if (now?.toString() !== HAND) failures.push(`${where}, the hand-put file is ${now === null ? "gone" : `now ${JSON.stringify(now.toString())}`}`);
+      if (v.repo.integrityWarnings.some((x) => x.kind === "invalid-txn-marker")) failures.push(`${where}, the marker was found invalid`);
+      if (v.repo.integrityWarnings.some((x) => x.kind === "changed-outside-before-rollback")) failures.push(`${where}, an outside change was said not kept`);
+      if ((await markerNames(v)).length !== 1) {
+        failures.push(`${where}, reported complete with the hand-put file at the path`);
+        continue;
+      }
+      const left = await keptCopies(v, m);
+      for (const [copy, b] of copies) if (left.get(copy) !== b) failures.push(`${where}, the kept copy ${copy} is ${left.has(copy) ? "changed" : "gone"}`);
+      const why = v.repo.integrityWarnings.filter((x) => x.kind === "rolled-back-incomplete-write").flatMap((x) => x.causes ?? []);
+      const known = why.length > 0 && why.every((c) => c.path === rel && ["hand-changed-file", "path-occupied", "kept-copy-gone"].includes(c.kind));
+      // An incomplete re-run is refused as a whole when the R131 b append offsets no longer hold (nothing touched).
+      const refused = v.repo.integrityWarnings.some((x) => x.kind === "txn-recovery-skipped-audit-unverifiable");
+      if (!known && !refused) failures.push(`${where}, incomplete without its cause at the path (${JSON.stringify(why)})`);
+      const state = { copies: left, causes: JSON.stringify(why) };
+      if (second && (second.causes !== state.causes || [...second.copies].join() !== [...state.copies].join())) failures.push(`${where}, it changed what the second left`);
+      second = state;
+    }
+    return { failures, lines: m.entries.length };
+  } finally {
+    await dropWorld(v);
+  }
+}
+
+/**
+ * R509 M1, by enumeration: every write of the change puts the original's very bytes back. The first roll-back is cut
+ * after each of its steps; the second must complete (never "incomplete for ever" because the bytes are equal), the path
+ * as it was before the change, and a third finds nothing left to do.
+ */
+async function equalBytesCase(seq: Op[], startExists: boolean, cut: number): Promise<{ failures: string[]; lines: number }> {
+  const v = await makeWorld();
+  const failures: string[] = [];
+  const name = `[${seq.join(", ")}] writing the original's bytes, from ${startExists ? "the original" : "no file"}, first roll-back cut after ${cut} step(s)`;
+  try {
+    const rel = `${v.folder}/rerun.txt`;
+    if (startExists) await writeFile(fromRel(v.lib.root, rel), ORIGINAL);
+    const before = await bytesAt(v, rel);
+    seams.stopUndoAfter = cut;
+    await expect(
+      v.repo.mutate(v.pid, STORE, async (tx) => {
+        for (const op of seq) {
+          if (op === "trash") await tx.trash(rel);
+          else await tx.writeFile(rel, ORIGINAL);
+        }
+        throw new Error("the change failed");
+      }),
+    ).rejects.toThrow("the change failed");
+    seams.stopUndoAfter = undefined;
+    const lines = (await markerNames(v)).length ? (await readMarker(v)).entries.length : 0;
+    for (const run of ["second", "third"]) {
+      await reopen(v);
+      const now = await bytesAt(v, rel);
+      if ((await markerNames(v)).length) failures.push(`${name}: after the ${run} roll-back, still incomplete`);
+      if (!(now === null ? before === null : before !== null && now.equals(before))) failures.push(`${name}: after the ${run} roll-back, the path is not as before`);
+    }
+    return { failures, lines };
+  } finally {
+    await dropWorld(v);
+  }
+}
+
+/**
+ * The hand-put enumeration covers every sequence of trash, create and replace that the transaction takes (two steps:
+ * 3 from a file, 2 from none; three steps: 5 and 3). Sequences with an append are left out: an "append" line records
+ * only the size before it, so a file put by hand at a path the change only appended to cannot be told from the
+ * change's own (R519 rules the files the undo can tell). Cases: each sequence, each cut of its first roll-back (0 to
+ * its lines: 0 is before its first undo), each of the two ways of putting the file there: 94 in all. Beside each
+ * sequence, R509 M1's equal bytes at every cut.
+ */
+const EXPECTED_HAND: Record<string, number> = { "2-true": 18, "2-false": 12, "3-true": 40, "3-false": 24 };
+const WRITES: Op[] = ["trash", "create", "replace"];
+
+describe("R519: with a file put there by hand at every point, every sequence of trash, create and replace at one path", () => {
+  for (const length of [2, 3]) {
+    for (const startExists of [true, false]) {
+      it(`${length} steps, ${startExists ? "the file there with original bytes" : "no file"} at the start`, async () => {
+        const failures: string[] = [];
+        let cases = 0;
+        const taken = sequences(length).filter((s) => s.every((op) => WRITES.includes(op)) && takes(s, startExists));
+        for (const seq of taken) {
+          for (const how of ["a new file put in its place", "written over in place"] as const) {
+            const first = await handPutCase(seq, startExists, 0, how);
+            failures.push(...first.failures);
+            cases++;
+            for (let cut = 1; cut <= first.lines; cut++) {
+              failures.push(...(await handPutCase(seq, startExists, cut, how)).failures);
+              cases++;
+            }
+          }
+          // R509 M1: the same sequence writing the original's own bytes.
+          const first = await equalBytesCase(seq, startExists, 0);
+          failures.push(...first.failures);
+          for (let cut = 1; cut <= first.lines; cut++) failures.push(...(await equalBytesCase(seq, startExists, cut)).failures);
+        }
+        expect(failures, `${failures.length} failure(s) in ${cases} case(s)`).toEqual([]);
+        expect(cases).toBe(EXPECTED_HAND[`${length}-${startExists}`]);
+      }, 600_000);
+    }
+  }
+});
