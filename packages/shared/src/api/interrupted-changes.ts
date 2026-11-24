@@ -115,6 +115,13 @@ export const ROLLBACK_CAUSE_TEXT: Record<RollbackCauseKind, (f: string) => strin
 export const KEPT_COPY_GONE_UNCONFIRMED_TEXT = (f: string): string =>
   `The file this change removed from ${f} cannot be put back: the copy the app kept of it is gone. Something is at that place now, which may be that file, but the app cannot confirm it, so it left it as it is.`;
 
+/**
+ * R533 (1): in the list, a `could-not-look` cause where what could not be read is the copy the app kept of the file the
+ * change removed from the place (`copyUnread`), not the place itself.
+ */
+export const COULD_NOT_READ_KEPT_COPY_TEXT = (f: string): string =>
+  `The app could not read the copy it kept of the file this change removed from ${f}, so it left ${f} as it is. Make sure the library's work folder can be read, then choose “Roll it back”.`;
+
 /** R528 M5: the answer for a copy gone names the next step, the close the list then offers. */
 const LOST_ANSWER =
   "The change cannot be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back. You can now close the change as it is from the list.";

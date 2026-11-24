@@ -6,7 +6,7 @@
  * keeps and cannot put back (nothing left to do) says a backup is the way, never an act that is not offered.
  */
 import { describe, expect, it } from "vitest";
-import { INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_INCOMPLETE_ANSWER, ROLLBACK_LIST_NEXT, incompleteRollbackOf, type IncompleteRollback } from "./interrupted-changes.js";
+import { COULD_NOT_READ_KEPT_COPY_TEXT, INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_CAUSE_TEXT, ROLLBACK_INCOMPLETE_ANSWER, ROLLBACK_LIST_NEXT, incompleteRollbackOf, type IncompleteRollback } from "./interrupted-changes.js";
 
 /** `unreadGone` (R532 M1): a place the app could not look at, of a file whose kept copy is gone. */
 type Flags = { lost: boolean; unconfirmed: boolean; unreadGone: boolean; hand: boolean; occupied: boolean; unread: boolean; failed: boolean; copyKept: boolean };
@@ -119,5 +119,14 @@ describe("R528: the words of each state, word for word", () => {
       "lost-copy-stuck":
         "The app still keeps a copy of another file of this change, which it cannot put back either, and closing would let that copy go, so this change cannot be closed. The way forward is to restore the project from a backup made before this change.",
     });
+  });
+});
+
+describe("R533 (1): the list's line where the app could not read the copy it kept", () => {
+  it("names the place twice and the work folder; the ordinary could-not-look line is unchanged", () => {
+    expect(COULD_NOT_READ_KEPT_COPY_TEXT("P/a.txt")).toBe(
+      "The app could not read the copy it kept of the file this change removed from P/a.txt, so it left P/a.txt as it is. Make sure the library's work folder can be read, then choose “Roll it back”.",
+    );
+    expect(ROLLBACK_CAUSE_TEXT["could-not-look"]("P/a.txt")).toBe("The app could not read P/a.txt, so it left it as it is. Make sure the file can be read, then choose “Roll it back”.");
   });
 });

@@ -8,7 +8,7 @@ import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
-import { INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_CAUSE_TEXT, ROLLBACK_INCOMPLETE_ANSWER, ROLLBACK_LIST_NEXT } from "@ao/shared";
+import { COULD_NOT_READ_KEPT_COPY_TEXT, INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_CAUSE_TEXT, ROLLBACK_INCOMPLETE_ANSWER, ROLLBACK_LIST_NEXT } from "@ao/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -518,6 +518,8 @@ describe("R532 M1: where a look fails, the words never say what the app does not
     const [pw] = await repo.pendingWrites();
     // The list names the place the app could not read (it says nothing of what is there, and never "lost"); no close yet.
     expect(pw).toMatchObject({ rollback: "lost-and-blocked", canClose: false, causes: [{ kind: "could-not-look", path: rel }] });
+    // R533 (1): what could not be read is the place, not the kept copy.
+    expect(pw!.causes![0]!.copyUnread).toBeUndefined();
     expect(pw!.causes!.map((c) => ROLLBACK_CAUSE_TEXT[c.kind](c.path))).toEqual([
       `The app could not read ${rel}, so it left it as it is. Make sure the file can be read, then choose “Roll it back”.`,
     ]);
@@ -547,7 +549,12 @@ describe("R532 M1: where a look fails, the words never say what the app does not
       "An interrupted change in P could not be undone completely: the app could not read a file. Changes to P are off until it is undone. Choose “Resolve…” to see which file.",
     );
     const [pw] = await repo.pendingWrites();
-    expect(pw).toMatchObject({ rollback: "could-not-read", canClose: false, causes: [{ kind: "could-not-look", path: rel }] });
+    // R533 (1): the cause says that what could not be read is the kept copy, and the list's line says so.
+    expect(pw!.causes).toEqual([{ kind: "could-not-look", path: rel, copyUnread: true }]);
+    expect(pw).toMatchObject({ rollback: "could-not-read", canClose: false });
+    expect(COULD_NOT_READ_KEPT_COPY_TEXT(rel)).toBe(
+      `The app could not read the copy it kept of the file this change removed from ${rel}, so it left ${rel} as it is. Make sure the library's work folder can be read, then choose “Roll it back”.`,
+    );
     // Left as it is while the app cannot tell: the change's own file stays at the place, the copy in the work folder.
     expect(await readFile(fromRel(lib.root, rel), "utf8")).toBe("the change's own file\n");
     expect(await readFile(fromRel(lib.root, copy), "utf8")).toBe(ORIGINAL);

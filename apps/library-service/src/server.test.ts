@@ -3037,6 +3037,27 @@ describe("FR-736: an interrupted change whose undo is not complete, as the servi
     expect(Object.keys(w)).not.toContain("causes");
   });
 
+  it("R533 (1): could-not-look carries whether what could not be read is the kept copy or the place", async () => {
+    const { path, txn, rel } = await lostOriginal();
+    const copy = `.tmp/trash-${txn}-0`;
+    await writeFile(join(path, copy), "the original\n");
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    repoSeams.failLook = copy;
+    try {
+      expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+      const list = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;
+      expect(list).toEqual([expect.objectContaining({ txn, rollback: "could-not-read", causes: [{ kind: "could-not-look", path: rel, copyUnread: true }] })]);
+      await rm(join(path, copy));
+      expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+      repoSeams.failLook = rel;
+      expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+      const again = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<Record<string, unknown>>;
+      expect(again).toEqual([expect.objectContaining({ txn, causes: [{ kind: "could-not-look", path: rel }] })]);
+    } finally {
+      repoSeams.failLook = undefined;
+    }
+  });
+
   it("R527: something stands at the place: the list's cause says so, and the warning's state is unconfirmed (never lost)", async () => {
     const { path, txn, rel } = await lostOriginal();
     await writeFile(join(path, rel), "a file at the place\n");

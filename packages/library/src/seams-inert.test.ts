@@ -124,7 +124,7 @@ describe("R526 M5: the roll-back's look seams are inert outside NODE_ENV=test", 
     await rename(fromRel(root, R), fromRel(root, to));
     const entries = [{ kind: "trashed" as const, from: R, to }];
     seams.failLook = to;
-    expect(await under("test", () => undoEntries(root, entries))).toEqual({ ok: false, causes: [{ kind: "could-not-look", path: R }] });
+    expect(await under("test", () => undoEntries(root, entries))).toEqual({ ok: false, causes: [{ kind: "could-not-look", path: R, copyUnread: true }] });
     expect(await readFile(fromRel(root, to), "utf8")).toBe("the original\n");
     expect(await under("production", () => undoEntries(root, entries))).toEqual({ ok: true, causes: [] });
     expect(await readFile(fromRel(root, R), "utf8")).toBe("the original\n");

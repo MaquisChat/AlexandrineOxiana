@@ -321,6 +321,11 @@ export interface UndoCause {
    * place as one the app could not read, and says nothing of what is there.
    */
   copyGone?: true;
+  /**
+   * `could-not-look` only (R533 (1)): what could not be read is the copy the app kept of the file the change removed from
+   * the place (not the place itself); the list says so, and sends the researcher to the library's work folder.
+   */
+  copyUnread?: true;
 }
 /** `ok`: every step undone (or already undone); `causes`: what kept a path from being undone, when known. */
 export interface UndoResult {
@@ -464,10 +469,16 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
   let ok = true;
   const causes: UndoCause[] = [];
   let stepFailed = false;
-  const because = (kind: UndoCauseKind, path: string, somethingThere = false, copyGone = false) => {
+  const because = (kind: UndoCauseKind, path: string, somethingThere = false, copyGone = false, copyUnread = false) => {
     ok = false;
     if (!causes.some((c) => c.kind === kind && c.path === path)) {
-      causes.push({ kind, path, ...(somethingThere ? { somethingThere: true as const } : {}), ...(copyGone ? { copyGone: true as const } : {}) });
+      causes.push({
+        kind,
+        path,
+        ...(somethingThere ? { somethingThere: true as const } : {}),
+        ...(copyGone ? { copyGone: true as const } : {}),
+        ...(copyUnread ? { copyUnread: true as const } : {}),
+      });
     }
   };
   const done = new Set<number>();
@@ -486,7 +497,7 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       // Not known whether it was put back: nothing at that path is undone again, and the roll-back is not complete.
       putBack = true;
       copyUnread = true;
-      because("could-not-look", e.from);
+      because("could-not-look", e.from, false, false, true);
     }
     if (!putBack) continue;
     const earlier = trashedContent(entries, i);
