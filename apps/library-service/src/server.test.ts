@@ -3076,6 +3076,39 @@ describe("FR-736: an interrupted change whose undo is not complete, as the servi
   });
 });
 
+describe("FR-729: recovery's warnings, kept with the library until dismissed, as the service says them", () => {
+  beforeEach(() => start());
+
+  it("a change undone at the opening: its warning carries its id, is said again after a close and reopen, and once dismissed is gone for good", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const folder = (await call({ url: "/projects" })).json.projects[0].folder as string;
+    const txn = "019a7000-0000-7000-8000-0000000000e1";
+    const auditLines = (await readFile(join(path, folder, "audit", "0001.jsonl"), "utf8")).trim().split("\n").length;
+    await mkdir(join(path, ".tmp"), { recursive: true });
+    await writeFile(join(path, ".tmp", `txn-${txn}.json`), JSON.stringify({ formatVersion: 1, txn, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: auditLines, entries: [{ kind: "created", path: `${folder}/half.txt` }] }));
+    await writeFile(join(path, folder, "half.txt"), "half");
+    const reopen = async () => {
+      expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+      expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    };
+    const keptOf = async () => ((await call({ url: "/libraries/integrity" })).json.integrityWarnings as Array<Record<string, unknown>>).filter((w) => w.keptId !== undefined);
+    await reopen();
+    const [w] = await keptOf();
+    expect(w).toMatchObject({ projectId: pid, project: "Study", kind: "rolled-back-incomplete-write", keptId: expect.any(String) });
+    await reopen();
+    // The same warning (its detail, which no screen shows, says it was kept from an earlier opening).
+    expect(await keptOf()).toEqual([{ ...w, detail: expect.any(String) }]);
+    expect((await call({ method: "POST", url: `/libraries/recovery-warnings/019a7000-0000-7000-8000-0000000000ff/dismiss` })).status).toBe(404);
+    const gone = await call({ method: "POST", url: `/libraries/recovery-warnings/${w!.keptId as string}/dismiss` });
+    expect([gone.status, gone.json]).toEqual([200, { dismissed: true }]);
+    expect(await keptOf()).toEqual([]);
+    await reopen();
+    expect(await keptOf()).toEqual([]);
+  });
+});
+
 describe("Task 46b D2 (R137): a library row's needsReview means an item waits in the import review queue", () => {
   beforeEach(() => start());
 

@@ -34,7 +34,17 @@ export type BannerVariant =
    * it (R409 d). `count`: how many warnings of this kind in this project the banner stands for (R484 f). `state`: an
    * interrupted change whose undo is not complete, by its state (FR-736): its sentence, and "Resolve…".
    */
-  | { kind: "warning"; warning: string; project: string; detail?: string; oldCopies?: { text: string; places: string[] }; count?: number; state?: IncompleteRollback }
+  | {
+      kind: "warning";
+      warning: string;
+      project: string;
+      detail?: string;
+      oldCopies?: { text: string; places: string[] };
+      count?: number;
+      state?: IncompleteRollback;
+      /** FR-729: kept with the library until dismissed ("Dismiss"). */
+      keptId?: string;
+    }
   /** This computer's own notice (Task 68, R154, R178): fixed words by kind; goes by "Got it". */
   | { kind: "notice"; notice: DeviceNoticeKind };
 
@@ -112,6 +122,9 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   // R509: an interrupted change closed as it was, by the researcher's choice; the path is in the audit log only (R503 d).
   "interrupted-change-closed": (p) =>
     `An interrupted change in ${p} was closed as it was. A file it had removed could not be put back, because the copy the app kept of it was gone: that file is lost. The closing is recorded in the audit log of ${p}.`,
+  // FR-729: the record of recovery's warnings kept until dismissed could not be read (set aside when writable).
+  "recovery-warnings-set-aside": () =>
+    "The library's record of earlier warnings about interrupted changes could not be read, so some of those warnings may not be shown again. The damaged record is kept in the library's work folder.",
   "destroy-incomplete": (p) =>
     `A destruction of raw data in ${p} did not finish: some files could not be overwritten yet. They are kept out of the project and overwriting is tried again each time the library opens.`,
   "protocol-manifest-unreadable": (p) => `The sealed list of protocol document names in ${p} could not be read. The documents themselves are unchanged; check the verification report.`,
@@ -245,7 +258,18 @@ export function DeviceNoticeBanners({ notices, onDismiss, error }: { notices: Li
  */
 export const RESOLVABLE_WARNINGS: ReadonlySet<string> = new Set(["incomplete-write-pending", "invalid-txn-marker", "txn-recovery-skipped-audit-unverifiable", "source-change-unfinished"]);
 
-export function StatusBanner({ variant, onResolve, onDismiss }: { variant: BannerVariant; onResolve?: () => void; onDismiss?: (notice: DeviceNoticeKind) => void }) {
+export function StatusBanner({
+  variant,
+  onResolve,
+  onDismiss,
+  onDismissWarning,
+}: {
+  variant: BannerVariant;
+  onResolve?: () => void;
+  onDismiss?: (notice: DeviceNoticeKind) => void;
+  /** FR-729: dismisses a warning kept with the library; not given in a read-only library, which writes nothing. */
+  onDismissWarning?: (keptId: string) => void;
+}) {
   const resolvable = !!onResolve && variant.kind === "warning" && (RESOLVABLE_WARNINGS.has(variant.warning) || (variant.state !== undefined && ROLLBACK_KINDS.has(variant.warning)));
   // Project names and service details are user text, shown with dir=auto; in a warning only the project's name (FR-158).
   return (
@@ -281,6 +305,14 @@ export function StatusBanner({ variant, onResolve, onDismiss }: { variant: Banne
           {" "}
           <button type="button" className="ao-small" aria-label={`Resolve the interrupted change in ${variant.project}…`} onClick={onResolve}>
             Resolve…
+          </button>
+        </>
+      )}
+      {variant.kind === "warning" && variant.keptId !== undefined && onDismissWarning && (
+        <>
+          {" "}
+          <button type="button" className="ao-small" aria-label={`Dismiss this warning about ${variant.project}`} onClick={() => onDismissWarning(variant.keptId!)}>
+            Dismiss
           </button>
         </>
       )}
@@ -332,7 +364,7 @@ export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyR
   const grouped = new Map<string, { count: number }>();
   for (const w of state.integrityWarnings ?? ([] as IntegrityWarning[])) {
     if (!PER_PROJECT.has(w.kind)) {
-      out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail, ...(w.state ? { state: w.state } : {}) });
+      out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail, ...(w.state ? { state: w.state } : {}), ...(w.keptId ? { keptId: w.keptId } : {}) });
       continue;
     }
     const key = JSON.stringify([w.projectId, w.kind]);

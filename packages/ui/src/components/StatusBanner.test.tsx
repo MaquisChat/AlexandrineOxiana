@@ -174,7 +174,7 @@ describe("StatusBanner", () => {
       "recovery-code-unshown", "recovery-staging-discarded", "recovery-staging-unverifiable",
       "audit-unrecorded", "permissions-not-set", "audit-recorded-late", "refusal-unrecorded",
       "audit-unrecorded-blocked", "attention-unreadable", "audit-waiting",
-      "source-change-unfinished", "source-change-unfinished-read-only", "interrupted-change-closed",
+      "source-change-unfinished", "source-change-unfinished-read-only", "interrupted-change-closed", "recovery-warnings-set-aside",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();
@@ -283,6 +283,27 @@ describe("FR-736: an interrupted change whose undo is not complete says the stat
     render(<StatusBanner variant={b!} onResolve={onResolve} />);
     await userEvent.click(screen.getByRole("button", { name: "Resolve the interrupted change in P…" }));
     expect(onResolve).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("FR-729: a warning kept with the library until dismissed", () => {
+  const warning = { projectId: "p1", project: "Dissertation <b>2</b>", kind: "rolled-back-incomplete-write", detail: "x", keptId: "019a7000-0000-7000-8000-0000000000k1" };
+  it("offers \"Dismiss\", named for its project, which asks once for its id", async () => {
+    const [b] = bannersFor({ integrityWarnings: [warning] });
+    const onDismissWarning = vi.fn();
+    render(<StatusBanner variant={b!} onDismissWarning={onDismissWarning} />);
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss this warning about Dissertation <b>2</b>" }));
+    expect(onDismissWarning).toHaveBeenCalledWith(warning.keptId);
+    expect(screen.getByRole("status").querySelector("b")).toBeNull();
+  });
+  it("offers nothing to dismiss where the screen gives no way to (a read-only library), nor for a warning not kept", () => {
+    const [b] = bannersFor({ integrityWarnings: [warning] });
+    const { unmount } = render(<StatusBanner variant={b!} />);
+    expect(screen.queryByRole("button")).toBeNull();
+    unmount();
+    const [c] = bannersFor({ integrityWarnings: [{ ...warning, keptId: undefined }] });
+    render(<StatusBanner variant={c!} onDismissWarning={() => undefined} />);
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });
 

@@ -828,12 +828,13 @@ describe("crash recovery (write-ahead marker)", () => {
     expect(await markers()).toHaveLength(1);
 
     const again = await repoFor();
-    expect(again.integrityWarnings).toEqual([{ projectId: pid, kind: "rolled-back-incomplete-write", detail: expect.any(String) }]);
+    // FR-729: the warning is kept with the library until dismissed (its id), its record the only thing left in .tmp.
+    expect(again.integrityWarnings).toEqual([{ projectId: pid, kind: "rolled-back-incomplete-write", detail: expect.any(String), keptId: expect.any(String) }]);
     expect(await readdir(join(dir, "Sources"))).toEqual([]);
     expect(again.listSourceIds(pid)).toEqual([]);
     expect(await readFile(join(dir, "changes/2026-11.jsonl"), "utf8")).toBe(changesBefore);
     expect(await auditEvents(dir)).toEqual(auditBefore);
-    expect(await readdir(join(lib.root, ".tmp"))).toEqual([]);
+    expect(await readdir(join(lib.root, ".tmp"))).toEqual(["recovery-warnings.json"]);
   });
 
   it("truncates a partially appended audit (between the capture and store events)", async () => {
@@ -923,10 +924,11 @@ describe("crash recovery (write-ahead marker)", () => {
     await expect(r2.deleteSource(pid, sf.source.id)).rejects.toBeInstanceOf(SimulatedCrash);
     expect(await readdir(join(dir, "Sources"))).toEqual([]);
     const r3 = await repoFor();
-    expect(r3.integrityWarnings.map((w) => w.kind)).toEqual(["rolled-back-incomplete-write"]);
+    // FR-729: the first opening's warning is kept until dismissed, beside this opening's.
+    expect(r3.integrityWarnings.map((w) => w.kind)).toEqual(["rolled-back-incomplete-write", "rolled-back-incomplete-write"]);
     expect(await readFile(jsonPath, "utf8")).toBe(before);
     expect((await r3.getSource(pid, sf.source.id)).source.id).toBe(sf.source.id);
-    expect(await readdir(join(lib.root, ".tmp"))).toEqual([]);
+    expect(await readdir(join(lib.root, ".tmp"))).toEqual(["recovery-warnings.json"]);
   });
 
   it("keeps a committed change whose marker was not yet deleted", async () => {
@@ -1060,7 +1062,8 @@ describe("recovery safety (fix round 2)", () => {
     const again = await repoFor();
     expect(kinds(again)).toEqual(["rolled-back-incomplete-write"]);
     expect(await readdir(join(dir, "Sources"))).toEqual([]);
-    expect(await tmpNames()).toEqual([]);
+    // FR-729: only the record of the warning kept until dismissed is left in .tmp.
+    expect(await tmpNames()).toEqual(["recovery-warnings.json"]);
     await expect(again.createCollection(pid, "x")).resolves.toBeDefined();
   });
 

@@ -112,6 +112,8 @@ export interface IntegrityWarning {
   detail: string;
   /** FR-736: an undo that is not complete, by its state (chooses the banner's sentence). */
   state?: IncompleteRollback;
+  /** FR-729: kept with the library until dismissed: its id there. */
+  keptId?: string;
 }
 
 /** The `library.state` event (LibraryState.libraryState in the service). */
@@ -354,6 +356,8 @@ export function libraryApi(client: ApiClient) {
     libraries: {
       list: () => r<LibraryList>("GET", "/libraries"),
       /** The researcher's "Got it" for a device-level notice (Task 68): POST /settings/notices/dismiss. */
+      /** FR-729: dismisses, for good, a warning kept with the library. */
+      dismissWarning: (id: string) => r<{ dismissed: true }>("POST", `/libraries/recovery-warnings/${seg(id)}/dismiss`),
       dismissNotice: (kind: DeviceNoticeKind) => r<{ notices: DeviceNotice[] }>("POST", "/settings/notices/dismiss", { body: { kind } satisfies DeviceNoticeDismissRequest }),
       open: (path: string) => r<CurrentLibrary>("POST", "/libraries/open", { body: { path } }),
       create: (path: string, name: string) => r<CurrentLibrary>("POST", "/libraries", { body: { path, name } }),

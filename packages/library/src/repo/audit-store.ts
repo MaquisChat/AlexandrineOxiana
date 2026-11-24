@@ -60,6 +60,8 @@ export interface IntegrityWarning {
     | "destroy-incomplete"
     /** R509: the researcher closed an interrupted change whose undo could never complete; what it removed is lost. */
     | "interrupted-change-closed"
+    /** FR-729: the record of recovery's warnings kept until dismissed could not be read; set aside when writable. */
+    | "recovery-warnings-set-aside"
     /** A staged recovery-code key file that is not the committed one was removed, not activated (R148). */
     | "recovery-staging-discarded"
     /** A staged recovery-code key file was left in place, not activated: the audit log does not verify (R148). */
@@ -76,6 +78,8 @@ export interface IntegrityWarning {
    * choice to roll back): its state, which chooses the words the researcher is told. Absent: the undo was complete.
    */
   rollback?: IncompleteRollback;
+  /** FR-729: kept with the library until the researcher dismisses it (`dismissRecoveryWarning`); its id there. */
+  keptId?: string;
 }
 
 /** Segment file names in `dir`, oldest first (empty when the folder is missing). */

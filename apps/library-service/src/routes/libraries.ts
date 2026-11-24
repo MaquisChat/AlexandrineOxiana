@@ -479,6 +479,16 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     return r;
   });
 
+  // FR-729: a warning recovery raised, kept with the library until the researcher dismisses it; dismissed for good. Not
+  // in a read-only library (it writes nothing there).
+  app.post("/libraries/recovery-warnings/:id/dismiss", async (req) => {
+    const s = state.requireWritable();
+    const id = (req.params as { id?: string }).id ?? "";
+    await s.repo.dismissRecoveryWarning(id);
+    state.publishState();
+    return { dismissed: true };
+  });
+
   app.post("/libraries/relink", async (req) => {
     const s = state.requireWritable();
     const searchDir = absPath(bodyOf(req), "searchDir");

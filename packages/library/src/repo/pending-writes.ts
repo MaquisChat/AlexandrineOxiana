@@ -30,6 +30,7 @@ import { AuditStore, auditSegments, checkAnchor, type Head } from "./audit-store
 import { assertContained, exists, incompleteTail, readMaybe, truncateDurable } from "./io.js";
 import { NotFoundError, PendingWriteChoiceError, PendingWriteIncompleteError, PolicyDeniedError } from "./errors.js";
 import { appendLibraryAudit } from "./library-audit.js";
+import { keepWarning } from "./kept-warnings.js";
 import { scanIncompleteLines } from "./incomplete-lines.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
 import { loadProjectFolder, type ProjectState, type RepoCore } from "./state.js";
@@ -391,7 +392,7 @@ export async function closePendingWrite(core: RepoCore, txn: string, projectId: 
     await removeMarker(core.root, m);
     await afterResolved(core, st, txn, held);
     // What was lost is said until the researcher dismisses it (FR-729); no path here (R503 d: the audit log names it).
-    if (notPutBack.length) core.integrityWarnings.push({ projectId: st.project.id, kind: "interrupted-change-closed", detail: `an interrupted change was closed as it was; ${notPutBack.length} file(s) it removed could not be put back (transaction ${txn})` });
+    if (notPutBack.length) await keepWarning(core, { projectId: st.project.id, kind: "interrupted-change-closed", detail: "an interrupted change was closed as it was; a file it had removed could not be put back" });
     return { txn, projectId: st.project.id };
   });
 }

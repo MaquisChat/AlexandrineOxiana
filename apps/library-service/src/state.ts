@@ -1699,7 +1699,7 @@ export class ServiceState {
   integrityWarnings(
     s: Session,
     names = new Map(s.repo.listProjects().map((p) => [p.id, p.name])),
-  ): Array<{ projectId: string; project: string; kind: string; detail: string; state?: IncompleteRollback }> {
+  ): Array<{ projectId: string; project: string; kind: string; detail: string; state?: IncompleteRollback; keptId?: string }> {
     return [
       ...s.repo.integrityWarnings.map((w) => ({
         projectId: w.projectId,
@@ -1708,6 +1708,8 @@ export class ServiceState {
         detail: scrubPaths(w.detail, this.roots),
         // FR-736: an undo not complete says its state (never its paths here: those are for the list only, R503 d).
         ...(w.rollback ? { state: w.rollback } : {}),
+        // FR-729: kept with the library until dismissed (POST /libraries/recovery-warnings/:id/dismiss).
+        ...(w.keptId ? { keptId: w.keptId } : {}),
       })),
       ...(s.sessionWarnings ?? []).map((w) => ({ projectId: "*", project: "library", kind: w.kind, detail: scrubPaths(w.detail, this.roots) })),
     ];

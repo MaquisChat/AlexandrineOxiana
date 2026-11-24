@@ -94,6 +94,7 @@ import { loadPseudonyms, participantCodeOf } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "./errors.js";
+import { dismissKeptWarning, keepRecoveryWarnings } from "./kept-warnings.js";
 import { closePendingWrite, completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { inspectMarkers, isOrphanBackup, markerPaths, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import {
@@ -421,6 +422,10 @@ export class Repo {
   closePendingWrite(txn: string, projectId: string): Promise<{ txn: string; projectId: string }> {
     return closePendingWrite(this.core, txn, projectId);
   }
+  /** FR-729: dismisses, for good, a warning kept with the library (its `keptId`). Writable libraries only. */
+  dismissRecoveryWarning(id: string): Promise<void> {
+    return dismissKeptWarning(this.core, id);
+  }
   listWorkspaceTags(): Promise<Tag[]> {
     return workspaceTags(this.core);
   }
@@ -675,6 +680,8 @@ export async function openRepoInternal(
       }
     }
     await sweep(core);
+    // FR-729: what recovery did is said until dismissed, at this opening and every later one.
+    await keepRecoveryWarnings(core, true, core.integrityWarnings.slice());
   } else {
     const markers = await pendingMarkers(core.root);
     // Not acted on here (no writes): the changes they name stay half done until a writable open (R473 I1).
@@ -688,6 +695,8 @@ export async function openRepoInternal(
         detail: `${markers} interrupted change(s) will be finished or rolled back when the library is opened read-write`,
       });
     }
+    // FR-729: the warnings kept from earlier openings are shown; nothing is written here.
+    await keepRecoveryWarnings(core, false, []);
   }
   const isPending = (p: { id: string; rel: string }) => pendingIds.has(p.id) || pendingFolders.has(folderKey(p.rel) ?? "");
 
