@@ -87,8 +87,9 @@ export interface TxnMarker {
 const MARKER = /^txn-([0-9a-f-]+)\.json$/;
 const BACKUP = /^txn-([0-9a-f-]+)\.orig-\d+$/;
 
-/** R503 a: the programming error of a transaction asked to both append to a file and rewrite it. */
-export const MIXED_WRITE = "A change must not both append to a file and rewrite that same file (R503 a).";
+/** R503 a: the programming error of a transaction asked to both append to a file and rewrite it (its words name no ruling, R509). */
+export const MIXED_WRITE =
+  "A change must not both append to a file and rewrite that same file: if it were interrupted, it could not always be undone. Cut a torn last line in a change of its own, then append in the next.";
 
 export const toRel = (root: string, abs: string): string => relative(root, abs).split(sep).join("/");
 export const fromRel = (root: string, rel: string): string => join(root, ...rel.split("/"));

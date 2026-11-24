@@ -277,6 +277,7 @@ export async function recordWatchedFiles(core: RepoCore, projectId: string, watc
   const lines = entries.map(clean);
   try {
     await mendTail(core, projectId, watchId);
+    if (process.env.NODE_ENV === "test") registerMendSeams.afterMend?.();
     await write(core, projectId, watchId, lines);
   } catch (err) {
     // A file-system error's message names the file: never passed on (R96, review I4).
@@ -325,6 +326,12 @@ function endsTornSync(abs: string): boolean {
 }
 
 class NothingToMend extends Error {}
+
+/**
+ * Test-only seam (honoured only under NODE_ENV=test, R47): runs after a torn last line was cut by its own committed
+ * change and before the change that appends begins (R503 a), so that a test can crash the second change.
+ */
+export const registerMendSeams: { afterMend?: () => void } = {};
 
 /**
  * A last line torn by an unclean stop (not by this app's own writes, which the marker takes back) is cut by ONE governed

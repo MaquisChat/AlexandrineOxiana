@@ -343,7 +343,11 @@ describe("R503 a: a change that would both append to a file and rewrite it is re
         );
       expect(failed).toBe(refused);
       expect(refused).toBeInstanceOf(Error);
-      expect((refused as Error).message).toBe("A change must not both append to a file and rewrite that same file (R503 a).");
+      // A developer's error in plain words: what is wrong and why, naming no ruling (R509 M4).
+      expect((refused as Error).message).toBe(
+        "A change must not both append to a file and rewrite that same file: if it were interrupted, it could not always be undone. Cut a torn last line in a change of its own, then append in the next.",
+      );
+      expect((refused as Error).message).not.toMatch(/\bR\d+/u);
       expect((await bytesAt(w, rel))?.toString()).toBe(ORIGINAL);
       expect(await markerNames(w)).toEqual([]);
     });
