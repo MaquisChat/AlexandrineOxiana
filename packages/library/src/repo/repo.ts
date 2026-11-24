@@ -95,7 +95,7 @@ import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError } from "./errors.js";
 import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
-import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
+import { inspectMarkers, isOrphanBackup, markerPaths, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import {
   adoptRestoredProject as adoptRestoredIn,
   authorizeRestoreIn,
@@ -619,6 +619,9 @@ export async function openRepoInternal(
   const pendingFolders = new Set<string>();
   /** A marker is unresolved and cannot be tied to a project: no file of any project is trimmed. */
   let unattributed = false;
+  /** The paths each project's unresolved (readable) markers name: half changed until resolved (R473 I1). */
+  const unfinished = new Map<string, string[]>();
+  const noteUnfinished = (projectId: string, paths: readonly string[]) => unfinished.set(projectId, [...(unfinished.get(projectId) ?? []), ...paths]);
   if (writable) {
     // Choices the researcher recorded but a crash or failed audit append left unfinished are
     // completed and audited first (R131 c); recovery never acts on a recorded choice itself.
@@ -631,6 +634,17 @@ export async function openRepoInternal(
         if (r.projectId !== "*") pendingIds.add(r.projectId);
         if (folder !== null) pendingFolders.add(folder);
         if (r.projectId === "*" || folder === null) unattributed = true;
+        if (r.paths) noteUnfinished(r.projectId, r.paths);
+      }
+      // Files the roll-back found changed outside the app meanwhile: put back all the same, and said (R473 I1 3). An
+      // annotations file too gets this kind (R484 b): the roll-back overwrote it, so it is not "shown as it is now".
+      for (const file of r.changedOutside ?? []) {
+        core.integrityWarnings.push({
+          projectId: r.projectId,
+          kind: "changed-outside-before-rollback",
+          detail: `A file was changed outside the app while an interrupted change waited to be undone; the state before that change was put back (transaction ${r.txn})`,
+          file,
+        });
       }
       const w = RECOVERY_WARNINGS[r.outcome];
       if (w) {
@@ -644,6 +658,10 @@ export async function openRepoInternal(
     await sweep(core);
   } else {
     const markers = await pendingMarkers(core.root);
+    // Not acted on here (no writes): the changes they name stay half done until a writable open (R473 I1).
+    for (const i of await inspectMarkers(core.root, (pid) => anchors[core.anchorKey(pid)]).catch(() => [])) {
+      if (i.marker && (i.status === "uncommitted" || i.status === "unverifiable")) noteUnfinished(i.projectId, markerPaths(i.marker));
+    }
     if (markers > 0) {
       core.integrityWarnings.push({
         projectId: "*",
@@ -681,6 +699,7 @@ export async function openRepoInternal(
     // is still incomplete blocks them too: nothing can be appended after it.
     const blocked = isPending({ id: st.project.id, rel: st.rel }) || (writable && lines.some((l) => !l.trimmed));
     if (blocked) st.recoveryPending = true;
+    if (unfinished.has(st.project.id)) st.unfinished = new Set(unfinished.get(st.project.id));
     const anchor = anchors[core.anchorKey(st.project.id)];
     const problem = checkAnchor(events, verify, anchor, core.device);
     const at = core.clock().toISOString();
@@ -1477,6 +1496,16 @@ export function withProjectQueue<T>(repo: Repo, projectId: string, fn: (ctx: Pro
   });
 }
 
+/**
+ * A way into the repository's write queue for a read that confirms what it found (FR-420, R469 b): `fn` runs in
+ * a turn of the queue, after any change in progress, so nothing is half written while it reads. Called from inside
+ * a turn, `fn` runs there and then (the queue is not re-entrant: a second turn would wait for the first forever).
+ */
+export function writeQueueTurn(repo: Repo): <T>(fn: () => Promise<T>) => Promise<T> {
+  const core = cores.get(repo)!;
+  return <T>(fn: () => Promise<T>) => (core.holdsTurn() ? fn() : core.serial(fn));
+}
+
 /** Package-internal (restore): a key in the repo's key ring, if unlocked. */
 export function keyFromRing(repo: Repo, keyId: string): Uint8Array | undefined {
   return cores.get(repo)!.keyRing.get(keyId);
@@ -1538,6 +1567,20 @@ export async function auditEventsMentioning(repo: Repo, projectId: string, needl
     if (endsAt(first.last, st.audit.head)) return { events: first.events, headMatches: true };
     const { events, last } = await AuditStore.readMatching(st.audit.dir, needles);
     return { events, headMatches: endsAt(last, st.audit.head) };
+  });
+}
+
+/**
+ * Package-internal (retention, FR-420): `fn` runs in a turn of the write queue, given the project's audit events whose
+ * line contains one of `needles`, read in that turn (nothing is appended meanwhile), so what `fn` reads from disk is
+ * taken together with them. A locked project is refused (ProjectLockedError) before anything is read.
+ */
+export function inTurnWithAuditEventsMentioning<T>(repo: Repo, projectId: string, needles: readonly string[], fn: (events: AuditEvent[]) => Promise<T>): Promise<T> {
+  const core = cores.get(repo)!;
+  return writeQueueTurn(repo)(async () => {
+    const st = core.state(projectId);
+    core.assertUnlocked(st);
+    return fn((await AuditStore.readMatching(st.audit.dir, needles)).events);
   });
 }
 

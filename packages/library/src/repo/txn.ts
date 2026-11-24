@@ -35,6 +35,7 @@
  * Paths in the marker are relative to the library root (`/` separators), so a
  * library moved between the crash and the next open still recovers.
  */
+import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { LibraryRelativePath, isId, newId, verifyChain, type AuditEvent } from "@ao/core";
@@ -45,9 +46,13 @@ import { shredPath } from "../fs/shred.js";
 import { assertContained, exists, undoAppend, type AppendUndo } from "./io.js";
 import { seams } from "./seams.js";
 
+/**
+ * `sha256` (created, replaced): of the bytes the change wrote there, when it wrote them itself (R473 I1 3): a
+ * roll-back that finds the file neither so nor as before the change records that it was changed outside the app.
+ */
 export type MarkerEntry =
-  | { kind: "created"; path: string }
-  | { kind: "replaced"; path: string; backup: string; mode: number }
+  | { kind: "created"; path: string; sha256?: string }
+  | { kind: "replaced"; path: string; backup: string; mode: number; sha256?: string }
   | { kind: "dir"; path: string }
   /** `shred`: destroyed, not deleted (R90 d): overwritten before it is removed once committed. */
   | { kind: "trashed"; from: string; to: string; shred?: boolean }
@@ -131,19 +136,19 @@ export class TxnLog {
     return this.newDirs.some((d) => rel.startsWith(`${d}/`));
   }
 
-  async created(abs: string) {
+  async created(abs: string, sha256?: string) {
     const rel = toRel(this.root, abs);
     // A file in a folder this transaction created needs no step of its own.
     if (this.inNewDir(rel)) return;
-    await this.add({ kind: "created", path: rel });
+    await this.add({ kind: "created", path: rel, ...(sha256 ? { sha256 } : {}) });
   }
 
   /** Copies the current file aside (same mode, so 0600 stays 0600), then records it. */
-  async replaced(abs: string, mode: number) {
+  async replaced(abs: string, mode: number, sha256?: string) {
     await fsp.mkdir(this.dir, { recursive: true });
     const backup = join(this.dir, `txn-${this.id}.orig-${this.backups++}`);
     await copyFileAtomic(abs, backup, { mode });
-    await this.add({ kind: "replaced", path: toRel(this.root, abs), backup: toRel(this.root, backup), mode });
+    await this.add({ kind: "replaced", path: toRel(this.root, abs), backup: toRel(this.root, backup), mode, ...(sha256 ? { sha256 } : {}) });
   }
 
   async createdDir(abs: string) {
@@ -197,10 +202,44 @@ export class TxnLog {
   }
 }
 
-/** Best effort: keeps going past failures, and reports whether every step succeeded. */
+/**
+ * Best effort: keeps going past failures, and reports whether every step succeeded. Repeatable (R493): a step already
+ * undone is never undone again. A "trashed" line whose trash copy is gone was put back by an earlier run of this
+ * roll-back (every step is recorded before it is taken, so a copy never made means the change stopped there, with no
+ * later line), and every later line of the marker at that path was undone before it: those lines are skipped, since
+ * undoing one again could only remove or overwrite the original put back.
+ */
 export async function undoEntries(root: string, entries: MarkerEntry[]): Promise<boolean> {
   let ok = true;
-  for (const e of [...entries].reverse()) {
+  const done = new Set<number>();
+  for (const [i, e] of entries.entries()) {
+    if (e.kind !== "trashed") continue;
+    let putBack: boolean;
+    try {
+      putBack = !(await exists(fromRel(root, e.to)));
+    } catch {
+      // Not known whether it was put back: nothing at that path is undone again, and the roll-back is not complete.
+      putBack = true;
+      ok = false;
+    }
+    if (!putBack) continue;
+    for (let j = i + 1; j < entries.length; j++) {
+      const x = entries[j]!;
+      if ((x.kind === "trashed" ? x.from : x.path) === e.from) done.add(j);
+    }
+  }
+  let steps = 0;
+  /** Test seam (R47): the roll-back is cut off here, as by a crash. */
+  const cut = (): boolean => {
+    if (process.env.NODE_ENV !== "test" || seams.stopUndoAfter !== steps) return false;
+    seams.stopUndoAfter = undefined;
+    return true;
+  };
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i]!;
+    if (cut()) return false;
+    steps++;
+    if (done.has(i)) continue;
     try {
       if (seams.failUndo === e.kind) throw new Error(`simulated undo failure (${e.kind})`);
       if (e.kind === "created") await fsp.rm(fromRel(root, e.path), { force: true });
@@ -210,7 +249,13 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
         if (await exists(backup)) await writeFileAtomic(fromRel(root, e.path), await fsp.readFile(backup), { mode: e.mode });
       } else if (e.kind === "trashed") {
         const to = fromRel(root, e.to);
-        if ((await exists(to)) && !(await exists(fromRel(root, e.from)))) await renameWithRetry(to, fromRel(root, e.from));
+        if (await exists(to)) {
+          // Steps after it are undone first, so something at the path now is not the change's (or a later undo
+          // failed): it is never overwritten, and the step is not done, so the marker, and with it the trash copy,
+          // is kept for the researcher to resolve (R491 C a; nothing overwritten, nothing deleted).
+          if (await exists(fromRel(root, e.from))) ok = false;
+          else await renameWithRetry(to, fromRel(root, e.from));
+        }
       } else {
         // Nothing to undo when the file is gone or is not a regular file (the append never happened).
         const path = fromRel(root, e.path);
@@ -221,6 +266,7 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       ok = false;
     }
   }
+  if (cut()) return false;
   return ok;
 }
 
@@ -268,9 +314,11 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
       case "created":
       case "dir":
         if (!under(en.path, pf)) return `${en.kind} path outside the project`;
+        if (en.sha256 !== undefined && (en.kind === "dir" || !isSha(en.sha256))) return "bad entry";
         break;
       case "replaced":
         if (!under(en.path, pf)) return "replaced path outside the project";
+        if (en.sha256 !== undefined && !isSha(en.sha256)) return "bad entry";
         if (!isBackupOf(en.backup, x.txn)) return "backup is not this transaction's copy in .tmp";
         if (!count(en.mode) || (en.mode as number) > 0o777) return "bad mode";
         break;
@@ -337,6 +385,10 @@ export type RecoveryOutcome =
 export interface RecoveryResult {
   /** The marker's project id, or "*" when the marker cannot be read. */
   projectId: string;
+  /** Not finished or rolled back: the paths the (readable) marker names, which stay half changed until it is (R473 I1). */
+  paths?: string[];
+  /** Rolled back: the files it found changed outside the app meanwhile (R473 I1 3), which it put back all the same. */
+  changedOutside?: string[];
   /** The marker's `projectFolder` as written, when it has one (it may be a different project's folder). */
   projectFolder?: string;
   txn: string;
@@ -537,6 +589,73 @@ export async function rollBackMarker(root: string, m: TxnMarker): Promise<boolea
   return true;
 }
 
+/** The library-relative paths a marker names (the files and folders its change touched). */
+export function markerPaths(m: Pick<TxnMarker, "entries">): string[] {
+  return m.entries.map((e) => (e.kind === "trashed" ? e.from : e.path));
+}
+
+const isSha = (x: unknown): boolean => typeof x === "string" && /^[0-9a-f]{64}$/u.test(x);
+const sha256File = async (abs: string): Promise<string | null> => {
+  try {
+    return createHash("sha256").update(await fsp.readFile(abs)).digest("hex");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT" || (err as NodeJS.ErrnoException).code === "ENOTDIR") return null;
+    throw err;
+  }
+};
+
+/**
+ * R473 I1 3, R484 a: the files a marker names that are, before it is rolled back, neither as they were before its
+ * change nor as the change itself left them: changed outside the app meanwhile. A path is judged as a whole, never
+ * line by line: against the state before its FIRST line (absent before a "created", the backup copy of a "replaced")
+ * and the bytes the change wrote there, its LAST write's above all; an earlier write of the change counts as its own
+ * too, since a roll-back cut off half-way (in the running app, or a crash during the reopen's) leaves one there. A
+ * trashed path whose trash copy is gone was put back by the app's own roll-back; one whose copy is still in the trash
+ * and that something not of the change fills is never listed: the roll-back leaves it and stays incomplete. Only what the marker
+ * can tell is judged: a path whose last write the change recorded no hash for (a copied file) is not. The roll-back
+ * puts the earlier state back all the same; the caller records these. Reads only.
+ */
+export async function changedSinceMarker(root: string, m: TxnMarker): Promise<string[]> {
+  /** Each path the change wrote or trashed, with the indices of its lines in order. */
+  const lines = new Map<string, number[]>();
+  m.entries.forEach((e, k) => {
+    const p = e.kind === "trashed" ? e.from : e.kind === "created" || e.kind === "replaced" ? e.path : null;
+    if (p !== null) lines.set(p, [...(lines.get(p) ?? []), k]);
+  });
+  const out: string[] = [];
+  for (const [p, ks] of lines) {
+    try {
+      const own = ks.map((k) => m.entries[k]!);
+      const trashes = own.filter((e): e is Extract<MarkerEntry, { kind: "trashed" }> => e.kind === "trashed");
+      let putBack = false;
+      for (const t of trashes) if (!(await exists(fromRel(root, t.to)))) putBack = true;
+      if (putBack) continue; // the app's own roll-back moved it back (R484 a)
+      const lastTrash = ks.filter((k) => m.entries[k]!.kind === "trashed").at(-1);
+      const writes = own.filter((e): e is Extract<MarkerEntry, { kind: "created" | "replaced" }> => e.kind === "created" || e.kind === "replaced");
+      const lastWrite = ks.filter((k) => m.entries[k]!.kind !== "trashed").at(-1);
+      if (lastTrash !== undefined) {
+        // Something there again is the change's own only when a later step of it wrote at or under that path.
+        const refilled = m.entries.slice(lastTrash + 1).some((x) => x.kind !== "trashed" && (x.path === p || x.path.startsWith(`${p}/`)));
+        // Not refilled by the change: something there now is not put back over (the roll-back stays incomplete, its
+        // marker and trash copy kept, R491 C a), so "the outside change was not kept" would be untrue: not listed here.
+        if (!refilled) continue;
+        if (lastWrite === undefined || lastWrite < lastTrash) continue; // refilled by a step that records no hash
+      }
+      if (!writes.at(-1)?.sha256) continue;
+      const now = await sha256File(fromRel(root, p));
+      if (now === null) continue; // absent: as before a "created", or in the trash; nothing is claimed
+      if (writes.some((w) => w.sha256 === now)) continue; // as the change wrote it
+      let before = false;
+      for (const w of writes) if (w.kind === "replaced" && now === (await sha256File(fromRel(root, w.backup)))) before = true;
+      if (before) continue; // as before the change (or a write of it a later line kept aside): put back already
+      out.push(p);
+    } catch {
+      // Unreadable now: the roll-back says what it can; nothing is claimed here.
+    }
+  }
+  return out;
+}
+
 /**
  * Finishes or rolls back every transaction marker left by a crash. Writable
  * libraries only. `anchorOf` returns the external audit anchor of a project.
@@ -556,7 +675,7 @@ export async function recoverTransactions(
     const m = i.marker!;
     if (m.resolve) {
       // The researcher's recorded choice is completed, and audited, by openRepo (R131 c); never silently here.
-      out.push({ ...where, outcome: "resolve-incomplete", detail: `the choice to ${m.resolve.choice === "keep" ? "keep" : "roll back"} it is recorded but could not be completed yet` });
+      out.push({ ...where, paths: markerPaths(m), outcome: "resolve-incomplete", detail: `the choice to ${m.resolve.choice === "keep" ? "keep" : "roll back"} it is recorded but could not be completed yet` });
       continue;
     }
     if (i.status === "committed") {
@@ -566,11 +685,13 @@ export async function recoverTransactions(
       continue;
     }
     if (i.status === "unverifiable") {
-      out.push({ ...where, outcome: "skipped-audit-unverifiable", ...(i.detail ? { detail: i.detail } : {}) });
+      out.push({ ...where, paths: markerPaths(m), outcome: "skipped-audit-unverifiable", ...(i.detail ? { detail: i.detail } : {}) });
       continue;
     }
-    if (await rollBackMarker(root, m)) out.push({ projectId: m.projectId, txn: m.txn, outcome: "rolled-back" });
-    else out.push({ ...where, outcome: "rollback-incomplete" });
+    const changedOutside = await changedSinceMarker(root, m);
+    const also = changedOutside.length ? { changedOutside } : {};
+    if (await rollBackMarker(root, m)) out.push({ projectId: m.projectId, txn: m.txn, outcome: "rolled-back", ...also });
+    else out.push({ ...where, paths: markerPaths(m), outcome: "rollback-incomplete", ...also });
   }
   return out;
 }

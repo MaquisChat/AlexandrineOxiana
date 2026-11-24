@@ -21,6 +21,7 @@ import {
   planMove,
   reconnect,
   relinkMissing,
+  ReadOnlyLibraryError,
   scrubPaths,
   type IntegritySample,
   type Library,
@@ -73,6 +74,10 @@ function absPath(o: Record<string, unknown>, key: string): string {
 /** A rebuild the researcher asked for, stopped because the library was closed or moved meanwhile (M4). */
 const stoppedByClose = () =>
   new ApiError(409, "CONFLICT", "The rebuild stopped because the library was closed or moved. Open the library and choose \"Rebuild library from folder\" again if it is still needed.");
+
+/** The integrity check, ended because the library was closed or moved while it confirmed its findings (R491 C b). */
+const checkStoppedByClose = () =>
+  new ApiError(409, "CONFLICT", "The check was stopped because the library was closed or moved. Open the library again and run the check again.");
 
 export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
@@ -394,7 +399,16 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       if (!(n > 0 && n <= 1)) throw badRequest('"sample" must be a fraction above 0 and at most 1, or "full".');
       sample = n;
     }
-    const report = await checkIntegrity(s.lib, sample, { keyRing: s.ring });
+    // A finding is read again in the write queue's turn: a change in progress is not reported (FR-420).
+    let report: Awaited<ReturnType<typeof checkIntegrity>>;
+    try {
+      report = await checkIntegrity(s.lib, sample, { keyRing: s.ring, confirm: state.writeQueueTurn(s) });
+    } catch (err) {
+      // Ended by a close or a move (its session is gone or replaced): said as such; a library that really is open
+      // read-only keeps its own answer (R491 C b).
+      if (err instanceof ReadOnlyLibraryError && state.session !== s) throw checkStoppedByClose();
+      throw err;
+    }
     const projectWarnings = await state.projectWarnings(s);
     return {
       report: { ...report, errors: report.errors.map((e) => ({ path: e.path, message: scrubPaths(e.message, state.roots) })) },

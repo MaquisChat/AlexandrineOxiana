@@ -1,7 +1,7 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_RW, LIBRARIES, libraryHandlers, server, serviceError, testClient, url, useMockService } from "../test/service";
 import { navigate } from "../navigation";
 import { LibraryRoutes, isLibraryPath } from "./library";
@@ -76,6 +76,47 @@ describe("library routes", () => {
     // ...and once it is open, the library is shown.
     phase = "open";
     expect(await screen.findByRole("navigation", { name: "Projects" }, { timeout: 5000 })).toBeTruthy();
+  });
+
+  it("FR-368: while the last library is still being opened, it asks again after 2, 4 and 8 seconds, then every 15, and stops when the screen goes", async () => {
+    let checks = 0;
+    server.use(
+      http.get(url("/libraries"), () => {
+        checks++;
+        return HttpResponse.json({ ...LIBRARIES, reopening: { libraryId: "lib-1", name: "Thesis library" } });
+      }),
+    );
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const wait = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+      // Lets the answers in flight arrive without moving the clock (vi.waitFor would move it).
+      const settle = async () => {
+        for (let i = 0; i < 20; i++) await wait(0);
+      };
+      const { unmount } = render(<LibraryRoutes client={testClient()} />);
+      await settle();
+      expect(screen.getByText(stillOpening(/Still opening Thesis library/))).toBeTruthy();
+      const base = checks; // the first look, and the chooser's own list of libraries
+      // The checks after it come at 2, 6, 14, 29 and 44 seconds (2, 4, 8, then every 15).
+      const at = [2_000, 6_000, 14_000, 29_000, 44_000];
+      let now = 0;
+      for (const [i, t] of at.entries()) {
+        await wait(t - now - 1);
+        expect(checks).toBe(base + i);
+        await wait(1);
+        await settle();
+        expect(checks).toBe(base + 1 + i);
+        now = t;
+      }
+      // The wording does not change.
+      expect(screen.getByText(stillOpening(/Still opening Thesis library, the library that was open last time/))).toBeTruthy();
+      // Once the screen goes, nothing more is asked.
+      unmount();
+      await wait(60_000);
+      expect(checks).toBe(base + at.length);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("I1: a library chosen while the last one is still being opened stays; a late answer of the check is dropped", async () => {
