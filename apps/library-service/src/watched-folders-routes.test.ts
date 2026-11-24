@@ -27,7 +27,7 @@ import { lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, symlink, t
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { WATCH_REASONS, createLibrary, deviceDeps, type Deps, type FolderWatch, type LocationEnv, type WatchRegisterEntry, type WatchStatus } from "@ao/library";
 import type { WatchedFolderSummary } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
@@ -813,6 +813,8 @@ describe("files and origins", () => {
     const repo = svc!.state.session!.repo;
     let letGo!: () => void;
     const held = new Promise<void>((r) => (letGo = r));
+    // Released whatever the test's end, so a failure here is reported where it happened and the service can close (R499 M2).
+    onTestFinished(() => letGo());
     const record = repo.recordWatchedFiles.bind(repo);
     vi.spyOn(repo, "recordWatchedFiles").mockImplementation(async (...a) => {
       await held;
@@ -870,6 +872,8 @@ describe("files and origins", () => {
     const repo = svc!.state.session!.repo;
     let letGo!: () => void;
     const held = new Promise<void>((r) => (letGo = r));
+    // Released whatever the test's end, so a failure here is reported where it happened and the service can close (R499 M2).
+    onTestFinished(() => letGo());
     const record = repo.recordWatchedFiles.bind(repo);
     vi.spyOn(repo, "recordWatchedFiles").mockImplementation(async (...a) => {
       await held;
