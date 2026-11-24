@@ -94,6 +94,35 @@ def test_the_pin_check_fails_the_build_and_says_which_package(tmp_path, capsys):
     assert "every package in the bundle (1) is pinned by constraints-macos-arm64.txt at the version installed" in capsys.readouterr().out
 
 
+def run_main_pins_complete(tmp_path, monkeypatch, constraints_text: str) -> int:
+    """manifest.main() with --pins-complete on a one-package bundle (packaging, as this venv has it);
+    the licence folder and the native libraries are stubbed: only the checks and the exit code count."""
+    bundle = make_bundle(tmp_path / "bundle", dists=["packaging"])
+    monkeypatch.setattr(manifest, "runtime_dists", lambda: ["ao-worker", "packaging"])
+    monkeypatch.setattr(manifest, "write_licence_folder", lambda b, dists, libs: b / "licenses")
+    monkeypatch.setattr(manifest, "native_libraries", lambda b, dists: [])
+    monkeypatch.setattr(manifest.metadata, "version", lambda name: "0.0-test")
+    c = tmp_path / "constraints-macos-arm64.txt"
+    c.write_text(constraints_text)
+    monkeypatch.setattr(sys, "argv", ["manifest.py", "--bundle", str(bundle), "--target", "t", "--pin-set", "macos-arm64",
+                                      "--constraints", str(c), "--pins-complete", "--out", str(tmp_path / "m.json")])
+    return manifest.main()
+
+
+def test_main_with_pins_complete_fails_the_build_when_the_bundle_differs_from_the_constraints(tmp_path, monkeypatch, capsys):
+    from importlib import metadata as md
+    installed = md.distribution("packaging").version
+    # (a) the file misses the bundle's one package
+    assert run_main_pins_complete(tmp_path / "a", monkeypatch, "rawpy==0.28.0\n") != 0
+    assert f"packaging {installed} is in the bundle, but the constraints file does not name it" in capsys.readouterr().err
+    # (b) the file names it at another version
+    assert run_main_pins_complete(tmp_path / "b", monkeypatch, f"packaging=={installed}.post9\n") != 0
+    assert f"pins it at {installed}.post9" in capsys.readouterr().err
+    # (c) complete and matching
+    assert run_main_pins_complete(tmp_path / "c", monkeypatch, f"packaging=={installed}\n") == 0
+    assert "every package in the bundle (1) is pinned by constraints-macos-arm64.txt" in capsys.readouterr().out
+
+
 def test_pins_complete_needs_a_constraints_file(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["manifest.py", "--bundle", str(tmp_path), "--target", "t", "--pin-set", "p",
                                       "--out", str(tmp_path / "m.json"), "--pins-complete"])
