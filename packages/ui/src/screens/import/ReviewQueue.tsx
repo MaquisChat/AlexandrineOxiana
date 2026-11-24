@@ -945,21 +945,23 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
    */
   const lookGone = !!lookAt && (!!laid?.ended[lookAt.item.id] || (items !== null && !waitingIds.has(lookAt.item.id)));
   /**
-   * The look closed (its button or Escape). The file still waiting: focus back on its "Look at the file" (the dialog's
-   * own restore does the same, unless the queue was read again meanwhile and the control is a new one). The file gone:
-   * where the queue puts focus after that card's decision — the next waiting file's heading, else that card's heading —
-   * never the inert stand-in that took the control's place (R319).
+   * The look closed (its button or Escape). R492 c: while the card still waits — also after a "not found" in the look (the
+   * held file gone from disk; nothing reads the queue again on it), its controls are still there — focus goes back on its
+   * "Look at the file" (the dialog's own restore does the same, unless the queue was read again meanwhile and the control
+   * is a new one). The card ended (decided, or no longer listed by the queue as last read): where the queue puts focus
+   * after that card's decision — the next waiting file's heading, else that card's heading — never the inert stand-in
+   * that took the control's place (R319).
    */
-  const closeLook = (gone: boolean) => {
+  const closeLook = () => {
     const at = lookAt;
     setLookAt(null);
     if (!at) return;
-    if (!gone) {
+    const ended = laidRef.current?.ended ?? {};
+    if (!ended[at.item.id] && (!itemsRef.current || itemsRef.current.some((x) => x.id === at.item.id))) {
       setFileFocus({ to: `${LOOK_BACK}${at.item.id}` });
       return;
     }
     const listed = itemsRef.current ? new Set(itemsRef.current.map((x) => x.id)) : undefined;
-    const ended = laidRef.current?.ended ?? {};
     const next = nextWaiting(at.item, (x) => x.id !== at.item.id && (!listed || listed.has(x.id)) && !ended[x.id]);
     setFileFocus({ to: next ? next.id : at.item.id });
   };
@@ -1691,7 +1693,7 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
  * says LOOK_GONE instead, said once: focus moves to it (as the reader moves focus to a changed state's heading; no live
  * region), and Shift+Tab from it is kept inside as from the heading. `onClose` is told whether the file had gone.
  */
-function LookDialog({ title, projectId, sourceId, lookFor, reviewId, gone, onClose }: { title: string; projectId: string; sourceId: string; lookFor: LookFor; reviewId: string; gone: boolean; onClose(gone: boolean): void }) {
+function LookDialog({ title, projectId, sourceId, lookFor, reviewId, gone, onClose }: { title: string; projectId: string; sourceId: string; lookFor: LookFor; reviewId: string; gone: boolean; onClose(): void }) {
   const id = useId();
   const heading = useRef<HTMLHeadingElement>(null);
   const note = useRef<HTMLParagraphElement>(null);
@@ -1702,7 +1704,7 @@ function LookDialog({ title, projectId, sourceId, lookFor, reviewId, gone, onClo
   useEffect(() => {
     if (ended) note.current?.focus();
   }, [ended]);
-  const close = () => onClose(ended);
+  const close = () => onClose();
   return (
     <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={close} className="ao-review__look" initialFocus={ended ? note : heading}>
       <h2 id={`${id}-t`} ref={heading} tabIndex={-1}>

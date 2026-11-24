@@ -370,7 +370,9 @@ describe("R487 a: a look and the card's own decision", () => {
     expect(heldReads()).toBe(reads);
   });
 
-  it("(ii) a “not found” in mid-look: no longer shown, said once, and Escape sends focus to the card's heading when no other file waits", async () => {
+  // R492 c: a "not found" while the card STILL waits (the held file gone from disk; nothing reads the queue again on it):
+  // the card keeps its controls, so focus returns to that card's own "Look at the file", a live control, as after any look.
+  it("R492 c: a “not found” in mid-look while the card still waits: no longer shown, said once, and Escape returns focus to the card's “Look at the file”", async () => {
     let fail!: (e: PdfOpenError) => void;
     let transport!: { requestDataRange(begin: number, end: number): void };
     const destroy = vi.fn(async () => {});
@@ -403,9 +405,13 @@ describe("R487 a: a look and the card's own decision", () => {
     const reads = heldReads();
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    const head = card(RECORD).querySelector("h4")!;
-    await waitFor(() => expect(document.activeElement).toBe(head));
-    expect(reachable(document.activeElement!)).toBe(true);
+    // The card still waits, its controls as before; focus on its own Look control, neither inert nor hidden.
+    const back = within(card(RECORD)).getByRole("button", { name: `Look at the file for ${NAMED}` });
+    await waitFor(() => expect(document.activeElement).toBe(back));
+    expect(back.closest("[inert]")).toBeNull();
+    expect(back.closest("[aria-hidden='true']")).toBeNull();
+    expect(back.getAttribute("aria-disabled")).toBeNull();
+    expect(screen.getByRole("button", { name: `Use this file for ${NAMED}` })).toBeTruthy();
     expect(heldReads()).toBe(reads);
   });
 });
