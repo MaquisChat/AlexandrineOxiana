@@ -204,7 +204,11 @@ export class BackupCancelledError extends Error {
  */
 const backupsInFlight = new WeakMap<Library, Set<Promise<unknown>>>();
 
-function inFlight<T>(lib: Library, run: () => Promise<T>): Promise<T> {
+/**
+ * Package-internal (retention, R554): runs `run` as work under Backups/ that the library's `close()` waits for — a
+ * backup, or a destruction's backups step (its fresh backup, its removals, its record).
+ */
+export function inFlight<T>(lib: Library, run: () => Promise<T>): Promise<T> {
   let set = backupsInFlight.get(lib);
   if (!set) {
     const mine = new Set<Promise<unknown>>();
@@ -220,8 +224,8 @@ function inFlight<T>(lib: Library, run: () => Promise<T>): Promise<T> {
   return p;
 }
 
-/** A close (or the session's closing) cut the backup: the library refused a step, or the backup saw it between steps. */
-const cutByClose = (err: unknown): boolean => err instanceof BackupCancelledError || err instanceof LibraryClosedError;
+/** A close (or the session's closing) cut the backup: the library refused a step, or the backup saw it between steps. Package-internal (retention, R554). */
+export const cutByClose = (err: unknown): boolean => err instanceof BackupCancelledError || err instanceof LibraryClosedError;
 
 /** The `backup.create` event (the commit point) could not be written: the backup was not kept. */
 export class BackupNotRecordedError extends Error {
@@ -1459,12 +1463,14 @@ async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise
  * not remove it. Either way the manifest lists it no longer. A failure does not stop the others.
  * Only plain names of the backup pattern, inside Backups/, are ever touched. With `expect` (name →
  * sha256, for a list inherited through a restore, R175) a file is removed only when its bytes are
- * those: one of another content is `other` and is left alone, with its manifest entry.
+ * those: one of another content is `other` and is left alone, with its manifest entry. With `step`, it is called
+ * before each file; what it throws ends the removals there (R554: the library's close), the ones made standing.
  */
 export async function removeHoldingBackups(
   repo: Repo,
   files: string[],
   expect?: ReadonlyMap<string, string>,
+  step?: () => void,
 ): Promise<{ removed: string[]; gone: string[]; other: string[]; failed: Array<{ file: string; error: unknown }> }> {
   const dir = backupsDir(repo);
   const removed: string[] = [];
@@ -1472,6 +1478,8 @@ export async function removeHoldingBackups(
   const other: string[] = [];
   const failed: Array<{ file: string; error: unknown }> = [];
   for (const f of files) {
+    // R554: before each removal (never in the middle of one), the caller's step may stop the rest by throwing.
+    step?.();
     if (!isBackupFileName(f) || (expect && !expect.has(f))) {
       failed.push({ file: f, error: new Error(isBackupFileName(f) ? "the making of this backup is not on record" : "this is not the name of a backup") });
       continue;
