@@ -221,12 +221,27 @@ export class TxnLog {
   }
 }
 
+/** Whether the regular file at `rel` holds bytes one of `later` ("created"/"replaced" lines at that path) wrote. */
+async function ownBytesAt(root: string, rel: string, later: MarkerEntry[]): Promise<boolean> {
+  const hashes = later.flatMap((x) => ((x.kind === "created" || x.kind === "replaced") && x.path === rel && x.sha256 ? [x.sha256] : []));
+  if (!hashes.length) return false;
+  const st = await fsp.lstat(fromRel(root, rel)).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
+    throw err;
+  });
+  if (!st?.isFile()) return false;
+  const now = await sha256File(fromRel(root, rel));
+  return now !== null && hashes.includes(now);
+}
+
 /**
  * Best effort: keeps going past failures, and reports whether every step succeeded. Repeatable (R493): a step already
  * undone is never undone again. A "trashed" line whose trash copy is gone was put back by an earlier run of this
  * roll-back (every step is recorded before it is taken, so a copy never made means the change stopped there, with no
- * later line), and every later line of the marker at that path was undone before it: those lines are skipped, since
- * undoing one again could only remove or overwrite the original put back.
+ * later line), and every later line of the marker at or under that path (R503 b 1) was undone before it: those lines
+ * are skipped, since undoing one again could only remove or overwrite the original put back. Unless the change's own
+ * bytes are still at that path (R503 b 2): then the copy was deleted outside the app, not put back; the lines are
+ * skipped all the same (nothing is deleted) and the roll-back is not complete.
  */
 export async function undoEntries(root: string, entries: MarkerEntry[]): Promise<boolean> {
   let ok = true;
@@ -242,9 +257,18 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
       ok = false;
     }
     if (!putBack) continue;
+    // R503 b 2: a copy gone while the change's own bytes (a later line's hash) are still at the path was not put back:
+    // it was deleted outside the app. The roll-back is then not complete (the marker is kept); nothing is deleted.
+    try {
+      if (await ownBytesAt(root, e.from, entries.slice(i + 1))) ok = false;
+    } catch {
+      ok = false;
+    }
     for (let j = i + 1; j < entries.length; j++) {
       const x = entries[j]!;
-      if ((x.kind === "trashed" ? x.from : x.path) === e.from) done.add(j);
+      // R503 b 1: at or under the path (a file inside a folder the change trashed and made again).
+      const p = x.kind === "trashed" ? x.from : x.path;
+      if (p === e.from || p.startsWith(`${e.from}/`)) done.add(j);
     }
   }
   let steps = 0;

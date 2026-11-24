@@ -5,7 +5,8 @@
  * original put back is never removed or overwritten. Proven by the reviewer's probe Q1, the crash-in-reopen case, and
  * an enumeration of every two- and three-step sequence at one path, each first roll-back cut after each of its steps.
  */
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
@@ -17,7 +18,7 @@ import type { Repo } from "./index.js";
 import type { Tx } from "./mutate.js";
 import { importChange } from "./repo.js";
 import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
-import { MIXED_WRITE, fromRel, undoEntries, type TxnMarker } from "./txn.js";
+import { MIXED_WRITE, fromRel, undoEntries, type MarkerEntry, type TxnMarker } from "./txn.js";
 
 const OPEN_GOV = `identifiability:
   containsIdentifiable: false
@@ -193,6 +194,112 @@ describe("R493: the cut seam is inert outside NODE_ENV=test (R47)", () => {
     } finally {
       process.env.NODE_ENV = env;
     }
+  });
+});
+
+describe("R503 b 1 (FR-737): a step at or UNDER a trashed path that was put back is not undone again", () => {
+  /**
+   * A folder the change trashed and made again, with a file written inside (each step recorded, as the marker records
+   * steps). The first roll-back is cut after each of its steps; a second runs to its end, then a third. The marker lines
+   * are built by hand: no change the app makes today records a line under a folder it made again (R495).
+   */
+  const SHAPES: Array<{ name: string; inside: string[] }> = [
+    { name: "a file created inside", inside: ["a.txt"] },
+    { name: "a file created in a folder inside", inside: ["sub/b.txt"] },
+    { name: "two files created inside", inside: ["a.txt", "sub/b.txt"] },
+  ];
+  for (const shape of SHAPES) {
+    it(`a folder trashed, made again, ${shape.name}: the original folder and its files come back, byte for byte, at every cut`, async () => {
+      const failures: string[] = [];
+      const sha = (t: string) => createHash("sha256").update(t).digest("hex");
+      for (let cut = 0; cut <= 2 + shape.inside.length; cut++) {
+        const root = await mkdtemp(join(tmpdir(), "ao-r503b1-"));
+        try {
+          const F = "Projects/P/F";
+          await mkdir(fromRel(root, `${F}/sub`), { recursive: true });
+          for (const f of ["a.txt", "sub/b.txt"]) await writeFile(fromRel(root, `${F}/${f}`), `${ORIGINAL}(${f})`);
+          await mkdir(fromRel(root, ".tmp"), { recursive: true });
+          const to = ".tmp/trash-0-0";
+          const entries: MarkerEntry[] = [{ kind: "trashed", from: F, to }, { kind: "dir", path: F }];
+          await rename(fromRel(root, F), fromRel(root, to));
+          await mkdir(fromRel(root, F));
+          for (const f of shape.inside) {
+            entries.push({ kind: "created", path: `${F}/${f}`, sha256: sha(`new ${f}`) });
+            await mkdir(fromRel(root, `${F}/${f}`.slice(0, `${F}/${f}`.lastIndexOf("/"))), { recursive: true });
+            await writeFile(fromRel(root, `${F}/${f}`), `new ${f}`);
+          }
+          seams.stopUndoAfter = cut;
+          await undoEntries(root, entries);
+          seams.stopUndoAfter = undefined;
+          for (const run of ["second", "third"]) {
+            const ok = await undoEntries(root, entries);
+            const name = `${shape.name}, first roll-back cut after ${cut} step(s), the ${run} roll-back`;
+            if (!ok) failures.push(`${name}: reported incomplete`);
+            for (const f of ["a.txt", "sub/b.txt"]) {
+              const now = await readFile(fromRel(root, `${F}/${f}`), "utf8").catch(() => null);
+              if (now !== `${ORIGINAL}(${f})`) failures.push(`${name}: ${f} is ${now === null ? "gone" : JSON.stringify(now)}`);
+            }
+          }
+        } finally {
+          seams.stopUndoAfter = undefined;
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+      expect(failures).toEqual([]);
+    });
+  }
+});
+
+describe("R503 b 2 (FR-737): the app's kept copy of a trashed original deleted by hand, the change's own file still at the path", () => {
+  beforeEach(async () => {
+    w = await makeWorld();
+  });
+  afterEach(async () => {
+    await dropWorld(w);
+  });
+
+  it("the roll-back is NOT reported as done: incomplete, the marker kept, nothing deleted, the could-not-be-undone warning; so at every reopen", async () => {
+    const rel = `${w.folder}/kept.txt`;
+    await writeFile(fromRel(w.lib.root, rel), ORIGINAL);
+    seams.crashAt = "before-audit";
+    await expect(
+      w.repo.mutate(w.pid, STORE, async (tx) => {
+        await tx.trash(rel);
+        await tx.writeFile(rel, "the change's own new file\n");
+      }),
+    ).rejects.toBeInstanceOf(SimulatedCrash);
+    const m = await readMarker(w);
+    const t = m.entries.find((e): e is Extract<MarkerEntry, { kind: "trashed" }> => e.kind === "trashed")!;
+    await rm(fromRel(w.lib.root, t.to), { recursive: true, force: true }); // someone deleted the app's kept copy by hand
+    for (const run of ["first", "second"]) {
+      await reopen(w);
+      expect((await bytesAt(w, rel))?.toString(), `${run} reopen`).toBe("the change's own new file\n");
+      expect(await markerNames(w), `${run} reopen`).toEqual([`txn-${m.txn}.json`]);
+      const mine = w.repo.integrityWarnings.filter((x) => x.projectId === w.pid).map((x) => x.kind);
+      expect(mine, `${run} reopen`).toContain("rolled-back-incomplete-write");
+      expect(mine, `${run} reopen`).not.toContain("changed-outside-before-rollback");
+      expect(w.repo.integrityWarnings.find((x) => x.kind === "rolled-back-incomplete-write")!.detail).toMatch(/could only be partly rolled back/u);
+      expect((await w.repo.pendingWrites()).map((x) => x.txn)).toEqual([m.txn]);
+    }
+  });
+
+  it("a copy put back by an earlier roll-back (the original at the path) is still done: the R493 case is unchanged", async () => {
+    const rel = `${w.folder}/kept.txt`;
+    await writeFile(fromRel(w.lib.root, rel), ORIGINAL);
+    seams.crashAt = "before-audit";
+    await expect(
+      w.repo.mutate(w.pid, STORE, async (tx) => {
+        await tx.trash(rel);
+        await tx.writeFile(rel, "the change's own new file\n");
+      }),
+    ).rejects.toBeInstanceOf(SimulatedCrash);
+    const m = await readMarker(w);
+    // The first reopen's roll-back undoes both steps and is cut just before the marker goes.
+    await reopen(w, () => void (seams.stopUndoAfter = m.entries.length));
+    expect((await bytesAt(w, rel))?.toString()).toBe(ORIGINAL);
+    await reopen(w);
+    expect((await bytesAt(w, rel))?.toString()).toBe(ORIGINAL);
+    expect(await markerNames(w)).toEqual([]);
   });
 });
 
