@@ -63,6 +63,21 @@ describe("a change may not close its own library, told truly (FR-749, R555 1, 2)
     expect(existsSync(join(lib.root, ".lock"))).toBe(false);
   });
 
+  it("2: close() from a callback set up inside a change and run after it ended goes through: closed, the lock gone", async () => {
+    kit = await makeKit("ao-close-inside-2-");
+    const p = await makeProject(kit);
+    const lib = kit.lib;
+    const g = gate();
+    let later!: Promise<unknown>;
+    await importChange(kit.repo, p.id, STORE, async () => {
+      later = g.p.then(() => lib.close()).then(() => "closed", (err: unknown) => err);
+    }, { op: "test.callback-closes-later" });
+    g.open();
+    expect(await later).toBe("closed");
+    expect(isClosed(lib)).toBe(true);
+    expect(existsSync(join(lib.root, ".lock"))).toBe(false);
+  });
+
   it("2, the true case: close() inside the running change is still refused, and the library stays open", async () => {
     kit = await makeKit("ao-close-inside-3-");
     const p = await makeProject(kit);

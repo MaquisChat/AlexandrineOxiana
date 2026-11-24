@@ -224,7 +224,7 @@ export class RepoCore {
     this.auditSegmentSize = opts.auditSegmentSize;
     // FR-749 (R546 1, R247 d): the handle's close() waits for the change in its store turn before the lock goes; the
     // turns still waiting are refused as they come up (`enqueue`), so the queue empties without writing.
-    onClose(library, { drain: () => this.whenIdle(), holdsTurn: () => this.holdsTurn() });
+    onClose(library, { drain: () => this.whenIdle(), holdsTurn: () => this.inRunningTurn() });
   }
 
   /** Resolves when no turn is running or waiting. */
@@ -338,6 +338,15 @@ export class RepoCore {
   /** True while running in a turn of this repo's write queue (`serial`): no other write is in progress. */
   holdsTurn(): boolean {
     return inTurn.getStore()?.core === this;
+  }
+
+  /**
+   * R555 2: true only inside the turn that is RUNNING now. A callback set up inside a turn carries that turn's context
+   * after it ended (see `inTurn`); it is not inside a change, so it may close the library.
+   */
+  inRunningTurn(): boolean {
+    const t = inTurn.getStore();
+    return t !== undefined && t.core === this && t === this.running;
   }
 
   state(projectId: string): ProjectState {
