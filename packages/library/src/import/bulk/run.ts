@@ -82,7 +82,7 @@ import { UnsafeFileError } from "../../extract/errors.js";
 import { extractMetadata } from "../../extract/index.js";
 import type { IndexDb } from "../../index/db.js";
 import { LookupCancelledError, lookupContextFor, providerAllowed, type HttpClient, type LookupContext } from "../../lookup/index.js";
-import { NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError, isLockedRefusal } from "../../repo/errors.js";
+import { LibraryClosedError, NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError, isLockedRefusal } from "../../repo/errors.js";
 import type { CreateSourceOptions, SourceInputFile } from "../../repo/sources.js";
 import { storeRequest } from "../../repo/sources.js";
 import {
@@ -1137,6 +1137,9 @@ class Run {
       await writeBatchReport(this.repo, this.projectId, this.rec.id);
     } catch (err) {
       this.deps.debug?.(`bulk import: the batch record could not be saved: ${errorForLog(err)}`);
+      // FR-749 (R546 1): the library was closed under the run, so its end was not saved: on disk the batch is still
+      // "running" (shown as interrupted, resumable). The run's answer says no more than that: it stopped, resumable.
+      if (err instanceof LibraryClosedError && state !== "failed") state = "paused";
       // R413 b, c: the report still says why the batch stopped (kept in memory until the record is saved again).
       const stop = this.rec.notes.find((n) => STOPPED_NOTE.test(n));
       if (stop) unsavedStops.set(this.rec.id, stop);
