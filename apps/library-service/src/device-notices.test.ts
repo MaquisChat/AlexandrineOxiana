@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { addWatchedFolder, deviceDeps, deviceNoticesIdle, raiseDeviceNotice, type Deps } from "@ao/library";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
@@ -363,5 +363,124 @@ describe("FR-720 (R508 I1): the restart of the watches waits while a move or the
     await svc!.state.idle();
     for (const id of ids) expect(watching(id)).toBe(false);
     expect(warned()).toBe(true);
+  });
+});
+
+describe("FR-720 (R508 M3): one start of a project's watches at a time", () => {
+  const GOV = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [manual_upload]\n";
+  const warned = () => (svc!.state.libraryState() as { integrityWarnings: Array<{ kind: string }> }).integrityWarnings.some((w) => w.kind === "watched-folders-unreadable");
+  const listFile = () => join(deps.appConfigDir, "watched-folders.json");
+  /** The service's own view: how many watches it holds for the project. */
+  const watchCount = (id: string) => svc!.state.session!.watches.get(id)?.length ?? 0;
+
+  async function until(fn: () => Promise<boolean>, what: string, ms = 30_000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (!(await fn())) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  /** Two projects, each with one watched folder holding one PDF; the list is then made unreadable (kept beside it). */
+  async function made(): Promise<{ ids: string[]; wids: string[] }> {
+    await start({ watchStabilityMs: 50 });
+    await openLibrary();
+    const ids: string[] = [];
+    const wids: string[] = [];
+    for (const name of ["P", "Q"]) {
+      const p = await call({ method: "POST", url: "/projects", body: { name, governanceYaml: GOV, encryption: { enabled: false } } });
+      expect(p.status, p.body).toBe(200);
+      const id = p.json.project.id as string;
+      const dir = join(tmp, "drive", name);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "report.pdf"), await buildPdf({ title: `Fieldwork ${name}`, author: "Ana Souza", lines: ["Report."] }));
+      const s = svc!.state.session!;
+      wids.push((await addWatchedFolder({ repo: s.repo, lib: s.lib }, id, dir)).id);
+      ids.push(id);
+    }
+    await svc!.close();
+    svc = undefined;
+    await rename(listFile(), `${listFile()}.kept`);
+    await mkdir(listFile());
+    return { ids, wids };
+  }
+  async function readable(): Promise<void> {
+    await rm(listFile(), { recursive: true });
+    await rename(`${listFile()}.kept`, listFile());
+  }
+  /** Each folder's file is in its register once, and in its project once. */
+  async function broughtInOnce(ids: string[], wids: string[]): Promise<void> {
+    const s = svc!.state.session!;
+    for (const [i, id] of ids.entries()) {
+      await until(async () => (await s.repo.watchRegister(id, wids[i]!)).size === 1 && s.repo.listSourceIds(id).length === 1, "the file brought in");
+      await svc!.state.idle();
+      expect((await s.repo.watchRegister(id, wids[i]!)).size).toBe(1);
+      expect(s.repo.listSourceIds(id)).toHaveLength(1);
+    }
+  }
+
+  it("two reads of the list in flight at once start each project's watches once", async () => {
+    const { ids, wids } = await made();
+    await start({ watchStabilityMs: 50 });
+    await openLibrary();
+    await svc!.state.idle();
+    expect(warned()).toBe(true);
+    await readable();
+    // Every start is held until both reads have asked for the restart.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    const real = svc!.state.startWatches.bind(svc!.state);
+    let starts = 0;
+    vi.spyOn(svc!.state, "startWatches").mockImplementation(async (s, projectId) => {
+      starts++;
+      await held;
+      return real(s, projectId);
+    });
+    const both = Promise.all([call({ url: `/projects/${ids[0]}/watched-folders` }), call({ url: `/projects/${ids[1]}/watched-folders` })]);
+    await until(async () => starts >= 2, "the restart's starts");
+    release();
+    for (const r of await both) expect(r.status, r.body).toBe(200);
+    await svc!.state.idle();
+    expect(starts).toBe(2);
+    for (const id of ids) expect(watchCount(id)).toBe(1);
+    expect(warned()).toBe(false);
+    await broughtInOnce(ids, wids);
+  });
+
+  it("a read while the opening's own start of a project is still in flight does not start that project a second time", async () => {
+    const { ids, wids } = await made();
+    await start({ watchStabilityMs: 50 });
+    // The opening's start of Q is held; P's start fails (the list cannot be read), which raises the warning.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    const real = svc!.state.startWatches.bind(svc!.state);
+    const startsOf = new Map<string, number>();
+    let qEntered!: () => void;
+    const qHeld = new Promise<void>((r) => (qEntered = r));
+    vi.spyOn(svc!.state, "startWatches").mockImplementation(async (s, projectId) => {
+      startsOf.set(projectId, (startsOf.get(projectId) ?? 0) + 1);
+      if (projectId === ids[1]) {
+        qEntered();
+        await held;
+      }
+      return real(s, projectId);
+    });
+    await openLibrary();
+    await qHeld;
+    await until(async () => warned(), "the warning");
+    await readable();
+    // P's read succeeds while Q's opening start is in flight.
+    const reading = call({ url: `/projects/${ids[0]}/watched-folders` });
+    await until(async () => svc!.state.session!.watchRestart !== undefined, "the restart");
+    release();
+    const r = await reading;
+    expect(r.status, r.body).toBe(200);
+    await svc!.state.idle();
+    expect(startsOf.get(ids[1]!)).toBe(1);
+    for (const id of ids) expect(watchCount(id)).toBe(1);
+    expect(warned()).toBe(false);
+    await broughtInOnce(ids, wids);
   });
 });

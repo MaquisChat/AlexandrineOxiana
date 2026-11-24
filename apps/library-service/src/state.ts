@@ -152,6 +152,8 @@ export interface Session {
   sessionWarnings?: Array<{ kind: string; detail: string }>;
   /** FR-720: the start of the watches that did not start at open, under way after the list could be read again. */
   watchRestart?: Promise<void>;
+  /** R508 M3: each project's start of its watches under way (the opening's or a restart's): one per project at a time. */
+  watchStarting: Map<string, Promise<void>>;
   /** Find and acquire's runner (Task F5): one per open read-write library, made at `activate`; see "Find and acquire" below. */
   find?: FindRunner;
   /** The index errors already seen when the index was last known good (Task F5): a new one means it cannot be trusted. */
@@ -711,6 +713,7 @@ export class ServiceState {
       }),
       bulk: undefined,
       watches: new Map(),
+      watchStarting: new Map(),
       batches: new Map(),
       moveTokens: new Map(),
       workerClient: undefined,
@@ -984,11 +987,20 @@ export class ServiceState {
   /**
    * Starts the watched folders of these projects, each tracked as background work: at the library's opening (every
    * project), and again for those that did not start then once this computer's list can be read (FR-720). True when
-   * every one started.
+   * every one started. A project whose start is still under way is not started beside it: that start is waited for and
+   * counts as this one (R508 M3), so a folder never gets two watches.
    */
   async startProjectsWatches(s: Session, projectIds: string[]): Promise<boolean> {
-    const runs = projectIds.map((id) => this.startWatches(s, id));
-    for (const r of runs) this.track(r, "watched folders");
+    const runs = projectIds.map((id) => {
+      const under = s.watchStarting.get(id);
+      if (under) return under;
+      const run: Promise<void> = this.startWatches(s, id).finally(() => {
+        if (s.watchStarting.get(id) === run) s.watchStarting.delete(id);
+      });
+      s.watchStarting.set(id, run);
+      this.track(run, "watched folders");
+      return run;
+    });
     return (await Promise.allSettled(runs)).every((r) => r.status === "fulfilled");
   }
 
