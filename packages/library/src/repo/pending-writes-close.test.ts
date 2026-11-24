@@ -5,7 +5,7 @@
  * nothing deleted, and a warning saying what was lost. Never for a cause that may pass or that the researcher can
  * remove; nothing in a read-only library.
  */
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditEvent, Provenance, SourceDraft } from "@ao/core";
@@ -15,7 +15,7 @@ import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
 import type { Repo } from "./index.js";
 import type { Tx } from "./mutate.js";
-import { NotFoundError, PendingWriteChoiceError, PolicyDeniedError, ReadOnlyLibraryError } from "./errors.js";
+import { NotFoundError, PendingWriteChoiceError, PendingWriteIncompleteError, PolicyDeniedError, ReadOnlyLibraryError } from "./errors.js";
 import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
 import { fromRel, type TxnMarker } from "./txn.js";
 
@@ -30,6 +30,9 @@ const STORE = { action: "store" as const, store: { identifiable: false, hasLocat
 const HAND = "a file put here by hand\n";
 const ORIGINAL = "the researcher's original\n";
 const OWN = "the change's own file\n";
+/** Sentence 25: the refusal to close while the app still keeps a copy of the change. */
+const COPIES_LEFT_TEXT =
+  "This change cannot be closed yet: the app still keeps a copy of a file it could not put back, and closing would let that copy go. Choose “Roll it back” to try again.";
 
 let tmp: string;
 let lib: Library;
@@ -247,6 +250,36 @@ describe("R509: closing a change whose undo can never complete", () => {
     expect((err as Error).message).toBe("Only a change that can never be undone completely can be closed as it is; this one can still be rolled back.");
     expect(await readFile(join(lib.root, ".tmp", `txn-${m.txn}.json`), "utf8")).toBe(marker);
     expect(await text(rel)).toBe(HAND);
+  });
+
+  it("R528 I3 (probe P5): a folder whose kept copy is gone while a file inside it keeps its copy: never closed, and the inner copy outlives a reopen", async () => {
+    const dir = `${folder}/D`;
+    const inner = `${dir}/x.txt`;
+    const INNER = "inner original\n";
+    await mkdir(fromRel(lib.root, dir));
+    await writeFile(fromRel(lib.root, inner), INNER);
+    const m = await crashed(async (tx) => {
+      await tx.trash(inner);
+      await tx.trash(dir);
+    });
+    const innerCopy = (m.entries[0] as { to: string }).to;
+    await rm(fromRel(lib.root, (m.entries[1] as { to: string }).to), { recursive: true, force: true });
+    await reopen();
+    // The causes name only the folder; the file inside it keeps its copy, which cannot be put back without the folder.
+    expect((await repo.pendingWrites())[0]).toMatchObject({ txn: m.txn, canRollBack: true, canClose: false, causes: [{ kind: "kept-copy-gone", path: dir }] });
+    const marker = await readFile(join(lib.root, ".tmp", `txn-${m.txn}.json`), "utf8");
+    const err = await repo.closePendingWrite(m.txn, pid).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PendingWriteIncompleteError);
+    expect((err as Error).message).toBe(COPIES_LEFT_TEXT);
+    expect(await readFile(join(lib.root, ".tmp", `txn-${m.txn}.json`), "utf8")).toBe(marker);
+    expect(await readFile(fromRel(lib.root, innerCopy), "utf8")).toBe(INNER);
+    await reopen();
+    expect(await markers()).toEqual([`txn-${m.txn}.json`]);
+    expect(await readFile(fromRel(lib.root, innerCopy), "utf8")).toBe(INNER);
+    expect((await repo.pendingWrites())[0]).toMatchObject({ canClose: false });
   });
 
   it("named with another project, or an unknown change: not found", async () => {

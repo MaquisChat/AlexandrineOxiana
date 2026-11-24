@@ -129,6 +129,29 @@ describe("FR-729: a change undone when the library opened is said until dismisse
   });
 });
 
+describe("R528 I3: an undo that did not complete is never kept as one that did", () => {
+  it("the record holds nothing of it, and no later opening shows it as undone", async () => {
+    const { pid, folder } = await project("P");
+    const rel = `${folder}/copied.txt`;
+    seams.crashAt = "before-audit";
+    await expect(repo.mutate(pid, STORE, async (tx) => tx.writeFile(rel, "the change's own\n"))).rejects.toBeInstanceOf(SimulatedCrash);
+    seams.crashAt = undefined;
+    // Changed by hand: the undo leaves it, and is incomplete (in the way).
+    await writeFile(fromRel(lib.root, rel), "a file put here by hand\n");
+    await reopen();
+    const standing = repo.integrityWarnings.filter((w) => w.projectId === pid && w.kind === "rolled-back-incomplete-write");
+    expect(standing).toHaveLength(1);
+    expect(standing[0]!.rollback).toBeDefined();
+    expect(standing[0]!.keptId).toBeUndefined();
+    expect(await fileText()).toBeNull();
+    await reopen();
+    expect(await fileText()).toBeNull();
+    expect(kept()).toEqual([]);
+    // Shown only with its state (the standing warning), never as one undone completely.
+    expect(repo.integrityWarnings.filter((w) => w.projectId === pid && w.kind === "rolled-back-incomplete-write").map((w) => w.rollback === undefined)).toEqual([false]);
+  });
+});
+
 describe("R527: the record travels with the library", () => {
   const MOVABLE_GOV = `identifiability:
   containsIdentifiable: false
