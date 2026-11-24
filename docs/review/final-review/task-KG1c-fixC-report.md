@@ -378,3 +378,113 @@ Each is what the code answers, so there is no finding. The original file, run as
 - Typechecks: shared, library, ui, library-service and cli, each ok.
 - `lint:css` and `lint:colours`: ok.
 - `git status --short`: empty.
+
+## The guard and covering folders (review 3)
+
+Branch `kg-1-rollback`, from 4e83973. Head a4ba523. Not pushed.
+
+| Commit | What |
+|---|---|
+| 4d78362 | The mend (I1), its probe test, and the folder table. |
+| a4ba523 | M2: comments only. |
+
+**The mend:** `backupHoldsOriginal`, `packages/library/src/repo/txn.ts` (about :1060). Inside the scan, before the old skip, there is now one stop:
+```ts
+const at = x.kind === "trashed" ? x.from : x.path;
+if ((x.kind === "trashed" || x.kind === "dir") && (path === at || path.startsWith(`${at}/`))) return true;
+```
+
+**The rule as it now reads, word for word (doc comment):**
+> R532 I1, R533 (4): whether the backup of "replaced" line `i` may hold bytes that are not the change's own. It holds only the change's own bytes where the nearest earlier line of the change at its path shows the change wrote the file there from bytes of its own making: an earlier "replaced" line at the path (the backup holds that rewrite's bytes), a "created" line with a hash of its own and no completion mark (a file written whole), or a file the change created by appending. Every other origin counts as holding the researcher's bytes (the safe side): the path was there before the change; the change created it BY COPYING a file (a "created" line with no hash of its own, whose completion line carries the hash as stored); or it lies in a folder the change made, where a copy and a write leave the same line. Where the scan back meets a "trashed" or "dir" line that covers the path (the path itself or a folder above it) before the line that made the file as it stood at the rewrite, it stops and counts the backup as kept (review 3 I1).
+
+### (a) The reviewer's probe, as a test
+
+It is in `close-guard.test.ts`, under "review 3 I1 … the reviewer's probe". The steps:
+1. Write `d/f`.
+2. Trash `d`.
+3. Make `d` again.
+4. Copy `q` into `d/f`.
+5. Rewrite `d/f`.
+6. Trash `q`.
+
+Then both kept copies are deleted.
+
+At both moments it asserts:
+- From the bytes, `q`'s bytes are held only in a kept copy.
+- The guard says "kept".
+- The list shows `lost-copy-stuck` with `canClose: false`.
+- The close is refused with `COPIES_LEFT_TEXT`, and the marker, `.tmp` and the library are unchanged.
+
+**It failed first** on the unchanged guard: "undone: expected false to be true".
+
+### (b) The folder table
+
+The file is `d/f.txt` inside the folder `d`.
+
+| Step kind | Letter |
+|---|---|
+| Create from the change's own bytes | C |
+| Create by copying `q` | K |
+| Rewrite | R |
+| Trash the file | T |
+| Make `d` | M |
+| Trash `d` | D |
+| Trash `d` and make it again | X |
+
+What it covers:
+- **Sequences:** every sequence of one to four steps the transaction can take with at least one folder step.
+- **Starts:** `d` with the researcher's `f.txt` and `g.txt`; `d` with `g.txt` only; no `d`.
+- **Duplicates removed:** a cut of a longer sequence is the shorter sequence, so it is not a case of its own.
+- **Why four steps, not three:** the reviewer's shape is C X K R, and three steps cannot reach it.
+- **Kept copies deleted:** after the crash, every kept copy the change trashed is deleted (the copies of `q`, of the file and of the folder).
+- **The oracle**, from the bytes alone: it walks `.tmp`, into folders. For f's original, g and q, it asks whether each is held only there and in no library file.
+
+What it asserts:
+- `onlyKept ⇒ guard`.
+- Where the guard holds, the close is refused with nothing changed.
+- Where the guard lets the close through, nothing that a kept copy held before the close is lost. This covers a close that goes through, one refused as not closable, and one whose own undo stayed incomplete.
+
+**Before the mend:** the only miss in the whole table was "d CXKR", at both moments: the reviewer's shape. No other miss.
+
+**The counts:**
+
+| Measure | Result |
+|---|---|
+| Cases | 405 |
+| Runs | 810 |
+| Undone: "kept" / "not kept" | 104 / 301 |
+| As crashed: "kept" / "not kept" | 104 / 301 |
+| Runs with the researcher's bytes held only in a kept copy (all "kept") | 162 |
+| Closed for real | 546 |
+| Let through but not closed | 56 |
+| Refused by the guard with nothing changed | 208 |
+
+The old table's counts are unchanged: undone 6/58, as crashed 48/16, held only in a kept copy 47.
+
+Two things to note:
+- The folder table's "undone" and "as crashed" counts are identical. With every kept copy deleted, the opening's undo changes nothing the guard reads in these shapes. This is an observation, not looked into further.
+- In 56 runs the guard let the close through but it did not close (the change was refused as not closable, or its own undo stayed incomplete). Some of these record the close choice on the marker before stopping (R532 M3's path). No researcher bytes are lost in any of them.
+
+### M2 (comments only)
+
+In `packages/shared/src/api/interrupted-changes.ts`, three places now say that a cause of a kind this build does not know is also told "a step failed" (or "a step of the undo also failed"):
+- the state list's line for `lost-and-try-again`;
+- the comment at the `lost-and-try-again` return;
+- a new comment at the final `try-again` return.
+
+No behaviour changed.
+
+M1 is for the coordinator's list; nothing was built.
+
+### Runs (each alone, `nice -n 10`, `NODE_OPTIONS="--use-openssl-ca"`)
+
+| Run | Result |
+|---|---|
+| close-guard | 942/942 |
+| pending-writes | 22/22 |
+| rollback-rerun | 30/30 |
+| rollback-hand-put | 42/42 |
+| `@ao/library` typecheck | ok |
+| `@ao/shared` typecheck (comment change) | ok |
+
+`git status --short`: empty.

@@ -49,3 +49,34 @@ No route or screen changed, so no end-to-end scenario applies.
 
 ## Note
 R328 e's test counts reads from the moment the unlock answers. With the mend, the 2 reads it sees after the unlock are made by the pass, and the view then reads nothing. The pass runs after the answer, because it first reads the project's rules and its queue. So the test's exact count still depends on that order, as it already did at the base: the unlock's backup reads also land after its count. It was stable over 6 runs. A robust form of the test would count reads from before the unlock. That would change the test, which this task forbids, so it is not done. Nothing needs a ruling.
+
+## The count made certain (review I1, M1; commit ff3b6a9)
+The coordinator gave leave to change the set-up of R328 e's test, but not its expectation of 2.
+
+- **(a) Count from before the unlock.** R328 e now clears its counter before `POST /unlock` (`your-library-routes.test.ts:463`). The opening's pass and the GET share the cache, so each record is read once between them, whichever reads first. The count is still **2**.
+- **(b) No backup in the window, by construction.** A helper, `noBackups(pid)` (`:206`), sends `PUT /projects/:id/backup-settings {automatic:false}`, as `server.test.ts` does. Each of the three counting tests calls it right after creating its project (`:441`, `:497`, `:527`). The backup's "due" check (`backupIfDueLocked`, and `runScheduledBackups`) returns nothing when automatic backups are off. The R534 c tests no longer depend on the backup not being due again the same day (M1). Their earlier lock/unlock and backup wait are gone.
+- **(c) A true signal for the pass.**
+  - `FindRunner.resume` now returns `Promise<void>` (`packages/library/src/find/runner.ts:715-719`, `:2743-2755`, `:2804`, `:2862-2867`). The promise never rejects. It settles when the opening's pass (`judgeResting`) has ended, or as soon as the opening ends without one (closed, read-only, locked, recovery pending, the rules unreadable). It does not wait for the work the opening queues.
+  - `ServiceState.resumeFind` registers that promise with `track` (`apps/library-service/src/state.ts:1489-1496`), which is the set `idle()` waits on.
+  - The R534 c tests now `await svc.state.idle()` instead of polling, then assert that the moved entry is in your library.
+  - **The orderly stop:** `closeLibrary` (and so `shutdown`) calls `endFind` (the runner's `stopAll`) before it waits on `tasks`. The stop signal ends the pass through `guard`, and its write checks `live()`. So the stop is held no longer than before.
+  - **A lock:** a lock calls `stop`, which ends the pass the same way. The existing tests for a lock or close during the pass passed: `runner.linked-missing.test.ts` 62/62 and `runner.test.ts` 300/300.
+
+**Failed first:** with `state.ts` restored, the two R534 c tests failed after `idle()` (`expected 'no-open-copy' to be 'in-library'`).
+
+**The reviewer's experiments, each a scratch edit restored afterwards with `git checkout --`:**
+- With 300 ms added before the unlock's answer (`routes/projects.ts:165`), the three counting tests passed with their exact counts.
+- With 300 ms added in `libraryPartsOf` before `libraryChances` (`routes/find.ts:210`), the three counting tests passed with their exact counts.
+
+**Runs (each file alone, `nice -n 10`, `NODE_OPTIONS=--use-openssl-ca`):**
+- `your-library-routes.test.ts`: 35/35, five times in a row
+- `find-routes.test.ts`: 46/46
+- `find-browser-routes.test.ts`: 44/44
+- `capture-queues.test.ts`: 30/30
+- `server.test.ts`: 151 passed, 1 skipped
+- `runner.test.ts`: 300/300
+- `runner.linked-missing.test.ts`: 62/62
+- Both typechecks: clean
+- `git status --short`: empty
+
+The file took between 17 and 32 s across runs, depending on the machine's load; the base took about 20 s.
