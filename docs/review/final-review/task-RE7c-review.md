@@ -126,3 +126,121 @@ Reviewed: worktree `.claude/worktrees/re-7c`, branch `re-7c-find`, 7a8f5ee..ba36
   
   The guard is shared and was not changed. I did not edit tracked files to prove this.
 - How pdf.js renders a real held PDF, or garbage, in WebKit. pdf.js was stubbed. By the existing mapping, garbage gives "Damaged PDF" and a 409 gives "PDF not shown"; neither should spin forever.
+
+## Second look (R487, R492)
+
+Scope: ba36ce7..d9923fd (eight commits; RE-7h and RE-7i). The reviewer's probes were again `*.probeRE7c.test.ts(x)`. All are deleted; no commits were made and `git stash` was not used.
+
+**Verdict: APPROVED WITH SMALL POINTS.** The lock hole R492 a names is closed: a lock asked before the file's key is taken, by the wipe or by the mark, now refuses the read. Each harness row fails without the change (result below). R487 a–e and R492 b and c are built and hold. Three Minor points remain, plus one point for the coordinator's ruling: how wide the window still is once a file is open.
+
+### Runs
+- **Service tests:**
+  - `documents-route.test.ts`: 24 passed.
+  - `media.test.ts`: 27 passed.
+  - `held-file-document.test.ts`: 10 passed. This file hashes the library before and after a look; nothing changed, and the audit is the same.
+  - `ui-only-routes.test.ts`: 126 passed.
+- **Library tests:**
+  - `held-file-content.test.ts`: 5 passed.
+  - `asset-content.test.ts`: 9 passed.
+  - `asset-content-open.test.ts`: 3 passed.
+- **UI tests:**
+  - `ReviewQueue.look.test.tsx`: 12 passed.
+  - `ReviewQueue.test.tsx`: 116 passed.
+  - `Reader.test.tsx`: 56 passed.
+  - `PdfPages.test.tsx`: 17 passed.
+
+### 1. The lock (bd3cea8, 5c4196e)
+
+**When the key is asked for, and what that closes.**
+- `keyAtOpening` (`asset-content.ts:113`) is passed as the key getter to `openDecryptedHandle`.
+- That function calls the getter once: right after `noteOpening` (the seam) and before any byte is read (`random-access.ts:57-61`).
+- Under the mark or the wipe, `projectDataKey` now throws `ProjectLockedError`. `openStored` closes the handle.
+- So a lock asked before or at the opening serves nothing.
+- A plain (unencrypted) project passes `null` and is read exactly as before.
+
+**Picture route, a lock by the mark at the opening.** This was a service probe:
+- I held a change of another project on a gate, counted the openings of an unlocked request, then locked by the mark at the last opening.
+- Result: **423 `PROJECT_LOCKED`, no picture bytes** (97-byte body).
+- The same probe with the OLD eager key put back (a `vi.mock` of `@ao/library`): **200, with the whole picture.**
+- The happy path before and after is 200 with the exact bytes.
+
+**Media-ticket issue, the same lock.** Result: **423**, and no ticket.
+
+**Damaged, re-keyed and missing files.**
+- `media.test.ts` (a damaged recording and a damaged picture give 409) and `documents-route.test.ts` (a missing linked file gives 404) pass unchanged.
+- I probed a re-keyed picture: a file sealed under another project's key put in the asset's place. It answers 423. By reading, this is the same as before: both getters return `undefined` for a foreign key id, which gives `KeyNotAvailableError`. See M-c.
+- A missing picture answers 404, as before.
+
+**Callers.** `grep openAssetContent|openStored|keyAtOpening|openHeldFileContent` finds only:
+- media.ts:312, 328 and 364;
+- documents.ts:158 and 222.
+
+The implementers' table is complete. `openDecryptedFile` has no caller outside tests. Previews, exports, the worker's inputs and the CLI do not use these readers.
+
+**The tightened harness rows.**
+- Probe `lock-mid-read.probeRE7c.test.ts`: a copy of the harness with both readers' OLD eager key put back through `vi.mock`, run with `-t "openHeldFileContent|openAssetContent"`. Result: **[see the line below]**.
+- By reading, each row throws when `lockAsked && !after` and bytes come back. That is exactly the case the eager key allows (under the mark the getter would still hand over the captured key).
+
+**THE WINDOW LEFT: the whole file, once it is open, at the library level.**
+- `openDecryptedHandle` COPIES the key at the opening (`const key = Buffer.from(k)`, `random-access.ts:61`). After that, neither the wipe nor the mark reaches an open handle.
+- Probe (`held-file-content.probeRE7c.test.ts`): open a 5 MiB sealed held file, read 10 bytes, `await lockProject` (the key is wiped, `isUnlocked` is false), then read the rest. Result: **all 5,242,947 bytes, correct.**
+- So `keyAtOpening`'s comment, "not one byte of the file's content is read under it", is true only for a lock asked before or at the opening.
+- **What bounds it at the service:**
+  - The document and held routes: `serve`'s guard checks the lock before and after every 64 KiB read. Nothing read after a lock leaves; only bytes already in flight do. The held mid-read test now pins this: it fails with the guard removed, as the RE-7h report says, and it is consistent with my probe that the open handle would serve the whole range. Each request opens its own handle for at most 4 MiB.
+  - The PICTURE route has no per-read check. Probe: a lock (the wipe) one microtask after the picture's opening gives **200 with the whole picture**, and `isUnlocked` is false afterwards. That window is bounded by the picture limit.
+  - Media streams are cut by the lock route's `revokeProject`.
+- **How this fits the rulings.** R404 and R435 e accept "the right result" for a reading under way, and the harness exempts the "after the last opening" points. So this is the accepted design, but its size is the whole file per open handle, not one chunk.
+- R386 a assumed that readers keep the ring's buffer, so that a wipe ends them. `openDecryptedHandle`'s copy is the exception (older than this task).
+- **For the coordinator's ruling:** whether the picture route should take the same per-read guard as the document route, or `openDecryptedHandle` should re-check the key per chunk.
+
+### 2. R487 a with R492 b and c (6f6b6c2, e85d767, d9923fd)
+
+**(i) No look while the card's own decision is out.**
+- `aria-disabled={busy}` and `onClick={() => busy || onLook(…)}`: the same state as the deciding controls.
+- The test does with Enter, Space and a click what my probe A did, and checks that nothing opens and no range is read.
+
+**(ii) A look whose file stops waiting.** The tests cover:
+- a decision recorded late (given up, then shown at the next read), then Close, with two cards: focus goes to the next card's `<h4>`;
+- the last found card while an import entry still waits: focus goes to the "Files found for records" heading;
+- nothing else waiting, then Escape: focus goes to "Nothing is waiting…";
+- a "not found" while the card still waits: focus goes to the card's live "Look at the file".
+
+In each case the reader is unmounted, its document destroyed and no range read afterwards. `LOOK_GONE` is said once, by moving focus to it.
+
+**What "the look now belongs to the screen" changed.**
+- `lookAt` is screen state now, so a re-read (`setItems(null)` unmounts the section) no longer closes the dialog.
+- A lock (`forget`) and another project or layout (`laidFor` key) still close it.
+- A card that leaves the queue for another reason (decided elsewhere, a re-read that no longer lists it) makes `lookGone` true, which gives the sentence and no reader. It cannot stay showing a file that is no longer waiting.
+
+**M-a (Minor): Close during a slow re-read loses focus.**
+- File: `ReviewQueue.tsx` `closeLook` and the `fileFocus` effect (around :963 and :797).
+- Probe P-gap:
+  1. Card A's "Use this file" is given up after 60 s while card B's look is open.
+  2. The re-read is held back.
+  3. Escape during it.
+- Result: focus goes to **BODY**, and is still BODY after the read lands.
+- Why: `closeLook` targets `look:B`, but B's card is not mounted during the re-read. The effect finds no control, returns, and nothing retries.
+- Narrow: it needs a given-up decision on another card and a Close inside the read's gap.
+- Direction: keep the target pending until the section is back, or fall back to the screen's heading.
+
+**Probe P-lock.**
+- The re-read answers 423. `forget` closes the look and the screen shows the unlock form; focus goes to BODY.
+- This matches the queue's behaviour on a lock without a look: neither `UnlockProject` nor `forget` places focus.
+- So it is not caused by this round. I note it only.
+
+### 3. R487 b, c, d, e
+- **b:** `LOOK_NO_TEXT_SENTENCE` is shown only in a look (`PdfPages.tsx:70`, `:606`). Outside a look the reader's sentence is unchanged; `PdfPages.test.tsx` passes.
+- **c:** `LOOK_GONE` is one constant with the ruled words, and the old words appear nowhere.
+- **d:** both comments are back on their own declarations.
+- **e, the service test:** it now asserts `aborted`, that the bytes are the file's own prefix, and that the marker at 4 MiB − 4096 never arrives. By reading, together with my probe that an open handle outlives a wipe, removing the guard lets the whole range through, so the test fails. The RE-7h report shows that run.
+- **e, the harness row:** the eager-key run is the probe above.
+
+### 4. What I approved before
+- A look still writes and attaches nothing. The service test hashes the whole library before and after and compares the audit; it passed.
+- The route's refusals pass unchanged: 404, 423, 400 and 416, and the token, Host and Origin checks.
+- `documents-route` and `media` pass unchanged.
+
+### Minor
+- **M-a:** focus is lost to the page when a look is closed during a slow re-read (above).
+- **M-b:** `keyAtOpening`'s comment claims more than holds. "Not one byte of the file's content is read under it" is true only for a lock asked before or at the opening. After the opening, the whole file stays readable through the handle (see "The window left").
+- **M-c:** a re-keyed picture (or document) answers 423 "locked". This is older than this round and unchanged by it, but R435 d says "only a lock is locked". For the coordinator, outside RE-7c.
