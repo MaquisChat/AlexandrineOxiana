@@ -5877,10 +5877,15 @@ describe("F15: a fetch through the researcher's library", () => {
         const p = await project();
         const r = runner();
         const view = async (q: Project = p) => libraryChancesOf(repo, q.id, (await queue(q)).values(), { access: null, atWork: (id) => r.atWork(q.id, id) });
-        const withFile = await restingWithLink(p);
+        // R503 g (FR-728): a resting entry whose record had a file at the queue's opening is moved to "in your library"
+        // by the opening's pass (its one write); it marks the pass's end.
         const mine = join(tmp, "f18c-mine.pdf");
         await writeFile(mine, await buildPdf({ title: "Mine", lines: ["Mine"] }));
-        await addCapturedOriginal(repo, p.id, withFile.sourceId!, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+        const attach = (e: FindEntry) => addCapturedOriginal(repo, p.id, e.sourceId!, { fromPath: mine, kind: "pdf", ext: "pdf", mime: "application/pdf", label: "mine" }, "manual_upload");
+        const atOpening = await restingWithLink(p);
+        await attach(atOpening);
+        // R510 M5: one whose file is attached AFTER the opening (mid-session) stays resting — and is offered no link start.
+        const withFile = await restingWithLink(p);
         const sid = await record(p);
         const waitingFor = await restingWithLink(p, RESTING[1]!, sid);
         await resting(p, { state: "needs-check", reason: { code: "file-title-absent" } }, sid);
@@ -5889,11 +5894,11 @@ describe("F15: a fetch through the researcher's library", () => {
         settingsFn = () => new Promise(() => {}); // the copy part waits on the settings: the entry stays at work
         r.resume(p.id);
         await until(() => r.atWork(p.id, atWork.id), "the entry to be at work");
-        // R503 g (FR-728): the opening's pass finds the file of the entry with one, and it rests in your library.
-        await until(async () => (await entryOf(p, withFile.id))?.state === "in-library", "the entry with a file to rest in your library");
+        await until(async () => (await entryOf(p, atOpening.id))?.state === "in-library", "the opening's pass to end");
+        await attach(withFile);
+        expect((await entryOf(p, withFile.id))!.state).toBe(withFile.state);
         const v = await view();
-        expect(v.get(withFile.id)?.link).toBeUndefined();
-        for (const e of [waitingFor, atWork]) expect(v.get(e.id)!.link, e.typed).toBeUndefined();
+        for (const e of [withFile, waitingFor, atWork]) expect(v.get(e.id)!.link, e.typed).toBeUndefined();
         expect(v.get(plain.id)!.link).toBe(true);
         // The rules forbid free copies: none (and the start is refused in its own words).
         const q = await project({ gov: NO_FREE });
