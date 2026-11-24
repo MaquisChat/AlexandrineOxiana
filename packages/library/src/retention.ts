@@ -748,9 +748,8 @@ async function settleRun(repo: Repo, hold: MaintenanceHold, projectId: string, a
   const before = act ? await retentionRetry(repo, key) : undefined;
   let rec = before;
   if (act && opts.retry) {
-    // This attempt, for the back-off: written once the attempt ends — with its outcome, or as it is when the attempt
-    // fails — and NOT when the library's close cut it (R554: the retry record stays as it was, so the next opening
-    // tries again; a closed library's state file is not written, R555 4).
+    // Noted before anything is tried, so the back-off holds even if this attempt cannot be recorded — and an attempt
+    // that brings the app down is not made again at once at every opening (R147, R558 c): a crash leaves the stamp.
     rec = {
       firstFailedAt: before?.firstFailedAt ?? a.amendments[0]?.at ?? at,
       lastAttemptAt: at,
@@ -758,12 +757,14 @@ async function settleRun(repo: Repo, hold: MaintenanceHold, projectId: string, a
       attemptsSinceRecord: (before?.attemptsSinceRecord ?? 0) + 1,
       ...(before?.lastFreshAt ? { lastFreshAt: before.lastFreshAt } : {}),
     };
+    await setRetentionRetry(repo, key, rec).catch(() => {});
   }
   try {
     return await settleAttempt();
   } catch (err) {
-    // An attempt that failed counts for the back-off, even though it could not be recorded; a cut one does not (R554).
-    if (!(err instanceof StepCutByClose) && !(err instanceof SimulatedCrash) && rec !== before) await setRetentionRetry(repo, key, rec).catch(() => {});
+    // R554, R558 c: an attempt cut by the library's close does not count: the record is put back to what it was. This
+    // write belongs to the step, which the close waits for (R558 a), so it lands before the lock is released.
+    if (err instanceof StepCutByClose && rec !== before) await setRetentionRetry(repo, key, before).catch(() => {});
     throw err;
   }
 
@@ -858,6 +859,7 @@ async function settleRun(repo: Repo, hold: MaintenanceHold, projectId: string, a
     const changed = removed.length > 0 || gone.length > 0 || elsewhere.size > 0 || notHolding.length > 0 || freshMade !== undefined;
     if (!changed && (!act || !first)) {
       if (!act || !rec) return undefined;
+      const noted = rec;
       // A retry that changed nothing: no amendment, no audit event, except one summary a day.
       if (now.getTime() - Date.parse(rec.lastRecordedAt) >= DAY_MS) {
         await appendLibraryEvent(repo, projectId, "retention.backups", {
@@ -878,7 +880,7 @@ async function settleRun(repo: Repo, hold: MaintenanceHold, projectId: string, a
         rec = { ...rec, lastRecordedAt: at, attemptsSinceRecord: 0 };
       }
       if (freshTried) rec = { ...rec, lastFreshAt: at };
-      if (rec !== before) await setRetentionRetry(repo, key, rec).catch(() => {});
+      if (rec !== noted) await setRetentionRetry(repo, key, rec).catch(() => {});
       return undefined;
     }
 

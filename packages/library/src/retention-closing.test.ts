@@ -17,7 +17,7 @@ import type { AuditEvent, Project, SourceFile } from "@ao/core";
 import { KeyRing } from "./crypto/keys.js";
 import { shredSeams } from "./fs/shred.js";
 import { openLibrary, type Library } from "./library.js";
-import { openTestRepo } from "./repo/testing.js";
+import { SimulatedCrash, openTestRepo } from "./repo/testing.js";
 import type { Repo } from "./repo/repo.js";
 import { backupFailure, backupProject, backupSeams, restoreBackup, type BackupResult } from "./export/backup.js";
 import { addSource, makeKit, makeProject, scratchFile, walk, type Kit } from "./export/test-kit.js";
@@ -29,6 +29,8 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   backupSeams.afterSnapshot = undefined;
+  backupSeams.crashAt = undefined;
+  backupSeams.failBackup = false;
   shredSeams.failFor = undefined;
   await kit.close().catch(() => {});
 });
@@ -76,6 +78,9 @@ async function stateFile(): Promise<{ failures: Record<string, unknown>; retries
     return { failures: {}, retries: {} };
   }
 }
+
+/** The backups state file's bytes, or "<none>" when there is none. */
+const stateBytes = () => readFile(join(kit.lib.root, "Backups", "backups-state.json"), "utf8").catch(() => "<none>");
 
 /** The project's audit events, read from its folder (no repository needed). */
 async function events(p: Project): Promise<AuditEvent[]> {
@@ -364,5 +369,91 @@ describe("a destruction's backups step cut by the library's close (FR-749, R554)
     const rec = await readDestruction(again.repo, copy, r.certificatePath.slice(r.certificatePath.lastIndexOf("/") + 1));
     expect(rec).toMatchObject({ status: "no-longer-present", outstanding: [] });
     expect((rec.certificate!.backups as { deleted: string[] }).deleted).toEqual([]);
+  });
+});
+
+/**
+ * R558 c: the retry record's stamp of an attempt (`lastAttemptAt`, the count) is written BEFORE the attempt, so that an
+ * attempt that brings the app down does not bring it down again at every opening (the back-off holds). When the
+ * library's closing cuts the attempt, the record is put back to what it was, in the close's wait; a crash between the
+ * two leaves the stamp.
+ */
+describe("the retry record's stamp of an attempt (FR-749, R558 c)", () => {
+  /** A destruction whose listed backup X could not be removed: recorded, with a retry record. */
+  async function stuck(freshFails = false): Promise<{ p: Project; x: BackupResult; certificatePath: string; key: string }> {
+    const { p, sf, backups } = await withBackups(1);
+    const [x] = backups as [BackupResult];
+    shredSeams.failFor = (path) => path.endsWith(`/${nameOf(x)}`);
+    // With `freshFails`, the destruction's own fresh backup could not be made either (R138 e): a retry tries it again.
+    backupSeams.failBackup = freshFails;
+    const r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    shredSeams.failFor = undefined;
+    expect(r.status).toBe("pending");
+    const keys = Object.keys((await stateFile()).retries);
+    expect(keys).toHaveLength(1);
+    return { p, x, certificatePath: r.certificatePath, key: keys[0]! };
+  }
+
+  it("an attempt that crashes the app leaves its stamp on disk: the next opening's pass is not due at once, and an attempt that crashes every time is not made at every opening", async () => {
+    const { p, x, certificatePath, key } = await stuck();
+    kit.clock.now = new Date(kit.clock.now.getTime() + HOUR);
+    const crashedAt = kit.clock.now.toISOString();
+    // X still cannot be removed, and the app goes down before anything is recorded: every time it is tried.
+    shredSeams.failFor = (path) => path.endsWith(`/${nameOf(x)}`);
+    backupSeams.crashAt = "before-removal-record";
+    await expect(resumeDestruction(kit.repo, p.id)).rejects.toBeInstanceOf(SimulatedCrash);
+    const rec = (await stateFile()).retries[key] as { lastAttemptAt?: string; attemptsSinceRecord: number };
+    expect(rec.lastAttemptAt).toBe(crashedAt);
+    expect(rec.attemptsSinceRecord).toBe(1);
+    // The next openings, a minute apart: the attempt is not due, so it is not made (and does not bring the app down).
+    for (let i = 0; i < 2; i++) {
+      kit.clock.now = new Date(kit.clock.now.getTime() + 60_000);
+      backupSeams.crashAt = "before-removal-record";
+      const again = await kit.reopen();
+      expect(await resumeDestruction(again, p.id)).toEqual([]);
+      expect(existsSync(x.path)).toBe(true);
+    }
+    // Once the back-off has passed, it is tried again; X can be removed now and the step completes.
+    backupSeams.crashAt = undefined;
+    shredSeams.failFor = undefined;
+    kit.clock.now = new Date(Date.parse(crashedAt) + HOUR);
+    expect(await resumeDestruction(kit.repo, p.id)).toEqual([certificatePath]);
+    expect(existsSync(x.path)).toBe(false);
+    expect(await readDestruction(kit.repo, p.id, certificatePath)).toMatchObject({ status: "deleted", outstanding: [] });
+    expect(Object.keys((await stateFile()).retries)).toEqual([]);
+  });
+
+  it("a retry pass whose fresh backup is cut by the close: the state file is byte for byte as it was, nothing changes after close(), and the next opening's pass is due at once and completes the step", async () => {
+    const { p, x, certificatePath } = await stuck(true);
+    // A day later: the retry makes a fresh backup first (at most once a day), held here, and the library closed.
+    kit.clock.now = new Date(kit.clock.now.getTime() + 25 * HOUR);
+    const bytesBefore = await stateBytes();
+    const zipsBefore = await zips();
+    const stepsBefore = (await stepEvents(p)).length;
+    const h = hold();
+    backupSeams.afterSnapshot = h.seam;
+    let closing: Promise<void> | undefined;
+    const began = h.inside.then(() => {
+      closing = kit.lib.close();
+      h.release();
+    });
+    const result = await settle(resumeDestruction(kit.repo, p.id), () => closing, began);
+    expect(result).toEqual({ ok: [] });
+    expect(await stateBytes()).toBe(bytesBefore);
+    expect(await zips()).toEqual(zipsBefore);
+    expect(existsSync(x.path)).toBe(true);
+    // Nothing of the step recorded (the fresh backup's own decision is audited as a cancelled backup's is, R551 I2).
+    expect((await stepEvents(p)).length).toBe(stepsBefore);
+
+    // The next opening, a minute later: the record is as it was, so the pass is due at once and completes the step.
+    backupSeams.afterSnapshot = undefined;
+    kit.clock.now = new Date(kit.clock.now.getTime() + 60_000);
+    const again = await openAgain();
+    expect(await resumeDestruction(again.repo, p.id)).toEqual([certificatePath]);
+    expect(existsSync(x.path)).toBe(false);
+    const rec = await readDestruction(again.repo, p.id, certificatePath);
+    expect(rec).toMatchObject({ status: "deleted", outstanding: [] });
+    expect(Object.keys((await stateFile()).retries)).toEqual([]);
   });
 });
