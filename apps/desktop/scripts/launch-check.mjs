@@ -199,6 +199,43 @@ export function quitEventVerdict({ reached, osascript }) {
   return { problem: `the quit Apple event was sent (osascript: ${osascript?.ok ? "answered" : said}) but the shell neither took the quit nor exited` };
 }
 
+/** How long B (and Q, where it stops the app that way) waits for the shell to end after SIGTERM. */
+export const SIGTERM_STOP_LIMIT_MS = 120_000;
+
+/**
+ * What is wrong with a stop by SIGTERM (scenario B, and Q where its quit could not be judged): how the wait
+ * for the shell's exit ended (`exit`: {code, signal}, or {code: "timeout"}) and the helpers' stop line.
+ */
+export function sigtermStopProblems(exit, events) {
+  const p = [];
+  if (exit?.code === "timeout") p.push(`the shell did not end within ${SIGTERM_STOP_LIMIT_MS / 1000} s of SIGTERM`);
+  const stopped = events.find((e) => e.kind === "stopped");
+  if (!stopped) p.push("the helpers were not reported stopped");
+  else if (stopped.how !== "clean") p.push(`the helpers were stopped ${stopped.how}, not cleanly`);
+  return p;
+}
+
+/**
+ * Q once its quit could not be judged (`verdict`, from `quitEventVerdict`) and the app was stopped by SIGTERM
+ * instead, as B stops it (`stopProblems`: what B's checks found; M1, R511): the skip stands only when that
+ * stop passed them. An app that did not end cleanly then fails, because it may hang at the quit (the quit
+ * hook blocking the main thread would look exactly like an event that got no answer). A verdict that judged
+ * the app, or found a problem, is returned as it is.
+ */
+export function skippedQuitVerdict(verdict, stopProblems) {
+  if (!verdict.skip || !stopProblems.length) return verdict;
+  return { problem: `the app neither answered the quit Apple event nor ended cleanly on SIGTERM afterwards: it may hang at the quit (${verdict.skip}; ${stopProblems.join("; ")})` };
+}
+
+/** Whether the shell printed anything after the quit event was sent (its output lines and standard error since then), for a skip's note. */
+export function printedAfterEvent(lines, err) {
+  const n = lines.length;
+  const e = String(err ?? "").length;
+  const errPart = e ? `${e} character${e === 1 ? "" : "s"} on its standard error` : "";
+  if (!n) return e ? `the shell printed nothing on its output after the event was sent, and ${errPart}` : "the shell printed nothing after the event was sent";
+  return `the shell printed ${n} line${n === 1 ? "" : "s"} after the event was sent (the last: ${JSON.stringify(lines[n - 1].slice(0, 200))})${e ? `, and ${errPart}` : ""}`;
+}
+
 /** What is wrong with a quit that should have gone the orderly way (the events of the run, the shell's exit code). */
 export function orderlyQuitProblems(events, code) {
   const p = [];
@@ -1090,6 +1127,24 @@ async function assertGone(label, pids, marker, problems, ms = 30_000) {
   }
 }
 
+/**
+ * Stops the shell with SIGTERM and checks the stop as scenario B does (M1, R511: Q uses the same code where
+ * its quit could not be judged): the shell ends within the limit, the helpers stop cleanly, no helper
+ * process is left. Prints each check; returns what was wrong (also killing anything left).
+ */
+async function stopBySigterm(run, label, shellPid, helpers, dir) {
+  const problems = [];
+  try {
+    process.kill(shellPid, "SIGTERM");
+  } catch {}
+  const exit = await Promise.race([run.exit, sleep(SIGTERM_STOP_LIMIT_MS).then(() => ({ code: "timeout" }))]);
+  const sp = sigtermStopProblems(exit, run.events);
+  report(`${label}: an orderly stop`, sp.length === 0, `${MAC ? "" : "xvfb-run "}exit ${exit.code ?? exit.signal}, stop ${run.find("stopped")?.how ?? "not reported"}${sp.length ? `: ${sp.join("; ")}` : ""}`) || problems.push(...sp.map((x) => `${label}: ${x}`));
+  closingWindowNote(run);
+  await assertGone(label, helpers, dir, problems);
+  return problems;
+}
+
 /** A D-Bus session bus for the run (Linux: the keychain and the web view use it); none on a Mac. */
 function startBus() {
   if (MAC) return { proc: undefined, address: Promise.resolve(undefined) };
@@ -1289,16 +1344,14 @@ async function main() {
       const run = startShell(env, label);
       try {
         const { svc, helpers } = await upAndProbed(run, media, problems);
-        process.kill(svc.shell, signal);
-        const { code, signal: sig } = await Promise.race([run.exit, sleep(120_000).then(() => ({ code: "timeout" }))]);
         if (signal === "SIGTERM") {
-          const stopped = run.find("stopped");
-          report(`${label}: an orderly stop`, stopped?.how === "clean", `xvfb-run exit ${code ?? sig}, stop ${stopped?.how ?? "not reported"}`) || problems.push(`${label}: not orderly`);
-          closingWindowNote(run);
+          problems.push(...(await stopBySigterm(run, label, svc.shell, helpers, dir)));
         } else {
+          process.kill(svc.shell, signal);
+          const { code, signal: sig } = await Promise.race([run.exit, sleep(120_000).then(() => ({ code: "timeout" }))]);
           report(`${label}: the shell is gone`, !running(svc.shell), `xvfb-run exit ${code ?? sig}`);
+          await assertGone(label, helpers, dir, problems);
         }
-        await assertGone(label, helpers, dir, problems);
       } finally {
         if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
       }
@@ -1443,13 +1496,19 @@ async function main() {
         const run = startShell(env, label);
         const exited = () => run.child.exitCode !== null || run.child.signalCode !== null;
         try {
-          const { helpers } = await upAndProbed(run, media, problems);
+          const { svc, helpers } = await upAndProbed(run, media, problems);
+          // M1 (R511): the app is then stopped the orderly way the check can use, SIGTERM, and that stop is
+          // checked exactly as B checks it; the skip stands only when it passed (`skippedQuitVerdict`).
           const skip = async (why) => {
+            const stop = await stopBySigterm(run, `${label}, stopped by SIGTERM instead`, svc.shell, helpers, dir);
+            problems.push(...stop);
+            const v = skippedQuitVerdict({ skip: why }, stop);
+            if (v.problem) {
+              report(`${label}: the app ended after the quit could not be judged`, false, v.problem);
+              return;
+            }
             skipped = why;
             process.stdout.write(`launch-check: note ${label}: not checked: ${why}\n`);
-            // The app is stopped the orderly way the check can use (SIGTERM, as B).
-            if (!exited()) process.kill(run.child.pid, "SIGTERM");
-            await Promise.race([run.exit, sleep(120_000)]);
           };
           const notRunning = appRunningSkip(await runCappedAsync("osascript", scripts.running, { timeout: 20_000 }));
           if (notRunning) {
@@ -1457,6 +1516,7 @@ async function main() {
             continue;
           }
           const closeAt = performance.now();
+          const [linesAtEvent, errAtEvent] = [run.lines.length, run.log().length];
           const sent = await runCappedAsync("osascript", scripts.quit, { timeout: QUIT_EVENT_LIMIT_MS });
           const reached = await until("the shell to take the quit", 20_000, async () => !!run.find("quit") || exited()).then(
             () => true,
@@ -1464,7 +1524,10 @@ async function main() {
           );
           const verdict = quitEventVerdict({ reached, osascript: sent });
           if (verdict.skip) {
-            await skip(verdict.skip);
+            // Whether the shell said anything after the event (read before SIGTERM makes it print its stop).
+            // (Its standard error is kept to its last 200,000 characters: after such a cut the count is approximate.)
+            const printed = printedAfterEvent(run.lines.slice(linesAtEvent), run.log().slice(Math.min(errAtEvent, run.log().length)));
+            await skip(`${verdict.skip}; ${printed}`);
             continue;
           }
           if (verdict.problem) {

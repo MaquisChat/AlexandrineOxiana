@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { appleEventScripts, appRunningSkip, bundleIdOf, orderlyQuitProblems, QUIT_EVENT_LIMIT_MS, quitEventVerdict, appProcesses, capLines, CLOSING_WINDOW_TITLE, closingWindowProblems, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
+import { appleEventScripts, appRunningSkip, printedAfterEvent, sigtermStopProblems, skippedQuitVerdict, SIGTERM_STOP_LIMIT_MS, bundleIdOf, orderlyQuitProblems, QUIT_EVENT_LIMIT_MS, quitEventVerdict, appProcesses, capLines, CLOSING_WINDOW_TITLE, closingWindowProblems, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -783,6 +783,36 @@ describe("scenario Q: quit by Apple event (a Mac only; FR-731, R503 h)", () => {
       assert.equal(v.skip, undefined);
       assert.match(v.problem, /neither took the quit nor exited/, JSON.stringify(osascript));
     }
+  });
+
+
+  // M1 (R511): a skip after the quit event is never "not checked" for an app that hangs at the quit.
+  it("judges a stop by SIGTERM as B does: the shell ended within the limit, the helpers stopped cleanly", () => {
+    const clean = [{ kind: "stopped", how: "clean" }];
+    assert.deepEqual(sigtermStopProblems({ code: 0, signal: null }, clean), []);
+    assert.deepEqual(sigtermStopProblems({ code: null, signal: "SIGTERM" }, clean), []);
+    assert.deepEqual(sigtermStopProblems({ code: "timeout" }, []), [`the shell did not end within ${SIGTERM_STOP_LIMIT_MS / 1000} s of SIGTERM`, "the helpers were not reported stopped"]);
+    assert.deepEqual(sigtermStopProblems({ code: 0 }, [{ kind: "stopped", how: "forced" }]), ["the helpers were stopped forced, not cleanly"]);
+  });
+
+  it("keeps a skip only when the app then ended cleanly on SIGTERM; an app that does not end fails (it may hang at the quit); an answer is judged as before", () => {
+    const noAnswer = quitEventVerdict({ reached: false, osascript: { ok: false, out: "", reason: "timed out after 30 s", timedOut: true } });
+    assert.deepEqual(skippedQuitVerdict(noAnswer, []), noAnswer, "no answer, and the shell ends cleanly on SIGTERM: skipped, its checks passed");
+    const hung = skippedQuitVerdict(noAnswer, ["Q (quit by Apple event), stopped by SIGTERM instead: the shell did not end within 120 s of SIGTERM"]);
+    assert.equal(hung.skip, undefined);
+    assert.match(hung.problem, /^the app neither answered the quit Apple event nor ended cleanly on SIGTERM afterwards: it may hang at the quit \(osascript had no answer.*; .*did not end within 120 s of SIGTERM\)$/);
+    for (const v of [{ check: true }, { problem: "the quit Apple event was sent (osascript: answered) but the shell neither took the quit nor exited" }]) {
+      assert.deepEqual(skippedQuitVerdict(v, []), v);
+      assert.deepEqual(skippedQuitVerdict(v, ["x"]), v);
+    }
+  });
+
+  it("says whether the shell printed anything after the quit event was sent", () => {
+    assert.equal(printedAfterEvent([], ""), "the shell printed nothing after the event was sent");
+    assert.equal(printedAfterEvent(["AO_SHELL_QUIT orderly"], ""), 'the shell printed 1 line after the event was sent (the last: "AO_SHELL_QUIT orderly")');
+    assert.equal(printedAfterEvent(["a", "b"], "oops\n"), 'the shell printed 2 lines after the event was sent (the last: "b"), and 5 characters on its standard error');
+    assert.equal(printedAfterEvent([], "x"), "the shell printed nothing on its output after the event was sent, and 1 character on its standard error");
+    assert.equal(printedAfterEvent(["y".repeat(500)], "").length < 300, true);
   });
 
   const ev = (...kinds) => kinds.map((k) => (typeof k === "string" ? { kind: k } : k));
