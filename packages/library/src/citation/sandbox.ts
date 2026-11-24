@@ -12,7 +12,14 @@
  *   - starting a worker and building its engine for a language has `startTimeoutMs` (10 s); each
  *     render `renderTimeoutMs` (5 s), counted from when the worker begins that render (time spent
  *     waiting for a free worker does not count);
- *   - a heap cap of `maxHeapMb` (256 MB) per worker;
+ *   - a heap cap of `maxHeapMb` (256 MB) per worker, given to the worker as `resourceLimits`. A
+ *     process-wide `--max-old-space-size` (on the command line or in NODE_OPTIONS) overrides it:
+ *     where such a setting is given, every worker's cap is that setting, whatever `maxHeapMb` says
+ *     (tried with Node 22: 64 or 512 gives every worker that cap, for a `maxHeapMb` of 16, 256 or
+ *     1024; R503 k, FR-740). The desktop app starts the service with `--max-old-space-size=512`
+ *     (its memory ceiling, src-tauri/src/service.rs), so in the app a worker's cap is 512 MB: a
+ *     style that allocates without end still ends only its worker ("resources"), later than at
+ *     256 MB. The render time limit holds whatever the setting;
  *   - on a timeout, a heap overrun or an error the worker is terminated (the next render gets a
  *     fresh one).
  * Every failure is a SandboxError (`reason`: timeout, resources, or error — the last is

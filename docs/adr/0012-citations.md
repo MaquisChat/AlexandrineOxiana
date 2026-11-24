@@ -61,7 +61,8 @@ These follow the CSL convention the styles expect (R87):
 - **Imported styles.** These are untrusted, and citeproc-js has no limits of its own. They are never rendered in-process: core throws `CustomStyleSandboxError`.
   - `@ao/library` renders them in a pool of `worker_threads` workers (R89). At most 2 run at once, and further renders wait their turn.
   - Each style keeps one warm worker, whose engine is reused with fresh state for every render. A warm worker is ended after 60 s idle, or when its slot is needed for another style.
-  - Limits: 10 s to start a worker and build its engine; 5 s per render, counted from when the worker begins it; 256 MB of heap.
+  - Limits: 10 s to start a worker and build its engine; 5 s per render, counted from when the worker begins it; a heap cap of 256 MB.
+  - The heap cap is overridden by a process-wide Node memory setting (`--max-old-space-size`, on the command line or in `NODE_OPTIONS`): where one is set, every worker's real cap is that setting, whatever the sandbox asks for (R503 k, FR-740). The desktop app starts the service with `--max-old-space-size=512`, the service's memory ceiling, so in the app the cap is 512 MB; a style that allocates without end still ends only its worker, later than at 256 MB. The time limits always hold.
   - A timeout, a heap overrun or an error ends the worker.
   - This covers the import probe, every render with an imported style, and files dropped into `styles/` by hand (checked when listed).
   - A verdict on a dropped file is remembered by sha256 only when it is deterministic: usable, too complex, or refused by citeproc. A timeout is never remembered.

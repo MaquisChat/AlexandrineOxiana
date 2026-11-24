@@ -1,8 +1,10 @@
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { fileURLToPath } from "node:url";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
 import { CustomStyleSandboxError, renderBibliography, type CslItem, type Project } from "@ao/core";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -24,7 +26,7 @@ import {
   renderBibliographyIn,
   renderCitationIn,
 } from "./custom-styles.js";
-import { SandboxError, configureSandbox, renderInSandbox, sandboxStats, shutdownSandbox } from "./sandbox.js";
+import { SandboxError, configureSandbox, renderInSandbox, sandboxStats, shutdownSandbox, type SandboxRequest } from "./sandbox.js";
 import { ResourceMissingError, sourceResolver, useResolverForTests } from "../resources.js";
 
 const HAVE_BUNDLE = bundleAvailable();
@@ -231,6 +233,80 @@ function fanOut(depth: number, fan = 2): string {
   return style({ id: `http://www.zotero.org/styles/fan-${depth}`, body: `${macros.join("\n")}<citation><layout><text macro="m0"/></layout></citation><bibliography><layout><text macro="m0"/></layout></bibliography>` });
 }
 
+/** NODE_OPTIONS without its process-wide heap setting (FR-740): a `--max-old-space-size` there
+ *  overrides the heap cap the sandbox gives its worker; every other option is kept. */
+function withoutHeapSetting(nodeOptions: string | undefined): string {
+  return (nodeOptions ?? "").replace(/(^|\s)--max[-_]old[-_]space[-_]size(=|\s+)\S+/g, "").trim();
+}
+
+interface ChildRun {
+  /** How the first render ended: "rendered", or the SandboxError's name and reason. */
+  first: "rendered" | { name: string; reason?: string };
+  /** The second render's output: the process can render again after the first. */
+  again: string;
+  /** The child's own heap limit and options, to show which setting it ran under. */
+  heapLimitMb: number;
+  execArgv: string[];
+  nodeOptions: string;
+}
+
+/**
+ * Runs two renders in the sandbox of a CHILD Node process started with `execArgv` and this
+ * process's environment with the heap setting removed from NODE_OPTIONS (FR-740): first `first`
+ * with `opts`, then `again` with the defaults. So the outcome depends on the setting given here,
+ * never on the machine's NODE_OPTIONS.
+ */
+async function sandboxInChild(execArgv: string[], first: SandboxRequest, opts: { maxHeapMb?: number; timeoutMs?: number }, again: SandboxRequest): Promise<ChildRun> {
+  const dir = await mkdtemp(join(tmpdir(), "ao-sandbox-child-"));
+  onTestFinished(() => rm(dir, { recursive: true, force: true }));
+  const input = join(dir, "input.json");
+  await writeFile(input, JSON.stringify({ first, opts, again }));
+  const script = join(dir, "child.mjs");
+  await writeFile(
+    script,
+    `import { readFileSync } from "node:fs";
+import { getHeapStatistics } from "node:v8";
+import { renderInSandbox, shutdownSandbox } from ${JSON.stringify(new URL("./sandbox.ts", import.meta.url).href)};
+const { first, opts, again } = JSON.parse(readFileSync(process.argv[2], "utf8"));
+const out = { heapLimitMb: getHeapStatistics().heap_size_limit / 2 ** 20, execArgv: process.execArgv, nodeOptions: process.env.NODE_OPTIONS ?? "" };
+try {
+  await renderInSandbox(first, opts);
+  out.first = "rendered";
+} catch (e) {
+  out.first = { name: e.name, reason: e.reason };
+}
+out.again = await renderInSandbox(again);
+await shutdownSandbox();
+console.log("AO_CHILD " + JSON.stringify(out));
+`,
+  );
+  const child = spawn(process.execPath, [...execArgv, "--import", "tsx", script, input], {
+    cwd: fileURLToPath(new URL("../..", import.meta.url)),
+    env: { ...process.env, NODE_OPTIONS: withoutHeapSetting(process.env.NODE_OPTIONS) },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  onTestFinished(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+  const code = await new Promise<number | null>((resolve) => child.once("exit", (c) => resolve(c)));
+  const line = stdout.split("\n").find((l) => l.startsWith("AO_CHILD "));
+  if (code !== 0 || !line) throw new Error(`the child process ended with ${code}: ${stderr.slice(-2000)}`);
+  return JSON.parse(line.slice("AO_CHILD ".length)) as ChildRun;
+}
+
+describe("withoutHeapSetting", () => {
+  it("removes only the process-wide heap setting from NODE_OPTIONS", () => {
+    expect(withoutHeapSetting("--use-openssl-ca --max-old-space-size=8192")).toBe("--use-openssl-ca");
+    expect(withoutHeapSetting("--max_old_space_size 8192 --trace-warnings")).toBe("--trace-warnings");
+    expect(withoutHeapSetting("--use-openssl-ca")).toBe("--use-openssl-ca");
+    expect(withoutHeapSetting(undefined)).toBe("");
+  });
+});
+
 describe.skipIf(!HAVE_BUNDLE)("R88 I3: imported styles cannot block or exhaust the process", () => {
   it("counts macro expansions with a memoised walk", () => {
     expect(macroExpansions(fanOut(3))).toBe(2 * (1 + 2 + 4 + 8));
@@ -291,14 +367,34 @@ describe.skipIf(!HAVE_BUNDLE)("R88 I3: imported styles cannot block or exhaust t
     // A render that always takes far longer than its 1 ms budget (a fan-out the static cap would
     // refuse), so the outcome never depends on machine load: the timeout fires first.
     await expect(renderInSandbox({ ...ok, styleXml: fanOut(22) }, { timeoutMs: 1 })).rejects.toMatchObject({ name: "SandboxError", reason: "timeout" });
-    // A heap cap: a style that builds ever longer output runs out of its (here 16 MB) heap.
+    // A heap cap: a style that builds ever longer output runs out of its (here 16 MB) heap. In a
+    // child process without a process-wide heap setting, which would override the cap (FR-740).
     const big = { ...ok, styleXml: fanOut(18), items: [{ id: "x", type: "book", title: "T".repeat(1000) }] };
-    await expect(renderInSandbox(big, { maxHeapMb: 16, timeoutMs: 15_000 })).rejects.toMatchObject({ name: "SandboxError", reason: "resources" });
+    const withLocale = { ...ok, locales: { "en-US": bundledCslLoader().localeXml("en-US")! } };
+    const capped = await sandboxInChild([], big, { maxHeapMb: 16, timeoutMs: 15_000 }, withLocale);
+    expect(capped.first).toEqual({ name: "SandboxError", reason: "resources" });
+    expect(capped.again).toBe("T");
     // A fan-out the static cap would refuse, run directly: the timeout ends it.
     const t = performance.now();
     await expect(renderInSandbox({ ...ok, styleXml: fanOut(22) }, { timeoutMs: 2000 })).rejects.toBeInstanceOf(SandboxError);
     expect(performance.now() - t).toBeLessThan(5000);
   }, 20_000);
+
+  it("under the app's own setting (the service's 512 MB ceiling) a render that needs too much memory ends only its worker, and the process renders again (FR-740)", async () => {
+    const ok = { styleXml: style(), locales: {}, lang: "en-US", format: "text" as const, kind: "bibliography" as const, items: [{ id: "x", type: "book", title: "T" }] };
+    const big = { ...ok, styleXml: fanOut(18), items: [{ id: "x", type: "book", title: "T".repeat(1000) }] };
+    // As the desktop shell starts the service (src-tauri/src/service.rs): the sandbox's own cap
+    // (256 MB) is overridden, so the worker's real cap is 512 MB. A generous time limit, so that the
+    // memory cap, not the clock, ends the render.
+    const withLocale = { ...ok, locales: { "en-US": bundledCslLoader().localeXml("en-US")! } };
+    const r = await sandboxInChild(["--max-old-space-size=512"], big, { timeoutMs: 90_000 }, withLocale);
+    expect(r.execArgv).toContain("--max-old-space-size=512");
+    expect(r.nodeOptions).not.toMatch(/max[-_]old[-_]space[-_]size/);
+    expect(r.heapLimitMb).toBeGreaterThanOrEqual(512);
+    expect(r.heapLimitMb).toBeLessThan(1024);
+    expect(r.first).toEqual({ name: "SandboxError", reason: "resources" });
+    expect(r.again).toBe("T");
+  }, 150_000);
 
   it("renders citations with a custom style in the sandbox, locators cleaned", async () => {
     const p = await project();

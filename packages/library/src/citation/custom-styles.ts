@@ -13,7 +13,8 @@
  *     independent style without `<citation>`; one whose macros would expand more than
  *     MAX_MACRO_EXPANSIONS calls (a memoised walk of the macro graph; self-calling macros too); one
  *     that does not render a probe citation and bibliography in the sandbox (sandbox.ts: a worker
- *     pool: warm workers, 5 s per render, 256 MB heap); a dependent style whose independent parent is not a
+ *     pool: warm workers, 5 s per render, a 256 MB heap cap that a process-wide memory setting
+ *     replaces: 512 MB in the desktop app, see sandbox.ts); a dependent style whose independent parent is not a
  *     bundled or imported independent style (R88 I3).
  *   - governed: evaluated as a `store` with no identifiable data and no location
  *     (authorizeProcessing; a deny is audited and thrown as PolicyDeniedError).
