@@ -147,8 +147,11 @@ export function ReaderStateView({ heading, sentence, focus = false, children }: 
 /** R470 b: a file to LOOK at only — its bytes by ranges from a route of its own (a held file). */
 export interface LookOnly {
   range(start: number, end: number, signal?: AbortSignal): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
-  /** Said when the file is no longer there (instead of the stored file's "missing" sentence). */
-  goneSentence: string;
+  /**
+   * Called once the file is no longer there ("not found", at the first range or in mid-look): the holder of the look
+   * stops showing it and says so in its own words (R487 a).
+   */
+  onGone(): void;
 }
 
 export interface ReaderScreenProps {
@@ -297,8 +300,9 @@ export function ReaderScreen({ api, projectId, sourceId, assetId: storedAssetId,
 
   const fail = useCallback((s: { state: ReaderStateKind; sentence: string }) => {
     attempts.current++;
-    const gone = lookRef.current?.goneSentence;
-    setPhase({ kind: "failed", ...s, ...(s.state === "missing" && gone ? { sentence: gone } : {}), attempt: attempts.current });
+    setPhase({ kind: "failed", ...s, attempt: attempts.current });
+    // R487 a: a look whose file is no longer there is ended by whoever holds it (its own sentence, not the source's).
+    if (s.state === "missing") lookRef.current?.onGone();
   }, []);
 
   /** A 423 while open (A11): locked, by the same path as a refused range (A7, A9): destroyed at once, never reused. */

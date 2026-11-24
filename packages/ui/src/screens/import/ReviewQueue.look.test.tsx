@@ -15,10 +15,10 @@ import { http, HttpResponse } from "msw";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReviewItem } from "../../api/import";
 import { LOOK_NO_TEXT_SENTENCE, NO_TEXT_SENTENCE } from "../../reader/PdfPages";
-import type { PdfHandle } from "../../reader/pdfjs";
+import { PdfOpenError, type PdfHandle } from "../../reader/pdfjs";
 import { BASE as SERVICE, mockService, P1, server, type ServiceSetup } from "../../test/importService";
 import { NO_PREVIEW } from "./FilePreview";
-import { LOOK_GONE, LOOK_ONLY_NOTICE, ReviewQueue } from "./ReviewQueue";
+import { DECIDE_SETTLE_MS, FOUND_FILES_TEXT, HELD_DECISION_TIMEOUT_MS, HELD_NO_ANSWER_TEXT, LOOK_GONE, LOOK_ONLY_NOTICE, ReviewQueue } from "./ReviewQueue";
 
 const openPdf = vi.hoisted(() => vi.fn());
 vi.mock("../../reader/pdfjs", async (importOriginal) => ({ ...(await importOriginal<typeof import("../../reader/pdfjs")>()), openPdf }));
@@ -205,17 +205,26 @@ describe("R470 b: looking at a held file before deciding", () => {
     expect(main.closest("[inert]")).not.toBeNull();
   });
 
-  it("the file no longer held: the reader says so in its own words; a project locked meanwhile: locked, never damaged", async () => {
-    for (const [status, code, heading, sentence] of [
-      [404, "NOT_FOUND", "File not found", LOOK_GONE],
-      [423, "PROJECT_LOCKED", "Project locked", "This project is locked. Unlock it in the library to read its files."],
-    ] as const) {
+  it("the file no longer held: the look's line says so in place of its notice; a project locked meanwhile: locked, never damaged", async () => {
+    // R487 a, c: "not found" at the first range: the file is not shown, the line says it can no longer be shown.
+    {
       const { user, look } = await openLook();
-      server.use(http.get(`${SERVICE}${HELD_DOC}`, () => HttpResponse.json({ error: { code, message: "x" } }, { status })));
+      server.use(http.get(`${SERVICE}${HELD_DOC}`, () => HttpResponse.json({ error: { code: "NOT_FOUND", message: "x" } }, { status: 404 })));
       await user.click(look);
       const dialog = await screen.findByRole("dialog");
-      expect(await within(dialog).findByRole("heading", { name: heading })).toBeTruthy();
-      expect(within(dialog).getByText(sentence)).toBeTruthy();
+      await waitFor(() => expect(within(dialog).getByText(LOOK_GONE)).toBeTruthy());
+      expect(within(dialog).queryByText(LOOK_ONLY_NOTICE)).toBeNull();
+      expect(within(dialog).queryByRole("heading", { name: "File not found" })).toBeNull();
+      expect(within(dialog).queryByRole("link")).toBeNull();
+      cleanup();
+    }
+    {
+      const { user, look } = await openLook();
+      server.use(http.get(`${SERVICE}${HELD_DOC}`, () => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "x" } }, { status: 423 })));
+      await user.click(look);
+      const dialog = await screen.findByRole("dialog");
+      expect(await within(dialog).findByRole("heading", { name: "Project locked" })).toBeTruthy();
+      expect(within(dialog).getByText("This project is locked. Unlock it in the library to read its files.")).toBeTruthy();
       // Nothing to go to from a look: the screen behind it unlocks the project itself.
       expect(within(dialog).queryByRole("link")).toBeNull();
       cleanup();
@@ -234,5 +243,169 @@ describe("R470 b: looking at a held file before deciding", () => {
     expect(within(c).queryByRole("button", { name: /Look at the file/u })).toBeNull();
     await act(async () => {});
     expect(requests.filter((r) => r.path.includes("held-file"))).toEqual([]);
+  });
+});
+
+/**
+ * R487 a (I1): a look and the card's own decision. (i) While the card's decision is out, "Look at the file" is busy as
+ * its two deciding controls are (announced unavailable, still focusable) and a press opens nothing. (ii) A file that
+ * stops waiting while it is looked at — a given-up decision the service recorded late (shown at the next read), or a
+ * "not found" in mid-look — is no longer shown: the reader goes (no range is read after), the notice is replaced by the
+ * sentence that it can no longer be shown, said once (focus moves to it; no live region), and on Close or Escape focus
+ * goes where the queue puts it after that card's decision (the next waiting file, else the card's heading) — never to
+ * the inert stand-in that took the Look control's place.
+ */
+describe("R487 a: a look and the card's own decision", () => {
+  const OTHER = "A Second Record";
+  beforeEach(() => void vi.useFakeTimers({ toFake: ["Date"] }));
+  afterEach(() => void vi.useRealTimers());
+  /** R319 d: the quiet at the screen's opening, passed. */
+  const passGuard = () => vi.setSystemTime(Date.now() + DECIDE_SETTLE_MS + 1);
+  const named = (title: string) => `${title} (Smith, 2020)`;
+  const use = (title: string) => screen.getByRole("button", { name: `Use this file for ${named(title)}` });
+  const lookAt = (title: string) => screen.getByRole("button", { name: `Look at the file for ${named(title)}` });
+  const heldReads = () => requests.filter((r) => r.path.endsWith("/held-file/document")).length;
+  /** Not inert and not hidden from assistive technology, itself or by an ancestor. */
+  const reachable = (el: Element) => el.closest("[inert], [aria-hidden='true']") === null;
+
+  it("(i) while the card's decision is out, “Look at the file” is busy like its two deciding controls, and a press opens nothing", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const o = setup([held(7, "pdf")]);
+    o.extra!.push(
+      http.post(`${SERVICE}/review/:itemId/held-file`, async () => {
+        await gate;
+        return HttpResponse.json({ decided: true });
+      }),
+    );
+    const m = mockService(o);
+    const user = userEvent.setup();
+    render(<ReviewQueue client={m.client} projectId={P1} />);
+    const look = await screen.findByRole("button", { name: `Look at the file for ${NAMED}` });
+    passGuard();
+    const u = use(RECORD);
+    fireEvent.click(u);
+    await waitFor(() => expect(u.getAttribute("aria-busy")).toBe("true"));
+    // The deciding controls' own busy state: announced as unavailable, never disabled (focus stays where it is).
+    expect(u.getAttribute("aria-disabled")).toBe("true");
+    expect(look.getAttribute("aria-disabled")).toBe("true");
+    expect((look as HTMLButtonElement).disabled).toBe(false);
+    await user.click(look);
+    look.focus();
+    await user.keyboard("{Enter}");
+    await user.keyboard(" ");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(look);
+    expect(heldReads()).toBe(0);
+    // The decision lands: the card is decided, its Look control replaced by the stand-in; still nothing was looked at.
+    release();
+    await waitFor(() => expect(within(card(RECORD)).queryByRole("button", { name: /Look at the file/u })).toBeNull());
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(heldReads()).toBe(0);
+  });
+
+  it("(ii) a given-up decision recorded late while the file is looked at: no longer shown, said once, and Close sends focus to the next waiting file", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const items = [held(7, "pdf"), held(8, "pdf", OTHER)];
+    let list = items;
+    const o = setup(items);
+    o.extra!.push(
+      http.get(`${SERVICE}/projects/:id/review`, () => HttpResponse.json({ items: list, total: list.length, offset: 0, limit: 500 })),
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ params }) => {
+        await gate;
+        // Recorded by the service, late: the file no longer waits.
+        list = list.filter((x) => x.id !== params.itemId);
+        return HttpResponse.json({ decided: true });
+      }),
+    );
+    const m = mockService(o);
+    const user = userEvent.setup();
+    render(<ReviewQueue client={m.client} projectId={P1} />);
+    await screen.findByRole("button", { name: `Look at the file for ${NAMED}` });
+    await screen.findByRole("button", { name: `Look at the file for ${named(OTHER)}` });
+    passGuard();
+    // "Use this file" with no answer in 60 seconds: given up, the card usable again (R313 e).
+    const t = Date.now();
+    vi.useRealTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    vi.setSystemTime(t);
+    try {
+      fireEvent.click(use(RECORD));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+    } finally {
+      vi.useRealTimers();
+      vi.useFakeTimers({ toFake: ["Date"] });
+    }
+    await waitFor(() => expect(within(card(RECORD)).getByText(HELD_NO_ANSWER_TEXT)).toBeTruthy());
+    const look = lookAt(RECORD);
+    expect(look.getAttribute("aria-disabled")).toBeNull();
+    // The look is opened FIRST.
+    await user.click(look);
+    const dialog = await screen.findByRole("dialog", { name: `Look at the file: ${RECORD}` });
+    await within(dialog).findByRole("toolbar", { name: "Reader" });
+    const handle = (await openPdf.mock.results[0]!.value) as PdfHandle;
+    // Then the service's late record shows at the next read: the card no longer waits.
+    release();
+    await waitFor(() => expect(within(card(RECORD)).getByText(FOUND_FILES_TEXT.gone)).toBeTruthy());
+    // The file is no longer shown; the notice is replaced by the sentence, said once (focus moves to it).
+    const note = await within(dialog).findByText(LOOK_GONE);
+    await waitFor(() => expect(document.activeElement).toBe(note));
+    expect(within(dialog).getAllByText(LOOK_GONE)).toHaveLength(1);
+    expect(within(dialog).queryByText(LOOK_ONLY_NOTICE)).toBeNull();
+    expect(within(dialog).queryByRole("toolbar", { name: "Reader" })).toBeNull();
+    expect(dialog.querySelector(".ao-reader-scroll, canvas")).toBeNull();
+    expect(dialog.querySelectorAll("[role=status], [role=alert], [aria-live]")).toHaveLength(0);
+    expect(handle.destroy).toHaveBeenCalled();
+    const reads = heldReads();
+    await new Promise((r) => setTimeout(r, 50));
+    // Close: focus goes where the queue puts it after this card's decision — the next waiting file's heading.
+    await user.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const next = card(OTHER).querySelector("h4")!;
+    await waitFor(() => expect(document.activeElement).toBe(next));
+    expect(reachable(document.activeElement!)).toBe(true);
+    expect(document.activeElement).not.toBe(look);
+    // No range was read once the file stopped waiting.
+    expect(heldReads()).toBe(reads);
+  });
+
+  it("(ii) a “not found” in mid-look: no longer shown, said once, and Escape sends focus to the card's heading when no other file waits", async () => {
+    let fail!: (e: PdfOpenError) => void;
+    let transport!: { requestDataRange(begin: number, end: number): void };
+    const destroy = vi.fn(async () => {});
+    openPdf.mockImplementation(async (o: { transport: typeof transport }) => {
+      transport = o.transport;
+      const failed = new Promise<PdfOpenError>((r) => (fail = r));
+      return { ...(fakeHandle() as unknown as Record<string, unknown>), failed, destroy } as unknown as PdfHandle;
+    });
+    const m = mockService(setup([held(7, "pdf")]));
+    const user = userEvent.setup();
+    render(<ReviewQueue client={m.client} projectId={P1} />);
+    const look = await screen.findByRole("button", { name: `Look at the file for ${NAMED}` });
+    look.focus();
+    await user.keyboard("{Enter}");
+    const dialog = await screen.findByRole("dialog");
+    await within(dialog).findByRole("toolbar", { name: "Reader" });
+    // In mid-look the held file is no longer there: a later range is refused "not found", and the document fails so.
+    server.use(http.get(`${SERVICE}${HELD_DOC}`, () => HttpResponse.json({ error: { code: "NOT_FOUND", message: "That file was not found." } }, { status: 404 })));
+    const before = heldReads();
+    transport.requestDataRange(2048, 4096);
+    await waitFor(() => expect(heldReads()).toBe(before + 1));
+    act(() => fail(new PdfOpenError("missing")));
+    const note = await within(dialog).findByText(LOOK_GONE);
+    await waitFor(() => expect(document.activeElement).toBe(note));
+    expect(within(dialog).getAllByText(LOOK_GONE)).toHaveLength(1);
+    expect(within(dialog).queryByText(LOOK_ONLY_NOTICE)).toBeNull();
+    expect(within(dialog).queryByRole("toolbar", { name: "Reader" })).toBeNull();
+    expect(within(dialog).queryByRole("heading", { name: "File not found" })).toBeNull();
+    expect(destroy).toHaveBeenCalled();
+    const reads = heldReads();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const head = card(RECORD).querySelector("h4")!;
+    await waitFor(() => expect(document.activeElement).toBe(head));
+    expect(reachable(document.activeElement!)).toBe(true);
+    expect(heldReads()).toBe(reads);
   });
 });

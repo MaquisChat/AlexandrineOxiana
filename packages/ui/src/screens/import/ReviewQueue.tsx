@@ -173,6 +173,9 @@ export const LOOK_TEXT = "Look at the file";
 export const LOOK_ONLY_NOTICE = "This file has not been added to your library. Use this file, or Not this file, in the review queue.";
 export const LOOK_GONE = "This file can no longer be shown. It is no longer waiting for your decision, or it can no longer be found on this computer.";
 
+/** R487 a: the focus target that means a card's own "Look at the file" (followed by the card's id). */
+const LOOK_BACK = "look:";
+
 /** What a look at held file `reviewId` reads with: the reader's calls (none made in a look) and the file's own ranges. */
 type LookFor = (reviewId: string) => { api: ReaderApi; range: LookOnly["range"] };
 
@@ -303,6 +306,9 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const heldBusyRef = useRef(new Set<string>());
   const [heldErrors, setHeldErrors] = useState<Readonly<Record<string, string>>>({});
   const [fileFocus, setFileFocus] = useState<{ to: string } | null>(null);
+  /** R470 b, R487 a: the waiting file being looked at, and the title its dialog shows (null when none is). */
+  const [lookAt, setLookAt] = useState<{ item: HeldItem; title: string } | null>(null);
+  const openLook = useCallback((item: HeldItem, title: string) => setLookAt({ item, title }), []);
   /**
    * R319: the found files' section as laid out (null until the queue is first read; again after a lock or for another
    * project). Its cards stay in their places for the whole visit: a decided file keeps its card, a file the service no
@@ -453,8 +459,9 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     setHeldErrors({});
     noticesRef.current = {};
     setHeldNotices({});
-    // Nothing of the found files' section outlives a lock: unlocked, it is laid out afresh.
+    // Nothing of the found files' section outlives a lock: unlocked, it is laid out afresh (and a look is closed).
     putLayout(null);
+    setLookAt(null);
     setStore(recordStore());
     setLocked(true);
   }, []);
@@ -471,6 +478,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     if (laidFor.current !== layoutKey) {
       laidFor.current = layoutKey;
       putLayout(null);
+      setLookAt(null);
     }
     setError(null);
     setItems(null);
@@ -732,6 +740,16 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
    * (the next in its group, else the one before it, else the first waiting card of the other group; decided and departed
    * cards are skipped), else to the section's heading while other entries wait, else to the message that nothing waits.
    */
+  /**
+   * The next WAITING card after `item` as laid out (the next in its group, else the one before it, else the first of the
+   * other group), by `waiting`; none when no other card waits.
+   */
+  const nextWaiting = (item: ReviewItem, waiting: (x: ReviewItem) => boolean): ReviewItem | undefined => {
+    const laidOut = laidRef.current?.items ?? [];
+    const mine = laidOut.filter((x) => looksRight(x) === looksRight(item));
+    const k = mine.findIndex((x) => x.id === item.id);
+    return mine.slice(k + 1).find(waiting) ?? mine.slice(0, Math.max(0, k)).reverse().find(waiting) ?? laidOut.filter((x) => looksRight(x) !== looksRight(item)).find(waiting);
+  };
   const fileLeft = (item: ReviewItem, end: FileEnd, said: (n: number) => string) => {
     const list = itemsRef.current ?? [];
     const at = list.findIndex((x) => x.id === item.id);
@@ -744,12 +762,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const layout = laidRef.current;
     const ended = { ...(layout?.ended ?? {}), [item.id]: end };
     const still = new Set(rest.map((x) => x.id));
-    const waiting = (x: ReviewItem) => still.has(x.id) && !ended[x.id];
-    const laidOut = layout?.items ?? [];
-    const mine = laidOut.filter((x) => looksRight(x) === looksRight(item));
-    const k = mine.findIndex((x) => x.id === item.id);
-    const next =
-      mine.slice(k + 1).find(waiting) ?? mine.slice(0, Math.max(0, k)).reverse().find(waiting) ?? laidOut.filter((x) => looksRight(x) !== looksRight(item)).find(waiting);
+    const next = nextWaiting(item, (x) => still.has(x.id) && !ended[x.id]);
     itemsRef.current = rest;
     if (layout) putLayout({ ...layout, ended });
     setItems(rest);
@@ -774,6 +787,12 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     if (!fileFocus) return;
     const t = fileFocus.to;
     // R313 a: a waiting file's heading, never a control that decides.
+    // R487 a: back to a card's own "Look at the file" (the control as it is now; never the stand-in, which has none).
+    const lookBack = t.startsWith(LOOK_BACK) ? fileCards.current.get(t.slice(LOOK_BACK.length))?.querySelector<HTMLElement>(".ao-review__file-look button:not([tabindex])") : undefined;
+    if (t.startsWith(LOOK_BACK)) {
+      if (lookBack && lookBack !== document.activeElement) lookBack.focus();
+      return;
+    }
     const el =
       t === ":empty" ? emptyNote.current : t === ":title" ? title.current : t === ":section" ? (foundHead.current ?? title.current) : (fileHeads.current.get(t) ?? title.current);
     el?.focus();
@@ -920,6 +939,30 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const listed = useMemo(() => (projectWide ? (items ?? []).filter((i) => !isFound(i)) : (items ?? [])), [items, projectWide]);
   /** R319: the waiting files the service lists now (by id); those not laid out have arrived during the visit. */
   const waitingIds = useMemo(() => new Set((items ?? []).filter(isFound).map((i) => i.id)), [items]);
+  /**
+   * R487 a (ii): the file looked at no longer waits — decided here, found decided, or no longer listed by the queue as
+   * last read (while the queue is being read again, it is not known yet).
+   */
+  const lookGone = !!lookAt && (!!laid?.ended[lookAt.item.id] || (items !== null && !waitingIds.has(lookAt.item.id)));
+  /**
+   * The look closed (its button or Escape). The file still waiting: focus back on its "Look at the file" (the dialog's
+   * own restore does the same, unless the queue was read again meanwhile and the control is a new one). The file gone:
+   * where the queue puts focus after that card's decision — the next waiting file's heading, else that card's heading —
+   * never the inert stand-in that took the control's place (R319).
+   */
+  const closeLook = (gone: boolean) => {
+    const at = lookAt;
+    setLookAt(null);
+    if (!at) return;
+    if (!gone) {
+      setFileFocus({ to: `${LOOK_BACK}${at.item.id}` });
+      return;
+    }
+    const listed = itemsRef.current ? new Set(itemsRef.current.map((x) => x.id)) : undefined;
+    const ended = laidRef.current?.ended ?? {};
+    const next = nextWaiting(at.item, (x) => x.id !== at.item.id && (!listed || listed.has(x.id)) && !ended[x.id]);
+    setFileFocus({ to: next ? next.id : at.item.id });
+  };
   const arrivedCount = useMemo(() => {
     const laidIds = new Set(laid?.items.map((i) => i.id));
     let k = 0;
@@ -1090,8 +1133,23 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           onPointedAt={(id) => notice(id, null)}
           onDecide={(i, d, how) => void decideHeld(i, d, how)}
           onShowArrived={layOutAgain}
-          lookFor={lookFor}
+          onLook={openLook}
+        />
+      )}
+      {/*
+       * R470 b, R487 a: the look is the screen's, not the card's: the found files' section is gone while the queue is read
+       * again, and the look must outlive that read to see what it says of the file.
+       */}
+      {!locked && lookAt && (
+        <LookDialog
+          key={lookAt.item.id}
+          title={lookAt.title}
           projectId={projectId}
+          sourceId={lookAt.item.sourceId ?? ""}
+          lookFor={lookFor}
+          reviewId={lookAt.item.id}
+          gone={lookGone}
+          onClose={closeLook}
         />
       )}
     </main>
@@ -1286,9 +1344,8 @@ interface FoundFilesProps {
   onPointedAt(id: string): void;
   onDecide(item: HeldItem, decision: HeldFileDecision, how: PressCheck): void;
   onShowArrived(): void;
-  /** R470 b: what a look at a held file reads with. */
-  lookFor: LookFor;
-  projectId: string;
+  /** R470 b: "Look at the file" pressed on a card. */
+  onLook(item: HeldItem, title: string): void;
 }
 
 /** What the app's check says of a file, in the app's own words; nothing for a `why` it does not have (R313 f). */
@@ -1317,7 +1374,7 @@ function describeRecord(item: HeldItem, record: SourceFile | undefined): string 
  * and stays). Files that arrive are only counted, on a line in a place kept for it above the groups (laid out whether
  * or not it says anything, so its appearing moves nothing); "Show them" lays the section out afresh.
  */
-function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, failed, notices, pointing, onPointedAt, headRef, cardRef, onDecide, onShowArrived, lookFor, projectId }: FoundFilesProps) {
+function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, failed, notices, pointing, onPointedAt, headRef, cardRef, onDecide, onShowArrived, onLook }: FoundFilesProps) {
   // Re-rendered when a record is read: the names depend on every waiting file's record.
   useSyncExternalStore(store.subscribe, store.version);
   const right = items.filter(looksRight);
@@ -1361,8 +1418,7 @@ function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, secti
               headRef={headRef}
               cardRef={cardRef}
               onDecide={onDecide}
-              lookFor={lookFor}
-              projectId={projectId}
+              onLook={onLook}
             />
           ))}
         </ul>
@@ -1423,9 +1479,8 @@ interface FileCardProps {
   headRef(id: string, el: HTMLHeadingElement | null): void;
   cardRef(id: string, el: HTMLElement | null): void;
   onDecide(item: HeldItem, decision: HeldFileDecision, how: PressCheck): void;
-  /** R470 b: what a look at the file reads with. */
-  lookFor: LookFor;
-  projectId: string;
+  /** R470 b: "Look at the file" pressed (with the title its dialog shows). */
+  onLook(item: HeldItem, title: string): void;
 }
 
 /** R322 b: the Creators and Year rows before the record is read, when it has none, and when it could not be read. */
@@ -1440,9 +1495,7 @@ export const RECORD_ROW_TEXT = { reading: "…", none: "—", unread: "This sour
  * "Removing this file…" and looks busy, the other looks unavailable; R318 b: the press renews the quiet); R313 b — a key held down never decides: a repeated keydown
  * (Enter or Space) is cancelled, and so is the click a browser makes of it.
  */
-const FileCard = memo(function FileCard({ item, store, named, end, unread, notice, pointing, onPointedAt, epoch, busy, error, headRef, cardRef, onDecide, lookFor, projectId }: FileCardProps) {
-  /** R470 b: the file is being looked at (the look-only reader open over the screen). */
-  const [looking, setLooking] = useState(false);
+const FileCard = memo(function FileCard({ item, store, named, end, unread, notice, pointing, onPointedAt, epoch, busy, error, headRef, cardRef, onDecide, onLook }: FileCardProps) {
   const h = item.heldFile;
   const record = useRecord(store, item.sourceId);
   const s = record?.source;
@@ -1590,14 +1643,15 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
             </p>
           ) : (
             <p>
-              <button type="button" aria-label={`${LOOK_TEXT} for ${named}`} onClick={() => setLooking(true)}>
+              {/* R487 a (i): while this file's own decision is out, busy as its two deciding controls are (aria-disabled,
+                  never disabled, so focus stays), and a press opens nothing. */}
+              <button type="button" aria-label={`${LOOK_TEXT} for ${named}`} aria-disabled={busy ? true : undefined} onClick={() => busy || onLook(item, recordTitle || "Untitled")}>
                 {LOOK_TEXT}
               </button>
             </p>
           )}
         </div>
       )}
-      {looking && <LookDialog title={recordTitle || "Untitled"} projectId={projectId} sourceId={item.sourceId ?? ""} lookFor={lookFor} reviewId={item.id} onClose={() => setLooking(false)} />}
       {/*
        * R322 b, R323 c: the line under the two controls — a refusal's or a give-up's sentence, and a press not taken
        * (R323 b: not an alert; the control is described by it while it is shown). Its place is kept on every card from
@@ -1631,26 +1685,40 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
  * — to its heading, so the key that opened it decides nothing — is kept inside, and goes back to "Look at the file" when
  * it closes; the rest of the screen is inert). The reader reads the held file's own ranges and nothing else: no
  * highlight, no note, no annotation list, nothing remembered, nothing attached. Its line says what the file is.
+ *
+ * R487 a (ii): once the file no longer waits (`gone`: the queue says so) or is not found (the reader's "not found", at
+ * once or in mid-look), the file is no longer shown — the reader goes, and with it every read of a range — and the line
+ * says LOOK_GONE instead, said once: focus moves to it (as the reader moves focus to a changed state's heading; no live
+ * region), and Shift+Tab from it is kept inside as from the heading. `onClose` is told whether the file had gone.
  */
-function LookDialog({ title, projectId, sourceId, lookFor, reviewId, onClose }: { title: string; projectId: string; sourceId: string; lookFor: LookFor; reviewId: string; onClose(): void }) {
+function LookDialog({ title, projectId, sourceId, lookFor, reviewId, gone, onClose }: { title: string; projectId: string; sourceId: string; lookFor: LookFor; reviewId: string; gone: boolean; onClose(gone: boolean): void }) {
   const id = useId();
   const heading = useRef<HTMLHeadingElement>(null);
+  const note = useRef<HTMLParagraphElement>(null);
+  const [notFound, setNotFound] = useState(false);
+  const ended = gone || notFound;
   const look = useMemo(() => lookFor(reviewId), [lookFor, reviewId]);
-  const lookOnly = useMemo<LookOnly>(() => ({ range: look.range, goneSentence: LOOK_GONE }), [look]);
+  const lookOnly = useMemo<LookOnly>(() => ({ range: look.range, onGone: () => setNotFound(true) }), [look]);
+  useEffect(() => {
+    if (ended) note.current?.focus();
+  }, [ended]);
+  const close = () => onClose(ended);
   return (
-    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onClose} className="ao-review__look" initialFocus={heading}>
+    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={close} className="ao-review__look" initialFocus={ended ? note : heading}>
       <h2 id={`${id}-t`} ref={heading} tabIndex={-1}>
         {`${LOOK_TEXT}: `}
         <UserText>{title}</UserText>
       </h2>
-      <p id={`${id}-d`} className="ao-review__look-note">
-        {LOOK_ONLY_NOTICE}
+      <p id={`${id}-d`} ref={note} tabIndex={ended ? -1 : undefined} className="ao-review__look-note">
+        {ended ? LOOK_GONE : LOOK_ONLY_NOTICE}
       </p>
-      <div className="ao-review__look-reader">
-        <ReaderScreen api={look.api} projectId={projectId} sourceId={sourceId} readOnly look={lookOnly} />
-      </div>
+      {!ended && (
+        <div className="ao-review__look-reader">
+          <ReaderScreen api={look.api} projectId={projectId} sourceId={sourceId} readOnly look={lookOnly} />
+        </div>
+      )}
       <div className="ao-actions">
-        <button type="button" onClick={onClose}>
+        <button type="button" onClick={close}>
           Close
         </button>
       </div>
