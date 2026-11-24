@@ -712,8 +712,11 @@ export interface FindRunner {
    * At open and unlock: clears `stoppedFor`, and restarts every "looking-up" entry, and (F11) every entry in the free
    * copy's part — "record-complete" (its source without a file), "looking-for-copy", and "fetching" (which resumes as
    * "looking-for-copy": a download is never resumed).
+   * R534 c: the promise settles (it never rejects) once the opening's pass that judges the resting entries (R483 a,
+   * R503 g) has ended — or at once when there is none (closed, read-only, locked, the rules unreadable). A lock or a
+   * close ends the pass, and so settles it. It does not wait for the work the opening queues.
    */
-  resume(projectId: string): void;
+  resume(projectId: string): Promise<void>;
   /** At lock (together with the lock) or close: nothing more is written for the project; its work in flight is let go. */
   stop(projectId: string): void;
   /** At close: settles within FIND_STOP_SETTLE_MS whatever is in flight, acts already inside their turn included (R245). */
@@ -2737,15 +2740,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     });
   }
 
-  function resume(projectId: string): void {
-    if (closed || readOnly()) return;
+  function resume(projectId: string): Promise<void> {
+    if (closed || readOnly()) return Promise.resolve();
     let unlocked: boolean;
     try {
       unlocked = repo.isUnlocked(projectId);
     } catch {
-      return; // not a project of this library
+      return Promise.resolve(); // not a project of this library
     }
-    if (!unlocked) return;
+    if (!unlocked) return Promise.resolve();
+    // R534 c: settled when the opening's pass has ended, or when the opening ends without one.
+    let judged: Promise<void> | undefined;
+    let opened!: () => void;
+    const settled = new Promise<void>((res) => (opened = res));
     blocked.delete(projectId);
     const r = runOf(projectId);
     r.signalStop(); // the previous generation's work is let go at once
@@ -2794,7 +2801,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         if (!(err instanceof Abandoned)) debug(`find: the resting entries could not be judged (${errName(err)})`);
       });
       inflight.add(judging);
-      void judging.finally(() => inflight.delete(judging));
+      judged = judging.finally(() => inflight.delete(judging));
+      void judged.finally(opened);
       // F11: the free copy's part goes on (a "fetching" entry resumes as "looking-for-copy": a download is never resumed).
       // An entry resting for want of its linked file, with no pick, is judged by `judgeResting` alone (R483 a).
       for (const e of q.values()) {
@@ -2851,8 +2859,12 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
           if (alive(projectId, gen)) block(projectId, "unexpected");
         }
       })
-      .finally(() => inflight.delete(p));
+      .finally(() => {
+        inflight.delete(p);
+        if (!judged) opened();
+      });
     inflight.add(p);
+    return settled;
   }
 
   function stop(projectId: string): void {

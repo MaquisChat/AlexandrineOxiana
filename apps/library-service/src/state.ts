@@ -1486,11 +1486,14 @@ export class ServiceState {
     if (note.startsWith("bulk import")) this.opts.log.warn({ note }, "import");
   };
 
-  /** Resumes the queue of every unlocked project (or of `projectId`), whatever the index's state (R247 a). */
+  /**
+   * Resumes the queue of every unlocked project (or of `projectId`), whatever the index's state (R247 a). R534 c: the
+   * opening's pass over the resting entries is background work `idle()` waits for (a lock or a close ends it).
+   */
   resumeFind(s: Session, projectId?: string): void {
     const r = s.find;
     if (!r || this.moving) return;
-    for (const p of s.repo.listProjects()) if ((projectId === undefined || p.id === projectId) && s.repo.isUnlocked(p.id)) r.resume(p.id);
+    for (const p of s.repo.listProjects()) if ((projectId === undefined || p.id === projectId) && s.repo.isUnlocked(p.id)) this.track(r.resume(p.id), "find's opening");
   }
 
   /**

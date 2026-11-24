@@ -202,6 +202,8 @@ const setLibrary = async (body: Record<string, unknown> = { name: "Zorblatt Univ
   expect(r.status, r.body).toBe(200);
   return r.json;
 };
+/** R534 c: no automatic backup for the project (it reads every record): the counts below are the queue's alone. */
+const noBackups = async (pid: string) => expect((await call({ method: "PUT", url: `/projects/${pid}/backup-settings`, body: { automatic: false } })).status).toBe(200);
 const startFetch = async (pid: string, eid: string) => {
   const r = await call({ method: "POST", url: `/projects/${pid}/find/${eid}/library/start` });
   if (r.status === 200) tickets.push(r.json.ticket);
@@ -436,6 +438,7 @@ describe("R328 e: the queue's read reads a record only when it changed", () => {
     await start();
     await openNewLibrary();
     const pid = await newProject({ encrypted: true });
+    await noBackups(pid);
     await setLibrary();
     const a = await resting(pid, { state: "no-open-copy" });
     const b = await resting(pid, { state: "no-open-copy" });
@@ -457,8 +460,9 @@ describe("R328 e: the queue's read reads a record only when it changed", () => {
     // Locked: the queue cannot be read (as before), and nothing read before is served; at the unlock it is read anew.
     expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
     expect((await call({ url: `/projects/${pid}/find` })).status).toBe(423);
-    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    // R534 c: counted from before the unlock, so the opening's pass and the GET are counted whichever reads first.
     reads();
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
     expect((await view(pid, b.id)).library).toEqual({ canStart: true });
     expect(reads()).toBe(2);
   });
@@ -490,11 +494,8 @@ describe("R534 c (R328 e, R503 g): the opening's pass reads each record once, an
     await openNewLibrary();
     const pid = await newProject({ encrypted: true });
     await setLibrary();
+    await noBackups(pid);
     const { a, b, c } = await three(pid);
-    // A first unlock makes the project's daily backup (which reads every record); the counted one is within the day.
-    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
-    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
-    await until(async () => events.some((e) => JSON.stringify(e).includes('"backup"')), "the unlock's backup");
     await giveFile(pid, c);
     expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
     const spy = vi.spyOn(repo(), "getSource");
@@ -504,7 +505,9 @@ describe("R534 c (R328 e, R503 g): the opening's pass reads each record once, an
       return n;
     };
     expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
-    await until(async () => (await stateOf(pid, c.id)) === "in-library", "the opening's pass to move the entry whose source has a file");
+    // The opening's pass is background work the service waits for (R534 c): ended, it has written its move.
+    await svc!.state.idle();
+    expect(await stateOf(pid, c.id)).toBe("in-library");
     const first = await queue(pid);
     // The three records were read once, at the opening's pass; the first GET found what it needs already read.
     expect(reads()).toBe(3);
@@ -521,12 +524,9 @@ describe("R534 c (R328 e, R503 g): the opening's pass reads each record once, an
     await start();
     const path = await openNewLibrary();
     const pid = await newProject();
+    await noBackups(pid);
     await setLibrary();
     const { a, c } = await three(pid);
-    // A first reopening makes the project's daily backup (which reads every record); the counted one is within the day.
-    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
-    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
-    await until(async () => events.some((e) => JSON.stringify(e).includes('"backup"')), "the opening's backup");
     await giveFile(pid, c);
     expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
     const { Repo } = await import("../../../packages/library/src/repo/repo.js");
@@ -537,7 +537,8 @@ describe("R534 c (R328 e, R503 g): the opening's pass reads each record once, an
       return n;
     };
     expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
-    await until(async () => (await stateOf(pid, c.id)) === "in-library", "the opening's pass to move the entry whose source has a file");
+    await svc!.state.idle();
+    expect(await stateOf(pid, c.id)).toBe("in-library");
     const first = await queue(pid);
     expect(reads()).toBe(3);
     expect(first.entries.find((e) => e.id === a.id)!.library).toEqual({ canStart: true });
