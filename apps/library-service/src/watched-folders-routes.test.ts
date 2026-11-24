@@ -802,6 +802,118 @@ describe("files and origins", () => {
     expect((await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` })).json.origins).toEqual([first]);
   }, 60_000);
 
+  /**
+   * R497 c: a source whose origin is shown from the running watch's memory (FR-475: its register line not written yet)
+   * and noted changed there. The register on disk is held back until the action route has looked in it; the act then
+   * runs in the running watch, which writes its lines first.
+   */
+  async function changedInMemoryOnly(name: string) {
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc!.state.session!.repo;
+    let letGo!: () => void;
+    const held = new Promise<void>((r) => (letGo = r));
+    const record = repo.recordWatchedFiles.bind(repo);
+    vi.spyOn(repo, "recordWatchedFiles").mockImplementation(async (...a) => {
+      await held;
+      return record(...a);
+    });
+    const dir = await folder(name);
+    const file = join(dir, "paper.pdf");
+    await pdf(file, "A Paper Changed Before Its Line Was Written");
+    const wid = (await add(pid, dir, { label: name })).json.id as string;
+    const sid = await until(async () => (await sourceIds(pid))[0], 30_000, "the source");
+    await until(async () => (await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` })).json.origins[0]?.state === "in-library", 20_000, "the origin from memory");
+    const v2 = await buildPdf({ title: "The Paper As A Colleague Rewrote It", author: "Ana Souza", lines: ["A colleague's revision."] });
+    const aside = join(tmp, `aside-${randomBytes(4).toString("hex")}`);
+    await writeFile(aside, v2);
+    await rename(aside, file);
+    const shown = await until(async () => {
+      const o = (await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` })).json.origins;
+      return o[0]?.state === "changed" && o[0].presence === "local" ? o : undefined;
+    }, 30_000, "the origin shown changed");
+    expect(shown).toEqual([{ watchId: wid, folderLabel: name, folderRemoved: false, file: "paper.pdf", state: "changed", newBytes: v2.length, presence: "local" }]);
+    expect((await repo.watchRegister(pid, wid)).size, "the register on disk has no line yet").toBe(0);
+    // The lines are let go once the route has looked in the register on disk (and found no line there).
+    const look = repo.watchOrigins.bind(repo);
+    vi.spyOn(repo, "watchOrigins").mockImplementation(async (...a) => {
+      const found = await look(...a);
+      letGo();
+      return found;
+    });
+    return { pid, wid, sid, repo, v2 };
+  }
+
+  it("R497 c: “Bring in the new version…” works on an origin shown from the running watch's memory; the register on disk then says so", async () => {
+    const { pid, wid, sid, repo, v2 } = await changedInMemoryOnly("Early change");
+    const before = (await repo.getSource(pid, sid)).assets.filter((a) => a.role === "original");
+    const bring = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "bring-in-new-version" } });
+    expect([bring.status, bring.json], bring.body).toEqual([200, { done: "attached", sourceId: sid }]);
+    const after = (await repo.getSource(pid, sid)).assets.filter((a) => a.role === "original");
+    expect([after.length, after[0]]).toEqual([2, before[0]]);
+    expect((await repo.watchRegister(pid, wid)).get("paper.pdf")).toMatchObject({ sourceId: sid, state: "in-library", size: v2.length });
+    expect((await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` })).json.origins).toMatchObject([{ watchId: wid, state: "in-library" }]);
+  }, 90_000);
+
+  it("R497 c: “Keep the library's copy as it is” works on an origin shown from the running watch's memory; the register on disk then says so", async () => {
+    const { pid, wid, sid, repo } = await changedInMemoryOnly("Early keep");
+    const keep = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "keep-as-it-is" } });
+    expect([keep.status, keep.json], keep.body).toEqual([200, { done: "settled", sourceId: sid }]);
+    expect((await repo.getSource(pid, sid)).assets.filter((a) => a.role === "original")).toHaveLength(1);
+    expect((await repo.watchRegister(pid, wid)).get("paper.pdf")).toMatchObject({ sourceId: sid, state: "settled" });
+    expect((await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` })).json.origins).toMatchObject([{ watchId: wid, state: "settled" }]);
+  }, 90_000);
+
+  it("R497 c: a source with origins in two folders, neither line written yet: each act reaches the folder it names; a stopped watch's origin is found as before", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc!.state.session!.repo;
+    let letGo!: () => void;
+    const held = new Promise<void>((r) => (letGo = r));
+    const record = repo.recordWatchedFiles.bind(repo);
+    vi.spyOn(repo, "recordWatchedFiles").mockImplementation(async (...a) => {
+      await held;
+      return record(...a);
+    });
+    const one = await folder("First of two");
+    const two = await folder("Second of two");
+    const data = await buildPdf({ title: "A Paper Kept In Two Folders", author: "Ana Souza", lines: ["The same paper, twice."] });
+    await writeFile(join(one, "paper.pdf"), data);
+    const w1 = (await add(pid, one, { label: "First" })).json.id as string;
+    const sid = await until(async () => (await sourceIds(pid))[0], 30_000, "the source");
+    await writeFile(join(two, "same paper.pdf"), data);
+    const w2 = (await add(pid, two, { label: "Second" })).json.id as string;
+    const originsNow = async () => (await call({ url: `/projects/${pid}/sources/${sid}/watch-origin` })).json.origins as Array<{ watchId: string; state: string; presence: string }>;
+    await until(async () => (await originsNow()).length === 2, 30_000, "both origins from memory");
+    // The copy in the second folder is replaced; the first is unchanged.
+    const v2 = await buildPdf({ title: "The Second Folder's Revision", author: "Ana Souza", lines: ["Revised in the second folder."] });
+    const aside = join(tmp, `aside-${randomBytes(4).toString("hex")}`);
+    await writeFile(aside, v2);
+    await rename(aside, join(two, "same paper.pdf"));
+    await until(async () => (await originsNow()).some((o) => o.watchId === w2 && o.state === "changed" && o.presence === "local"), 30_000, "the second shown changed");
+    expect(new Map((await originsNow()).map((o) => [o.watchId, o.state]))).toEqual(new Map([[w1, "in-library"], [w2, "changed"]]));
+    expect([(await repo.watchRegister(pid, w1)).size, (await repo.watchRegister(pid, w2)).size], "no line on disk yet").toEqual([0, 0]);
+    const look = repo.watchOrigins.bind(repo);
+    vi.spyOn(repo, "watchOrigins").mockImplementation(async (...a) => {
+      const found = await look(...a);
+      letGo();
+      return found;
+    });
+    // "Keep the library's copy" on the first folder's unchanged file: the engine's own refusal, as for a line on disk.
+    const keepFirst = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: w1, action: "keep-as-it-is" } });
+    expect([keepFirst.status, keepFirst.json.error.message]).toEqual([400, "There is nothing to settle for this file: it is as it came in."]);
+    const bring = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: w2, action: "bring-in-new-version" } });
+    expect([bring.status, bring.json], bring.body).toEqual([200, { done: "attached", sourceId: sid }]);
+    expect((await repo.watchRegister(pid, w2)).get("same paper.pdf")).toMatchObject({ sourceId: sid, state: "in-library", size: v2.length });
+    expect((await repo.watchRegister(pid, w1)).get("paper.pdf")).toMatchObject({ sourceId: sid, state: "in-library", size: data.length });
+    // A stopped watch writes its lines; its origin is then the register's, and an act on it is found as before.
+    const s = svc!.state.session!;
+    for (const w of s.watches.get(pid)!) await w.stop();
+    expect((await originsNow()).map((o) => [o.watchId, o.state, o.presence]).sort()).toEqual([[w1, "in-library", "unknown"], [w2, "in-library", "unknown"]].sort());
+    const keepStopped = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: w2, action: "keep-as-it-is" } });
+    expect([keepStopped.status, keepStopped.json.error.message]).toEqual([400, "There is nothing to settle for this file: it is as it came in."]);
+  }, 90_000);
+
   it("R474 M9: the origins keep the register's order (its files' names, as the library reads them), each folder's lines in their own order", () => {
     // "ab-c.jsonl" comes before "ab.jsonl" ("-" before "."), although "ab" comes before "ab-c".
     const byWatch = new Map([
