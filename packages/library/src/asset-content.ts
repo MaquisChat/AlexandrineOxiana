@@ -75,6 +75,7 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
   // An encrypted file needs the project's key: a locked project is refused before anything is opened.
   const key = asset.encrypted ? projectDataKey(repo, projectId) : null;
   if (asset.encrypted && !key) throw new InvalidInputError("this file is encrypted but the project is not");
+  // R492 a: and the key is asked for again AT the file's opening (keyAtOpening, as for a held file, R487 e), for every caller.
   let abs: string;
   if (asset.linked) {
     abs = asset.linked.absolutePath;
@@ -83,7 +84,7 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
     abs = absPath(root, asset.path);
     await assertContained(root, abs);
   }
-  return { asset, ...(await openStored(abs, key && ((id) => (id === key.keyId ? key.key : undefined)), asset.mime, () => new NotFoundError("Asset", assetId))) };
+  return { asset, ...(await openStored(abs, key && keyAtOpening(repo, projectId), asset.mime, () => new NotFoundError("Asset", assetId))) };
 }
 
 /**
@@ -97,18 +98,23 @@ export async function openHeldFileContent(repo: Repo, projectId: string, reviewI
   const h = await heldFileToLookIn(repo, projectId, reviewId);
   const key = h.encrypted ? projectDataKey(repo, projectId) : null;
   if (h.encrypted && !key) throw new InvalidInputError("this file is encrypted but the project is not");
-  // R487 e: the key is asked for again AT the file's opening, not taken before it: a lock asked in between (by the wipe,
-  // or by the mark that hides the key from every reader at once, R386 b) refuses the look as locked, and not one byte of
-  // the file's content is read under it.
-  const keyNow = (id: string): Uint8Array | undefined => {
-    const k = projectDataKey(repo, projectId);
-    return k && id === k.keyId ? k.key : undefined;
-  };
   const root = repoLibrary(repo).root;
   const abs = absPath(root, h.rel);
   await assertContained(root, abs);
   const mime = h.kind === "pdf" ? "application/pdf" : "application/epub+zip";
-  return { kind: h.kind, ...(await openStored(abs, key && keyNow, mime, () => new NotFoundError("Held file", reviewId))) };
+  return { kind: h.kind, ...(await openStored(abs, key && keyAtOpening(repo, projectId), mime, () => new NotFoundError("Held file", reviewId))) };
+}
+
+/**
+ * R487 e, R492 a: the project's key, asked for AT the file's opening, not taken before it: a lock asked in between (by
+ * the wipe, or by the mark that hides the key from every reader at once, R386 b) refuses the read as locked, and not one
+ * byte of the file's content is read under it.
+ */
+function keyAtOpening(repo: Repo, projectId: string): (keyId: string) => Uint8Array | undefined {
+  return (id) => {
+    const k = projectDataKey(repo, projectId);
+    return k && id === k.keyId ? k.key : undefined;
+  };
 }
 
 /**

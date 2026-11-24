@@ -177,6 +177,8 @@ let lockAsked: { after: boolean } | undefined;
 const HELD_MARKER = "R487e-the-later-part-of-the-held-file";
 /** R487 e: the held file is read as the route reads it, slice by slice. */
 const HELD_SLICE = 64 * 1024;
+/** R492 a: a marker in the later part of the first source's stored PDF: never handed back once a lock was asked before its key was. */
+const ASSET_MARKER = "R492a-the-later-part-of-the-stored-file";
 
 /** Comparable form: Maps and Sets as sorted arrays, bytes as their SHA-256, errors as name and message. */
 function norm(v: unknown): unknown {
@@ -484,7 +486,9 @@ async function build(): Promise<Ctx> {
   const sources: SourceFile[] = [];
   // Sources with stored files (PDFs); one is identifiable (its creators pseudonymised).
   for (let i = 0; i < 3; i++) {
-    const f = await scratchFile(kit, `paper-${i}.pdf`, PDF(i));
+    const bytes = Buffer.from(PDF(i), "latin1");
+    if (i === 0) bytes.write(ASSET_MARKER, bytes.length - 256, "latin1");
+    const f = await scratchFile(kit, `paper-${i}.pdf`, bytes);
     sources.push(
       await addSource(kit, p, {
         title: `Paper ${i}`,
@@ -678,12 +682,21 @@ const ROWS: Row[] = [
   { name: "readTranscript", where: "transcript-segments.ts:305", run: async () => readTranscript(c.kit.repo, c.p.id, c.talk.source.id, transcriptVersions(c.talk)[0]!.id) },
   { name: "readAssetText (the transcript)", where: "source-actions.ts:122 (decrypt :132)", run: async () => readAssetText(c.kit.repo, c.p.id, c.talk.source.id, transcriptVersions(c.talk)[0]!.id) },
   {
+    // R492 a: as the held file's row (R487 e): a lock asked at any opening of the reading (by the wipe or the mark),
+    // before the file's key is asked for, lets not one byte of its content through: counted, and the marker in its
+    // later part must never come back. A lock asked after the last opening finds the key already taken: the reading
+    // under way may end as unlocked here; the service's guard of every read stops it there.
     name: "openAssetContent (a whole stored PDF)",
-    where: "asset-content.ts:58 (open :100)",
+    where: "asset-content.ts (openAssetContent → openStored)",
     run: async () => {
       const a = await openAssetContent(c.kit.repo, c.p.id, c.pdf.source.id, c.pdf.assets[0]!.id, () => true);
+      const lockedFirst = lockAsked !== undefined && !lockAsked.after;
       try {
-        return await a.read(0, a.size);
+        const parts: Buffer[] = [];
+        for (let at = 0; at < a.size; at += HELD_SLICE) parts.push(await a.read(at, Math.min(HELD_SLICE, a.size - at)));
+        const got = Buffer.concat(parts);
+        if (lockedFirst) throw new Error(`${got.length} bytes of the stored file's content came back after the lock${got.includes(ASSET_MARKER) ? ", its later part (the marker) included" : ""}`);
+        return got;
       } finally {
         await a.close();
       }
