@@ -202,9 +202,32 @@ export class TxnLog {
   }
 }
 
-/** Best effort: keeps going past failures, and reports whether every step succeeded. */
+/**
+ * Best effort: keeps going past failures, and reports whether every step succeeded. Repeatable (R493): a step already
+ * undone is never undone again. A "trashed" line whose trash copy is gone was put back by an earlier run of this
+ * roll-back (every step is recorded before it is taken, so a copy never made means the change stopped there, with no
+ * later line), and every later line of the marker at that path was undone before it: those lines are skipped, since
+ * undoing one again could only remove or overwrite the original put back.
+ */
 export async function undoEntries(root: string, entries: MarkerEntry[]): Promise<boolean> {
   let ok = true;
+  const done = new Set<number>();
+  for (const [i, e] of entries.entries()) {
+    if (e.kind !== "trashed") continue;
+    let putBack: boolean;
+    try {
+      putBack = !(await exists(fromRel(root, e.to)));
+    } catch {
+      // Not known whether it was put back: nothing at that path is undone again, and the roll-back is not complete.
+      putBack = true;
+      ok = false;
+    }
+    if (!putBack) continue;
+    for (let j = i + 1; j < entries.length; j++) {
+      const x = entries[j]!;
+      if ((x.kind === "trashed" ? x.from : x.path) === e.from) done.add(j);
+    }
+  }
   let steps = 0;
   /** Test seam (R47): the roll-back is cut off here, as by a crash. */
   const cut = (): boolean => {
@@ -212,9 +235,11 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
     seams.stopUndoAfter = undefined;
     return true;
   };
-  for (const e of [...entries].reverse()) {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i]!;
     if (cut()) return false;
     steps++;
+    if (done.has(i)) continue;
     try {
       if (seams.failUndo === e.kind) throw new Error(`simulated undo failure (${e.kind})`);
       if (e.kind === "created") await fsp.rm(fromRel(root, e.path), { force: true });
