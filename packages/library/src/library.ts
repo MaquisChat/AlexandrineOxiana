@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 import { newId } from "@ao/core";
 import type { Deps } from "./deps.js";
 import { writeFileAtomic } from "./fs/atomic.js";
+import { CloseInsideChangeError } from "./repo/errors.js";
 import {
   LockNotWritableError,
   NOT_WRITABLE_CODES,
@@ -417,7 +418,9 @@ interface HandleControl {
    * FR-749 (R546 1): what `close()` waits for before the lock is released — the change already in its store turn of
    * each repository opened on this handle (registered with `onClose`), without a time limit (R247 d).
    */
-  drains: Array<() => Promise<void>>;
+  drains: Array<CloseDrain>;
+  /** FR-749 (R551 M1): the first `close()`'s promise; every later call returns it (never before the lock is released). */
+  closing?: Promise<void>;
   /** The mode and reason before the library went offline. */
   beforeOffline?: { mode: Library["mode"]; reason?: Library["readOnlyReason"] };
   /** Read-write handles only: stop the heartbeat while offline. */
@@ -452,13 +455,20 @@ function makeHandle(
     ...(movedTo ? { movedTo } : {}),
     appConfigDir: deps.appConfigDir,
     deviceId: deps.deviceId,
-    async close() {
-      if (ctl.closed) return;
+    close() {
+      // R551 M1: a second call (while the first still waits for a change in its turn) is the first call.
+      if (ctl.closing) return ctl.closing;
+      // R551 M2: a change that closes its own library would wait for itself for ever: refused, and the library stays
+      // open (the change's own turn then ends as it would have).
+      if (ctl.drains.some((d) => d.holdsTurn())) return Promise.reject(new CloseInsideChangeError());
       // From here every further write through this handle is refused (`isClosed`, R546 1); a change already in its
       // store turn finishes and is recorded first, and only then is the lock released (R247 c, d).
       ctl.closed = true;
-      await Promise.allSettled(ctl.drains.map((d) => d()));
-      await release?.();
+      ctl.closing = (async () => {
+        await Promise.allSettled(ctl.drains.map((d) => d.drain()));
+        await release?.();
+      })();
+      return ctl.closing;
     },
   };
   controls.set(lib, ctl);
@@ -506,11 +516,18 @@ export async function markOnline(lib: Library, opts: { acceptNotWritable?: boole
 }
 
 /**
- * Package-internal (FR-749, R546 1): `drain` is awaited by the handle's `close()` before its lock is released (a
- * repository's write queue: the change in its store turn finishes). Never throws; the handle's own state only.
+ * What a repository opened on a handle gives its `close()` (FR-749, R546 1; R551 M2): `drain` is awaited before the lock
+ * is released (its write queue: the change in its store turn finishes); `holdsTurn` is true while the caller runs inside
+ * one of its changes (that change cannot close its own library: it would wait for itself).
  */
-export function onClose(lib: Library, drain: () => Promise<void>): void {
-  controls.get(lib)?.drains.push(drain);
+export interface CloseDrain {
+  drain: () => Promise<void>;
+  holdsTurn: () => boolean;
+}
+
+/** Package-internal (FR-749, R546 1): registers a repository's `CloseDrain` with its handle. Never throws. */
+export function onClose(lib: Library, d: CloseDrain): void {
+  controls.get(lib)?.drains.push(d);
 }
 
 /**
@@ -518,17 +535,34 @@ export function onClose(lib: Library, drain: () => Promise<void>): void {
  * bringing-in). Once it is aborted — the service has begun to close the library — that work begins no further change
  * (its repository refuses it with LibraryClosedError, as a closed handle does), and the lookup client cuts its waits
  * short (a wait cut is never a request sent again). A change already in its store turn is not touched by it.
+ * R551 M3: the scope is bound to ITS library: only that library's repository (and its lookup client) consult it.
  */
-const closingScope = new AsyncLocalStorage<AbortSignal>();
+const closingScope = new AsyncLocalStorage<{ lib: Library; signal: AbortSignal }>();
 
-/** Runs `fn` as work of the session that `signal` closes (see `closingSignal`); without a signal, `fn` as it is. */
-export function whileOpen<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
-  return signal ? closingScope.run(signal, fn) : fn();
+/** Runs `fn` as work of `lib`'s session that `signal` closes (see `closingSignal`); without a signal, `fn` as it is. */
+export function whileOpen<T>(lib: Library, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+  return signal ? closingScope.run({ lib, signal }, fn) : fn();
 }
 
-/** The closing signal of the session the current work runs for (`whileOpen`), if any. */
-export function closingSignal(): AbortSignal | undefined {
-  return closingScope.getStore();
+/** The closing signal of `lib`'s session the current work runs for (`whileOpen`), if any; another library's: none. */
+export function closingSignal(lib: Library): AbortSignal | undefined {
+  const s = closingScope.getStore();
+  return s && s.lib === lib ? s.signal : undefined;
+}
+
+/** As `closingSignal`, for the library at `root` (the lookup client knows its library by its folder). */
+export function closingSignalAt(root: string): AbortSignal | undefined {
+  const s = closingScope.getStore();
+  return s && s.lib.root === root ? s.signal : undefined;
+}
+
+/**
+ * R551 M3: runs `fn` outside any session's closing scope. Background work a piece of work merely STARTS (a viewing
+ * proxy an attach queued) is not that work: it is not refused because the attach's session began to close later; it
+ * meets the closed library as any other work does.
+ */
+export function outsideClosingScope<T>(fn: () => T): T {
+  return closingScope.exit(fn);
 }
 
 /** Package-internal: true once `close()` was called on the handle. */

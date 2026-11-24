@@ -21,6 +21,7 @@ export {
   InvalidInputError,
   KeyFileChangedError,
   LibraryClosedError,
+  CloseInsideChangeError,
   DestroyedParentError,
   FieldworkInUseError,
   ReviewEntryDecidedError,

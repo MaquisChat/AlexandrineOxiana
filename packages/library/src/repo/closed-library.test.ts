@@ -9,9 +9,9 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, onTestFinished } from "vitest";
-import { openLibrary } from "../library.js";
+import { createLibrary, openLibrary, whileOpen, type Library } from "../library.js";
 import { auditEvents, addSource, makeKit, makeProject, scratchFile, walk, type Kit } from "../export/test-kit.js";
-import { LibraryClosedError } from "./errors.js";
+import { CloseInsideChangeError, LibraryClosedError } from "./errors.js";
 import { appendRefusalEvent, importChange } from "./repo.js";
 import { pendingMarkers } from "./txn.js";
 import { openTestRepo } from "./testing.js";
@@ -125,5 +125,108 @@ describe("a closed Library refuses every write (FR-749, R546 1)", () => {
     const repo2 = await openTestRepo(again, ring, { tz: "UTC", scryptN: 2 ** 10 });
     expect(repo2.integrityWarnings).toEqual([]);
     await again.close();
+  });
+});
+
+/** A change held inside its store turn until `release`; `inside` resolves once it is there; `log` records its end. */
+function heldChange(k: Kit, projectId: string, log: string[]) {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  onTestFinished(() => release());
+  let entered!: () => void;
+  const inside = new Promise<void>((r) => (entered = r));
+  const change = importChange(k.repo, projectId, STORE, async (ops) => {
+    entered();
+    await gate;
+    ops.tx.record("project", projectId, { note: "" }, { note: "recorded before the lock went" });
+    log.push("turn ended");
+  }, { op: "test.held" });
+  return { change, inside, release };
+}
+
+/**
+ * While `held()` is true, for a bounded time: the lock file stays and nothing in `log` happened. The time is the
+ * bound on how long a close that does NOT wait would take to release the lock (an unlink: well under it).
+ */
+async function stillHeld(root: string, log: string[], ms = 300): Promise<void> {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    expect(existsSync(join(root, ".lock")), "the lock is still there while the change is in its turn").toBe(true);
+    expect(log).toEqual([]);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+describe("the order of a close (FR-749, R551 I3, M1, M2)", () => {
+  it("I3: the lock is released only after the change in its turn has ended, and close() resolves after that", async () => {
+    kit = await makeKit("ao-closed-order-");
+    const p = await makeProject(kit);
+    const root = kit.lib.root;
+    const log: string[] = [];
+    const held = heldChange(kit, p.id, log);
+    await held.inside;
+    const closing = kit.lib.close().then(() => log.push(`close resolved, lock ${existsSync(join(root, ".lock")) ? "still there" : "gone"}`));
+    await stillHeld(root, log);
+    held.release();
+    await held.change;
+    await closing;
+    expect(log).toEqual(["turn ended", "close resolved, lock gone"]);
+    expect(await pendingMarkers(root)).toBe(0);
+  });
+
+  it("M1: a second close() while the first waits is the first one: it never resolves before the lock is released", async () => {
+    kit = await makeKit("ao-closed-twice-");
+    const p = await makeProject(kit);
+    const root = kit.lib.root;
+    const log: string[] = [];
+    const held = heldChange(kit, p.id, log);
+    await held.inside;
+    const first = kit.lib.close();
+    const second = kit.lib.close();
+    expect(second).toBe(first);
+    const settled = second.then(() => log.push(`second resolved, lock ${existsSync(join(root, ".lock")) ? "still there" : "gone"}`));
+    await stillHeld(root, log);
+    held.release();
+    await held.change;
+    await settled;
+    expect(log).toEqual(["turn ended", "second resolved, lock gone"]);
+  });
+
+  it("M2: a change that closes its own library is refused with a named error; its turn ends normally and the library stays open", async () => {
+    kit = await makeKit("ao-closed-self-");
+    const p = await makeProject(kit);
+    const lib = kit.lib;
+    let refused: unknown;
+    await importChange(kit.repo, p.id, STORE, async (ops) => {
+      refused = await lib.close().then(
+        () => "closed",
+        (err: unknown) => err,
+      );
+      ops.tx.record("project", p.id, { note: "" }, { note: "after the refused close" });
+    }, { op: "test.self-close" });
+    expect(refused).toBeInstanceOf(CloseInsideChangeError);
+    expect(existsSync(join(lib.root, ".lock"))).toBe(true);
+    // Still open: a later change is made, and a close from outside works.
+    await kit.repo.createCollection(p.id, "Still open");
+    const ops = (await auditEvents(kit, p)).map((e) => e.details?.op);
+    expect(ops).toContain("test.self-close");
+    await lib.close();
+    expect(existsSync(join(lib.root, ".lock"))).toBe(false);
+  });
+});
+
+describe("the closing scope belongs to its library (FR-749, R551 M3)", () => {
+  it("under the aborted closing signal of ANOTHER library's session, this library's change goes through; under its own, it is refused", async () => {
+    kit = await makeKit("ao-closed-scope-");
+    const p = await makeProject(kit);
+    const other: Library = await createLibrary(join(kit.tmp, "Other"), "Other", { clock: () => new Date(), deviceId: "dev-A", hostname: "host-A", pid: process.pid, isPidAlive: () => true, appConfigDir: join(kit.tmp, "config"), settleMs: 0, setInterval: () => ({}), clearInterval: () => {} });
+    onTestFinished(() => other.close());
+    const closing = new AbortController();
+    closing.abort();
+    await whileOpen(other, closing.signal, () => kit!.repo.createCollection(p.id, "Goes through"));
+    await expect(whileOpen(other, closing.signal, () => importChange(kit!.repo, p.id, STORE, async () => undefined, { op: "test.other-scope" }))).resolves.toBeUndefined();
+    await expect(whileOpen(kit.lib, closing.signal, () => Promise.resolve().then(() => kit!.repo.createCollection(p.id, "Refused")))).rejects.toBeInstanceOf(LibraryClosedError);
+    const ops = (await auditEvents(kit, p)).map((e) => e.details?.op);
+    expect(ops).toContain("test.other-scope");
   });
 });

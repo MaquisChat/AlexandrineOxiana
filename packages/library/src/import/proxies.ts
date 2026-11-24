@@ -28,7 +28,7 @@ import { copyFileAtomic } from "../fs/atomic.js";
 import { stricterLocation } from "../repo/assets.js";
 import { PolicyDeniedError, ProxyRecordRefusedError, isLockedRefusal } from "../repo/errors.js";
 import { addProxyAsset, currentProjectLocationMode, editPendingProxies, projectDataKey, repoLibrary, type Repo } from "../repo/repo.js";
-import type { Library } from "../library.js";
+import { outsideClosingScope, type Library } from "../library.js";
 import { activeTemp } from "../tmp-registry.js";
 import { WorkerJobError, WorkerUnavailableError, type WorkerClient } from "../worker-client.js";
 import { LOCATION_REASON, type LocationMode } from "./common.js";
@@ -237,7 +237,8 @@ export class ProxyQueue {
   }
 
   private then<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(fn);
+    // R551 M3: a job runs outside the closing scope of whatever queued it (an attach): it is not that attach's work.
+    const run = outsideClosingScope(() => this.chain.then(fn));
     this.chain = run.then(
       () => undefined,
       () => undefined,

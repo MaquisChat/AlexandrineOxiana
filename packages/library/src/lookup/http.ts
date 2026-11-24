@@ -49,7 +49,7 @@ import { libraryVersion } from "../resources.js";
 import { join } from "node:path";
 import { request, type Dispatcher } from "undici";
 import { writeFileAtomic } from "../fs/atomic.js";
-import { closingSignal } from "../library.js";
+import { closingSignalAt } from "../library.js";
 import { recordedLookupsFromEnv, type RecordedFiles, type RecordedLookups } from "./recorded.js";
 
 const VERSION: string = libraryVersion();
@@ -257,6 +257,8 @@ export class HttpClient {
    * A client made for a folder that does not exist yet creates it as before.
    */
   private readonly rootExisted: boolean;
+  /** The library this client serves (R551 M3: only that library's closing scope cuts its waits). */
+  private readonly libraryRoot: string;
   /** R247 (c): false once the service has said the library is closing or moving: nothing more is written to disk. */
   private diskCache = true;
   /** FR-749 (R546 2, 3): aborted by `stop()`: from then on the client sends nothing more, for every caller. */
@@ -284,6 +286,7 @@ export class HttpClient {
     this.keyForHost = opts.keyFor;
     this.keyReady = opts.keyReady;
     this.cacheDir = join(opts.libraryRoot, ".cache", "lookups");
+    this.libraryRoot = opts.libraryRoot;
     this.rootExisted = existsSync(opts.libraryRoot);
     this.dispatcher = opts.dispatcher;
     this.clock = opts.clock ?? Date.now;
@@ -385,13 +388,13 @@ export class HttpClient {
 
   /** What ends this call's waits: the client's stop, and the closing of the session the current work runs for. */
   private halt(): AbortSignal {
-    const scope = closingSignal();
+    const scope = closingSignalAt(this.libraryRoot);
     return scope ? AbortSignal.any([this.stopped.signal, scope]) : this.stopped.signal;
   }
 
   /** Throws LookupCancelledError once the client is stopped or the current work's session is closing. */
   private assertOpen(): void {
-    if (this.stopped.signal.aborted || closingSignal()?.aborted) throw new LookupCancelledError();
+    if (this.stopped.signal.aborted || closingSignalAt(this.libraryRoot)?.aborted) throw new LookupCancelledError();
   }
 
   /** `p`, or LookupCancelledError as soon as the client is stopped or the current work's session closes (the wait is cut). */

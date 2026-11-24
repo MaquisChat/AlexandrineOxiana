@@ -20,6 +20,17 @@ export class LibraryClosedError extends Error {
   }
 }
 
+/**
+ * R551 M2: a change asked its own library to close. The close would wait for that change for ever, so it is refused:
+ * the library stays open and the change's turn ends as it would have.
+ */
+export class CloseInsideChangeError extends Error {
+  override name = "CloseInsideChangeError";
+  constructor() {
+    super("A change cannot close its own library; the library was left open");
+  }
+}
+
 /** The governance engine denied the action. The deny decision has been audited. */
 export class PolicyDeniedError extends Error {
   override name = "PolicyDeniedError";

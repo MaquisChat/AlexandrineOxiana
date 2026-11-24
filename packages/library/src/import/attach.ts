@@ -467,7 +467,7 @@ export function createAttach(deps: AttachDeps): Attach {
       try {
         // One file at a time per project, across attach, watched folders and Bulk Import (R81 I4);
         // the duplicate keys are read afresh inside the turn.
-        out.push(await whileOpen(deps.closing, () => one(path)));
+        out.push(await whileOpen(repoLibrary(repo), deps.closing, () => one(path)));
       } catch (err) {
         // The library closed (or began to close) before the file's change began: nothing of it was written (R546).
         if (err instanceof LibraryClosedError || err instanceof LookupCancelledError) out.push(cancelled(path));

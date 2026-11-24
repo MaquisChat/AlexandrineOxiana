@@ -224,7 +224,7 @@ export class RepoCore {
     this.auditSegmentSize = opts.auditSegmentSize;
     // FR-749 (R546 1, R247 d): the handle's close() waits for the change in its store turn before the lock goes; the
     // turns still waiting are refused as they come up (`enqueue`), so the queue empties without writing.
-    onClose(library, () => this.whenIdle());
+    onClose(library, { drain: () => this.whenIdle(), holdsTurn: () => this.holdsTurn() });
   }
 
   /** Resolves when no turn is running or waiting. */
@@ -239,7 +239,7 @@ export class RepoCore {
    * every other is refused with LibraryClosedError.
    */
   private refusesNewChanges(): boolean {
-    return isClosed(this.library) || closingSignal()?.aborted === true;
+    return isClosed(this.library) || closingSignal(this.library)?.aborted === true;
   }
 
   get root(): string {

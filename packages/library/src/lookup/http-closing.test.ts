@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, MockAgent } from "undici";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
-import { whileOpen } from "../library.js";
+import { whileOpen, type Library } from "../library.js";
 import { HttpClient, LookupCancelledError } from "./http.js";
 
 let tmp: string;
@@ -28,6 +28,8 @@ afterEach(async () => {
   await rm(tmp, { recursive: true, force: true });
 });
 
+/** The library the client serves, as the closing scope knows it (by its folder; R551 M3). */
+const libAt = () => ({ root: join(tmp, "Lib") }) as unknown as Library;
 const client = (extra: Partial<ConstructorParameters<typeof HttpClient>[0]> = {}) => new HttpClient({ libraryRoot: join(tmp, "Lib"), dispatcher: agent, sleep: forever, ...extra });
 
 /** Intercepts one GET at OpenAlex answering `status`; resolves `asked` when the request arrives. */
@@ -50,7 +52,7 @@ describe("a lookup of a library session that begins to close (FR-749, R546 2)", 
     const asked = answerOnce(429, { "retry-after": "60" });
     const closing = new AbortController();
     const http = client();
-    const call = whileOpen(closing.signal, () => http.getJson("https://api.openalex.org/works?search=tide", { cacheKey: "k1" }));
+    const call = whileOpen(libAt(), closing.signal, () => http.getJson("https://api.openalex.org/works?search=tide", { cacheKey: "k1" }));
     const outcome = call.then(
       () => "answered",
       (err: unknown) => err,
@@ -66,7 +68,7 @@ describe("a lookup of a library session that begins to close (FR-749, R546 2)", 
     const asked = answerOnce(503);
     const closing = new AbortController();
     const http = client();
-    const outcome = whileOpen(closing.signal, () => http.getJson("https://api.openalex.org/works?search=tide", { cacheKey: "k2" })).then(
+    const outcome = whileOpen(libAt(), closing.signal, () => http.getJson("https://api.openalex.org/works?search=tide", { cacheKey: "k2" })).then(
       () => "answered",
       (err: unknown) => err,
     );
@@ -93,7 +95,7 @@ describe("a lookup of a library session that begins to close (FR-749, R546 2)", 
     const { port } = server.address() as AddressInfo;
     const closing = new AbortController();
     const http = new HttpClient({ libraryRoot: join(tmp, "Lib"), dispatcher: real, sleep: forever, attemptTimeoutMs: 600_000, timeoutMs: 600_000 });
-    const outcome = whileOpen(closing.signal, () => http.getJson(`http://127.0.0.1:${port}/works?search=tide`, { cacheKey: "k3" })).then(
+    const outcome = whileOpen(libAt(), closing.signal, () => http.getJson(`http://127.0.0.1:${port}/works?search=tide`, { cacheKey: "k3" })).then(
       () => "answered",
       (err: unknown) => err,
     );
@@ -108,7 +110,7 @@ describe("a lookup of a library session that begins to close (FR-749, R546 2)", 
     const closing = new AbortController();
     closing.abort();
     const http = client();
-    await expect(whileOpen(closing.signal, () => http.getJson("https://api.openalex.org/works?search=tide", { cacheKey: "k4" }))).rejects.toBeInstanceOf(LookupCancelledError);
+    await expect(whileOpen(libAt(), closing.signal, () => http.getJson("https://api.openalex.org/works?search=tide", { cacheKey: "k4" }))).rejects.toBeInstanceOf(LookupCancelledError);
     expect(agent.pendingInterceptors()).toHaveLength(1);
   });
 
