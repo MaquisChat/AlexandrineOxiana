@@ -199,6 +199,26 @@ export function quitEventVerdict({ reached, osascript }) {
   return { problem: `the quit Apple event was sent (osascript: ${osascript?.ok ? "answered" : said}) but the shell neither took the quit nor exited` };
 }
 
+/** A skip of a run of Q on a Mac, with the prefix every other skip uses (M2, R511). */
+export function quitSkipLine(label, reason) {
+  return `launch-check: skip ${label}: ${reason}\n`;
+}
+
+/**
+ * The one closing line of scenario Q on a Mac (M2, R511; R505 e: whether Q ran must be read in one line),
+ * from each run's outcome: {label, state: "passed" | "failed" | "skipped", reason}. A failure wins over a
+ * skip; a skip of only some runs says which.
+ */
+export function quitSummaryLine(outcomes) {
+  const failed = outcomes.filter((o) => o.state === "failed");
+  const skipped = outcomes.filter((o) => o.state === "skipped");
+  const checked = outcomes.length - skipped.length;
+  if (failed.length) return `launch-check: Q FAILED (${failed.map((o) => o.label).join("; ")}): see its FAIL lines above\n`;
+  if (!outcomes.length || !checked) return `launch-check: Q SKIPPED (${skipped[0]?.reason ?? "no run of Q was made"}): the Mac's own Quit was not checked\n`;
+  if (skipped.length) return `launch-check: Q SKIPPED in part (${checked} of ${outcomes.length} runs checked; ${skipped.map((o) => `${o.label}: ${o.reason}`).join("; ")})\n`;
+  return `launch-check: Q ran: ${checked} of ${outcomes.length} runs quit the app by Apple event and were checked\n`;
+}
+
 /** How long B (and Q, where it stops the app that way) waits for the shell to end after SIGTERM. */
 export const SIGTERM_STOP_LIMIT_MS = 120_000;
 
@@ -1269,6 +1289,8 @@ async function main() {
     problems.push("the app was already running");
   }
   const bus = startBus();
+  /** Scenario Q's runs on a Mac (null where Q does not run), for its closing line. */
+  let qOutcomes = null;
   try {
     const address = await bus.address;
     const worker = workerBin(root);
@@ -1483,18 +1505,23 @@ async function main() {
     } else {
       const scripts = appleEventScripts(bundleIdOf(JSON.parse(readFileSync(TAURI_CONF, "utf8"))));
       let skipped = null;
+      qOutcomes = [];
       for (const [name, slow, label] of [
         ["q", undefined, "Q (quit by Apple event)"],
         ["q-slow", "10000", "Q (quit by Apple event during a slowed quit)"],
       ]) {
         if (skipped) {
-          process.stdout.write(`launch-check: note ${label}: skipped, for the reason above\n`);
+          process.stdout.write(quitSkipLine(label, "for the reason above"));
+          qOutcomes.push({ label, state: "skipped", reason: "for the reason above" });
           continue;
         }
         const { dir, env } = scenario(name);
         if (slow) env.AO_SHELL_TEST_SLOW_STOP_MS = slow;
         const run = startShell(env, label);
         const exited = () => run.child.exitCode !== null || run.child.signalCode !== null;
+        // This run's outcome for the closing line: skipped (with the reason) or else passed unless a problem was found in it.
+        const problemsBefore = problems.length;
+        let skippedHere = null;
         try {
           const { svc, helpers } = await upAndProbed(run, media, problems);
           // M1 (R511): the app is then stopped the orderly way the check can use, SIGTERM, and that stop is
@@ -1507,8 +1534,8 @@ async function main() {
               report(`${label}: the app ended after the quit could not be judged`, false, v.problem);
               return;
             }
-            skipped = why;
-            process.stdout.write(`launch-check: note ${label}: not checked: ${why}\n`);
+            skipped = skippedHere = why;
+            process.stdout.write(quitSkipLine(label, why));
           };
           const notRunning = appRunningSkip(await runCappedAsync("osascript", scripts.running, { timeout: 20_000 }));
           if (notRunning) {
@@ -1547,6 +1574,7 @@ async function main() {
           await assertGone(label, helpers, dir, problems, 10_000);
         } finally {
           if (!exited()) killTree(run.child.pid);
+          qOutcomes.push(skippedHere ? { label, state: "skipped", reason: skippedHere } : { label, state: problems.length > problemsBefore ? "failed" : "passed" });
         }
       }
     }
@@ -1556,6 +1584,8 @@ async function main() {
     if (MAC) report("no process of the app is left at the end", left.length === 0, left.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; ")) || problems.push("app processes left");
     rmSync(root, { recursive: true, force: true });
   }
+  // M2 (R511): on a Mac, one line says whether Q ran (on Linux its skip line above says it does not exist there).
+  if (qOutcomes) process.stdout.write(quitSummaryLine(qOutcomes));
   finish(problems);
 }
 

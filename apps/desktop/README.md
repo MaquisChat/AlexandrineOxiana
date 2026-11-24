@@ -370,9 +370,14 @@ orderly way (the shell's `AO_SHELL_QUIT orderly`, a clean stop, exit 0, nothing 
 with the slowed stop, as F does, that the closing window was shown. When the event cannot be sent for
 a reason outside the app — macOS does not see the app as running under its bundle id, does not permit
 osascript to send it Apple events, or osascript gets no answer within 30 s (a permission request may be
-waiting on the runner's screen) — Q prints that as a note and skips its checks; an event delivered that
-the app does nothing about fails. On Linux Q is skipped, and says so. Pressing Cmd-Q on a real Mac
-remains the owner's check.
+waiting on the runner's screen) — Q stops the app with SIGTERM instead and checks that stop exactly as B
+does (the shell ends, the helpers stop cleanly, nothing is left): when it passes, Q prints
+`launch-check: skip Q (…): <reason>`, saying also whether the shell printed anything after the event; when
+it does not, Q fails, because an app that hangs at the quit looks exactly like an event with no answer. An
+event delivered that the app does nothing about fails. On a Mac the check then prints one line that says
+whether Q ran: `launch-check: Q ran: …`, `launch-check: Q SKIPPED (<reason>): …` (or `SKIPPED in part`), or
+`launch-check: Q FAILED (…)`. On Linux Q is skipped, and says so. Pressing Cmd-Q on a real Mac remains
+the owner's check.
 At the start and the end the check looks for any process of any copy of the app (its program, or
 Node.js or the worker from an app's resources) and stops it; one found at the end is a failure. On a
 Mac the processes are read with `ps` instead of `/proc`, there is no virtual display or D-Bus (the

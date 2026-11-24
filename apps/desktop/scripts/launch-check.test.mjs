@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { appleEventScripts, appRunningSkip, printedAfterEvent, sigtermStopProblems, skippedQuitVerdict, SIGTERM_STOP_LIMIT_MS, bundleIdOf, orderlyQuitProblems, QUIT_EVENT_LIMIT_MS, quitEventVerdict, appProcesses, capLines, CLOSING_WINDOW_TITLE, closingWindowProblems, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
+import { appleEventScripts, appRunningSkip, quitSkipLine, quitSummaryLine, printedAfterEvent, sigtermStopProblems, skippedQuitVerdict, SIGTERM_STOP_LIMIT_MS, bundleIdOf, orderlyQuitProblems, QUIT_EVENT_LIMIT_MS, quitEventVerdict, appProcesses, capLines, CLOSING_WINDOW_TITLE, closingWindowProblems, formatCrashReport, isCrashReportOf, macCrashDiagnostics, newCrashReport, parseIps, CAPABILITIES_DIR, capabilityFileProblems, capabilityProblems, platformConfFiles, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, EXPECTED_LIBRARY_WINDOW_IPC, helperProblems, LIBRARY_PROBE_JS, describeReportServer, libraryProbeProblems, libraryTrace, libraryReportFrom, MAIN_WINDOW_PERMISSIONS, startReportServer, NOT_PROBED_IPC, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf, TAURI_CONF } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -813,6 +813,24 @@ describe("scenario Q: quit by Apple event (a Mac only; FR-731, R503 h)", () => {
     assert.equal(printedAfterEvent(["a", "b"], "oops\n"), 'the shell printed 2 lines after the event was sent (the last: "b"), and 5 characters on its standard error');
     assert.equal(printedAfterEvent([], "x"), "the shell printed nothing on its output after the event was sent, and 1 character on its standard error");
     assert.equal(printedAfterEvent(["y".repeat(500)], "").length < 300, true);
+  });
+
+
+  // M2 (R511, R505 e): a skip of Q reads like every other skip, and one closing line says whether Q ran.
+  it("prints a skip of Q with the prefix every other skip uses", () => {
+    assert.equal(quitSkipLine("Q (quit by Apple event)", "osascript had no answer within 30 s"), "launch-check: skip Q (quit by Apple event): osascript had no answer within 30 s\n");
+    assert.equal(quitSkipLine("Q (quit by Apple event during a slowed quit)", "for the reason above"), "launch-check: skip Q (quit by Apple event during a slowed quit): for the reason above\n");
+  });
+
+  it("ends with one line that says whether Q ran, was skipped (and why) or failed", () => {
+    const A = "Q (quit by Apple event)";
+    const S = "Q (quit by Apple event during a slowed quit)";
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }, { label: S, state: "passed" }]), "launch-check: Q ran: 2 of 2 runs quit the app by Apple event and were checked\n");
+    assert.equal(quitSummaryLine([{ label: A, state: "skipped", reason: "osascript had no answer within 30 s" }, { label: S, state: "skipped", reason: "for the reason above" }]), "launch-check: Q SKIPPED (osascript had no answer within 30 s): the Mac's own Quit was not checked\n");
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }, { label: S, state: "skipped", reason: "osascript had no answer within 30 s" }]), `launch-check: Q SKIPPED in part (1 of 2 runs checked; ${S}: osascript had no answer within 30 s)\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "failed" }, { label: S, state: "passed" }]), `launch-check: Q FAILED (${A}): see its FAIL lines above\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "skipped", reason: "r" }, { label: S, state: "failed" }]), `launch-check: Q FAILED (${S}): see its FAIL lines above\n`);
+    assert.equal(quitSummaryLine([]), "launch-check: Q SKIPPED (no run of Q was made): the Mac's own Quit was not checked\n");
   });
 
   const ev = (...kinds) => kinds.map((k) => (typeof k === "string" ? { kind: k } : k));
