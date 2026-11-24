@@ -84,7 +84,7 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
     abs = absPath(root, asset.path);
     await assertContained(root, abs);
   }
-  return { asset, ...(await openStored(abs, key && keyAtOpening(repo, projectId), asset.mime, () => new NotFoundError("Asset", assetId))) };
+  return { asset, ...(await openStored(abs, key && keyAtOpening(repo, projectId), asset.mime, () => new NotFoundError("Asset", assetId), !!asset.linked)) };
 }
 
 /**
@@ -121,10 +121,14 @@ function keyAtOpening(repo: Repo, projectId: string): (keyId: string) => Uint8Ar
 
 /**
  * Opens the file at `abs` (decrypted with the key `keyOf` gives at its opening, when given; sealed files only); `missing`
- * is what a file not there is refused as.
+ * is what a file not there is refused as. R510 (FR-727): for a LINKED original (`linked`), a symbolic link (never
+ * followed) or a folder at the recorded path is refused as `missing` too — the Missing files rule counts both as
+ * missing; for a file stored inside the library they stay refused as unsafe.
  */
-async function openStored(abs: string, keyOf: ((keyId: string) => Uint8Array | undefined) | null, mime: string, missing: () => Error): Promise<StoredContent> {
+async function openStored(abs: string, keyOf: ((keyId: string) => Uint8Array | undefined) | null, mime: string, missing: () => Error, linked = false): Promise<StoredContent> {
   const unsafe = () => new InvalidInputError("this file could not be opened safely");
+  /** What a symbolic link or a folder at the path is refused as: unsafe, or for a linked original, not there. */
+  const notAFile = () => (linked ? missing() : unsafe());
   let fh: fsp.FileHandle;
   try {
     // Never through a symbolic link put in the file's place after the check above; never waiting
@@ -133,11 +137,11 @@ async function openStored(abs: string, keyOf: ((keyId: string) => Uint8Array | u
     fh = await fsp.open(abs, fsc.O_RDONLY | (fsc.O_NOFOLLOW ?? 0) | (fsc.O_NONBLOCK ?? 0));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ELOOP") throw unsafe();
+    if (code === "ELOOP") throw notAFile(); // a symbolic link at the path (O_NOFOLLOW)
     if (code === "ENOENT" || code === "ENOTDIR") throw missing();
     // Something other than a regular file that cannot even be opened (a socket): refused as unsafe.
     const st = await fsp.lstat(abs).catch(() => undefined);
-    if (st && !st.isFile()) throw unsafe();
+    if (st && !st.isFile()) throw st.isDirectory() || st.isSymbolicLink() ? notAFile() : unsafe();
     // There, but unreadable (permission, too many open files, an I/O error): never "missing", and
     // the error carries only its code, never the path.
     throw Object.assign(new Error("this file could not be opened"), { code });
@@ -146,8 +150,8 @@ async function openStored(abs: string, keyOf: ((keyId: string) => Uint8Array | u
   let size: number;
   try {
     const st = await fh.stat();
-    // A FIFO, a device or a folder put in the file's place: refused, never read.
-    if (!st.isFile()) throw unsafe();
+    // A FIFO, a device or a folder put in the file's place: refused, never read (a folder at a linked path: missing).
+    if (!st.isFile()) throw st.isDirectory() ? notAFile() : unsafe();
     if (keyOf) {
       // One decrypted chunk cached: reads for display are sequential (R140 review M8).
       dec = await openDecryptedHandle(fh, keyOf, { cacheChunks: 1 });
