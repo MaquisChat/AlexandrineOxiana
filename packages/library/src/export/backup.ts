@@ -322,8 +322,9 @@ function withManifest<T>(repo: Repo, fn: (m: BackupManifest) => Promise<T>): Pro
     const m = await loadManifest(repo);
     const before = JSON.stringify(m);
     const out = await fn(m);
-    // (Never into a library this computer does not hold for writing: its readers change nothing.)
-    if (JSON.stringify(m) !== before && repoLibrary(repo).mode === "read-write") await writeManifest(dir, m);
+    // (Never into a library this computer does not hold for writing: its readers change nothing. Nor into a closed one,
+    // R560 M1: kept in memory only.)
+    if (JSON.stringify(m) !== before && repoLibrary(repo).mode === "read-write") await whileOpenOrWaited(repoLibrary(repo), () => writeManifest(dir, m));
     return out;
   });
   manifestLocks.set(
@@ -331,6 +332,18 @@ function withManifest<T>(repo: Repo, fn: (m: BackupManifest) => Promise<T>): Pro
     run.catch(() => {}),
   );
   return run;
+}
+
+/**
+ * R560 M1 (R247 c; as the state file's one writer, R555 4, R558 a): runs `write` — a write under Backups/ — only while the
+ * library is open, counted in the close's wait (`inFlight`, checked and registered in the same tick), or for work the close
+ * was already waiting for when it began. Once the library is closed it writes nothing and resolves (the caller's reading
+ * stands in memory; whatever it would have tidied is left for the next opening).
+ */
+function whileOpenOrWaited(lib: Library, write: () => Promise<unknown>): Promise<void> {
+  if (waitedForByClose(lib)) return write().then(() => undefined);
+  if (isClosed(lib)) return Promise.resolve();
+  return inFlight(lib, write).then(() => undefined);
 }
 
 const writeManifest = async (dir: string, m: BackupManifest) => {
@@ -355,7 +368,7 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
     const rebuilt = await rebuildManifest(repo);
     // Nothing to list: nothing is written (a library that never made a backup keeps no manifest).
     if (!rebuilt.backups.length && !rebuilt.unresolved?.length) return { formatVersion: 1, backups: [] };
-    if (mayWrite) await writeManifest(dir, rebuilt);
+    if (mayWrite) await whileOpenOrWaited(repoLibrary(repo), () => writeManifest(dir, rebuilt));
     return rebuilt;
   }
   let m: BackupManifest;
@@ -368,9 +381,9 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
       ...(Array.isArray(parsed.unresolved) ? { unresolved: parsed.unresolved.filter((x) => typeof x === "string") } : {}),
     };
   } catch {
-    if (mayWrite) await fsp.rename(join(dir, BACKUPS_MANIFEST), join(dir, `${BACKUPS_MANIFEST}.unreadable-${Date.now()}`)).catch(() => {});
+    if (mayWrite) await whileOpenOrWaited(repoLibrary(repo), () => fsp.rename(join(dir, BACKUPS_MANIFEST), join(dir, `${BACKUPS_MANIFEST}.unreadable-${Date.now()}`)).catch(() => {}));
     const rebuilt = await rebuildManifest(repo);
-    if (mayWrite) await writeManifest(dir, rebuilt);
+    if (mayWrite) await whileOpenOrWaited(repoLibrary(repo), () => writeManifest(dir, rebuilt));
     return rebuilt;
   }
   // Files a rebuild could not read are tried again every time (R94): e.g. a sealed backup whose
@@ -400,7 +413,7 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
     if (moved) {
       if (still.length) m.unresolved = still;
       else delete m.unresolved;
-      if (mayWrite) await writeManifest(dir, m);
+      if (mayWrite) await whileOpenOrWaited(repoLibrary(repo), () => writeManifest(dir, m));
     }
   }
   return m;
@@ -1085,6 +1098,12 @@ async function discardArchive(dir: string, op: { tmp?: string; file?: string; en
  */
 async function settlePending(repo: Repo): Promise<void> {
   if (repoLibrary(repo).mode !== "read-write") return;
+  // R560 M1: not in a closed library (the interrupted record and its files are left for the next opening), unless the
+  // close already waits for the caller; otherwise counted in the close's wait while it settles.
+  await whileOpenOrWaited(repoLibrary(repo), () => settlePendingNow(repo));
+}
+
+async function settlePendingNow(repo: Repo): Promise<void> {
   const state = await readState(backupsDir(repo));
   for (const [id, op] of Object.entries(state.pending)) {
     if (activeOps.has(id)) continue;

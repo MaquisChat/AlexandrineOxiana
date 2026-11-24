@@ -7,11 +7,14 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, rm, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
 import { resumeDestruction, retentionSeams } from "../retention.js";
-import { BACKUPS_STATE, backupSeams, setRetentionRetry } from "./backup.js";
+import { KeyRing } from "../crypto/keys.js";
+import { openLibrary } from "../library.js";
+import { openTestRepo } from "../repo/testing.js";
+import { BACKUPS_MANIFEST, BACKUPS_STATE, backupProject, backupSeams, listBackups, setRetentionRetry } from "./backup.js";
 import { makeKit, makeProject, walk, type Kit } from "./test-kit.js";
 
 let kit: Kit;
@@ -21,6 +24,7 @@ beforeEach(async () => {
 afterEach(async () => {
   retentionSeams.beforeNotes = undefined;
   backupSeams.stateWrite = undefined;
+  backupSeams.crashAt = undefined;
   await kit.close().catch(() => {});
 });
 
@@ -137,5 +141,69 @@ describe("the backups state file once its library is closed (FR-749, R555 4)", (
     const after = await readFile(statePath(), "utf8");
     await expect(setRetentionRetry(kit.repo, "later", rec)).rejects.toThrow(/closed/);
     expect(await readFile(statePath(), "utf8")).toBe(after);
+  });
+});
+
+/**
+ * R560 M1 (R247 c, with R555 4 and R558 a): the backups' manifest and the settling of an interrupted backup write nothing
+ * under Backups/ once the library is closed — a caller still holding the old repository reads the manifest as it is (or
+ * rebuilt in memory only) and leaves the interrupted backup's temporary file for the next opening, which heals both as
+ * before.
+ */
+describe("the manifest and an interrupted backup once the library is closed (FR-749, R560 M1)", () => {
+  async function openAgain() {
+    const lib = await openLibrary(kit.lib.root, {
+      clock: () => kit.clock.now,
+      deviceId: "dev-A",
+      hostname: "host-A",
+      pid: process.pid,
+      isPidAlive: () => true,
+      appConfigDir: join(kit.tmp, "config"),
+      settleMs: 0,
+      setInterval: () => ({}),
+      clearInterval: () => {},
+    });
+    onTestFinished(() => lib.close());
+    const repo = await openTestRepo(lib, new KeyRing(), { clock: () => kit.clock.now, tz: "UTC", actor: "tester", scryptN: 2 ** 10 });
+    return { lib, repo };
+  }
+  const manifestPath = () => join(kit.lib.root, "Backups", BACKUPS_MANIFEST);
+
+  it("a missing manifest is rebuilt in memory only by a read of the closed library; the next opening writes it", async () => {
+    const p = await makeProject(kit, GOV, false, "Ropes");
+    const b = await backupProject(kit.repo, p.id);
+    await rm(manifestPath());
+    await kit.lib.close();
+    const afterClose = await snapshot(kit.lib.root);
+    const listed = await listBackups(kit.repo, p.id);
+    expect(listed.map((x) => x.file)).toEqual([basename(b.path)]);
+    expect(await snapshot(kit.lib.root)).toEqual(afterClose);
+    expect(existsSync(manifestPath())).toBe(false);
+
+    const again = await openAgain();
+    expect((await listBackups(again.repo, p.id)).map((x) => x.file)).toEqual([basename(b.path)]);
+    expect(existsSync(manifestPath())).toBe(true);
+  });
+
+  it("an interrupted backup's temporary file is left by a read of the closed library; the next opening settles it as before", async () => {
+    const p = await makeProject(kit, GOV, false, "Sails");
+    backupSeams.crashAt = "after-zip";
+    await expect(backupProject(kit.repo, p.id)).rejects.toThrow();
+    const pending = Object.values(JSON.parse(await readFile(statePath(), "utf8")).pending as Record<string, { tmp?: string }>);
+    expect(pending).toHaveLength(1);
+    const tmpFile = join(kit.lib.root, "Backups", pending[0]!.tmp!);
+    expect(existsSync(tmpFile)).toBe(true);
+    await kit.lib.close();
+    const afterClose = await snapshot(kit.lib.root);
+    expect(await listBackups(kit.repo, p.id)).toEqual([]);
+    expect(await snapshot(kit.lib.root)).toEqual(afterClose);
+    expect(existsSync(tmpFile)).toBe(true);
+
+    const again = await openAgain();
+    expect(await listBackups(again.repo, p.id)).toEqual([]);
+    expect(existsSync(tmpFile)).toBe(false);
+    const state = JSON.parse(await readFile(statePath(), "utf8")) as { pending: Record<string, unknown>; failures: Record<string, unknown> };
+    expect(state.pending).toEqual({});
+    expect(Object.keys(state.failures)).toEqual([p.id]);
   });
 });
