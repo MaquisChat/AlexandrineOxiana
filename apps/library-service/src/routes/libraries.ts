@@ -294,7 +294,9 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       // included: a move refused at its plan (a destination that is not empty, a project whose rules forbid the place…)
       // leaves every piece of work as it was, and is answered as executeMove's refusals are (a line of the stream, kept as
       // the last failed move). executeMove takes its plan again after the stop below, so what the work changed meanwhile
-      // (a transcription that finished and stored its transcript) is what is copied.
+      // (a transcription that finished and stored its transcript) is what is copied. Planning twice walks the library once
+      // more: one to two seconds for 50,000 files on a local disk, more on a network disk — accepted (R513 M3), since a
+      // move of that size takes minutes and the second plan is what keeps the copy list true after the stop.
       try {
         await ctx.beforeMovePlan?.();
         await acceptMovePlan(s.lib, dest, { ...moveOpts, env: await defaultLocationEnv() });
