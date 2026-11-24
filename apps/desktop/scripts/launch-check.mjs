@@ -202,6 +202,13 @@ export function quitEventVerdict({ reached, osascript }) {
   return { problem: `the quit Apple event was sent (osascript: ${osascript?.ok ? "answered" : said}) but the shell neither took the quit nor exited` };
 }
 
+/** The runs of scenario Q on a Mac: [scenario name, slowed stop (ms), label]. */
+const Q_RUN_LIST = [
+  ["q", undefined, "Q (quit by Apple event)"],
+  ["q-slow", "10000", "Q (quit by Apple event during a slowed quit)"],
+];
+const Q_RUNS = Q_RUN_LIST.length;
+
 /** A skip of a run of Q on a Mac, with the prefix every other skip uses (M2, R511). */
 export function quitSkipLine(label, reason) {
   return `launch-check: skip ${label}: ${reason}\n`;
@@ -211,20 +218,24 @@ export function quitSkipLine(label, reason) {
  * The one closing line of scenario Q on a Mac (M2, R511; N2, R514; R505 e: whether Q ran is read in one line, and
  * its prefix is printed by no other line), from each run's outcome: {label, state: "passed" | "failed" |
  * "skipped", reason}. A failure wins over a skip; a run that threw is a failure with what ended it; a skip of
- * only some runs says what ran. `reached: false`: the check ended before Q (`error`, its first line, says why).
+ * only some runs says what ran. `reached: false`: the check ended before Q (`error`, its first line, says why; with
+ * `setupFailed`, the check's own set-up failed before any scenario). `threw`: something was thrown (a flag, so
+ * that a thrown falsy value counts; by default `error` being given); `planned`: how many runs Q was to make
+ * (KG-6 m3, m5, R517): a throw that leaves fewer outcomes than planned is a failure, never "ran".
  */
-export function quitSummaryLine(outcomes, { reached = true, error } = {}) {
+export function quitSummaryLine(outcomes, { reached = true, error, threw = error !== undefined, planned = 0, setupFailed = false } = {}) {
   const prefix = "launch-check: scenario Q result:";
-  if (!reached) return `${prefix} not reached (the check ended before scenario Q${error ? `: ${firstLine(error)}` : ""})\n`;
-  // Q began and threw before any run had an outcome.
-  if (!outcomes.length && error) return `${prefix} FAILED (scenario Q did not finish: ${firstLine(error)})\n`;
+  const why = threw && error ? firstLine(error) : "";
+  if (!reached) return `${prefix} not reached (${setupFailed ? "the check's set-up failed" : "the check ended before scenario Q"}${why ? `: ${why}` : ""})\n`;
+  // Q began and threw before some run had its outcome.
+  if (threw && outcomes.length < Math.max(planned, 1)) return `${prefix} FAILED (scenario Q did not finish${why ? `: ${why}` : ""})\n`;
   const failed = outcomes.filter((o) => o.state === "failed");
   const skipped = outcomes.filter((o) => o.state === "skipped");
   const ran = outcomes.filter((o) => o.state === "passed");
   if (failed.length) return `${prefix} FAILED (${failed.map((o) => (o.reason ? `${o.label}: ${o.reason}` : o.label)).join("; ")}): see its FAIL lines above\n`;
   if (!ran.length) return `${prefix} SKIPPED (${skipped[0]?.reason ?? "no run of Q was made"}): the Mac's own Quit was not checked\n`;
   if (skipped.length) return `${prefix} SKIPPED in part (${ran.map((o) => `${o.label} ran and was checked`).join("; ")}; ${skipped.map((o) => `${o.label}: ${o.reason}`).join("; ")})\n`;
-  return `${prefix} ran (${ran.length} of ${outcomes.length} runs quit the app by Apple event and were checked)\n`;
+  return `${prefix} ran (${ran.length} of ${Math.max(planned, outcomes.length)} runs quit the app by Apple event and were checked)\n`;
 }
 
 /** How long B (and Q, where it stops the app that way) waits for the shell to end after SIGTERM. */
@@ -1292,28 +1303,33 @@ async function main() {
   } else if (args.app || args.releaseApp) {
     throw new Error("--app and --release-app are for a Mac.");
   }
-  for (const [what, p] of [[MAC ? "the app's program" : "the built shell (pnpm --filter @ao/desktop run build:linux)", SHELL], ...(PACKAGED ? [] : [["the built service folder", join(SERVICE_DIR, "service.mjs")]])]) {
-    if (!existsSync(p)) throw new Error(`Missing ${what}.`);
-  }
-  // The watched-folder chooser is not called by the probe (it would open a dialog): its grant is
-  // judged from the capability files the shell was built with.
-  const caps = capabilityFileProblems();
-  report("the main window's capability grants exactly the expected commands, the watched-folder chooser included", caps.length === 0, caps.join("; ")) || problems.push(...caps);
-  const root = mkdtempSync(join(tmpdir(), "ao-launch-check-"));
-  if (!(await leftoverSearchWorks(root))) {
-    report("the search for leftover processes can see a process by its environment", false, "it could not; every 'no process is left' check would be blind");
-    problems.push("could not check: leftover processes");
-  }
-  const before = stopAppProcesses();
-  if (before.length) {
-    report("no copy of the app was running before the check", false, before.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; "));
-    problems.push("the app was already running");
-  }
-  const bus = startBus();
-  /** Scenario Q's runs on a Mac (null where Q does not exist), for its closing line; and what ended the check, if it threw. */
-  const q = MAC ? { reached: false, outcomes: [] } : null;
+  /** Scenario Q's runs on a Mac (null where Q does not exist), for its closing line; `setup`: the check's own set-up is not over yet (KG-6 m5, R517). */
+  const q = MAC ? { reached: false, outcomes: [], setup: true } : null;
+  // What ended the check, if it threw (a flag too: a thrown falsy value counts).
   let ended;
+  let didThrow = false;
+  let root;
+  let bus;
   try {
+    for (const [what, p] of [[MAC ? "the app's program" : "the built shell (pnpm --filter @ao/desktop run build:linux)", SHELL], ...(PACKAGED ? [] : [["the built service folder", join(SERVICE_DIR, "service.mjs")]])]) {
+      if (!existsSync(p)) throw new Error(`Missing ${what}.`);
+    }
+    // The watched-folder chooser is not called by the probe (it would open a dialog): its grant is
+    // judged from the capability files the shell was built with.
+    const caps = capabilityFileProblems();
+    report("the main window's capability grants exactly the expected commands, the watched-folder chooser included", caps.length === 0, caps.join("; ")) || problems.push(...caps);
+    root = mkdtempSync(join(tmpdir(), "ao-launch-check-"));
+    if (!(await leftoverSearchWorks(root))) {
+      report("the search for leftover processes can see a process by its environment", false, "it could not; every 'no process is left' check would be blind");
+      problems.push("could not check: leftover processes");
+    }
+    const before = stopAppProcesses();
+    if (before.length) {
+      report("no copy of the app was running before the check", false, before.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; "));
+      problems.push("the app was already running");
+    }
+    bus = startBus();
+    if (q) q.setup = false;
     const address = await bus.address;
     const worker = workerBin(root);
     process.stdout.write(`launch-check: shell ${SHELL}\nlaunch-check: worker: ${worker.kind}\n`);
@@ -1531,10 +1547,7 @@ async function main() {
       const scripts = appleEventScripts(bundleIdOf(JSON.parse(readFileSync(TAURI_CONF, "utf8"))));
       let skipped = null;
       const qOutcomes = q.outcomes;
-      for (const [name, slow, label] of [
-        ["q", undefined, "Q (quit by Apple event)"],
-        ["q-slow", "10000", "Q (quit by Apple event during a slowed quit)"],
-      ]) {
+      for (const [name, slow, label] of Q_RUN_LIST) {
         if (skipped) {
           process.stdout.write(quitSkipLine(label, "for the reason above"));
           qOutcomes.push({ label, state: "skipped", reason: "for the reason above" });
@@ -1548,6 +1561,7 @@ async function main() {
         const problemsBefore = problems.length;
         let skippedHere = null;
         let threw = null;
+        let didThrowHere = false;
         try {
           const { svc, helpers } = await upAndProbed(run, media, problems);
           // M1 (R511): the app is then stopped the orderly way the check can use, SIGTERM, and that stop is
@@ -1603,26 +1617,32 @@ async function main() {
           await assertGone(label, helpers, dir, problems, 10_000);
         } catch (err) {
           threw = err;
+          didThrowHere = true;
           throw err;
         } finally {
           if (!exited()) killTree(run.child.pid);
           // N2 (R514): a run that threw never counts as passed.
-          if (threw) qOutcomes.push({ label, state: "failed", reason: `it did not finish: ${firstLine(threw instanceof Error ? threw.message : threw)}` });
+          if (didThrowHere) qOutcomes.push({ label, state: "failed", reason: `it did not finish: ${firstLine(threw instanceof Error ? threw.message : threw)}` });
           else qOutcomes.push(skippedHere ? { label, state: "skipped", reason: skippedHere } : { label, state: problems.length > problemsBefore ? "failed" : "passed" });
         }
       }
     }
   } catch (err) {
     ended = err;
+    didThrow = true;
     throw err;
   } finally {
-    bus.proc?.kill("SIGTERM");
-    const left = stopAppProcesses();
-    if (MAC) report("no process of the app is left at the end", left.length === 0, left.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; ")) || problems.push("app processes left");
-    rmSync(root, { recursive: true, force: true });
-    // M2 (R511), N2 (R514): on a Mac, one line says whether Q ran, on every path, also when a scenario threw (on
-    // Linux Q's skip line above says it does not exist there).
-    if (q) process.stdout.write(quitSummaryLine(q.outcomes, { reached: q.reached, error: ended === undefined ? undefined : ended instanceof Error ? ended.message : String(ended) }));
+    // M2 (R511), N2 (R514), KG-6 m3, m5 (R517): on a Mac, one line says whether Q ran, on every path, also when a
+    // scenario threw or the set-up failed (on Linux Q's skip line above says it does not exist there). It is
+    // printed FIRST: a failing clean-up below cannot lose it.
+    if (q) process.stdout.write(quitSummaryLine(q.outcomes, { reached: q.reached, setupFailed: q.setup, threw: didThrow, planned: Q_RUNS, error: !didThrow ? undefined : ended instanceof Error ? ended.message : String(ended) }));
+    bus?.proc?.kill("SIGTERM");
+    // Only once the bus was started: a failed set-up has started nothing to clean up (as before).
+    if (bus) {
+      const left = stopAppProcesses();
+      if (MAC) report("no process of the app is left at the end", left.length === 0, left.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; ")) || problems.push("app processes left");
+    }
+    if (root) rmSync(root, { recursive: true, force: true });
   }
   finish(problems);
 }

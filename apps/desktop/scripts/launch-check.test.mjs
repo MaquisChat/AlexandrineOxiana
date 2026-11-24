@@ -842,6 +842,16 @@ describe("scenario Q: quit by Apple event (a Mac only; FR-731, R503 h)", () => {
     assert.equal(quitSummaryLine([], { reached: false }), `${P}not reached (the check ended before scenario Q)\n`);
     assert.equal(quitSummaryLine([], { reached: true, error: "tauri.conf.json's identifier undefined is not a bundle identifier" }), `${P}FAILED (scenario Q did not finish: tauri.conf.json's identifier undefined is not a bundle identifier)\n`);
     assert.equal(quitSummaryLine([]), `${P}SKIPPED (no run of Q was made): the Mac's own Quit was not checked\n`);
+    // KG-6 m3 (R517): a run that threw before it began (in scenario() or startShell) leaves fewer outcomes than planned: FAILED, never "ran", and the planned count is the one counted.
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }], { planned: 2, threw: true, error: "spawn failed\nmore" }), `${P}FAILED (scenario Q did not finish: spawn failed)\n`);
+    // A thrown falsy value (0, "") still counts as thrown.
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }], { planned: 2, threw: true, error: "0" }), `${P}FAILED (scenario Q did not finish: 0)\n`);
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }], { planned: 2, threw: true, error: "" }), `${P}FAILED (scenario Q did not finish)\n`);
+    assert.equal(quitSummaryLine([], { planned: 2, threw: true, error: "" }), `${P}FAILED (scenario Q did not finish)\n`);
+    // Every planned run has an outcome and nothing threw: the count is of the planned runs.
+    assert.equal(quitSummaryLine([{ label: A, state: "passed" }, { label: S, state: "passed" }], { planned: 2, threw: false }), `${P}ran (2 of 2 runs quit the app by Apple event and were checked)\n`);
+    // KG-6 m5 (R517): the check's own set-up failed before any scenario.
+    assert.equal(quitSummaryLine([], { reached: false, setupFailed: true, threw: true, error: "Missing the app's program.\nmore" }), `${P}not reached (the check's set-up failed: Missing the app's program.)\n`);
     // Unique: no other line the check prints starts the same way (the crash diagnosis prints "launch-check: Q (…): the shell exited …").
     const src = readFileSync(new URL("./launch-check.mjs", import.meta.url), "utf8");
     assert.equal(src.split("scenario Q result:").length - 1, 1, "the prefix is written once, in quitSummaryLine");
