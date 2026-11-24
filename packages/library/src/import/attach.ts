@@ -25,6 +25,11 @@
  *      below AUTO_ACCEPT_THRESHOLD or whose verification needs review → created and queued
  *      (`review/pending.jsonl`, sealed in encrypted projects, R31); else `created`.
  *
+ * Decision 31 (b), R556 (2): the lookups never wait for a metadata service that asks to wait (a 429, or a 503 with a
+ * wait asked): that service is left out for the file (and, until the time it named, for every file of the session),
+ * and the file is stored at once. A file in review while a lookup was left out has the reason ITEM_REASONS.waiting
+ * (the owner's "Waiting for lookup service response.") and its review entry keeps what was left out (`leftOut`).
+ *
  * Identifiers found in a file but not confirmed by a lookup are never recorded or used to find
  * duplicates (R55): they go on the review entry as `hints`. Media (images, video, audio) with GPS,
  * or whose metadata could not be read, are stored with `hasLocation: true`, so location governance
@@ -235,7 +240,10 @@ export function createAttach(deps: AttachDeps): Attach {
             throw err;
           }
         })()),
-      lookup: () => (lookup ??= lookupContextFor(repo, projectId, http, deps.debug ? { debug: deps.debug } : {})),
+      // Decision 31 (b), R556 (2) i: an attach (and so a watched folder's bringing-in) never waits for a service that asks
+      // to wait: that service is left out for the file, which comes in at once.
+      lookup: () =>
+        (lookup ??= lookupContextFor(repo, projectId, http, deps.debug ? { debug: deps.debug } : {}).then((c): LookupContext => ({ ...c, askedToWait: "leave-out" }))),
       /** Inside a queue turn: forget the cached duplicate keys if anyone else stored since this call's last turn. */
       refreshKeys: () => {
         const t = storeTurn(repo, projectId);
@@ -388,7 +396,9 @@ export function createAttach(deps: AttachDeps): Attach {
     keys.push(dupKey(sf));
     const note = { ...proxyNote(projectId, sf.source.id, plan, rule.mode()), ...(noCollection ? { noCollection: true as const } : {}) };
     if (!needsReview) return { path, outcome: "created", sourceId: sf.source.id, ...note };
-    return { path, outcome: "needs-review", sourceId: sf.source.id, reason: dup ? REASONS.likelyDuplicate : REASONS.review, ...note };
+    // R556 (2) iii: a record in review while a service it would have asked had asked to wait says so, in the owner's words.
+    const reason = dup ? REASONS.likelyDuplicate : reviewItem?.leftOut?.length ? REASONS.waiting : REASONS.review;
+    return { path, outcome: "needs-review", sourceId: sf.source.id, reason, ...note };
   }
 
   async function collectionExists(projectId: string, id: string): Promise<boolean> {

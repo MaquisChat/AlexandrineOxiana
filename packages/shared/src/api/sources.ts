@@ -151,6 +151,13 @@ export const ATTACH_CLOSED_TEXT = {
  */
 export const WATCH_ACT_CLOSED_TEXT = "The library was closed or went offline before this could be done, so nothing was changed. Try again when the library is open.";
 
+/**
+ * Decision 31 (b), R556 (2) iii — the owner's words: the reason of a file an attach or a watched folder brought in at once,
+ * as "needs review", because a metadata service it would have asked had asked to wait (it was left out, not waited for).
+ * The attach route's outcome reason ("Stored; it needs review: …") and the first reason of its entry in the review queue.
+ */
+export const LOOKUP_WAITING_TEXT = "Waiting for lookup service response.";
+
 /** The one sentence for a file whose attach the library's closing cancelled (ATTACH_CLOSED_TEXT around its name). */
 export function attachClosedSentence(fileName: string): string {
   return `${ATTACH_CLOSED_TEXT.before}${fileName}${ATTACH_CLOSED_TEXT.after}`;

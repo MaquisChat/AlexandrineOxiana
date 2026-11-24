@@ -79,20 +79,15 @@ describe("a watched folder and the library's closing (FR-749, R546 2)", () => {
   it("a file waiting on its lookup stays in the folder, unregistered, and comes in at the next start", async () => {
     const p = (await repo.createProject({ name: "Study", governanceYaml: GOV, encryption: { enabled: false } })).project;
     const wid = newId();
-    let asked!: () => void;
-    const lookedUp = new Promise<void>((r) => (asked = r));
-    let requests = 0;
+    agent.enableCallHistory();
+    const sent = () => agent.getCallHistory()?.calls().length ?? 0;
     const openalex = agent.get("https://api.openalex.org");
-    openalex
-      .intercept({ path: (x) => x.startsWith("/works"), method: "GET" })
-      .reply(() => {
-        requests++;
-        asked();
-        return { statusCode: 429, data: "slow down", responseOptions: { headers: { "retry-after": "60" } } };
-      })
-      .times(1);
+    // In the air (an answer ten minutes away, abandoned when the request is): decision 31 b, a "too many requests"
+    // answer is no longer waited for.
+    openalex.intercept({ path: (x) => x.startsWith("/works"), method: "GET" }).reply(404, "").delay(600_000).times(1);
+    const lookedUp = until(() => sent() > 0);
     const closing = new AbortController();
-    // The client's wait is the real, capped 60-second one: only the closing ends it.
+    // The request stays in the air (the client's own limit is a real 60 seconds): only the closing ends it.
     const http = new HttpClient({ libraryRoot: lib.root, dispatcher: agent });
     const events: WatchEvent[] = [];
     const w = watchFolder({ repo, http, lib, closing: closing.signal, onEvent: (e) => events.push(e), ...W }, p.id, inbox, {}, wid);
@@ -103,7 +98,7 @@ describe("a watched folder and the library's closing (FR-749, R546 2)", () => {
     await lookedUp;
     closing.abort();
     await w.stop();
-    expect(requests).toBe(1);
+    expect(sent()).toBe(1);
     expect(await readFile(file)).toEqual(bytes);
     expect([...(await repo.watchRegister(p.id, wid)).keys()]).toEqual([]);
     expect(repo.listSourceIds(p.id)).toEqual([]);
