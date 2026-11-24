@@ -750,6 +750,17 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const k = mine.findIndex((x) => x.id === item.id);
     return mine.slice(k + 1).find(waiting) ?? mine.slice(0, Math.max(0, k)).reverse().find(waiting) ?? laidOut.filter((x) => looksRight(x) !== looksRight(item)).find(waiting);
   };
+  /**
+   * Where focus goes once `item`'s card has ended, with `list` the queue (as last read) and `ended` the ended cards: the
+   * next waiting card's heading, else the section's heading while other entries wait, else the note that nothing waits.
+   * `fileLeft`'s rule, and a closed look's whose card ended (R492 b).
+   */
+  const focusAfterLeft = (item: ReviewItem, list: readonly ReviewItem[], ended: Readonly<Record<string, unknown>>): string => {
+    const rest = list.filter((x) => x.id !== item.id);
+    const still = new Set(rest.map((x) => x.id));
+    const next = nextWaiting(item, (x) => still.has(x.id) && !ended[x.id]);
+    return next ? next.id : rest.length ? ":section" : ":empty";
+  };
   const fileLeft = (item: ReviewItem, end: FileEnd, said: (n: number) => string) => {
     const list = itemsRef.current ?? [];
     const at = list.findIndex((x) => x.id === item.id);
@@ -761,15 +772,14 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     const rest = list.filter((x) => x.id !== item.id);
     const layout = laidRef.current;
     const ended = { ...(layout?.ended ?? {}), [item.id]: end };
-    const still = new Set(rest.map((x) => x.id));
-    const next = nextWaiting(item, (x) => still.has(x.id) && !ended[x.id]);
+    const to = focusAfterLeft(item, list, ended);
     itemsRef.current = rest;
     if (layout) putLayout({ ...layout, ended });
     setItems(rest);
     setSelected((s) => s.filter((x) => x !== item.id));
     setHeldErrors((cur) => withoutKey(cur, item.id));
     setStatus(said(at + 1));
-    if (hadFocus) setFileFocus({ to: next ? next.id : rest.length ? ":section" : ":empty" });
+    if (hadFocus) setFileFocus({ to });
   };
   /**
    * R319 c: "Show them" — the section laid out afresh from the queue as last read: decided and departed cards go, the
@@ -948,22 +958,20 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
    * The look closed (its button or Escape). R492 c: while the card still waits — also after a "not found" in the look (the
    * held file gone from disk; nothing reads the queue again on it), its controls are still there — focus goes back on its
    * "Look at the file" (the dialog's own restore does the same, unless the queue was read again meanwhile and the control
-   * is a new one). The card ended (decided, or no longer listed by the queue as last read): where the queue puts focus
-   * after that card's decision — the next waiting file's heading, else that card's heading — never the inert stand-in
-   * that took the control's place (R319).
+   * is a new one). R492 b: the card ended (decided, or no longer listed by the queue as last read): focus goes by
+   * `fileLeft`'s own rule, as after that card's decision — never the inert stand-in that took the control's place (R319).
    */
   const closeLook = () => {
     const at = lookAt;
     setLookAt(null);
     if (!at) return;
+    const list = itemsRef.current;
     const ended = laidRef.current?.ended ?? {};
-    if (!ended[at.item.id] && (!itemsRef.current || itemsRef.current.some((x) => x.id === at.item.id))) {
+    if (!ended[at.item.id] && (!list || list.some((x) => x.id === at.item.id))) {
       setFileFocus({ to: `${LOOK_BACK}${at.item.id}` });
       return;
     }
-    const listed = itemsRef.current ? new Set(itemsRef.current.map((x) => x.id)) : undefined;
-    const next = nextWaiting(at.item, (x) => x.id !== at.item.id && (!listed || listed.has(x.id)) && !ended[x.id]);
-    setFileFocus({ to: next ? next.id : at.item.id });
+    setFileFocus({ to: focusAfterLeft(at.item, list ?? laidRef.current?.items ?? [], ended) });
   };
   const arrivedCount = useMemo(() => {
     const laidIds = new Set(laid?.items.map((i) => i.id));

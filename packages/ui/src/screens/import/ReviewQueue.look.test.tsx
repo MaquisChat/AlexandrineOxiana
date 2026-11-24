@@ -251,9 +251,10 @@ describe("R470 b: looking at a held file before deciding", () => {
  * its two deciding controls are (announced unavailable, still focusable) and a press opens nothing. (ii) A file that
  * stops waiting while it is looked at — a given-up decision the service recorded late (shown at the next read), or a
  * "not found" in mid-look — is no longer shown: the reader goes (no range is read after), the notice is replaced by the
- * sentence that it can no longer be shown, said once (focus moves to it; no live region), and on Close or Escape focus
- * goes where the queue puts it after that card's decision (the next waiting file, else the card's heading) — never to
- * the inert stand-in that took the Look control's place.
+ * sentence that it can no longer be shown, said once (focus moves to it; no live region). On Close or Escape, a card
+ * that has ended sends focus where the queue puts it after that card's decision (R492 b: `fileLeft`'s rule — the next
+ * waiting file, else the section's heading, else the note that nothing waits); a card that still waits (R492 c) takes it
+ * back on its own "Look at the file" — never the inert stand-in that took the Look control's place.
  */
 describe("R487 a: a look and the card's own decision", () => {
   const OTHER = "A Second Record";
@@ -304,10 +305,13 @@ describe("R487 a: a look and the card's own decision", () => {
     expect(heldReads()).toBe(0);
   });
 
-  it("(ii) a given-up decision recorded late while the file is looked at: no longer shown, said once, and Close sends focus to the next waiting file", async () => {
+  /**
+   * A look opened on RECORD's card after its "Use this file" was given up (R313 e); the service's late record then shows at
+   * the next read, so the card no longer waits (R487 a ii). `items` is the queue as first read (RECORD's card first).
+   */
+  async function lookThenLateRecord(items: ReviewItem[]) {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
-    const items = [held(7, "pdf"), held(8, "pdf", OTHER)];
     let list = items;
     const o = setup(items);
     o.extra!.push(
@@ -323,7 +327,6 @@ describe("R487 a: a look and the card's own decision", () => {
     const user = userEvent.setup();
     render(<ReviewQueue client={m.client} projectId={P1} />);
     await screen.findByRole("button", { name: `Look at the file for ${NAMED}` });
-    await screen.findByRole("button", { name: `Look at the file for ${named(OTHER)}` });
     passGuard();
     // "Use this file" with no answer in 60 seconds: given up, the card usable again (R313 e).
     const t = Date.now();
@@ -348,6 +351,11 @@ describe("R487 a: a look and the card's own decision", () => {
     // Then the service's late record shows at the next read: the card no longer waits.
     release();
     await waitFor(() => expect(within(card(RECORD)).getByText(FOUND_FILES_TEXT.gone)).toBeTruthy());
+    return { user, dialog, look, handle };
+  }
+
+  it("(ii) a given-up decision recorded late while the file is looked at: no longer shown, said once, and Close sends focus to the next waiting file", async () => {
+    const { user, dialog, look, handle } = await lookThenLateRecord([held(7, "pdf"), held(8, "pdf", OTHER)]);
     // The file is no longer shown; the notice is replaced by the sentence, said once (focus moves to it).
     const note = await within(dialog).findByText(LOOK_GONE);
     await waitFor(() => expect(document.activeElement).toBe(note));
@@ -368,6 +376,33 @@ describe("R487 a: a look and the card's own decision", () => {
     expect(document.activeElement).not.toBe(look);
     // No range was read once the file stopped waiting.
     expect(heldReads()).toBe(reads);
+  });
+
+  // R492 b: closing a look whose card has ended sends focus by `fileLeft`'s own rule, so that closing it and deciding the
+  // file end in the same place: the next waiting file (above), else the section's heading while other entries wait, else
+  // the note that nothing waits — never the ended card's own heading.
+  it("R492 b: the card ended and no other file waits, other entries do: Close sends focus to the section's heading", async () => {
+    const entry = { id: "r1", projectId: P1, sourceId: "s1", kind: "import", status: "pending", createdAt: "2026-11-11T10:00:00.000Z", fields: {}, reasons: ["Low confidence"], confidence: 0.5, method: "embedded", title: "An Imported Record" } as unknown as ReviewItem;
+    const { user, dialog } = await lookThenLateRecord([held(7, "pdf"), entry]);
+    const note = await within(dialog).findByText(LOOK_GONE);
+    await waitFor(() => expect(document.activeElement).toBe(note));
+    await user.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const section = screen.getByRole("heading", { name: "Files found for records" });
+    await waitFor(() => expect(document.activeElement).toBe(section));
+    expect(reachable(document.activeElement!)).toBe(true);
+  });
+
+  it("R492 b: the card ended and nothing else waits: Escape sends focus to the note that nothing waits", async () => {
+    const { user, dialog } = await lookThenLateRecord([held(7, "pdf")]);
+    const note = await within(dialog).findByText(LOOK_GONE);
+    await waitFor(() => expect(document.activeElement).toBe(note));
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const empty = screen.getByText("Nothing is waiting for review in this project.");
+    await waitFor(() => expect(document.activeElement).toBe(empty));
+    expect(reachable(document.activeElement!)).toBe(true);
+    expect(document.activeElement).not.toBe(card(RECORD).querySelector("h4"));
   });
 
   // R492 c: a "not found" while the card STILL waits (the held file gone from disk; nothing reads the queue again on it):
