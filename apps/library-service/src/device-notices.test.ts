@@ -3,13 +3,14 @@
  * (the event the status banner reads, sent at connection and on every change), dismissed only by the
  * desktop app's "Got it" (`POST /settings/notices/dismiss`), and gone for good after that.
  */
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { deviceDeps, deviceNoticesIdle, raiseDeviceNotice, type Deps } from "@ao/library";
-import { createService, type LibraryService } from "./server.js";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { addWatchedFolder, deviceDeps, deviceNoticesIdle, raiseDeviceNotice, type Deps } from "@ao/library";
+import { buildPdf } from "../../../tests/fixtures/generate.mjs";
+import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const APP = "http://tauri.localhost";
@@ -32,10 +33,10 @@ afterEach(async () => {
   await rm(tmp, { recursive: true, force: true });
 });
 
-async function start(): Promise<void> {
+async function start(over: Partial<ServiceOptions> = {}): Promise<void> {
   await svc?.close();
   logs = "";
-  svc = await createService({ token: TOKEN, deps, worker: null, logStream: new Writable({ write: (c, _e, cb) => ((logs += c.toString()), cb()) }), pairing: { confirmPerMinute: 100 } });
+  svc = await createService({ token: TOKEN, deps, worker: null, logStream: new Writable({ write: (c, _e, cb) => ((logs += c.toString()), cb()) }), pairing: { confirmPerMinute: 100 }, ...over });
 }
 
 async function call(r: { method?: "GET" | "POST"; url: string; body?: unknown; headers?: Record<string, string> }) {
@@ -168,5 +169,371 @@ describe("watched folders that cannot be read when a library opens (review round
     expect(w!.detail).not.toContain(tmp);
     // A session warning, not a stored notice.
     expect((await stateNow()).notices).toEqual([]);
+  });
+});
+
+describe("FR-720: the warning that the watched folders were not started clears when the list can be read again", () => {
+  const GOV = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [manual_upload]\n";
+  const warned = () => (svc!.state.libraryState() as { integrityWarnings: Array<{ kind: string }> }).integrityWarnings.some((w) => w.kind === "watched-folders-unreadable");
+
+  /** A library with two projects, opened while this computer's list of watched folders cannot be read. */
+  async function openedUnreadable(): Promise<string[]> {
+    await start();
+    await openLibrary();
+    const ids: string[] = [];
+    for (const name of ["P", "Q"]) {
+      const p = await call({ method: "POST", url: "/projects", body: { name, governanceYaml: GOV, encryption: { enabled: false } } });
+      expect(p.status, p.body).toBe(200);
+      ids.push(p.json.project.id as string);
+    }
+    await mkdir(join(deps.appConfigDir, "watched-folders.json"));
+    await start();
+    await openLibrary();
+    await svc!.state.idle();
+    expect(warned()).toBe(true);
+    for (const id of ids) expect(svc!.state.session!.watches.has(id)).toBe(false);
+    return ids;
+  }
+
+  it("the next successful read of the list starts every project's watches, the opening's way, and takes the warning away", async () => {
+    const ids = await openedUnreadable();
+    // Still unreadable: the read fails, nothing starts, the warning stays.
+    expect((await call({ url: `/projects/${ids[0]}/watched-folders` })).status).not.toBe(200);
+    await svc!.state.idle();
+    expect(warned()).toBe(true);
+    // Readable again.
+    await rm(join(deps.appConfigDir, "watched-folders.json"), { recursive: true });
+    const states: boolean[] = [];
+    const off = svc!.state.events.subscribe((e) => {
+      if (e.type === "library.state") states.push(warned());
+    });
+    const r = await call({ url: `/projects/${ids[0]}/watched-folders` });
+    await svc!.state.idle(); // the state is published once its warnings are gathered
+    off();
+    expect(r.status, r.body).toBe(200);
+    for (const id of ids) expect(svc!.state.session!.watches.has(id)).toBe(true);
+    expect(warned()).toBe(false);
+    expect(states.at(-1)).toBe(false);
+  });
+
+  it("a start that fails again leaves the warning", async () => {
+    const ids = await openedUnreadable();
+    await rm(join(deps.appConfigDir, "watched-folders.json"), { recursive: true });
+    const real = svc!.state.startWatches.bind(svc!.state);
+    const spy = vi.spyOn(svc!.state, "startWatches").mockImplementation(async (s, projectId) => {
+      if (projectId === ids[1]) throw new Error("the list could not be read again");
+      return real(s, projectId);
+    });
+    const r = await call({ url: `/projects/${ids[0]}/watched-folders` });
+    expect(r.status, r.body).toBe(200);
+    await svc!.state.idle();
+    expect(svc!.state.session!.watches.has(ids[0]!)).toBe(true);
+    expect(svc!.state.session!.watches.has(ids[1]!)).toBe(false);
+    expect(warned()).toBe(true);
+    // The next read tries the one that did not start.
+    spy.mockRestore();
+    expect((await call({ url: `/projects/${ids[1]}/watched-folders` })).status).toBe(200);
+    expect(svc!.state.session!.watches.has(ids[1]!)).toBe(true);
+    expect(warned()).toBe(false);
+  });
+});
+
+describe("FR-720 (R508 I1): the restart of the watches waits while a move or the service's stop is under way, and is never made for a locked project or a read-only library", () => {
+  const GOV = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [manual_upload]\n";
+  const PASS = "correct horse battery staple";
+  const warned = () => (svc!.state.libraryState() as { integrityWarnings: Array<{ kind: string }> }).integrityWarnings.some((w) => w.kind === "watched-folders-unreadable");
+  const listFile = () => join(deps.appConfigDir, "watched-folders.json");
+  const watching = (id: string) => svc!.state.session!.watches.has(id);
+  const registered = async (id: string, wid: string) => (await svc!.state.session!.repo.watchRegister(id, wid)).size;
+
+  /** Polls a true state (the watch's own work) until it holds. */
+  async function until(fn: () => Promise<boolean>, what: string, ms = 30_000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (!(await fn())) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  /**
+   * A library with two projects (the first encrypted when asked), each with a watched folder on this computer that holds
+   * one PDF, opened while this computer's list of watched folders cannot be read; the list is then readable again.
+   */
+  async function opened(o: { encryptFirst?: boolean; over?: Partial<ServiceOptions> } = {}): Promise<{ ids: string[]; wids: string[] }> {
+    await start({ watchStabilityMs: 50, ...o.over });
+    await openLibrary();
+    const ids: string[] = [];
+    const wids: string[] = [];
+    for (const name of ["P", "Q"]) {
+      const encryption = o.encryptFirst && name === "P" ? { enabled: true, passphrase: PASS } : { enabled: false };
+      const p = await call({ method: "POST", url: "/projects", body: { name, governanceYaml: GOV, encryption } });
+      expect(p.status, p.body).toBe(200);
+      const id = p.json.project.id as string;
+      const dir = join(tmp, "drive", name);
+      await mkdir(dir, { recursive: true });
+      const s = svc!.state.session!;
+      wids.push((await addWatchedFolder({ repo: s.repo, lib: s.lib }, id, dir)).id);
+      ids.push(id);
+    }
+    // The list cannot be read at the opening (a folder in its place); the file waits beside it.
+    await rename(listFile(), `${listFile()}.kept`);
+    await mkdir(listFile());
+    await start({ watchStabilityMs: 50, ...o.over });
+    await openLibrary();
+    await svc!.state.idle();
+    expect(warned()).toBe(true);
+    for (const id of ids) expect(watching(id)).toBe(false);
+    for (const name of ["P", "Q"]) await writeFile(join(tmp, "drive", name, "report.pdf"), await buildPdf({ title: `Fieldwork ${name}`, author: "Ana Souza", lines: ["Report."] }));
+    // Readable again.
+    await rm(listFile(), { recursive: true });
+    await rename(`${listFile()}.kept`, listFile());
+    return { ids, wids };
+  }
+
+  it("a read of the list while a move holds the library starts nothing and keeps the warning; the next read after the move starts them", async () => {
+    const { ids, wids } = await opened();
+    svc!.state.moving = true; // as the move sets it once the watches are stopped
+    try {
+      const r = await call({ url: `/projects/${ids[0]}/watched-folders` });
+      expect(r.status, r.body).toBe(200);
+      await svc!.state.idle();
+      for (const id of ids) expect(watching(id)).toBe(false);
+      for (const [i, id] of ids.entries()) expect(await registered(id, wids[i]!)).toBe(0);
+      expect(warned()).toBe(true);
+    } finally {
+      svc!.state.moving = false;
+    }
+    // The move is over: the next successful read starts them in the library open then, and takes the warning away.
+    const r = await call({ url: `/projects/${ids[1]}/watched-folders` });
+    expect(r.status, r.body).toBe(200);
+    await svc!.state.idle();
+    for (const id of ids) expect(watching(id)).toBe(true);
+    expect(warned()).toBe(false);
+    // They do their work: each waiting file is now in its folder's register.
+    for (const [i, id] of ids.entries()) await until(async () => (await registered(id, wids[i]!)) === 1, "the file in the register");
+  });
+
+  it("a restart already under way when a move begins is waited for and then stopped: no watch runs during the copy (R515 N1)", async () => {
+    // What the copy sees, taken just before it starts.
+    let atCopy: { watches: number; warned: boolean; registered: number[] } | undefined;
+    const { ids, wids } = await opened({
+      over: {
+        beforeExecuteMove: async () => {
+          const s = svc!.state.session!;
+          // The copy takes a while: whatever start of watches is still under way ends during it.
+          await Promise.allSettled([...s.watchStarting.values()]);
+          atCopy = {
+            watches: [...s.watches.values()].reduce((n, l) => n + l.length, 0),
+            warned: warned(),
+            registered: await Promise.all(ids.map((id, i) => registered(id, wids[i]!))),
+          };
+        },
+      },
+    });
+    // The restart's start of every project is held until the move has begun (released as the move stops every watch of
+    // the library): it ends during the move.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    const real = svc!.state.startWatches.bind(svc!.state);
+    let entered = 0;
+    vi.spyOn(svc!.state, "startWatches").mockImplementation(async (s, projectId) => {
+      entered++;
+      await held;
+      return real(s, projectId);
+    });
+    const stopAll = svc!.state.stopWatches.bind(svc!.state);
+    vi.spyOn(svc!.state, "stopWatches").mockImplementation(async (s, projectId) => {
+      if (svc!.state.moving && projectId === undefined) release();
+      return stopAll(s, projectId);
+    });
+    const reading = call({ url: `/projects/${ids[0]}/watched-folders` });
+    await until(async () => entered === 2, "the restart's starts");
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.status, moved.body).toBe(200);
+    expect(JSON.parse(moved.body.trim().split("\n").at(-1)!).done, moved.body).toBe(true);
+    expect((await reading).status).toBe(200);
+    // During the copy: no watch ran in the library being copied, nothing was written to its registers, and the
+    // warning still stood.
+    expect(atCopy).toEqual({ watches: 0, warned: true, registered: [0, 0] });
+    // After the move: the moved library's watches run, once each, and the next read starts nothing more.
+    await svc!.state.idle();
+    expect(svc!.state.session!.lib.root).toBe(join(tmp, "Moved"));
+    expect((await call({ url: `/projects/${ids[1]}/watched-folders` })).status).toBe(200);
+    await svc!.state.idle();
+    for (const id of ids) expect(svc!.state.session!.watches.get(id)?.length).toBe(1);
+    expect(warned()).toBe(false);
+    for (const [i, id] of ids.entries()) await until(async () => (await registered(id, wids[i]!)) === 1, "the file in the moved library's register");
+  });
+
+  it("a read that ends while the service's stop is under way starts nothing and keeps the warning", async () => {
+    const { ids } = await opened();
+    const s = svc!.state.session!;
+    svc!.state.shuttingDown = true; // as close() sets it, with this read still in flight
+    try {
+      await svc!.state.watchedFoldersReadAgain(s);
+      await svc!.state.idle();
+      for (const id of ids) expect(watching(id)).toBe(false);
+      expect(warned()).toBe(true);
+    } finally {
+      svc!.state.shuttingDown = false;
+    }
+  });
+
+  it("a locked project's list is refused (423) and starts nothing; the warning stays", async () => {
+    const { ids } = await opened({ encryptFirst: true });
+    expect(svc!.state.session!.repo.isUnlocked(ids[0]!)).toBe(false);
+    const r = await call({ url: `/projects/${ids[0]}/watched-folders` });
+    expect([r.status, r.json?.error?.code]).toEqual([423, "PROJECT_LOCKED"]);
+    await svc!.state.idle();
+    for (const id of ids) expect(watching(id)).toBe(false);
+    expect(warned()).toBe(true);
+    // An unlocked project's read starts every project's watches as the opening does: the locked project's watch waits,
+    // locked, and brings nothing in until the unlock.
+    expect((await call({ url: `/projects/${ids[1]}/watched-folders` })).status).toBe(200);
+    await svc!.state.idle();
+    for (const id of ids) expect(watching(id)).toBe(true);
+    expect(warned()).toBe(false);
+    const [w] = svc!.state.session!.watches.get(ids[0]!)!;
+    await w!.ready;
+    expect(w!.status().state).toBe("locked");
+  });
+
+  it("a library open read-only starts nothing at a read of the list", async () => {
+    const { ids } = await opened();
+    await svc!.close();
+    svc = undefined;
+    const meta = join(tmp, "Lib", "library.json");
+    await writeFile(meta, JSON.stringify({ ...JSON.parse(await readFile(meta, "utf8")), formatVersion: 99 }));
+    await start({ watchStabilityMs: 50 });
+    const opened2 = await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } });
+    expect(opened2.json?.mode).toBe("read-only");
+    // As if the warning stood (the opening of a read-only library starts no watch, so it is never raised there).
+    const s = svc!.state.session!;
+    s.sessionWarnings = [{ kind: "watched-folders-unreadable", detail: "not read" }];
+    const r = await call({ url: `/projects/${ids[0]}/watched-folders` });
+    expect(r.status, r.body).toBe(200);
+    await svc!.state.idle();
+    for (const id of ids) expect(watching(id)).toBe(false);
+    expect(warned()).toBe(true);
+  });
+});
+
+describe("FR-720 (R508 M3): one start of a project's watches at a time", () => {
+  const GOV = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [manual_upload]\n";
+  const warned = () => (svc!.state.libraryState() as { integrityWarnings: Array<{ kind: string }> }).integrityWarnings.some((w) => w.kind === "watched-folders-unreadable");
+  const listFile = () => join(deps.appConfigDir, "watched-folders.json");
+  /** The service's own view: how many watches it holds for the project. */
+  const watchCount = (id: string) => svc!.state.session!.watches.get(id)?.length ?? 0;
+
+  async function until(fn: () => Promise<boolean>, what: string, ms = 30_000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (!(await fn())) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  /** Two projects, each with one watched folder holding one PDF; the list is then made unreadable (kept beside it). */
+  async function made(): Promise<{ ids: string[]; wids: string[] }> {
+    await start({ watchStabilityMs: 50 });
+    await openLibrary();
+    const ids: string[] = [];
+    const wids: string[] = [];
+    for (const name of ["P", "Q"]) {
+      const p = await call({ method: "POST", url: "/projects", body: { name, governanceYaml: GOV, encryption: { enabled: false } } });
+      expect(p.status, p.body).toBe(200);
+      const id = p.json.project.id as string;
+      const dir = join(tmp, "drive", name);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "report.pdf"), await buildPdf({ title: `Fieldwork ${name}`, author: "Ana Souza", lines: ["Report."] }));
+      const s = svc!.state.session!;
+      wids.push((await addWatchedFolder({ repo: s.repo, lib: s.lib }, id, dir)).id);
+      ids.push(id);
+    }
+    await svc!.close();
+    svc = undefined;
+    await rename(listFile(), `${listFile()}.kept`);
+    await mkdir(listFile());
+    return { ids, wids };
+  }
+  async function readable(): Promise<void> {
+    await rm(listFile(), { recursive: true });
+    await rename(`${listFile()}.kept`, listFile());
+  }
+  /** Each folder's file is in its register once, and in its project once. */
+  async function broughtInOnce(ids: string[], wids: string[]): Promise<void> {
+    const s = svc!.state.session!;
+    for (const [i, id] of ids.entries()) {
+      await until(async () => (await s.repo.watchRegister(id, wids[i]!)).size === 1 && s.repo.listSourceIds(id).length === 1, "the file brought in");
+      await svc!.state.idle();
+      expect((await s.repo.watchRegister(id, wids[i]!)).size).toBe(1);
+      expect(s.repo.listSourceIds(id)).toHaveLength(1);
+    }
+  }
+
+  it("two reads of the list in flight at once start each project's watches once", async () => {
+    const { ids, wids } = await made();
+    await start({ watchStabilityMs: 50 });
+    await openLibrary();
+    await svc!.state.idle();
+    expect(warned()).toBe(true);
+    await readable();
+    // Every start is held until both reads have asked for the restart.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    const real = svc!.state.startWatches.bind(svc!.state);
+    let starts = 0;
+    vi.spyOn(svc!.state, "startWatches").mockImplementation(async (s, projectId) => {
+      starts++;
+      await held;
+      return real(s, projectId);
+    });
+    const both = Promise.all([call({ url: `/projects/${ids[0]}/watched-folders` }), call({ url: `/projects/${ids[1]}/watched-folders` })]);
+    await until(async () => starts >= 2, "the restart's starts");
+    release();
+    for (const r of await both) expect(r.status, r.body).toBe(200);
+    await svc!.state.idle();
+    expect(starts).toBe(2);
+    for (const id of ids) expect(watchCount(id)).toBe(1);
+    expect(warned()).toBe(false);
+    await broughtInOnce(ids, wids);
+  });
+
+  it("a read while the opening's own start of a project is still in flight does not start that project a second time", async () => {
+    const { ids, wids } = await made();
+    await start({ watchStabilityMs: 50 });
+    // The opening's start of Q is held; P's start fails (the list cannot be read), which raises the warning.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    const real = svc!.state.startWatches.bind(svc!.state);
+    const startsOf = new Map<string, number>();
+    let qEntered!: () => void;
+    const qHeld = new Promise<void>((r) => (qEntered = r));
+    vi.spyOn(svc!.state, "startWatches").mockImplementation(async (s, projectId) => {
+      startsOf.set(projectId, (startsOf.get(projectId) ?? 0) + 1);
+      if (projectId === ids[1]) {
+        qEntered();
+        await held;
+      }
+      return real(s, projectId);
+    });
+    await openLibrary();
+    await qHeld;
+    await until(async () => warned(), "the warning");
+    await readable();
+    // P's read succeeds while Q's opening start is in flight.
+    const reading = call({ url: `/projects/${ids[0]}/watched-folders` });
+    await until(async () => svc!.state.session!.watchRestart !== undefined, "the restart");
+    release();
+    const r = await reading;
+    expect(r.status, r.body).toBe(200);
+    await svc!.state.idle();
+    expect(startsOf.get(ids[1]!)).toBe(1);
+    for (const id of ids) expect(watchCount(id)).toBe(1);
+    expect(warned()).toBe(false);
+    await broughtInOnce(ids, wids);
   });
 });

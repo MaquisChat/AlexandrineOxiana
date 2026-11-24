@@ -6,7 +6,7 @@
  * lets the screen read the badges again. Events that arrive before the start is answered are kept
  * by job id, so a job that finished at once is not left showing progress.
  */
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { errorText, isProjectLocked, type LibraryApi } from "../api/library";
 import type { RecheckProgress } from "../api/verification";
 
@@ -82,7 +82,47 @@ export function useProjectRecheck(api: Pick<LibraryApi, "verification">, opts: {
     [api, apply],
   );
 
-  return { jobs, start, onEvent };
+  /**
+   * FR-717: asks the service whether the project's recheck is running (a recheck started before the researcher left the
+   * library and came back), so it is shown, and its button kept off, before its next event. The screen's own state wins:
+   * a start being answered or a job followed is kept, and an answer about a job whose event has already arrived here is
+   * older than that event and is dropped. A failed read leaves things as they are (the job's next event still shows it).
+   *
+   * R515 N2: asked `again` when the screen's event stream has reconnected, events of the job shown as running may have
+   * been lost meanwhile. If the service then says it runs no recheck, that job has ended (its entry goes only at its end,
+   * or when it stops for a move): it is no longer shown running, the button is free, and the badges are read again. If
+   * it still runs, its progress is brought up to date. Only for the job shown when the question was asked.
+   */
+  const ask = useCallback(async (projectId: string, live: () => boolean, o: { again?: boolean } = {}) => {
+    const before = jobsRef.current[projectId];
+    let running: { jobId: string; done: number; total: number } | null;
+    try {
+      ({ running } = await api.verification.recheckState(projectId));
+    } catch {
+      return;
+    }
+    if (!live() || starting.current.has(projectId)) return;
+    const cur = jobsRef.current[projectId];
+    if (o.again && before?.state === "running" && cur?.state === "running" && cur.jobId === before.jobId) {
+      if (!running) {
+        jobsRef.current = Object.fromEntries(Object.entries(jobsRef.current).filter(([id]) => id !== projectId));
+        setJobs((all) => Object.fromEntries(Object.entries(all).filter(([id]) => id !== projectId)));
+        optsRef.current.onFinished(projectId);
+      } else if (running.jobId === cur.jobId && running.done > cur.done) {
+        const shown: ProjectRecheck = { state: "running", jobId: running.jobId, done: running.done, total: running.total };
+        jobsRef.current = { ...jobsRef.current, [projectId]: shown };
+        setJobs((all) => ({ ...all, [projectId]: shown }));
+      }
+      return;
+    }
+    if (!running || seen.current.has(running.jobId)) return;
+    if (cur?.state === "starting" || cur?.state === "running") return;
+    const shown: ProjectRecheck = { state: "running", jobId: running.jobId, done: running.done, total: running.total };
+    jobsRef.current = { ...jobsRef.current, [projectId]: shown };
+    setJobs((all) => ({ ...all, [projectId]: shown }));
+  }, [api]);
+
+  return { jobs, start, onEvent, ask };
 }
 
 export type ProjectRecheckControl = ReturnType<typeof useProjectRecheck>;
@@ -94,8 +134,28 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
  * the end are announced (the live region's text changes twice, R113); the counter and the bar move
  * outside it, where a screen reader finds them when asked.
  */
-export function RecheckProjectButton({ control, projectId, readOnly }: { control: ProjectRecheckControl; projectId: string; readOnly: boolean }) {
+export function RecheckProjectButton({ control, projectId, readOnly, reconnects = 0 }: { control: ProjectRecheckControl; projectId: string; readOnly: boolean; reconnects?: number }) {
   const job = control.jobs[projectId];
+  const { ask } = control;
+  // FR-717: a recheck already running is shown from the service's answer, not only from its next event.
+  useEffect(() => {
+    let live = true;
+    void ask(projectId, () => live);
+    return () => {
+      live = false;
+    };
+  }, [ask, projectId]);
+  // R515 N2: asked again each time the screen's event stream reconnects (`reconnects` counts them), as events may be lost.
+  const projectRef = useRef(projectId);
+  projectRef.current = projectId;
+  useEffect(() => {
+    if (reconnects === 0) return;
+    let live = true;
+    void ask(projectRef.current, () => live, { again: true });
+    return () => {
+      live = false;
+    };
+  }, [ask, reconnects]);
   const busy = job?.state === "starting" || job?.state === "running";
   return (
     <>

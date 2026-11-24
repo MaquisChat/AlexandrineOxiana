@@ -150,6 +150,10 @@ export interface Session {
    * Rm4): e.g. this computer's watched folders could not be read at open, so none run now.
    */
   sessionWarnings?: Array<{ kind: string; detail: string }>;
+  /** FR-720: the start of the watches that did not start at open, under way after the list could be read again. */
+  watchRestart?: Promise<void>;
+  /** R508 M3: each project's start of its watches under way (the opening's or a restart's): one per project at a time. */
+  watchStarting: Map<string, Promise<void>>;
   /** Find and acquire's runner (Task F5): one per open read-write library, made at `activate`; see "Find and acquire" below. */
   find?: FindRunner;
   /** The index errors already seen when the index was last known good (Task F5): a new one means it cannot be trusted. */
@@ -721,6 +725,7 @@ export class ServiceState {
       }),
       bulk: undefined,
       watches: new Map(),
+      watchStarting: new Map(),
       batches: new Map(),
       moveTokens: new Map(),
       workerClient: undefined,
@@ -947,7 +952,10 @@ export class ServiceState {
     s.unsubscribe.push(proxies.onResult((r) => this.events.publish("job.progress", { kind: "proxy", ...r })));
     s.unsubscribe.push(ocr.onResult((r) => this.events.publish("job.progress", { kind: "ocr", ...r })));
     if (s.lib.mode === "read-write") {
-      for (const p of s.repo.listProjects()) this.track(this.startWatches(s, p.id), "watched folders");
+      void this.startProjectsWatches(
+        s,
+        s.repo.listProjects().map((p) => p.id),
+      );
       // A backup that came due while the app was closed is made now (R99 I7).
       this.startWork("backup", async () => {
         await this.runScheduledBackups();
@@ -988,6 +996,53 @@ export class ServiceState {
     };
   }
 
+  /**
+   * Starts the watched folders of these projects, each tracked as background work: at the library's opening (every
+   * project), and again for those that did not start then once this computer's list can be read (FR-720). True when
+   * every one started. A project whose start is still under way is not started beside it: that start is waited for and
+   * counts as this one (R508 M3), so a folder never gets two watches.
+   */
+  async startProjectsWatches(s: Session, projectIds: string[]): Promise<boolean> {
+    const runs = projectIds.map((id) => {
+      const under = s.watchStarting.get(id);
+      if (under) return under;
+      const run: Promise<void> = this.startWatches(s, id).finally(() => {
+        if (s.watchStarting.get(id) === run) s.watchStarting.delete(id);
+      });
+      s.watchStarting.set(id, run);
+      this.track(run, "watched folders");
+      return run;
+    });
+    return (await Promise.allSettled(runs)).every((r) => r.status === "fulfilled");
+  }
+
+  /**
+   * FR-720: this computer's list of watched folders was read successfully (the list route). When it could not be read
+   * at the opening, the watches that did not start then are started the opening's way, and once every one has, the
+   * warning that they were not started is taken away; a start that fails again leaves it. One at a time.
+   *
+   * R508 I1: never while a move or the service's stop is under way (nothing may write into a library being copied, R102
+   * N2; the move has stopped every watch), and only in a read-write library, as at the opening; the warning then stays and
+   * the next successful read afterwards starts them in the library open then. A locked project's list is refused before
+   * this is reached (423); a locked project's watch is started as the opening starts it, and waits until the unlock.
+   */
+  async watchedFoldersReadAgain(s: Session): Promise<void> {
+    if (this.moving || this.shuttingDown) return;
+    if (this.session !== s || s.lib.mode !== "read-write" || !s.sessionWarnings?.some((w) => w.kind === WATCHED_FOLDERS_UNREADABLE)) return;
+    if (s.watchRestart) return s.watchRestart;
+    const run = (async () => {
+      const ids = s.repo.listProjects().map((p) => p.id).filter((id) => !s.watches.has(id));
+      // A move or the stop that began meanwhile has stopped (or will stop) these watches: the warning stays (R515 N1).
+      if (!(await this.startProjectsWatches(s, ids)) || this.session !== s || this.moving || this.shuttingDown) return;
+      s.sessionWarnings = (s.sessionWarnings ?? []).filter((w) => w.kind !== WATCHED_FOLDERS_UNREADABLE);
+      this.publishState();
+    })().finally(() => {
+      if (s.watchRestart === run) s.watchRestart = undefined;
+    });
+    s.watchRestart = run;
+    return run;
+  }
+
   /** Starts the project's watched folders (all of them; replaces any running). */
   async startWatches(s: Session, projectId: string): Promise<void> {
     await this.stopWatches(s, projectId);
@@ -1012,7 +1067,16 @@ export class ServiceState {
     s.watches.set(projectId, [...(s.watches.get(projectId) ?? []), ...watches]);
   }
 
+  /**
+   * Stops the project's watches, or every watch of the library. For the whole library (a move, a close), every start of
+   * watches still under way (`watchStarting`: the opening's or a restart's) is waited for first, so that none ends after
+   * this stop and leaves a watch running (R515 N1); the wait is bounded by the time the service gives background work to
+   * reach a safe point (`suspendTimeoutMs`). A start still under way after it stays in `watchStarting` (the move refuses).
+   */
   async stopWatches(s: Session, projectId?: string): Promise<void> {
+    if (projectId === undefined && s.watchStarting.size) {
+      await withTimeout(Promise.allSettled([...s.watchStarting.values()]), this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS).catch(() => {});
+    }
     const ids = projectId ? [projectId] : [...s.watches.keys()];
     await Promise.allSettled(ids.flatMap((id) => s.watches.get(id) ?? []).map((w) => w.stop()));
     for (const id of ids) s.watches.delete(id);
@@ -1129,6 +1193,8 @@ export class ServiceState {
     try {
       this.stopBackupScheduler();
       await this.stopWatches(s);
+      // A start of watches that did not end in time could still leave a watch running during the copy: refused (R515 N1).
+      if (s.watchStarting.size) throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
       await disposeProxyQueue(s.repo);
       await disposeOcrQueue(s.repo);
       // Last, so that a rollback above leaves the queue running (R247 M6); `stopAll` always settles, never throws.

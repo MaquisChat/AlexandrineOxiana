@@ -6,7 +6,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import { CURRENT_RW, libraryHandlers, server, SOURCES, serviceError, testApi, url, useMockService } from "../test/service";
 import { FIELD_ISSUED_CONFLICT, FIELD_TITLE_VERIFIED, VERIFIED_SOURCE, withFields } from "../test/verification";
 import { Library } from "./Library";
@@ -31,6 +31,11 @@ function liveEvents() {
       return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
     }),
     send: (type: string, data: unknown) => write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`),
+    /** Ends the stream the screen is reading (it connects again by itself); what is sent next goes to the new stream. */
+    drop: () => {
+      ctl?.close();
+      ctl = undefined;
+    },
   };
 }
 
@@ -188,6 +193,132 @@ describe("Recheck project (R99)", () => {
     ev.send("job.progress", { ...progress(10, 10, { finished: true, changed: 2, failed: 0 }), jobId: "job-old" });
     await waitFor(() => expect(status.textContent).toBe("Recheck finished: 2 sources changed."));
     expect(button.disabled).toBe(false);
+  });
+
+  it("FR-717: a recheck already running when the screen opens is shown at once from the service's answer, before any event; no second one is started", async () => {
+    const ev = liveEvents();
+    let starts = 0;
+    const asked: string[] = [];
+    server.use(
+      ev.handler,
+      http.get(url("/projects/:id/recheck"), ({ params }) => {
+        asked.push(String(params.id));
+        return HttpResponse.json({ running: params.id === "p1" ? { jobId: "job-old", done: 3, total: 10 } : null });
+      }),
+      http.post(url("/projects/:id/recheck"), () => {
+        starts++;
+        return HttpResponse.json({ jobId: "job-2", total: 10 });
+      }),
+      ...libraryHandlers(),
+    );
+    ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+    await libraryShown();
+    const button = screen.getByRole("button", { name: "Recheck project" }) as HTMLButtonElement;
+    const status = screen.getByRole("status", { name: "Project recheck" });
+    await screen.findByText("3 of 10");
+    expect(asked).toEqual(["p1"]);
+    expect(status.textContent).toBe("Rechecking the project's sources.");
+    expect(button.disabled).toBe(true);
+    await userEvent.setup().click(button);
+    expect(starts).toBe(0);
+    // Its next events carry it on, and its end frees the button.
+    ev.send("job.progress", { ...progress(4, 10), jobId: "job-old" });
+    await screen.findByText("4 of 10");
+    ev.send("job.progress", { ...progress(10, 10, { finished: true, changed: 0, failed: 0 }), jobId: "job-old" });
+    await waitFor(() => expect(status.textContent).toBe("Recheck finished: 0 sources changed."));
+    expect(button.disabled).toBe(false);
+  });
+
+  it("FR-717: an answer older than the job's own end (the end's event came first) does not show the job running again", async () => {
+    const ev = liveEvents();
+    // The service's answer is held back until the job's end has been shown (released whatever the test's end).
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    server.use(
+      ev.handler,
+      http.get(url("/projects/:id/recheck"), async () => {
+        ev.send("job.progress", { ...progress(10, 10, { finished: true, changed: 1, failed: 0 }), jobId: "job-old" });
+        await held;
+        return HttpResponse.json({ running: { jobId: "job-old", done: 9, total: 10 } });
+      }),
+      ...libraryHandlers(),
+    );
+    // Tells when the screen has read the answer: `running` is read as the answer is taken in, and what the screen does
+    // with it runs in the same turn, so the flag is set once that is done.
+    const api = testApi();
+    let read = false;
+    const ask = api.verification.recheckState;
+    api.verification.recheckState = async (pid) => {
+      const answer = await ask(pid);
+      return {
+        get running() {
+          queueMicrotask(() => (read = true));
+          return answer.running;
+        },
+      };
+    };
+    ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+    render(<Library api={api} current={CURRENT_RW as never} />);
+    const nav = await screen.findByRole("navigation", { name: "Projects" });
+    await within(nav).findByRole("button", { name: /Dissertation/ });
+    const status = await screen.findByRole("status", { name: "Project recheck" });
+    await waitFor(() => expect(status.textContent).toBe("Recheck finished: 1 source changed."));
+    release();
+    await waitFor(() => expect(read).toBe(true));
+    expect(status.textContent).toBe("Recheck finished: 1 source changed.");
+    expect(screen.queryByText("9 of 10")).toBeNull();
+    expect((screen.getByRole("button", { name: "Recheck project" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  describe("R515 N2: when the event stream reconnects, the screen asks the service again", () => {
+    /** The route answers `answer()`; `asked` counts its calls. The stream drops, and the new one starts with a fresh state. */
+    async function reconnectWith(answer: () => { running: { jobId: string; done: number; total: number } | null }) {
+      const ev = liveEvents();
+      const asked: string[] = [];
+      server.use(
+        ev.handler,
+        http.get(url("/projects/:id/recheck"), ({ params }) => {
+          asked.push(String(params.id));
+          return HttpResponse.json(answer());
+        }),
+        ...libraryHandlers(),
+      );
+      ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+      await libraryShown();
+      const button = screen.getByRole("button", { name: "Recheck project" }) as HTMLButtonElement;
+      const status = screen.getByRole("status", { name: "Project recheck" });
+      await screen.findByText("3 of 10");
+      expect(button.disabled).toBe(true);
+      expect(asked).toEqual(["p1"]);
+      return { ev, asked, button, status };
+    }
+    const fresh = { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} };
+
+    it("a job whose end event was lost while the stream was down: the service says none, and the button is free again", async () => {
+      let running: { jobId: string; done: number; total: number } | null = { jobId: "job-old", done: 3, total: 10 };
+      const { ev, asked, button, status } = await reconnectWith(() => ({ running }));
+      running = null; // the job ended while the stream was down; its end event is lost
+      ev.drop();
+      ev.send("library.state", fresh);
+      // The screen connects again by itself (after its own pause), and asks once more.
+      await waitFor(() => expect(button.disabled).toBe(false), { timeout: 10_000 });
+      expect(asked).toEqual(["p1", "p1"]);
+      expect(status.textContent).toBe("");
+      expect(screen.queryByText("3 of 10")).toBeNull();
+    });
+
+    it("a job still running when the stream comes back: the button stays off, and its progress is brought up to date", async () => {
+      let running: { jobId: string; done: number; total: number } | null = { jobId: "job-old", done: 3, total: 10 };
+      const { ev, asked, button, status } = await reconnectWith(() => ({ running }));
+      running = { jobId: "job-old", done: 4, total: 10 };
+      ev.drop();
+      ev.send("library.state", fresh);
+      await screen.findByText("4 of 10", undefined, { timeout: 10_000 });
+      expect(asked).toEqual(["p1", "p1"]);
+      expect(button.disabled).toBe(true);
+      expect(status.textContent).toBe("Rechecking the project's sources.");
+    });
   });
 
   it("a job whose events arrive before its start is answered still finishes (no stuck progress)", async () => {

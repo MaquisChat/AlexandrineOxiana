@@ -27,6 +27,7 @@ import type {
   FieldConfirmRequest,
   FieldReview,
   ProjectRecheckResponse,
+  ProjectRecheckState,
   RecheckProgressEvent,
   SourceRecordExtras,
   TranscriptListResponse,
@@ -281,6 +282,22 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     return record(await s.repo.recheckSource(projectId, sid));
   });
 
+  /**
+   * FR-717: the project rechecks running now (by job id), with their progress as of their last event. An entry lives
+   * from the start until the job's last event, or until the job ends without one (the library closed). A job stopped
+   * for a move gives up its entry, so a library whose copy is never opened is not left showing it (R508 M5); its
+   * continuation, when it runs on the moved library, takes the entry up again.
+   */
+  const rechecks = new Map<string, { projectId: string; done: number; total: number }>();
+
+  app.get("/projects/:id/recheck", async (req): Promise<ProjectRecheckState> => {
+    const projectId = projectParam(ctx, req);
+    // A locked project is answered as every other read of a locked project (R508 M4): 423, nothing told.
+    if (!state.requireSession().repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
+    for (const [jobId, r] of rechecks) if (r.projectId === projectId) return { running: { jobId, done: r.done, total: r.total } };
+    return { running: null };
+  });
+
   // Every source of the project, as a background job with progress (`job.progress`, kind "recheck").
   app.post("/projects/:id/recheck", async (req): Promise<ProjectRecheckResponse> => {
     const s = state.requireWritable();
@@ -290,13 +307,24 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const total = ids.length;
     const tally = { changed: 0, failed: 0 };
     // In the work registry: a move stops it between sources; it continues on the moved library (R106).
+    const entry = { projectId, done: 0, total };
+    rechecks.set(jobId, entry);
     const run = (from: number) =>
       state.startWork("recheck", async (ctl) => {
         let done = from;
         for (const id of ids.slice(from)) {
-          if (ctl.stopping) return () => run(done);
+          if (ctl.stopping) {
+            rechecks.delete(jobId);
+            return () => {
+              rechecks.set(jobId, entry);
+              void run(done);
+            };
+          }
           const cur = state.session;
-          if (!cur) return;
+          if (!cur) {
+            rechecks.delete(jobId);
+            return;
+          }
           try {
             const before = await cur.repo.getSource(projectId, id);
             const after = await cur.repo.recheckSource(projectId, id);
@@ -305,8 +333,10 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
             tally.failed++;
           }
           done++;
+          entry.done = done;
           state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total, finished: false } satisfies RecheckProgressEvent);
         }
+        rechecks.delete(jobId);
         state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total, changed: tally.changed, failed: tally.failed, finished: true } satisfies RecheckProgressEvent);
       });
     run(0);

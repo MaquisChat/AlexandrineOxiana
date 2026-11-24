@@ -624,6 +624,8 @@ export function registerWatchedFolders(app: FastifyInstance, ctx: Ctx): void {
     requireUnlocked(s, projectId);
     const seq = nextSeq(s); // first: the list and its summaries are read after it (R241)
     const recs = await listWatchedFolders(settingsDeps(s), projectId);
+    // FR-720: the list can be read again; watches that did not start at the opening start now.
+    await state.watchedFoldersReadAgain(s);
     const cols = await collectionsOf(s, projectId);
     return { seq, folders: await Promise.all(recs.map((r) => summaryOf(ctx, s, projectId, r, cols, seq))) };
   });

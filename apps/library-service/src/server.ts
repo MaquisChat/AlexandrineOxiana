@@ -43,6 +43,8 @@ export type { ServiceWorker, WorkerProvider } from "./state.js";
 
 /** Default JSON body limit (R96). */
 export const BODY_LIMIT = 1024 * 1024;
+/** How long the orderly stop waits for the requests in flight, and for a pairing's taking back (R508 M2). */
+export const IN_FLIGHT_WAIT_MS = 60_000;
 
 export interface ServiceOptions {
   /** The UI token (main.ts reads it from standard input, R98; see startup-token.ts). */
@@ -64,6 +66,8 @@ export interface ServiceOptions {
   openLibrary?: typeof openLibrary;
   /** How long a close waits for registered work before abandoning what can be (test seam; Task 62). */
   closeGraceMs?: number;
+  /** How long the orderly stop waits for the requests in flight, and for a pairing's taking back (test seam; default IN_FLIGHT_WAIT_MS). */
+  inFlightWaitMs?: number;
   /** Rebuilds the index when needed (test seam). */
   rebuildIndexIfNeeded?: typeof rebuildIndexIfNeeded;
   /** Test seam (a fake clock) for GET /libraries' wait at start. */
@@ -363,6 +367,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerFindBrowser(app, ctx);
 
   let closing: Promise<void> | undefined;
+  const inFlightWaitMs = opts.inFlightWaitMs ?? IN_FLIGHT_WAIT_MS;
   return {
     app,
     state,
@@ -387,11 +392,13 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
         // opened is then refused and released); then running work is paused and the library closed.
         if (inFlight > 0) await new Promise<void>((r) => {
           idleWaiters.push(r);
-          setTimeout(r, 60_000).unref?.();
+          setTimeout(r, inFlightWaitMs).unref?.();
         });
         await state.shutdown();
-        // A browser's port being recorded (R171) finishes its atomic write before the service exits.
-        await pairing.idle();
+        // A browser's port being recorded (R171) finishes its atomic write before the service exits. A pairing being taken
+        // back (FR-718) is waited for no longer than a request in flight (R508 M2): a save that never lands must not hold
+        // the stop for ever; the pairing stays unusable meanwhile, as it is in memory.
+        await pairing.idle(inFlightWaitMs);
         // A device-level notice being written (Task 68) is not lost at shutdown.
         await deviceNoticesIdle();
         await app.close();
