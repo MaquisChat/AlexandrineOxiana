@@ -272,6 +272,7 @@ export {
   BACKUP_INTERRUPTED,
   BACKUP_LIMITS,
   BackupNotRecordedError,
+  BackupCancelledError,
   DEFAULT_KEEP,
   DestructionRecordError,
   UnreadableBackupError,

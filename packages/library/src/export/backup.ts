@@ -95,7 +95,9 @@ import { scrubPaths } from "../app-settings.js";
 import { defaultLocationEnv, type LocationEnv } from "../location.js";
 import { candidates, locate } from "../move.js";
 import { AuditStore } from "../repo/audit-store.js";
-import { PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { LibraryClosedError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { isClosed, onClose, type Library } from "../library.js";
+import { backupClosedSentence } from "@ao/shared";
 import { SimulatedCrash } from "../repo/seams.js";
 import { foldName, namesIn, readMaybe } from "../repo/io.js";
 import type { ProjectKeyFile } from "../repo/projects.js";
@@ -168,6 +170,8 @@ export const backupSeams: {
   beforePruneAudit?: () => Promise<void>;
   /** Runs once the archive is complete and recorded, before it is named and committed (R138 probes). */
   beforeCommit?: (hold: MaintenanceHold) => Promise<void>;
+  /** Runs before each piece of the zip is written to its temp file (R551 I2 probes: a close in the middle of the zip). */
+  zipChunk?: () => Promise<void>;
 } = {};
 
 function crashPoint(point: BackupCrashPoint): void {
@@ -179,6 +183,45 @@ function crashPoint(point: BackupCrashPoint): void {
 
 /** Package-internal (retention): the same test seam, for the steps of a destruction's backups. */
 export const backupCrashPoint = crashPoint;
+
+/**
+ * R551 I2 (R247 c): the library was closed (or its session began to close: the close, the close inside opening or
+ * creating another library or a reconnect, the service's stop) while the backup was being made. It stopped at its next
+ * step, before its commit point; its temporary file is removed; neither a success nor a failure is recorded. The
+ * message is the one sentence for whoever asked (`backupClosedSentence`).
+ */
+export class BackupCancelledError extends Error {
+  override name = "BackupCancelledError";
+  constructor(projectName: string) {
+    super(backupClosedSentence(projectName));
+  }
+}
+
+/**
+ * R551 I2: the backups in flight on each library. Its `close()` waits for them (registered once, as a repository's
+ * write queue is) before the lock is released: a backup cut by the close removes its temporary file and its pending
+ * record first, so nothing under Backups/ changes after the close.
+ */
+const backupsInFlight = new WeakMap<Library, Set<Promise<unknown>>>();
+
+function inFlight<T>(lib: Library, run: () => Promise<T>): Promise<T> {
+  let set = backupsInFlight.get(lib);
+  if (!set) {
+    const mine = new Set<Promise<unknown>>();
+    set = mine;
+    backupsInFlight.set(lib, mine);
+    onClose(lib, { drain: async () => void (await Promise.allSettled([...mine])), holdsTurn: () => false });
+  }
+  const p = run();
+  const held = set;
+  const forget = () => void held.delete(p);
+  held.add(p);
+  p.then(forget, forget);
+  return p;
+}
+
+/** A close (or the session's closing) cut the backup: the library refused a step, or the backup saw it between steps. */
+const cutByClose = (err: unknown): boolean => err instanceof BackupCancelledError || err instanceof LibraryClosedError;
 
 /** The `backup.create` event (the commit point) could not be written: the backup was not kept. */
 export class BackupNotRecordedError extends Error {
@@ -750,7 +793,7 @@ async function snapshot(repo: Repo, projectId: string): Promise<Snapshot> {
 const DOS_EPOCH = new Date("1980-01-02T00:00:00Z");
 
 /** Streams the zip of the snapshot (backup.json first) through the encryption (if any) into `tmp`. */
-async function writeZip(tmp: string, snap: Snapshot, header: Record<string, unknown>): Promise<{ sha256: string; bytes: number }> {
+async function writeZip(tmp: string, snap: Snapshot, header: Record<string, unknown>, step: () => void = () => {}): Promise<{ sha256: string; bytes: number }> {
   // R454: the zip starts reading its files as soon as they are added, so nothing is awaited from here on until its
   // errors are listened to and its output consumed: the temp file is opened first.
   const hash = createHash("sha256");
@@ -776,6 +819,10 @@ async function writeZip(tmp: string, snap: Snapshot, header: Record<string, unkn
     const sink = new Writable({
       async write(chunk: Buffer, _enc, cb) {
         try {
+          // R551 I2: a close cuts the zip between two of its pieces (the stream ends with the error; the caller shreds
+          // the temp file).
+          await backupSeams.zipChunk?.();
+          step();
           hash.update(chunk);
           bytes += chunk.length;
           for (let off = 0; off < chunk.length; ) off += (await fh.write(chunk, off)).bytesWritten;
@@ -890,8 +937,8 @@ export function backupFailureReason(repo: Repo, err: unknown): string {
 }
 
 async function recordFailure(repo: Repo, projectId: string, err: unknown): Promise<void> {
-  // A locked project or a read-only library: nothing failed, it cannot run now (M3).
-  if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError) return;
+  // A locked project or a read-only library: nothing failed, it cannot run now (M3). Nor a closed one (R551 I2).
+  if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError || cutByClose(err)) return;
   const at = repoClock(repo)().toISOString();
   const f: BackupFailure = { at, reason: backupFailureReason(repo, err), ...(err instanceof PolicyDeniedError ? { refused: true as const } : {}) };
   await withState(repo, (s) => {
@@ -1095,6 +1142,11 @@ export interface BackupOptions {
   prune?: boolean;
   /** Where things are on this machine, to classify the library's folder (default: probed). */
   locationEnv?: LocationEnv;
+  /**
+   * R551 I2: the closing signal of the library's session (the service's). Once it is aborted the backup stops at its
+   * next step, as when the library itself is closed: BackupCancelledError, nothing kept, nothing recorded.
+   */
+  signal?: AbortSignal;
 }
 
 /** The commit could not be appended (as opposed to a refusal or a discard at the commit point). */
@@ -1111,7 +1163,20 @@ export function backupProject(repo: Repo, projectId: string, opts: BackupOptions
   return withProjectMaintenance(repo, projectId, (hold) => backupLocked(repo, projectId, opts, hold));
 }
 
-async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, hold: MaintenanceHold): Promise<BackupResult> {
+function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, hold: MaintenanceHold): Promise<BackupResult> {
+  const lib = repoLibrary(repo);
+  return inFlight(lib, () => backupRun(repo, projectId, opts, hold, lib));
+}
+
+async function backupRun(repo: Repo, projectId: string, opts: BackupOptions, hold: MaintenanceHold, lib: Library): Promise<BackupResult> {
+  // R551 I2: between its steps, up to its commit point, the backup stops once its library is closed or its session
+  // closing (nothing is written by this check itself; what was written is taken back below).
+  const projectName = repo.getProject(projectId).name;
+  const cut = () => isClosed(lib) || opts.signal?.aborted === true;
+  const step = () => {
+    if (cut()) throw new BackupCancelledError(projectName);
+  };
+  step();
   const dir = backupsDir(repo);
   await fsp.mkdir(dir, { recursive: true });
   await settlePending(repo);
@@ -1126,6 +1191,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
   let undecided = false;
   const temps: string[] = [];
   try {
+    step();
     if (backupSeams.failBackup) throw new Error("simulated backup failure");
     const destinations = await backupDestinations(dir, opts.locationEnv ?? (await defaultLocationEnv()));
     const request = { action: "backup" as const, backup: { destinations } };
@@ -1140,6 +1206,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
     const decision = await authorizeProcessing(repo, projectId, request, { op: "backup.create", entity, auditAllow: { details: { backupId } } });
     const mustSeal = decision.result === "allow_with_conditions" && decision.conditions.some((c) => c.type === "encrypt");
     crashPoint("after-decision");
+    step();
 
     // 2. The zip, complete and fsynced under its temp name; the backup name reserved.
     let result: { snap: Snapshot; tmp: string; sha256: string; bytes: number; name: string; wanted: string } | undefined;
@@ -1149,6 +1216,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
         // Never an unsealed backup of a project whose rules require encryption (the engine's condition).
         if (mustSeal && !snap.key) throw new PolicyDeniedError("Governance requires encryption at rest, but this project is not encrypted", "backup");
         await backupSeams.afterSnapshot?.();
+        step();
         let wanted = datedFileName(`${snap.project.name} - backup`, new Date(snap.at), "zip", tz);
         if (snap.key) wanted = `${wanted}.enc`;
         const tmp = join(dir, `${wanted}.tmp-${randomBytes(6).toString("hex")}`);
@@ -1157,7 +1225,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
         const name = await reserveName(repo, backupId, wanted, basename(tmp));
         try {
           const header = { formatVersion: 1, projectId, projectName: snap.project.name, createdAt: snap.at, encrypted: !!snap.key, auditHead: snap.head, files: snap.files.length, assets: snap.assets };
-          const r = await writeZip(tmp, snap, header);
+          const r = await writeZip(tmp, snap, header, step);
           if (await changedSince(snap.files)) {
             if (attempt === 0) {
               await shredPath(tmp);
@@ -1171,6 +1239,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
           if (err instanceof SimulatedCrash) throw err;
           await shredPath(tmp).catch(() => {});
           activeTemps.delete(tmp);
+          if (cutByClose(err)) throw err;
           // A file that changed size or went away while it was read: start again once.
           if (attempt === 0 && (await changedSince(snap.files))) continue;
           throw err;
@@ -1199,6 +1268,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
       if (p?.kind === "create") Object.assign(p, { tmp: basename(result.tmp), file: result.name, entry: entryOf(result.name) });
     });
     await backupSeams.beforeCommit?.(hold);
+    step();
 
     // 3. Its name, never over an existing file (a taken name gets the next counter), then the
     // bytes under that name checked against what was recorded (R138 b).
@@ -1219,6 +1289,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
       throw new BackupDiscardedError(CHANGED_ON_DISK);
     }
     crashPoint("before-commit");
+    step();
 
     // 4. The commit point, in one write-queue turn (R138 c, d): the decision again, against the
     // governance in force now (a deny is audited, with this attempt's id and name, and thrown); no
@@ -1274,6 +1345,8 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
         delete s.pending[backupId];
       }).catch(() => {});
     }
+    // R551 I2: cut by a close: neither a success nor a failure is recorded; whoever asked reads the one sentence.
+    if (cutByClose(err)) throw err instanceof BackupCancelledError ? err : new BackupCancelledError(projectName);
     await recordFailure(repo, projectId, err);
     throw err;
   } finally {
@@ -1281,7 +1354,8 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
     for (const t of temps) activeTemps.delete(t);
   }
   let pruned: string[] = [];
-  if (opts.prune !== false) {
+  // R551 I2: the backup is made and recorded; with the library closing, its older backups are left for the next one.
+  if (opts.prune !== false && !cut()) {
     try {
       pruned = await pruneLocked(repo, projectId, opts.keep ?? made.project.backups?.keep ?? DEFAULT_KEEP);
     } catch (err) {
@@ -1331,6 +1405,7 @@ async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise
   // Never in a library this computer does not hold for writing (R154 e): nothing is removed or noted.
   const lib = repoLibrary(repo);
   if (lib.mode !== "read-write") throw new ReadOnlyLibraryError(lib.readOnlyReason);
+  if (isClosed(lib)) throw new LibraryClosedError(); // R551 I2: nothing removed from a closed library
   await settlePending(repo);
   const pruneId = newId();
   activeOps.add(pruneId);
@@ -1626,13 +1701,13 @@ export function setBackupSettings(repo: Repo, projectId: string, settings: { aut
  * as the project's warning `backup-failed`, with its reason. A refused one is asked again a day
  * later, not at every pass of the scheduler (one denial in the audit log a day, not one an hour).
  */
-export function backupIfDue(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv"> = {}): Promise<BackupResult | null> {
+export function backupIfDue(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv" | "signal"> = {}): Promise<BackupResult | null> {
   // Whether one is due is decided while holding the project (R138 a): a manual backup running at
   // the same time makes this one not due, instead of a second backup.
   return withProjectMaintenance(repo, projectId, (hold) => backupIfDueLocked(repo, projectId, now, opts, hold));
 }
 
-async function backupIfDueLocked(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv">, hold: MaintenanceHold): Promise<BackupResult | null> {
+async function backupIfDueLocked(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv" | "signal">, hold: MaintenanceHold): Promise<BackupResult | null> {
   const p = repo.getProject(projectId);
   if (p.backups?.automatic === false) return null;
   if (!repo.isUnlocked(projectId)) return null;
@@ -1643,7 +1718,8 @@ async function backupIfDueLocked(repo: Repo, projectId: string, now: Date, opts:
   try {
     return await backupLocked(repo, projectId, opts, hold);
   } catch (err) {
-    if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError) return null;
+    // Cannot run now: locked, read-only, or the library closed under it (R551 I2: nothing kept, nothing recorded).
+    if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError || cutByClose(err)) return null;
     throw err;
   }
 }

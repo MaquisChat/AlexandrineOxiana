@@ -1893,7 +1893,8 @@ export class ServiceState {
       }
       if (p.backups?.automatic === false) continue;
       try {
-        const r = await backupIfDue(s.repo, p.id, this.opts.now());
+        // R551 I2: a close that begins meanwhile cancels it: nothing made, nothing recorded (it could not run now).
+        const r = await backupIfDue(s.repo, p.id, this.opts.now(), { signal: s.closing.signal });
         out.push({ projectId: p.id, ok: true, backedUp: r !== null });
         if (r) this.events.publish("job.progress", { kind: "backup", projectId: p.id, ok: true });
       } catch (err) {
