@@ -18,11 +18,11 @@
  * a settle), never one per scan. Reading folds the lines by key, streaming them (memory: one entry per key,
  * not per line).
  */
-import { statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { isId } from "@ao/core";
-import { InvalidInputError, ProjectLockedError } from "./errors.js";
+import { InvalidInputError, ProjectLockedError, TornFileError } from "./errors.js";
 import { openLine, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation } from "./mutate.js";
 import { PURPOSE_WATCH_REGISTER } from "./sealed-purposes.js";
@@ -57,6 +57,8 @@ export interface WatchRegisterEntry {
 }
 
 export const WATCH_REGISTER_OP = "project.watched-folder.register";
+/** R503 a: a torn last line of a register cut by a change of its own, before the change that appends (`{ watch, bytes }`). */
+export const WATCH_REGISTER_REPAIR_OP = "project.watched-folder.repair";
 const PURPOSE = PURPOSE_WATCH_REGISTER;
 const DIR = "watched";
 /** A name longer than this is not a name (a path component is at most 255 bytes; 20 levels deep at most). */
@@ -263,8 +265,8 @@ export function countStates(entries: readonly WatchRegisterEntry[]): Record<Watc
 
 /**
  * Appends `entries` to a watch's register: ONE governed change (R26: policy, transaction marker, audit
- * `project.watched-folder.register` with `{ watch, entries, states }` — counts only). Nothing is written for no
- * entries. Refuses a read-only library and a locked project (in plain words, before anything is written).
+ * `project.watched-folder.register` with `{ watch, entries, states }` — counts only), after a torn last line, if any,
+ * was cut by a change of its own (`mendTail`, R503 a). Nothing is written for no entries. Refuses a read-only library and a locked project (in plain words, before anything is written).
  */
 export async function recordWatchedFiles(core: RepoCore, projectId: string, watchId: string, entries: WatchRegisterEntry[]): Promise<void> {
   core.assertWritable();
@@ -274,10 +276,85 @@ export async function recordWatchedFiles(core: RepoCore, projectId: string, watc
   for (const e of entries) if (!isRegisterEntry(e)) throw new InvalidInputError("A register entry is not well formed.");
   const lines = entries.map(clean);
   try {
+    await mendTail(core, projectId, watchId);
     await write(core, projectId, watchId, lines);
   } catch (err) {
     // A file-system error's message names the file: never passed on (R96, review I4).
-    if (isSystemError(err)) throw new WatchRegisterUnwritableError();
+    if (isSystemError(err) || err instanceof TornFileError) throw new WatchRegisterUnwritableError();
+    throw err;
+  }
+}
+
+/** True when the register's last byte is not a newline (only that byte is read, N3); false for an empty or absent file. */
+async function endsTorn(abs: string): Promise<boolean> {
+  let fh: fsp.FileHandle;
+  try {
+    fh = await fsp.open(abs, "r");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+  try {
+    return !(await lastByteIsNewline(fh));
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * The same as `endsTorn`, read synchronously: a change that finds its file intact is queued in the same turn as before
+ * the cut became a change of its own (R503 a), so a lock asked as it starts still waits for it (R379).
+ */
+function endsTornSync(abs: string): boolean {
+  let fd: number;
+  try {
+    fd = openSync(abs, "r");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+  try {
+    const size = fstatSync(fd).size;
+    if (size === 0) return false;
+    const b = Buffer.alloc(1);
+    readSync(fd, b, 0, 1, size - 1);
+    return b[0] !== 0x0a;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+class NothingToMend extends Error {}
+
+/**
+ * A last line torn by an unclean stop (not by this app's own writes, which the marker takes back) is cut by ONE governed
+ * change of its own, committed before the change that appends (A8, review I4; R503 a: a change that both rewrote the
+ * register and appended to it could not always be undone). An intact register (or none) writes nothing.
+ */
+async function mendTail(core: RepoCore, projectId: string, watchId: string): Promise<void> {
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  if (!endsTornSync(core.abs(registerRel(st.rel, watchId)))) return;
+  let cut = 0;
+  try {
+    await runMutation(
+      core,
+      projectId,
+      REQ,
+      async (tx) => {
+        const rel = registerRel(tx.state.rel, watchId);
+        const abs = core.abs(rel);
+        const raw = (await endsTorn(abs)) ? await readMaybe(abs) : null;
+        if (!raw || raw.length === 0 || raw[raw.length - 1] === 0x0a) throw new NothingToMend();
+        const keep = raw.lastIndexOf(0x0a) + 1;
+        cut = raw.length - keep;
+        await tx.writeFile(rel, raw.subarray(0, keep), { mode: CHANGE_LOG_MODE });
+        tx.onCommit(() => cacheOf(core).delete(abs));
+      },
+      { op: WATCH_REGISTER_REPAIR_OP, entity: { type: "project", id: projectId }, auditDetails: () => ({ watch: watchId, bytes: cut }) },
+    );
+  } catch (err) {
+    if (err instanceof NothingToMend) return;
     throw err;
   }
 }
@@ -291,25 +368,10 @@ function write(core: RepoCore, projectId: string, watchId: string, lines: WatchR
       const st = tx.state;
       const rel = registerRel(st.rel, watchId);
       const abs = core.abs(rel);
-      // A last line torn by an unclean stop (not by this app's own writes, which the marker takes back) is removed
-      // in this change, so that the register can be appended to again (A8, review I4).
-      // Only the last byte is read to tell (N3); the whole file only when it is torn (rare).
-      let torn = false;
-      try {
-        const fh = await fsp.open(abs, "r");
-        try {
-          torn = !(await lastByteIsNewline(fh));
-        } finally {
-          await fh.close();
-        }
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      }
-      const raw = torn ? await readMaybe(abs) : null;
-      if (raw && raw.length > 0 && raw[raw.length - 1] !== 0x0a) {
-        const end = raw.lastIndexOf(0x0a) + 1;
-        await tx.writeFile(rel, raw.subarray(0, end), { mode: CHANGE_LOG_MODE });
-      }
+      // A torn last line was cut by a change of its own before this one (mendTail, R503 a): a change never both
+      // rewrites the register and appends to it. One still torn here is refused before anything is written or kept in
+      // memory (TornFileError).
+      if (await endsTorn(abs)) throw new TornFileError(rel);
       tx.onCommit(() => {
         const cache = cacheOf(core);
         const kept = cache.get(abs);

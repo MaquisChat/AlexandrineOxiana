@@ -46,11 +46,11 @@
  * writes refuse (`FindQueueUnreadableError`) and nothing is written. The only thing a write removes is a last
  * line torn by an unclean stop (no newline after it); a read passes it by.
  */
-import { statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 import { Readable } from "node:stream";
 import * as fsp from "node:fs/promises";
 import { Creator, SourceType, isId } from "@ao/core";
-import { InvalidInputError, ProjectLockedError } from "../repo/errors.js";
+import { InvalidInputError, ProjectLockedError, TornFileError } from "../repo/errors.js";
 import { openLine, readMaybe, sealLine } from "../repo/io.js";
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "../repo/mutate.js";
 import { PURPOSE_FIND_QUEUE } from "../repo/sealed-purposes.js";
@@ -608,11 +608,13 @@ export async function appendFindEntries(core: RepoCore, projectId: string, entri
   const updates = alongside.map(clean);
   if (cleaned.length === 0) return;
   try {
+    await mendFindQueueTail(core, projectId);
+    if (process.env.NODE_ENV === "test") mendSeams.afterMend?.();
     await write(core, projectId, op, cleaned, updates, method);
   } catch (err) {
     if (err instanceof NothingToWrite) return;
     // A file-system error's message names the file: never passed on (R96).
-    if (isSystemError(err)) throw new FindQueueUnwritableError();
+    if (isSystemError(err) || err instanceof TornFileError) throw new FindQueueUnwritableError();
     throw err;
   }
   try {
@@ -675,12 +677,10 @@ async function linesInTx(core: RepoCore, tx: Tx, op: Op, given: FindEntry[], alo
 
   const rel = queueRel(st.rel);
   const abs = core.abs(rel);
-  // A last line torn by an unclean stop (not by this app's own writes, which the marker takes back) is
-  // removed in this change, so that the file can be appended to again.
-  if (await endsTorn(abs)) {
-    const raw = await readMaybe(abs);
-    if (raw && raw.length > 0 && raw[raw.length - 1] !== 0x0a) await tx.writeFile(rel, raw.subarray(0, raw.lastIndexOf(0x0a) + 1), { mode: CHANGE_LOG_MODE });
-  }
+  // A last line torn by an unclean stop was cut by a change of its own before this one (mendFindQueueTail, R503 a): a
+  // change never both rewrites the file and appends to it. One still torn here is refused before anything is written
+  // or kept in memory (TornFileError).
+  if (await endsTorn(abs)) throw new TornFileError(rel);
   tx.onCommit(() => {
     const kept = cacheOf(core).get(abs);
     if (!kept || kept.folded !== folded) return;
@@ -702,6 +702,62 @@ async function linesInTx(core: RepoCore, tx: Tx, op: Op, given: FindEntry[], alo
     for (const e of todo) await tx.appendLine(rel, JSON.stringify(e), { mode: CHANGE_LOG_MODE });
   }
   return todo;
+}
+
+/**
+ * The same as `endsTorn`, read synchronously: a change that finds its file intact is queued in the same turn as before
+ * the cut became a change of its own (R503 a), so a lock asked as it starts still waits for it (R379).
+ */
+function endsTornSync(abs: string): boolean {
+  let fd: number;
+  try {
+    fd = openSync(abs, "r");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+  try {
+    const size = fstatSync(fd).size;
+    if (size === 0) return false;
+    const b = Buffer.alloc(1);
+    readSync(fd, b, 0, 1, size - 1);
+    return b[0] !== 0x0a;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * R503 a: a last line of the queue torn by an unclean stop (not by this app's own writes, which the marker takes back)
+ * is cut by ONE governed change of its own (`project.find.repair`, audited with the number of bytes cut), committed
+ * before the change that appends begins: a change that both rewrote the file and appended to it could not always be
+ * undone. Only the last byte is read to tell; an intact queue (or none) writes nothing and audits nothing. Callers
+ * that append to the queue inside a change of their own call it before that change begins.
+ */
+export async function mendFindQueueTail(core: RepoCore, projectId: string): Promise<void> {
+  if (!endsTornSync(core.abs(queueRel(core.state(projectId).rel)))) return;
+  let cut = 0;
+  try {
+    await runMutation(
+      core,
+      projectId,
+      REQ,
+      async (tx) => {
+        const rel = queueRel(tx.state.rel);
+        const abs = core.abs(rel);
+        const raw = (await endsTorn(abs)) ? await readMaybe(abs) : null;
+        if (!raw || raw.length === 0 || raw[raw.length - 1] === 0x0a) throw new NothingToWrite();
+        const keep = raw.lastIndexOf(0x0a) + 1;
+        cut = raw.length - keep;
+        await tx.writeFile(rel, raw.subarray(0, keep), { mode: CHANGE_LOG_MODE });
+        tx.onCommit(() => cacheOf(core).delete(abs));
+      },
+      { op: FIND_QUEUE_OPS.repair, entity: { type: "project", id: projectId }, auditDetails: () => ({ bytes: cut }) },
+    );
+  } catch (err) {
+    if (err instanceof NothingToWrite) return;
+    throw err;
+  }
 }
 
 /**
@@ -853,3 +909,9 @@ export async function compactFindQueue(core: RepoCore, projectId: string): Promi
 
 /** Test-only seam (honoured only under NODE_ENV=test, R47): replaces the lines the compaction built, to force a disagreement. */
 export const compactionSeams: { mutateBuilt?: (lines: string[]) => string[] } = {};
+
+/**
+ * Test-only seam (honoured only under NODE_ENV=test, R47): runs after a torn last line was cut by its own committed
+ * change and before the change that appends begins (R503 a), so that a test can crash the second change or between.
+ */
+export const mendSeams: { afterMend?: () => void } = {};

@@ -14,9 +14,10 @@ import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
 import type { Repo } from "./index.js";
+import type { Tx } from "./mutate.js";
 import { importChange } from "./repo.js";
 import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
-import { fromRel, undoEntries, type TxnMarker } from "./txn.js";
+import { MIXED_WRITE, fromRel, undoEntries, type TxnMarker } from "./txn.js";
 
 const OPEN_GOV = `identifiability:
   containsIdentifiable: false
@@ -195,6 +196,52 @@ describe("R493: the cut seam is inert outside NODE_ENV=test (R47)", () => {
   });
 });
 
+describe("R503 a: a change that would both append to a file and rewrite it is refused before that step writes anything", () => {
+  beforeEach(async () => {
+    w = await makeWorld();
+  });
+  afterEach(async () => {
+    await dropWorld(w);
+  });
+
+  for (const order of [
+    ["rewrite", "append"],
+    ["append", "rewrite"],
+  ] as const) {
+    it(`${order.join(", then ")}: a programming error; the file, the marker and the kept copies are as the first step left them; the change is undone`, async () => {
+      const rel = `${w.folder}/mixed.txt`;
+      await writeFile(fromRel(w.lib.root, rel), ORIGINAL);
+      const step = (tx: Tx, kind: "rewrite" | "append") =>
+        kind === "rewrite" ? tx.writeFile(rel, "rewritten whole\n") : tx.appendLine(rel, "added at the end");
+      let refused: unknown = null;
+      const failed = await w.repo
+        .mutate(w.pid, STORE, async (tx) => {
+          await step(tx, order[0]);
+          const bytes = await bytesAt(w, rel);
+          const marker = await readMarker(w);
+          const tmp = (await readdir(join(w.lib.root, ".tmp"))).sort();
+          refused = await step(tx, order[1]).then(
+            () => null,
+            (err: unknown) => err,
+          );
+          expect(await bytesAt(w, rel)).toEqual(bytes);
+          expect(await readMarker(w)).toEqual(marker);
+          expect((await readdir(join(w.lib.root, ".tmp"))).sort()).toEqual(tmp);
+          throw refused ?? new Error("not refused");
+        })
+        .then(
+          () => null,
+          (err: unknown) => err,
+        );
+      expect(failed).toBe(refused);
+      expect(refused).toBeInstanceOf(Error);
+      expect((refused as Error).message).toBe("A change must not both append to a file and rewrite that same file (R503 a).");
+      expect((await bytesAt(w, rel))?.toString()).toBe(ORIGINAL);
+      expect(await markerNames(w)).toEqual([]);
+    });
+  }
+});
+
 // ---- the enumeration ---------------------------------------------------------------------------------------------
 
 type Op = "trash" | "create" | "replace" | "append";
@@ -215,6 +262,8 @@ function takes(seq: Op[], startExists: boolean): boolean {
   }
   return true;
 }
+/** R503 a: a change that both appends to the file and writes it whole (created or replaced) is refused by the transaction. */
+const mixed = (seq: Op[]): boolean => seq.includes("append") && seq.some((op) => op === "create" || op === "replace");
 const sequences = (n: number): Op[][] => (n === 0 ? [[]] : sequences(n - 1).flatMap((s) => OPS.map((op) => [...s, op])));
 
 /**
@@ -274,12 +323,46 @@ async function runCase(seq: Op[], startExists: boolean, cut: number): Promise<{ 
   }
 }
 
+/** A sequence the transaction refuses (R503 a): refused at its first step that mixes, nothing of it is left, no marker. */
+async function refusedCase(seq: Op[], startExists: boolean): Promise<string[]> {
+  const v = await makeWorld();
+  const name = `[${seq.join(", ")}] from ${startExists ? "a file with original bytes" : "no file"}`;
+  try {
+    const rel = `${v.folder}/rerun.txt`;
+    if (startExists) await writeFile(fromRel(v.lib.root, rel), ORIGINAL);
+    const before = await bytesAt(v, rel);
+    const failed = await v.repo
+      .mutate(v.pid, STORE, async (tx) => {
+        for (const [i, op] of seq.entries()) {
+          if (op === "trash") await tx.trash(rel);
+          else if (op === "append") await tx.appendLine(rel, `step ${i} appended`);
+          else await tx.writeFile(rel, `step ${i} wrote (${op})\n`);
+        }
+      })
+      .then(
+        () => null,
+        (err: unknown) => err,
+      );
+    const out: string[] = [];
+    if (!(failed instanceof Error) || failed.message !== MIXED_WRITE) out.push(`${name}: not refused (${failed === null ? "it was written" : String(failed)})`);
+    const now = await bytesAt(v, rel);
+    if (!(now === null ? before === null : before !== null && now.equals(before))) out.push(`${name}: the path is not as before the change`);
+    if ((await markerNames(v)).length) out.push(`${name}: a marker is left`);
+    return out;
+  } finally {
+    await dropWorld(v);
+  }
+}
+
 /**
  * Cases per group: the sum, over the sequences the API takes, of the marker's lines + 1 (a cut after 0 … all its steps).
  * Every step records one line, except an append to a file already appended to since its last trash (covered by the
- * first). Two steps: 8 sequences (23 cases) from a file, 6 (17) from none; three: 22 (81) and 16 (58). 52 sequences, 179 cases.
+ * first). A sequence that both appends and writes the file whole is refused by the transaction (R503 a) and is checked
+ * as refused instead. Two steps: 6 sequences (17 cases) from a file, 4 (11) from none, and 2 + 2 refused; three: 10 (36)
+ * and 6 (21), and 12 + 10 refused. 26 sequences and 85 cases rolled back, 26 sequences refused.
  */
-const EXPECTED_CASES: Record<string, number> = { "2-true": 23, "2-false": 17, "3-true": 81, "3-false": 58 };
+const EXPECTED_CASES: Record<string, number> = { "2-true": 17, "2-false": 11, "3-true": 36, "3-false": 21 };
+const EXPECTED_REFUSED: Record<string, number> = { "2-true": 2, "2-false": 2, "3-true": 12, "3-false": 10 };
 
 describe("R493: every two- and three-step sequence at one path, every cut of the first roll-back", () => {
   for (const length of [2, 3]) {
@@ -288,7 +371,12 @@ describe("R493: every two- and three-step sequence at one path, every cut of the
         const failures: string[] = [];
         const taken = sequences(length).filter((s) => takes(s, startExists));
         let cases = 0;
-        for (const seq of taken) {
+        let refused = 0;
+        for (const seq of taken.filter(mixed)) {
+          failures.push(...(await refusedCase(seq, startExists)));
+          refused++;
+        }
+        for (const seq of taken.filter((s) => !mixed(s))) {
           // The first case (no step undone) shows how many lines the marker holds: then one cut after each step, the last
           // included (every step undone, the marker not yet removed: a crash just before it is).
           const first = await runCase(seq, startExists, 0);
@@ -300,6 +388,7 @@ describe("R493: every two- and three-step sequence at one path, every cut of the
           }
         }
         expect(cases).toBe(EXPECTED_CASES[`${length}-${startExists}`]);
+        expect(refused).toBe(EXPECTED_REFUSED[`${length}-${startExists}`]);
         expect(failures, `${failures.length} of ${cases} case(s) failed`).toEqual([]);
       }, 600_000);
     }

@@ -87,6 +87,9 @@ export interface TxnMarker {
 const MARKER = /^txn-([0-9a-f-]+)\.json$/;
 const BACKUP = /^txn-([0-9a-f-]+)\.orig-\d+$/;
 
+/** R503 a: the programming error of a transaction asked to both append to a file and rewrite it. */
+export const MIXED_WRITE = "A change must not both append to a file and rewrite that same file (R503 a).";
+
 export const toRel = (root: string, abs: string): string => relative(root, abs).split(sep).join("/");
 export const fromRel = (root: string, rel: string): string => join(root, ...rel.split("/"));
 
@@ -97,6 +100,9 @@ export class TxnLog {
   private readonly newDirs: string[] = [];
   /** Files already appended to in this transaction: undo truncates them to the first recorded size. */
   private readonly appended = new Set<string>();
+  /** R503 a: every file this transaction appended to, and every file it wrote whole (created or replaced), trash or not. */
+  private readonly appendedEver = new Set<string>();
+  private readonly rewritten = new Set<string>();
   private dirReady = false;
 
   constructor(
@@ -136,8 +142,19 @@ export class TxnLog {
     return this.newDirs.some((d) => rel.startsWith(`${d}/`));
   }
 
+  /**
+   * R503 a: a transaction never both appends to a file and rewrites that same file, in either order (with or without a
+   * trash between): its undo could not always tell where the append began, so a crash would leave a change that is
+   * refused at every opening. A programming error, thrown before the offending step records or writes anything.
+   */
+  private refuseMixed(rel: string, as: "append" | "rewrite"): void {
+    if ((as === "append" ? this.rewritten : this.appendedEver).has(rel)) throw new Error(MIXED_WRITE);
+    (as === "append" ? this.appendedEver : this.rewritten).add(rel);
+  }
+
   async created(abs: string, sha256?: string) {
     const rel = toRel(this.root, abs);
+    this.refuseMixed(rel, "rewrite");
     // A file in a folder this transaction created needs no step of its own.
     if (this.inNewDir(rel)) return;
     await this.add({ kind: "created", path: rel, ...(sha256 ? { sha256 } : {}) });
@@ -145,6 +162,7 @@ export class TxnLog {
 
   /** Copies the current file aside (same mode, so 0600 stays 0600), then records it. */
   async replaced(abs: string, mode: number, sha256?: string) {
+    this.refuseMixed(toRel(this.root, abs), "rewrite");
     await fsp.mkdir(this.dir, { recursive: true });
     const backup = join(this.dir, `txn-${this.id}.orig-${this.backups++}`);
     await copyFileAtomic(abs, backup, { mode });
@@ -185,6 +203,7 @@ export class TxnLog {
 
   async append(u: AppendUndo) {
     const rel = toRel(this.root, u.path);
+    this.refuseMixed(rel, "append");
     // A later append to the same file is covered by the first step (undo truncates to its size).
     if (this.appended.has(rel) || this.inNewDir(rel)) return;
     this.appended.add(rel);

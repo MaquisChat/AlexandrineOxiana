@@ -5,7 +5,7 @@
  * the same change. Nothing is ever left orphaned; an encrypted project's held file is encrypted at rest, and its
  * backup restores.
  */
-import { readFile, readdir, stat } from "node:fs/promises";
+import { appendFile, readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { newId, type Project } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -13,10 +13,11 @@ import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { backupProject, restoreBackup } from "../export/backup.js";
 import { OPEN_GOV, PASS, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, plainOf, scratchFile, type Kit } from "../export/test-kit.js";
 import { appendFindEntries, readFindQueue } from "../find/queue-store.js";
-import type { FindEntry } from "../find/types.js";
+import { FIND_QUEUE_OPS, type FindEntry } from "../find/types.js";
 import { ProjectLockedError, ReviewEntryDecidedError } from "./errors.js";
 import {
   FIND_HELD_MAX,
+  FIND_HELD_OPS,
   HELD_FILE_REASON,
   HeldFileEntryGoneError,
   HeldFileLimitError,
@@ -361,6 +362,52 @@ describe("nothing is ever left orphaned", () => {
     expect(text).toContain("project.find.hold");
     expect(text).toContain("project.find.held-attach");
     expect(text).toContain("project.find.held-discard");
+  });
+});
+
+describe("R503 a: a queue whose last line an unclean stop tore", () => {
+  const queueFile = (w: World) => join(kit.lib.root, kit.repo.getProject(w.p.id).folder, "find", "queue.jsonl");
+  const tear = (w: World) => appendFile(queueFile(w), '{"id":"half'); // by something else (no newline)
+  /** The ops of the audit entries written since `from` (one per change: its store request's entry). */
+  const opsSince = async (w: World, from: number) =>
+    (await auditEvents(kit, w.p))
+      .slice(from)
+      .filter((e) => e.action === "store")
+      .map((e) => e.details?.op);
+
+  it("the hold, a decision and the entry's removal each cut it first by a change of its own, then make their own change", async () => {
+    for (const decide of ["attach", "discard", "remove"] as const) {
+      const w = await world();
+      await tear(w);
+      let from = (await auditEvents(kit, w.p)).length;
+      await hold(w);
+      expect(await opsSince(w, from)).toEqual([FIND_QUEUE_OPS.repair, FIND_HELD_OPS.hold]);
+      expect(await stateOf(w)).toBe("needs-check");
+      await tear(w);
+      from = (await auditEvents(kit, w.p)).length;
+      if (decide === "remove") await removeFindEntryWithHeld(coreOf(), w.p.id, needsCheck(w));
+      else await resolveHeldFile(coreOf(), w.p.id, (await pending(w))[0]!.id, decide);
+      expect(await opsSince(w, from)).toEqual([FIND_QUEUE_OPS.repair, decide === "remove" ? FIND_QUEUE_OPS.remove : FIND_HELD_OPS[decide]]);
+      const raw = await readFile(queueFile(w), "utf8");
+      expect(raw).not.toContain("half");
+      expect(raw.endsWith("\n")).toBe(true);
+      expect(await heldFiles(w)).toEqual([]);
+    }
+  });
+
+  it("deleting the source is not stopped by it: the held file goes, the entry's line stays as it was, the torn line is left for the queue's next change", async () => {
+    const w = await world();
+    await hold(w);
+    await tear(w);
+    await kit.repo.deleteSource(w.p.id, w.sourceId);
+    expect(await heldFiles(w)).toEqual([]);
+    expect(await pending(w)).toEqual([]);
+    expect(await stateOf(w)).toBe("needs-check");
+    expect((await readFile(queueFile(w), "utf8")).endsWith('{"id":"half')).toBe(true);
+    // The queue's next change cuts it first.
+    await removeFindEntryWithHeld(coreOf(), w.p.id, needsCheck(w));
+    expect((await readFile(queueFile(w), "utf8")).includes("half")).toBe(false);
+    expect((await readFindQueue(coreOf(), w.p.id)).size).toBe(0);
   });
 });
 

@@ -16,7 +16,7 @@ import { HttpClient } from "../lookup/index.js";
 import { InvalidInputError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
 import type { Repo } from "./repo.js";
 import { SimulatedCrash, openTestRepo, seams, type CrashPoint } from "./testing.js";
-import { WATCH_REGISTER_OP, WatchRegisterUnreadableError, WatchRegisterUnwritableError, type WatchRegisterEntry } from "./watch-register.js";
+import { WATCH_REGISTER_OP, WATCH_REGISTER_REPAIR_OP, WatchRegisterUnreadableError, WatchRegisterUnwritableError, type WatchRegisterEntry } from "./watch-register.js";
 
 const GOV = `identifiability:
   containsIdentifiable: false
@@ -248,6 +248,20 @@ describe("the register of a watched folder (Task W3)", () => {
       expect([...(await repo.watchRegister(p.id, watchId)).values()]).toEqual([a, b]);
     });
   }
+
+  it("R503 a: a torn last line and new entries make two audited changes, the cut committed before the append; an intact register one", async () => {
+    const p = await project();
+    const watchId = newId();
+    await repo.recordWatchedFiles(p.id, watchId, [entry("a.pdf")]);
+    await appendFile(registerFile(p, watchId), '{"key":"half');
+    const ops = async () => (await auditEvents(p)).map((e) => e.details?.op).filter((op) => typeof op === "string" && op.startsWith("project.watched-folder."));
+    const before = (await ops()).length;
+    await repo.recordWatchedFiles(p.id, watchId, [entry("b.pdf")]);
+    expect((await ops()).slice(before)).toEqual([WATCH_REGISTER_REPAIR_OP, WATCH_REGISTER_OP]);
+    await repo.recordWatchedFiles(p.id, watchId, [entry("c.pdf")]);
+    expect((await ops()).slice(before + 2)).toEqual([WATCH_REGISTER_OP]);
+    expect([...(await repo.watchRegister(p.id, watchId)).keys()]).toEqual(["a.pdf", "b.pdf", "c.pdf"]);
+  });
 
   it("N2: a last line complete but for its newline is skipped by the reader as the writer cuts it", async () => {
     const p = await project();
