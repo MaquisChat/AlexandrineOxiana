@@ -1,5 +1,7 @@
 # The final review — what I need from you
 
+*Updated 24 November 2026: part 10, at the end, is new — the 94 rough edges are fixed and come to you as Mac build 10. Start there.*
+
 *Updated 17 November 2026: part 6, at the end, is new — four more decisions (22–25) after the last review of the whole branch.*
 
 *15 November 2026. How to answer: reply in the chat with the numbers of part 2 (for example "1: no author; 4: 12 characters; 13: keep the check") and a yes or no to part 3. The checklist of part 4 needs a new Mac build and can wait for it.*
@@ -9,7 +11,7 @@
 - All the app's features are built on the working branch. Everything was tested on Linux; nothing of the newest feature (Find and acquire) has run on a Mac yet.
 - Along the way the project's reviews set aside 616 small points for a final review. They are now sorted.
 - 7 are real problems, being fixed now: (1) reasons you type in an encrypted project were readable in its change log; (2) a file waiting for your check could be dragged onto a source from inside the library's own folder, skipping the check; (3) in the review queue a quick double press could decide the next entry unseen; (4) signing out of your library could say "done" while the sign-in window stayed signed in; (5) names of collections, tags and consent texts in an encrypted project are readable without the passphrase (a note is being added; sealing them is your decision, part 2); (6) pausing a recording just as its access renews was ignored and it started playing again; (7) a BibTeX file with a line starting with "@" inside an abstract lost the rest of that entry without a warning.
-- 16 missing tests are being added. 94 small rough edges await your word (part 3). 83 points are yours (parts 2 and 4). 386 are left as documented notes. 29 were already settled.
+- 16 missing tests are being added. The 94 small rough edges are fixed (24 November; part 10). 83 points are yours (parts 2 and 4). 386 are left as documented notes. 29 were already settled.
 
 ## 2. Decisions I need from you
 
@@ -149,6 +151,8 @@
 
 ## 3. The 94 small rough edges
 
+*24 November: you said "Fix the 94 rough edges", and they are fixed — part 10 says what changed. The text below is kept as it was written on 15 November; two of its examples are overtaken: the export's statement about a destroyed file is now mended, and a source whose linked file is missing now offers "Get a copy for this source".*
+
 These are small flaws a researcher could meet but that lose nothing important: wrong or confusing wording, a missing next step in a message, a screen that does not refresh, focus that lands in the wrong place, a few small gaps in what is shown. Examples:
 
 - Creating a library in a Mac folder that holds only the Finder's hidden `.DS_Store` file is refused as "not empty". **Fixing now regardless.**
@@ -169,7 +173,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 
 ## 4. Things only you can check
 
-*Use Mac build 9 for these (part 8 says where to download it). Note your findings beside each box.*
+*Use Mac build 10 for these (part 10 says where to download it). Note your findings beside each box.*
 
 ### Installing and opening the app on your Mac
 
@@ -255,7 +259,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 
 ## 5. What happens next without waiting for you
 
-Nothing, as of 23 November: everything that could be done without you is done, verified and on `main`. Part 9 lists what I need from you.
+As of 24 November: the rough-edge fixes are built, tested together and in Mac build 10; they are not yet on `main`, and I will ask you before they go there. Parts 9 and 10 list what I need from you.
 
 ## 6. Added on 17 November: the last review of the whole branch
 
@@ -339,7 +343,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 **It is merged.** You asked me to check and merge. `main` now holds everything built so far, and its files are identical to the branch that was verified.
 
-**Your Mac build is build 9 (24 November 2026). Use it instead of build 8.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. It passed every start-up check on GitHub's Mac, in both the debug app and the release app from the disk image.
+**Your Mac build was build 9 (24 November 2026) when this part was written; **build 10 (part 10) now replaces it.** Build 9 replaced build 8.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. It passed every start-up check on GitHub's Mac, in both the debug app and the release app from the disk image.
 
 - **Why build 9.** In build 8 you found that nothing on the Optional tools screen would install ("The download did not finish…"). The fault was the app's: the helper that downloads the tools looked for its list of trusted certificate authorities in a place that exists on the machine that built the app and not on your Mac, so it trusted nobody and refused every connection. Build 9 carries that list inside the app, and its build proves it from inside the finished app ("118 authorities from the app's own list"). If an install fails now, the message says whether it is the connection or a certificate that could not be verified (a VPN, a security program or a network that inspects secure connections can cause that).
 - **Where (build 9):** GitHub → Actions → "Desktop (macOS)" → run 12 → Artifacts → `alexandrine-oxiana-macos-apple-silicon`. Direct link to the run: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45291457721 — the disk image's checksum (SHA-256) is `1415478b68f59901b1b15a2938b490ca4623e981cb1cb798606fe9c22526852f`. Quit the app, then replace it with the one in this disk image.
@@ -367,13 +371,13 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 ## 9. Added on 23 November: what I need from you
 
-Everything built so far is on `main`, checked by GitHub and on a Mac. What is left is yours. In the order I would do it:
+Everything built up to 23 November is on `main`, checked by GitHub and on a Mac. The rough-edge fixes of 24 November are in Mac build 10 and wait for your word before they go to `main` (part 10). What is left is yours. In the order I would do it:
 
-- [ ] **1. Install Mac build 9** (part 8 says where: run 12's download). It replaces build 8, in which no optional tool could be installed.
+- [ ] **1. Install Mac build 10** (part 10 says where: run 13's download). It replaces builds 8 and 9: build 8 could not install any optional tool, build 9 mended that, and build 10 adds the rough-edge fixes.
 - [ ] **2. Undo the import that stopped when the disk filled, then import again** with enough free space, or with "leave the files where they are".
 - [ ] **3. Work through the hands-on checklist in part 4** (51 boxes, about ten areas). Tell me what you find, in any form; a sentence per problem is enough. Three areas matter most because nothing but your Mac can test them: "Get through my library" (the sign-in window), watched cloud folders, and the macOS prompts.
 - [ ] **4. Answer the decisions.** There are 27; two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26) and part 8 (27).
-- [ ] **5. Say whether the 94 small rough edges should be fixed** (part 3). My recommendation: yes, in four or five batches.
+- [x] **5. Say whether the 94 small rough edges should be fixed** (part 3). You said yes on 23 November; they are fixed (part 10).
 - [ ] **6. Tell me how much usage I may spend**, and remind me to stop at any usage warning. As a guide from the last round: a small reviewed fix costs about 1% of a week, a fix with two review rounds 2–3%, a hard one 5% or more.
 
 Not urgent, when you have time:
@@ -382,5 +386,84 @@ Not urgent, when you have time:
 - [ ] **8. Decide about an Apple Developer account.** Without it the app is not signed by Apple: macOS warns when you open it and you must choose "Open Anyway". It is needed only before the app is given to anyone else.
 - [x] **9. On GitHub, make `main` the default branch.** Done by you on 23 November.
 
-What I do once I have your answers: fix what your tests find, apply the decisions, fix the rough edges if you say so, then close the project out (a last check of the guide and the notes).
+What I do once I have your answers: fix what your tests find, apply the decisions, then close the project out (a last check of the guide and the notes).
 
+## 10. Added on 24 November: the rough edges are fixed — what changed, and what to check
+
+The 94 rough edges of part 3 are fixed. They were built in seven batches, and a second reviewer checked each batch and tried to break it. Then everything was tested together. They come to you as **Mac build 10**, and nothing in it needs a decision from you before you use it.
+
+- **Where:** run 13 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45321193812 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon`, unzip it and open the `.dmg` inside. Its SHA-256 is `de3f679d60def4bc9671800025054c31d3fc592661f8950bdd6563f8520999f9`.
+- **It replaces builds 8 and 9.** It contains build 9's download fix and everything below.
+- **It passed every check on GitHub's Mac** (24 November): the app starts, reaches its helpers, and stops cleanly; and the new "Closing Alexandrine Oxiana" window appeared there two seconds into a slowed quit, as it should.
+- **It is not yet in `main`** (the approved version). `main` lacks build 9's download fix and this whole round. **May I merge it?** A yes in the chat is enough; I would wait for GitHub's check of the merged state before calling it done.
+
+### What you will notice
+
+**The library and projects**
+- A collection's little arrow now opens and closes it with a mouse click.
+- Renaming a workspace tag asks you first.
+- An import's report shows "Collections created" and "Tags created". For older imports too, the review queue now warns that names may come from folder names.
+- A new project whose rules need things only you can give (such as a destruction date) lists them as soon as it is created, with "Open Governance".
+- On Fieldwork you can detach a signed form ("Detach the form…"). The app asks for a reason.
+- A project name written right to left no longer flips the banner.
+- An interrupted change is reported once per project: "A change to a source in <project> did not finish and could not be undone. Close the library and open it again to put it back."
+
+**Locked and encrypted projects**
+- The project picker marks a locked project "(locked)", and Governance, Audit log and Fieldwork link you to unlock it.
+- After you unlock a project, Capture tells you what the lock cut: "A lock stopped N links in this project from being captured. The links were not kept while the project was locked: add them again to capture them."
+
+**The PDF reader**
+- When a highlight in Chinese or Japanese text crosses a line break, the lines are joined without an added space.
+- If a source's linked PDF is missing but a copy has been added, the reader opens the copy.
+
+**Recordings and transcripts**
+- If a recording's file has changed, the player stops with: "The recording stopped: its file is no longer as the app stored it — it was changed outside the app, or it is damaged — so it cannot be played from here. Check the verification report."
+- After a long pause, a recording plays again without a false "may be damaged".
+- When you move the library, a running transcription stops and carries on after the move.
+- In Optional tools, the sentence now reads "Each download contacts only the addresses listed with the tool".
+
+**Watched folders**
+- During a folder's first look the screen shows "Watching — looking through the folder…".
+- A line counts the files that were not brought in again because they were already in the library.
+- A source opened just after it came in from a watched folder shows where it came from straight away (before, only a few seconds later), and its two buttons work from that moment.
+
+**Zotero**
+- Imports and syncs now say that removals in Zotero are not copied here: for example, a tag you take off there stays on here.
+- A sync whose end was never written no longer claims the app was closed.
+
+**Find and acquire**
+- A source whose linked file is on a disconnected drive now says: "Its linked file cannot be found at the moment; the drive it is on may not be connected." It offers "Get a copy for this source". "Use this file" then adds the copy beside the link, and the link stays.
+- Each found-file card has "Look at the file". It opens the file in the reader, to look at only; nothing is added to your library.
+- "Service cannot be reached" appears once, not twice.
+
+**Getting a PDF through your library**
+- If you press a button while its last request is still under way, the app tells you to wait ("Wait until the test has started.").
+- A late answer can no longer close a newer sign-in window.
+
+**Closing the app**
+- If closing takes more than two seconds, a small window "Closing Alexandrine Oxiana" says: "Your library is being closed safely. This can take up to a minute and a half." It does not take the keyboard.
+
+### What became safer underneath
+- An interrupted change is undone correctly even if the app is interrupted twice. **This mends an older fault:** an undo that ran a second time could delete a source's original annotations and still report success.
+- A lock now reaches a file at the very moment it is opened. **This mends an older fault:** a lock at exactly that moment let one whole picture through. Your documents had a separate guard.
+- If something put there by hand blocks an original the app must put back, the original is kept and the change is left unfinished. Before, the original could be deleted.
+- The app no longer reports its own writes as "changed outside the app". Real outside changes are still reported.
+- A transcript's two files are stored together or not at all.
+
+### Things only you can check in build 10
+- [ ] Start something long, such as a transcription, then quit with **Cmd-Q**. Does "Closing Alexandrine Oxiana" appear if closing takes more than two seconds, and does the app end completely? (FR-731)
+- [ ] In the review queue, press "Look at the file" on a found PDF. You should be able to read it but not add anything. Close it and note where the keyboard focus lands.
+- [ ] Unplug the drive that holds a source's linked file and press "Get a copy for this source". After "Use this file", the reader should open the copy.
+- [ ] In Optional tools, install "Speech model: tiny". This is build 9's fix, which you have not yet confirmed.
+- [ ] Highlight lines in a Chinese or Japanese PDF. The highlighted text should read correctly.
+
+### Known gaps found during the round (not fixed)
+- **FR-738:** after two crashes in a row, the second at one exact moment of Find and acquire's own repair, that project would stay blocked: each time the library opens, the app tries to undo the change and refuses. Nothing is lost. It is very unlikely.
+- **FR-735, FR-736:** when a file put there by hand is in the way, the original is kept, but the app cannot yet put it back itself, and its messages do not tell you what to do.
+- **FR-722:** a network that inspects secure connections (some universities) still refuses tool downloads. The app's message says why.
+- **FR-729:** warnings shown when a library reopens are gone after a restart.
+- **FR-733:** a move refused at its start restarts a running transcription.
+- **FR-727, FR-728:** a broken shortcut counts as a present file, and a waiting entry is not judged again when a file arrives some other way.
+- **FR-723, FR-737:** rare cases in undoing an unfinished change.
+- **FR-724, FR-732:** small inaccuracies in an export's notes about left-out files.
+- Small technical points, and small points of wording, focus and speed: FR-725, FR-726, FR-730, FR-734, FR-739, FR-740, FR-741.
