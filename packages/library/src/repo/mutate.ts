@@ -261,6 +261,9 @@ class TxImpl implements Tx {
     // than the thread-pool round trips of the asynchronous path, with the same guarantees.
     if (bytes.length <= SMALL_FILE_BYTES) await writeSmallFileAtomic(abs, bytes, { mode: opts.mode });
     else await writeFileAtomic(abs, bytes, { mode: opts.mode });
+    // Inside a folder this change created there is no line before the write: its completion line says the file
+    // holds these bytes once they are durable (R503 c 1, R519 (2)).
+    if (this.log.inCreatedDir(abs)) await this.log.completed(abs, sha256);
   }
 
   async copyFile(src: string, rel: string, opts: FileOptions = {}): Promise<{ sha256: string; bytes: number }> {
@@ -274,9 +277,16 @@ class TxImpl implements Tx {
       decode = (r) => r.pipe(decryptStream((id) => (id === keyId ? key : undefined)));
     }
     const nf = opts.noFollow ? { noFollow: true } : {};
-    if (!opts.encrypt) return copyFileAtomic(src, abs, { mode: opts.mode, ...nf, ...(decode ? { decode } : {}) });
-    const { key, keyId } = this.key();
-    return copyFileAtomic(src, abs, { mode: opts.mode, ...nf, ...(decode ? { decode } : {}), transform: (r) => r.pipe(encryptStream(key, keyId)) });
+    let copied: { sha256: string; bytes: number; storedSha256: string };
+    if (!opts.encrypt) copied = await copyFileAtomic(src, abs, { mode: opts.mode, ...nf, ...(decode ? { decode } : {}) });
+    else {
+      const { key, keyId } = this.key();
+      copied = await copyFileAtomic(src, abs, { mode: opts.mode, ...nf, ...(decode ? { decode } : {}), transform: (r) => r.pipe(encryptStream(key, keyId)) });
+    }
+    // The copy is durable (synced and renamed into place): its completion line carries the hash of the bytes as stored,
+    // hashed in the same pass (R503 c 1, R519 (2)). Without it, the file at the path is the change's half-written copy.
+    await this.log.completed(abs, copied.storedSha256);
+    return { sha256: copied.sha256, bytes: copied.bytes };
   }
 
   async appendLine(rel: string, line: string, opts: { mode?: number } = {}): Promise<void> {
@@ -303,7 +313,9 @@ class TxImpl implements Tx {
     await fsp.mkdir(dir, { recursive: true });
     const to = join(dir, `trash-${this.log.id}-${randomBytes(8).toString("hex")}`);
     await assertContained(dir, to);
-    await this.log.trashed(from, to, shred);
+    // The original's identity as the file system gives it, before it moves (R519 (3)): a rename keeps all three.
+    const st = await fsp.lstat(from, { bigint: true });
+    await this.log.trashed(from, to, shred, { ino: st.ino.toString(), size: Number(st.size), mtimeNs: st.mtimeNs.toString() });
     await renameWithRetry(from, to);
     this.trashed.push(to);
     if (shred) this.shred.push(to);

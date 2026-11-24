@@ -51,12 +51,30 @@ import { seams } from "./seams.js";
  * roll-back that finds the file neither so nor as before the change records that it was changed outside the app.
  */
 export type MarkerEntry =
-  | { kind: "created"; path: string; sha256?: string }
+  /**
+   * `complete` (R503 c 1, R519 (2)): a completion line, written once the file's bytes are durable, for a file written by
+   * copying or inside a folder the change created; `sha256` is of the bytes as stored. It is a second "created" line for
+   * the path, not a kind of its own: the reader of an older build refuses a marker with a kind it does not know, ignores
+   * a field it does not know, and undoes a second "created" line exactly as the first.
+   */
+  | { kind: "created"; path: string; sha256?: string; complete?: true }
   | { kind: "replaced"; path: string; backup: string; mode: number; sha256?: string }
   | { kind: "dir"; path: string }
-  /** `shred`: destroyed, not deleted (R90 d): overwritten before it is removed once committed. */
-  | { kind: "trashed"; from: string; to: string; shred?: boolean }
+  /**
+   * `shred`: destroyed, not deleted (R90 d): overwritten before it is removed once committed. `ino`, `size`, `mtimeNs`
+   * (R519 (3)): the original's identity when it was trashed (the file number and the time of last modification in
+   * nanoseconds as decimal strings), which a rename keeps: where the trash copy is gone, a file with this identity at
+   * the path is the original, put back.
+   */
+  | { kind: "trashed"; from: string; to: string; shred?: boolean; ino?: string; size?: number; mtimeNs?: string }
   | { kind: "append"; path: string; prevSize: number; created: boolean };
+
+/** The identity a "trashed" line records of its original (R519 (3)). */
+export interface FileIdentity {
+  ino: string;
+  size: number;
+  mtimeNs: string;
+}
 
 /**
  * The researcher's choice for an interrupted change (R27, R131 c), written into the marker before
@@ -170,6 +188,20 @@ export class TxnLog {
     await this.add({ kind: "replaced", path: toRel(this.root, abs), backup: toRel(this.root, backup), mode, ...(sha256 ? { sha256 } : {}) });
   }
 
+  /** Whether `abs` lies inside a folder this transaction created (a file written there has no line before its write). */
+  inCreatedDir(abs: string): boolean {
+    return this.inNewDir(toRel(this.root, abs));
+  }
+
+  /**
+   * The completion line of a file just written whole and made durable (R503 c 1, R519 (2)): a second "created" line for
+   * the path with the hash of its bytes as stored. Recorded after the write, so a file with no such line is the
+   * change's own half-written one. Not a second write of the file (R503 a's rule is not asked again).
+   */
+  async completed(abs: string, sha256: string) {
+    await this.add({ kind: "created", path: toRel(this.root, abs), sha256, complete: true });
+  }
+
   async createdDir(abs: string) {
     const rel = toRel(this.root, abs);
     if (this.inNewDir(rel)) return;
@@ -192,14 +224,14 @@ export class TxnLog {
     await writeSmallFileAtomic(this.path, JSON.stringify(this.marker));
   }
 
-  async trashed(from: string, to: string, shred = false) {
+  async trashed(from: string, to: string, shred = false, identity?: FileIdentity) {
     const rel = toRel(this.root, from);
     // What was at or under `from` is gone: a later append or folder there is new and needs its own
     // step (else undo would truncate or remove the new file and leave the original in the trash).
     const covers = (p: string) => p === rel || p.startsWith(`${rel}/`);
     for (const p of [...this.appended]) if (covers(p)) this.appended.delete(p);
     for (let i = this.newDirs.length - 1; i >= 0; i--) if (covers(this.newDirs[i]!)) this.newDirs.splice(i, 1);
-    await this.add({ kind: "trashed", from: rel, to: toRel(this.root, to), ...(shred ? { shred: true } : {}) });
+    await this.add({ kind: "trashed", from: rel, to: toRel(this.root, to), ...(shred ? { shred: true } : {}), ...(identity ?? {}) });
   }
 
   async append(u: AppendUndo) {
@@ -359,6 +391,7 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
       case "dir":
         if (!under(en.path, pf)) return `${en.kind} path outside the project`;
         if (en.sha256 !== undefined && (en.kind === "dir" || !isSha(en.sha256))) return "bad entry";
+        if (en.complete !== undefined && (en.kind === "dir" || en.complete !== true || en.sha256 === undefined)) return "bad entry";
         break;
       case "replaced":
         if (!under(en.path, pf)) return "replaced path outside the project";
@@ -370,6 +403,10 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
         if (!under(en.from, pf)) return "trashed path outside the project";
         if (!isTrashOf(en.to, x.txn)) return "trash is not this transaction's folder in .tmp";
         if (en.shred !== undefined && typeof en.shred !== "boolean") return "bad trashed entry";
+        // The identity is whole or absent (an older build's line): never judged on part of it.
+        if (en.ino !== undefined || en.size !== undefined || en.mtimeNs !== undefined) {
+          if (!isDigits(en.ino) || !count(en.size) || !isDigits(en.mtimeNs)) return "bad trashed entry";
+        }
         break;
       case "append":
         if (!under(en.path, pf)) return "append path outside the project";
@@ -638,6 +675,7 @@ export function markerPaths(m: Pick<TxnMarker, "entries">): string[] {
   return m.entries.map((e) => (e.kind === "trashed" ? e.from : e.path));
 }
 
+const isDigits = (x: unknown): boolean => typeof x === "string" && /^\d{1,30}$/u.test(x);
 const isSha = (x: unknown): boolean => typeof x === "string" && /^[0-9a-f]{64}$/u.test(x);
 const sha256File = async (abs: string): Promise<string | null> => {
   try {

@@ -184,13 +184,14 @@ export interface CopyOptions {
 /**
  * Atomically copies `src` to `dest`, optionally through `transform`.
  * Returns the SHA-256 (hex) and byte count of the source content, i.e. the
- * plaintext when `transform` encrypts.
+ * plaintext when `transform` encrypts, and `storedSha256`, the SHA-256 of the
+ * bytes as written to `dest`, hashed as they are written.
  */
 export async function copyFileAtomic(
   src: string,
   dest: string,
   opts: CopyOptions = {},
-): Promise<{ sha256: string; bytes: number }> {
+): Promise<{ sha256: string; bytes: number; storedSha256: string }> {
   // R454: every stream below is made, given its error listeners and consumed with NO `await` in between. The source
   // starts reading (and failing: a missing file, a lock, a damaged or foreign file) as soon as it is made; an `await`
   // there lets that error arrive with no listener — an uncaught exception, which stops the service — and leaves the
@@ -210,6 +211,8 @@ export async function copyFileAtomic(
     throw err;
   }
   const hash = createHash("sha256");
+  /** Of the bytes as written to `dest` (after `transform`), in the same pass (R519 (2)): differs from `hash` when encrypting. */
+  const stored = createHash("sha256");
   let bytes = 0;
   const hasher = new Transform({
     transform(chunk: Buffer, _enc, cb) {
@@ -235,6 +238,7 @@ export async function copyFileAtomic(
     out = opts.transform ? opts.transform(hashed) : hashed;
     if (out !== hashed) hashed.on("error", (err) => out.destroy(err));
     for await (const chunk of out as AsyncIterable<Uint8Array>) {
+      stored.update(chunk);
       for (let off = 0; off < chunk.length; ) {
         off += (await fh.write(chunk, off)).bytesWritten;
       }
@@ -246,7 +250,7 @@ export async function copyFileAtomic(
     await fh.close();
     fh = undefined;
     await commit(tmp, dest);
-    return { sha256: hash.digest("hex"), bytes };
+    return { sha256: hash.digest("hex"), bytes, storedSha256: stored.digest("hex") };
   } catch (err) {
     raw?.destroy();
     source?.destroy();
