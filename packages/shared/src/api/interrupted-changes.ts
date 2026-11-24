@@ -29,7 +29,8 @@ export type RollbackCauseKind = (typeof ROLLBACK_CAUSE_KINDS)[number];
  *   list says whether the change can be closed (R530: in one rare combination it cannot, `lost-copy-stuck`); not
  *   closable yet;
  * - `lost-and-try-again` (R532 M2): the same, where the only other blocker is a step that failed (or a cause of a kind
- *   this build does not know): nothing the list names, so the words say "try again" and point at no file;
+ *   this build does not know, for which the words say "a step of the undo also failed" all the same): nothing the list
+ *   names, so the words say "try again" and point at no file;
  * - `lost-copy-stuck` (R528 M2): a copy is gone, nothing else the researcher can deal with stops the undo, and the app
  *   still keeps a copy of another file of the change that it cannot put back (probe P5: a file inside a folder whose own
  *   copy is gone): closing would let that copy go, so no close is offered; a backup made before the change is the way.
@@ -62,7 +63,9 @@ export function incompleteRollbackOf(
   const unknown = causes.some((c) => !(ROLLBACK_CAUSE_KINDS as readonly string[]).includes(c.kind));
   if (gone.length > 0) {
     if (inTheWay || unread) return "lost-and-blocked";
-    // R532 M2: nothing the list names stops it (it shows no line for a failed step or a kind it does not know).
+    // R532 M2: nothing the list names stops it (it shows no line for a failed step or a kind it does not know). The words
+    // of this state say "a step of the undo also failed" for a cause of a kind this build does not know as well: not
+    // strictly so (a later build named a cause), but the next step they give, "Roll it back" again, is the right one.
     if (unknown || stepFailed) return "lost-and-try-again";
     if (copyKept) return "lost-copy-stuck";
     // Lost where nothing is at one place at least (a file of the change is lost there); else nothing is confirmed lost.
@@ -70,6 +73,7 @@ export function incompleteRollbackOf(
   }
   if (inTheWay) return "in-the-way";
   if (unread) return "could-not-read";
+  // A failed step, or a cause of a kind this build does not know: the words of `try-again` say "a step failed" for both.
   return "try-again";
 }
 
