@@ -376,7 +376,7 @@ Everything built up to 23 November is on `main`, checked by GitHub and on a Mac.
 - [ ] **1. Install Mac build 10** (part 10 says where: run 13's download). It replaces builds 8 and 9: build 8 could not install any optional tool, build 9 mended that, and build 10 adds the rough-edge fixes.
 - [ ] **2. Undo the import that stopped when the disk filled, then import again** with enough free space, or with "leave the files where they are".
 - [ ] **3. Work through the hands-on checklist in part 4** (51 boxes, about ten areas). Tell me what you find, in any form; a sentence per problem is enough. Three areas matter most because nothing but your Mac can test them: "Get through my library" (the sign-in window), watched cloud folders, and the macOS prompts.
-- [ ] **4. Answer the decisions.** There are 27; two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26) and part 8 (27).
+- [ ] **4. Answer the decisions.** There are 29 (28 and 29 are new, in part 10); two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26), part 8 (27) and part 10 (28, 29).
 - [x] **5. Say whether the 94 small rough edges should be fixed** (part 3). You said yes on 23 November; they are fixed (part 10).
 - [ ] **6. Tell me how much usage I may spend**, and remind me to stop at any usage warning. As a guide from the last round: a small reviewed fix costs about 1% of a week, a fix with two review rounds 2–3%, a hard one 5% or more.
 
@@ -457,6 +457,25 @@ The 94 rough edges of part 3 are fixed. They were built in seven batches, and a 
 - [ ] Unplug the drive that holds a source's linked file and press "Get a copy for this source". After "Use this file", the reader should open the copy.
 - [ ] In Optional tools, install "Speech model: tiny". This is build 9's fix, which you have not yet confirmed.
 - [ ] Highlight lines in a Chinese or Japanese PDF. The highlighted text should read correctly.
+
+### Two more decisions for you (28, 29)
+
+28. **Links waiting to be captured when a project is locked**
+   **What it is:** If you lock an encrypted project while links are still waiting to be captured, the app forgets them (nothing of an encrypted project is kept readable or in memory at a lock) and tells you after the unlock how many were dropped, so you can add them again.
+   **Your options:** (a) Leave it so. (b) Keep the waiting links sealed inside the project and offer them again after the unlock.
+   **My recommendation:** (a) for now: (b) means writing a queue of web addresses into the project at every lock, a new kind of stored data with its own rules; worth it only if you lock projects in the middle of capturing often.
+   <sub>(FR-719)</sub>
+
+29. **Tool downloads on a network that inspects secure connections**
+   **What it is:** Build 9 made the optional tools download with the app's own list of trusted certificate authorities. On a network that re-signs secure connections with its own authority (some universities, some security programs), the download is still refused, with a message that says why, because the app does not look in your Mac's keychain where such an authority is installed.
+   **Your options:** (a) Leave it so: on such a network you download the tool on another network. (b) Let the app also trust what your Mac's keychain trusts: it needs one more ready-made library in the app, and it means that whoever controls such a network could see and change what is downloaded (the app still checks each download's fingerprint against the one it expects).
+   **My recommendation:** (a) unless you meet the problem: you said no such network is in your way.
+   <sub>(FR-722)</sub>
+
+### What I am building next, and GitHub's check (24 November, late evening)
+
+- **Building now, as you asked ("keep building"):** the known gaps listed below, except the two decisions above — 23 items in nine batches, each built, checked by a second reviewer, then tested together, as before. They will come to you as Mac build 11. Nothing reaches `main` without your word.
+- **GitHub's own check is red on `main` and on the working branch, for a reason outside the app:** one of Ubuntu's package mirrors has been missing a file for hours, so the check cannot install its tools on most of GitHub's machines (on the one machine that could, the tests ran). The app, the Mac build and what was merged are not affected. I am adding a third download source to the check's install step; it will reach `main` with the next merge you approve.
 
 ### Known gaps found during the round (not fixed)
 - **FR-738:** after two crashes in a row, the second at one exact moment of Find and acquire's own repair, that project would stay blocked: each time the library opens, the app tries to undo the change and refuses. Nothing is lost. It is very unlikely.
