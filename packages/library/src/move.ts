@@ -605,7 +605,7 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
 
   // A switch interrupted by a crash: finish it (the source is closed as the move would have).
   if (await finishesSwitch(lib, dest, deps)) {
-    return completeMove(dest, deps, env, { source: lib, tz: opts.tz, actor: opts.actor, destRepo: opts.destRepo });
+    return completeMove(dest, deps, env, { source: lib, index: opts.index, tz: opts.tz, actor: opts.actor, destRepo: opts.destRepo });
   }
 
   const exclude = [...new Set(opts.excludeProjectIds ?? [])].sort();
@@ -774,13 +774,15 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
     },
   };
   await writeJournal(dest, j);
-  const res = await runSwitch(dest, j, rec, deps, { source: lib, tz: opts.tz, actor: opts.actor, destRepo: opts.destRepo });
+  const res = await runSwitch(dest, j, rec, deps, { source: lib, index: opts.index, tz: opts.tz, actor: opts.actor, destRepo: opts.destRepo });
   return { ...res, filesCopied };
 }
 
 interface SwitchContext {
   /** The source library handle, when this process still has it open. */
   source?: Library;
+  /** The source's open index: closed with the source, before its lock is released (R570 b). */
+  index?: IndexHandle;
   tz?: string;
   actor?: string;
   destRepo?: Repo;
@@ -849,7 +851,11 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
   await step("register", () => registerLibrary({ libraryId: j.libraryId, name: sw.libraryName, path: dest }, deps));
   await step("close-source", async () => {
     // The source repo, if any, is never written after this: its library handle is closed.
-    if (ctx.source && resolve(ctx.source.root) === oldRoot) await ctx.source.close();
+    // Its index goes with it, before the lock is released (R551 M7, R570 b): a later close of the same library (the
+    // service's closeLibrary) only gets this close's promise, so its own step that closes the index never runs.
+    // Checkpointed before the copy and not written since (the verify compared it), it closes without changing
+    // library.sqlite; only its working files (never copied) go.
+    if (ctx.source && resolve(ctx.source.root) === oldRoot) await ctx.source.close({ beforeRelease: () => ctx.index?.close() });
   });
   await step("audit-split", async () => {
     const details = { moveId: sw.moveId, fromHint: sw.details.fromHint, toHint: sw.details.toHint, projectsMoved: sw.movedProjectIds, projectsRemaining: sw.excludedProjectIds };
