@@ -33,6 +33,7 @@ import { assignableWorkspaceTags, refuseUnknownTags } from "./collections.js";
 import { assignCodes, loadPseudonyms, participantNames, savePseudonyms } from "./pseudonyms.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
 import { appendReviewEntry, queueUnlistedConflicts, resolveCaptureEntriesAfterEdit, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type QueuedConflicts, type ReexaminedBy, type ReviewInput } from "./review.js";
+import { mendFindQueueTail } from "../find/queue-store.js";
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
 import { isClosed } from "../library.js";
@@ -910,6 +911,9 @@ export async function deleteSource(core: RepoCore, projectId: string, id: string
   const st = core.state(projectId);
   core.assertUnlocked(st);
   sourceFolderOf(st, id);
+  // The removal may write a queue entry's line (a file held for this source): a torn last line is cut first, by a
+  // change of its own, so that line is always written (R503 a, R505 b).
+  await mendFindQueueTail(core, projectId);
   await runMutation(
     core,
     projectId,

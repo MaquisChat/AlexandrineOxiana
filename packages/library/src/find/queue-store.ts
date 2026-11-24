@@ -609,7 +609,6 @@ export async function appendFindEntries(core: RepoCore, projectId: string, entri
   if (cleaned.length === 0) return;
   try {
     await mendFindQueueTail(core, projectId);
-    if (process.env.NODE_ENV === "test") mendSeams.afterMend?.();
     await write(core, projectId, op, cleaned, updates, method);
   } catch (err) {
     if (err instanceof NothingToWrite) return;
@@ -735,6 +734,12 @@ function endsTornSync(abs: string): boolean {
  * that append to the queue inside a change of their own call it before that change begins.
  */
 export async function mendFindQueueTail(core: RepoCore, projectId: string): Promise<void> {
+  await mendTailOnce(core, projectId);
+  // Test-only: a crash between the repair and the caller's own change (R47).
+  if (process.env.NODE_ENV === "test") mendSeams.afterMend?.();
+}
+
+async function mendTailOnce(core: RepoCore, projectId: string): Promise<void> {
   if (!endsTornSync(core.abs(queueRel(core.state(projectId).rel)))) return;
   let cut = 0;
   try {

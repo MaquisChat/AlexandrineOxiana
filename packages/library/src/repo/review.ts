@@ -13,7 +13,7 @@ import { FIND_QUEUE_OPS, type FindEntry } from "../find/types.js";
 import { addOriginalInTx } from "./assets.js";
 import { originalsReach } from "./linked-file.js";
 import { kindFor, mimeFor, openLine, readMaybe, sealLine } from "./io.js";
-import { InvalidInputError, NotFoundError, ReviewEntryDecidedError, TornFileError } from "./errors.js";
+import { InvalidInputError, NotFoundError, ReviewEntryDecidedError } from "./errors.js";
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
 import { readSourceFile, storeRequest } from "./sources.js";
 import type { ProjectState, RepoCore } from "./state.js";
@@ -339,7 +339,9 @@ export async function resolveEntriesOfRemovedSource(core: RepoCore, tx: Tx, sour
 
 /**
  * R282 g (M1): inside the change that removes a source, the line of the queue entry a file was held for: "no-open-copy",
- * reason "record-removed". A queue that cannot be read never stops the source's removal (its line then stays).
+ * reason "record-removed". A queue that cannot be read never stops the source's removal (its line then stays). A torn
+ * last line was cut before this change began, by a change of its own (R503 a, R505 b: every caller that removes a
+ * source mends the queue first), so the line is always written; a queue still torn here refuses the removal.
  */
 async function recordRemovedLine(core: RepoCore, tx: Tx, entryId: string): Promise<void> {
   let next: FindEntry | null;
@@ -349,13 +351,7 @@ async function recordRemovedLine(core: RepoCore, tx: Tx, entryId: string): Promi
     return;
   }
   if (!next || next.removed) return;
-  try {
-    await appendFindLinesInTx(core, tx, "update", [next]);
-  } catch (err) {
-    // A queue whose last line an unclean stop tore is not mended inside another change (R503 a): like one that cannot
-    // be read, it never stops the removal, and the entry's line stays as it was.
-    if (!(err instanceof TornFileError)) throw err;
-  }
+  await appendFindLinesInTx(core, tx, "update", [next]);
 }
 
 /** What a caller queues; the entry's id, project, status and time are filled in. */

@@ -11,8 +11,10 @@ import { newId, type Project } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { backupProject, restoreBackup } from "../export/backup.js";
-import { OPEN_GOV, PASS, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, plainOf, scratchFile, type Kit } from "../export/test-kit.js";
-import { appendFindEntries, readFindQueue } from "../find/queue-store.js";
+import { DEID_GOV, OPEN_GOV, PASS, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, plainOf, scratchFile, type Kit } from "../export/test-kit.js";
+import { appendFindEntries, mendSeams, readFindQueue } from "../find/queue-store.js";
+import { decideReview } from "../import/bulk/review.js";
+import { undoBatch } from "../import/bulk/undo.js";
 import { FIND_QUEUE_OPS, type FindEntry } from "../find/types.js";
 import { ProjectLockedError, ReviewEntryDecidedError } from "./errors.js";
 import {
@@ -42,6 +44,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   seams.crashAt = undefined;
+  mendSeams.afterMend = undefined;
   await kit.close();
 });
 const coreOf = () => (kit.repo as unknown as { core: RepoCore }).core;
@@ -395,20 +398,141 @@ describe("R503 a: a queue whose last line an unclean stop tore", () => {
     }
   });
 
-  it("deleting the source is not stopped by it: the held file goes, the entry's line stays as it was, the torn line is left for the queue's next change", async () => {
-    const w = await world();
+  /*
+   * R505 b, R509 (I1): the three changes that remove a source holding a file (deleting it; an import's decision on a
+   * duplicate, "merge" or "skip"; undoing an import) add the queue entry's "record-removed" line inside their own
+   * change. Each cuts a torn last line first, by a change of its own (the queue's repair), so that line is always
+   * written; a crash between the two leaves the queue whole and the removal not begun.
+   */
+  const BATCH = "019a0000-0000-7000-8000-0000000000b1";
+  type Way = "delete" | "skip" | "merge" | "undo";
+  const LARGER: Record<Way, string> = { delete: "source.delete", skip: "review.decide", merge: "review.decide", undo: "source.delete" };
+  interface Removal extends World {
+    run(): Promise<unknown>;
+  }
+  async function removal(way: Way, gov = OPEN_GOV, identifiable = false): Promise<Removal> {
+    const p = await makeProject(kit, gov);
+    const sf = await kit.repo.createSource(
+      p.id,
+      { projectIds: [p.id], type: "article-journal", title: { variants: [{ lang: "en", kind: "original", value: TITLE }] }, creators: [{ role: "author", family: "Okafor", given: "Amara" }], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [],
+      {
+        provenance: {
+          captureMethod: "manual_upload",
+          capturedAt: NOW,
+          tool: { name: "test", version: "1" },
+          fileHashes: {},
+          ...(way === "undo" ? { importBatchId: BATCH } : {}),
+          legal: { status: "unknown" },
+          identifiable,
+        },
+        ...(way === "skip" || way === "merge" ? { reviewItem: { kind: "import" as const, fields: {}, reasons: ["It may be a duplicate."] } } : {}),
+      },
+    );
+    const entry: FindEntry = { id: newId(), projectId: p.id, typed: "Okafor, Rivers and Memory", state: "fetching", createdAt: NOW, updatedAt: NOW, attempts: 0, sourceId: sf.source.id };
+    await appendFindEntries(coreOf(), p.id, [entry], "add");
+    const pdf = await scratchFile(kit, "1.pdf", await buildPdf({ title: "A Different Paper Entirely", lines: ["A Different Paper Entirely"] }));
+    const w: World = { p, sourceId: sf.source.id, entry, pdf };
     await hold(w);
-    await tear(w);
-    await kit.repo.deleteSource(w.p.id, w.sourceId);
-    expect(await heldFiles(w)).toEqual([]);
-    expect(await pending(w)).toEqual([]);
-    expect(await stateOf(w)).toBe("needs-check");
-    expect((await readFile(queueFile(w), "utf8")).endsWith('{"id":"half')).toBe(true);
-    // The queue's next change cuts it first.
-    await removeFindEntryWithHeld(coreOf(), w.p.id, needsCheck(w));
-    expect((await readFile(queueFile(w), "utf8")).includes("half")).toBe(false);
-    expect((await readFindQueue(coreOf(), w.p.id)).size).toBe(0);
-  });
+    const importItem = async () => (await pending(w)).find((e) => e.kind === "import")!.id;
+    let run: () => Promise<unknown>;
+    if (way === "delete") run = () => kit.repo.deleteSource(p.id, sf.source.id);
+    else if (way === "skip") run = async () => decideReview(kit.repo, p.id, await importItem(), { action: "skip" });
+    else if (way === "merge") {
+      const target = await addSource(kit, p, { title: "The Same Paper, Kept", identifiable });
+      run = async () => decideReview(kit.repo, p.id, await importItem(), { action: "merge", sourceId: target.source.id });
+    } else {
+      // A batch record as an import leaves it (the one source it created).
+      await kit.repo.mutate(p.id, { action: "store", store: { identifiable: false, hasLocation: false } }, async (tx) => {
+        const base = `${p.folder}/imports/batch-0001`;
+        await tx.mkdir(base);
+        await tx.writeFile(
+          `${base}/batch.json`,
+          JSON.stringify({ id: BATCH, projectId: p.id, number: 1, source: { kind: "folder", location: "Papers" }, options: {}, startedAt: NOW, counts: { created: 1, merged: 0, skipped: 0, failed: 0, needsReview: 0 }, state: "finished", createdSourceIds: [sf.source.id] }),
+        );
+        await tx.appendLine(`${base}/journal.jsonl`, JSON.stringify({ key: "a.pdf", outcome: "created", sourceId: sf.source.id }));
+      });
+      run = () => undoBatch(kit.repo, p.id, BATCH);
+    }
+    return { ...w, run };
+  }
+  const txnMarkers = async () => (await readdir(join(kit.lib.root, ".tmp")).catch(() => [] as string[])).filter((n) => /^txn-.*\.json$/u.test(n));
+  /** Each change's op once, in order (a change audits one entry per request it evaluates). */
+  const changesSince = async (w: World, from: number) =>
+    (await auditEvents(kit, w.p))
+      .slice(from)
+      .map((e) => (e.details as { op?: string } | undefined)?.op ?? e.action)
+      .filter((op, i, all) => op !== all[i - 1]);
+  const recordRemoved = async (w: World) => {
+    const e = (await readFindQueue(coreOf(), w.p.id)).get(w.entry.id);
+    return e?.state === "no-open-copy" && e.reason?.code === "record-removed";
+  };
+  const queueWhole = async (w: World) => {
+    const raw = await readFile(queueFile(w), "utf8");
+    return !raw.includes("half") && raw.endsWith("\n");
+  };
+
+  for (const way of ["delete", "skip", "merge", "undo"] as const) {
+    it(`${way}: the torn line is cut by a change of its own first; then the removal writes the entry's "record-removed" line`, async () => {
+      const w = await removal(way);
+      await tear(w);
+      const from = (await auditEvents(kit, w.p)).length;
+      await w.run();
+      const ops = await changesSince(w, from);
+      expect(ops[0]).toBe(FIND_QUEUE_OPS.repair);
+      expect(ops.filter((op) => op === FIND_QUEUE_OPS.repair)).toHaveLength(1);
+      expect(ops).toContain(LARGER[way]);
+      expect(kit.repo.listSourceIds(w.p.id)).not.toContain(w.sourceId);
+      expect(await heldFiles(w)).toEqual([]);
+      expect((await pending(w)).filter((e) => e.sourceId === w.sourceId)).toEqual([]);
+      expect(await recordRemoved(w)).toBe(true);
+      expect(await queueWhole(w)).toBe(true);
+      expect(await txnMarkers()).toEqual([]);
+    });
+
+    it(`${way}: a crash between the queue's repair and the removal leaves the queue whole and the removal not begun; the next try finishes it`, async () => {
+      const w = await removal(way);
+      await tear(w);
+      const waiting = (await pending(w)).length;
+      mendSeams.afterMend = () => {
+        throw new SimulatedCrash("simulated crash between the two changes");
+      };
+      await expect(w.run()).rejects.toBeInstanceOf(SimulatedCrash);
+      mendSeams.afterMend = undefined;
+      expect(await queueWhole(w)).toBe(true);
+      expect(await txnMarkers()).toEqual([]);
+      expect(kit.repo.listSourceIds(w.p.id)).toContain(w.sourceId);
+      expect(await heldFiles(w)).toHaveLength(1);
+      expect(await pending(w)).toHaveLength(waiting);
+      expect(await stateOf(w)).toBe("needs-check");
+      // Tried again: nothing is left to repair, and the removal writes its line.
+      const from = (await auditEvents(kit, w.p)).length;
+      await w.run();
+      expect(await changesSince(w, from)).not.toContain(FIND_QUEUE_OPS.repair);
+      expect(kit.repo.listSourceIds(w.p.id)).not.toContain(w.sourceId);
+      expect(await recordRemoved(w)).toBe(true);
+    });
+  }
+
+  for (const way of ["skip", "merge"] as const) {
+    it(`${way}: a decision the project's rules refuse leaves the queue repaired and nothing else changed (the torn line was an earlier crash's)`, async () => {
+      const w = await removal(way, DEID_GOV, true);
+      await tear(w);
+      // The rules now ask for a legal basis the identifiable source does not have: the decision's store is refused.
+      const g = await kit.repo.getGovernance(w.p.id);
+      await kit.repo.setGovernance(w.p.id, DEID_GOV.replace("requireLegalBasis: false", "requireLegalBasis: true"), { baseSha256: g.sha256, reason: "test: a legal basis is now required" });
+      const waiting = (await pending(w)).length;
+      const from = (await auditEvents(kit, w.p)).length;
+      await expect(w.run()).rejects.toThrow(/legal basis/i);
+      expect((await changesSince(w, from))[0]).toBe(FIND_QUEUE_OPS.repair);
+      expect(await queueWhole(w)).toBe(true);
+      expect(await txnMarkers()).toEqual([]);
+      expect(kit.repo.listSourceIds(w.p.id)).toContain(w.sourceId);
+      expect(await heldFiles(w)).toHaveLength(1);
+      expect(await pending(w)).toHaveLength(waiting);
+      expect(await stateOf(w)).toBe("needs-check");
+    });
+  }
 });
 
 describe("backups (A2)", () => {
