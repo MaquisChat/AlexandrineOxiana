@@ -290,6 +290,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
 
   app.get("/projects/:id/recheck", async (req): Promise<ProjectRecheckState> => {
     const projectId = projectParam(ctx, req);
+    // A locked project is answered as every other read of a locked project (R508 M4): 423, nothing told.
+    if (!state.requireSession().repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
     for (const [jobId, r] of rechecks) if (r.projectId === projectId) return { running: { jobId, done: r.done, total: r.total } };
     return { running: null };
   });

@@ -100,6 +100,16 @@ describe("FR-717: the rechecks that are running", () => {
     expect(await call("GET", `/projects/${pid}/recheck`)).toMatchObject({ status: 200, json: { running: null } });
   });
 
+  it("a locked project is answered as every other read of a locked project: 423, and nothing about its recheck (R508 M4)", async () => {
+    expect((await call("POST", "/libraries", { path: join(tmp, "Lib"), name: "Lib" })).status).toBe(200);
+    const p = await call("POST", "/projects", { name: "Sealed", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "correct horse battery staple" } });
+    expect(p.status, p.body).toBe(200);
+    const pid = p.json.project.id as string;
+    expect((await call("POST", `/projects/${pid}/lock`)).status).toBe(200);
+    const r = await call("GET", `/projects/${pid}/recheck`);
+    expect([r.status, r.json]).toEqual([423, { error: { code: "PROJECT_LOCKED", message: "This project is locked. Its passphrase is needed." } }]);
+  });
+
   it("an unknown project is 404", async () => {
     await projectWithTwoSources();
     expect((await call("GET", "/projects/01234567-89ab-7def-8123-456789abcdef/recheck")).status).toBe(404);
