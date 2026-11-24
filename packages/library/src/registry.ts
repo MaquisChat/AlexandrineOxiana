@@ -89,18 +89,26 @@ async function corruptName(deps: RegDeps, now: Date): Promise<string> {
  * Keeps a damaged registry as libraries.json.corrupt-<stamp>[-n] before it is overwritten, and then,
  * only once that rename has succeeded, raises a device-level notice (Task 68 fix round 2, R181 a):
  * nothing in the settings folder is set aside in silence.
+ *
+ * R508 M7 (FR-721): the list is read again just before the rename and set aside only if it is STILL
+ * damaged, so a good list another process has just saved is never set aside; that list is returned
+ * instead (`good`), and the change is made on it. The window left open is the moment between this
+ * read and the rename. `entries`: what was usable of the list set aside.
  */
-async function backupIfDamaged(deps: RegDeps, damaged: boolean): Promise<void> {
-  if (!damaged) return;
+async function backupIfDamaged(deps: RegDeps): Promise<{ good: { entries: RegistryEntry[]; raw: string | null } } | { entries: RegistryEntry[] }> {
   const now = deps.clock();
+  const name = await corruptName(deps, now);
+  const again = await load(deps);
+  if (!again.damaged) return { good: { entries: again.entries, raw: again.raw } };
   try {
-    await rename(file(deps), await corruptName(deps, now));
+    await rename(file(deps), name);
   } catch (err) {
     // FR-721: another process (the command line, or the service) set it aside first, and said so itself.
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { entries: again.entries };
     throw err;
   }
   await raiseDeviceNotice(deps.appConfigDir, "libraries-list-set-aside", now);
+  return { entries: again.entries };
 }
 
 async function save(deps: RegDeps, entries: RegistryEntry[]): Promise<void> {
@@ -146,8 +154,11 @@ const UPDATE_TRIES = 5;
  * set aside and just before the save, the list's text is compared with what was read; on a
  * difference another process has changed it, and the change is made again on the list as it is
  * then (with what was usable of any damaged list this writer set aside). After UPDATE_TRIES it is
- * saved all the same. Each save is an atomic rename, so the list is never unreadable in between; the
- * moment between the last comparison and the rename stays open, as no lock is held.
+ * saved all the same. A damaged list is set aside only if it is still damaged when read again just
+ * before its rename (R508 M7). Each save is an atomic rename, so the list is never unreadable in
+ * between. As no lock is held, a window stays open: for a save, from the last comparison through the
+ * writing and syncing of the temporary file to the rename; for a setting aside, from the last read to
+ * the rename.
  */
 function update(deps: RegDeps, apply: (entries: RegistryEntry[], damaged: boolean) => boolean): Promise<void> {
   return inTurn(deps, async () => {
@@ -161,14 +172,26 @@ function update(deps: RegDeps, apply: (entries: RegistryEntry[], damaged: boolea
       let read = first.raw;
       if (first.damaged) {
         if (!last && (await rawNow(deps)) !== first.raw) continue;
-        await backupIfDamaged(deps, true);
-        setAside = true;
-        salvaged.push(...first.entries.filter((e) => !salvaged.some((x) => x.libraryId === e.libraryId)));
-        const latest = await load(deps);
-        await backupIfDamaged(deps, latest.damaged);
-        entries = latest.damaged ? [] : latest.entries;
-        read = latest.damaged ? null : latest.raw;
-        if (latest.damaged) salvaged.push(...latest.entries.filter((e) => !salvaged.some((x) => x.libraryId === e.libraryId)));
+        const salvage = (list: RegistryEntry[]) => salvaged.push(...list.filter((e) => !salvaged.some((x) => x.libraryId === e.libraryId)));
+        const aside = await backupIfDamaged(deps);
+        if ("good" in aside) {
+          // Another process saved a good list meanwhile: nothing is set aside, the change is made on that list.
+          entries = aside.good.entries;
+          read = aside.good.raw;
+        } else {
+          setAside = true;
+          salvage(aside.entries);
+          const latest = await load(deps);
+          const after = latest.damaged ? await backupIfDamaged(deps) : { good: { entries: latest.entries, raw: latest.raw } };
+          if ("good" in after) {
+            entries = after.good.entries;
+            read = after.good.raw;
+          } else {
+            salvage(after.entries);
+            entries = [];
+            read = null;
+          }
+        }
       }
       const known = new Set(entries.map((e) => e.libraryId));
       entries = [...entries, ...salvaged.filter((e) => !known.has(e.libraryId))];

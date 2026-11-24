@@ -28,6 +28,7 @@ vi.mock("node:fs/promises", async (orig) => {
   return { ...real, default: { ...real, readFile }, readFile };
 });
 
+import { deviceNoticesIdle, readDeviceNotices } from "./device-notices.js";
 import { writeFileAtomic } from "./fs/atomic.js";
 import { listLibraries, registerLibrary, type RegistryEntry } from "./registry.js";
 
@@ -92,5 +93,44 @@ describe("FR-721: two processes writing the libraries list", () => {
     const ids = (await listLibraries(deps())).map((e) => e.libraryId);
     expect(ids).toContain("C");
     expect(n).toBeLessThan(20);
+  });
+
+  /** Runs `then` once, just after the n-th read of the list (the text of that read is already taken). */
+  function afterNthRead(n: number, then: () => Promise<void>): void {
+    let reads = 0;
+    io.afterRead = async () => {
+      if (++reads !== n) return;
+      io.afterRead = undefined;
+      await then();
+    };
+  }
+
+  it("a list damaged when first read but good when read again just before it would be set aside is not set aside (R508 M7)", async () => {
+    await writeFile(join(dir, "libraries.json"), JSON.stringify([entry("A"), { junk: true }]));
+    // Read 1 finds the list damaged, and so does read 2 (the comparison); right after it the other process saves a good
+    // list. The read just before the setting aside finds it good.
+    afterNthRead(2, () => otherSaves([entry("A"), entry("B")]));
+    await registerLibrary({ libraryId: "C", name: "Fieldwork", path: "/libs/C" }, deps());
+    await deviceNoticesIdle();
+    expect((await readdir(dir)).filter((n) => n.includes(".corrupt-"))).toEqual([]);
+    expect(await readDeviceNotices(dir)).toEqual([]);
+    expect((await listLibraries(deps())).map((e) => e.libraryId).sort()).toEqual(["A", "B", "C"]);
+  });
+
+  it("a damaged list the other process sets aside between this writer's last read and its rename: no failure, no second copy (R508 M7)", async () => {
+    await writeFile(join(dir, "libraries.json"), JSON.stringify([entry("A"), { junk: true }]));
+    // Read 3 is the one just before the setting aside: still damaged; right after it the other process sets the list
+    // aside itself (its own save comes later), so this writer's rename finds no list.
+    afterNthRead(3, async () => {
+      const { rename } = await import("node:fs/promises");
+      await rename(join(dir, "libraries.json"), join(dir, "libraries.json.corrupt-other"));
+    });
+    await registerLibrary({ libraryId: "C", name: "Fieldwork", path: "/libs/C" }, deps());
+    await deviceNoticesIdle();
+    expect((await readdir(dir)).filter((n) => n.includes(".corrupt-"))).toEqual(["libraries.json.corrupt-other"]);
+    // The other process raised its own notice; this writer raised none.
+    expect(await readDeviceNotices(dir)).toEqual([]);
+    // What was usable of the damaged list is kept, with this registration.
+    expect((await listLibraries(deps())).map((e) => e.libraryId).sort()).toEqual(["A", "C"]);
   });
 });
