@@ -174,3 +174,94 @@ The real Tauri ordering of two builds with the same label (A-M1), and A-M4's rea
 3. **The Dock icon.** No `Reopen` handler exists. Clicking the icon while closing does nothing: no relaunch is noted, unlike the Linux hand-over.
 4. **Scenario F on the Mac.** It reports "opened before the close began" if `at_quit` (`renew` → `remove_data_stores`, with up to 5 × 300 ms retries per store, and `start_webkit` waiting up to 10 s) takes more than 2 s. The window would then open before `AO_SHELL_CLOSING` is printed. That would be a false FAIL; the app itself would be right.
 5. **The rest:** that `visible=true` and the title are reported on the Mac as they are on Linux; that `on_document_title_changed` fires for the closing page in WKWebView (the main window relies on the same); the bundled font and dark mode; and that the red close button changes nothing.
+
+---
+
+## Second look (R486 C, R489)
+
+**Scope:** 77b491e..c8cb276. The commits are 9ba367f and c8cb276 (FR-561), 12dcb45 (`.focused(false)`) and fe498d6 (scenario E at 12 s). I read R486 (g, h, i), R489 and the RE-7g report.
+
+**What I ran:**
+- One `cargo test --lib`: **138 passed**, which is 135 plus 3 probes in a scratch `mod probe_re7d`, since removed.
+- Three guard-removal runs, each restored with `git checkout`.
+
+**State at the end:** `apps/desktop/src-tauri/target` is deleted and `git status --short` is empty.
+
+### FR-561: **APPROVE WITH SMALL POINTS**
+
+**Hunting for the opposite fault: can either new rule hand the window to an overtaken or ended open?**
+- **R489** (`library_window.rs:1602-1617`): when a build finishes, its window stands and nobody owns it, the owner becomes that build's ticket.
+  - A newer open always sets the owner to its own ticket, under the lock, before it builds or re-uses the window.
+  - Two things clear it:
+    - `window_closed`: the window is then gone, and a re-use of it fails;
+    - a failed open: the owner then goes back to the window's own open, or to None when no window stands.
+  - So an overtaken build always finds the newer owner and answers false.
+  - Probes, both passing:
+    - `probe_overtaken_build_does_not_take_window`: a re-use during the older build. The older open answers false, the older ticketed close does nothing and the newer one closes the window.
+    - `probe_overlapping_builds_newer_owns`: a second build nested inside the first. The same holds.
+- **The window given to an ended open is exactly the R489 case. On a late answer the page closes it:**
+  - `FindAcquire.tsx:1617-1623`: `late === true && !libTicket.current`, then the window is closed.
+  - Your library's Test handles its own answer.
+- **(g)** gives the window to `building` only while a window stands. `building` is the first build still under way, and it clears itself whether that build succeeds or fails.
+- **My earlier guarantees still hold.**
+  - The earlier FR-561 tests pass, and so do the probes above.
+  - `probe_after_r489_owner_next_open_true`: after an R489 ownership, both a researcher close followed by a new open and a re-use answer true.
+  - No lock is held across a host call: both `window_exists()` calls are made before the lock is taken.
+- **Guards fail without themselves:**
+  - Without R489's take: its test fails.
+  - Without "None when no window stands": `a_failed_open_…` fails.
+
+**S-M1 (Minor). R486 g's `building` rule is now redundant, and its test no longer holds it.**
+- With `.or_else(|| g.building.clone())` removed (line 1591), **all tests pass**.
+- R489 now covers that sequence: T2's failure leaves the owner None, and T1 takes it when it answers.
+- The rule matters only in the moment between T2's failure and T1's answer. In that moment no page holds a window for T1 to close.
+- It is harmless, but it is dead weight. Either remove the field, or make the test close by T1 before T1 answers.
+
+**S-M2 (Minor, a small race, by reading).** R489 reads `stands` before it takes the lock.
+- If the window is destroyed in between, the ended open can take an owner while no window stands.
+- The result is harmless: the next open overwrites the owner, and a ticketed close finds no window and only emits `closed` with no ticket.
+
+**S-M3 (Minor, page side; it was already there, for the page follow-up R477 b).**
+- If the row leaves while an open is in flight, `endWindow(T1)` sends a ticketless close.
+- T1's window then stands, and T1 answers true **in time**, not late.
+- `openWindow` returns true and nothing closes the window (`FindAcquire.tsx:1682-1686`).
+- R489 makes it closable with T1's ticket, but the page does not ask. The page follow-up should close an ended ticket's in-time `true` too.
+
+**Residue: can two builds overlap? Yes. It is not unreachable, but it is rare, and the outcome is not about ownership.**
+- In tauri 2.12.5, `prepare_window` (`manager/window.rs:66-72`) checks the label before the window is built. The label is registered later, by `attach_window`, on the builder's thread after the runtime answers.
+- So a second `build` started while the first is in flight passes the check, and both **succeed**: two native windows labelled `library`, with the manager's map pointing at the second.
+- How it is reached:
+  1. A second open is refused.
+  2. The page's ticketless close finds no window and ends T1.
+  3. The page hears `closed` and asks again, while T1's build is still in flight.
+  - That takes a second press within the first build's time.
+- The ownership is right: the newer open owns the mapped window and the older answers false (probe).
+- But the first native window is left out of the map. The shell cannot close it, and its `Destroyed` handler, when the researcher closes it, runs `window_closed` and ends the NEWER ticket.
+- The implementer's residue, the newer build *failing*, does not happen this way. The real residue is this duplicate window. It was there before this change. It is noted for the record, not to block.
+
+### FR-297: **still SOUND TO JOIN**
+
+**12dcb45 `.focused(false)`.** I read the declarations of the versions in `Cargo.lock`.
+- **Linux, tao 0.37.2** `platform_impl/linux/window.rs`:
+  - `:88-90`: `accept_focus(focusable && focused)`.
+  - `:224-225`: `show_all()` whenever `visible`.
+  - `:231-244`: focus is accepted again after the first draw.
+  - So it is shown, and `is_visible()` (gtk) is true. The line `AO_SHELL_CLOSING_WINDOW … visible=true` still holds.
+- **macOS** `platform_impl/macos/window.rs:604-611`: `orderFront` instead of `makeKeyAndOrderFront`.
+  - It is shown and in front of the app's own windows, but not the key window.
+  - `is_visible()` is `NSWindow.isVisible`, which is true once ordered in.
+  - Nothing activates the app, so if another app is active the window may stay behind that app's windows.
+- The unit test asserts `.focused(false)` and that `.visible(` is absent.
+
+**fe498d6 (E at 12 s).** Every limit still holds, and the check is as strict.
+- "quit to begin" (30 s) comes before the sleep.
+- The second launch (60 s) has more margin: the closing state now lasts at least 12 s.
+- "relaunch noted" (10 s) does not depend on the stop.
+- "helpers to stop" (120 s) is ample.
+- The restarted shell's SIGTERM stop is also slowed by 12 s, against 120 s and then 30 s.
+- The CI step allows 15 minutes; this adds about 12 s twice.
+- The page title is still required before the first "stopped".
+
+### The Mac watch list: one item changed
+- Item 2 now reads: the closing window is ordered front without becoming key (`orderFront`). It is in front of the app's own windows, but after a SIGTERM or logout, or a switch to another app, it may sit behind the active app's windows. It never takes the keyboard's focus.
+- The other items stand: Cmd-Q skips the closing path; Dock clicks do nothing; F falsely fails if `at_quit` takes more than 2 s.
