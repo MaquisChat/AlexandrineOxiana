@@ -218,6 +218,23 @@ describe("Governance settings", () => {
     expect((within(card("Protocol record")).getByRole("textbox", { name: "Protocol number" }) as HTMLInputElement).value).toBe("IRB-2026-200");
   });
 
+  it("R555 3: a save refused because the library was closed shows that answer's own sentence, never “changed elsewhere”, and keeps the edits", async () => {
+    const closed = "That library has been closed, so nothing was changed.";
+    serve({ put: () => HttpResponse.json({ error: { code: "LIBRARY_CLOSED", message: closed } }, { status: 409 }) });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const num = within(card("Protocol record")).getByRole("textbox", { name: "Protocol number" });
+    await user.clear(num);
+    await user.type(num, "IRB-2026-201");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(closed);
+    expect(alert.textContent).not.toMatch(/changed elsewhere/);
+    expect(within(alert).queryByRole("button", { name: "Reload" })).toBeNull();
+    expect((within(card("Protocol record")).getByRole("textbox", { name: "Protocol number" }) as HTMLInputElement).value).toBe("IRB-2026-201");
+  });
+
   it("shows violations from the save inline on their control's card", async () => {
     serve({ put: () => HttpResponse.json({ violations: [{ control: "sharing.locationMetadata", required: "strip", actual: "keep", profile: "hipaa" }], loosened: [], sha256: "c".repeat(64) }) });
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);
