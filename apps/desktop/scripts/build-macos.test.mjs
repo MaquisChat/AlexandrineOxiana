@@ -49,7 +49,10 @@ describe("macosTarget", () => {
     assert.equal(a.triple, "aarch64-apple-darwin");
     assert.equal(a.label, "apple-silicon");
     assert.equal(a.node.key, "darwin-arm64");
-    assert.deepEqual(a.workerArgs, ["--constraints", "none"]);
+    // FR-730 (R503 j): Apple Silicon on its complete pin set, every package of the bundle named.
+    assert.equal(a.workerArgs[0], "--constraints");
+    assert.match(a.workerArgs[1], /services\/media-worker\/packaging\/constraints-macos-arm64\.txt$/);
+    assert.ok(existsSync(a.workerArgs[1]));
     assert.match(a.workerBundle, /apps\/desktop\/sidecars\/ao-worker-aarch64-apple-darwin$/);
     assert.equal(a.dmgName("0.1.0"), "Alexandrine-Oxiana-0.1.0-apple-silicon.dmg");
 
@@ -452,6 +455,16 @@ describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
     assert.match(wf, new RegExp(`MACOSX_DEPLOYMENT_TARGET: "${PINS.minimumSystemVersion.replace(".", "\\.")}"`));
   });
 
+  it("smoke-tests the worker on the build's own pin set, and keys the build venv's cache on both constraints files (FR-730)", () => {
+    const smoke = wf.split("\n").find((l) => l.includes("build-sidecars.mjs --skip-build --smoke"));
+    assert.ok(smoke, "no smoke step");
+    // build-sidecars.mjs picks the Mac's own constraints file by default, as build-macos.mjs passes it.
+    assert.doesNotMatch(smoke, /--constraints/);
+    const keys = wf.split("\n").filter((l) => /desktop-macos-build-\$\{\{ matrix\.runner \}\}/.test(l));
+    assert.equal(keys.length, 2);
+    for (const k of keys) assert.match(k, /'services\/media-worker\/packaging\/constraints-macos-x86_64\.txt', 'services\/media-worker\/packaging\/constraints-macos-arm64\.txt'\)/);
+  });
+
   it("pins every action by full commit id, with its release named (R167 b)", () => {
     const uses = wf.split("\n").filter((l) => /^\s*-?\s*uses:/.test(l));
     assert.ok(uses.length >= 10);
@@ -574,7 +587,8 @@ describe("plan (--dry-run)", () => {
       const text = steps.map((s) => s.describe).join("\n");
       assert.match(text, new RegExp(`node-${PINS.node.version}-darwin-${arch}\\.tar\\.gz`));
       assert.match(text, /MACOSX_DEPLOYMENT_TARGET=15\.0/);
-      assert.match(text, new RegExp(arch === "x64" ? "constraints-macos-x86_64\\.txt" : "--constraints none"));
+      assert.match(text, new RegExp(arch === "x64" ? "constraints-macos-x86_64\\.txt" : "constraints-macos-arm64\\.txt"));
+      assert.doesNotMatch(text, /--constraints none/);
       assert.match(text, /notices\.mjs .*--node .*bin\/node/);
     }
     assert.ok(!plan(macosTarget("arm64"), { debugApp: false }).some((s) => s.id.endsWith("-debug")));

@@ -61,6 +61,48 @@ def test_native_library_mismatch_fails_both_ways(tmp_path):
     assert any("libgone" in p and "not in the bundle" in p for p in problems)
 
 
+# ---------- every bundled package pinned by a complete pin set (FR-730, R503 j) ----------
+
+
+def test_every_bundled_package_pinned_at_its_version_has_no_problems():
+    packages = [{"name": "PyYAML", "version": "6.0.4"}, {"name": "pillow_heif", "version": "1.8.1"},
+                {"name": "pikepdf", "version": "10.13.0.post1"}]
+    # Names compare as pip compares them; a pin for a package that is not in the bundle is harmless.
+    text = "# head\n\npyyaml==6.0.4\nPillow-HEIF == 1.8.1  # why\npikepdf==10.13.0post1\nsetuptools==80.9.0\n"
+    assert manifest.check_pinned(packages, text) == []
+
+
+def test_a_bundled_version_that_differs_from_its_pin_is_a_problem_naming_both_versions():
+    problems = manifest.check_pinned([{"name": "ctranslate2", "version": "4.9.2"}], "ctranslate2==4.9.1\n")
+    assert problems == ["ctranslate2 4.9.2 is in the bundle, but the constraints file pins it at 4.9.1"]
+
+
+def test_a_bundled_package_the_constraints_do_not_name_is_a_problem():
+    problems = manifest.check_pinned([{"name": "filelock", "version": "4.3.1"}, {"name": "rawpy", "version": "0.28.0"}],
+                                     "rawpy==0.28.0\n")
+    assert problems == ["filelock 4.3.1 is in the bundle, but the constraints file does not name it"]
+
+
+def test_the_pin_check_fails_the_build_and_says_which_package(tmp_path, capsys):
+    c = tmp_path / "constraints-macos-arm64.txt"
+    c.write_text("packaging==26.3\n")
+    assert manifest.report_pins([{"name": "packaging", "version": "26.4"}], c) == 1
+    err = capsys.readouterr().err
+    assert "packaging 26.4 is in the bundle, but the constraints file pins it at 26.3" in err
+    c.write_text("packaging==26.4\n")
+    assert manifest.report_pins([{"name": "packaging", "version": "26.4"}], c) == 0
+    assert "every package in the bundle (1) is pinned by constraints-macos-arm64.txt at the version installed" in capsys.readouterr().out
+
+
+def test_pins_complete_needs_a_constraints_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["manifest.py", "--bundle", str(tmp_path), "--target", "t", "--pin-set", "p",
+                                      "--out", str(tmp_path / "m.json"), "--pins-complete"])
+    with pytest.raises(SystemExit) as e:
+        manifest.main()
+    assert e.value.code == 2
+    assert "--pins-complete needs --constraints" in capsys.readouterr().err
+
+
 def test_extension_modules_and_symlinks_are_not_native_libraries(tmp_path):
     b = make_bundle(tmp_path, libs=["av/_core.cpython-313-x86_64-linux-gnu.so", "pkg/thing.abi3.so", "av.libs/libvpx-11111111.so.9"])
     (b / "_internal" / "libvpx-11111111.so.9").symlink_to("av.libs/libvpx-11111111.so.9")

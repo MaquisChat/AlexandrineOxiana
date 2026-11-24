@@ -1,7 +1,7 @@
 """Writes the manifest of a packaged worker and its licence folder. Run with the build venv's
 Python by build-sidecars.mjs, after PyInstaller:
 
-    python manifest.py --bundle <folder> --target <triple> --pin-set <name> [--constraints <file>] --out <file>
+    python manifest.py --bundle <folder> --target <triple> --pin-set <name> [--constraints <file> [--pins-complete]] --out <file>
 
 1. `packages`: every bundled Python distribution, with its licence as its metadata states it
    (PEP 639 `License-Expression`, else `License`, else trove classifiers), its licence files, and
@@ -19,6 +19,10 @@ Python by build-sidecars.mjs, after PyInstaller:
    whose wheel ships no licence text gets the standard text of its licence (the repository's
    licences/standard, also copied to `packages/<name>/STANDARD-TEXT-<id>.txt`) and is named in it.
    A package with neither stops the build (licence_texts.py, Task 37j).
+
+4. With `--pins-complete` (a constraints file that names every package of the bundle, FR-730): every
+   bundled package must be named in the constraints file at the version installed; a package it
+   does not name, or another version, fails the build with a sentence naming the package.
 
 `copyleft` is "yes", "weak", "runtime-exception", "choice" (the text offers a copyleft and a
 non-copyleft option), "no" or "unknown": a pointer for a human review, not a legal judgement.
@@ -41,6 +45,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import licence_texts  # noqa: E402
 from dists import canonical, runtime_dists  # noqa: E402
+from packaging.version import InvalidVersion, Version  # noqa: E402
 
 STRONG = re.compile(r"\b(A?GPL|GNU (Affero )?General Public|GPLv[23])", re.I)
 WEAK = re.compile(r"\b(LGPL|MPL|Mozilla Public|EPL|Eclipse Public|CDDL|Lesser General Public|Library General Public)", re.I)
@@ -255,6 +260,45 @@ def check_complete(bundle: Path, manifest: dict) -> list[str]:
     return problems
 
 
+def _same_version(a: str, b: str) -> bool:
+    try:
+        return Version(a) == Version(b)
+    except InvalidVersion:
+        return a == b
+
+
+def check_pinned(packages: list[dict], constraints_text: str) -> list[str]:
+    """Bundled packages that a complete pin set does not pin at the version installed (empty when
+    none, FR-730). Names compare as pip compares them; a line for a package that is not in the
+    bundle (never installed, or a build tool) is not a problem."""
+    pins = {}
+    for raw in constraints_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            name, _, version = line.partition("==")
+            pins[canonical(name.strip())] = version.strip()
+    problems = []
+    for p in packages:
+        pin = pins.get(canonical(p["name"]))
+        if pin is None:
+            problems.append(f"{p['name']} {p['version']} is in the bundle, but the constraints file does not name it")
+        elif not _same_version(p["version"], pin):
+            problems.append(f"{p['name']} {p['version']} is in the bundle, but the constraints file pins it at {pin}")
+    return problems
+
+
+def report_pins(packages: list[dict], constraints: Path) -> int:
+    problems = check_pinned(packages, constraints.read_text(encoding="utf-8"))
+    if problems:
+        print(f"constraints check FAILED: {len(problems)} package(s) in the bundle not pinned by {constraints.name} "
+              "at the version installed (change the file deliberately, services/media-worker/README.md)", file=sys.stderr)
+        for p in problems:
+            print(f"  {p}", file=sys.stderr)
+        return 1
+    print(f"constraints check: every package in the bundle ({len(packages)}) is pinned by {constraints.name} at the version installed")
+    return 0
+
+
 def review_lines(manifest: dict) -> list[str]:
     """What a licence review should look at: every package or native library that is not plainly
     permissive, as stated."""
@@ -411,7 +455,11 @@ def main() -> int:
     ap.add_argument("--constraints", type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--check", action="store_true", help="only compare an existing manifest (--out) with the bundle")
+    ap.add_argument("--pins-complete", action="store_true",
+                    help="the constraints file names every package of the bundle: fail when one differs (FR-730)")
     args = ap.parse_args()
+    if args.pins_complete and not args.constraints:
+        ap.error("--pins-complete needs --constraints")
 
     if args.check:
         return report_completeness(args.bundle, json.loads(args.out.read_text()))
@@ -461,7 +509,9 @@ def main() -> int:
     nolicence = [p["name"] for p in packages if not p["licenceFiles"]]
     if nolicence:
         print(f"  packages whose wheel ships no licence file: {', '.join(nolicence)}")
-    return report_completeness(args.bundle, manifest)
+    complete = report_completeness(args.bundle, manifest)
+    pinned = report_pins(packages, args.constraints) if args.pins_complete else 0
+    return complete or pinned
 
 
 def report_completeness(bundle: Path, manifest: dict) -> int:

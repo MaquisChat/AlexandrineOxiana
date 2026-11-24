@@ -196,9 +196,9 @@ jobs:
           path: |
             apps/desktop/.build/node/*.tar.gz
             apps/desktop/.build/venv-*
-          key: desktop-macos-build-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-py3.13-${{ hashFiles('apps/desktop/macos/pins.json', 'services/media-worker/pyproject.toml', 'services/media-worker/packaging/constraints-macos-x86_64.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: desktop-macos-build-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-py3.13-${{ hashFiles('apps/desktop/macos/pins.json', 'services/media-worker/pyproject.toml', 'services/media-worker/packaging/constraints-macos-x86_64.txt', 'services/media-worker/packaging/constraints-macos-arm64.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            desktop-macos-build-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-py3.13-${{ hashFiles('apps/desktop/macos/pins.json', 'services/media-worker/pyproject.toml', 'services/media-worker/packaging/constraints-macos-x86_64.txt') }}-
+            desktop-macos-build-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-py3.13-${{ hashFiles('apps/desktop/macos/pins.json', 'services/media-worker/pyproject.toml', 'services/media-worker/packaging/constraints-macos-x86_64.txt', 'services/media-worker/packaging/constraints-macos-arm64.txt') }}-
 
       - run: pnpm install --frozen-lockfile
         timeout-minutes: 10
@@ -269,7 +269,7 @@ jobs:
             ao-worker-smoke-models-tiny-v1-${{ matrix.runner }}-
       - name: Packaged worker smoke test (manifest, health, HEIC, proxy, transcription, imports)
         timeout-minutes: 15
-        run: node apps/desktop/scripts/build-sidecars.mjs --skip-build --smoke ${{ matrix.arch == 'arm64' && '--constraints none' || '' }}
+        run: node apps/desktop/scripts/build-sidecars.mjs --skip-build --smoke
       - name: Save the tiny speech model
         if: ${{ !cancelled() && steps.model-cache.outcome == 'success' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
