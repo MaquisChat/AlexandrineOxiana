@@ -471,7 +471,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         steps: p.steps,
         ...(p.detail ? { detail: scrubPaths(p.detail, state.roots) } : {}),
         // FR-736: what keeps its undo from completing, with the library-relative path (R503 d: shown in this list only).
-        ...(p.rollback ? { rollback: p.rollback, causes: (p.causes ?? []).map((c) => ({ kind: c.kind, path: c.path, ...(c.somethingThere ? { somethingThere: true } : {}) })) } : {}),
+        ...(p.rollback ? { rollback: p.rollback, causes: (p.causes ?? []).map((c) => ({ kind: c.kind, path: c.path, ...(c.somethingThere ? { somethingThere: true } : {}), ...(c.copyUnread ? { copyUnread: true } : {}) })) } : {}),
         // R509: it can be closed as it is; what that leaves lost, where, and what is there now.
         canClose: p.canClose,
         ...(p.canClose ? { lost: await lostOf(p) } : {}),

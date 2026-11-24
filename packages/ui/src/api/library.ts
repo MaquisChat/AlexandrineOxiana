@@ -98,7 +98,8 @@ export interface PendingWrite {
   /** FR-736: its latest undo was not complete: the state, and what is in the way with its library-relative path. */
   rollback?: IncompleteRollback;
   /** `somethingThere` (R527, `kept-copy-gone` only): something stands at the place that the app cannot confirm is the file. */
-  causes?: Array<{ kind: string; path: string; somethingThere?: boolean }>;
+  /** `copyUnread` (R533 (1), `could-not-look` only): what could not be read is the copy the app kept, not the place. */
+  causes?: Array<{ kind: string; path: string; somethingThere?: boolean; copyUnread?: boolean }>;
   /** R509: it can be closed as it is (its undo can never complete); `lost`: what that leaves lost, and what is there now. */
   canClose?: boolean;
   lost?: Array<{ path: string; now: "nothing" | "a file" | "something else" | "could-not-look"; source?: string }>;

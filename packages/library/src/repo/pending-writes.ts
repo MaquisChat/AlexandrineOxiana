@@ -139,6 +139,9 @@ const DETAIL_AFTER: Record<IncompleteRollback, string> = {
     ": the copy the app kept of a file it removed is gone, so that file cannot be put back; the marker is kept until the change is closed in the app's list of interrupted changes",
   "lost-and-blocked":
     ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the roll-back (the app's list of interrupted changes names it); the marker is kept, and once that is dealt with, that list says whether the change can be closed as it is",
+  // R532 M2: nothing the list names stops it: the roll-back is tried again (at the next open, or from the list).
+  "lost-and-try-again":
+    ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and a step of the roll-back also failed; the marker is kept, and once the roll-back is tried again (at the next open, or from the app's list of interrupted changes), that list says whether the change can be closed as it is",
   "lost-copy-stuck":
     ": the copy the app kept of a file it removed is gone, so that file cannot be put back, and the app keeps a copy of another file of the change that it cannot put back either; the marker is kept, and restoring the project from a backup made before the change is the way to undo it",
 };
@@ -191,8 +194,11 @@ function namesProject(i: MarkerInspection, st: ProjectState): boolean {
 
 const TXN = /^[0-9a-f-]{36}$/;
 
+/** An invalid marker: why no choice, and no close (R533 (3)), is offered. */
+const RECORD_UNREADABLE = "Its record cannot be read safely, so nothing it names can be undone or kept.";
+
 function whyNot(i: MarkerInspection, choice: PendingWriteChoice): string {
-  if (i.status === "invalid") return "Its record cannot be read safely, so nothing it names can be undone or kept.";
+  if (i.status === "invalid") return RECORD_UNREADABLE;
   if (i.status === "unverifiable") return `${i.detail ? `${i.detail[0]!.toUpperCase()}${i.detail.slice(1)}. ` : ""}${NO_CHOICE}`;
   if (i.marker?.resolve && i.marker.resolve.choice !== choice) return `The choice to ${i.marker.resolve.choice === "keep" ? "keep" : "roll back"} this change is already recorded; it can only be completed.`;
   return choice === "keep"
@@ -349,9 +355,17 @@ async function afterResolved(core: RepoCore, st: ProjectState, txn: string, held
 
 /** R509: why a change cannot be closed as it is (plain words). */
 const NOT_CLOSABLE = "Only a change that can never be undone completely can be closed as it is; this one can still be rolled back.";
+/** R533 (3): a completed change can only be kept, never closed. */
+const NOT_CLOSABLE_COMMITTED = "This change was completed, so it cannot be closed; it can only be kept.";
+/** R532 M5 (b): an unverifiable change can be neither rolled back nor closed (R529): a backup is the way. */
+const NOT_CLOSABLE_UNVERIFIABLE =
+  "This change cannot be closed: the app can neither undo it nor close it safely. Restoring a backup made before the change is the way.";
 /** R528: a copy is gone, and something the researcher can deal with also stops the undo: that first. */
 const NOT_CLOSABLE_YET =
   "This change cannot be closed yet: something else still stops its undo. Deal with what the list names first, then choose “Roll it back” again.";
+/** R532 M2: the same, where the only other blocker is a step that failed (nothing the list names). */
+const NOT_CLOSABLE_TRY_AGAIN =
+  "This change cannot be closed yet: a step of its undo also failed. Choose “Roll it back” again first; after that, the list says whether the change can be closed as it is.";
 /**
  * R509: whether the list offers to close this change as it is: an uncommitted change (no other choice recorded) whose
  * latest undo was incomplete ONLY for causes that can never pass (the kept copy of a removed file is gone).
@@ -429,7 +443,19 @@ export async function closePendingWrite(core: RepoCore, txn: string, projectId: 
       const a = core.rollbackAttempts.get(txn);
       const state = a ? stateOf(a) : undefined;
       if (state === "lost-copy-stuck") throw new PendingWriteIncompleteError(txn, CLOSE_COPIES_LEFT_TEXT);
-      throw new PendingWriteChoiceError(txn, allowed(i), state === "lost-and-blocked" ? NOT_CLOSABLE_YET : NOT_CLOSABLE);
+      const why =
+        i.status === "invalid"
+          ? RECORD_UNREADABLE
+          : i.status === "committed"
+            ? NOT_CLOSABLE_COMMITTED
+            : i.status === "unverifiable"
+              ? NOT_CLOSABLE_UNVERIFIABLE
+              : state === "lost-and-blocked"
+                ? NOT_CLOSABLE_YET
+                : state === "lost-and-try-again"
+                  ? NOT_CLOSABLE_TRY_AGAIN
+                  : NOT_CLOSABLE;
+      throw new PendingWriteChoiceError(txn, allowed(i), why);
     }
     const m = i.marker!;
     const st = core.projects.get(m.projectId);

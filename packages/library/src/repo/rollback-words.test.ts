@@ -8,7 +8,7 @@ import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
-import { INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_CAUSE_TEXT, ROLLBACK_INCOMPLETE_ANSWER } from "@ao/shared";
+import { COULD_NOT_READ_KEPT_COPY_TEXT, INCOMPLETE_ROLLBACK_BANNER, ROLLBACK_CAUSE_TEXT, ROLLBACK_INCOMPLETE_ANSWER, ROLLBACK_LIST_NEXT } from "@ao/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -352,15 +352,37 @@ describe("R528 I1, M2: the banner speaks of the worst thing true, and the words 
     ]);
   });
 
-  it("probe P2: a lost file AND a step that failed: the same banner; the list names the lost file", async () => {
+  it("probe P2: a lost file AND a step that failed: the loss leads, then \"try again\" (R532 M2: never a file the list does not name); the list names the lost file", async () => {
     const { a } = await lostAndWritten();
     seams.failUndo = "created";
     await reopen();
-    expect(standing().map((w) => w.rollback)).toEqual(["lost-and-blocked"]);
-    expect(bannerOf(standing()[0]!.rollback)).not.toMatch(/Nothing was lost|a step failed/u);
+    expect(standing().map((w) => w.rollback)).toEqual(["lost-and-try-again"]);
+    expect(bannerOf(standing()[0]!.rollback)).toBe(
+      "An interrupted change in P cannot be undone completely: a file it removed cannot be put back, because the copy the app kept of it is gone. A step of the undo also failed, and you can try again first. After that, the list says whether the change can be closed as it is. Changes to P are off until then. Choose “Resolve…” to try again.",
+    );
     const [pw] = await repo.pendingWrites();
-    expect(pw).toMatchObject({ rollback: "lost-and-blocked", canClose: false, causes: [{ kind: "kept-copy-gone", path: a }] });
+    expect(pw).toMatchObject({ rollback: "lost-and-try-again", canClose: false, causes: [{ kind: "kept-copy-gone", path: a }] });
     expect(pw!.causes!.map((c) => ROLLBACK_CAUSE_TEXT[c.kind](c.path))).toEqual([`The file this change removed from ${a} cannot be put back: the copy the app kept of it is gone, so it is lost.`]);
+    expect(ROLLBACK_LIST_NEXT[pw!.rollback!]).toBe("A step of the undo also failed: first choose “Roll it back” again. After that, this list says whether the change can be closed as it is.");
+    // The command line's detail and the close's refusal name no file either.
+    expect(standing()[0]!.detail).toBe(
+      `a change interrupted before it was audited could only be partly rolled back: the copy the app kept of a file it removed is gone, so that file cannot be put back, and a step of the roll-back also failed; the marker is kept, and once the roll-back is tried again (at the next open, or from the app's list of interrupted changes), that list says whether the change can be closed as it is (transaction ${pw!.txn})`,
+    );
+    const refused = await repo.closePendingWrite(pw!.txn, pid).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((refused as Error).message).toBe(
+      "This change cannot be closed yet: a step of its undo also failed. Choose “Roll it back” again first; after that, the list says whether the change can be closed as it is.",
+    );
+    // "Roll it back" while the step still fails: the answer says try again, and names no file.
+    const again = await repo.resolvePendingWrite(pw!.txn, "roll-back").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((again as Error).message).toBe(
+      "The change could not be undone completely: the copy the app kept of a file it removed is gone, so that file cannot be put back, and a step of the undo also failed. Try again first: choose “Roll it back” again. After that, the list says whether the change can be closed as it is.",
+    );
     // Tried again once the step passes: only the loss is left, and the close is offered.
     seams.failUndo = undefined;
     const err = await repo.resolvePendingWrite(pw!.txn, "roll-back").then(
@@ -478,5 +500,68 @@ describe("R528 I2: the warning follows every outcome of the list's acts", () => 
     await rm(fromRel(lib.root, c));
     await expect(repo.resolvePendingWrite(m.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteIncompleteError);
     expect(pending().map((x) => [x.rollback, x.causes?.map((k) => k.kind)])).toEqual([["lost", ["kept-copy-gone"]]]);
+  });
+});
+
+describe("R532 M1: where a look fails, the words never say what the app does not know", () => {
+  it("probe C: the kept copy is gone, nothing is at the place, and the look at the place fails: never \"Nothing was lost\"; the loss leads", async () => {
+    const rel = `${folder}/kept.txt`;
+    await writeFile(fromRel(lib.root, rel), ORIGINAL);
+    const m = await crashed(async (tx) => {
+      await tx.trash(rel);
+    });
+    await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { recursive: true, force: true });
+    seams.failLook = rel;
+    await reopen();
+    expect(standing().map((w) => w.rollback)).toEqual(["lost-and-blocked"]);
+    expect(bannerOf(standing()[0]!.rollback)).not.toMatch(/Nothing was lost/u);
+    const [pw] = await repo.pendingWrites();
+    // The list names the place the app could not read (it says nothing of what is there, and never "lost"); no close yet.
+    expect(pw).toMatchObject({ rollback: "lost-and-blocked", canClose: false, causes: [{ kind: "could-not-look", path: rel }] });
+    // R533 (1): what could not be read is the place, not the kept copy.
+    expect(pw!.causes![0]!.copyUnread).toBeUndefined();
+    expect(pw!.causes!.map((c) => ROLLBACK_CAUSE_TEXT[c.kind](c.path))).toEqual([
+      `The app could not read ${rel}, so it left it as it is. Make sure the file can be read, then choose “Roll it back”.`,
+    ]);
+    // Once the look works, "Roll it back" finds the loss, and the list offers the close.
+    seams.failLook = undefined;
+    const err = await repo.resolvePendingWrite(m.txn, "roll-back").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toBe(ROLLBACK_INCOMPLETE_ANSWER.lost);
+    expect((await repo.pendingWrites())[0]).toMatchObject({ rollback: "lost", canClose: true, causes: [{ kind: "kept-copy-gone", path: rel }] });
+    expect(standing().map((w) => w.rollback)).toEqual(["lost"]);
+  });
+
+  it("the look at the kept COPY fails (it is there): the copy is never said to be gone, nothing is said lost or not lost, nothing at the place is touched", async () => {
+    const rel = `${folder}/kept.txt`;
+    await writeFile(fromRel(lib.root, rel), ORIGINAL);
+    const m = await crashed(async (tx) => {
+      await tx.trash(rel);
+      await tx.writeFile(rel, "the change's own file\n");
+    });
+    const copy = (m.entries[0] as { to: string }).to;
+    seams.failLook = copy;
+    await reopen();
+    expect(standing().map((w) => w.rollback)).toEqual(["could-not-read"]);
+    expect(bannerOf("could-not-read")).toBe(
+      "An interrupted change in P could not be undone completely: the app could not read a file. Changes to P are off until it is undone. Choose “Resolve…” to see which file.",
+    );
+    const [pw] = await repo.pendingWrites();
+    // R533 (1): the cause says that what could not be read is the kept copy, and the list's line says so.
+    expect(pw!.causes).toEqual([{ kind: "could-not-look", path: rel, copyUnread: true }]);
+    expect(pw).toMatchObject({ rollback: "could-not-read", canClose: false });
+    expect(COULD_NOT_READ_KEPT_COPY_TEXT(rel)).toBe(
+      `The app could not read the copy it kept of the file this change removed from ${rel}, so it left ${rel} as it is. Make sure the library's work folder can be read, then choose “Roll it back”.`,
+    );
+    // Left as it is while the app cannot tell: the change's own file stays at the place, the copy in the work folder.
+    expect(await readFile(fromRel(lib.root, rel), "utf8")).toBe("the change's own file\n");
+    expect(await readFile(fromRel(lib.root, copy), "utf8")).toBe(ORIGINAL);
+    // Once the copy can be read, "Roll it back" completes: the original is back.
+    seams.failLook = undefined;
+    await repo.resolvePendingWrite(m.txn, "roll-back");
+    expect(await readFile(fromRel(lib.root, rel), "utf8")).toBe(ORIGINAL);
+    expect(await repo.pendingWrites()).toEqual([]);
   });
 });

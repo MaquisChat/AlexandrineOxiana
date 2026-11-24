@@ -335,6 +335,45 @@ describe("R509: closing a change whose undo can never complete", () => {
     expect((await repo.pendingWrites())[0]).toMatchObject({ canClose: false });
   });
 
+  it("R532 M3: a close whose own undo now finds a file put in the way: refused, and the warning follows the list (the close path updates it too)", async () => {
+    const a = `${folder}/a.txt`;
+    const b = `${folder}/b.txt`;
+    await writeFile(fromRel(lib.root, a), ORIGINAL);
+    const m = await crashed(async (tx) => {
+      await tx.trash(a);
+      await tx.writeFile(b, OWN);
+    });
+    await rm(fromRel(lib.root, (m.entries[0] as { to: string }).to), { recursive: true, force: true });
+    await reopen();
+    const standing = () => repo.integrityWarnings.filter((w) => w.projectId === pid && w.kind === "rolled-back-incomplete-write");
+    expect((await repo.pendingWrites())[0]).toMatchObject({ rollback: "lost", canClose: true });
+    expect(standing().map((w) => w.rollback)).toEqual(["lost"]);
+    // A file is put at b.txt by hand after the list said "lost": the close's undo finds it in the way.
+    await writeFile(fromRel(lib.root, b), HAND);
+    const err = await repo.closePendingWrite(m.txn, pid).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PendingWriteIncompleteError);
+    expect(await markers()).toEqual([`txn-${m.txn}.json`]);
+    expect(await text(b)).toBe(HAND);
+    expect((await repo.pendingWrites())[0]).toMatchObject({ rollback: "lost-and-blocked", canClose: false });
+    // The banner says what the list says: its state, its causes and the command line's detail.
+    const w = standing();
+    expect(w.map((x) => [x.rollback, x.causes])).toEqual([
+      [
+        "lost-and-blocked",
+        [
+          { kind: "kept-copy-gone", path: a },
+          { kind: "hand-changed-file", path: b },
+        ],
+      ],
+    ]);
+    expect(w[0]!.detail).toBe(
+      `a change interrupted before it was audited could only be partly rolled back: the copy the app kept of a file it removed is gone, so that file cannot be put back, and something else also stops the roll-back (the app's list of interrupted changes names it); the marker is kept, and once that is dealt with, that list says whether the change can be closed as it is (transaction ${m.txn})`,
+    );
+  });
+
   it("named with another project, or an unknown change: not found", async () => {
     const { m } = await lost();
     const other = (await repo.createProject({ name: "Q", governanceYaml: OPEN_GOV, encryption: { enabled: false } }).catch(() => null))?.project.id ?? "019a7000-0000-7000-8000-0000000000ee";

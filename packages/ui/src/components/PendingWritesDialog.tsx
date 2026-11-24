@@ -12,7 +12,7 @@
  */
 import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { KEPT_COPY_GONE_UNCONFIRMED_TEXT, ROLLBACK_CAUSE_KINDS, ROLLBACK_CAUSE_TEXT, ROLLBACK_LIST_NEXT, type RollbackCauseKind } from "@ao/shared";
+import { COULD_NOT_READ_KEPT_COPY_TEXT, KEPT_COPY_GONE_UNCONFIRMED_TEXT, ROLLBACK_CAUSE_KINDS, ROLLBACK_CAUSE_TEXT, ROLLBACK_LIST_NEXT, type RollbackCauseKind } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { errorText, type LibraryApi, type PendingWrite, type PendingWriteChoice } from "../api/library";
 import { UserText } from "./UserText";
@@ -61,11 +61,18 @@ const UNSURE_CONFIRM: Record<PendingWriteChoice, string> = {
  * FR-736 (R503 d): what keeps the undo from completing, cause by cause, with the file's library-relative path — shown
  * here only, through `UserText`, because the researcher has to find the file.
  */
-function causeSentence(kind: string, path: string, somethingThere = false): ReactNode {
+function causeSentence(kind: string, path: string, somethingThere = false, copyUnread = false): ReactNode {
   if (!(ROLLBACK_CAUSE_KINDS as readonly string[]).includes(kind)) return null;
   const mark = "\u0000";
   // R527: the copy is gone but something stands at the place: the app cannot confirm it is the file, never "lost".
-  return (kind === "kept-copy-gone" && somethingThere ? KEPT_COPY_GONE_UNCONFIRMED_TEXT : ROLLBACK_CAUSE_TEXT[kind as RollbackCauseKind])(mark)
+  // R533 (1): what could not be read is the app's kept copy, not the file at the place.
+  const text =
+    kind === "kept-copy-gone" && somethingThere
+      ? KEPT_COPY_GONE_UNCONFIRMED_TEXT
+      : kind === "could-not-look" && copyUnread
+        ? COULD_NOT_READ_KEPT_COPY_TEXT
+        : ROLLBACK_CAUSE_TEXT[kind as RollbackCauseKind];
+  return text(mark)
     .split(mark)
     .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={i}>{path}</UserText>, part]));
 }
@@ -170,7 +177,7 @@ function Item({ pw, readOnly, onChoose, onCloseAsIs }: { pw: PendingWrite; readO
           )}
         </p>
         {(pw.causes ?? []).map((c) => {
-          const said = causeSentence(c.kind, c.path, c.somethingThere === true);
+          const said = causeSentence(c.kind, c.path, c.somethingThere === true, c.copyUnread === true);
           return said ? <p key={`${c.kind}:${c.path}`}>{said}</p> : null;
         })}
         {/* R528 M2: where the causes alone do not say it, the next step: what to deal with first, or that a backup is the way. */}

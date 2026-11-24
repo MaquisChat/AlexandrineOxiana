@@ -246,6 +246,16 @@ describe("FR-736: what is in the way of an undo that is not complete", () => {
     expect(item.textContent).not.toMatch(/lost/u);
   });
 
+  it("R533 (1): could-not-look where what could not be read is the kept copy: the list says so, with the place as text", async () => {
+    const said = `The app could not read the copy it kept of the file this change removed from ${F}, so it left ${F} as it is. Make sure the library's work folder can be read, then choose “Roll it back”.`;
+    serve([[pw({ rollback: "could-not-read", causes: [{ kind: "could-not-look", path: F, copyUnread: true }] })]]);
+    show();
+    const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
+    const item = within(group).getByText((_, el) => el?.tagName === "P" && el.textContent === said);
+    expect(item.querySelector("b")).toBeNull();
+    expect([...item.querySelectorAll("bdi, [dir]")].map((e) => e.textContent)).toEqual([F, F]);
+  });
+
   it("\"Roll it back\" answered with the undo's state: the library's own sentence, not \"something changed meanwhile\"", async () => {
     const said = "The change could not be undone completely: a file changed or put there outside the app is in the way. The list shows which file; move it, then choose “Roll it back” again.";
     serve([[pw({ rollback: "in-the-way", causes: [{ kind: "hand-changed-file", path: F }] })]], () =>
@@ -276,6 +286,18 @@ describe("R528 I1, M2: a copy gone together with something else: the words lead 
       `The file this change removed from ${A} cannot be put back: the copy the app kept of it is gone, so it is lost.`,
       `${B} was changed or put there outside the app, so the app left it as it is. Move it somewhere outside the library (it is kept there as it is), then choose “Roll it back”.`,
       "Deal with what is named above first, then choose “Roll it back” again. After that, this list says whether the change can be closed as it is.",
+    ]);
+    expect(within(group).getByRole("button", { name: "Roll it back" })).toBeTruthy();
+    expect(within(group).queryByRole("button", { name: "Close this change as it is" })).toBeNull();
+  });
+
+  it("R532 M2 (probe P2: a lost file and a step that failed): the lost file, then \"try again\", never a file the list does not name; no close yet", async () => {
+    serve([[pw({ rollback: "lost-and-try-again", causes: [{ kind: "kept-copy-gone", path: A }], canClose: false })]]);
+    show();
+    const group = await screen.findByRole("group", { name: "Interrupted change in Dissertation" });
+    expect(lines(group)).toEqual([
+      `The file this change removed from ${A} cannot be put back: the copy the app kept of it is gone, so it is lost.`,
+      "A step of the undo also failed: first choose “Roll it back” again. After that, this list says whether the change can be closed as it is.",
     ]);
     expect(within(group).getByRole("button", { name: "Roll it back" })).toBeTruthy();
     expect(within(group).queryByRole("button", { name: "Close this change as it is" })).toBeNull();

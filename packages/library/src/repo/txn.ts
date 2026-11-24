@@ -315,6 +315,17 @@ export interface UndoCause {
    * removed (the words then never say that file is lost). Absent: nothing is there, and the file is lost.
    */
   somethingThere?: true;
+  /**
+   * `could-not-look` only (R532 M1): the place of a file the change removed, whose kept copy is gone, could not be looked
+   * at: that file may be lost, so the state speaks of the loss first (never "nothing was lost"); the list names the
+   * place as one the app could not read, and says nothing of what is there.
+   */
+  copyGone?: true;
+  /**
+   * `could-not-look` only (R533 (1)): what could not be read is the copy the app kept of the file the change removed from
+   * the place (not the place itself); the list says so, and sends the researcher to the library's work folder.
+   */
+  copyUnread?: true;
 }
 /** `ok`: every step undone (or already undone); `causes`: what kept a path from being undone, when known. */
 export interface UndoResult {
@@ -458,9 +469,17 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
   let ok = true;
   const causes: UndoCause[] = [];
   let stepFailed = false;
-  const because = (kind: UndoCauseKind, path: string, somethingThere = false) => {
+  const because = (kind: UndoCauseKind, path: string, somethingThere = false, copyGone = false, copyUnread = false) => {
     ok = false;
-    if (!causes.some((c) => c.kind === kind && c.path === path)) causes.push({ kind, path, ...(somethingThere ? { somethingThere: true as const } : {}) });
+    if (!causes.some((c) => c.kind === kind && c.path === path)) {
+      causes.push({
+        kind,
+        path,
+        ...(somethingThere ? { somethingThere: true as const } : {}),
+        ...(copyGone ? { copyGone: true as const } : {}),
+        ...(copyUnread ? { copyUnread: true as const } : {}),
+      });
+    }
   };
   const done = new Set<number>();
   /** Paths where something not of the change, or not known to be, was left as it is (R519). */
@@ -469,24 +488,33 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
     // A line that says the identity was not kept is no step of its own: its first line's move (R526).
     if (e.kind !== "trashed" || e.noIdentity) continue;
     let putBack: boolean;
+    let copyUnread = false;
     try {
+      // The look seam (R47, "test" only) reaches the look at the kept copy too (R532 M1).
+      if (process.env.NODE_ENV === "test" && seams.failLook === e.to) throw new Error("simulated read failure");
       putBack = !(await exists(fromRel(root, e.to)));
     } catch {
       // Not known whether it was put back: nothing at that path is undone again, and the roll-back is not complete.
       putBack = true;
-      because("could-not-look", e.from);
+      copyUnread = true;
+      because("could-not-look", e.from, false, false, true);
     }
     if (!putBack) continue;
     const earlier = trashedContent(entries, i);
     const id = trashedIdentity(entries, i);
-    if (id === undefined) {
+    if (copyUnread) {
+      // R532 M1: not known whether the kept copy is there: it is never said to be gone, and nothing at, under or above
+      // the place is undone (each would remove or overwrite what may be the original, or what the copy must go back to).
+      blocked.push(e.from);
+    } else if (id === undefined) {
       // An older build's line (no identity), judged as before. R503 b 2: a copy gone while the change's own bytes (a
       // later line's hash) are still at the path was not put back: it was deleted outside the app. The roll-back is
       // then not complete (the marker is kept); nothing is deleted.
       try {
         if (await ownBytesAt(root, e.from, entries.slice(i + 1))) because("kept-copy-gone", e.from, true);
       } catch {
-        because("could-not-look", e.from);
+        // R532 M1: the copy is gone and the place could not be looked at: the file may be lost.
+        because("could-not-look", e.from, false, true);
       }
     } else if (earlier !== "the change's") {
       // R519 (3), R526: the line knows the original's identity (file number, time of birth). What has it at the path IS
@@ -505,7 +533,8 @@ export async function undoEntries(root: string, entries: MarkerEntry[]): Promise
           blocked.push(e.from);
         }
       } catch {
-        because("could-not-look", e.from);
+        // R532 M1: the copy is gone and the place could not be looked at: the file may be lost (the loss leads).
+        because("could-not-look", e.from, false, true);
         blocked.push(e.from);
       }
     }
@@ -1018,15 +1047,43 @@ export async function lookNow(root: string, rel: string): Promise<"nothing" | "a
 }
 
 /**
- * Whether the app still keeps a copy of something of this change that is not back in its place: a trash copy, or a
- * backup of a replaced file whose bytes are not at its path. Removing the marker lets such a copy go (its backups are
- * deleted with it, and the next opening sweeps the trash): closing must delete nothing (R509), so it waits; where nothing
- * else stops the undo and its own copy is gone, nothing the researcher can do in the app remains (R528 M2).
+ * R532 I1, R533 (4): whether the backup of "replaced" line `i` may hold bytes that are not the change's own. It holds
+ * only the change's own bytes where the nearest earlier line of the change at its path shows the change wrote the file
+ * there from bytes of its own making: an earlier "replaced" line at the path (the backup holds that rewrite's bytes), a
+ * "created" line with a hash of its own and no completion mark (a file written whole), or a file the change created by
+ * appending. Every other origin counts as holding the researcher's bytes (the safe side): the path was there before the
+ * change; the change created it BY COPYING a file (a "created" line with no hash of its own, whose completion line
+ * carries the hash as stored); or it lies in a folder the change made, where a copy and a write leave the same line.
+ * Where the scan back meets a "trashed" or "dir" line that covers the path (the path itself or a folder above it)
+ * before the line that made the file as it stood at the rewrite, it stops and counts the backup as kept (review 3 I1).
+ */
+function backupHoldsOriginal(entries: MarkerEntry[], i: number): boolean {
+  const path = (entries[i] as Extract<MarkerEntry, { kind: "replaced" }>).path;
+  for (let j = i - 1; j >= 0; j--) {
+    const x = entries[j]!;
+    // Review 3 I1: a trash or a folder made at the path or above it covers it: what the scan would meet beyond is about a
+    // file that is no longer the one rewritten, so it stops on the safe side.
+    const at = x.kind === "trashed" ? x.from : x.path;
+    if ((x.kind === "trashed" || x.kind === "dir") && (path === at || path.startsWith(`${at}/`))) return true;
+    if (x.kind === "trashed" || x.kind === "dir" || x.path !== path) continue;
+    if (x.kind === "replaced" || (x.kind === "append" && x.created)) return false;
+    if (x.kind === "created" && x.complete !== true) return x.sha256 === undefined;
+  }
+  return true;
+}
+
+/**
+ * Whether the app still keeps a copy of something of the researcher's that is not back in its place: a trash copy, or
+ * the backup of a replaced file that holds bytes not the change's own (`backupHoldsOriginal`) and whose bytes are not
+ * at its path. Removing the marker lets such a copy go (its backups are deleted with it, and the next opening sweeps the
+ * trash): closing must delete nothing (R509), so it waits; where nothing else stops the undo and its own copy is gone,
+ * nothing the researcher can do in the app remains (R528 M2). The change's own intermediate bytes do not hold it (R532);
+ * a copy the change made of a file of the library does (R533 (4)).
  */
 export async function keptCopiesLeft(root: string, m: Pick<TxnMarker, "entries">): Promise<boolean> {
-  for (const e of m.entries) {
+  for (const [i, e] of m.entries.entries()) {
     if (e.kind === "trashed" && (await exists(fromRel(root, e.to)))) return true;
-    if (e.kind === "replaced") {
+    if (e.kind === "replaced" && backupHoldsOriginal(m.entries, i)) {
       const backup = await readMaybe(fromRel(root, e.backup));
       if (backup === null) continue;
       const now = await readMaybe(fromRel(root, e.path)).catch(() => null);
