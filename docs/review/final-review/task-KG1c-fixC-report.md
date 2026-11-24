@@ -232,3 +232,149 @@ A real permission or I/O failure at the look at a kept copy, or at a lost file's
 - End to end: not run. `interrupted-change.spec.ts` asserts only the in-the-way banner and the list's line, and neither changed.
 
 `git status --short`: empty.
+
+## Last points (R533, R534)
+
+Branch `kg-1-rollback`, from 9073095. Head 4e83973. Not pushed. `git stash` was never used, and `…/kg-1-look` was not touched. No permission check refused anything.
+
+| Point | Commit | What |
+|---|---|---|
+| 1 (R533 (4)) | db204f8 | The guard counts the backup of a copy-made path as kept. The table creates by copying too. |
+| 2 (R533 (1)) | 6083608 | The list's line for an unreadable kept copy. |
+| 3 (R533 (3)) | bd1e502 | The route's refusal to close a completed or unreadable change. |
+| 4 (R534 a) | 4e83973 | The atomic copy's tests assert `storedSha256` (test only). |
+
+### 1. The guard, on the safe side (R533 (4))
+
+**Where:** `backupHoldsOriginal`, `packages/library/src/repo/txn.ts:1058`. Its doc comment is at :1049. `keptCopiesLeft` itself is unchanged.
+
+**The rule as it now reads, word for word:**
+> R532 I1, R533 (4): whether the backup of "replaced" line `i` may hold bytes that are not the change's own. It holds only the change's own bytes where the nearest earlier line of the change at its path shows the change wrote the file there from bytes of its own making: an earlier "replaced" line at the path (the backup holds that rewrite's bytes), a "created" line with a hash of its own and no completion mark (a file written whole), or a file the change created by appending. Every other origin counts as holding the researcher's bytes (the safe side): the path was there before the change; the change created it BY COPYING a file (a "created" line with no hash of its own, whose completion line carries the hash as stored); or it lies in a folder the change made, where a copy and a write leave the same line.
+
+How it tells the two kinds of file apart:
+- `Tx.writeFile` writes a "created" line with `sha256` and no `complete`. That is the change's own bytes.
+- `Tx.copyFile` writes a "created" line with no `sha256`, then a completion line (`complete: true`, the hash as stored).
+- The scan goes back from the rewrite to the nearest line at that path. It skips completion lines and "trashed" and "dir" lines.
+
+**One shape now held on the safe side that R532 I1 had let through: a file inside a folder the change made.** There, `writeFile` and `copyFile` both leave only a completion line. `created()` writes nothing in a new folder. So the guard cannot tell a copy from the change's own write, and it counts that backup as kept.
+
+What this costs:
+- Take a change that makes a folder, writes a file in it, and rewrites that file in the same change, and that also lost an original elsewhere. It now lands in "a copy is still kept", and no close is offered.
+- Nothing is destroyed; a project is held without need, the over-refusal R532 I1 had removed for this shape.
+- The table runs at one path in an existing folder and does not take this shape.
+- The only way to tell the two apart would be a new field on the completion line, a change to the marker format. Not built; it is the coordinator's call.
+
+**The table** (`packages/library/src/repo/close-guard.test.ts`):
+- **A fourth kind of step, K:** create by copying. It goes only where nothing is: `tx.copyFile(q, p)`, from the researcher's file `q`.
+- **Where q is trashed:** in a case whose steps include a copy, the change trashes `q` after its steps, not before. Its kept copy is deleted as before. So the residual shape, copy → rewrite → trash the source with its kept copy gone, is "none KR cut 2" (and KRR, KRT, TKR…).
+- **What counts as the researcher's:** the test works out, from the bytes, whether either is held only in a `.tmp` copy:
+  - the original at `p`, as before;
+  - or `q`'s bytes, when they are in no file of the library outside `.tmp`.
+- **What is asserted:** the same as before. `onlyKept ⇒ guard` (never fewer) and `guard === expected` (exact), the list's state and `canClose`, and then the real close or the refusal, with every byte compared.
+- Every earlier case is unchanged in its steps and its expectations.
+
+**Failed first:** on the unchanged guard, 10 runs failed at "never fewer" (`if (onlyKept) expect(guard).toBe(true)`, line 223): the guard said "not kept" while `q`'s bytes were held only in a rewrite's backup.
+- undone: orig TKR c3; none KR c2, KRR c2, KRR c3, KRT c2, KRT c3;
+- as crashed: none KR c2, KRR c2, KRR c3, KRT c2.
+
+After the change, all pass.
+
+A finding about the undo, not the guard: in the "undone" failures, the undo restores the copy's backup and leaves `q`'s bytes only in a kept file. So the guard's refusal is needed there too.
+
+**The new counts:**
+
+| | Before | Now |
+|---|---|---|
+| Cases | 34 | 64 (32 with an original, 32 without) |
+| Runs (each case at both moments) | 68 | 128 |
+| Undone: "kept" / "not kept" | 0 / 34 | 6 / 58 |
+| As crashed: "kept" / "not kept" | 25 / 9 | 48 / 16 |
+| Runs where the researcher's bytes are held only in a kept copy (all "kept") | 21 | 47 |
+| Closed for real | 43 | 74 |
+| Refused with nothing changed | 25 | 54 |
+
+The file runs 130 tests: the 128 runs, the count check and the counts line.
+
+### 2. The list's line for an unreadable kept copy (R533 (1))
+
+The cause carries the field `copyUnread?: true` on the existing `could-not-look` cause. There is no new cause kind.
+- It is defined at `txn.ts:328` and set at `txn.ts:500`, where the look at the kept copy fails.
+- The route passes it on: `apps/library-service/src/routes/libraries.ts:449`.
+- The UI's type: `packages/ui/src/api/library.ts:102`.
+- The screen chooses the sentence at `packages/ui/src/components/PendingWritesDialog.tsx:64-75`. `{f}` is shown through `UserText`, both times.
+- The sentence lives in one place: `COULD_NOT_READ_KEPT_COPY_TEXT`, `packages/shared/src/api/interrupted-changes.ts:122`.
+- The banner is unchanged.
+
+New sentence, word for word (`{f}` is the place's library-relative path):
+> The app could not read the copy it kept of the file this change removed from {f}, so it left {f} as it is. Make sure the library's work folder can be read, then choose “Roll it back”.
+
+Tests (each failed first):
+
+| File | Test |
+|---|---|
+| `packages/shared/src/api/interrupted-changes.test.ts:125` | The whole sentence, and the ordinary could-not-look line unchanged. |
+| `rollback-words.test.ts:552` | The cause is `{ kind: "could-not-look", path, copyUnread: true }`, and the whole sentence. At :521 (probe C, the place unread) there is no `copyUnread`. |
+| `PendingWritesDialog.test.tsx:249` | The whole sentence rendered, with both paths as text. The existing four lines in the table above it are unchanged and pass. |
+| `server.test.ts:3040` | The route carries `copyUnread` when the copy's look fails, and not when the place's look fails. |
+
+Changed because it asserted the old shape: `packages/library/src/seams-inert.test.ts`, the "R532 M1 … kept copy" case. It now expects `copyUnread: true`.
+
+### 3. The route's refusal to close (R533 (3))
+
+In `packages/library/src/repo/pending-writes.ts`:
+- `RECORD_UNREADABLE` (:198) is the existing sentence, moved into a constant that `whyNot` (:201) and the close refusal (:448) both use.
+- `NOT_CLOSABLE_COMMITTED` (:359) is new.
+
+The refusal now reads, word for word:
+
+| Change asked to close | Refusal |
+|---|---|
+| Completed | "This change was completed, so it cannot be closed; it can only be kept." |
+| Its record cannot be read | "Its record cannot be read safely, so nothing it names can be undone or kept." |
+| Can still be rolled back (unchanged) | "Only a change that can never be undone completely can be closed as it is; this one can still be rolled back." |
+
+Tests (each failed first):
+
+| File | Test |
+|---|---|
+| `pending-writes.test.ts:184` | A completed change. |
+| `pending-writes.test.ts:210` | An invalid marker, closed with `projectId "*"`. |
+| `server.test.ts:3107` | The route, 409 with each sentence. |
+
+The unchanged refusal is still asserted in `pending-writes-close.test.ts:289`, which passes.
+
+### 4. The atomic copy's tests (R534 a)
+
+`packages/library/src/fs/atomic.test.ts:133, :145, :160, :180`. No product code changed.
+
+What each test now asserts for `storedSha256`:
+
+| Case | `storedSha256` |
+|---|---|
+| Plain copy | The sha256 of the content. |
+| `noFollow` | As the plain case. |
+| Transform | The sha256 of the destination file read back from disk, and different from `sha256`. |
+| Empty file | `e3b0c442…b855`, the hash of nothing. |
+
+Each is what the code answers, so there is no finding. The original file, run as a copy beside it, failed these 4 tests, and the mended file passes 23/23.
+
+### Runs (each alone, `nice -n 10`, `NODE_OPTIONS="--use-openssl-ca"`)
+
+| File | Result |
+|---|---|
+| close-guard | 130/130 |
+| rollback-rerun (untouched) | 30/30 |
+| rollback-hand-put (untouched) | 42/42 |
+| pending-writes | 22/22 |
+| fs/atomic | 23/23 |
+| shared interrupted-changes | 263/263 |
+| library-service server.test | 160 passed, 1 skipped |
+| ui PendingWritesDialog | 26/26 |
+| seams-inert | 9/9 |
+| rollback-words | 20/20 |
+| pending-writes-close | 14/14 |
+| rollback-own-writes | 14/14 |
+
+- Typechecks: shared, library, ui, library-service and cli, each ok.
+- `lint:css` and `lint:colours`: ok.
+- `git status --short`: empty.
