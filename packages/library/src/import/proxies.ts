@@ -28,7 +28,7 @@ import { copyFileAtomic } from "../fs/atomic.js";
 import { stricterLocation } from "../repo/assets.js";
 import { PolicyDeniedError, ProxyRecordRefusedError, isLockedRefusal } from "../repo/errors.js";
 import { addProxyAsset, currentProjectLocationMode, editPendingProxies, projectDataKey, repoLibrary, type Repo } from "../repo/repo.js";
-import { outsideClosingScope, type Library } from "../library.js";
+import { isClosed, outsideClosingScope, type Library } from "../library.js";
 import { activeTemp } from "../tmp-registry.js";
 import { WorkerJobError, WorkerUnavailableError, type WorkerClient } from "../worker-client.js";
 import { LOCATION_REASON, type LocationMode } from "./common.js";
@@ -213,7 +213,8 @@ export class ProxyQueue {
 
   /** Runs the source's pending jobs after those already queued (nothing while no worker is configured). */
   enqueue(projectId: string, sourceId: string): void {
-    if (!this.worker) return;
+    // R562: none once the library is closed (a queue a caller did not dispose of): the job stays pending for the next opening.
+    if (!this.worker || isClosed(repoLibrary(this.repo))) return;
     this.then(() => this.runSource(projectId, sourceId)).catch(() => {});
   }
 
@@ -298,6 +299,9 @@ export class ProxyQueue {
   private async runJob(worker: WorkerClient, projectId: string, sf: SourceFile, job: PendingProxy, attempts: number): Promise<ProxyResult> {
     const sourceId = sf.source.id;
     const base = { projectId, sourceId, jobId: job.id };
+    // R562 (R546 1, R247 c): no job starts once the library is closed — nothing is made under it, nothing recorded; the job
+    // stays pending, as one refused is.
+    if (isClosed(repoLibrary(this.repo))) return { ...base, ok: false, code: "PENDING" };
     const asset = sf.assets.find((a) => a.id === job.assetId && a.role === "original");
     if (!asset) {
       await editPendingProxies(this.repo, projectId, sourceId, (list) => list.filter((j) => j.id !== job.id)).catch(() => {});
@@ -305,6 +309,8 @@ export class ProxyQueue {
     }
     // The rule as it is now, if stricter than when the job was queued (R85 C1).
     const mode = stricterLocation(job.location, await currentProjectLocationMode(this.repo, projectId));
+    // Asked again after that read, in the same tick as the scratch folder's making begins (R562).
+    if (isClosed(repoLibrary(this.repo))) return { ...base, ok: false, code: "PENDING" };
     const root = repoLibrary(this.repo).root;
     const input = asset.linked ? asset.linked.absolutePath : join(root, ...asset.path.split("/"));
     const ext = job.type === "image.proxy" ? "jpg" : "mp4";
