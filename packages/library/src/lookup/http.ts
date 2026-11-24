@@ -705,6 +705,12 @@ export class HttpClient {
     return t;
   }
 
+  /** R556 (2) ii: throws LookupLeftOutError while `host`'s "not before" has not passed. */
+  private leftOutIfHeld(host: string): void {
+    const t = this.notBefore.get(host);
+    if (t !== undefined && this.clock() < t) throw new LookupLeftOutError(host, t);
+  }
+
   /**
    * R411 for a caller that waits: a host's "not before" is waited for before it is asked — as long as the client waits
    * for a Retry-After of its own (`maxRetryAfterMs`). The wait is cut short when the library closes (R546 2).
@@ -734,10 +740,7 @@ export class HttpClient {
     const first = new URL(url);
     const host = first.hostname;
     // R556 (2) ii: within a host's "not before", a caller that does not wait is left out at once: nothing is sent.
-    if (leaveOut) {
-      const t = this.notBefore.get(host);
-      if (t !== undefined && this.clock() < t) throw new LookupLeftOutError(host, t);
-    }
+    if (leaveOut) this.leftOutIfHeld(host);
     if (this.keyReady && first.hostname === KEY_FOR_HOST && this.keyForHost) {
       try {
         await this.keyReady(first.hostname);
@@ -754,11 +757,13 @@ export class HttpClient {
     let lastError: LookupHttpError | undefined;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       if (!leaveOut) await this.awaitHold(host);
+      // R563 I1: before every retry too (a hold another call set meanwhile); and again just before the send, below.
+      else if (attempt > 0) this.leftOutIfHeld(host);
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
       try {
-        res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) });
+        res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) }, leaveOut);
       } catch (e) {
-        if (e instanceof LookupHttpError) throw e; // refused redirect or oversized body: not retryable
+        if (e instanceof LookupHttpError || e instanceof LookupLeftOutError) throw e; // refused redirect, oversized body, held: not retried
         // The library is being closed: a request in the air is abandoned and never sent again (R546 2).
         if (e instanceof LookupCancelledError || this.halt().aborted) throw new LookupCancelledError();
         // The library's own words can hold the address it was asked; with a query (an e-mail), a key or a contact
@@ -769,12 +774,12 @@ export class HttpClient {
       if (res) {
         if (res.status === 200) return { status: 200, body: res.body, sent };
         if (res.status === 404 || res.status === 410) return { status: 404, body: null, sent };
-        if (leaveOut) {
-          // R556 (2) i: a 429 (a minute when it names no time), or a 503 that asks for a wait, is not waited for.
-          const asked = retryAfterMs(res.retryAfter, this.clock());
-          if (res.status === 429 || (res.status === 503 && asked !== undefined)) {
-            throw new LookupLeftOutError(host, this.holdHost(host, asked ?? UNNAMED_WAIT_MS));
-          }
+        // R556 (2) i, R563 I1: a 429 (a minute when it names no time), or a 503 that asks for a wait, sets the host's
+        // hold, whoever received it; a call with the choice is then left out at once, any other goes on as before.
+        const asked = retryAfterMs(res.retryAfter, this.clock());
+        if (res.status === 429 || (res.status === 503 && asked !== undefined)) {
+          const t = this.holdHost(host, asked ?? UNNAMED_WAIT_MS);
+          if (leaveOut) throw new LookupLeftOutError(host, t);
         }
         if (res.status === 429 && res.rateLimit) {
           // The answer (body included) is shown to the caller's decision and then dropped: only
@@ -808,6 +813,7 @@ export class HttpClient {
   private async fetchFollowingRedirects(
     url: string,
     send: { ua: string; key?: string },
+    leaveOut = false,
   ): Promise<{ status: number; body: string | null; retryAfter?: string; rateLimit?: RateLimitAnswer }> {
     let current = new URL(url);
     let signal: AbortSignal | undefined;
@@ -815,6 +821,9 @@ export class HttpClient {
       const giveBack = await this.hold(current.hostname);
       try {
         await this.throttle(current.hostname);
+        // R563 I1: a call with the choice looks at the hold immediately before it sends (another call may have set it
+        // while this one waited for its place or its slot).
+        if (leaveOut) this.leftOutIfHeld(current.hostname);
         if (!signal) {
           signal = AbortSignal.any([AbortSignal.timeout(this.attemptTimeoutMs), this.halt()]);
         }

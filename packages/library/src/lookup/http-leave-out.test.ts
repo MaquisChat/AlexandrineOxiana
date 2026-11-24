@@ -226,3 +226,78 @@ describe("the providers carry 'left out' (decision 31 b)", () => {
     expect(sleeps).toEqual([3000]);
   });
 });
+
+/**
+ * R563 I1: a call that carries the choice looks at the hold immediately before every send and every retry, and a hold
+ * is set by ANY caller's 429 (or 503 with a wait asked). A request already in the air when the service first asks to
+ * wait cannot be called back: Crossref takes one request at a time (DEFAULT_CONCURRENCY), so here exactly one request
+ * is in the air and every later one waits for its place behind it.
+ */
+describe("the hold is looked at just before every send and every retry (decision 31 b, R563 I1)", () => {
+  it("five calls with the choice started together: after the first 429 nothing more is sent", async () => {
+    answering(CR, () => ({ statusCode: 429, headers: { "retry-after": "60" } }));
+    const http = client();
+    const calls = [1, 2, 3, 4, 5].map((i) => http.getJson(`${CR}/works/10.5555/n${i}`, { ...LEAVE, cacheKey: `k${i}` }).catch((e: unknown) => e));
+    const errs = await Promise.all(calls);
+    for (const e of errs) expect(e).toBeInstanceOf(LookupLeftOutError);
+    expect(count("api.crossref.org")).toBe(1);
+  });
+
+  it("a call with the choice whose first try got a 500 sends no retry once another call has set a hold", async () => {
+    answering(CR, (n) => (n === 1 ? { statusCode: 500 } : { statusCode: 429, headers: { "retry-after": "60" } }));
+    let backoffStarted!: () => void;
+    const inBackoff = new Promise<void>((r) => (backoffStarted = r));
+    let endBackoff!: () => void;
+    const backoffGate = new Promise<void>((r) => (endBackoff = r));
+    const http = new HttpClient({
+      libraryRoot: join(tmp, "Lib"),
+      dispatcher: agent,
+      clock: () => now,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        if (ms === 500) {
+          backoffStarted();
+          await backoffGate; // the first call's back-off ends only when the test says so
+        }
+        now += ms;
+      },
+    });
+    const a = http.getJson(`${CR}/works/10.5555/a`, { ...LEAVE, cacheKey: "ka" }).catch((e: unknown) => e);
+    await inBackoff;
+    const b = await http.getJson(`${CR}/works/10.5555/b`, { ...LEAVE, cacheKey: "kb" }).catch((e: unknown) => e);
+    expect(b).toBeInstanceOf(LookupLeftOutError); // the hold: until +60 s
+    endBackoff();
+    expect(await a).toBeInstanceOf(LookupLeftOutError);
+    expect(count("api.crossref.org")).toBe(2); // a's first try and b's: a's retry was not sent
+  });
+
+  it("a 429 received by a caller WITHOUT the choice sets the hold: a call with the choice then sends nothing", async () => {
+    answering(CR, (n) => (n === 1 ? { statusCode: 429, headers: { "retry-after": "60" } } : { statusCode: 200, data: fixture("crossref-work.json") }));
+    let waitStarted!: () => void;
+    const waiting = new Promise<void>((r) => (waitStarted = r));
+    let endWait!: () => void;
+    const waitGate = new Promise<void>((r) => (endWait = r));
+    const http = new HttpClient({
+      libraryRoot: join(tmp, "Lib"),
+      dispatcher: agent,
+      clock: () => now,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        if (ms === 60_000) {
+          waitStarted();
+          await waitGate; // Bulk sits out its minute until the test says so
+        }
+        now += ms;
+      },
+    });
+    const bulk = http.getJson(CR_URL, { cacheKey: "bulk" });
+    await waiting;
+    const attach = await http.getJson(`${CR}/works/10.5555/other`, LEAVE).catch((e: unknown) => e);
+    expect(attach).toBeInstanceOf(LookupLeftOutError);
+    expect((attach as LookupLeftOutError).notBefore).toBe(1_000_000 + 60_000);
+    expect(count("api.crossref.org")).toBe(1);
+    endWait();
+    await expect(bulk).resolves.toMatchObject({ message: { DOI } }); // Bulk itself is as before: it waited, then asked
+    expect(count("api.crossref.org")).toBe(2);
+  });
+});
