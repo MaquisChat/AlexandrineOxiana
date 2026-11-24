@@ -384,7 +384,7 @@ describe.skipIf(!HAVE_BUNDLE)("R88 I3: imported styles cannot block or exhaust t
     const ok = { styleXml: style(), locales: {}, lang: "en-US", format: "text" as const, kind: "bibliography" as const, items: [{ id: "x", type: "book", title: "T" }] };
     const big = { ...ok, styleXml: fanOut(18), items: [{ id: "x", type: "book", title: "T".repeat(1000) }] };
     // As the desktop shell starts the service (src-tauri/src/service.rs): the sandbox's own cap
-    // (256 MB) is overridden, so the worker's real cap is 512 MB. A generous time limit, so that the
+    // (256 MB) is overridden, so each worker's real cap is 512 MB. A generous time limit, so that the
     // memory cap, not the clock, ends the render.
     const withLocale = { ...ok, locales: { "en-US": bundledCslLoader().localeXml("en-US")! } };
     const r = await sandboxInChild(["--max-old-space-size=512"], big, { timeoutMs: 90_000 }, withLocale);

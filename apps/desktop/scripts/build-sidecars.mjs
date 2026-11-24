@@ -17,8 +17,10 @@
 //
 // Pin sets: the default pins of services/media-worker/pyproject.toml, or those plus a constraints
 // file. On an Intel Mac packaging/constraints-macos-x86_64.txt is used, on an Apple-silicon Mac
-// packaging/constraints-macos-arm64.txt, unless `--constraints none` is given. A package named in the
-// Intel file is pinned by it even where pyproject.toml pins it directly. The Apple-silicon file is a
+// packaging/constraints-macos-arm64.txt, unless `--constraints none` is given. A constraints file that is
+// not a complete pin set (the Intel file, or any file given by hand with `--constraints <file>`, even a
+// copy of the Apple-silicon file at another path) overrides pyproject.toml's direct pins for the
+// packages it names, and the bundle is not checked against it. The Apple-silicon file is a
 // COMPLETE pin set (FR-730, R503 j): it names every package of the bundle; pyproject.toml's direct pins
 // are kept (a direct pin and its constraint that differ stop pip), and manifest.py --pins-complete
 // fails the build when a package in the bundle is not named there or has another version.

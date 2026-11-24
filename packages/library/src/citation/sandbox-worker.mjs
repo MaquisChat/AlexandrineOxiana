@@ -1,6 +1,6 @@
 // The sandbox worker for one imported citation style (R88 I3, R89): kept warm by the parent's pool
 // and reused for that style's renders. It runs in a worker_threads Worker with a heap cap (256 MB, or
-// the process-wide memory setting where one is given: 512 MB in the desktop app; sandbox.ts); the
+// the process-wide memory setting where one is given: 512 MB per worker in the desktop app; sandbox.ts); the
 // parent terminates it on a timeout, an error or after it has been idle, so a style that loops or
 // allocates without end cannot block or exhaust the library process. Plain JavaScript (no build
 // step): it needs only citeproc.
