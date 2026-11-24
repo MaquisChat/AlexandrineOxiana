@@ -21,6 +21,7 @@ import {
   planMove,
   reconnect,
   relinkMissing,
+  LibraryClosedError,
   ReadOnlyLibraryError,
   acceptMovePlan,
   scrubPaths,
@@ -431,7 +432,8 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     } catch (err) {
       // Ended by a close or a move (its session is gone or replaced): said as such; a library that really is open
       // read-only keeps its own answer (R491 C b).
-      if (err instanceof ReadOnlyLibraryError && state.session !== s) throw checkStoppedByClose();
+      // FR-749: a closed library's write queue refuses the turn with LibraryClosedError (R546 1).
+      if ((err instanceof ReadOnlyLibraryError || err instanceof LibraryClosedError) && state.session !== s) throw checkStoppedByClose();
       throw err;
     }
     const projectWarnings = await state.projectWarnings(s);
