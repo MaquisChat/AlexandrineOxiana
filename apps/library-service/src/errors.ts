@@ -34,6 +34,7 @@ import {
   WatchedFoldersUnreadableError,
   WatchFileNotLocalError,
   FolderNotAnsweringError,
+  WatchStoppedError,
   ApprovedFoldersUnreadableError,
   PathEscapeError,
   ProxyRecordRefusedError,
@@ -167,6 +168,9 @@ export function toApiError(err: unknown): ApiError {
   // A watched folder's file the researcher acted on is not on this computer, or is changing: nothing was read (W7).
   if (err instanceof WatchFileNotLocalError) return new ApiError(409, "CONFLICT", err.message);
   // A watched folder that did not answer (A6).
+  // FR-741 (R503 m): the watch stopped between the act's request and its turn; nothing was done, and a new try runs
+  // without the watch.
+  if (err instanceof WatchStoppedError) return new ApiError(409, "CONFLICT", "Watching of this folder stopped before this could be done, so nothing was changed. Try again.");
   if (err instanceof FolderNotAnsweringError) return new ApiError(503, "UNAVAILABLE", "The folder did not answer. Try again when it is reachable.");
   if (err instanceof ApprovedFoldersUnreadableError) return new ApiError(503, "UNAVAILABLE", err.message);
   if (err instanceof MoveVerificationError) return new ApiError(409, "CONFLICT", "The copied library did not verify; the old copy is kept and nothing was switched.");

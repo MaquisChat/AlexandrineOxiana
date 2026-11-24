@@ -918,6 +918,65 @@ describe("files and origins", () => {
     expect([keepStopped.status, keepStopped.json.error.message]).toEqual([400, "There is nothing to settle for this file: it is as it came in."]);
   }, 90_000);
 
+  it("FR-741 (1): when the folder's register cannot be written (a full disk), both acts say so, and nothing is changed", async () => {
+    const { pid, wid, sid, repo } = await changedInMemoryOnly("Full disk");
+    const record = vi.mocked(repo.recordWatchedFiles).getMockImplementation()!;
+    vi.mocked(repo.recordWatchedFiles).mockImplementation(async () => {
+      throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+    });
+    for (const action of ["bring-in-new-version", "keep-as-it-is"]) {
+      const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action } });
+      expect([r.status, r.json], action).toEqual([503, { error: { code: "DISK_FULL", message: "The disk is full. Free some space and try again." } }]);
+    }
+    expect((await repo.getSource(pid, sid)).assets.filter((a) => a.role === "original")).toHaveLength(1);
+    // Once the disk can be written again, the act goes through.
+    vi.mocked(repo.recordWatchedFiles).mockImplementation(record);
+    const keep = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "keep-as-it-is" } });
+    expect([keep.status, keep.json], keep.body).toEqual([200, { done: "settled", sourceId: sid }]);
+    expect((await repo.watchRegister(pid, wid)).get("paper.pdf")).toMatchObject({ state: "settled" });
+  }, 90_000);
+
+  it("FR-741 (2): an act asked for while the watch runs, and refused because the watch stopped before it ran, says that and asks for another try; nothing is changed", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc!.state.session!.repo;
+    let letGo!: () => void;
+    const held = new Promise<void>((r) => (letGo = r));
+    onTestFinished(() => letGo());
+    const dir = await folder("Stopped");
+    await pdf(join(dir, "paper.pdf"), "A Paper Whose Watch Stopped");
+    const wid = (await add(pid, dir, { label: "Stopped" })).json.id as string;
+    const sid = await until(async () => (await sourceIds(pid))[0], 30_000, "the source");
+    await until(async () => (await repo.watchRegister(pid, wid)).size === 1, 30_000, "the register line");
+    // From here the register's writes wait: the change below is noted in the watch's memory, its line not written, so
+    // the first act's job waits on that write and the second act's job is queued behind it.
+    const record = repo.recordWatchedFiles.bind(repo);
+    vi.spyOn(repo, "recordWatchedFiles").mockImplementation(async (...a) => {
+      await held;
+      return record(...a);
+    });
+    const watch = svc!.state.session!.watches.get(pid)![0]!;
+    const v2 = await buildPdf({ title: "The Paper Rewritten", author: "Ana Souza", lines: ["Rewritten."] });
+    const aside = join(tmp, `aside-${randomBytes(4).toString("hex")}`);
+    await writeFile(aside, v2);
+    await rename(aside, join(dir, "paper.pdf"));
+    await until(async () => watch.status().counts.changed === 1, 30_000, "the change noted");
+    // The watch stops once the second act's look has been answered and its job queued (after every pending step).
+    const look = repo.watchOrigins.bind(repo);
+    let looks = 0;
+    vi.spyOn(repo, "watchOrigins").mockImplementation(async (...a) => {
+      const found = await look(...a);
+      if (++looks === 2) setImmediate(() => void watch.stop());
+      return found;
+    });
+    const first = call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "keep-as-it-is" } });
+    const second = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/watch-origin/action`, body: { watchId: wid, action: "bring-in-new-version" } });
+    expect([second.status, second.json]).toEqual([409, { error: { code: "CONFLICT", message: "Watching of this folder stopped before this could be done, so nothing was changed. Try again." } }]);
+    expect((await repo.getSource(pid, sid)).assets.filter((a) => a.role === "original")).toHaveLength(1);
+    letGo();
+    await first;
+  }, 90_000);
+
   it("R474 M9: the origins keep the register's order (its files' names, as the library reads them), each folder's lines in their own order", () => {
     // "ab-c.jsonl" comes before "ab.jsonl" ("-" before "."), although "ab" comes before "ab-c".
     const byWatch = new Map([
