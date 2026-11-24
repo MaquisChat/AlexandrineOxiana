@@ -31,6 +31,11 @@ function liveEvents() {
       return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
     }),
     send: (type: string, data: unknown) => write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`),
+    /** Ends the stream the screen is reading (it connects again by itself); what is sent next goes to the new stream. */
+    drop: () => {
+      ctl?.close();
+      ctl = undefined;
+    },
   };
 }
 
@@ -264,6 +269,56 @@ describe("Recheck project (R99)", () => {
     expect(status.textContent).toBe("Recheck finished: 1 source changed.");
     expect(screen.queryByText("9 of 10")).toBeNull();
     expect((screen.getByRole("button", { name: "Recheck project" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  describe("R515 N2: when the event stream reconnects, the screen asks the service again", () => {
+    /** The route answers `answer()`; `asked` counts its calls. The stream drops, and the new one starts with a fresh state. */
+    async function reconnectWith(answer: () => { running: { jobId: string; done: number; total: number } | null }) {
+      const ev = liveEvents();
+      const asked: string[] = [];
+      server.use(
+        ev.handler,
+        http.get(url("/projects/:id/recheck"), ({ params }) => {
+          asked.push(String(params.id));
+          return HttpResponse.json(answer());
+        }),
+        ...libraryHandlers(),
+      );
+      ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+      await libraryShown();
+      const button = screen.getByRole("button", { name: "Recheck project" }) as HTMLButtonElement;
+      const status = screen.getByRole("status", { name: "Project recheck" });
+      await screen.findByText("3 of 10");
+      expect(button.disabled).toBe(true);
+      expect(asked).toEqual(["p1"]);
+      return { ev, asked, button, status };
+    }
+    const fresh = { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} };
+
+    it("a job whose end event was lost while the stream was down: the service says none, and the button is free again", async () => {
+      let running: { jobId: string; done: number; total: number } | null = { jobId: "job-old", done: 3, total: 10 };
+      const { ev, asked, button, status } = await reconnectWith(() => ({ running }));
+      running = null; // the job ended while the stream was down; its end event is lost
+      ev.drop();
+      ev.send("library.state", fresh);
+      // The screen connects again by itself (after its own pause), and asks once more.
+      await waitFor(() => expect(button.disabled).toBe(false), { timeout: 10_000 });
+      expect(asked).toEqual(["p1", "p1"]);
+      expect(status.textContent).toBe("");
+      expect(screen.queryByText("3 of 10")).toBeNull();
+    });
+
+    it("a job still running when the stream comes back: the button stays off, and its progress is brought up to date", async () => {
+      let running: { jobId: string; done: number; total: number } | null = { jobId: "job-old", done: 3, total: 10 };
+      const { ev, asked, button, status } = await reconnectWith(() => ({ running }));
+      running = { jobId: "job-old", done: 4, total: 10 };
+      ev.drop();
+      ev.send("library.state", fresh);
+      await screen.findByText("4 of 10", undefined, { timeout: 10_000 });
+      expect(asked).toEqual(["p1", "p1"]);
+      expect(button.disabled).toBe(true);
+      expect(status.textContent).toBe("Rechecking the project's sources.");
+    });
   });
 
   it("a job whose events arrive before its start is answered still finishes (no stuck progress)", async () => {
