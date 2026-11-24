@@ -339,3 +339,58 @@ describe("callers without the choice are as at db8623b (decision 31 b, R563 I2)"
     expect(sent.length).toBe(2);
   });
 });
+
+/**
+ * R563 M1: for the HOLD, on a 429 a Retry-After that is absent, unreadable, zero, negative or a date in the past counts
+ * as one minute; a usable positive value is honoured, cut to an hour. A 503 sets a hold only when a wait is asked: a
+ * zero, negative, unreadable or past value asks for none, so such a 503 takes today's failure path (retried, then a
+ * LookupHttpError), with no hold. The waits of callers without the choice are untouched (retryAfterMs is unchanged).
+ */
+describe("odd Retry-After values (decision 31 b, R563 M1)", () => {
+  const PAST = () => new Date(now - 120_000).toUTCString();
+  for (const [label, value] of [
+    ["unreadable (x 7)", () => "x 7"],
+    ["zero", () => "0"],
+    ["negative (-5)", () => "-5"],
+    ["a date in the past", PAST],
+  ] as const) {
+    it(`a 429 whose Retry-After is ${label} holds the host for one minute`, async () => {
+      answering(CR, () => ({ statusCode: 429, headers: { "retry-after": value() } }));
+      const http = client();
+      const err = (await http.getJson(CR_URL, LEAVE).catch((e: unknown) => e)) as LookupLeftOutError;
+      expect(err).toBeInstanceOf(LookupLeftOutError);
+      expect(err.notBefore).toBe(now + 60_000);
+      now += 59_999;
+      await expect(http.getJson(`${CR}/works/10.5555/next`, LEAVE)).rejects.toBeInstanceOf(LookupLeftOutError);
+      expect(count("api.crossref.org")).toBe(1);
+    });
+
+    it(`a 503 whose Retry-After is ${label} asks for no wait: today's failure path, and no hold`, async () => {
+      answering(CR, () => ({ statusCode: 503, headers: { "retry-after": value() } }));
+      const http = client();
+      const err = await http.getJson(CR_URL, LEAVE).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(LookupHttpError);
+      expect(count("api.crossref.org")).toBe(4); // the first try and 3 retries, as at db8623b
+      answering(OA, () => ({ statusCode: 404 }));
+      await expect(http.getJson(`${OA}/works/doi:${DOI}`, { ...LEAVE, cacheKey: "oa" })).resolves.toBeNull();
+      sent = [];
+      await expect(http.getJson(`${CR}/works/10.5555/next`, { ...LEAVE, cacheKey: "next" })).rejects.toBeInstanceOf(LookupHttpError);
+      expect(count("api.crossref.org")).toBe(4); // asked: nothing held it
+    });
+  }
+
+  it("a 429 with a usable Retry-After (30) holds for 30 s", async () => {
+    answering(CR, () => ({ statusCode: 429, headers: { "retry-after": "30" } }));
+    const err = (await client().getJson(CR_URL, LEAVE).catch((e: unknown) => e)) as LookupLeftOutError;
+    expect(err.notBefore).toBe(now + 30_000);
+  });
+
+  it("a caller without the choice still waits what it waited at db8623b for a 429 with Retry-After 0: no wait", async () => {
+    answering(CR, () => ({ statusCode: 429, headers: { "retry-after": "0" } }));
+    const err = await client().getJson(CR_URL, { cacheKey: "bulk" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(LookupHttpError);
+    expect(sleeps).toEqual([0, 200, 0, 200, 0, 200]); // the db8623b client's, measured: a 0 wait, then the throttle's gap
+    expect(sent.map((x) => x.at - 1_000_000)).toEqual([0, 200, 400, 600]);
+    expect(count("api.crossref.org")).toBe(4);
+  });
+});

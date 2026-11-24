@@ -768,9 +768,9 @@ export class HttpClient {
         if (res.status === 404 || res.status === 410) return { status: 404, body: null, sent };
         // R556 (2) i, R563 I1: a 429 (a minute when it names no time), or a 503 that asks for a wait, sets the host's
         // hold, whoever received it; a call with the choice is then left out at once, any other goes on as before.
-        const asked = retryAfterMs(res.retryAfter, this.clock());
-        if (res.status === 429 || (res.status === 503 && asked !== undefined)) {
-          const t = this.holdHost(host, asked ?? UNNAMED_WAIT_MS);
+        const holdMs = holdAskedMs(res.status, res.retryAfter, this.clock());
+        if (holdMs !== undefined) {
+          const t = this.holdHost(host, holdMs);
           if (leaveOut) throw new LookupLeftOutError(host, t);
         }
         if (res.status === 429 && res.rateLimit) {
@@ -894,6 +894,25 @@ export function retryAfterMs(value: string | undefined, now: number): number | u
   if (/^\d{1,10}$/.test(v)) return Number(v) * 1000;
   const t = Date.parse(v);
   return Number.isNaN(t) ? undefined : Math.max(0, t - now);
+}
+
+/** An HTTP date as RFC 9110 5.6.7 allows it (IMF-fixdate, RFC 850, asctime); anything else is not read as a date. */
+const HTTP_DATE =
+  /^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT|[A-Z][a-z]+day, \d{2}-[A-Z][a-z]{2}-\d{2} \d{2}:\d{2}:\d{2} GMT|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4})$/u;
+
+/**
+ * Decision 31 (b), R563 M1: how long a host is held after an answer, or undefined for no hold. A 429 holds: a usable
+ * positive Retry-After (whole seconds or an HTTP date in the future) is honoured, anything else (absent, unreadable,
+ * zero, negative, a past date) counts as one minute. A 503 holds only when it asks for a usable positive wait; a 503
+ * with none takes today's failure path. The hour's cut is `holdHost`'s. The waits of a caller that waits stay
+ * `retryAfterMs`'s (R563 I2): this rule is the hold's only.
+ */
+export function holdAskedMs(status: number, value: string | undefined, now: number): number | undefined {
+  if (status !== 429 && status !== 503) return undefined;
+  const v = value?.trim();
+  const asked = v === undefined ? undefined : /^\d{1,10}$/u.test(v) ? Number(v) * 1000 : HTTP_DATE.test(v) ? Date.parse(v) - now : undefined;
+  const usable = asked !== undefined && Number.isFinite(asked) && asked > 0 ? asked : undefined;
+  return status === 429 ? (usable ?? UNNAMED_WAIT_MS) : usable;
 }
 
 /** The first `max` bytes of a body (as text); the rest is not read. Never throws. */
