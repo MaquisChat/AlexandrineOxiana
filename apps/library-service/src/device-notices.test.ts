@@ -239,7 +239,10 @@ describe("FR-720: the warning that the watched folders were not started clears w
 });
 
 describe("FR-720 (R508 I1): the restart of the watches waits while a move or the service's stop is under way, and is never made for a locked project or a read-only library", () => {
-  const GOV = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [manual_upload]\n";
+  // The files brought in here ask no metadata service (`metadata_lookup: []`): a lookup reaches the public services over
+  // the network, and an answer "too many requests" made the bringing in wait a minute (its Retry-After), past these
+  // tests' waits (R540 a). What is tested is the watch's start and its own work, not the lookups.
+  const GOV = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [manual_upload]\nprocessing:\n  metadata_lookup: []\n";
   const PASS = "correct horse battery staple";
   const warned = () => (svc!.state.libraryState() as { integrityWarnings: Array<{ kind: string }> }).integrityWarnings.some((w) => w.kind === "watched-folders-unreadable");
   const listFile = () => join(deps.appConfigDir, "watched-folders.json");
@@ -420,7 +423,10 @@ describe("FR-720 (R508 I1): the restart of the watches waits while a move or the
 });
 
 describe("FR-720 (R508 M3): one start of a project's watches at a time", () => {
-  const GOV = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [manual_upload]\n";
+  // The files brought in here ask no metadata service (`metadata_lookup: []`): a lookup reaches the public services over
+  // the network, and an answer "too many requests" made the bringing in wait a minute (its Retry-After), past these
+  // tests' waits (R540 a). What is tested is the watch's start and its own work, not the lookups.
+  const GOV = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [manual_upload]\nprocessing:\n  metadata_lookup: []\n";
   const warned = () => (svc!.state.libraryState() as { integrityWarnings: Array<{ kind: string }> }).integrityWarnings.some((w) => w.kind === "watched-folders-unreadable");
   const listFile = () => join(deps.appConfigDir, "watched-folders.json");
   /** The service's own view: how many watches it holds for the project. */
