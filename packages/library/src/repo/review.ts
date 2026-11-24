@@ -98,6 +98,22 @@ export interface ReviewEntry {
   reason?: string;
   /** Cause "acquired-file-mismatch" (F11): what the check found about the held file. */
   heldFile?: HeldFileFacts;
+  /**
+   * Import items (decision 31 b, R556 2 iv): lookups left out because their services asked to wait — which services, and
+   * for which identifier (a hint, R55) or title search — for a later "look up again". An optional field of an entry of
+   * the existing kind "import": a build that does not know it reads the entry as before and keeps it when it rewrites it.
+   */
+  leftOut?: LeftOutLookup[];
+}
+
+/** A lookup left out (decision 31 b): see `ReviewEntry.leftOut`. */
+export interface LeftOutLookup {
+  services: string[];
+  identifier?: string;
+  title?: string;
+  creator?: string;
+  /** ISO 8601: those services are not to be asked again before it (R411). */
+  notBefore: string;
 }
 
 /**
@@ -368,6 +384,7 @@ export interface ReviewInput {
   batchId?: string;
   cause?: ReviewCause;
   heldFile?: HeldFileFacts;
+  leftOut?: LeftOutLookup[];
 }
 
 /** A `review_items` row; `payload` is safe for the persistent index (nothing identifying when `encrypted`). */
@@ -425,6 +442,7 @@ export async function appendReviewEntry(
     ...(input.batchId ? { batchId: input.batchId } : {}),
     ...(input.cause ? { cause: input.cause } : {}),
     ...(input.heldFile ? { heldFile: input.heldFile } : {}),
+    ...(input.leftOut?.length ? { leftOut: input.leftOut } : {}),
   };
   await writeReviewLine(core, tx, entry);
   return entry;

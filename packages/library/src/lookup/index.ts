@@ -10,16 +10,18 @@
  *
  * Returns null (or []) when no permitted provider knows the item or every provider is denied.
  * Throws LookupHttpError only when every permitted provider failed to answer.
+ * Decision 31 (b), R556 (2): with `ctx.askedToWait: "leave-out"`, a provider that asks to wait is left out (no wait) and
+ * the next one is asked; when none gave the item and at least one was left out, LookupLeftOutError names those left out.
  */
 import { toIsbn13 } from "@ao/core";
 import { isSensitive, providerAllowed, type LookupContext, type LookupResult, type Provider } from "./context.js";
 import { crossrefWork } from "./crossref.js";
-import { LookupHttpError } from "./http.js";
+import { LookupHttpError, LookupLeftOutError } from "./http.js";
 import { locIsbn } from "./loc.js";
 import { openAlexSearch, openAlexWork } from "./openalex.js";
 import { openLibraryIsbn } from "./openlibrary.js";
 
-export { DEFAULT_ATTEMPT_TIMEOUT_MS, DEFAULT_RATE_LIMITS, HttpClient, LookupCancelledError, LookupHttpError, USER_AGENT } from "./http.js";
+export { DEFAULT_ATTEMPT_TIMEOUT_MS, DEFAULT_RATE_LIMITS, HttpClient, LookupCancelledError, LookupHttpError, LookupLeftOutError, USER_AGENT } from "./http.js";
 export type { GetOptions, HttpClientOptions } from "./http.js";
 export { isSensitive, lookupContextFor, providerAllowed } from "./context.js";
 export type { LookupContext, LookupResult, Provider } from "./context.js";
@@ -31,6 +33,7 @@ async function firstAnswer(
 ): Promise<LookupResult | null> {
   let failed: LookupHttpError | undefined;
   let answered = false;
+  const leftOut: LookupLeftOutError[] = [];
   for (const [provider, ask] of chain) {
     if (provider === "loc" && isSensitive(ctx)) {
       ctx.debug?.("metadata lookup via loc skipped: its endpoint is plain HTTP, never used for encrypted (sensitive) projects");
@@ -42,13 +45,25 @@ async function firstAnswer(
       answered = true;
       if (r) return r;
     } catch (e) {
+      if (e instanceof LookupLeftOutError) {
+        ctx.debug?.(`metadata lookup via ${provider} left out: the service asked to wait`);
+        leftOut.push(new LookupLeftOutError(e.host, e.notBefore, [provider]));
+        continue;
+      }
       if (!(e instanceof LookupHttpError)) throw e;
       ctx.debug?.(`metadata lookup via ${provider} failed: ${e.message}`);
       failed = e;
     }
   }
+  if (leftOut.length) throw mergeLeftOut(leftOut);
   if (failed && !answered) throw failed;
   return null;
+}
+
+/** One LookupLeftOutError for several providers left out: every one named, the latest "not before". */
+function mergeLeftOut(list: LookupLeftOutError[]): LookupLeftOutError {
+  const latest = list.reduce((a, b) => (b.notBefore > a.notBefore ? b : a));
+  return new LookupLeftOutError(latest.host, latest.notBefore, list.flatMap((e) => e.services));
 }
 
 /** Canonical DOI: lowercase, without a doi.org URL or `doi:` prefix. */
@@ -78,5 +93,10 @@ export async function lookupIsbn(isbn: string, ctx: LookupContext): Promise<Look
 /** Candidate matches for a title (and optionally a creator name) from OpenAlex. */
 export async function searchTitle(title: string, creator: string | undefined, ctx: LookupContext): Promise<LookupResult[]> {
   if (!providerAllowed(ctx, "openalex")) return [];
-  return openAlexSearch(title, creator, ctx);
+  try {
+    return await openAlexSearch(title, creator, ctx);
+  } catch (e) {
+    if (e instanceof LookupLeftOutError) throw new LookupLeftOutError(e.host, e.notBefore, ["openalex"]);
+    throw e;
+  }
 }

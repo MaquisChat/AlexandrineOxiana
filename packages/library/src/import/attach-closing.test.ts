@@ -1,6 +1,7 @@
 /**
- * FR-749 (R546 1, 2): an attach and the library's closing. A file whose lookup waits on a "too many requests" answer
- * when the library begins to close is cancelled at once (the wait is cut short): nothing of it is written — no source,
+ * FR-749 (R546 1, 2): an attach and the library's closing. Here a lookup waits on a request in the air: since
+ * decision 31 (b) an attach no longer waits on a "too many requests" answer. A file whose lookup waits when the library
+ * begins to close is cancelled at once (the wait is cut short). Nothing of it is written — no source,
  * no stored file, no review entry, no audit entry, no marker — the original is untouched, and the outcome is the one
  * sentence `attachClosedSentence`. A file still waiting for its project's store turn is cancelled too. A closed library
  * refuses the attach's change by itself (the same outcome), whatever the caller passes.
@@ -102,32 +103,37 @@ async function snapshot(root: string): Promise<string[]> {
   return out;
 }
 
-/** Every OpenAlex request answers 429 with Retry-After 60; `asked` resolves at the first. */
+/**
+ * Every OpenAlex request stays in the air: its answer is ten minutes away and is dropped when the request is abandoned.
+ * Since decision 31 (b) an attach no longer waits on a "too many requests" answer; a slow service is what it still waits
+ * for. `asked` is resolved by the stand-in's own reply handler when the first request arrives.
+ */
 function openAlexSaysWait(): { asked: Promise<void>; count: () => number } {
   let n = 0;
-  let asked!: () => void;
-  const p = new Promise<void>((r) => (asked = r));
+  let arrived!: () => void;
+  const asked = new Promise<void>((r) => (arrived = r));
   agent
     .get("https://api.openalex.org")
     .intercept({ path: (x) => x.startsWith("/works"), method: "GET" })
     .reply(() => {
       n++;
-      asked();
-      return { statusCode: 429, data: "slow down", responseOptions: { headers: { "retry-after": "60" } } };
+      arrived();
+      return { statusCode: 404, data: "" };
     })
+    .delay(600_000)
     .persist();
-  return { asked: p, count: () => n };
+  return { asked, count: () => n };
 }
 
 describe("an attach and the library's closing (FR-749, R546)", () => {
-  it("a file waiting on a Retry-After when the library begins to close is cancelled at once; nothing is written", async () => {
+  it("a file waiting on its lookup when the library begins to close is cancelled at once; nothing is written", async () => {
     const p = await project();
     const path = await put("tide-line-notes.pdf", "Notes from the tide-line interviews");
     const original = await readFile(path);
     const before = await snapshot(lib.root);
     const wait = openAlexSaysWait();
     const closing = new AbortController();
-    // The client's own wait is a real 60-second one (capped Retry-After); only the closing ends it.
+    // The request stays in the air (the client's own limit is a real 60 seconds); only the closing ends it.
     const http = new HttpClient({ libraryRoot: lib.root, dispatcher: agent });
     const attach = createAttach({ repo, http, closing: closing.signal });
     const outcome = attach.attachFiles(p.id, [path]);

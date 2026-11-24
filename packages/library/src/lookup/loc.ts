@@ -7,7 +7,7 @@ import { toIsbn13, type Creator } from "@ao/core";
 import { clean, decodeEntities, normalizeDate, parseName } from "../extract/names.js";
 import { elements, firstElement, textOf } from "../extract/scan.js";
 import { LookupHttpError } from "./http.js";
-import { isSensitive, type LookupContext, type LookupResult } from "./context.js";
+import { requestRules, type LookupContext, type LookupResult } from "./context.js";
 
 export const LOC_SRU_BASE = "http://lx2.loc.gov:210/LCDB";
 
@@ -78,7 +78,7 @@ export async function locIsbn(isbn13: string, ctx: LookupContext): Promise<Looku
   const xml = await ctx.http.getText(`${LOC_SRU_BASE}?${query}`, {
     cacheKey: `loc:isbn:${isbn13}`,
     ttlDays: 30,
-    sensitive: isSensitive(ctx),
+    ...requestRules(ctx),
     // An error page (e.g. "No Connections Available") with status 200 is an outage, never cached.
     validate: (body) => {
       if (!body.slice(0, MAX_LOC_XML).includes("searchRetrieveResponse")) throw new LookupHttpError("The Library of Congress did not return an SRU response");

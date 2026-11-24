@@ -44,6 +44,10 @@
  * provider, sensitive for encrypted projects); `null` means no lookups at all. Title searches (steps
  * 5 and 6) are made only when the context allows them (`titleSearchAllowed`: the project holds no
  * identifiable data) and never for an audio, video or image file (R379).
+ *
+ * Decision 31 (b), R556 (2): when the lookup context leaves out a service that asks to wait (`askedToWait:
+ * "leave-out"`), a lookup none of whose services gave the item and some of whose services were left out is recorded in
+ * `leftOut` (which services, and which identifier or title search): resolution goes on at once with what is known.
  */
 import { basename, extname } from "node:path";
 import {
@@ -75,7 +79,8 @@ import {
 } from "@ao/core";
 import { extractMetadata, type Extracted } from "../extract/index.js";
 import { parseName } from "../extract/names.js";
-import { LookupHttpError, lookupDoi, lookupIsbn, searchTitle, type LookupContext, type LookupResult } from "../lookup/index.js";
+import { LookupHttpError, LookupLeftOutError, lookupDoi, lookupIsbn, searchTitle, type LookupContext, type LookupResult } from "../lookup/index.js";
+import type { LeftOutLookup } from "../repo/review.js";
 import { readSidecar, type SidecarMetadata } from "./sidecar.js";
 
 /**
@@ -200,6 +205,12 @@ export interface Resolution {
   hasLocation: boolean;
   /** The document could not be parsed at all (a damaged or password-protected PDF). */
   unreadable: boolean;
+  /**
+   * Decision 31 (b), R556 (2) iv: lookups left out because their services asked to wait and none of whose services gave
+   * the item — enough to ask again later. An identifier here is one found in the file, as a hint ("doi:10.1/x"): never on
+   * the record unless a lookup confirmed it (R55). A title search names its title (and creator).
+   */
+  leftOut: LeftOutLookup[];
 }
 
 interface Fields extends Biblio {
@@ -378,10 +389,16 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     const key = `${r.provider}|${r.identifiers.doi ?? ""}|${r.title.toLowerCase()}`;
     if (!candidates.some((c) => `${c.provider}|${c.identifiers.doi ?? ""}|${c.title.toLowerCase()}` === key)) candidates.push(r);
   };
-  const ask = async <T>(fn: () => Promise<T>, empty: T): Promise<T> => {
+  const leftOut: LeftOutLookup[] = [];
+  const ask = async <T>(fn: () => Promise<T>, empty: T, what: Omit<LeftOutLookup, "services" | "notBefore">): Promise<T> => {
     try {
       return await fn();
     } catch (e) {
+      if (e instanceof LookupLeftOutError) {
+        // R556 (2): not waited for; kept for a later "look up again".
+        leftOut.push({ services: [...e.services], ...what, notBefore: new Date(e.notBefore).toISOString() });
+        return empty;
+      }
       if (!(e instanceof LookupHttpError)) throw e;
       lookup?.debug?.(`metadata lookup failed: ${e.message}`);
       return empty;
@@ -401,7 +418,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     const q = `${title}\u0000${creator ?? ""}`.toLowerCase();
     if (!lookup || !titleSearch || searched.has(q)) return { sim: 0 };
     searched.add(q);
-    const rs = await ask(() => searchTitle(title, creator, lookup), [] as LookupResult[]);
+    const rs = await ask(() => searchTitle(title, creator, lookup), [] as LookupResult[], { title, ...(creator ? { creator } : {}) });
     const ranked = rs.map((r) => ({ r, sim: titleSimilarity(title, r.title) })).sort((a, b) => b.sim - a.sim);
     for (const { r } of ranked) addCandidate(r);
     return ranked[0] ? { best: ranked[0].r, sim: ranked[0].sim } : { sim: 0 };
@@ -459,7 +476,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     let nearMatch: Hit | undefined;
     if (lookup) {
       for (const id of ids.slice(0, MAX_IDENTIFIER_LOOKUPS)) {
-        const r = await ask(() => (id.kind === "doi" ? lookupDoi(id.id, lookup) : lookupIsbn(id.id, lookup)), null);
+        const r = await ask(() => (id.kind === "doi" ? lookupDoi(id.id, lookup) : lookupIsbn(id.id, lookup)), null, { identifier: id.arxiv ? `arxiv:${id.arxiv}` : `${id.kind}:${id.id}` });
         if (!r) continue;
         lookups.push({ provider: r.provider, matchedIdentifier: id.id, title: r.title, ...(r.creators.length ? { creators: r.creators } : {}), ...(r.issued ? { issued: r.issued } : {}) });
         addCandidate(r);
@@ -657,6 +674,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     identifierHints: hints.slice(0, 10),
     hasLocation: mayHaveLocation(mime, extracted),
     unreadable: extracted.readFailed === true,
+    leftOut,
   };
 }
 

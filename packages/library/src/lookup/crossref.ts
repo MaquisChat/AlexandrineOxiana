@@ -1,7 +1,7 @@
 /** Crossref REST API: `https://api.crossref.org/works/{doi}`. */
 import { biblioOf, toIsbn13, type Biblio, type Creator, type SourceType } from "@ao/core";
 import { clean } from "../extract/names.js";
-import { isSensitive, type LookupContext, type LookupResult } from "./context.js";
+import { requestRules, type LookupContext, type LookupResult } from "./context.js";
 
 interface CrossrefPerson {
   given?: string;
@@ -110,7 +110,7 @@ export async function crossrefWork(doi: string, ctx: LookupContext): Promise<Loo
   const res = await ctx.http.getJson<{ message?: CrossrefWork }>(`https://api.crossref.org/works/${encodeDoi(doi)}`, {
     cacheKey: `crossref:doi:${doi}`,
     ttlDays: 30,
-    sensitive: isSensitive(ctx),
+    ...requestRules(ctx),
   });
   return res?.message ? mapCrossref(res.message, doi) : null;
 }
