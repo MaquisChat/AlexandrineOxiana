@@ -198,6 +198,21 @@ describe("a close while an attach waits on its lookup (FR-749, R546)", () => {
 describe("a close while an attach is inside its store turn (FR-749, R546; R247 d)", () => {
   it("the close waits: the source is fully stored and audited, then the lock goes; a change asked meanwhile is refused", async () => {
     const { path, pid, folder } = await libraryWithProject(NO_LOOKUP_GOV);
+    await closeWaitsForTheTurn(path, pid, folder);
+  });
+
+  it("R551 M7: in an encrypted project too, the change finishes with its key and its index update (the index and the keys go after the wait)", async () => {
+    const path = join(tmp, "Lib");
+    expect((await call({ method: "POST", url: "/libraries", body: { path, name: "Lib" } })).status).toBe(200);
+    const p = await call({ method: "POST", url: "/projects", body: { name: "Sealed", governanceYaml: NO_LOOKUP_GOV, encryption: { enabled: true, passphrase: "correct horse battery" } } });
+    expect(p.status, p.body).toBe(200);
+    await closeWaitsForTheTurn(path, p.json.project.id as string, p.json.project.folder as string, true);
+  });
+});
+
+async function closeWaitsForTheTurn(path: string, pid: string, folder: string, encrypted = false): Promise<void> {
+  {
+    const repo = svc!.state.session!.repo;
     const file = await pdf("ledger.pdf", "Harbour ledger of 1932");
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
@@ -234,14 +249,16 @@ describe("a close while an attach is inside its store turn (FR-749, R546; R247 d
     // Fully there and audited, no marker left; the late collection is nowhere.
     const sources = await readdir(join(path, folder, "Sources"));
     expect(sources).toHaveLength(1);
-    expect(existsSync(join(path, folder, "Sources", sources[0]!, "source.json"))).toBe(true);
+    expect(existsSync(join(path, folder, "Sources", sources[0]!, encrypted ? "source.json.enc" : "source.json"))).toBe(true);
     const audit = (await readdir(join(path, folder, "audit"))).sort();
     const lines = (await Promise.all(audit.map((f) => readFile(join(path, folder, "audit", f), "utf8")))).join("");
-    expect(lines).toContain(sid);
+    if (!encrypted) expect(lines).toContain(sid);
     expect(await readFile(join(path, folder, "project.json"), "utf8")).not.toContain("Late");
+    // R551 M7: the change in its turn updated the index too (it was closed after the wait, not before).
+    expect(repo.indexErrors).toEqual([]);
     await cleanForAnother(path);
-  });
-});
+  }
+}
 
 /** Every OpenAlex request answers 429 / Retry-After 60 while `wait` is true, else "not found"; `asked` at the first. */
 function openAlexSwitchable(): { asked: Promise<void>; count: () => number; answer: () => void } {

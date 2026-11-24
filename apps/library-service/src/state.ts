@@ -1330,16 +1330,18 @@ export class ServiceState {
     // ... and whatever has not ended writes nothing more: no journal line after the lock is released.
     await s.workerClient?.close?.().catch(() => {});
     this.transcriptions.forget(s.lib);
+    s.http.purgeSensitive();
+    // No late lookup answer writes into this library once its lock is released (R247 c).
+    s.http.setDiskCache(false);
+    // The engine's close waits for the change in its store turn (and a backup in flight) before the lock goes (R247 d);
+    // that change still needs its project's key and updates the index, so both go only after it (R551 M7).
+    await s.lib.close().catch(() => {});
     try {
       s.index?.close();
     } catch {
       // already closed
     }
-    s.http.purgeSensitive();
-    // No late lookup answer writes into this library once its lock is released (R247 c).
-    s.http.setDiskCache(false);
     s.ring.clear();
-    await s.lib.close().catch(() => {});
     this.publishState();
   }
 
