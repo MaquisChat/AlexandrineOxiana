@@ -47,25 +47,43 @@ const RETRY_DELAYS_MS = [20, 40, 80, 160, 320];
  * hold files open there, making rename fail with EPERM/EACCES/EBUSY. We retry
  * up to 5 times (20 → 320 ms backoff, ~620 ms in all), only on win32 or when a
  * test sets `force`. Elsewhere those codes are real permission errors. Also
- * used for directory renames (trash, rollback, project staging).
+ * used for directory renames (trash, rollback, project staging), and for reading
+ * the anchors file (`readMaybeWithRetry`, FR-732 2).
  */
 export const _renameRetry = {
   force: false,
   sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
-export async function renameWithRetry(from: string, to: string): Promise<void> {
+/** Runs `op`, trying again on a file briefly held by another program, as above (the one wait-and-retry). */
+async function withHeldFileRetry<T>(op: () => Promise<T>): Promise<T> {
   const retry = process.platform === "win32" || _renameRetry.force;
   for (let attempt = 0; ; attempt++) {
     try {
-      await fsp.rename(from, to);
-      return;
+      return await op();
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code ?? "";
       const delay = RETRY_DELAYS_MS[attempt];
       if (!retry || !RETRY_CODES.has(code) || delay === undefined) throw err;
       await _renameRetry.sleep(delay);
     }
+  }
+}
+
+export async function renameWithRetry(from: string, to: string): Promise<void> {
+  await withHeldFileRetry(() => fsp.rename(from, to));
+}
+
+/**
+ * Reads a whole file, or null when there is none, with the same retry as `renameWithRetry` for a file briefly held
+ * by another program (FR-732 2: the anchors file, which a scanner or sync client may hold while an export reads it).
+ */
+export async function readMaybeWithRetry(path: string): Promise<Buffer | null> {
+  try {
+    return await withHeldFileRetry(() => fsp.readFile(path));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
   }
 }
 
