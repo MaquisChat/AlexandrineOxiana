@@ -50,3 +50,31 @@ None.
 - The extension: not run. Its tests do not assert the sentence.
 - One time-limit failure, my own test: under load, the first run of the M3 "two reads" test timed out waiting for the file to come in. Run again alone, it passed in 6.5 s, and it passed in every later run.
 - `git status --short`: empty
+
+## Last points (R515)
+
+Head **57d550c** (c4f0bf2 → 737ccda → 57d550c). One commit per point. Not pushed. `git status --short` is empty.
+
+| Point | What changed (file:line) | Test, and whether it failed first |
+|---|---|---|
+| **N1 (FR-720)** 737ccda | `apps/library-service/src/state.ts:1057-1068` `stopWatches`: the whole-library stop is the one place where a move (`quiesce`) and a close stop every watch. It now first waits for every start of watches still under way (`s.watchStarting`, from M3), then stops. The wait is bounded by `suspendTimeoutMs`/`SUSPEND_TIMEOUT_MS` (60 s), the existing bound on the move's wait for background work to reach a safe point; no new number. At `:1185`, if a start is still under way after that bound, the move is refused with the existing sentence "Some background work could not be paused in time, so the library was not moved; try again in a moment." `quiesce`'s own rollback then restarts the watches. At `:1024`, a restart whose starts end while a move or the stop is under way leaves the warning. No new start begins once the move has begun, as already built (`:1018`). | `device-notices.test.ts` "a restart already under way when a move begins…" uses the real `POST /libraries/move`. The restart's start of both projects is held, and is released only when the move calls its whole-library stop. The move's `beforeExecuteMove` hook waits for any start still under way, as a long copy would, and then looks. **Failed first**: 2 watches running in the library being copied. Now the copy sees no watch, empty registers and the warning still there. After the move, the moved library's watches run once each, a further read starts nothing more, and each file reaches its register. |
+| **N2 (R508 M5 c)** 57d550c | `packages/ui/src/screens/Library.tsx:240-257`: the event loop counts the streams opened after a drop (`reconnects`, raised at the first event of a new stream, the fresh state) and passes the count to `RecheckProjectButton` (`:624`). `components/RecheckProject.tsx:96-121`, `:148-159`: at each reconnect the control asks `GET …/recheck` again, for the job it showed when it asked. If the service says none, the job is no longer shown, the button is free, and the badges are read again (`onFinished`). If the job still runs, its progress is brought up to date. | `Library.recheck.test.tsx`, describe "R515 N2", with a `drop()` added to the test's own event stream. (1) Running 3 of 10 at mount, then the stream drops and the route says none: the button is enabled again, the status is empty and the route was asked twice. (2) The job still runs (4 of 10): "4 of 10" shows and the button stays off. **Both failed first.** The reconnect is the screen's own 2-second retry. No existing test drives that loop's reconnect, so the tests wait on the true state with `waitFor`/`findBy` (10 s limit), not a sleep. |
+
+**What bounds a start today:** nothing of its own. A start is the read of this computer's settings file (`listWatchedFolders`; a damaged file is set aside under its lock). `watchFolder` returns at once, and its folder calls run in the watch's own `ready`, which is not awaited. So the move's existing 60-second bound applies.
+
+**The service's stop:** `closeLibrary` clears `session` before it stops the watches, and a start that ends afterwards stops its own watches (`startWatches`' session check). Its watches are also waited for among the tracked tasks before the lock goes, so no watch outlives the stop. The close now also goes through the same bounded wait, because it uses the same whole-library stop; nothing else changed there.
+
+**Researcher-visible sentences:** none new or changed. N1 reuses the existing move refusal above, and only when a start of watches hangs for 60 s. N2 adds no sentence: a job's status text simply empties.
+
+**NEEDS A RULING:** none.
+
+**Runs (nice -n 10, one at a time):**
+- library-service `device-notices.test.ts`: 17 passed (17)
+- `watched-folders-routes.test.ts`: in the first run, "FR-741 (2)" hit its time limit (150 s, load average 3.7) and the next test failed after it. Run again alone: 58 passed (58). That test does not touch the start or stop of watches.
+- `find-routes.test.ts`: 46 passed (46). It replaces `stopWatches` in a move test.
+- `server.test.ts`: 151 passed | 1 skipped (152)
+- ui `Library.recheck.test.tsx`: 12 passed (12); `Library.test.tsx`: 46 passed (46)
+- typecheck `@ao/library-service`, `@ao/ui`: clean
+- `lint:css`: clean; `lint:colours`: ok
+- UI build: built
+- e2e Chromium `watched-folders.spec.ts`: 13 passed (2.0m); `maintenance.spec.ts`: 3 passed (23.6s)

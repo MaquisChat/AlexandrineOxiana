@@ -81,3 +81,5 @@ None. For the coordinator's information: the precedence of `quiesce`'s 409 again
 - `@ao/ui` build: "✓ built in 5.34s".
 - e2e, Chromium, `--trace off`: `maintenance.spec.ts` **3 passed**; `review-queue.spec.ts` **11 passed**.
 - No time-limit failures. `git status --short` is empty.
+
+**N1 (R513, after the second look), commit 7fa4041:** `packages/ui/src/screens/import/ReviewQueue.tsx:561-564`: when the re-read lands with focus on the page body, focus now also moves to the looked-at card's heading. Focus on any other element still stays where it is. Its test, `ReviewQueue.look.test.tsx` "R513 (N1): … focus falls to the page body …", **failed first** (`expected <body> to be <h4>`). Runs: `ReviewQueue.look.test.tsx` 18 passed, `ReviewQueue.test.tsx` 125 passed, `ProjectReviewQueue.test.tsx` 25 passed; `@ao/ui` typecheck passes with no errors; `lint:css` is clean; `lint:colours` "ok".

@@ -445,3 +445,4 @@ R519 (2026-11-24): KG-1b re-ruled after its implementer stopped — the library'
 R520 (2026-11-24): KG-1a APPROVED (ad99c57) and joined; FR-738's blocked state is real for a marker an older build left (15 enumerated cases) and never reachable from a build from 11 on — KG-1c lets the researcher close it
 R521 (2026-11-24): KG-3b's second look — approved with small points; to mend: focus on the page body when the read lands goes to the card's heading (N1); accepted: a backup or sync started during the early plan can make the move refuse (N2)
 R522 (2026-11-24): KG-3b APPROVED and joined (7fa4041; kg-join 198f0a1, one import clash resolved); the join holds six batches
+R523 (2026-11-24): KG-3a APPROVED and joined (57d550c; kg-join 07d27f8) — all seven first batches joined; left: KG-1b (building) and KG-1c
