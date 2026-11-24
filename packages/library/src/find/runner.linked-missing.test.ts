@@ -9,7 +9,7 @@
  * line written, its event sent, its download folder gone).
  */
 import { copyFileSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp } from "node:fs/promises";
@@ -227,6 +227,55 @@ describe("R470 a: the copy part tells a linked original it cannot reach", () => 
     const sf = await repo.getSource(w.p.id, w.sid);
     expect(sf.assets).toHaveLength(1);
     expect(sf.assets[0]!.linked).toBeDefined();
+  });
+
+  // R503 f (FR-727): the shared rule's other missing kinds, as the Missing files list counts them.
+  const KINDS: Array<[string, () => Promise<void>]> = [
+    ["a symbolic link that leads nowhere (its file on a drive not connected)", async () => {
+      await rm(outside());
+      await symlink(join(tmp, "Unplugged", "zorblatt.pdf"), outside());
+    }],
+    ["a folder where the file is recorded", async () => {
+      await rm(outside());
+      await mkdir(outside());
+    }],
+  ];
+  for (const [kind, make] of KINDS) {
+    it(`R503 f: ${kind} rests with the linked file's reason, and nothing is asked or fetched`, async () => {
+      const w = await world("linked");
+      await make();
+      runner().resume(w.p.id);
+      const e = await restsAt(w, "record-complete", "linked-file-missing");
+      expect(e.reason).toEqual({ code: "linked-file-missing" });
+      expect(copyRequests).toEqual([]);
+      expect(fileRequests).toEqual([]);
+      expect(await pendingReviews(w)).toEqual([]);
+      expect((await checkIntegrity(lib, "full", { keyRing: ring })).missing.map((m) => m.path)).toEqual([(await repo.getSource(w.p.id, w.sid)).assets[0]!.path]);
+    });
+
+    it(`R503 f: ${kind} — an entry resting in your library is moved to the linked file's reason at the next opening, nothing asked or fetched`, async () => {
+      const w = await world("linked");
+      runner().resume(w.p.id);
+      await restsAt(w, "in-library");
+      for (const x of runners) await x.stopAll();
+      await make();
+      changes = [];
+      runner().resume(w.p.id);
+      await restsAt(w, "record-complete", "linked-file-missing");
+      expect(copyRequests).toEqual([]);
+      expect(fileRequests).toEqual([]);
+    });
+  }
+
+  it("R503 f: a link to a file that is there is in your library", async () => {
+    const w = await world("linked");
+    await writeFile(join(tmp, "Drive", "real.pdf"), await readFile(outside()));
+    await rm(outside());
+    await symlink(join(tmp, "Drive", "real.pdf"), outside());
+    runner().resume(w.p.id);
+    await restsAt(w, "in-library");
+    expect(copyRequests).toEqual([]);
+    expect(fileRequests).toEqual([]);
   });
 
   it("a linked original that can be reached rests in the library, as before", async () => {

@@ -715,6 +715,74 @@ describe("relinkMissing", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+describe("R503 f (FR-727): the Missing files list counts every missing kind of linked file, by the shared rule", () => {
+  /** A source of P whose only original is linked in place at `Exports/linked/scan.pdf` (inside the library). */
+  async function linkedFixture() {
+    const fx = await fixture();
+    await mkdir(join(fx.lib.root, "Exports", "linked"), { recursive: true });
+    const linkedFile = join(fx.lib.root, "Exports", "linked", "scan.pdf");
+    await writeFile(linkedFile, "linked body");
+    const sf = await fx.repo.createSource(fx.pid, draft("Linked"), [{ path: linkedFile, role: "original", handling: "link" }], { provenance: provenance() });
+    const asset = sf.assets[0]!;
+    expect(asset.linked).toBeDefined();
+    return { ...fx, linkedFile, sf, entry: { assetId: asset.id, path: asset.path } };
+  }
+  const KINDS: Array<[string, (linkedFile: string) => Promise<void>]> = [
+    ["a symbolic link that leads nowhere", async (f) => {
+      await rename(f, `${f}.away`);
+      await symlink(join(tmp, "Unplugged", "scan.pdf"), f);
+    }],
+    ["a folder where the file is recorded", async (f) => {
+      await rename(f, `${f}.away`);
+      await mkdir(f);
+    }],
+    ["a link to a folder", async (f) => {
+      await rename(f, `${f}.away`);
+      await mkdir(join(tmp, "AFolder"));
+      await symlink(join(tmp, "AFolder"), f);
+    }],
+  ];
+
+  for (const [kind, make] of KINDS) {
+    it(`${kind} is listed as missing (and not as mismatched), with and without the confirming turn`, async () => {
+      const { lib, linkedFile, entry } = await linkedFixture();
+      await make(linkedFile);
+      for (const o of [{}, { confirm: <T,>(fn: () => Promise<T>) => fn() }]) {
+        const r = await checkIntegrity(lib, "full", { keyRing: ring, ...o });
+        expect(r.missing).toEqual([entry]);
+        expect(r.mismatched).toEqual([]);
+        expect(r.errors).toEqual([]);
+      }
+    });
+
+    it(`${kind}: "Search a folder" relinks the record to the file found, and leaves what is at the old path as it is`, async () => {
+      const { lib, repo, pid, linkedFile, sf } = await linkedFixture();
+      await make(linkedFile);
+      await mkdir(join(lib.root, "Exports", "moved"));
+      await writeFile(join(lib.root, "Exports", "moved", "scan.pdf"), "linked body");
+      const r = await relinkMissing(lib, join(lib.root, "Exports", "moved"), repo, { keyRing: ring });
+      expect(r).toMatchObject({ relinked: 1, stillMissing: 0, relinkedPaths: ["Exports/moved/scan.pdf"], skipped: [] });
+      expect((await repo.getSource(pid, sf.source.id)).assets[0]!.path).toBe("Exports/moved/scan.pdf");
+      // The person's link or folder at the old path is never removed.
+      const { lstat } = await import("node:fs/promises");
+      const old = await lstat(linkedFile);
+      expect(old.isSymbolicLink() || old.isDirectory()).toBe(true);
+      expect((await checkIntegrity(lib, "full", { keyRing: ring })).missing).toEqual([]);
+    });
+  }
+
+  it("a link to a file that is there is present: not missing, not mismatched, and its content is checked", async () => {
+    const { lib, linkedFile } = await linkedFixture();
+    await rename(linkedFile, join(lib.root, "Exports", "real.pdf"));
+    await symlink(join(lib.root, "Exports", "real.pdf"), linkedFile);
+    const r = await checkIntegrity(lib, "full", { keyRing: ring, confirm: (fn) => fn() });
+    expect(r.missing).toEqual([]);
+    expect(r.mismatched).toEqual([]);
+    expect(r.hashed).toBe(4);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 describe("isPlaceholder and hydrate", () => {
   const fake = (size: number, blocks: number) => async () => ({ size, blocks }) as Stats;
   it("uses size > 0 && blocks === 0 on POSIX, false on Windows (Phase 1)", async () => {

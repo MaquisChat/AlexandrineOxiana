@@ -47,7 +47,7 @@ import {
 } from "./repo/repo.js";
 import { SimulatedCrash } from "./repo/seams.js";
 // The Missing files rule (what "missing" means for a file of the library), shared with Find and acquire (R470 a).
-import { absIn, isGone } from "./repo/linked-file.js";
+import { absIn, isGone, linkedStat, missingAt } from "./repo/linked-file.js";
 import { LinkedContentChangedError } from "./repo/sources.js";
 import { LockNotWritableError } from "./lock.js";
 import type { Manifest } from "./repo/state.js";
@@ -513,7 +513,13 @@ async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySam
     report.checked++;
     let st: Stats;
     try {
-      st = await stat(abs);
+      // R503 f: a linked file is judged by the shared rule (a dangling link or a folder is missing; a link is followed).
+      const got = f.asset?.linked ? await linkedStat(lib.root, f.path) : await stat(abs);
+      if (!got) {
+        flag(report.missing, entry, f);
+        continue;
+      }
+      st = got;
     } catch (err) {
       if (isGone(err)) flag(report.missing, entry, f);
       else report.errors.push({ path: f.path, message: msg(err) });
@@ -665,7 +671,10 @@ async function stillWrong(
   } else if (!(record.manifest.sources ?? []).some((m) => (m.files ?? []).includes(f.path))) return undefined;
   let st: Stats;
   try {
-    st = await stat(absIn(root, path));
+    // R503 f: a linked file by the shared rule, as checkOnce judged it.
+    const got = fresh?.linked ? await linkedStat(root, path) : await stat(absIn(root, path));
+    if (!got) return "missing";
+    st = got;
   } catch (err) {
     return isGone(err) ? "missing" : { error: msg(err) };
   }
@@ -997,9 +1006,11 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
   const missing: ExpectedFile[] = [];
   for (const f of files) {
     try {
-      await fsp.lstat(absIn(lib.root, f.path));
-    } catch (err) {
-      if (isGone(err)) missing.push(f);
+      // R503 f: a linked file is missing by the shared rule (nothing there, a dangling link, a folder); what is at its
+      // old path is never touched — a relink only points the record at the file found.
+      if (f.asset?.linked ? await missingAt(lib.root, f.path) : !(await pathExists(absIn(lib.root, f.path)))) missing.push(f);
+    } catch {
+      // Neither missing nor known to be there (it cannot be read): not searched for, as before.
     }
   }
   result.stillMissing = missing.length;
