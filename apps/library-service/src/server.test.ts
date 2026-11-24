@@ -567,6 +567,46 @@ describe("background work (R96 carry-overs)", () => {
     expect(r.json.report).toMatchObject({ missing: [], mismatched: [] });
   });
 
+  it("R491 C b: GET /libraries/integrity ended by a close answers 409 with its own sentence, not the read-only one", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc.state.session!.repo;
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "report", title: { variants: [{ lang: "en", kind: "original", value: "Paper" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: await fixturePdf(), role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+    // A real finding, so that the check asks for the write queue's turn to confirm it.
+    await rm(join(svc.state.session!.lib.root, ...sf.assets[0]!.path.split("/")));
+    const state = svc.state as unknown as { writeQueueTurn(s: unknown): <T>(fn: () => Promise<T>) => Promise<T>; closeLibrary(): Promise<void> };
+    const own = state.writeQueueTurn.bind(state);
+    let closedNow!: () => void;
+    const closed = new Promise<void>((r) => (closedNow = r));
+    let asked!: () => void;
+    const askedTurn = new Promise<void>((r) => (asked = r));
+    // The library is closed while the check waits for its turn.
+    state.writeQueueTurn = (s) => {
+      const turn = own(s);
+      return async (fn) => {
+        asked();
+        await closed;
+        return turn(fn);
+      };
+    };
+    const answer = call({ url: "/libraries/integrity?sample=full" });
+    await askedTurn;
+    await state.closeLibrary();
+    closedNow();
+    const r = await answer;
+    expect(r.status, r.body).toBe(409);
+    expect(r.json.error).toMatchObject({
+      code: "CONFLICT",
+      message: "The check was stopped because the library was closed or moved. Open the library again and run the check again.",
+    });
+  });
+
   it("closing the library cancels running work, disposes of its queues and releases the lock", async () => {
     await start();
     const path = await openNewLibrary();
