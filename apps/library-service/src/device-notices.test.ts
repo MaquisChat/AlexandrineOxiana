@@ -259,8 +259,8 @@ describe("FR-720 (R508 I1): the restart of the watches waits while a move or the
    * A library with two projects (the first encrypted when asked), each with a watched folder on this computer that holds
    * one PDF, opened while this computer's list of watched folders cannot be read; the list is then readable again.
    */
-  async function opened(o: { encryptFirst?: boolean } = {}): Promise<{ ids: string[]; wids: string[] }> {
-    await start({ watchStabilityMs: 50 });
+  async function opened(o: { encryptFirst?: boolean; over?: Partial<ServiceOptions> } = {}): Promise<{ ids: string[]; wids: string[] }> {
+    await start({ watchStabilityMs: 50, ...o.over });
     await openLibrary();
     const ids: string[] = [];
     const wids: string[] = [];
@@ -278,7 +278,7 @@ describe("FR-720 (R508 I1): the restart of the watches waits while a move or the
     // The list cannot be read at the opening (a folder in its place); the file waits beside it.
     await rename(listFile(), `${listFile()}.kept`);
     await mkdir(listFile());
-    await start({ watchStabilityMs: 50 });
+    await start({ watchStabilityMs: 50, ...o.over });
     await openLibrary();
     await svc!.state.idle();
     expect(warned()).toBe(true);
@@ -311,6 +311,59 @@ describe("FR-720 (R508 I1): the restart of the watches waits while a move or the
     expect(warned()).toBe(false);
     // They do their work: each waiting file is now in its folder's register.
     for (const [i, id] of ids.entries()) await until(async () => (await registered(id, wids[i]!)) === 1, "the file in the register");
+  });
+
+  it("a restart already under way when a move begins is waited for and then stopped: no watch runs during the copy (R515 N1)", async () => {
+    // What the copy sees, taken just before it starts.
+    let atCopy: { watches: number; warned: boolean; registered: number[] } | undefined;
+    const { ids, wids } = await opened({
+      over: {
+        beforeExecuteMove: async () => {
+          const s = svc!.state.session!;
+          // The copy takes a while: whatever start of watches is still under way ends during it.
+          await Promise.allSettled([...s.watchStarting.values()]);
+          atCopy = {
+            watches: [...s.watches.values()].reduce((n, l) => n + l.length, 0),
+            warned: warned(),
+            registered: await Promise.all(ids.map((id, i) => registered(id, wids[i]!))),
+          };
+        },
+      },
+    });
+    // The restart's start of every project is held until the move has begun (released as the move stops every watch of
+    // the library): it ends during the move.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    const real = svc!.state.startWatches.bind(svc!.state);
+    let entered = 0;
+    vi.spyOn(svc!.state, "startWatches").mockImplementation(async (s, projectId) => {
+      entered++;
+      await held;
+      return real(s, projectId);
+    });
+    const stopAll = svc!.state.stopWatches.bind(svc!.state);
+    vi.spyOn(svc!.state, "stopWatches").mockImplementation(async (s, projectId) => {
+      if (svc!.state.moving && projectId === undefined) release();
+      return stopAll(s, projectId);
+    });
+    const reading = call({ url: `/projects/${ids[0]}/watched-folders` });
+    await until(async () => entered === 2, "the restart's starts");
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.status, moved.body).toBe(200);
+    expect(JSON.parse(moved.body.trim().split("\n").at(-1)!).done, moved.body).toBe(true);
+    expect((await reading).status).toBe(200);
+    // During the copy: no watch ran in the library being copied, nothing was written to its registers, and the
+    // warning still stood.
+    expect(atCopy).toEqual({ watches: 0, warned: true, registered: [0, 0] });
+    // After the move: the moved library's watches run, once each, and the next read starts nothing more.
+    await svc!.state.idle();
+    expect(svc!.state.session!.lib.root).toBe(join(tmp, "Moved"));
+    expect((await call({ url: `/projects/${ids[1]}/watched-folders` })).status).toBe(200);
+    await svc!.state.idle();
+    for (const id of ids) expect(svc!.state.session!.watches.get(id)?.length).toBe(1);
+    expect(warned()).toBe(false);
+    for (const [i, id] of ids.entries()) await until(async () => (await registered(id, wids[i]!)) === 1, "the file in the moved library's register");
   });
 
   it("a read that ends while the service's stop is under way starts nothing and keeps the warning", async () => {

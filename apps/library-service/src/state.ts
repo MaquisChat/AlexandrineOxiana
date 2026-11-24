@@ -1020,7 +1020,8 @@ export class ServiceState {
     if (s.watchRestart) return s.watchRestart;
     const run = (async () => {
       const ids = s.repo.listProjects().map((p) => p.id).filter((id) => !s.watches.has(id));
-      if (!(await this.startProjectsWatches(s, ids)) || this.session !== s) return;
+      // A move or the stop that began meanwhile has stopped (or will stop) these watches: the warning stays (R515 N1).
+      if (!(await this.startProjectsWatches(s, ids)) || this.session !== s || this.moving || this.shuttingDown) return;
       s.sessionWarnings = (s.sessionWarnings ?? []).filter((w) => w.kind !== WATCHED_FOLDERS_UNREADABLE);
       this.publishState();
     })().finally(() => {
@@ -1054,7 +1055,16 @@ export class ServiceState {
     s.watches.set(projectId, [...(s.watches.get(projectId) ?? []), ...watches]);
   }
 
+  /**
+   * Stops the project's watches, or every watch of the library. For the whole library (a move, a close), every start of
+   * watches still under way (`watchStarting`: the opening's or a restart's) is waited for first, so that none ends after
+   * this stop and leaves a watch running (R515 N1); the wait is bounded by the time the service gives background work to
+   * reach a safe point (`suspendTimeoutMs`). A start still under way after it stays in `watchStarting` (the move refuses).
+   */
   async stopWatches(s: Session, projectId?: string): Promise<void> {
+    if (projectId === undefined && s.watchStarting.size) {
+      await withTimeout(Promise.allSettled([...s.watchStarting.values()]), this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS).catch(() => {});
+    }
     const ids = projectId ? [projectId] : [...s.watches.keys()];
     await Promise.allSettled(ids.flatMap((id) => s.watches.get(id) ?? []).map((w) => w.stop()));
     for (const id of ids) s.watches.delete(id);
@@ -1171,6 +1181,8 @@ export class ServiceState {
     try {
       this.stopBackupScheduler();
       await this.stopWatches(s);
+      // A start of watches that did not end in time could still leave a watch running during the copy: refused (R515 N1).
+      if (s.watchStarting.size) throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
       await disposeProxyQueue(s.repo);
       await disposeOcrQueue(s.repo);
       // Last, so that a rollback above leaves the queue running (R247 M6); `stopAll` always settles, never throws.
