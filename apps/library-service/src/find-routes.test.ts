@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 // The service has no undici of its own: the library's (the one its lookup client uses) sets the global dispatcher.
 import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "../../../packages/library/node_modules/undici/index.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { FindRunnerClosedError, deviceDeps, rebuildIndexIfNeeded, type Deps, type FindEntry } from "@ao/library";
 import { FIND_REASON_CODES, FIND_REASON_TEXT, FIND_ROUTE_TEXT, FIND_STOPPED_TEXT, findAlreadyAddedRefusal, findWorkIdRefusal, type FindEntryView, type FindQueueResponse } from "@ao/shared";
 import { serialStore } from "../../../packages/library/src/import/project-queue.js";
@@ -60,6 +60,13 @@ let events: ServiceEvent[];
 let agent: MockAgent;
 let gated: Gated;
 let previous: Dispatcher;
+/**
+ * Between the tests and after them: a dispatcher that answers nothing and connects nowhere. A closed service's lookup
+ * client can still send a request it had queued, and retry it, for a few seconds after the close (FR-748); with the
+ * process's own dispatcher back in place between the tests those late requests went to the real OpenAlex. The test
+ * run's network guard (packages/library/tests/net-guard.ts) caught them.
+ */
+let quiet: MockAgent;
 /** Crossref's answer per typed text (cleaned as the library cleans it; our lines need no cleaning). */
 let answers: Map<string, unknown>;
 /** Every error answer of this file. */
@@ -189,9 +196,19 @@ function mockServices(): void {
       .persist();
   }
   gated = new Gated(agent);
-  previous = getGlobalDispatcher();
   setGlobalDispatcher(gated);
 }
+
+beforeAll(() => {
+  quiet = new MockAgent();
+  quiet.disableNetConnect();
+  previous = getGlobalDispatcher();
+  setGlobalDispatcher(quiet);
+});
+afterAll(async () => {
+  setGlobalDispatcher(previous);
+  await quiet.close();
+});
 
 beforeEach(async () => {
   tmp = await mkdtemp(join(tmpdir(), "ao-find-routes-"));
@@ -211,7 +228,7 @@ afterEach(async () => {
   gated.releaseAll();
   await svc?.close();
   svc = undefined;
-  setGlobalDispatcher(previous);
+  setGlobalDispatcher(quiet);
   await agent.close();
   // Whatever a test did, no typed word reached a log line, an error answer or an event.
   const seen = [logs, ...errorBodies, ...events.map((e) => JSON.stringify(e))].join("\n");
