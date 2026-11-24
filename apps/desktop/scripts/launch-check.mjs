@@ -21,12 +21,16 @@
 //     closing page); closing that window changes nothing: the helpers stop cleanly, the shell exits
 //     0 and no process is left. In A and B, where the helpers normally go within two seconds, whether
 //     the closing window was shown is printed as a note.
+//  Q. a Mac only (FR-731, R503 h): the app asked to quit by a quit Apple event (osascript; the same
+//     terminate: as Cmd-Q and the Dock's Quit) takes the orderly way: the helpers stop cleanly, the
+//     shell exits 0 and no process is left; with a slowed stop, the closing window is shown. Skipped,
+//     with the reason as a note, when the event cannot be sent for a reason outside the app.
 //
 //   pnpm --filter @ao/desktop run launch-check            (node apps/desktop/scripts/launch-check.mjs)
 //
 // On a Mac (Task 37f; no virtual display: GitHub's Mac runners have a logged-in desktop session):
 //
-//   node apps/desktop/scripts/launch-check.mjs --app <the DEBUG .app>       scenarios A-F
+//   node apps/desktop/scripts/launch-check.mjs --app <the DEBUG .app>       scenarios A-F (E skipped) and Q
 //   node apps/desktop/scripts/launch-check.mjs --release-app <the .app>     scenario R only
 //
 // With --app the shell runs from inside the bundle and finds Node, the service folder and the worker
@@ -83,6 +87,8 @@ export function parseShellLine(line) {
   if (line === "AO_SHELL_CLOSING") return { kind: "closing" };
   if (line === "AO_SHELL_RELAUNCH_REQUESTED") return { kind: "relaunch-requested" };
   if (line === "AO_SHELL_RELAUNCHING") return { kind: "relaunching" };
+  m = /^AO_SHELL_QUIT (orderly|now)$/.exec(line);
+  if (m) return { kind: "quit", how: m[1] };
   m = /^AO_SHELL_LIBRARY (opened|fetching|handed-over|not-a-pdf|failed|closed)$/.exec(line);
   if (m) return { kind: "library", state: m[1] };
   if (line === "AO_SHELL_BROWSER_OPENED") return { kind: "browser-opened" };
@@ -141,6 +147,71 @@ export function closingWindowProblems(events, { expect, closeAt, closedByButton 
     if (ix === -1) p.push("closing it by its close button did not close it");
     else if (is !== -1 && is < ix) p.push("it was closed only once the helpers had gone");
   }
+  return p;
+}
+
+// ---------- scenario Q: quit by Apple event (a Mac only; FR-731, R503 h) ----------
+
+/** The app's bundle identifier (tauri.conf.json `identifier`), refused unless it is safe inside an AppleScript string. */
+export function bundleIdOf(conf) {
+  const id = conf?.identifier;
+  if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(id)) throw new Error(`tauri.conf.json's identifier ${JSON.stringify(id)} is not a bundle identifier`);
+  return id;
+}
+
+/**
+ * osascript's arguments. `running`: whether the app runs, asked of the system (no Apple event is sent and
+ * nothing is launched). `quit`: the quit Apple event, which AppKit answers with the same `terminate:` as
+ * Cmd-Q and the Dock's Quit.
+ */
+export function appleEventScripts(id) {
+  return { running: ["-e", `application id "${id}" is running`], quit: ["-e", `tell application id "${id}" to quit`] };
+}
+
+/** How long osascript may wait for the app's answer to the quit Apple event. */
+export const QUIT_EVENT_LIMIT_MS = 30_000;
+
+const firstLine = (s) => String(s ?? "").trim().split("\n")[0].slice(0, 300);
+
+/** Why scenario Q cannot ask the app to quit (the system does not see it running under its bundle id), or null when it can. */
+export function appRunningSkip(r) {
+  if (r.ok && String(r.out).trim() === "true") return null;
+  if (r.ok) return `the system does not see the app as running under its bundle id (osascript: ${firstLine(r.out) || "no answer"}), so no quit Apple event can be addressed to it`;
+  return `the system could not tell whether the app runs: ${[firstLine(r.out), r.reason].filter(Boolean).join("; ")}`;
+}
+
+/**
+ * What scenario Q does with the quit Apple event (`osascript`: {ok, out, reason, timedOut}). `reached`: the
+ * shell printed its quit line or exited after the event was sent. The app is judged whenever the quit
+ * reached it ({check: true}); a request that could not be made for a reason outside the app — no
+ * permission to send Apple events (macOS's Automation consent), no answer (a consent request may be
+ * waiting on the runner's screen), the app not found by its bundle id, osascript missing — is skipped
+ * with the reason ({skip}); an event delivered that the app did nothing about is a problem ({problem}).
+ */
+export function quitEventVerdict({ reached, osascript }) {
+  if (reached) return { check: true };
+  const out = String(osascript?.out ?? "");
+  const said = [firstLine(out), osascript?.reason].filter(Boolean).join("; ");
+  if (osascript?.timedOut) return { skip: `osascript had no answer within ${QUIT_EVENT_LIMIT_MS / 1000} s (a request for permission to control the app may be waiting on the runner's screen)` };
+  if (/\(-1743\)|not authori[sz]ed|not permitted/i.test(out)) return { skip: `macOS did not permit osascript to send Apple events to the app (Automation): ${said}` };
+  if (/\((-600|-10814|-1728)\)/.test(out)) return { skip: `osascript could not find the running app by its bundle id: ${said}` };
+  if (!osascript?.ok && /^not found/.test(String(osascript?.reason))) return { skip: `osascript could not be run: ${osascript.reason}` };
+  return { problem: `the quit Apple event was sent (osascript: ${osascript?.ok ? "answered" : said}) but the shell neither took the quit nor exited` };
+}
+
+/** What is wrong with a quit that should have gone the orderly way (the events of the run, the shell's exit code). */
+export function orderlyQuitProblems(events, code) {
+  const p = [];
+  const quit = events.find((e) => e.kind === "quit");
+  if (!quit) p.push("the quit did not reach the shell's quit handler (no AO_SHELL_QUIT line): the app ended without its orderly path");
+  else if (quit.how !== "orderly") p.push(`the shell answered the quit "${quit.how}", not the orderly way`);
+  if (!events.some((e) => e.kind === "closing")) p.push("the orderly close never began (no AO_SHELL_CLOSING line)");
+  const stopped = events.filter((e) => e.kind === "stopped");
+  if (!stopped.length) p.push("the helpers were not reported stopped");
+  else if (stopped[0].how !== "clean") p.push(`the helpers were stopped ${stopped[0].how}, not cleanly`);
+  if (stopped.length > 1) p.push(`the helpers were stopped ${stopped.length} times`);
+  if (events.some((e) => e.kind === "relaunching")) p.push("the app started again");
+  if (code !== 0) p.push(`the shell exited ${code}, not 0`);
   return p;
 }
 
@@ -645,6 +716,38 @@ function runCapped(cmd, args, { env = process.env, timeout = 20_000 } = {}) {
   if (r.error) return { ok: false, out, reason: r.error.code === "ENOENT" ? `not found (${r.error.message})` : r.error.message };
   if (r.status !== 0) return { ok: false, out, reason: `exit ${r.status ?? r.signal}` };
   return { ok: true, out };
+}
+
+/**
+ * `runCapped` without blocking: the shell's output keeps being read (and its pipes drained) while the
+ * command runs. Also says whether the time limit ended it (`timedOut`).
+ */
+function runCappedAsync(cmd, args, { timeout = 20_000 } = {}) {
+  return new Promise((done) => {
+    let out = "";
+    let timedOut = false;
+    let child;
+    try {
+      child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    } catch (err) {
+      done({ ok: false, out: "", reason: err.message });
+      return;
+    }
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeout);
+    for (const s of [child.stdout, child.stderr]) s.on("data", (d) => (out = `${out}${d}`.slice(-64 * 1024)));
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      done({ ok: false, out, reason: err.code === "ENOENT" ? `not found (${err.message})` : err.message });
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (timedOut) done({ ok: false, out, reason: `timed out after ${Math.round(timeout / 1000)} s`, timedOut: true });
+      else done(code === 0 ? { ok: true, out } : { ok: false, out, reason: `exit ${code ?? signal}` });
+    });
+  });
 }
 
 /** The context is printed once per run of the check. */
@@ -1313,6 +1416,75 @@ async function main() {
         await assertGone(run.label, helpers, dir, problems, 10_000);
       } finally {
         if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
+      }
+    }
+
+    // Q. Quit by Apple event (FR-731, R503 h; a Mac only): the app's own Quit goes the orderly way. The
+    //    quit Apple event is answered by the same terminate: as Cmd-Q and the Dock's Quit; it is sent by
+    //    osascript, without the keyboard. As A: the quit is taken the orderly way, the helpers stop cleanly,
+    //    the shell exits 0, nothing is left; run again with the slowed stop, as F: the closing window is
+    //    shown. A request that cannot be made for a reason outside the app (no permission to send Apple
+    //    events, no answer, the app not found under its bundle id) is a note, and Q's checks are skipped.
+    if (!MAC) {
+      process.stdout.write("launch-check: skip Q (quit by Apple event): the Mac's own Quit (Cmd-Q, the Dock's Quit, a quit Apple event) exists only on macOS\n");
+    } else {
+      const scripts = appleEventScripts(bundleIdOf(JSON.parse(readFileSync(TAURI_CONF, "utf8"))));
+      let skipped = null;
+      for (const [name, slow, label] of [
+        ["q", undefined, "Q (quit by Apple event)"],
+        ["q-slow", "10000", "Q (quit by Apple event during a slowed quit)"],
+      ]) {
+        if (skipped) {
+          process.stdout.write(`launch-check: note ${label}: skipped, for the reason above\n`);
+          continue;
+        }
+        const { dir, env } = scenario(name);
+        if (slow) env.AO_SHELL_TEST_SLOW_STOP_MS = slow;
+        const run = startShell(env, label);
+        const exited = () => run.child.exitCode !== null || run.child.signalCode !== null;
+        try {
+          const { helpers } = await upAndProbed(run, media, problems);
+          const skip = async (why) => {
+            skipped = why;
+            process.stdout.write(`launch-check: note ${label}: not checked: ${why}\n`);
+            // The app is stopped the orderly way the check can use (SIGTERM, as B).
+            if (!exited()) process.kill(run.child.pid, "SIGTERM");
+            await Promise.race([run.exit, sleep(120_000)]);
+          };
+          const notRunning = appRunningSkip(await runCappedAsync("osascript", scripts.running, { timeout: 20_000 }));
+          if (notRunning) {
+            await skip(notRunning);
+            continue;
+          }
+          const closeAt = performance.now();
+          const sent = await runCappedAsync("osascript", scripts.quit, { timeout: QUIT_EVENT_LIMIT_MS });
+          const reached = await until("the shell to take the quit", 20_000, async () => !!run.find("quit") || exited()).then(
+            () => true,
+            () => false,
+          );
+          const verdict = quitEventVerdict({ reached, osascript: sent });
+          if (verdict.skip) {
+            await skip(verdict.skip);
+            continue;
+          }
+          if (verdict.problem) {
+            report(`${label}: the app took the quit`, false, verdict.problem);
+            problems.push(`Q: ${verdict.problem}`);
+            continue;
+          }
+          const { code } = await Promise.race([run.exit, sleep(150_000).then(() => ({ code: "timeout" }))]);
+          const qp = orderlyQuitProblems(run.events, code);
+          report(`${label}: the quit went the orderly way: the helpers stop cleanly and the shell exits 0`, qp.length === 0, qp.length ? qp.join("; ") : `osascript ${sent.ok ? "answered" : `said ${firstLine(sent.out) || sent.reason}`}`) || problems.push(...qp.map((x) => `Q: ${x}`));
+          if (slow) {
+            const cw = closingWindowProblems(run.events, { expect: "shown", closeAt });
+            report(`${label}: the closing window "${CLOSING_WINDOW_TITLE}" was shown two seconds after the quit, while the helpers ran`, cw.length === 0, cw.join("; ")) || problems.push(...cw.map((x) => `Q: ${x}`));
+          } else {
+            closingWindowNote(run);
+          }
+          await assertGone(label, helpers, dir, problems, 10_000);
+        } finally {
+          if (!exited()) killTree(run.child.pid);
+        }
       }
     }
   } finally {
