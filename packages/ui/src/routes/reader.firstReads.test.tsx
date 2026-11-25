@@ -129,6 +129,46 @@ describe("ReaderRoute: an event stream that does not open within the limit is tr
     expect(requests[0]!.signal.aborted).toBe(true);
     expect(screen.getByTestId("reader-screen")).toBeTruthy();
   });
+
+  it("R658: each pause before the stream is listened to again leaves no abort listener behind once it is over (as review M4)", async () => {
+    serve();
+    server.use(http.get(url("/events"), () => HttpResponse.error()));
+    // The reader's own signal, as it is handed to the stream; its live "abort" listeners are counted.
+    const client = testClient();
+    let live = 0;
+    let watched: AbortSignal | undefined;
+    const opened = vi.fn((o: Parameters<typeof client.events>[0]) => {
+      const signal = o?.signal;
+      if (signal && !watched) {
+        watched = signal;
+        const add = signal.addEventListener.bind(signal);
+        const remove = signal.removeEventListener.bind(signal);
+        signal.addEventListener = ((type: string, fn: EventListenerOrEventListenerObject, opts?: AddEventListenerOptions | boolean) => {
+          if (type === "abort") live++;
+          add(type, fn, opts);
+        }) as AbortSignal["addEventListener"];
+        signal.removeEventListener = ((type: string, fn: EventListenerOrEventListenerObject, opts?: EventListenerOptions | boolean) => {
+          if (type === "abort") live--;
+          remove(type, fn, opts);
+        }) as AbortSignal["removeEventListener"];
+      }
+      return client.events(o);
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      render(<ReaderRoute client={{ ...client, events: opened }} loc={{ pathname: "/reader", search: "?project=p1&source=s1" }} />);
+      await vi.waitFor(() => expect(screen.getByTestId("reader-screen")).toBeTruthy());
+      // Each try fails at once; after it the reader pauses (2 s), then listens again. Five pauses go by.
+      for (let n = 1; n <= 6; n++) {
+        await vi.waitFor(() => expect(opened).toHaveBeenCalledTimes(n));
+        if (n < 6) await vi.advanceTimersByTimeAsync(2_000);
+      }
+      // At rest in the sixth pause: its own listener, and none left from the five pauses before.
+      await vi.waitFor(() => expect(live).toBe(1));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("ReaderRoute: its two first reads are one read (FR-756, R605 M6)", () => {
