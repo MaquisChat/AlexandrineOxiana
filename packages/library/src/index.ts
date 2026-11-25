@@ -158,6 +158,11 @@ export { AUTO_ACCEPT_THRESHOLD, MAX_CANDIDATES, resolveItem } from "./import/res
 export type { Resolution, ResolveContext, ResolveInput } from "./import/resolve.js";
 export { ACCEPTED_EXTENSIONS, FOLDER_REASON, LOCATION_REASON, createAttach } from "./import/attach.js";
 export type { Attach, AttachDeps, AttachOutcome, AttachStatus } from "./import/attach.js";
+// Decision 31 (c), "Look up again" (R566, R577): the act and the automatic pass's list, for the service (T3).
+export { LOOK_SEND_OP, LOOK_UP_AGAIN_OP, dueLookUps, lookUpAgain } from "./import/look-again.js";
+export type { DueLookUp, LookUpAgainOptions, LookUpAgainRefusal, LookUpAgainResult, LookUpBy } from "./import/look-again.js";
+export { LOOK_UP_AGAIN_BOUNDS, lookUpStateOf } from "./import/look-up-state.js";
+export type { LookUpState, LookUpView } from "./import/look-up-state.js";
 export { DEVICE_EXTENSIONS, DEVICE_RESEARCHER_NOTE, RAW_JPEG_WINDOW_MS, deviceAdapter, groupDeviceFiles, importDeviceFolder } from "./import/device.js";
 export type { DeviceAdapterOptions, DeviceFile, DeviceGroup, DeviceImportOptions } from "./import/device.js";
 export { PROXY_ATTEMPTS, ProxyQueue, disposeProxyQueue, planProxies, proxyQueueFor, proxyTypeFor } from "./import/proxies.js";
