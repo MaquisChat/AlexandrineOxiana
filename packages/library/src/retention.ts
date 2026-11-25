@@ -31,8 +31,8 @@
  *     removed by the app; its manifest entry is cleared). One that could not be read leaves it too
  *     once it can be read and holds none of the destroyed files (`notHolding`; it is kept);
  *   - the step is `pending` (or `unknown-pending`) while the list has an entry, and the project
- *     shows `destruction-backups-pending`; it is `deleted` (or `no-longer-present`, when a file was
- *     not removed by the app) only when the list is empty.
+ *     shows `destruction-backups-pending`; it is `deleted` (or `no-longer-present`, when a file is no
+ *     longer there and the app has no record of removing it) only when the list is empty.
  * A fresh backup is tried first, and the listed backups are removed whether or not it could be made
  * (R138 e). The certificate written at the destruction is NEVER rewritten: its sha256 is in the
  * destruction's audit events and keeps verifying. Each later fact is an amendment, a file of its
@@ -206,7 +206,8 @@ export interface DestroyOptions {
  * How the backups step of a destruction stands. none: no backup held the files. pending: a listed
  * backup is still to be removed (retried). unknown-pending: a backup that could not be read, and
  * may hold them, is still there. deleted: every listed backup was removed by the app.
- * no-longer-present: none is left, and at least one was not removed by the app but found missing.
+ * no-longer-present: none is left. At least one listed backup is no longer there, and the app has no record of removing it
+ * (FR-751, R641 B4: a backup the app removed just before a crash or a close cut the step is one of these).
  */
 export type BackupsStepStatus = "none" | "pending" | "unknown-pending" | "deleted" | "no-longer-present";
 
@@ -221,7 +222,7 @@ interface CertificateBackups {
   removedAt?: Record<string, string>;
   /** Those in `deleted` that the app removed for another destruction of this project: the certificate of that destruction. */
   removedUnder?: Record<string, string>;
-  /** Those found missing: not removed by the app; `at` is when it was noticed. */
+  /** Those found missing, with no record of the app removing them; `at` is when it was noticed. */
   noLongerPresent?: Array<{ file: string; at: string }>;
   /** Those that could not be read at the destruction, read since and found to hold none of the destroyed files (kept). */
   notHolding?: Array<{ file: string; at: string }>;
