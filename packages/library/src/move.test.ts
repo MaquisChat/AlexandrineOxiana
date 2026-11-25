@@ -937,7 +937,7 @@ residency:
     });
   }
 
-  it("I6: rerunning executeMove after a crash in a split switch finishes it without duplicate audit events", async () => {
+  it("I6: a crash in a split switch is finished at its new place without duplicate audit events; the remaining library's own move there is refused (FR-760 (1))", async () => {
     const { lib, a, b } = await fixture(HIPAA_GOV, true);
     const dest = join(tmp, "Dest");
     moveSeams.crashAfter = "audit-split";
@@ -950,7 +950,11 @@ residency:
     j.switch.done = j.switch.done.filter((s: string) => s !== "audit-split");
     await writeFile(jp, JSON.stringify(j));
     const rest = await openLibrary(lib.root, mkDeps());
-    const res = await executeMove(rest, dest, { deps: mkDeps(), env, excludeProjectIds: [b.id] });
+    // FR-760 (1), R641 B1: the remaining library is not the library this split moved; its move there is refused.
+    await expect(executeMove(rest, dest, { deps: mkDeps(), env, excludeProjectIds: [b.id] })).rejects.toMatchObject({ code: "destination-not-empty" });
+    await rest.close();
+    await lib.close();
+    const res = await completeMove(dest, mkDeps(), env);
     expect(res.verified).toBe(true);
     await assertFinished(lib, dest, [a.folder]);
     expect((await auditOf(lib.root, b.folder)).filter((e) => e.action === "library.split")).toHaveLength(1);
@@ -2059,6 +2063,36 @@ describe("FR-068 (R607 a): a move into a folder holding a stopped move's switch 
       expect([res.verified, res.filesCopied, phases.has("copy"), phases.has("verify")]).toEqual([true, 0, false, false]);
       expect(await hashes(dest, switched)).toEqual(destAt);
       expect(await readdir(dest)).not.toContain(".move-journal.json");
+    });
+  }
+});
+
+describe("FR-760 (1), R641 B1: the library that stayed behind after a split, moved into that split's new place, is refused like any folder that holds something", () => {
+  const NOT_EMPTY = { name: "MoveNotAllowedError", code: "destination-not-empty", message: "The destination folder is not empty; choose an empty folder" };
+
+  for (const [what, crashAfter] of [
+    ["the split stopped after its marks were recorded", "register"],
+    ["the split stopped after its own audit", "audit-split"],
+  ] as const) {
+    it(`${what}: the plan (the dialog's check), the early plan and the move each refuse it in the ordinary words; nothing is written; the split is still finished by opening its new place`, async () => {
+      const f = await fixture(HIPAA_GOV, true);
+      const dest = join(tmp, "Dest");
+      moveSeams.crashAfter = crashAfter;
+      await expect(executeMove(f.lib, dest, { deps: mkDeps(), env, excludeProjectIds: [f.b.id] })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+      await f.lib.close();
+      const rest = await openLibrary(f.lib.root, mkDeps());
+      open.push(rest);
+      expect(rest.id).not.toBe(f.lib.id); // the remaining library, its id the split's
+      const before = [await hashes(join(tmp, "config")), await hashes(f.lib.root), await hashes(dest)];
+      await expect(planMove(rest, dest, env)).rejects.toMatchObject(NOT_EMPTY);
+      await expect(acceptMovePlan(rest, dest, { deps: mkDeps(), env })).rejects.toMatchObject(NOT_EMPTY);
+      await expect(executeMove(rest, dest, { deps: mkDeps(), env })).rejects.toMatchObject(NOT_EMPTY);
+      expect([await hashes(join(tmp, "config")), await hashes(f.lib.root), await hashes(dest)]).toEqual(before);
+      expect(JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8")).phase).toBe("switching");
+      await rest.close();
+      expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+      expect(await readdir(dest)).not.toContain(".move-journal.json");
+      expect((await auditOf(f.lib.root, f.b.folder)).filter((e) => e.action === "library.split")).toHaveLength(1);
     });
   }
 });

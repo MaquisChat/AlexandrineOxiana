@@ -413,18 +413,23 @@ async function preflight(lib: Library, destRoot: string, repo?: Repo, checkPendi
  * refuses the folder). Every other refusal is "unfinished" (that move's mark recorded or seen, a mark without a move's
  * id, an unreadable mark, the old place out of reach or holding another library, the record missing): the folder may
  * then hold the library itself.
+ *
+ * FR-760 (1), R641 B1: "occupied" for the library that stayed behind after that very split: the plan refuses it in the
+ * ordinary "not empty" words, and the move never resumes for it.
  */
-async function stoppedSwitch(lib: Pick<Library, "id" | "root" | "appConfigDir">, dest: string, j: Journal): Promise<"resume" | "stale" | "unfinished"> {
+async function stoppedSwitch(lib: Pick<Library, "id" | "root" | "appConfigDir">, dest: string, j: Journal): Promise<"resume" | "stale" | "unfinished" | "occupied"> {
   const sw = j.switch;
   if (j.phase !== "switching" || !sw) return "unfinished";
+  // FR-760 (1), R641 B1: the library that stayed behind after this very split (its id is the one the split made) is not
+  // the library this move moved: the folder is the other library's new place, and to it it holds something like any
+  // other ("not empty"). Resuming here finished the other library's split and answered "done" for a move never made.
+  if (sw.remainingLibraryId !== undefined && lib.id === sw.remainingLibraryId) return "occupied";
   const rec = await getPendingOldCopy({ appConfigDir: lib.appConfigDir, clock: () => new Date() }, sw.pendingId).catch(() => undefined);
   if (!rec || rec.libraryId !== j.libraryId || rec.moveId !== sw.moveId) return "unfinished";
   const recorded = sw.done.includes("mark-old");
   const seen = recorded ? "this-move" : await oldPlaceShows(rec, j);
-  // The old place's library id: the library's own, or, once this very split has marked its old place, the remaining
-  // library's id that this move made there (no other folder can carry it).
   const isOldPlace =
-    (lib.id === j.libraryId || (sw.remainingLibraryId !== undefined && lib.id === sw.remainingLibraryId)) &&
+    lib.id === j.libraryId &&
     (await sameFolder(rec.oldRoot, lib.root)) &&
     (await sameFolder(rec.newRoot, dest));
   if (isOldPlace && seen === "this-move") return "resume";
