@@ -324,6 +324,8 @@ export class ServiceState {
   private lookUpTurn: Promise<unknown> = Promise.resolve();
   /** The entry (project and id) whose look-up runs in its turn now (R592: a press for it answers "under way"). */
   private readonly lookUpRunning = new Set<string>();
+  /** R600 m1: the entries a researcher's press is waiting for, or running, its turn for. */
+  private readonly lookUpPressed = new Set<string>();
   /** Roots of libraries seen this run: paths inside them are shown library-relative in errors. */
   readonly roots = new Set<string>();
   readonly tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -2095,8 +2097,15 @@ export class ServiceState {
    */
   async lookUpAgainByHand(s: Session, projectId: string, entryId: string): Promise<LookUpAgainResult> {
     await s.holdsCarried;
-    if (this.lookUpRunning.has(lookUpKey(projectId, entryId))) return { done: false, why: "under-way" };
-    return this.lookUpInTurn(projectId, entryId, () => lookUpAgain(s.repo, s.http, projectId, entryId, { by: "researcher", closing: s.closing.signal, now: this.opts.now() }));
+    // R600 m1: a press already waiting for its turn counts as under way from the moment it was queued.
+    const key = lookUpKey(projectId, entryId);
+    if (this.lookUpRunning.has(key) || this.lookUpPressed.has(key)) return { done: false, why: "under-way" };
+    this.lookUpPressed.add(key);
+    try {
+      return await this.lookUpInTurn(projectId, entryId, () => lookUpAgain(s.repo, s.http, projectId, entryId, { by: "researcher", closing: s.closing.signal, now: this.opts.now() }));
+    } finally {
+      this.lookUpPressed.delete(key);
+    }
   }
 
   /** The service's clock (the entries' times and the pass's "now"). */

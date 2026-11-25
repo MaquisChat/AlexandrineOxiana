@@ -880,4 +880,34 @@ describe("fix round (R600)", () => {
     expect([r.status, r.json.outcome]).toEqual([200, { kind: "nothing" }]);
     expect(r.json.entry.lookUp).toEqual({ state: "nothing", tries: 0, canLookUpNow: true, failed: true });
   });
+
+  it("m1: a second press queued behind a busy turn is \"under way\" from the moment it is queued — one set of requests", { timeout: 60_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(2);
+    // Entry 2's lookup failed outright (another title), so each press of it is sent (and fails again).
+    await patchEntry(lib.pid, lib.sources[1]!, (e) => {
+      const { notBefore: _n, ...a } = e.leftOut![0]!;
+      return { leftOut: [{ ...a, title: "Second harbour ledger", why: "failed" as const }] };
+    });
+    answer = (_h, path) => (path.includes("Second") ? { statusCode: 500, data: "down" } : NO_RESULTS);
+    const held = holdFirstRequest();
+    // The pass holds the turn on entry 1.
+    await reopen(lib, 16 * MIN);
+    await held.atGate;
+    const second = bySource(await queue(lib.pid), lib.sources[1]!).id as string;
+    const one = lookUpAgain(lib.pid, second);
+    await new Promise((r) => setTimeout(r, 50));
+    const two = lookUpAgain(lib.pid, second);
+    expect((await two).json.outcome).toEqual({ kind: "under-way" });
+    held.release();
+    expect((await one).json.outcome).toEqual({ kind: "failed" });
+    await svc!.state.idle();
+    const asks = sent.filter((x) => x.includes("Second"));
+    // One press's requests (its attempts at the one service), not two presses'.
+    const once = asks.length;
+    expect(once).toBeGreaterThan(0);
+    expect(once).toBeLessThanOrEqual(4);
+    expect((await lookUpAudit(lib.pid)).filter((a) => a.by === "researcher" && a.op === LOOK_SEND_OP)).toHaveLength(1);
+  });
+
 });
