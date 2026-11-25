@@ -346,6 +346,8 @@ export async function fetchFile(
     try {
       await privateFolder(folder);
     } catch {
+      // FR-764: a call aborted meanwhile ends with the abort's reason, not a write failure.
+      if (ac.signal.aborted) throw ac.signal.reason;
       throw refuse("write-failed", SENTENCES.write);
     }
     let current = first;

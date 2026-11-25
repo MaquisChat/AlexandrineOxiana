@@ -160,7 +160,8 @@ export async function elicitAsk(text: string, key: string, ctx: LookupContext, o
       {
         key: { host: "elicit.com", value: key },
         timeoutMs,
-        ...(opts.signal ? { signal: opts.signal } : {}),
+        // FR-765: the caller's signal, else the context's stop (a Find run's).
+        ...(opts.signal ?? ctx.signal ? { signal: opts.signal ?? ctx.signal } : {}),
         onRefusal: (status, start) => (refusal = { status, start }),
       },
     );

@@ -81,7 +81,7 @@ import {
 import { UnsafeFileError } from "../../extract/errors.js";
 import { extractMetadata } from "../../extract/index.js";
 import type { IndexDb } from "../../index/db.js";
-import { LookupCancelledError, lookupContextFor, providerAllowed, type HttpClient, type LookupContext } from "../../lookup/index.js";
+import { LookupCancelledError, forgetSensitiveIfLocked, lookupContextFor, providerAllowed, type HttpClient, type LookupContext } from "../../lookup/index.js";
 import { LibraryClosedError, NotFoundError, PolicyDeniedError, ProjectLockedError, RecoveryPendingError, isLockedRefusal } from "../../repo/errors.js";
 import type { CreateSourceOptions, SourceInputFile } from "../../repo/sources.js";
 import { storeRequest } from "../../repo/sources.js";
@@ -1113,6 +1113,9 @@ class Run {
         this.deps.debug?.(`bulk import stopped: ${errorForLog(err)}`);
       }
     } finally {
+      // FR-767: Bulk Import, the Zotero Web import, its resume and the Zotero sync alike: locked while a lookup of the
+      // run was in the air, its late answer is not kept in memory.
+      forgetSensitiveIfLocked(this.repo, this.deps.http, this.projectId);
       await watchdog.close();
       await this.cleanup();
     }
