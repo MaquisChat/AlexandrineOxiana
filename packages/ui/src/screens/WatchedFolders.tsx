@@ -27,7 +27,7 @@
  */
 import type { WatchedFolderFileItem, WatchedFolderSummary, WatchFolderState } from "@ao/shared";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type Ref } from "react";
-import { ApiClientError, type ApiClient } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { isProjectLocked, libraryApi, type Collection, type LibraryState, type ProjectSummary } from "../api/library";
 import { formatSize } from "../api/tools";
@@ -147,7 +147,8 @@ function LiveRegion({ said, testId }: { said: Said; testId: string }) {
 // The route: the project named in the address.
 
 /** `firstReadMs` (FR-750, R579): how long the screen's reads are waited for before they are given up (smaller in tests). */
-export function WatchedFoldersRoute({ client, loc, firstReadMs }: { client: ApiClient; loc: AppLocation; firstReadMs?: number }) {
+/** `streamOpenMs` (FR-756 C, R597): how long the event stream is waited for to open before it is closed and tried afresh after the screen's pause (STREAM_OPEN_TIMEOUT_MS; smaller in tests); an open stream is never ended by it. */
+export function WatchedFoldersRoute({ client, loc, firstReadMs, streamOpenMs }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number }) {
   const projectId = projectInQuery(loc.search);
   if (!projectId) {
     return (
@@ -157,12 +158,12 @@ export function WatchedFoldersRoute({ client, loc, firstReadMs }: { client: ApiC
       </main>
     );
   }
-  return <WatchedFolders key={projectId} client={client} projectId={projectId} {...(firstReadMs !== undefined ? { firstReadMs } : {})} />;
+  return <WatchedFolders key={projectId} client={client} projectId={projectId} {...(firstReadMs !== undefined ? { firstReadMs } : {})} {...(streamOpenMs !== undefined ? { streamOpenMs } : {})} />;
 }
 
 // ---------------------------------------------------------------------------------------------
 
-export function WatchedFolders({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; projectId: string; firstReadMs?: number }) {
+export function WatchedFolders({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: { client: ApiClient; projectId: string; firstReadMs?: number; streamOpenMs?: number }) {
   const api = useMemo(() => watchedFoldersApi(client), [client]);
   const lib = useMemo(() => libraryApi(client), [client]);
   const shell = desktopShell();
@@ -418,7 +419,7 @@ export function WatchedFolders({ client, projectId, firstReadMs = FIRST_READ_TIM
           else if (opened) void relist();
           opened = true;
         };
-        for await (const ev of client.events({ signal: ac.signal, onOpen })) {
+        for await (const ev of client.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs })) {
           if (!alive.current) return;
           if (ev.type === "library.state" && ev.data && typeof ev.data === "object") {
             const d = ev.data as LibraryState;
@@ -459,7 +460,7 @@ export function WatchedFolders({ client, projectId, firstReadMs = FIRST_READ_TIM
       ac.abort();
       clearTimeout(retry);
     };
-  }, [client, projectId, take, relist, forgetLibrary, refreshCollections]);
+  }, [client, projectId, take, relist, forgetLibrary, refreshCollections, streamOpenMs]);
 
   useEffect(() => {
     if (focusFolders > 0) foldersHeading.current?.focus();

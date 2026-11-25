@@ -5512,6 +5512,44 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     expect(count("/find/screen")).toBe(2);
   });
 
+  it("FR-756 C (R597): a stream that never opens is cancelled at the limit and opened afresh after the screen's pause; at that opening the reads still out are made again", async () => {
+    useService();
+    const ev = sseAttempts((n) => (n === 1 ? "hang" : []));
+    const gate = hang();
+    let projectsN = 0;
+    let screenN = 0;
+    server.use(
+      ev.handler,
+      http.get(url("/projects"), async () => {
+        if (++projectsN === 1) await gate;
+        return HttpResponse.json(PROJECTS);
+      }),
+      http.get(url("/find/screen"), async () => {
+        if (++screenN === 1) await gate;
+        return HttpResponse.json(screenSettings);
+      }),
+    );
+    render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search: "" }} streamOpenMs={300} />);
+    expect(projectBox().textContent).toBe("Reading the projects…");
+    await waitFor(() => expect(projectBox().value).toBe(PID), { timeout: 10_000 });
+    await screen.findByRole("textbox", { name: "References" });
+    expect(ev.attempts()).toBe(2);
+    expect(count("/projects")).toBe(2);
+    expect(count("/find/screen")).toBe(2);
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("FR-756 C (R597): a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
+    useService();
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search: "" }} streamOpenMs={200} />);
+    await screen.findByRole("textbox", { name: "References" });
+    await waitFor(() => expect(ev.attempts()).toBe(1));
+    await new Promise((r) => setTimeout(r, 3_000));
+    expect(ev.attempts()).toBe(1);
+  });
+
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
     useService();
     const ev = sseAttempts((n) => (n === 1 ? "fail" : []));

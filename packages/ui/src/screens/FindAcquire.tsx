@@ -104,7 +104,7 @@ import {
   type FindScreenSettings,
 } from "@ao/shared";
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from "react";
-import { ApiClientError, SERVICE_UNREACHABLE, type ApiClient, type ServiceEvent } from "../api/client";
+import { ApiClientError, SERVICE_UNREACHABLE, STREAM_OPEN_TIMEOUT_MS, type ApiClient, type ServiceEvent } from "../api/client";
 import { findApi, findHref, findProgressOf, type FindApi } from "../api/find";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { isValidId } from "../api/import";
@@ -317,8 +317,10 @@ interface QueueBus {
 /**
  * `firstReadMs` (FR-750, R579): how long a read of the projects, of the remembered settings or of the queue is waited for
  * before it is given up as a read that got no answer (FIRST_READ_TIMEOUT_MS; smaller in tests).
+ * `streamOpenMs` (FR-756 C, R597): how long the event stream is waited for to open before it is closed and tried afresh
+ * after the screen's pause (STREAM_OPEN_TIMEOUT_MS; smaller in tests); an open stream is never ended by it.
  */
-export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number }) {
+export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number }) {
   const api = useMemo(() => findApi(client), [client]);
   const libApi = useMemo(() => findLibraryApi(client), [client]);
   const lib = useMemo(() => libraryApi(client), [client]);
@@ -595,7 +597,7 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
           }
           opened = true;
         };
-        for await (const ev of client.events({ signal: ac.signal, onOpen })) {
+        for await (const ev of client.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs })) {
           if (!alive.current) return;
           if (ev.type === "library.state" && ev.data && typeof ev.data === "object") {
             const d = ev.data as LibraryState;
@@ -660,7 +662,7 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
       clearTimeout(retry);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, readProjects, readScreen, forgetLibrary]);
+  }, [client, readProjects, readScreen, forgetLibrary, streamOpenMs]);
 
   const asked = projectInQuery(loc.search);
   // A project named in the address again (a link) takes over from the one chosen here.
