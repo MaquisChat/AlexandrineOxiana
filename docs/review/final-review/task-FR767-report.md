@@ -28,3 +28,9 @@ Device import and dry runs (Bulk Import runs by reading; untested); the Find rac
 - `@ao/library-service`: lock-during-lookups 5/5 · close-during-attach 14/14 · look-up-again 40/40 · zotero-web-resume 2/2 · watched-folders-routes 59/59 · zotero-sync-routes 43/43 · server 160 passed, 1 skipped.
 - Repeated 20 times each, all passed: the Zotero timer tests (20/20), lock-during-lookups (20/20), FR-759 (20/20).
 - Typecheck is clean for `@ao/library`, `@ao/library-service` and `@ao/cli`.
+
+## Second round (ruling on point 2), commit `91c5de8`
+- **Line:** `lookup/http.ts:408-409` in `get`: no `remember` and no `writeCache` when `opts.signal` is already aborted; the body is still returned. It is the only path that remembers a network answer. `postJson` caches nothing. The disk-cache read (`:398`) puts an entry that is already on disk, never a sensitive one, into memory: unchanged. Holds learned from a 429 are set in the request path, before this line: kept.
+- **Test:** `http-caller-stop.test.ts:276` "FR-767 …". The existing `validate` option runs between the read and the remember, and the stop is made there, so no new seam is needed. Sensitive and non-sensitive cases, checking memory and that a fresh client asks again (not on disk): **failed first** (1 entry kept each). A call without a signal is still remembered.
+- **Runs:** new tests 20/20; http-caller-stop 14/14; lookup 39/39; runner `-t "FR-765"` 5 passed; `@ao/library` typecheck clean.
+- Point 1 is left for FR-769, as ruled.
