@@ -11,11 +11,16 @@
  *     (R577 iii; a lookup that failed outright has no time to wait for);
  *  2. asks the project's rules again, now, per service and for title search; a lookup none of whose services is allowed
  *     is not asked and gets "not-allowed"; a service the client holds (it asked to wait since) is left out without sending;
- *  3. audits the send BEFORE it goes (R566 6): one governed authorisation of the `process/metadata_lookup` requests, op
- *     LOOK_SEND_OP, ids and service names only; refused like any change when the library closes or the project is locked;
- *  4. asks, one lookup after another, with `askedToWait: "leave-out"` and the call's own provider filter, under the
- *     session's closing scope: a service that asks to wait again sets the client's hold and the lookup a new time, one more
- *     try and no outcome — "gave-up" once the automatic bound is reached; a lookup cut by the closing writes NOTHING;
+ *  3. audits the send BEFORE it goes (R566 6), as one event PER SERVICE (R585 M8): each through the unchanged
+ *     `authorizeOnly` with that service's own `process/metadata_lookup` decision, op LOOK_SEND_OP, ids, the service's
+ *     name and the number of this act's lookups planned for it; on disk before that service's first request; refused like
+ *     any change when the library closes or the project is locked; a service the rules deny then is not asked;
+ *  4. asks, one lookup after another and each lookup's services one after another (the call's own provider filter,
+ *     `askedToWait: "leave-out"`), under the session's closing scope: a service that asks to wait again sets the
+ *     client's hold and the lookup a new time and no outcome. A try (`tries`, `lastTriedAt`) is counted only when a
+ *     request of the lookup actually LEFT (R585 M2) — not for an answer from the cache or a request the hold left out —
+ *     and `tries` counts only the AUTOMATIC pass's tries (R585 M3): "gave-up" once the automatic bound is reached; a
+ *     researcher's press moves `lastTriedAt` but is never counted. A lookup cut by the closing writes NOTHING;
  *  5. writes the result as ONE governed change that READS THE ENTRY AGAIN inside itself (R566 2, as
  *     `reviewedAfterWithdrawal`): a decided entry or a removed source → nothing is written (the answer is dropped); else
  *     one new line of the entry — candidates appended, the lookups' tries, last try and outcome, the reasons' sentence for
@@ -84,7 +89,7 @@ export type LookUpAgainResult =
       done: true;
       entryId: string;
       sourceId: string;
-      /** How many lookups were sent (each to its own left-out services, one after another). */
+      /** How many lookups were asked of a service (planned; see `sent` for requests that left). */
       asked: number;
       /** The services asked (names only). */
       services: string[];
@@ -205,7 +210,7 @@ function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string, b
   if (p.notAllowed || (a?.kind === "denied" && !p.held.length)) return { ...l, outcome: "not-allowed" };
   if (!a || a.kind === "denied") {
     // Every allowed service held: not asked now; it waits for the hold (no try counted).
-    return { ...l, services: p.held, notBefore: new Date(Math.max(keptNotBefore(l, ms(at)) ?? 0, p.heldUntil ?? 0)).toISOString() };
+    return { ...l, services: [...new Set([...p.held, ...(a?.denied ?? [])])], notBefore: new Date(Math.max(keptNotBefore(l, ms(at)) ?? 0, p.heldUntil ?? 0)).toISOString() };
   }
   // R585 M2: a try is counted only when a request of it left (not one the client's hold left out, nor an answer from
   // the cache). A time never moves backwards (R585 2): a later try written meanwhile keeps its time.
@@ -225,10 +230,11 @@ function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string, b
   if (a.kind === "failed") {
     // Every service asked failed outright: it is now a lookup that failed (looked up again by hand only, R577 iv).
     const { notBefore: _n, ...rest } = tried;
-    return { ...rest, services: [...new Set([...a.services, ...p.held])], why: "failed" };
+    // R593 m2: a service the rules denied at send time stays to be asked (when they allow it again).
+    return { ...rest, services: [...new Set([...a.services, ...p.held, ...a.denied])], why: "failed" };
   }
-  // Still to be asked: those that asked to wait again, and those held.
-  const services = a.kind === "waiting" ? [...new Set([...a.services, ...p.held])] : p.held;
+  // Still to be asked: those that asked to wait again, those held, and those the rules denied at send time (R593 m2).
+  const services = [...new Set([...(a.kind === "waiting" ? a.services : []), ...p.held, ...a.denied])];
   const notBefore = Math.max(a.kind === "waiting" ? a.notBefore : 0, p.heldUntil ?? 0, keptNotBefore(l, ms(at)) ?? 0);
   const waiting: LeftOutLookup = { ...tried, services, notBefore: new Date(notBefore).toISOString(), ...(isAskedToWait(l) ? {} : { why: "asked-to-wait" as const }) };
   if (counted && tries >= LOOK_UP_AGAIN_BOUNDS.maxAutomaticTries) return { ...waiting, outcome: "gave-up" };
@@ -386,6 +392,8 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
       await authorizeProcessing(repo, projectId, { action: "process", process: { op: "metadata_lookup", provider: s } }, {
         op: LOOK_SEND_OP,
         entity: { type: "source", id: e.sourceId! },
+        // `lookups`: the number of this act's lookups PLANNED to ask this service, not the number sent (a lookup whose
+        // chain found its match earlier never asks it); the outcome line's `sent` says what left.
         auditAllow: { details: { reviewEntry: e.id, by: opts.by, services: [s], lookups: toAsk.filter((p) => p.ask.includes(s)).length } },
       });
     } catch (err) {
