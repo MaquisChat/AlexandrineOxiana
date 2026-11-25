@@ -168,3 +168,72 @@ describe("the review queue's route with no project: the picker's reads have the 
     await waitFor(() => expect(alerts()).toEqual([]));
   });
 });
+
+describe("the review queue's route naming an import and no project: the picker and the queue are one page, one sentence and one “Try again” (FR-756 remainder, R623 I1)", () => {
+  type Step = "hold" | "fail" | "answer";
+  const STEPS: Step[] = ["hold", "fail", "answer"];
+  const BATCH = { batchId: B1, number: 1, kind: "folder", state: "finished", startedAt: "2026-11-11T10:00:00.000Z", counts: { created: 1, merged: 0, skipped: 0, failed: 0, needsReview: 1 } };
+  const EMPTY = "Nothing is waiting for review in this import.";
+  const queueLoading = () => screen.queryAllByRole("status").some((s) => s.textContent === "Loading…");
+  /** "could not be reached" wins over "did not answer in time"; with both read, nothing is said. */
+  const sentenceFor = (imports: Step, queue: Step) => (imports === "fail" || queue === "fail" ? UNREACHABLE : imports === "hold" || queue === "hold" ? NO_ANSWER : undefined);
+
+  for (const imports of STEPS)
+    for (const queue of STEPS)
+      it(`the list of imports ${imports === "hold" ? "held" : imports === "fail" ? "failed with no answer" : "answered"}, the import's queue ${queue === "hold" ? "held" : queue === "fail" ? "failed with no answer" : "answered"}`, async () => {
+        const asks = { imports: 0, queue: 0 };
+        const held: { imports: AbortSignal[] } = { imports: [] };
+        let answerAll = false;
+        const m = mockService({
+          extra: [
+            http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: P1, name: "Thesis", encrypted: false, unlocked: true }] })),
+            http.get(url("/projects/:id/imports"), async ({ request }) => {
+              asks.imports++;
+              if (!answerAll && imports === "hold") {
+                held.imports.push(request.signal);
+                await hang();
+              }
+              if (!answerAll && imports === "fail") return HttpResponse.error();
+              return HttpResponse.json({ batches: [BATCH] });
+            }),
+            http.get(url("/imports/:batchId/review"), async () => {
+              asks.queue++;
+              if (!answerAll && queue === "hold") await hang();
+              if (!answerAll && queue === "fail") return HttpResponse.error();
+              return HttpResponse.json({ items: [] });
+            }),
+          ],
+        });
+        render(<>{importRoute({ pathname: "/import/review", search: `?batch=${B1}` }, m.client, { firstReadMs: LIMIT })}</>);
+        const sentence = sentenceFor(imports, queue);
+        // At rest: the queue's read has landed (its "Loading…" gone), and so has the list's (answered, or its sentence said).
+        await screen.findByRole("heading", { level: 1, name: "Review queue" });
+        await waitFor(
+          () => {
+            expect(queueLoading()).toBe(false);
+            if (imports === "answer") expect(screen.queryByRole("option", { name: /Import 1/ })).not.toBeNull();
+            if (imports === "hold") expect(held.imports.every((s) => s.aborted)).toBe(true);
+            if (sentence !== undefined) expect(alerts()).toContain(sentence);
+          },
+          { timeout: 5000 },
+        );
+        if (sentence === undefined) {
+          expect(alerts()).toEqual([]);
+          expect(tryAgains()).toHaveLength(0);
+          expect(screen.getByText(EMPTY)).toBeTruthy();
+          return;
+        }
+        expect(alerts()).toEqual([sentence]);
+        expect(tryAgains()).toHaveLength(1);
+        const before = { ...asks };
+        answerAll = true;
+        await userEvent.setup().click(tryAgains()[0]!);
+        await screen.findByText(EMPTY);
+        await screen.findByRole("option", { name: /Import 1/ });
+        await waitFor(() => expect(alerts()).toEqual([]));
+        expect(tryAgains()).toHaveLength(0);
+        // The press reads again what was out, and only that (the queue, read again, reads its list of imports beside it too).
+        const again = { imports: imports === "answer" ? 0 : 1, queue: queue === "answer" ? 0 : 1 };
+        expect(asks).toEqual({ imports: before.imports + again.imports + again.queue, queue: before.queue + again.queue });
+      });
+});
