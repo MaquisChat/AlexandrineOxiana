@@ -577,3 +577,44 @@ describe("the provider filter is the call's own (R566 5)", () => {
     expect(to("api.crossref.org")).toBe(1);
   });
 });
+
+describe("decision 31 (c), R585: each left-out lookup is known by its PLACE in leftOut (I2)", () => {
+  it("P-N: Crossref asked to wait and OpenAlex failed for the file's DOI; OpenAlex then asks to wait; Crossref then finds the DOI — its \"found\" stands, the OpenAlex lookup appears once, the entry does not read \"Waiting…\"", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.crossref.org"] = () => WAIT_60;
+    answers["api.openalex.org"] = () => ({ statusCode: 500, data: "broken" });
+    const [e] = await attached(p, http, [buildDoiPdf()]);
+    const doi = `doi:${FIXTURE_DOI}`;
+    expect(e!.leftOut!.map((l) => [l.services, l.identifier ?? "title", l.why ?? "asked-to-wait"])).toEqual([
+      [["crossref"], doi, "asked-to-wait"],
+      [["openalex"], doi, "failed"],
+      [["openalex"], "title", "failed"],
+    ]);
+    // First look-up, by hand: both services ask to wait. The failed DOI lookup becomes one that waits — beside, not over,
+    // the Crossref one with the same identifier.
+    now += 2 * MIN;
+    answers["api.openalex.org"] = () => WAIT_60;
+    expect(await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true });
+    const mid = await entry(p, e!.id);
+    expect(mid.leftOut).toHaveLength(3);
+    expect(mid.leftOut!.map((l) => [l.services, l.identifier ?? "title"])).toEqual([
+      [["crossref"], doi],
+      [["openalex"], doi],
+      [["openalex"], "title"],
+    ]);
+    // Second look-up, by hand: Crossref finds the DOI; OpenAlex knows nothing of either.
+    now += 2 * MIN;
+    answers["api.crossref.org"] = () => ({ statusCode: 200, data: fixture("crossref-work.json") });
+    answers["api.openalex.org"] = (path) => (path.includes("search") ? NO_RESULTS : { statusCode: 404, data: "{}" });
+    const r = await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) });
+    expect(r).toMatchObject({ done: true, found: 1, state: { state: "found", fromFile: true } });
+    const end = await entry(p, e!.id);
+    expect(end.leftOut).toHaveLength(3);
+    expect(end.leftOut![0]).toMatchObject({ services: ["crossref"], identifier: doi, outcome: "found" });
+    expect(end.leftOut![1]).toMatchObject({ services: ["openalex"], identifier: doi, outcome: "nothing" });
+    expect(end.leftOut![2]).toMatchObject({ services: ["openalex"], title: "Rivers and Memory in Upland Villages", outcome: "nothing" });
+    expect(end.reasons.slice(0, 2)).toEqual([LOOK_UP_AGAIN_TEXT.found, LOOK_UP_AGAIN_TEXT.fromFile]);
+    expect(end.reasons).not.toContain(LOOKUP_WAITING_TEXT);
+  });
+});

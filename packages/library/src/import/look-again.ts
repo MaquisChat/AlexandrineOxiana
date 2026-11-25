@@ -137,11 +137,14 @@ export async function dueLookUps(repo: Repo, projectId: string, now: Date = new 
     .map((e) => ({ entryId: e.id, sourceId: e.sourceId! }));
 }
 
-/** A lookup's identity in the entry (its services and state may change; what it looks up does not). */
-const keyOf = (l: LeftOutLookup) => JSON.stringify([isAskedToWait(l) ? "w" : "f", l.identifier ?? "", l.title ?? "", l.creator ?? ""]);
-
 /** One chosen lookup, and what this act does with it. */
 interface Plan {
+  /**
+   * R585 (1): the lookup's PLACE in the entry's `leftOut` — its identity. Two lookups may look up the same thing (one
+   * service asked to wait, another failed); nothing reorders or shortens `leftOut` (the attach writes it once, in
+   * `reviewFor`; every later line keeps each item at its place), so the place names the one lookup.
+   */
+  at: number;
   lookup: LeftOutLookup;
   /** The services asked now. */
   ask: string[];
@@ -232,7 +235,7 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
   if (e.status !== "pending") return no("decided");
   if (!repo.listSourceIds(projectId).includes(e.sourceId)) return no("source-removed");
   const left = e.leftOut ?? [];
-  const chosen = left.filter((l) => (opts.by === "automatic" ? dueAutomatically(e, l, t) : askableByHand(l, t)));
+  const chosen = left.map((l, at) => ({ l, at })).filter(({ l }) => (opts.by === "automatic" ? dueAutomatically(e, l, t) : askableByHand(l, t)));
   if (!chosen.length) {
     if (opts.by === "automatic") return no("not-due");
     const later = left.filter((l) => !FINAL.has(l.outcome) && l.notBefore && ms(l.notBefore) > t).map((l) => l.notBefore!).sort();
@@ -247,11 +250,12 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
     if (s === "loc" && isSensitive(ctx)) return false; // plain HTTP: never for an encrypted project (R52)
     return providerAllowed(ctx, s as Provider);
   };
-  const plans: Plan[] = chosen.map((l) => {
+  const plans: Plan[] = chosen.map(({ l, at }) => {
     const ok = l.services.filter((s) => allowed(l, s));
     const holds = ok.map((s) => [s, http.heldUntil(PROVIDER_HOSTS[s as Provider])] as const);
     const held = holds.filter(([, h]) => h !== undefined);
     return {
+      at,
       lookup: l,
       ask: holds.filter(([, h]) => h === undefined).map(([s]) => s),
       held: held.map(([s]) => s),
@@ -294,7 +298,7 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
     if (a.kind === "found") found.push(...a.results);
   }
   const at = now.toISOString();
-  const next = new Map(plans.map((p) => [keyOf(p.lookup), after(p, answered.get(p), at)]));
+  const next = new Map(plans.map((p) => [p.at, after(p, answered.get(p), at)]));
 
   // 5. One governed change that reads the entry again inside itself.
   let added = 0;
@@ -309,7 +313,7 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
       async (ops) => {
         const cur = (await ops.reviewEntries()).find((x) => x.id === entryId);
         if (!cur || cur.status !== "pending" || !cur.sourceId || !ops.tx.state.sources.has(cur.sourceId)) throw new Dropped();
-        const leftOut = (cur.leftOut ?? []).map((l) => next.get(keyOf(l)) ?? l);
+        const leftOut = (cur.leftOut ?? []).map((l, i) => next.get(i) ?? l);
         const candidates = appendCandidates(cur.candidates, found);
         added = candidates.length - (cur.candidates?.length ?? 0);
         view = lookUpStateOf({ leftOut, ...(cur.hints ? { hints: cur.hints } : {}) });
