@@ -5390,6 +5390,8 @@ describe("FindAcquire: a source whose linked file cannot be found (R470 a; FR-50
 
 describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
   const UNREACHABLE = "The library service could not be reached.";
+  /** R586 M5: said where a read was given up at the time limit (it neither answered nor failed). */
+  const NO_ANSWER = "The library service did not answer in time.";
   const count = (path: string) => calls.filter((c) => c.method === "GET" && c.path === path).length;
   const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
   const projectBox = () => screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement;
@@ -5414,7 +5416,7 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
     // Both reads have been given up: the switch shows what is confirmed (off), as after a failed read.
     await waitFor(() => expect(screen.getByRole("switch", { name: "Check everything I have" }).getAttribute("aria-disabled")).toBeNull());
-    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
     expect(projectBox().textContent).toBe("No project");
     expect(count("/projects")).toBe(1);
     expect(count("/find/screen")).toBe(1);
@@ -5452,8 +5454,14 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     release();
     await waitFor(() => expect(aborted).toBe(true));
     expect(projectBox().textContent).toBe("No project");
-    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
     expect(tryAgain()).not.toBeNull();
+    expect(count("/projects")).toBe(1);
+    // R586 M5: the late answer changed nothing by itself; a press then reads again, and the screen fills.
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(projectBox().value).toBe(PID));
+    expect(count("/projects")).toBe(2);
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
   });
 
   it("when the event stream opens anew, the reads that have not settled are made again, without a press and without an event on it", async () => {
@@ -5563,7 +5571,7 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     showWithin(300, `?project=${PID}`);
     await screen.findByRole("textbox", { name: "References" });
     await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
-    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
     answer = true;
     await userEvent.setup().click(tryAgain()!);
     await screen.findByText(FIND_SCREEN_EMPTY);

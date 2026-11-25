@@ -1353,6 +1353,8 @@ describe("the way in", () => {
 
 describe("Watched folders: first reads that never settle (FR-750, R579)", () => {
   const UNREACHABLE = "The library service could not be reached.";
+  /** R586 M5: said where a read was given up at the time limit (it neither answered nor failed). */
+  const NO_ANSWER = "The library service did not answer in time.";
   const listReads = () => calls.filter((c) => c === "GET /projects/p1/watched-folders").length;
   let calls: string[];
   const onReq = ({ request }: { request: Request }) => {
@@ -1382,7 +1384,7 @@ describe("Watched folders: first reads that never settle (FR-750, R579)", () => 
     showWithin(300);
     expect(screen.getByText("Reading the watched folders…")).toBeTruthy();
     await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
-    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
     expect(screen.queryByText("Reading the watched folders…")).toBeNull();
     expect(document.activeElement).toBe(document.body);
     answer = true;

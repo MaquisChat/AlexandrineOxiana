@@ -1313,6 +1313,8 @@ describe("ZoteroSync", () => {
 
 describe("Zotero: first reads that never settle (FR-750, R579)", () => {
   const UNREACHABLE = "The library service could not be reached.";
+  /** R586 M5: said where a read was given up at the time limit (it neither answered nor failed). */
+  const NO_ANSWER = "The library service did not answer in time.";
   const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
 
   it("a read of the state that hangs is given up after the limit: the usual alert with “Try again”; pressing it reads again, and focus is not lost", async () => {
@@ -1326,7 +1328,7 @@ describe("Zotero: first reads that never settle (FR-750, R579)", () => {
     render(<ZoteroSync client={testClient()} firstReadMs={300} />);
     expect(screen.getByText("Reading the Zotero sync settings…")).toBeTruthy();
     await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
-    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
     expect(document.activeElement).toBe(document.body);
     answer = true;
     await userEvent.setup().click(tryAgain()!);
