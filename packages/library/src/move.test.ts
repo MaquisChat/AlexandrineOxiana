@@ -1562,6 +1562,15 @@ describe("FR-755 (R583): split moves, the check before finishing, and what canno
     await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "files-differ", detail: { count: 1, oldWhole: false } });
   });
 
+  it("the old copy's day-long offer of deletion runs from the finishing of a move finished later", async () => {
+    const { lib, dest } = await stopped();
+    now = new Date(Date.parse(NOW) + 3 * 24 * 3600_000);
+    expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+    const [offer] = await listPendingOldCopies(mkDeps());
+    expect([offer!.expired, offer!.expiresAt]).toEqual([false, new Date(now.getTime() + 24 * 3600_000).toISOString()]);
+    expect((await deleteOldCopy(lib.root, { confirm: true }, { deps: mkDeps() })).filesDeleted).toBeGreaterThan(0);
+  });
+
   it("M4: a damaged journal cannot be finished, and says so", async () => {
     const { dest } = await stopped();
     await writeFile(join(dest, ".move-journal.json"), "{ not json");

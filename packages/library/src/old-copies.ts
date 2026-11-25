@@ -37,6 +37,8 @@ export interface PendingOldCopy {
   moveId: string;
   /** False while the move's switch has not finished. */
   complete: boolean;
+  /** When the switch finished (its record marked complete): the day-long offer of deletion runs from it (R583). */
+  completedAt?: string;
   /**
    * Set when the app deleted the old copy (deleteOldCopy) but the record was kept (R409 a): something
    * of the library stayed at the old place (`remains`: a file it kept or could not remove, or data
@@ -230,6 +232,7 @@ export async function markPendingComplete(deps: CfgDeps, id: string): Promise<vo
     const r = all.find((x) => x.id === id);
     if (!r || r.complete) return { records: null, result: undefined };
     r.complete = true;
+    r.completedAt = deps.clock().toISOString();
     return { records: all, result: undefined };
   });
 }
@@ -246,12 +249,17 @@ export async function readVerifiedHashes(rec: PendingOldCopy): Promise<VerifiedH
   return JSON.parse(await fsp.readFile(rec.verifiedHashesFile, "utf8")) as VerifiedHashes;
 }
 
-export const isExpired = (rec: PendingOldCopy, deps: Pick<Deps, "clock">) => deps.clock().getTime() > Date.parse(rec.createdAt) + OLD_COPY_TTL_MS;
+/** From when the offer of deletion runs: the switch's finishing (a move finished later, R583), else the record's making. */
+const offerFrom = (rec: PendingOldCopy) => {
+  const done = typeof rec.completedAt === "string" ? Date.parse(rec.completedAt) : Number.NaN;
+  return Number.isNaN(done) ? Date.parse(rec.createdAt) : done;
+};
+export const isExpired = (rec: PendingOldCopy, deps: Pick<Deps, "clock">) => deps.clock().getTime() > offerFrom(rec) + OLD_COPY_TTL_MS;
 
 /** Old copies of finished moves that can still be deleted with `deleteOldCopy(oldRoot, { confirm: true })`. */
 export async function listPendingOldCopies(deps: CfgDeps): Promise<Array<PendingOldCopy & { expiresAt: string; expired: boolean }>> {
   return (await load(deps))
     // A copy the app already deleted (kept only to be looked at again, R409 a) is not offered again.
     .filter((r) => r.complete && !r.deleted)
-    .map((r) => ({ ...r, expiresAt: new Date(Date.parse(r.createdAt) + OLD_COPY_TTL_MS).toISOString(), expired: isExpired(r, deps) }));
+    .map((r) => ({ ...r, expiresAt: new Date(offerFrom(r) + OLD_COPY_TTL_MS).toISOString(), expired: isExpired(r, deps) }));
 }
