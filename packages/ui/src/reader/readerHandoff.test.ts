@@ -3,7 +3,7 @@
  * taken once, gone after 60 seconds, on a change of the library's state, and on a failed watch.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createClient, STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS } from "../api/client";
+import { createClient, STREAM_OPEN_TIMEOUT_MS } from "../api/client";
 import { clearPendingFind, FIND_DROPPED_TTL_MS, FIND_TTL_MS, guardPendingFind, setPendingFind, takeFindDropped, takePendingFind } from "./readerHandoff";
 
 beforeEach(() => {
@@ -150,7 +150,7 @@ describe("guardPendingFind", () => {
   });
 });
 
-describe("guardPendingFind's two limits (R641 D1, ruled (a)): a watch not open in time, or silent too long, is lost and drops the words; nothing reconnects", () => {
+describe("guardPendingFind's opening limit (R641 D1, ruled (a)): a watch not open in time is lost and drops the words; nothing reconnects", () => {
   const BASE = "http://127.0.0.1:4100";
   const TOKEN = "t".repeat(40);
   /** A real client over a fetch that answers by `answer`; each request's signal is kept. */
@@ -175,11 +175,12 @@ describe("guardPendingFind's two limits (R641 D1, ruled (a)): a watch not open i
     return new Response(body, { headers: { "content-type": "text/event-stream" } });
   };
 
-  it("the watch is opened with the opening limit and the silence limit", () => {
+  it("the watch is opened with the opening limit and no silence limit (the words' own 60 s life ends the watch first)", () => {
     const s = stream();
     setPendingFind("p1", "s1", "habitus");
     guardPendingFind(s.events);
-    expect(s.events.mock.calls[0]![0]).toMatchObject({ openWithinMs: STREAM_OPEN_TIMEOUT_MS, quietWithinMs: STREAM_QUIET_TIMEOUT_MS });
+    expect(s.events.mock.calls[0]![0]).toMatchObject({ openWithinMs: STREAM_OPEN_TIMEOUT_MS });
+    expect(s.events.mock.calls[0]![0]).not.toHaveProperty("quietWithinMs");
   });
 
   it("a watch that is not open within the limit is lost: its request is cancelled, the words are dropped (and said to be), nothing is opened again", async () => {
@@ -206,16 +207,6 @@ describe("guardPendingFind's two limits (R641 D1, ruled (a)): a watch not open i
     expect(takeFindDropped("p1", "s1")).toBe(false);
     // Taken: the watch ends.
     expect(svc.signals[0]!.aborted).toBe(true);
-    expect(svc.fetch).toHaveBeenCalledTimes(1);
-  });
-
-  it("a watch that opens and then delivers nothing is cancelled at the silence limit (the words, whose own life is no longer, are gone by then)", async () => {
-    const svc = service(opened([]));
-    setPendingFind("p1", "s1", "habitus");
-    guardPendingFind(svc.events);
-    await vi.advanceTimersByTimeAsync(STREAM_QUIET_TIMEOUT_MS + 1_000);
-    expect(svc.signals[0]!.aborted).toBe(true);
-    expect(takePendingFind("p1", "s1")).toBeUndefined();
     expect(svc.fetch).toHaveBeenCalledTimes(1);
   });
 });
