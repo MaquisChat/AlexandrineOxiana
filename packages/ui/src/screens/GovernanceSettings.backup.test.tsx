@@ -67,6 +67,26 @@ describe("Back up now (FR-754, R641 C3)", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  // Review I1: the route's warnings (the backup's own sentences) are shown below the success line, in its words.
+  it("a backup answered with a warning shows it, in the route's words, below “A backup of this project was made.”; one without shows none", async () => {
+    const warning = "A file changed while it was being copied, so <b>this backup</b> may not be one consistent state.";
+    let warnings: string[] = [warning];
+    serve(() => HttpResponse.json({ backup: { file: "Field notes 2026-11-25.aobackup", sha256: "b".repeat(64), bytes: 10, pruned: [], warnings } }));
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Back up now" }));
+    const made = await screen.findByText(MADE);
+    const shown = await screen.findByText(warning);
+    expect(made.compareDocumentPosition(shown) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(shown.closest("[dir=auto]")).toBeTruthy();
+    expect(document.querySelector("b")).toBeNull();
+    warnings = [];
+    await user.click(screen.getByRole("button", { name: "Back up now" }));
+    await waitFor(() => expect(screen.queryByText(warning)).toBeNull());
+    await screen.findByText(MADE);
+    expect(screen.queryByText(warning)).toBeNull();
+  });
+
   it("a backup cut by the library's closing shows that route's own sentence, and nothing says one was made", async () => {
     const sentence = backupClosedSentence("Field notes");
     serve(() => refusal(409, "LIBRARY_CLOSED", sentence));

@@ -544,7 +544,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
  */
 function BackUpNow({ api, projectId, whyId }: { api: GovernanceApi; projectId: string; whyId?: string }) {
   const [running, setRunning] = useState(false);
-  const [outcome, setOutcome] = useState<{ made: true } | { error: string } | null>(null);
+  const [outcome, setOutcome] = useState<{ made: true; warnings: string[] } | { error: string } | null>(null);
   // A ref, not state: a double click fires before the button re-renders (N8, R113).
   const sending = useRef(false);
   const alive = useRef(true);
@@ -558,8 +558,8 @@ function BackUpNow({ api, projectId, whyId }: { api: GovernanceApi; projectId: s
     setRunning(true);
     setOutcome(null);
     try {
-      await api.backUpNow(projectId);
-      if (alive.current) setOutcome({ made: true });
+      const { backup } = await api.backUpNow(projectId);
+      if (alive.current) setOutcome({ made: true, warnings: backup.warnings ?? [] });
     } catch (err) {
       if (alive.current) setOutcome({ error: errorText(err, "That could not be done. Try again.") });
     } finally {
@@ -568,17 +568,27 @@ function BackUpNow({ api, projectId, whyId }: { api: GovernanceApi; projectId: s
     }
   };
   return (
-    <div className="ao-actions">
-      <button type="button" disabled={!!whyId} aria-describedby={whyId} aria-disabled={running || undefined} onClick={() => void backUp()}>
-        {running ? "Backing up…" : "Back up now"}
-      </button>
-      <span role="status">{outcome && "made" in outcome ? "A backup of this project was made." : null}</span>
-      {outcome && "error" in outcome ? (
-        <p role="alert" className="ao-warning">
-          <UserText>{outcome.error}</UserText>
-        </p>
-      ) : null}
-    </div>
+    <>
+      <div className="ao-actions">
+        <button type="button" disabled={!!whyId} aria-describedby={whyId} aria-disabled={running || undefined} onClick={() => void backUp()}>
+          {running ? "Backing up…" : "Back up now"}
+        </button>
+        <span role="status">{outcome && "made" in outcome ? "A backup of this project was made." : null}</span>
+        {outcome && "error" in outcome ? (
+          <p role="alert" className="ao-warning">
+            <UserText>{outcome.error}</UserText>
+          </p>
+        ) : null}
+      </div>
+      {/* Review I1: what the backup itself warns of, below the success line, in the route's own words. */}
+      {outcome && "made" in outcome
+        ? outcome.warnings.map((w, i) => (
+            <p key={i} className="ao-warning">
+              <UserText>{w}</UserText>
+            </p>
+          ))
+        : null}
+    </>
   );
 }
 
