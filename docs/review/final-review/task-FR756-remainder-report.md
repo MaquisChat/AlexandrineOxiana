@@ -70,3 +70,21 @@ Each file alone, `nice -n 10`, `NODE_OPTIONS=--use-openssl-ca`, at the head 277b
 
 - Item 3 (no separate "Try again").
 - Item 1: the limit is per page of the project's queue (each page is a read of the local service). A queue of many pages takes several reads; each has twenty seconds.
+
+## After the review (R623)
+
+Five mends on `fr-756-remainder` (kg-7), one commit each, from 277b1ed. Not pushed.
+
+| Mend | Test | Failed first / bites | Change |
+|---|---|---|---|
+| 1. I1, the review route's one sentence | `ReviewQueue.firstReads.test.tsx`, describe "the review queue's route naming an import and no project: the picker and the queue are one page, one sentence and one “Try again” (FR-756 remainder, R623 I1)" (:210), nine tests (list of imports held / failed with no answer / answered × the import's queue the same): at rest one sentence ("could not be reached" winning), one "Try again", the press reads again what was out and only that | A test (no code change). Bites: with `!yields` taken out at `ReviewQueue.tsx:1290` (file copied aside, edited, run, restored with `cp`), 3 of 9 fail (held/held, failed/held, failed/failed) | none (cb450ff) |
+| 2. Minor 1, the source panel's stale alert | `SourceDetail.firstReads.test.tsx:87`, two tests "a refused read, then a re-read (the badges refreshed) given up / failed with no answer: the refusal stands while the re-read is out, then one alert, the re-read's" | Failed first (two alerts) | `SourceDetail.tsx:293`: `setError(undefined)` in the no-answer branch. Chosen over clearing at the start: the refusal stays visible while its re-read is out and is replaced only when the re-read settles with no answer, as a failure replaced it before this work; a re-read that answers or is refused behaves as before (addf6f8) |
+| 3. Minor 3, the queue's side reads | `ReviewQueue.firstReads.test.tsx:130`, "held, they are given up at the limit: no alert, and the bulk bar's lists show what a failure showed (nothing to choose)" and "leaving the queue cancels them" | Both failed first (signals never aborted) | `ReviewQueue.tsx:652-653`: collections and tags read through `readWithin` with the screen's signal, failure handling unchanged (silent); `api/import.ts:424,426`: optional `{ signal }` added. Look-up-again untouched; its three test files unchanged and pass (8c5666f) |
+| 4. Minor 4, the picker's old import | `routes/import.test.tsx:125`, "/import/review's picker, switching project while the new project's imports are still read: the old project's import is not shown under the new one; then the new project's imports (R623 Minor 4)" | Failed first (the queue of B1 shown under P2) | `routes/import.tsx:174-182`: at a switch of project, `batches` and `batchId` cleared; `:78`, `:113`, `:143-147`, `:194`: while the list of imports is out, the import picker's empty choice reads "Loading…" (otherwise "Choose an import", as before). Initial reading of an address naming an import is unchanged (1265d5f) |
+| 5. Minor 5, Zotero lines under strict mode | `Library.zotero.test.tsx:126`, "under strict mode (mounted, cleaned up, mounted again) the lines are read once and shown (R623 Minor 5)" | Failed first (no lines) | `LibraryZotero.tsx:110-117`: `alive.current = true` at each mount. `RecheckProject.tsx` checked: its reads use a per-run `live` flag and the leave signal (which makes a new controller after a clean-up): no fault, unchanged (3643ed9) |
+
+Researcher-visible words new or changed: "Loading…" (the app's existing word) as the import picker's empty choice while the project's list of imports is being read.
+
+Noticed, not mended (outside the five): the same strict-mode pattern (a mounted/alive ref set false at clean-up and never set back) is in `Library.tsx:447-453` (`mounted`, used after the creation re-read) and `AuditLog.tsx:244,367` (`alive`); development builds only.
+
+Runs (each alone, `nice -n 10`): ReviewQueue.firstReads 19/19; routes/import 19/19; SourceDetail.firstReads 9/9; SourceDetail 47/47; Library 48/48; Library.firstReads 17/17; Library.zotero 15/15; Library.recheck 12/12; ReviewQueue 125/125; ReviewQueue.look 18/18; ReviewQueue.lookUp 31/31; api/import 7/7; ProjectReviewQueue 26/26; typecheck, lint:css, lint:colours clean. No e2e spec drives the picker.
