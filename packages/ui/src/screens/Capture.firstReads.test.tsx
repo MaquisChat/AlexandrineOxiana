@@ -137,6 +137,40 @@ describe("Capture: first reads that never settle or fail (FR-756)", () => {
   });
 });
 
+describe("Capture route: the list of projects with a project in the address (FR-756, R605 I1)", () => {
+  const route = (m: ReturnType<typeof mockCapture>) => render(<CaptureRoute client={m.client} loc={{ pathname: "/capture", search: `?project=${P1}` }} firstReadMs={300} />);
+  const linksField = () => screen.getByRole("textbox", { name: "Links, one per line" }) as HTMLTextAreaElement;
+
+  it("a list given up at the limit leaves the working Capture screen as it was: links being typed are not lost, and nothing says the project is not one of the library's", async () => {
+    // The screen's own read of the projects asks first (a child's effect runs first): the route's is the second ask.
+    const projects = holding("/projects", (n) => n === 2);
+    const m = mockCapture({ extra: [projects.handler] });
+    route(m);
+    await screen.findByText("Thesis");
+    await waitFor(() => expect(projects.count()).toBe(2));
+    const user = userEvent.setup();
+    await user.click(linksField());
+    await user.keyboard("https://example.org/a");
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    expect(screen.queryByText(/not one of this library's projects/)).toBeNull();
+    expect(linksField().value).toBe("https://example.org/a");
+    expect(screen.getByRole("heading", { level: 1, name: "Capture" })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+  });
+
+  it("a list that failed with no answer leaves the Capture screen too, and never says the project is not one of the library's", async () => {
+    let n = 0;
+    const m = mockCapture({ extra: [http.get(url("/projects"), () => (++n === 2 ? HttpResponse.error() : undefined))] });
+    route(m);
+    await screen.findByText("Thesis");
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([UNREACHABLE]);
+    expect(screen.queryByText(/not one of this library's projects/)).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Links, one per line" })).toBeTruthy();
+  });
+});
+
 describe("Capture: an event stream that does not open within the limit is tried afresh (FR-756, R597)", () => {
   it("a stream that never opens is closed at the limit and opened afresh after the pause; at that opening the first reads still out are made again", async () => {
     const events = holding("/events", (n) => n === 1);

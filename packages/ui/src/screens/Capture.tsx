@@ -1177,7 +1177,9 @@ export function CaptureRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS 
       (list) => live && setProjects(list),
       (err: unknown) => {
         if (!live) return;
-        setProjects([]);
+        // R605 I1: a list not read (given up at the limit, or failed) is never taken for an empty one: the project named
+        // in the address stays shown (its working Capture screen, links being typed are not lost), and nothing says it
+        // is not one of the library's projects.
         // A read with no answer says only its own sentence (never "could not be reached" and "did not answer" together).
         setUnanswered(isUnreachable(err));
         setError(isUnreachable(err) ? (err as ApiClientError).message : plainError(err, "The projects could not be read."));
