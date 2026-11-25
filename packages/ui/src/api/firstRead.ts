@@ -3,7 +3,7 @@
  * (neither answered nor failed) would otherwise leave the screen at "Reading…" for ever. These are reads from the
  * service on the same machine, so twenty seconds is long; acts (an add, an attach, a move) have no such limit.
  */
-import { ApiClientError, noAnswerInTime } from "./client";
+import { ApiClientError, noAnswerInTime, SERVICE_NO_ANSWER } from "./client";
 
 /** How long a screen's first read is waited for before it is given up. */
 export const FIRST_READ_TIMEOUT_MS = 20_000;
@@ -33,3 +33,6 @@ export function readWithin<T>(read: (signal: AbortSignal) => Promise<T>, ms: num
 
 /** A read that got no answer (the service could not be reached, or it did not answer in time): "Try again" may help. */
 export const isUnreachable = (err: unknown): boolean => err instanceof ApiClientError && err.status === 0 && err.code === "UNAVAILABLE";
+
+/** FR-756: a read given up at its time limit (it neither answered nor failed), as `readWithin` gives it up. */
+export const isNoAnswerInTime = (err: unknown): boolean => isUnreachable(err) && (err as ApiClientError).message === SERVICE_NO_ANSWER;

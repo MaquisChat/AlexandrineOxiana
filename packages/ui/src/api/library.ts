@@ -358,7 +358,7 @@ export function libraryApi(client: ApiClient) {
       close: (txn: string, projectId: string) => r<{ txn: string; projectId: string }>("POST", `/libraries/pending-writes/${seg(txn)}/close`, { body: { projectId } }),
     },
     libraries: {
-      list: () => r<LibraryList>("GET", "/libraries"),
+      list: (opts: { signal?: AbortSignal } = {}) => r<LibraryList>("GET", "/libraries", opts.signal ? { signal: opts.signal } : {}),
       /** The researcher's "Got it" for a device-level notice (Task 68): POST /settings/notices/dismiss. */
       /** FR-729: dismisses, for good, a warning kept with the library. */
       dismissWarning: (id: string) => r<{ dismissed: true }>("POST", `/libraries/recovery-warnings/${seg(id)}/dismiss`),

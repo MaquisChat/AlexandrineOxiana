@@ -2,7 +2,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CURRENT_RW, LIBRARIES, libraryHandlers, server, serviceError, testClient, url, useMockService } from "../test/service";
+import { CURRENT_RW, hang, LIBRARIES, libraryHandlers, server, serviceError, testClient, url, useMockService } from "../test/service";
 import { navigate } from "../navigation";
 import { LibraryRoutes, isLibraryPath } from "./library";
 
@@ -146,6 +146,103 @@ describe("library routes", () => {
     await new Promise((r) => setTimeout(r, 1000));
     expect(screen.getByRole("heading", { level: 1, name: "Grant 2025" })).toBeTruthy();
     expect(screen.queryByRole("heading", { level: 1, name: /Library not found/ })).toBeNull();
+  });
+
+  describe("FR-756 A: the first look at the libraries has a time limit", () => {
+    const NO_ANSWER = "The library service did not answer in time.";
+    const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+
+    it("a list that never settles is given up at the limit: the alert and “Try again”, not the chooser; pressing it says “Connecting to the library…” and reads again", async () => {
+      let answer = false;
+      let asked = 0;
+      const gate = hang();
+      server.use(
+        http.get(url("/libraries"), async () => {
+          asked++;
+          if (!answer) await gate;
+          return HttpResponse.json({ ...LIBRARIES, current: CURRENT_RW });
+        }),
+        ...libraryHandlers(),
+      );
+      render(<LibraryRoutes client={testClient()} firstReadMs={300} />);
+      expect(screen.getByText("Connecting to the library…")).toBeTruthy();
+      await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+      expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+      expect(screen.queryByText("Connecting to the library…")).toBeNull();
+      // Not the chooser: whether a library is open is not known.
+      expect(screen.queryByRole("heading", { name: "Choose a library" })).toBeNull();
+      expect(asked).toBe(1);
+      expect(document.activeElement).toBe(document.body);
+      // Pressed: the loading words while it reads again (here it hangs once more, and is given up again).
+      const user = userEvent.setup();
+      await user.click(tryAgain()!);
+      expect(screen.getByText("Connecting to the library…")).toBeTruthy();
+      expect(tryAgain()).toBeNull();
+      // Focus is not lost to the page while it reads: it is on the words that say so.
+      expect(document.activeElement).toBe(screen.getByText("Connecting to the library…"));
+      await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+      expect(asked).toBe(2);
+      // ...and the button is where focus went back to.
+      expect(document.activeElement).toBe(tryAgain());
+      answer = true;
+      await user.click(tryAgain()!);
+      expect(await screen.findByRole("navigation", { name: "Projects" })).toBeTruthy();
+      expect(asked).toBe(3);
+      expect(screen.queryByText(NO_ANSWER)).toBeNull();
+      // The button pressed has gone: focus is in the library, never the page.
+      expect(document.activeElement).not.toBe(document.body);
+    });
+
+    it("a list that FAILS still shows the chooser, which says why (unchanged)", async () => {
+      server.use(http.get(url("/libraries"), () => HttpResponse.error()));
+      render(<LibraryRoutes client={testClient()} firstReadMs={300} />);
+      expect(await screen.findByRole("heading", { name: "Choose a library" })).toBeTruthy();
+      expect((await screen.findByRole("alert")).textContent).toBe("The library service could not be reached.");
+      expect(screen.queryByText(NO_ANSWER)).toBeNull();
+    });
+
+    it("a check that never settles while the last library is still being opened is given up at the limit, and the checking goes on", async () => {
+      let checks = 0;
+      const gate = hang();
+      server.use(
+        http.get(url("/libraries"), async () => {
+          checks++;
+          // The first look and the chooser's own list answer; the first later check (the third request) never does.
+          if (checks === 3) await gate;
+          return HttpResponse.json({ ...LIBRARIES, reopening: { libraryId: "lib-1", name: "Thesis library" } });
+        }),
+      );
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const wait = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+        const settle = async () => {
+          for (let i = 0; i < 20; i++) await wait(0);
+        };
+        render(<LibraryRoutes client={testClient()} />);
+        await settle();
+        expect(screen.getByText(stillOpening(/Still opening Thesis library/))).toBeTruthy();
+        expect(checks).toBe(2);
+        await wait(2_000); // the first check: it hangs
+        await settle();
+        expect(checks).toBe(3);
+        await wait(20_000 - 1); // not given up yet, and nothing else asked
+        await settle();
+        expect(checks).toBe(3);
+        await wait(1); // given up at twenty seconds: the next check comes 4 seconds later
+        await settle();
+        await wait(4_000);
+        await settle();
+        expect(checks).toBe(4);
+        await wait(8_000);
+        await settle();
+        expect(checks).toBe(5);
+        // Nothing said about it: the chooser and its line stay as they were.
+        expect(screen.getByText(stillOpening(/Still opening Thesis library, the library that was open last time/))).toBeTruthy();
+        expect(screen.queryByText(NO_ANSWER)).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   it("navigate() changes the path and notifies listeners", async () => {
