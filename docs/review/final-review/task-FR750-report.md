@@ -1,54 +1,161 @@
-# FR-750 (R574) — STOPPED: the cause in the page is not what the evidence suggests
+# FR-750: the Find screen when its first reads never settle (R574, R579)
 
-Worktree `.claude/worktrees/kg-3b`, branch `fr-750-find-first-reads` at 7d8d861. **No commit; no change to the tree** (`git status --short` empty). The probe tests are kept outside the tree, in the scratchpad's `fr750/` folder (`FindAcquire.fr750probe.test.tsx`, `FindAcquire.fr750probe2.test.tsx`).
+The work is on branch `fr-750-find-first-reads` in the worktree `.claude/worktrees/kg-3b`. The branch was at 7d8d861 and is now at c764074, with four commits on top. Nothing was pushed, and `git status --short` is empty.
 
-## What I found
+## Part 1 — the cause, as proved (the stop that led to R579)
 
-**1. A first read that fails with a network error does NOT leave the Find screen waiting.** The client turns a rejected `fetch` into `ApiClientError(0, UNAVAILABLE, "The library service could not be reached.")` (`packages/ui/src/api/client.ts:285-290`). The screen catches it. For the projects, `FindAcquire.tsx:415-419` sets the list to `[]` and stores the sentence. For the settings, `FindAcquire.tsx:448-453` does the same. The screen then shows the alert "The library service could not be reached." once (FR-576, `FindAcquire.tsx:861-881`) and the box reads "No project", not "Reading the projects…". An existing test already proves this: `FindAcquire.test.tsx:5292` ("FR-576 … said once").
+**A first read that fails is already handled.** The client turns a network error into "The library service could not be reached." (`packages/ui/src/api/client.ts:285-290`). The Find screen catches it and shows that alert with "No project" (`FindAcquire.tsx`, `readProjects` and `screenOnce` catch blocks).
 
-**2. The screen already asks again by itself when the event stream comes back.**
-- The service sends `library.state` as soon as a stream opens (`apps/library-service/src/routes/libraries.ts:568`).
-- When that event arrives and nothing has been read successfully, the screen starts afresh and reads everything again (R281 e, `FindAcquire.tsx:554-575`). When only some reads failed, it reads again just the ones that failed (R291 b, `rereadMissing`).
-- Probe 1 checks this with MSW. The first `/events`, `/projects` and `/find/screen` each answer `HttpResponse.error()`; the second `/events` sends `library.state`. Result: the alert shows first. About 2 s later the reconnect reads `/projects` and `/find/screen` again, once each. The project and the "References" box then appear, with no press.
+The screen also already reads everything again when a reconnected stream delivers `library.state` (R281 e).
+- Probe 1 tested this: network errors on the first reads, then a reconnect. It is in the scratchpad's `fr750/`.
 
-**3. The only page state that matches the snapshot is a read that never settles.** The snapshot shows "Reading the projects…", the switch disabled, no alert. That needs `projects === undefined` and `remembered === undefined`. Only two things leave both unset: a `fetch` promise still pending, or `forgetLibrary()` (`FindAcquire.tsx:488-517`). Probe 2 makes the first `/projects` and `/find/screen` hang (a promise never resolved). It reproduces the snapshot exactly: "Reading the projects…", no alert, switch disabled. It still recovers as soon as the reconnected stream delivers `library.state`.
+**What reproduces the failed run is a read that hangs.** That means a read that is neither answered nor failed.
+- Probe 2 (also in `fr750/`) shows exactly the run's picture: the disabled "Reading the projects…" box, no alert, the switch disabled.
+- In the WebKit run, no request followed the stream's reconnect at 3977 ms. So nothing reached the page after it.
 
-**4. So in the failed WebKit run, nothing from the service reached the page after the reconnect at 3977 ms.**
-- If the reconnected stream had delivered its `library.state`, the screen would have requested `/projects` and `/find/screen` again (point 2). The page's request list, which records every request for the whole 60 s test (`e2e/find-copies.spec.ts:399-409`), shows NO request after `3977 ms → GET /events`, and no answer to it either.
-- And if the first `/projects` had rejected in JavaScript, the screen would read "No project" with the alert (point 1), not "Reading the projects…".
-- So in that run, either the `/projects` and `/find/screen` promises never settled even though Playwright reported them failed, or the screen started afresh and its new reads were never sent. In both cases the reconnected `/events` also delivered nothing to the page.
-- The ledger says the reconnect "got through". I could not see the service log of that run, so I cannot confirm that its answer reached the page.
+Two things in the page made this permanent:
+- The first reads had no time limit (`readProjects`, and the first `readScreen()` with no timeout).
+- Getting out depended entirely on an event arriving on the stream.
 
-**The real gap in the page is that the first reads have no time limit.** `readProjects` (`FindAcquire.tsx:397-425`) and the first `readScreen()` (`FindAcquire.tsx:482-485`, no timeout) wait as long as the request does. Recovery depends wholly on the event stream delivering an event. A request that hangs (and a stream that hangs) leaves the screen at "Reading the projects…" for ever. There is also no "Try again" button on this screen's first-read alert: the alert is the plain FR-576 sentence. That part of R574 (a) is not yet true, but it would not have helped a page whose requests get no answer.
+## Part 2 — what was built (R579)
 
-## The question for a ruling
+### (1) A time limit on the first reads, and "Try again"
 
-R574 (b), "ask again when the stream comes back", is already built here and could not have helped in that run. Should FR-750 instead be:
+**The shared helper.** It is in `packages/ui/src/api/firstRead.ts` (new):
+- `FIRST_READ_TIMEOUT_MS = 20_000`.
+- `readWithin(read, ms, outer?)`: when the limit passes, the request is aborted, so a late answer changes nothing. It then rejects with the client's own "could not be reached" error.
+- `isUnreachable(err)`.
 
-- **(A)** A time limit on the first reads. Give up on `GET /projects` and `GET /find/screen` after, say, 15 s and treat them as failed: the existing alert, plus a "Try again" button that reads again what failed (wording below). Also a time limit on a new event stream that gives no first event within that time: drop it and connect again (bounded, as the 2 s pause already is). This is local to `FindAcquire.tsx`, not shared loading code. My recommendation: (A), both halves.
-- **(B)** Only the "Try again" button on the existing alert (R574 a). This is cheap, but on its own it does not end the endless wait seen.
-- **(C)** Treat the run as a WebKit/test artefact and change the e2e helper only (see below).
+**Client and API changes:**
+- `client.ts` now exports `SERVICE_UNREACHABLE` and `unreachable()`; the sentence is unchanged.
+- `projects.list`, `collections.list`, Zotero's `state` and `history` now take an optional `signal`.
 
-Proposed wording for (A): keep the existing sentence ("The library service could not be reached." / "The projects could not be read.") and add a button "Try again". I found no shared "could not be read … Try again" component during this look; I did not search the other screens for one, as I stopped first.
+**The Find screen** (`packages/ui/src/screens/FindAcquire.tsx`):
+- New prop `firstReadMs`, which defaults to the constant; tests make it small.
+- `readProjects` uses `readWithin` (in the "projects list" block, ~line 405). The read of the remembered settings, `screenOnce` in "first" mode, does too (~line 458); `readScreen` always uses that mode.
+- The queue's read asked for at once, `readNow`, uses it too, and so does the collections read.
+- When the limit passes, the screen shows its EXISTING alert "The library service could not be reached.". The alert is said once (FR-576).
+- Under the alert there is now a `<button type="button">Try again</button>`. It reads again what has not been read: the projects, the settings, and the queue through a `retry` signal (~line 862).
+- The queue's own alert gets the same button, which reads the queue again.
+- The button is shown only when the failure got no answer at all (`isUnreachable`). A failure that came with an answer the screen already handles shows its sentence as before, with no button. A test proves this.
 
-## The other screens (R574 c)
+**Focus:**
+- Nothing is focused while the screen waits or gives up.
+- If the researcher pressed "Try again" and the button then goes away (everything was read), focus goes to the h1. It never falls to the page body.
 
-Not surveyed, because I stopped. Watched folders (`WatchedFolders.tsx:81`) and Zotero (`ZoteroSync.tsx:87`) run their own reconnect loops with `RECONNECT_MS = 2000`, the same pattern as Find. The same question about time limits applies to them.
+**Colours:** none were added; the button uses the base button styles.
 
-## The end-to-end helper
+**Acts** (adding references, starting a fetch, PUT of the switch) are untouched.
 
-`openFind` (`e2e/find-copies.spec.ts:208-212`) calls `page.goto` while the page before still has requests in the air (its `/events` stream never ends). The run shows those requests cancelled, then the new page's first requests failing with "WebKit encountered an internal error".
-- With rejecting reads, the screen already recovers in about 2 s, which is well within the helper's 60 s wait.
-- What failed is a page that got no answers at all, so a page-side mend can only turn the endless wait into an error with "Try again". Whether "Try again" then gets through in that WebKit state is unknown.
-- `networkidle` cannot work as a "page before is idle" wait, because the SSE stream never idles. A helper that first goes to `about:blank` (or closes the stream) before `goto` would avoid provoking the quirk.
-- I changed nothing.
+### (2) Getting out does not depend on an event
 
-## Runs
+**When the stream opens anew.** The stream's `onOpen` runs as soon as the headers arrive, with no event needed. If the stream has failed or dropped at least once (`streamDrops > 0`), the screen reads again any read that:
+- has not succeeded, and
+- either failed, or is still out from before the stream last failed.
 
-- Probe 1 (network errors, then reconnect): 1 passed. It showed the alert, then recovery on reconnect.
-- Probe 2 (hung reads, then reconnect): 1 passed. It reproduced the snapshot exactly, then recovered on reconnect.
-- No typecheck, lint, build or e2e runs, because no code was changed.
+**How it reads again.** A read still out is aborted and replaced (`restart`). Each opening makes one more read of each, never a loop. A read that succeeded is not repeated.
+
+**At the first opening at load,** nothing extra is read, so an ordinary opening still reads each thing once. A test proves this.
+
+**How R281 e fits.** R281 e's re-read when the library's state is delivered is kept as it was. Two flags, `freshProjects` and `freshScreen`, mean "a read started at THIS opening is out".
+- With both fresh, "nothing read" is not a reason to start afresh with `forgetLibrary`.
+- `rereadMissing` and the "same library" branch skip a read that is fresh.
+- So after a failed first read, an opening followed by its `library.state` reads each thing twice in all: the first read and one re-read. Never three times; a test counts this.
+- Reads after a project-list change (M8) are as before.
+
+### (3) The same pattern elsewhere
+
+**Mended with the same constant, helper, alert and button:**
+- **Watched folders** (`WatchedFolders.tsx`): `relist` uses `readWithin` and `restart`, and offers "Try again" under its alert. `onOpen` lists again after a failure or drop when the list has not been read. Its existing focus rule (I2) moves focus to the "Folders" heading when the button goes.
+- **Zotero** (`ZoteroSync.tsx`): `read` uses it on both state and history, and offers "Try again" when no state has been read. `onOpen` reads again after a failure or drop when no state has been read. Its existing rule moves focus away from the button when it goes.
+
+Both screens' other reads keep their existing quiet handling.
+
+**Survey of the routes, with hung first reads.** I found these by reading the code, not by a test of each screen. "For ever" means no time limit and nothing that reads again.
+
+| Route | Screen | With a first read that hangs | Status |
+|---|---|---|---|
+| `/find` | Find and acquire | Had "Reading the projects…" for ever; now gives up after 20 s, shows the alert with "Try again", and reads again when the stream opens anew | **mended** |
+| `/settings/watched-folders` | Watched folders | Had "Reading the watched folders…" for ever; now the same as Find | **mended** |
+| `/settings/zotero` | Zotero | Had "Reading the Zotero sync settings…" for ever; now the same as Find | **mended** |
+| `/`, `/library` | Library route, then the library screen | `GET /libraries`: "Connecting to the library…" for ever, with no stream yet. Then `GET /projects`: "Loading projects…" for ever, because the screen's stream reconnect re-reads only the recheck, not the projects | listed (own work) |
+| `/import…` | Import wizard and review queue | Review queue: "Loading…" for ever (items stay null). Wizard: "Opening the import…" | listed |
+| governance routes | Governance settings, audit log, fieldwork, move, missing files | "Loading the project's rules…", "Loading…" and "Checking the library…" for ever. The route listens to the stream only for the library closing | listed |
+| `/transcript` | Transcript viewer | "Loading…" in the version box and "Loading the transcript…" for ever. The stream's open re-reads only the job | listed |
+| `/reader` | Reader | "Opening the source…" and "Opening the PDF…" for ever. Only the locate and lock questions have limits | listed |
+| `/capture` | Capture | "Reading this project's rules…" for ever | listed |
+| `/settings/extension` | Extension pairing | "Reading the list…" for ever | listed |
+| `/settings/tools` | Tools setup | "Reading the list of tools…" for ever | listed |
+| `/settings/search-sources` | Search sources | "Reading the Search sources settings…" for ever | listed |
+| `/settings/your-library` | Your library | "Reading the Your library settings…" for ever | listed |
+| `/settings/appearance` | Appearance and researcher name | Appearance runs on its defaults, so it stays usable. The researcher-name field and Save stay disabled for ever | listed |
+| `/about` | About | No reads | sound |
+
+### (4) The end-to-end helper
+
+**What was added** (`e2e/fixtures.ts`):
+- The page fixture keeps the page's requests to the service that are still out. The event stream, which never ends, is left out.
+- When a new document is asked for, the requests out at that moment are dropped once it is in the page. This was added after the first Chromium run: Chromium did not report the end of a request cancelled by `copiesOn`'s `page.goto`, so a `review?limit=0` stayed in the list.
+- `gotoWhenQuiet(page, url)` waits until that list is empty (polled, up to 30 s) and then calls `goto`.
+
+**Why this wait.** It waits on the true state the evidence points at: the page before has finished reading.
+- Playwright's network-idle can never happen here, because the event stream stays open.
+- `about:blank` would itself cancel the same requests in flight, the very thing that provoked WebKit. It is a guess, not a state.
+
+**Where it is used:**
+- `libraryWithProject` (fixtures).
+- `openFind` in `find-copies.spec.ts` and `find.spec.ts`.
+- `openReviewQueue` and `copiesOn` in `find-copies.spec.ts`.
+- `openWatched` in `watched-folders.spec.ts`.
+- The review queue's `fourWaiting` in `review-queue.spec.ts`.
+
+No scenario's assertions change. The other `page.goto` calls, written inside scenarios rather than in helpers, were left as they are.
+
+## Words a researcher can see
+
+The only new words are the button's "Try again", which other screens already use (the reader's annotation list, WatchOrigin, the Find rows). The alert's sentence, "The library service could not be reached.", already existed.
+
+## Runs (each file alone, `nice -n 10`)
+
+**Unit tests (vitest):**
+- `FindAcquire.test.tsx`: 226 passed. 8 are new FR-750 tests; the 6 behaviour tests among them failed first, for the stated reasons: no "Try again", and no re-read without an event.
+- `WatchedFolders.test.tsx`: 61 passed. 4 are new; 3 failed first.
+- `ZoteroSync.test.tsx`: 56 passed. 4 are new; 3 failed first.
+- `dialogs.r145.test.tsx`: 42 passed.
+- `SearchSources.test.tsx`: 34 passed.
+- `api/client.test.ts`: 39 passed.
+- `api/library.test.ts`: 10 passed.
+- `App.test.tsx`: 16 passed.
+- `Library.test.tsx`: 48 passed.
+- `WatchedFolders.test.tsx` prints three "[MSW] intercepted a request without a matching request handler" warnings (`watch-origin`, `/zotero/sync`). They are there before this change too: I checked against HEAD's files.
+
+**Checks:**
+- `pnpm --filter @ao/ui typecheck`: clean.
+- `lint:css`: clean.
+- `lint:colours`: "ok: no hard-coded colours".
+- e2e `tsc`: clean.
+- The interface was built.
+
+**End-to-end, WebKit, `--repeat-each=4`** (`find-copies.spec.ts:567`, `:645`, `find.spec.ts:535`):
+- With the first form of the helper: 12 passed.
+- Again with the final helper: 12 passed.
+
+**End-to-end, Chromium, whole `find.spec.ts` + `find-copies.spec.ts`:**
+- First run: 13 passed, 1 failed. `:836` timed out in `gotoWhenQuiet` on the leaked request described in (4); the helper was fixed.
+- Re-run: 14 passed.
+
+**End-to-end, Chromium, `watched-folders.spec.ts` + `review-queue.spec.ts`** (their helpers changed): 24 passed.
+
+## Commits
+
+- a34f34d — Find: time limit, "Try again", re-read at a new opening.
+- df5c626 — Watched folders: the same; the shared test helpers `sseAttempts` and `hang` move to `test/service.ts`.
+- ff80afc — Zotero: the same.
+- c764074 — the end-to-end scenarios use `gotoWhenQuiet`.
 
 ## Uncertain
 
-I had no service log of the failed run, so I cannot tell which of the two cases in point 4 happened in WebKit.
+- **Whether the cause is gone in WebKit itself.** The WebKit scenarios passed before too, so they show only that nothing broke. The quirk cannot be provoked on demand.
+- **The helper's change reaches every spec.** `libraryWithProject` is used by many specs; only the four spec files above were run with the change.
+- **A long-lived request other than the event stream** (an NDJSON stream left open) would make `gotoWhenQuiet` time out with its own message. None was seen.
+- **"Try again" pressed while the other read is still within its limit** reads only what has settled. If the other read then fails, the button stays; it does not loop.
