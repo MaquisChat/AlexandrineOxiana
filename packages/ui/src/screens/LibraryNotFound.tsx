@@ -142,7 +142,8 @@ export function LibraryNotFound({ api, library, onOpened, onOpenDifferent, waitI
 
   return (
     <main className="ao-page">
-      <h1>
+      {/* R602 M5: focusable, so focus can be put here after a retried look at the libraries. */}
+      <h1 tabIndex={-1}>
         Library not found: <UserText>{library.name}</UserText>
       </h1>
       <p>It is not where it was last seen. If it is on a removable drive or a network share, connect it; otherwise find where it went.</p>

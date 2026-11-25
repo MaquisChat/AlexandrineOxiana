@@ -211,6 +211,23 @@ describe("library routes", () => {
       expect(tryAgain()).toBeNull();
     });
 
+    it("R602 M5: after a retried look, “Library not found” takes focus", async () => {
+      let answer = false;
+      const gate = hang();
+      server.use(
+        http.get(url("/libraries"), async () => {
+          if (!answer) await gate;
+          return HttpResponse.json({ ...LIBRARIES, notFound: { libraryId: "lib-1", name: "Thesis library" } });
+        }),
+      );
+      render(<LibraryRoutes client={testClient()} firstReadMs={300} />);
+      await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+      answer = true;
+      await userEvent.setup().click(tryAgain()!);
+      const heading = await screen.findByRole("heading", { level: 1, name: "Library not found: Thesis library" });
+      await waitFor(() => expect(document.activeElement).toBe(heading));
+    });
+
     it("a list that FAILS still shows the chooser, which says why (unchanged)", async () => {
       server.use(http.get(url("/libraries"), () => HttpResponse.error()));
       render(<LibraryRoutes client={testClient()} firstReadMs={300} />);
