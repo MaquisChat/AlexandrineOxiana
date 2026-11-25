@@ -46,6 +46,7 @@ import { basename, delimiter, extname, isAbsolute, join, resolve, sep } from "no
 import { createInterface } from "node:readline";
 import { test as base, expect, type Page, type Request } from "@playwright/test";
 import { FAKE_SPEECH, FAKE_TOOLS, LIBRARY_DIR, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
+import { QUIET_WAIT_MS, stillOutMessage } from "./quiet.js";
 
 /** The desktop shell's origin (apps/library-service/src/auth.ts SHELL_ORIGINS): the page is served here. */
 export const APP_ORIGIN = "http://tauri.localhost";
@@ -640,7 +641,14 @@ const inFlight = new WeakMap<Page, Set<Request>>();
  */
 export async function gotoWhenQuiet(page: Page, url: string): Promise<void> {
   const out = inFlight.get(page);
-  if (out) await expect.poll(() => out.size, { message: "the page before has finished its requests to the service", timeout: 30_000 }).toBe(0);
+  if (out) {
+    try {
+      await expect.poll(() => out.size, { timeout: QUIET_WAIT_MS }).toBe(0);
+    } catch {
+      // R586 M4: which requests were still out, by method and path (never a query).
+      throw new Error(stillOutMessage([...out].map((r) => ({ method: r.method(), url: r.url() }))));
+    }
+  }
   await page.goto(url);
 }
 
