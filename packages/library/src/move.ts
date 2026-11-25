@@ -1149,7 +1149,10 @@ async function oldCopyShowsMark(rec: PendingOldCopy, j: Journal, unnamed: "id-on
     throw new MoveFinishRefusedError("old-copy-unreachable", "The old copy cannot be reached to see whether it is marked as moved", { oldRoot: rec.oldRoot });
   }
   const sw = j.switch!;
-  const ofThisMove = (p: string) => markOfMove(p, j.libraryId, sw.moveId, unnamed === "id-or-none");
+  // FR-760 (2), R641 B2: a mark without an id counts only where the folder's own record of the move (its journal) agrees
+  // on where that move went: the mark's toHint is the journal's (every build wrote the mark's toHint from it). An older
+  // build's later move to another folder marked the old copy too; that mark is not this move's.
+  const ofThisMove = (p: string) => markOfMove(p, j.libraryId, sw.moveId, unnamed === "id-or-none" ? sw.details.toHint : undefined);
   if (!rec.split) return ofThisMove(join(rec.oldRoot, MOVED_MARKER));
   for (const f of sw.movedFolders) if (await ofThisMove(join(rec.oldRoot, ...f.split("/"), MOVED_MARKER))) return true;
   try {
@@ -1160,11 +1163,14 @@ async function oldCopyShowsMark(rec: PendingOldCopy, j: Journal, unnamed: "id-on
   }
 }
 
-/** The moved marker at `p` names the library `libraryId` and carries the move's id `moveId` (or, with `unnamedCounts`, no move id). */
-async function markOfMove(p: string, libraryId: string, moveId: string, unnamedCounts: boolean): Promise<boolean> {
+/**
+ * The moved marker at `p` names the library `libraryId` and carries the move's id `moveId` (or, with `unnamedTo` given,
+ * no move id and the destination hint `unnamedTo`).
+ */
+async function markOfMove(p: string, libraryId: string, moveId: string, unnamedTo: unknown): Promise<boolean> {
   try {
-    const m = JSON.parse(await fsp.readFile(p, "utf8")) as { libraryId?: unknown; moveId?: unknown };
-    return m.libraryId === libraryId && (m.moveId === undefined ? unnamedCounts : m.moveId === moveId);
+    const m = JSON.parse(await fsp.readFile(p, "utf8")) as { libraryId?: unknown; moveId?: unknown; toHint?: unknown };
+    return m.libraryId === libraryId && (m.moveId === undefined ? unnamedTo !== undefined && m.toHint === unnamedTo : m.moveId === moveId);
   } catch {
     return false;
   }

@@ -2097,6 +2097,46 @@ describe("FR-760 (1), R641 B1: the library that stayed behind after a split, mov
   }
 });
 
+describe("FR-760 (2), R641 B2: at the finishing's first step a mark without a move's id counts only where the folder's own record of the move agrees", () => {
+  /** A move of `lib` into `dest` that fails before its old copy is marked (a folder stands where the mark goes, then removed). */
+  async function failedBeforeMark(lib: Library, dest: string) {
+    await mkdir(join(lib.root, "MOVED.json"));
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toThrow();
+    await rm(join(lib.root, "MOVED.json"), { recursive: true });
+    expect(JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8")).switch.done).toEqual([]);
+  }
+  /** The top mark at `root` as an older build wrote it: without the move's id. */
+  async function asOlderBuild(root: string) {
+    const { moveId: _drop, ...older } = JSON.parse(await readFile(join(root, "MOVED.json"), "utf8")) as Record<string, unknown>;
+    await writeFile(join(root, "MOVED.json"), JSON.stringify(older, null, 2));
+  }
+
+  it("across an upgrade: A→B failed before the mark, A→C finished with a mark without an id; opening B finishes nothing and writes nothing, at its first step", async () => {
+    const { lib } = await fixture();
+    const b = join(tmp, "B");
+    const c = join(tmp, "C");
+    await failedBeforeMark(lib, b);
+    expect((await executeMove(lib, c, { deps: mkDeps(), env })).verified).toBe(true);
+    await asOlderBuild(lib.root);
+    const at = async () => [await hashes(lib.root), await hashes(b), await hashes(c), await hashes(join(tmp, "config"))];
+    const before = await at();
+    // Not refused by the later checks (the checksums, the audit logs): the step itself does not count that mark.
+    expect(await finishMoveAt(b, mkDeps())).toBeUndefined();
+    expect(await at()).toEqual(before);
+    expect((await listLibraries(mkDeps())).find((e) => e.libraryId === lib.id)!.lastKnownPaths[0]).toBe(c);
+  });
+
+  it("unchanged: the move's own mark without an id (an older build's), its record agreeing, is still counted and the move finished", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toMatchObject({ code: "ENOSPC" });
+    await asOlderBuild(lib.root);
+    await lib.close();
+    expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+  });
+});
+
 describe("FR-068 (R607 b): a resumed copy never writes through a link", () => {
   it("the review's probe P2: the stopped copy's Exports replaced by a link to a folder outside holding a file; the move run again refuses before writing anything, naming it; the file outside is unchanged", async () => {
     const { lib } = await fixture();
