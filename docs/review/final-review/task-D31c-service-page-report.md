@@ -264,3 +264,63 @@ These are R577's words. In the reasons list they appear in the engine's order: f
 - **Order of the polite region's sentences.** Point 4's brief says main state first, so a waiting+found entry is announced "Waiting…" then "found". The reasons list uses the engine's own order (found first). The two orders differ.
 - **"Under way" answered by the service itself.** A press for an entry whose look-up runs in the service's turn gets "under-way" from the service, using the engine's value, without calling the engine. The engine's own guard still covers any call outside the turn.
 - **Not-allowed with no candidates still shows no sentence under the matches** (as in §8).
+
+## Fix round (R600)
+
+Branch `d31c-service-page`, worktree `kg-5`, from 8ce0311 to **5a53b73**: ten commits, one per finding. Not pushed. `git status --short` is empty, and no process of mine is left running.
+
+The engine changed in exactly the two ways allowed:
+- `HttpClient.holdUntil(host, t)` (`packages/library/src/lookup/http.ts:448`). It is an addition, with its own tests in `http-leave-out.test.ts`.
+- `keptNotBefore` is now exported from the package index (`packages/library/src/index.ts:164`).
+
+No ruled words were changed, and no new sentence was added.
+
+| Finding | Commit | Failing test, seen to fail | Mend |
+|---|---|---|---|
+| I1 | 712ed64 | `http-leave-out.test.ts` "holdUntil" ×2 (`holdUntil is not a function`). `look-up-again.test.ts` "I1 (probe A1)…" and "I1: the same across a lock and an unlock…" (2 requests, where 1 is right). | `state.ts:2019` `carryLookUpHolds`; the opening at `:1009`, awaited in `adopt` (`:787`); the pass at `:1998`; a press at `:2104`; the unlock at `routes/projects.ts:166`. `routes/review.ts:79` `lookUpOut` and `:62` `heldBy`. |
+| I2 | 4fd269a | "I2 (probe A3)…": 1 sensitive answer left in memory, where 0 is right. | `state.ts:2138`, in `lookUpInTurn`'s `finally`. |
+| I3 | 2b2c5d8 | Service: "I3 (R595)…" (`failed` was missing). Page: four tests under "a lookup that failed outright is always said": nothing:failed with and without matches, failed with matches, and the announcement. | `routes/review.ts:106`; shared `review.ts:107`; page `ReviewQueue.tsx:2389-2390` and `:274`. Two older service tests now expect `failed: true`. |
+| m1 | 7971a74 | "m1: a second press queued…" (timed out: the second press waited, then sent). | `state.ts:2107` (`lookUpPressed`). |
+| m2 | 6679371 | Page: "while one entry's look-up runs, another entry's decisions stay usable" (Skip was disabled). The service's "m2: a researcher's press goes before the pass's next entry" **passed when written**: the pass awaits each entry, and the press queues before the next one. | `ReviewQueue.tsx` `lookUpAgain` keeps a per-entry set; `:1331` sets `busy` for the entry only. |
+| m3 | 7c905da | "a re-read where only the time changed is not an answer…" and "after the thirtieth re-read…" (31 reads, nothing said). "no re-reading outlives the screen" **passed when written**: the screen's generation counter already ends it. | `ReviewQueue.tsx:827` compares `reasons`, `candidates` and `lookUp.state`. The last read is shown. New prop `lookUpRecheckMs` (`:164`), for tests. |
+| m4 | 545338e | "m4: a "not yet" (or a refusal) reads only its own entry" (the read was `{}`, the whole queue). | The request gains optional `sourceId` (shared `:282`; page `api/import.ts`). `routes/review.ts:265` reads only that source's entries, or the whole queue when the source is missing or wrong. Three page tests that assert the request body exactly now include `sourceId`. |
+| m5 | 711c651 | "the button's time … whatever the browser's own language" (French in a French browser). | `ReviewQueue.tsx:258`: `Intl.DateTimeFormat("en", …)`, as the screen's `DATE`. |
+| m6 | 0ed680e | "m6: the pass's bound … counts only entries for which a request left" (20 counted, where 2 is right). "m6, m7: a timer tick … an unlock during a pass…" (passes `[undefined, undefined]`). | `state.ts:2086` counts `sent > 0`. `:1987`/`:1993`: during a pass a tick is dropped and an unlock's project is queued. The unlock route passes `[id]`. |
+| m7 | 5a53b73 | "m7: an old session's pass…" and the page's 409 LIBRARY_CLOSED, 409 CONFLICT and network failure tests. **All passed when written.** The rest of the list came with the findings above. | — |
+
+### How the page gets the hold's time
+- `lookUpNow` cannot see the client's hold, so the service works it out in its one place, `lookUpOut` (`routes/review.ts:79`). It asks the session client `heldUntil` for each service's host (`heldBy`).
+- If, among the lookups `lookUpNow` would ask now, every one has all its services held, the entry is "not now". Its time is the earliest of those lookups' latest holds, and of `lookUpNow`'s time for the other lookups. This mirrors the engine's own "not yet" for held services.
+- The page still reads only `canLookUpNow` and `notBefore`. It has no second clock rule.
+- The A1 test checks that the queue's time equals the time a press answers ("not yet" with the same `notBefore`).
+
+### The attach after a reopening
+It follows from the mend. The attach uses the same session client with `askedToWait: "leave-out"`, so a held host is left out, and the A1 test asserts it: needs review, "Waiting for lookup service response.", and 0 requests. The opening's answer waits for the holds to be carried (`adopt` awaits `s.holdsCarried`), so no attach can come before them. At an unlock, the route awaits the carrying before it answers.
+
+### Uncertain
+1. **The carrying reads the queue with titles.** It uses `listProjectReview`, which reads each pending entry's source title, because `projectReviewEntries` is not exported. So the opening's answer waits for one read of each unlocked project's pending entries. Exporting `projectReviewEntries` would drop the title reads; I did not do it, since it is a third engine export.
+2. **Rules versus holds in `lookUpOut`.** It does not apply the project's rules per service. Take a lookup whose allowed services are all held while one denied service is not: the field says "now", and the press answers "not yet" with the hold's time, which the page already shows.
+3. **Hold times are in the client's clock.** Holds are set from times kept in the service's clock. These are the same clock in the app. In the tests the service's clock runs ahead, so only times still ahead of the service's "now" are carried.
+4. **An unlock with no pass running** now runs a pass of that project only, where it used to run a full pass. Other projects' due entries go with the next timer tick.
+5. **The purge after a look-up.** It runs when the project is encrypted and locked. If the project can no longer be read, it purges as well.
+
+### Runs (each alone, `nice -n 10`)
+- **library:** http-leave-out 33/33, http-closing 7/7, look-again 34/34, look-up-state 20/20, attach-asked-to-wait 12/12.
+- **service:**
+  - look-up-again 37/37
+  - review-queue 23/23
+  - open-library 26/26
+  - close-during-attach 13/13
+  - lock-during-change 3/3
+  - server 160 passed, 1 skipped
+  - recovery-code 10/10
+  - find-routes 47/47
+  - capture-queues 31/31
+  - watched-folders-routes 59/59
+  - transcription-jobs 40/40
+- **page:** ReviewQueue.lookUp 31/31, ReviewQueue.look 18/18, ReviewQueue 125/125, ProjectReviewQueue 26/26.
+- **other checks:**
+  - `pnpm -r typecheck`: all nine packages Done.
+  - `lint:css` exit 0; `lint:colours` ok.
+  - UI build passed.
+  - e2e Chromium `review-queue.spec.ts`: 11/11.
