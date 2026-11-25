@@ -35,3 +35,26 @@ Passed unmoved and moved; fixed dates are data or the injected clock is used:
 - `packages/shared/src` (one dated test file, no real-clock read) and `apps/cli/src` (no dated files).
 - Library test files outside the candidate list.
 - Only the 1 June 2027 date was probed, apart from the job-journal check. A rule that trips between today and then would show only if it matched the list above.
+
+## Second step
+
+Mended on branch `fr-763-dated-tests` (one commit, test only): `packages/library/src/job-journal.test.ts:271` and `:278` now pass the records' own time (`Date.parse(at)`) as the compaction's clock. The file passes as it is and with the clock at 1 June 2027 and 1 December 2027. It would have begun to fail on 11 December 2026.
+
+Whole unit suites with the clock at 1 December 2027 (the mended file included). No further real finding and nothing left unmended.
+- library: 5,996 passed, 9 failed, all artefacts.
+- library-service: 1,283 passed, 2 failed, artefacts.
+- ui: 2,762 passed, 1 failed, a load flake.
+- core 1,056, shared 318, browser-extension 242: all passed.
+- cli: 86 passed, 1 failed, artefact.
+
+Failures, each passing unmoved:
+- Two clock paths: the test makes a file whose modification time comes from the real file system, and the code compares it with the moved clock. A fresh file or lock then looks a year old.
+  - `fs/atomic.test.ts` "only removes old *.tmp-* files".
+  - `fs/file-lock.test.ts` (3 tests).
+  - `import/zotero-sync-settings.processes.test.ts` (3 tests, child processes use the real clock).
+  - `export/project-export.test.ts` "I1 .partial".
+  - `library-service/zotero-sync-routes.test.ts` (2 "R306 b" tests).
+- Clock written into a file that a separate, unmoved process reads: `apps/cli/src/commands/zotero.test.ts:616` ("R306 b").
+- Load flakes, passing alone with the moved clock (twice for custom-styles) and unmoved: `citation/custom-styles.test.ts` "a timeout is never remembered" (a 1 ms timeout), and `ui/screens/Reader.test.tsx` "the library closed or another one opened…".
+
+Not checked: other dates beyond 1 June 2027 and 1 December 2027; time zones other than UTC; the scale suites, the end-to-end browser test and the Python media worker.
