@@ -18,7 +18,7 @@ import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { PATHS } from "../navigation";
-import { BASE, CURRENT_RW, LIBRARIES, TOKEN, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
+import { BASE, CURRENT_RW, LIBRARIES, TOKEN, hang, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
 import { FindAcquire } from "./FindAcquire";
 import { SEARCH_SOURCES_TEXT, SearchSources, searchSourcesHref } from "./SearchSources";
@@ -787,5 +787,63 @@ describe("Search sources: reachable", () => {
     );
     render(<FindAcquire client={testClient()} loc={{ pathname: PATHS.find, search: `?project=${P1}` }} />);
     await waitFor(() => expect(screen.getByRole("link", { name: "Search sources" }).getAttribute("href")).toBe(`/settings/search-sources?project=${P1}`));
+  });
+});
+
+describe("Search sources: a first read that never settles (FR-756, R584, R586)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const UNREACHABLE = "The library service could not be reached.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
+
+  it("is given up at the limit: the alert and “Try again”; pressed, it reads again (with the project), the loading words meanwhile, and the settings are shown with focus kept", async () => {
+    const svc = useSvc();
+    const gate = hang();
+    let answer = false;
+    svc.onGet = async () => {
+      if (!answer) await gate;
+      return undefined;
+    };
+    render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: `?project=${P1}` }} firstReadMs={300} />);
+    expect(screen.getByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    // Given up: not taken for a project that could not be read, and not asked again without it.
+    expect(alerts()).toEqual([NO_ANSWER]);
+    expect(screen.queryByTestId("search-project-error")).toBeNull();
+    expect(svc.count("GET", "/settings/search-sources")).toBe(1);
+    await userEvent.setup().click(tryAgain()!);
+    expect(screen.getByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Search sources" }));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("checkbox", { name: "Crossref" });
+    await waitFor(() => expect(svc.count("GET", "/secrets/elicit-api-key")).toBe(1));
+    expect(tryAgain()).toBeNull();
+    expect(alerts()).toEqual([]);
+    const gets = svc.sent.filter((s) => s.method === "GET" && s.path === "/settings/search-sources");
+    expect(gets.map((s) => s.search)).toEqual([`?project=${P1}`, `?project=${P1}`, `?project=${P1}`]);
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Search sources" }));
+  });
+
+  it("a read that FAILS says what it said before, now with “Try again”", async () => {
+    const svc = useSvc();
+    let fail = true;
+    svc.onGet = async () => (fail ? HttpResponse.error() : undefined);
+    render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: "" }} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([UNREACHABLE]);
+    fail = false;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("checkbox", { name: "Crossref" });
+    await waitFor(() => expect(svc.count("GET", "/secrets/elicit-api-key")).toBe(1));
+  });
+
+  it("a read refused with an answer says its sentence as before, with no “Try again”", async () => {
+    const svc = useSvc();
+    svc.onGet = async () => HttpResponse.json({ error: { code: "INTERNAL", message: "The settings file could not be read." } }, { status: 500 });
+    render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: "" }} firstReadMs={300} />);
+    await screen.findByText("The settings file could not be read.");
+    expect(tryAgain()).toBeNull();
   });
 });
