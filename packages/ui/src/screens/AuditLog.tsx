@@ -241,7 +241,11 @@ function NeedsAttention({ api, projectId, onChanged }: { api: GovernanceApi; pro
   const [focusHeading, setFocusHeading] = useState(false);
   const heading = useRef<HTMLHeadingElement>(null);
   const alive = useRef(true);
-  useEffect(() => () => void (alive.current = false), []);
+  // Set again at mount: under strict mode (mount, clean-up, mount) nothing read afterwards would be shown (FR-762).
+  useEffect(() => {
+    alive.current = true;
+    return () => void (alive.current = false);
+  }, []);
   /** The project whose answers are current: an answer for another one is dropped (N8). */
   const current = useRef(projectId);
   current.current = projectId;
@@ -364,7 +368,11 @@ function LibraryAudit({ api }: { api: GovernanceApi }) {
   const loadingRef = useRef(false);
   const checkingRef = useRef(false);
   const alive = useRef(true);
-  useEffect(() => () => void (alive.current = false), []);
+  // Set again at mount: under strict mode (mount, clean-up, mount) nothing read afterwards would be shown (FR-762).
+  useEffect(() => {
+    alive.current = true;
+    return () => void (alive.current = false);
+  }, []);
   const show = async () => {
     if (loadingRef.current) return;
     loadingRef.current = true;

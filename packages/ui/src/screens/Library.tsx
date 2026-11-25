@@ -445,12 +445,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     };
   }, [api, showProjects, firstReadMs, tries.projects, answered, noAnswer]);
   const mounted = useRef(true);
-  useEffect(
-    () => () => {
+  // Set again at mount: under strict mode (mount, clean-up, mount) the screen otherwise reads nothing after (FR-762).
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
       mounted.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
   /** Reads the project list again (after the new-project dialog closes, whatever the reason). */
   const reloadProjects = useCallback(async (keep?: ProjectSummary) => {
     const { projects: read } = await api.projects.list();
