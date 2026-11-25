@@ -150,3 +150,135 @@ None.
   - give each lookup a stable key.
 - Each needs its probe as a test (P-B, P-N).
 - The Minors can follow, or go to T3 and T4 (M2's outcome counts, M3's sentence in mixes).
+
+## Second look (R592)
+
+Reviewed: `d31c-look-up-again` at e62d244, eight commits after 2e3a471. I read the fix report, R585, R592 and the whole diff from 2e3a471. I wrote my probes again as a throwaway file, `look-again.probeD31c.test.ts`, with the same harness as before: an undici `MockAgent` with `disableNetConnect()` and an injected clock. The file is deleted and `git status --short` is empty.
+
+### Per finding
+
+| finding | verdict | evidence |
+|---|---|---|
+| I1 two look-ups of one entry | **closed** | See below. |
+| I2 same key | **closed** | See below. |
+| M1 wrong clock | **closed** (as ruled) | See below. |
+| M2 what really left | **closed** | See below. |
+| M3 sentences in mixes; researcher's tries | **closed** | See below. |
+| M4, M5 | accepted as built (R585) | Not touched; confirmed unchanged. |
+| M6 missing tests | **closed** | See below. |
+| M7 older-build proof | **closed** | See below. |
+| M8 `authorizeOnly` put back | **closed** | See below. |
+
+**I1, two look-ups of one entry.**
+- *The rule.* `look-again.ts:299-318` is the guard: on the same handle, a second call answers "under-way". `:244-250` is `settle`: the result is worked out against the entry as re-read inside the change, at its place.
+- *Q1, same handle.* The automatic pass was held after its answer, then the researcher pressed. The press answered `under-way` with 0 requests, 0 audit lines and 0 review lines. The held pass then wrote "found". A later press answered `nothing-to-look-up`.
+- *Q2, two handles, so the guard does not apply.* Every order I could force:
+  - "wait" written first, then "found": "found" stands and `lastTriedAt` is the later time (t2).
+  - "found" first, then a stale "wait": "found" stands.
+  - both automatic and both told to wait: `tries` is 2, `lastTriedAt` is the later time, `notBefore` is the latest.
+  - both found: the 2 candidates are written once.
+- *Accept or remove between the read and the write.* Still `dropped` (the builder's tests pass).
+
+**I2, same key.**
+- *The rule.* Each lookup is now known by its place: `Plan.at`, `look-again.ts:157, 333, 430-434`.
+- *The test.* The P-N test (`look-again.test.ts:611`) passes.
+- *Writers of `leftOut`, by reading:*
+  - in this tree: resolve's `push`, `reviewFor` once, and every rewrite spreads the entry;
+  - the build at 2d12ab1 and the (b) build at 7d8d861 spread the entry and never write `leftOut` themselves.
+
+  None reorders or shortens the list.
+- *An artificial writer that shortens `leftOut`* (Q3, a test patch that drops place 0 between the read and the write). The identity check in `settle` (`:246`) compares only identifier, title and creator. So Crossref's "found" landed on the failed OpenAlex item that had moved to place 0, which has the same identifier. The title search's answer was dropped. No real writer does this, so this is not a finding. If one ever exists, the check should also compare `why` and the services.
+
+**M1, wrong clock.**
+- *The rule.* `look-up-state.ts:39-55`.
+- *Q5.*
+  - `notBefore` 61 minutes ahead: `lookUpNow` answers "can look up now", and the press sent.
+  - `notBefore` 59 minutes ahead: "not yet" with that time (R411 kept).
+  - clock far behind (now = 2020): every kept wait counts as passed. This is the ruled consequence: the in-memory hold, which is relative to the client's own clock, still applies.
+- *The P-D test.* It passes.
+
+**M2, what really left.**
+- *The rule.* `onSend` at `http.ts:840`; counting in `askByService` (`look-again.ts:265`); the try counted only when something left (`:214-216`).
+- *Q6.* Six automatic look-ups. In each, another caller set the hold between the send's audit and the request. Each time: 0 requests on the wire, `sent: 0` in the result and on the outcome line, `tries` absent, no "gave-up".
+
+**M3, sentences in mixes, and the researcher's tries.**
+- *Mixes.* Q8: "waiting" with "not-allowed" in `also`. The builder's pure tests cover the rest.
+- *Q7, giving up.*
+  - Automatic, every try answered 429: waiting/1 … waiting/4, then gave-up/5 (each with `sent: 1`), then `not-due`.
+  - Eight presses by the researcher, all answered 429: always waiting, `tries` 0. The entry stays in `dueLookUps`.
+
+**M6, missing tests.** The partial-chain test, and the "on disk before the request" check inside test (9), are present and pass.
+
+**M7, older-build proof.** `olderParse` now copies 2d12ab1 `review.ts:463-479` with the sealed-line branch. The new test with a sealed entry that gave up passes.
+
+**M8, `authorizeOnly` put back.**
+- *The diff.* `git diff 7d8d861..HEAD -- repo/mutate.ts repo/repo.ts` is **empty** (checked).
+- *Audited before each request.* Q6 "kill" point: the probe held the first request before it left and read the log. Its last line is `{op: "review.lookup-again.send", services: ["openalex"], lookups: 1}`, with nothing after it.
+- *What that line means.* It is true as "the send was authorised and audited". If the process dies there, it says more than happened, and no later line corrects it. This is the design R566 (6) chose (audit before send) and is accepted. The outcome line's `sent` is the true count whenever the act finishes.
+
+### R592 (2): the send line's count
+The field is named `lookups`, not `sent`, which is right. But nothing documents it as *planned*.
+- The module comment, steps 3 and 4 (`look-again.ts:14-18`), is stale. It still says "one governed authorisation of the requests" and "one more try" for every wait.
+- The result's `asked` is documented as "How many lookups were sent" (`:87`). Yet it counts lookups even when nothing left (held at the send, or answered from the cache). That is exactly the "sent" wording R592 (2) forbids, on a planned number.
+
+See m1.
+
+### The five changed tests
+- **(9), the audit lines.** It used to assert one send line; it now asserts one per service, `sent: 2`, and the "on disk" check. The old assertion was wrong by R585 M8, and the new one is stronger.
+- **Failed lookup asked by hand,** **failed lookup that fails again (renamed),** and **the encrypted entry sealed.** Each used to assert `tries: 1` after the researcher's press. That was wrong by R585 M3 (a press is never counted). Each now asserts `tries` absent AND `lastTriedAt` = the press time, so nothing was loosened. The second one passes the press time explicitly because the client's back-off moves the test's clock; this is correct.
+- **The `holdRequests` helper** (not a test, but changed). In "after" mode it now also holds an answer that throws. This widens what the helper can hold; no assertion is weakened.
+
+**Verdict on the tests: no true property was loosened.**
+
+### `lookUpNow`
+- *One rule.* `lookUpNow` and the engine's choice for a press share `askableByHand` (`look-up-state.ts:63-79`). The engine's "not yet" calls `lookUpNow` itself (`look-again.ts:337`). There is no second copy.
+- *Wrong-clock rule.* Applied through `keptNotBefore`.
+- *Q9, its answers:*
+
+  | entry | answer |
+  |---|---|
+  | nothing left (all "nothing") | `{canLookUpNow: false}` |
+  | empty | `{canLookUpNow: false}` |
+  | mix of waiting and failed | `true` |
+  | mix, every time later | `false` with the earliest time |
+  | gave up, time later | `false` with its time |
+  | gave up, time passed | `true` |
+  | not allowed | `true` (the act asks the rules again) |
+  | wrong clock (+24 h) | `true` |
+  | resolved | `false` |
+
+- *Limit.* It cannot see the client's hold (ruled R592 (4)). `view.notBefore` still carries a time only a wrong clock could have written (report §3.5), so the page must take its time from `lookUpNow` only.
+
+### New findings
+**Critical: none. Important: none.**
+
+**Minor:**
+- **m1. Wording.**
+  - `look-again.ts:87`: `asked` is documented as "lookups were sent". It should read "lookups asked of a service (planned; see `sent` for requests that left)".
+  - `:14-18`: the module comment is stale (one authorisation for all services; every wait counts a try).
+  - `:389`: add a comment that the send line's `lookups` is the number planned for that service, not the number sent.
+- **m2. A service denied at send time is dropped from a lookup that also met a wait.**
+  - *The sequence (Q8).* The entry has a DOI lookup with services `[crossref, openalex]`. Crossref answers 429. Before OpenAlex's send is authorised, the rules are changed to deny OpenAlex. The DOI lookup becomes `{services: ["crossref"], notBefore}`: OpenAlex is gone from it for good. The title search becomes "not-allowed".
+  - *Where.* `after()` (`look-again.ts:223, 228, 231`) keeps `a.denied` only in the "nothing" case (R592 (3)). It drops it in the "waiting" and "failed" cases.
+  - *Why Minor.* This needs the rules to change during one act.
+  - *The mend.* Keep `a.denied` in `services` in all three cases.
+- **m3. A real send's `lastTriedAt` is not recorded when another handle settled the lookup first.**
+  - *The sequence (Q2, "found first").* Handle 1 (automatic) sends and is answered "found"; its write is held. Handle 2's press is answered from the client's disk cache (0 sent) and writes "found" without `lastTriedAt`. Handle 1's `settle` keeps that version.
+  - *The cost.* Cosmetic: no wrong state.
+
+### Tests run (each alone, `nice -n 10`, all green)
+- import: look-again 32/32 · look-up-state 20/20 · attach-asked-to-wait 12/12 · attach-closing 5/5 · attach 69/69
+- lookup: http-closing 7/7 · http-keys 18/18 · http-leave-out 31/31 · lookup 39/39 · recorded 21/21
+- repo, the importers of the changed lookup and mutate modules: close-guard 942/942 · pending-writes-close 14/14 · pseudonyms 16/16 · review-held 67/67 · rollback-hand-put 42/42 · rollback-rerun 30/30 · rollback-words 20/20 · txn-completion 9/9
+- find: elicit 18/18 · fetch-file.recorded 15/15 · fetch-file 42/42 · free-copy 80/80 · people 40/40 · runner.linked-missing 62/62 · runner 301/301 · search 120/120 · settings 21/21
+- `pnpm --filter @ao/library run typecheck`: clean.
+
+Not re-run: the many test files that import `repo/review.ts`. Its diff since 2e3a471 is comments only (checked).
+
+### Verdict (second look)
+**Approved with small points.** Every ruled finding is closed. Three Minor points remain:
+- m1: wording;
+- m2: a denied service dropped in the "waiting" and "failed" cases;
+- m3: cosmetic.
+
+None of them blocks the join. m1 and m2 are a few lines each and can go with the service and page round.
