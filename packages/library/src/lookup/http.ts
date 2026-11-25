@@ -46,9 +46,9 @@
  *    with LookupLeftOutError, and the client keeps, per host and in memory only, "not before T" (the time asked, a 429
  *    without one counting as a minute, at most an hour: R411 b). Until T every such call to that host is left out
  *    without anything being sent: the hold is looked at just before every send and every retry (R563 I1). Any caller's
- *    429, or 503 with a wait asked, sets the hold; any 2xx from the host clears it. A call without the option neither
- *    looks at nor waits for a hold: it is exactly as before (R563 I2). The holds are lost when the client goes (the
- *    library is closed, the app quits).
+ *    429, or 503 with a wait asked, sets the hold; any 2xx from the host to a request that left after the hold was set
+ *    clears it (FR-753 1). A call without the option neither looks at nor waits for a hold: it is exactly as before
+ *    (R563 I2). The holds are lost when the client goes (the library is closed, the app quits).
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -332,6 +332,8 @@ export class HttpClient {
   private readonly waiting = new Map<string, Array<() => void>>();
   /** Decision 31 (b), R411: per host, the time (client clock) before which it is not asked again. Memory only. */
   private readonly notBefore = new Map<string, number>();
+  /** FR-753 (1): per host, how many times a hold was set; a request notes the count as it leaves. Memory only. */
+  private readonly holdsSet = new Map<string, number>();
 
   constructor(opts: HttpClientOptions) {
     this.contactEmailFor = opts.contactEmailFor;
@@ -459,6 +461,7 @@ export class HttpClient {
     const until = Math.min(t, this.clock() + MAX_HOLD_MS);
     if (until <= this.clock()) return;
     this.notBefore.set(host, Math.max(this.notBefore.get(host) ?? 0, until));
+    this.holdsSet.set(host, (this.holdsSet.get(host) ?? 0) + 1);
   }
 
   /**
@@ -787,6 +790,7 @@ export class HttpClient {
   private holdHost(host: string, ms: number): number {
     const t = Math.max(this.notBefore.get(host) ?? 0, this.clock() + Math.min(Math.max(0, ms), MAX_HOLD_MS));
     this.notBefore.set(host, t);
+    this.holdsSet.set(host, (this.holdsSet.get(host) ?? 0) + 1);
     return t;
   }
 
@@ -849,8 +853,10 @@ export class HttpClient {
         lastError = new LookupHttpError(`The metadata service could not be reached${why}`);
       }
       if (res) {
-        // R563 I2: a good answer clears the host's hold, whoever received it: the service is answering again.
-        if (res.status >= 200 && res.status < 300) this.notBefore.delete(host);
+        // R563 I2: a good answer clears the host's hold, whoever received it: the service is answering again. FR-753 (1):
+        // only an answer whose request left after the hold was set (none set since it left); an earlier request's late
+        // answer says nothing of the wait the service asked for since.
+        if (res.status >= 200 && res.status < 300 && res.holdsAtSend === (this.holdsSet.get(host) ?? 0)) this.notBefore.delete(host);
         if (res.status === 200) return { status: 200, body: res.body, sent };
         if (res.status === 404 || res.status === 410) return { status: 404, body: null, sent };
         // R556 (2) i, R563 I1: a 429 (a minute when it names no time), or a 503 that asks for a wait, sets the host's
@@ -895,9 +901,11 @@ export class HttpClient {
     leaveOut = false,
     onSend?: () => void,
     caller?: AbortSignal,
-  ): Promise<{ status: number; body: string | null; retryAfter?: string; rateLimit?: RateLimitAnswer }> {
+  ): Promise<{ status: number; body: string | null; retryAfter?: string; rateLimit?: RateLimitAnswer; holdsAtSend: number }> {
     let current = new URL(url);
     let signal: AbortSignal | undefined;
+    /** FR-753 (1): the host's count of holds set when the last hop's request left. */
+    let holdsAtSend = 0;
     for (let hop = 0; ; hop++) {
       const giveBack = await this.hold(current.hostname, caller);
       try {
@@ -914,6 +922,7 @@ export class HttpClient {
           throw e;
         }
         slot(true);
+        holdsAtSend = this.holdsSet.get(current.hostname) ?? 0;
         if (!signal) {
           signal = AbortSignal.any([AbortSignal.timeout(this.attemptTimeoutMs), this.halt(caller)]);
         }
@@ -956,13 +965,13 @@ export class HttpClient {
             ...(retryAfter !== undefined ? { retryAfter } : {}),
             body,
           };
-          return { status: 429, body: null, retryAfter, rateLimit };
+          return { status: 429, body: null, retryAfter, rateLimit, holdsAtSend };
         }
         if (res.statusCode !== 200) {
           await res.body.dump();
-          return { status: res.statusCode, body: null, retryAfter: header("retry-after") };
+          return { status: res.statusCode, body: null, retryAfter: header("retry-after"), holdsAtSend };
         }
-        return { status: 200, body: await readBounded(res.body) };
+        return { status: 200, body: await readBounded(res.body), holdsAtSend };
       } finally {
         giveBack();
       }
