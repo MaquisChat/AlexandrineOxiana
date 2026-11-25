@@ -498,6 +498,8 @@ test("scenario 7: delete library.sqlite while the service is stopped, start it a
 // it up at its twenty-second limit. No seam shortens the limit: the scenario waits for it, with room for a busy machine.
 test("FR-756 A: opened while its look at the libraries is never answered, the opening screen says so within the limit and “Try again” opens the chooser", async ({ page, app }) => {
   await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
+  // R602 I1: the chooser's own read of the list has been answered before the hold is set (the heading shows first).
+  await expect(page.getByText(/^No libraries yet/)).toBeVisible();
   const isList = (url: URL) => url.origin === app.baseUrl && url.pathname === "/libraries";
   let held = 0;
   let release!: () => void;
