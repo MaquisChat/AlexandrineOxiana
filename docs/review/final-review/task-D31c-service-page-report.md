@@ -324,3 +324,49 @@ It follows from the mend. The attach uses the same session client with `askedToW
   - `lint:css` exit 0; `lint:colours` ok.
   - UI build passed.
   - e2e Chromium `review-queue.spec.ts`: 11/11.
+
+## After the second look (R608)
+
+Worktree `kg-5`, branch `d31c-service-page`, from 5a53b73. Three commits, one per mend: 28328bf (n1), 3a3749e (n2), 6d82cf1 (n3). Nothing changed under `packages/library/`; no words changed. The new tests are in `apps/library-service/src/look-up-again.test.ts`, describe "second look (R608)".
+
+**n1: `failed` only without an outcome.**
+- Failing test: "n1: `failed` only for a lookup that failed outright and has no outcome…" (:1010). It follows the reviewer's sequence: A answered nothing and B failed again; the rules then allow no lookup; a press answers `not-allowed`. It failed first with `lookUp.failed: true` on the press's entry.
+- Change: `apps/library-service/src/routes/review.ts:93-95`. The condition is now `l.why === "failed" && !l.outcome`.
+- The page has no condition of its own (`ReviewQueue.tsx:274` and `:2192` read `lookUp.failed` only), so there is no page test.
+
+**n2: a watched folder's bring-in waits for the carried holds.**
+- Failing test: "n2: a watched folder's bring-in at an opening waits…" (:1037). The library has one entry whose OpenAlex time is an hour ahead, and a file waits in a watched folder. The library is reopened a minute later, with the test's replacement of `state.carryLookUpHolds` holding the carrying back behind a gate.
+- How it avoids a timing race: the replaced `state.watchDeps` (called by `startWatches` just before `startWatchedFolders`, i.e. the moment a bring-in can start asking) records whether the holds had been carried, then opens the gate. The verdict (`carriedAtWatchStart` equals `[true]`) does not depend on timing. A 500 ms fallback only lets a correct start go on, because there the watch never starts while the gate is shut.
+- It failed first with `[false]`. Then: 0 requests, and the file comes in with "Waiting for lookup service response.".
+- A probe of the unfixed code with the order assertion removed sent 0 requests: the watch's stability wait lost the race, as the reviewer expected. The guarantee is the new part.
+- Change, `apps/library-service/src/state.ts`:
+  - :998-1004: `s.holdsCarried` is set before `startProjectsWatches` is called.
+  - :1099-1103: `startWatches` first does `await s.holdsCarried` (it never rejects), then returns without starting anything if `this.session !== s || s.closing.signal.aborted`.
+- The opening's answer: `adopt` already awaited `holdsCarried`, and the watches were never awaited by it, so the answer is no slower.
+- At a close: `closeLibrary` clears `this.session` and `beginClosing` aborts the signal first. The waiting start then returns and starts no watch, so nothing is sent or written by it. `stopWatches` (the whole library) still waits for `watchStarting` with its bounded `suspendTimeoutMs`, as before.
+
+**n3: the pass skips held entries unread.**
+- Failing test: "n3: the pass skips, unread and uncounted…" (:1097). It sets up 50 waiting entries on OpenAlex and a 51st with a second lookup (a DOI at Crossref). OpenAlex is held for an hour, then a timer pass runs (`startLookUpAgain`, as the tick does). Taken entries are counted through the (private) `lookUpInTurn`, which wraps the engine's `lookUpAgain`.
+- It failed first with 51 taken. Now 1 is taken (the Crossref one), with 0 OpenAlex requests and 1 Crossref request.
+- Change:
+  - New `apps/library-service/src/look-up-holds.ts`: `heldBy` and `lookupHeldUntil`, the ONE hold rule. `routes/review.ts:78` (`lookUpOut`) now uses it; its old private `heldBy` is removed.
+  - `state.ts:2080-2085`: the pass asks `heldEntries` once per project.
+  - `state.ts:2109-2133` `heldEntries`: returns nothing when no service is held, so the pass is unchanged then. Otherwise it reads the project's entries once (`bulk.listProjectReview`) and skips an entry when every asked-to-wait lookup with no outcome has every service held. Those lookups are a superset of the due ones, so this is never a second time rule. A read that fails skips nothing.
+- Notes:
+  - With a hold there is now one extra queue read per project per pass, about the cost of carrying the holds (about 78 ms at 500 entries), instead of one read per entry.
+  - A hold that ends during the pass leaves the entry for the next pass.
+
+**Runs (each alone, `nice -n 10`):**
+- service:
+  - look-up-again 40/40
+  - review-queue 23/23
+  - open-library 26/26
+  - close-during-attach 13/13
+  - watched-folders-routes 59/59
+  - device-notices 17/17
+  - startup-token 29/29
+  - server 160 passed, 1 skipped
+  - held-file-document 10/10
+  - ui-only-routes 128/128
+- page: ReviewQueue.lookUp 31/31.
+- `pnpm -r typecheck`: 9/9 Done.
