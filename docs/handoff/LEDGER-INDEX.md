@@ -543,3 +543,4 @@ R617 (2026-11-25 UTC): FR-756's other screens approved with small points at the 
 R618 (2026-11-25 UTC): Mac build 13 exists and passed all checks (run 20; dmg SHA-256 cc6d1f09…0288; scenario Q 2 of 2); it replaces build 12; the owner's page updated
 R619 (2026-11-25 UTC): FR-068 strict ready (4b1496c: I-A's two sentences from one reading of the old place; the dialog shows a refusal's reason; the cause at the old folder; no anchor warning at an unmarked switching copy; completeMove unexported) and merged on kg-join for the build after 13
 R620 (2026-11-25 UTC): CI run 288 green on build 13's code (403f0f8); run 289 on 2f4a00c due ~08:05 UTC; main waits for the owner's word and then receives 2f4a00c exactly
+R621 (2026-11-25 UTC): FR-756's remainder built (277b1ed; step 0: the two lines agree, 2588 tests); two of the builder's choices accepted; to a fresh adversarial review
