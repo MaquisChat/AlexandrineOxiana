@@ -201,3 +201,60 @@ describe("FR-756: the governance screens' list of projects", () => {
     expect(screen.getByText("Choose a project first.")).toBeTruthy();
   });
 });
+
+describe("FR-756, R605 M1: the governance route never says the project is not in the library of a list it did not read", () => {
+  function Host() {
+    return <GovernanceRoutes client={createClient(BASE, TOKEN)} loc={useLocation()} firstReadMs={LIMIT} />;
+  }
+  const NOT_IN = /not in this library/;
+  const screenReads = () =>
+    server.use(
+      http.get(url("/projects/p1/audit"), () => HttpResponse.json({ events: [], total: 0 })),
+      http.get(url("/projects/p1/attention"), () => HttpResponse.json({ marks: [] })),
+    );
+  /** The list's asks in turn: "fail" (no answer), "hold" (never settles), or the list. */
+  function list(asks: Array<"fail" | "hold" | "answer">) {
+    let n = 0;
+    const gate = hang();
+    server.use(
+      http.get(url("/projects"), async () => {
+        const what = asks[Math.min(n++, asks.length - 1)];
+        if (what === "fail") return HttpResponse.error();
+        if (what === "hold") await gate;
+        return HttpResponse.json({ projects: [{ id: "p1", name: "Coastal kinship" }] });
+      }),
+    );
+    return () => n;
+  }
+
+  it("a list that failed, then was given up on “Try again”: never “not in this library”, and the project's screen stays", async () => {
+    screenReads();
+    const asks = list(["fail", "hold"]);
+    window.history.replaceState(null, "", "/audit?project=p1");
+    render(<Host />);
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([UNREACHABLE]);
+    expect(screen.queryByText(NOT_IN)).toBeNull();
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(asks()).toBe(2);
+    expect(alerts()).toEqual([NO_ANSWER]);
+    expect(screen.queryByText(NOT_IN)).toBeNull();
+    expect(screen.getByRole("heading", { level: 1, name: "Audit log" })).toBeTruthy();
+  });
+
+  it("a list given up, then failed on “Try again”: never “not in this library”, and the project's screen stays", async () => {
+    screenReads();
+    const asks = list(["hold", "fail"]);
+    window.history.replaceState(null, "", "/audit?project=p1");
+    render(<Host />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(alerts()).toEqual([UNREACHABLE]));
+    expect(asks()).toBe(2);
+    expect(screen.queryByText(NOT_IN)).toBeNull();
+    expect(screen.getByRole("heading", { level: 1, name: "Audit log" })).toBeTruthy();
+    expect(screen.queryByText("Choose a project first.")).toBeNull();
+  });
+});

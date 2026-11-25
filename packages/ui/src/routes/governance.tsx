@@ -97,14 +97,10 @@ export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT
       (err: unknown) => {
         if (!live) return;
         setListUnreachable(isUnreachable(err));
-        // Given up at the limit: nothing is known of the projects, so the one named in the address is still shown
-        // (never "not in this library"); its sentence alone, not run together with "could not be reached" (R586 M5).
-        if (isNoAnswerInTime(err)) {
-          setListError((err as Error).message);
-          return;
-        }
-        setProjects((cur) => cur ?? []);
-        setListError(errorText(err, "The projects could not be read."));
+        // Given up at the limit or failed: nothing is known of the projects, so the one named in the address is still
+        // shown, never "not in this library" (R605 M1, R601 b): the list stays as it was (unread, or as last read).
+        // Given up: its sentence alone, not run together with "could not be reached" (R586 M5).
+        setListError(isNoAnswerInTime(err) ? (err as Error).message : errorText(err, "The projects could not be read."));
       },
     );
     return () => {
