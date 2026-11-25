@@ -49,6 +49,8 @@ import {
   type ReviewDecision,
   type ReviewGroup,
   type ReviewItem,
+  type ReviewLookUp,
+  type ReviewLookUpOutcome,
   type ReviewPatch,
   type SourceFile,
   type SourceListItem,
@@ -56,7 +58,11 @@ import {
 } from "../../api/import";
 import {
   HELD_FILE_WHY_TEXT,
+  LOOKUP_WAITING_TEXT,
+  LOOK_UP_AGAIN_TEXT,
   PROJECT_REVIEW_PAGE_MAX,
+  lookUpAgainAfter,
+  lookUpGaveUpText,
   reviewGroup,
   type HeldFileDecision,
   type HeldFileRefusalReason,
@@ -242,6 +248,36 @@ const isFound = (i: ReviewItem): boolean => groupOf(i) === "found-file";
 const looksRight = (i: ReviewItem): boolean => (i as HeldItem).heldFile?.why === "looks-right";
 
 const DATE = new Intl.DateTimeFormat("en", { dateStyle: "medium" });
+
+/**
+ * Decision 31 (c): the service's named time as the researcher reads times — their own time zone and their own format
+ * (the browser's locale, as the pairing screen writes a time), with the date, since the time may be on another day.
+ */
+const lookUpTime = (iso: string): string => {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+};
+
+/** What the polite region says after a look-up: the state's own sentence (R577 4), or the button's "after {time}". */
+function lookUpSaid(outcome: ReviewLookUpOutcome, lookUp: ReviewLookUp | undefined): string {
+  if (outcome.kind === "not-yet") return lookUpAgainAfter(lookUpTime(outcome.notBefore));
+  switch (lookUp?.state) {
+    case "waiting":
+      return LOOKUP_WAITING_TEXT;
+    case "found":
+      return LOOK_UP_AGAIN_TEXT.found;
+    case "nothing":
+      return LOOK_UP_AGAIN_TEXT.nothing;
+    case "not-allowed":
+      return LOOK_UP_AGAIN_TEXT.notAllowed;
+    case "gave-up":
+      return lookUpGaveUpText(lookUp.tries);
+    case "failed":
+      return LOOK_UP_AGAIN_TEXT.notLookedUpFailed;
+    default:
+      return "";
+  }
+}
 
 function importTitle(batchId: string | undefined, batches: BatchSummary[]): string {
   const b = batches.find((x) => x.batchId === batchId);
@@ -728,6 +764,70 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   };
 
   /**
+   * Decision 31 (c), "Look up again" (R577 i, iii): one request per press, while nothing else of the queue is under way
+   * (the usual busy state). Answered, the entry is shown as the service lists it now — its new matches after the earlier
+   * ones, its reasons with the state's sentence — and the result is said in the polite region. Locked meanwhile: the queue
+   * is forgotten (as for a decision); decided meanwhile (another window): it leaves the view.
+   */
+  const [lookingUp, setLookingUp] = useState<string | null>(null);
+  const lookUpAgain = async (item: ReviewItem): Promise<void> => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    const g = gen.current;
+    setBusy(true);
+    setLookingUp(item.id);
+    setError(null);
+    try {
+      const { outcome, entry } = await api.lookUpAgain(projectId, item.id);
+      if (g !== gen.current) return;
+      setItems((cur) => cur && cur.map((x) => (x.id === item.id ? entry : x)));
+      // R585 (3): a look-up of this entry was already under way: it still shows "Looking this up again…", with no second
+      // press, until the queue lists the entry changed (read again now and then, a bounded number of times).
+      const answered = outcome.kind === "under-way" ? await afterUnderWay(entry, g) : entry;
+      if (g !== gen.current || !answered) return;
+      const words = outcome.kind === "under-way" ? (answered === entry ? "" : lookUpSaid({ kind: "nothing" }, answered.lookUp)) : lookUpSaid(outcome, entry.lookUp);
+      if (words) setStatus(words);
+    } catch (e) {
+      if (g !== gen.current) return;
+      if (isProjectLocked(e)) forget();
+      else if (e instanceof ApiClientError && e.code === "CONFLICT") leave([item.id], (n) => `This entry had already been reviewed, so it left the queue: ${titleFor(item, n)}`);
+      else setError(errorText(e));
+    } finally {
+      busyRef.current = false;
+      if (g === gen.current) {
+        setBusy(false);
+        setLookingUp(null);
+      }
+    }
+  };
+
+  /**
+   * R585 (3): while another look-up of the entry is under way, the entry is read again every LOOK_UP_RECHECK_MS (at most
+   * LOOK_UP_RECHECKS times) until the queue lists it changed; that entry is shown. Undefined when the view moved on or the
+   * entry left the queue (decided meanwhile: it leaves the view).
+   */
+  const afterUnderWay = async (entry: ReviewItem, g: number): Promise<ReviewItem | undefined> => {
+    const same = JSON.stringify(entry);
+    for (let i = 0; i < LOOK_UP_RECHECKS; i++) {
+      await new Promise((r) => setTimeout(r, LOOK_UP_RECHECK_MS));
+      if (g !== gen.current) return undefined;
+      const page = await api.projectReview(projectId, { source: entry.sourceId!, limit: PROJECT_REVIEW_PAGE_MAX }).catch(() => null);
+      if (g !== gen.current) return undefined;
+      if (!page) continue;
+      const now = page.items.find((x) => x.id === entry.id);
+      if (!now) {
+        leave([entry.id], (n) => `This entry had already been reviewed, so it left the queue: ${titleFor(entry, n)}`);
+        return undefined;
+      }
+      if (JSON.stringify(now) !== same) {
+        setItems((cur) => cur && cur.map((x) => (x.id === entry.id ? now : x)));
+        return now;
+      }
+    }
+    return entry;
+  };
+
+  /**
    * A field confirmed through the source screen's confirm (R149): the record it answers replaces the
    * one shown. In the project's queue, the service is then asked which of that source's entries are
    * left: the confirm that settles a capture entry's last field resolves it in the library (R176 1),
@@ -1208,6 +1308,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               flagFolderNames={flagging ? (id: string) => madeByBatch(id, batchId ?? item.batchId, itemBatch(item), batchesKnown) : () => false as const}
               busy={busy}
               onDecide={(d, done) => void decide(item, d, done)}
+              lookingUp={lookingUp === item.id}
+              onLookUpAgain={() => lookUpAgain(item)}
               onConfirm={(field, value) => confirmField(item, field, value)}
               pointing={pointing}
               epoch={items}
@@ -2014,6 +2116,10 @@ interface ItemPanelProps {
   flagFolderNames(id: string): FolderFlag;
   busy: boolean;
   onDecide(d: ReviewDecision, done: string): void;
+  /** Decision 31 (c): "Look up again" is under way for this entry. */
+  lookingUp: boolean;
+  /** Decision 31 (c): "Look up again" pressed; settles once the entry is shown as answered. */
+  onLookUpAgain(): Promise<void>;
   /** A conflicting field's value chosen through the source screen's confirm (R149). */
   onConfirm(field: string, value: unknown): Promise<void>;
   pointing: Pointing;
@@ -2043,8 +2149,24 @@ type Guarded = (key: string, act: () => void) => GuardedHandlers & { "aria-descr
  * none in the panel's quiet; a press not taken is said under the controls. A key press on a focused control (Tab, then
  * Enter or Space) decides as before, once per press.
  */
-function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collections, tags, flagTitle, flagFolderNames, busy, onDecide, onConfirm, pointing, epoch, notice, onPointedAt, admit, headRef, sectionRef }: ItemPanelProps) {
+function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collections, tags, flagTitle, flagFolderNames, busy, onDecide, lookingUp, onLookUpAgain, onConfirm, pointing, epoch, notice, onPointedAt, admit, headRef, sectionRef }: ItemPanelProps) {
   const [mode, setMode] = useState<"view" | "edit" | "merge">("view");
+  const lookUp = useLookUpOffer(item.lookUp);
+  const lookUpRef = useRef<HTMLButtonElement>(null);
+  const matchesHead = useRef<HTMLHeadingElement>(null);
+  const [lookedUp, setLookedUp] = useState(0);
+  // Answered, and the button has gone (nothing is left to look up): focus goes to the matches' heading, where the answer
+  // is, never to the page. While the button stays (off, or ready again) focus stays on it.
+  useEffect(() => {
+    if (!lookedUp || lookUpRef.current) return;
+    if (document.activeElement === null || document.activeElement === document.body) matchesHead.current?.focus();
+  }, [lookedUp]);
+  const pressLookUp = () => {
+    if (!lookUp.ready || lookingUp || busy) return;
+    void onLookUpAgain().then(() => setLookedUp((n) => n + 1));
+  };
+  const empty = !item.candidates?.length;
+  const lookUpState = item.lookUp?.state;
   const guard = usePressGuard<string>(pointing, epoch);
   const noticeId = `${useId()}-not-taken`;
   const guarded: Guarded = (key, act) => ({
@@ -2219,11 +2341,29 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
                 </button>
               </>
             )}
+            {/* Decision 31 (c): after the entry's reasons, before the candidates' accept buttons. Off (and still focusable,
+                so focus is never lost) before the service's named time and while it runs. */}
+            {lookUp.offered && (
+              <p>
+                <button
+                  type="button"
+                  ref={lookUpRef}
+                  aria-disabled={!lookUp.ready || lookingUp || busy ? true : undefined}
+                  aria-busy={lookingUp || undefined}
+                  onClick={pressLookUp}
+                >
+                  {lookingUp ? LOOK_UP_AGAIN_TEXT.looking : lookUp.ready ? LOOK_UP_AGAIN_TEXT.act : lookUpAgainAfter(lookUpTime(lookUp.notBefore!))}
+                </button>
+              </p>
+            )}
           </Section>
         </Section>
 
-        <Section title="Candidate matches" level={2} className="ao-review__candidates">
-          {!item.candidates?.length && <p className="ao-import__hint">No candidate matches were found.</p>}
+        <Section title="Candidate matches" level={2} className="ao-review__candidates" headingRef={matchesHead}>
+          {/* R566 (8): "No candidate matches were found." only where a look-up was made and found nothing. */}
+          {empty && (lookUpState === "waiting" || lookUpState === "gave-up") && <p className="ao-import__hint">{LOOK_UP_AGAIN_TEXT.notLookedUpYet}</p>}
+          {empty && lookUpState === "failed" && <p className="ao-import__hint">{LOOK_UP_AGAIN_TEXT.notLookedUpFailed}</p>}
+          {empty && (lookUpState === undefined || lookUpState === "nothing" || lookUpState === "found") && <p className="ao-import__hint">No candidate matches were found.</p>}
           {item.candidates && item.candidates.length > 0 && (
             <ol className="ao-review__candidate-list">
               {item.candidates.map((c, i) => (
@@ -2264,6 +2404,31 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
       {mode === "merge" && <MergeForm api={api} projectId={projectId} item={item} busy={busy} guarded={guarded} onMerge={(sid) => onDecide({ action: "merge", sourceId: sid }, "Merged")} />}
     </div>
   );
+}
+
+/** R585 (3): how often, and how many times, an entry another look-up is working on is read again. */
+export const LOOK_UP_RECHECK_MS = 1_000;
+const LOOK_UP_RECHECKS = 30;
+
+/** The longest wait a timer can be given (about 24.8 days); a later time is looked at again then. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * Decision 31 (c): whether "Look up again" is offered for an entry and whether it may be pressed now. Offered while some
+ * lookup is left to ask (now, or from its time on); ready when the service says the act may send now, or once the time it
+ * named has come (the button turns ready by itself then).
+ */
+function useLookUpOffer(l: ReviewLookUp | undefined): { offered: boolean; ready: boolean; notBefore?: string } {
+  const [now, setNow] = useState(() => Date.now());
+  const at = l?.notBefore ? Date.parse(l.notBefore) : Number.NaN;
+  const waiting = !!l && !l.canLookUpNow && at > now;
+  useEffect(() => {
+    if (!waiting) return;
+    const t = setTimeout(() => setNow(Date.now()), Math.min(MAX_TIMER_MS, Math.max(0, at - Date.now()) + 50));
+    return () => clearTimeout(t);
+  }, [waiting, at, now]);
+  if (!l || (!l.canLookUpNow && !l.notBefore)) return { offered: false, ready: false };
+  return { offered: true, ready: !waiting, ...(l.notBefore ? { notBefore: l.notBefore } : {}) };
 }
 
 function CandidateRow({ c, busy, guarded }: { c: Candidate; busy: boolean; guarded: ReturnType<Guarded> }) {
