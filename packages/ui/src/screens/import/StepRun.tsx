@@ -5,7 +5,8 @@
  * over to the report.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ApiClient } from "../../api/client";
+import { STREAM_OPEN_TIMEOUT_MS, type ApiClient, type ApiClientError } from "../../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../../api/firstRead";
 import { isProgressFor, type BatchState, type ImportApi } from "../../api/import";
 import { ErrorNote, errorText, fmt, Section } from "./shared";
 
@@ -19,13 +20,17 @@ export interface StepRunProps {
   onEnded(state: BatchState, error?: string): void;
   /** Focus the heading once shown: the researcher arrived on this run from an address (D1, R145). */
   focusOnArrival?: boolean;
+  /** FR-756: how long each read of the batch's state is waited for (a read given up is one that failed: silent). */
+  firstReadMs?: number;
+  /** FR-756 (R597): how long the event stream is waited for to open before it is closed and tried afresh. */
+  streamOpenMs?: number;
 }
 
 /** Reconnects after the event stream ends before the batch does (then a message and a manual check). */
 const RECONNECTS = 2;
 const RECONNECT_DELAY_MS = 300;
 
-export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArrival = false }: StepRunProps) {
+export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArrival = false, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: StepRunProps) {
   const heading = useRef<HTMLHeadingElement>(null);
   /** Focus the heading once, when the researcher arrived on this run from an address (D1, R145). */
   const arrival = useRef(focusOnArrival);
@@ -53,7 +58,9 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
   /** The batch's state as the service records it; ends the run screen if the batch has ended. */
   const recheck = useCallback(async (): Promise<boolean> => {
     try {
-      const b = (await api.batches(projectId)).find((x) => x.batchId === batchId);
+      // FR-756: given up after `firstReadMs` (the check on arrival comes before listening: one that never settled kept
+      // the step from ever following the run).
+      const b = (await readWithin((signal) => api.batches(projectId, { signal }), firstReadMs)).find((x) => x.batchId === batchId);
       if (!b) return false;
       if (ENDED.has(b.state)) {
         end(b.state);
@@ -64,7 +71,7 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
       // the stream or the next check will tell
     }
     return false;
-  }, [api, projectId, batchId, end]);
+  }, [api, projectId, batchId, end, firstReadMs]);
 
   useEffect(() => {
     const ctl = new AbortController();
@@ -75,8 +82,9 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
       for (let tries = 0; !stop && !over.current; tries++) {
         let failure: unknown;
         try {
-          // A batch that ended before the stream opened would never send its last event: check once open.
-          for await (const e of client.events({ signal: ctl.signal, onOpen: () => void recheck() })) {
+          // A batch that ended before the stream opened would never send its last event: check once open. FR-756 (R597):
+          // a stream not opened within `streamOpenMs` is closed and tried afresh below.
+          for await (const e of client.events({ signal: ctl.signal, onOpen: () => void recheck(), openWithinMs: streamOpenMs })) {
             if (!isProgressFor(batchId, e)) continue;
             const d = e.data;
             if (typeof d.done === "number") setDone(d.done);
@@ -97,7 +105,8 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
         if (await recheck()) return;
         if (tries >= RECONNECTS) {
           setLost(true);
-          if (failure) setError(errorText(failure));
+          // A stream that got no answer says only its own sentence ("did not answer in time" or "could not be reached").
+          if (failure) setError(isUnreachable(failure) ? (failure as ApiClientError).message : errorText(failure));
           return;
         }
         await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS));
@@ -107,7 +116,7 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
       stop = true;
       ctl.abort();
     };
-  }, [client, batchId, recheck, end, attempt]);
+  }, [client, batchId, recheck, end, attempt, streamOpenMs]);
 
   const checkAgain = async () => {
     setError(null);
