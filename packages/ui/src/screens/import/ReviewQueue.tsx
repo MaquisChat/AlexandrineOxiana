@@ -39,6 +39,9 @@
  */
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type MouseEvent, type PointerEvent, type ReactNode, type Ref } from "react";
 import { ApiClientError, type ApiClient } from "../../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../../api/firstRead";
+import { usePageRead } from "../../components/PageReads";
+import { TryAgain } from "../../components/TryAgain";
 import {
   importApi,
   type BatchSummary,
@@ -162,6 +165,8 @@ export interface ReviewQueueProps {
   pageSize?: number;
   /** R585 (3): how often an entry another look-up is working on is read again (tests shorten it). */
   lookUpRecheckMs?: number;
+  /** FR-756: how long each read of the queue is waited for before it is given up (smaller in tests). */
+  firstReadMs?: number;
 }
 
 /** Source requests in flight at once (R115 I4). */
@@ -327,7 +332,7 @@ function groupsOf(items: ReviewItem[], batches: BatchSummary[]): Group[] {
   return [...imports.values(), rest.attach, rest.capture, rest["found-file"], rest.withdrawal].filter((g) => g.items.length > 0);
 }
 
-export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = PROJECT_PAGE, lookUpRecheckMs = LOOK_UP_RECHECK_MS }: ReviewQueueProps) {
+export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = PROJECT_PAGE, lookUpRecheckMs = LOOK_UP_RECHECK_MS, firstReadMs = FIRST_READ_TIMEOUT_MS }: ReviewQueueProps) {
   const api = useMemo(() => importApi(client), [client]);
   /** R470 b: a look at a held file reads the file's own ranges (the reader's other calls are never made in a look). */
   const lookFor = useMemo<LookFor>(() => {
@@ -353,6 +358,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * FR-756: the queue's last read got no answer (given up at `firstReadMs`, or the service could not be reached): its
+   * sentence, with "Try again". Kept apart from `error`, which a decision's failure also uses.
+   */
+  const [unanswered, setUnanswered] = useState<string | null>(null);
+  /** FR-756: a read of the queue is in the air (it may never settle). */
+  const queueOut = useRef(false);
   /**
    * The polite region's messages; each is its own node, so the same words twice are said twice (R313 g). R319 e: a new
    * message never takes the place of one not yet shown — those already shown give way, those not yet shown stay before
@@ -572,21 +584,28 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       setLookAt(null);
     }
     setError(null);
+    setUnanswered(null);
     setItems(null);
+    // FR-756: each read of the queue is given up after `firstReadMs` (its request cancelled), and cancelled when the
+    // queue is left or read anew.
+    const ac = new AbortController();
+    queueOut.current = true;
     /** Every page of the project's queue, oldest first; a page for an older generation stops the read. */
     const readAll = async (): Promise<ReviewItem[]> => {
       const out: ReviewItem[] = [];
       for (let offset = 0; ok(); ) {
-        const page = await api.projectReview(projectId, { offset, limit: pageSize, ...(sourceId ? { source: sourceId } : {}) });
+        const at = offset;
+        const page = await readWithin((signal) => api.projectReview(projectId, { offset: at, limit: pageSize, ...(sourceId ? { source: sourceId } : {}) }, { signal }), firstReadMs, ac.signal);
         out.push(...page.items);
         offset += page.items.length;
         if (page.items.length === 0 || offset >= page.total) break;
       }
       return out;
     };
-    (batchId ? api.review(batchId) : readAll()).then(
+    (batchId ? readWithin((signal) => api.review(batchId, { signal }), firstReadMs, ac.signal) : readAll()).then(
       (list) => {
         if (!ok()) return;
+        queueOut.current = false;
         const shown = laidRef.current;
         if (!shown) {
           // R319 d: the screen's opening lays the section out; its cards appear, so the quiet holds.
@@ -621,15 +640,19 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       },
       (e: unknown) => {
         if (!ok()) return;
+        queueOut.current = false;
         if (isProjectLocked(e)) forget();
+        // FR-756: no answer (none in time, or none at all): its own sentence alone, with "Try again".
+        else if (isUnreachable(e)) setUnanswered((e as ApiClientError).message);
         else setError(errorText(e));
       },
     );
-    api.policy(projectId).then((x) => ok() && setPolicy(x), () => ok() && setPolicy({ pseudonymizeNames: true, encryptionRequired: true }));
+    // FR-756 (R602 M4): the reads beside the queue are given up at the limit silently, as they fail.
+    readWithin((signal) => api.policy(projectId, { signal }), firstReadMs, ac.signal).then((x) => ok() && setPolicy(x), () => ok() && setPolicy({ pseudonymizeNames: true, encryptionRequired: true }));
     api.collections(projectId).then((c) => ok() && setCollections(c), () => {});
     api.tags(projectId).then((t) => ok() && setTags(t), () => {});
     setBatchesKnown(false);
-    api.batches(projectId).then(
+    readWithin((signal) => api.batches(projectId, { signal }), firstReadMs, ac.signal).then(
       (b) => {
         if (!ok()) return;
         setBatches(b);
@@ -640,11 +663,22 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     return () => {
       live = false;
       p.live = false;
+      ac.abort();
+      queueOut.current = false;
       if (flushTimer.current) clearTimeout(flushTimer.current);
       flushTimer.current = null;
       arrived.current = new Map();
     };
-  }, [api, projectId, batchId, sourceId, pageSize, pump, locked, readKey, forget, holdQuiet, putLayout, panelQuiet]);
+  }, [api, projectId, batchId, sourceId, pageSize, pump, locked, readKey, forget, holdQuiet, putLayout, panelQuiet, firstReadMs]);
+  // FR-756 (R605 I2): one sentence and one "Try again" for the page (with the route's picker, when there is one).
+  const { yields, retryAll } = usePageRead("queue", {
+    sentence: unanswered ?? undefined,
+    out: () => queueOut.current,
+    retry: () => {
+      setUnanswered(null);
+      setReadKey((k) => k + 1);
+    },
+  });
   // Unmounting moves the generation on: a decision answered after the screen closed changes nothing.
   useEffect(() => () => void gen.current++, []);
   // R478, R486 e: leaving the queue (unmount, or another project shown) cancels every decision request still open —
@@ -1253,6 +1287,14 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         </p>
       ) : null}
       <ErrorNote error={error} />
+      {unanswered && !yields && (
+        <>
+          <p className="ao-import__error" role="alert">
+            {unanswered}
+          </p>
+          <TryAgain focusTo={title} onPress={retryAll} />
+        </>
+      )}
       <div className="ao-visually-hidden" role="status">
         {said.msgs.map((m) => (
           <p key={m.n}>{m.text}</p>
@@ -1270,7 +1312,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           />
         </div>
       )}
-      {!locked && items === null && !error && <p role="status">Loading…</p>}
+      {!locked && items === null && !error && !unanswered && <p role="status">Loading…</p>}
       {!locked && items !== null && items.length === 0 && (
         <p ref={emptyNote} tabIndex={-1}>
           {batchId ? "Nothing is waiting for review in this import." : sourceId ? "Nothing is waiting for review for this source." : "Nothing is waiting for review in this project."}

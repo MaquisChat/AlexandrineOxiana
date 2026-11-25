@@ -376,11 +376,12 @@ export function importApi(client: ApiClient) {
     cancel: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${bid(batchId)}/cancel`),
     undo: (batchId: string) => r<UndoResult>("POST", `/imports/${bid(batchId)}/undo`),
     report: (batchId: string) => r<ImportReport>("GET", `/imports/${bid(batchId)}/report`),
-    review: async (batchId: string) => (await r<{ items: ReviewItem[] }>("GET", `/imports/${bid(batchId)}/review`)).items,
+    review: async (batchId: string, o: { signal?: AbortSignal } = {}) => (await r<{ items: ReviewItem[] }>("GET", `/imports/${bid(batchId)}/review`, o)).items,
     /** One page of the project's whole review queue (Task 67, R172): every pending entry of every kind, oldest first. */
-    projectReview: async (projectId: string, q: { offset?: number; limit?: number; source?: string } = {}) => {
+    projectReview: async (projectId: string, q: { offset?: number; limit?: number; source?: string } = {}, o: { signal?: AbortSignal } = {}) => {
       const page = await r<ProjectReviewPage>("GET", `/projects/${pid(projectId)}/review`, {
         query: { ...(q.offset ? { offset: q.offset } : {}), ...(q.limit !== undefined ? { limit: q.limit } : {}), ...(q.source ? { source: q.source } : {}) },
+        ...(o.signal ? { signal: o.signal } : {}),
       });
       // Every field of the shared entry is typed through; only the candidates (lookup results) are narrowed.
       const items: ReviewItem[] = page.items.map(({ candidates, ...e }) => ({ ...e, ...(candidates ? { candidates: candidates as Candidate[] } : {}) }));
