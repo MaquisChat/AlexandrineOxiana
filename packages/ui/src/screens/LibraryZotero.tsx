@@ -18,6 +18,7 @@
 import { ZOTERO_SYNC_REASON_TEXT, type ZoteroSyncStateResponse } from "@ao/shared";
 import { useEffect, useRef, useState } from "react";
 import type { LibraryApi } from "../api/library";
+import { readWithin } from "../api/firstRead";
 import { UserText } from "../components/UserText";
 import "./LibraryZotero.css";
 import { LOCKED_TEXT, PAUSED_UNKNOWN_TEXT, ZoteroProgressText, hasUnknownPause, labelOfRef } from "./zoteroWords";
@@ -48,9 +49,11 @@ interface Props {
   /** False once the library has closed: nothing more is requested. */
   open: boolean;
   events: ZoteroEvents;
+  /** FR-756 M4 (R602): a read of the sync's state is given up silently after this long (as a failed one). */
+  firstReadMs?: number;
 }
 
-export function LibraryZotero({ api, projectId, open, events }: Props) {
+export function LibraryZotero({ api, projectId, open, events, firstReadMs }: Props) {
   const [shown, setShown] = useState<{ projectId: string; links: Link[]; running?: ZoteroSyncStateResponse["running"] } | undefined>();
   const [run, setRun] = useState<ZoteroEvents["run"]>();
   const alive = useRef(true);
@@ -61,13 +64,13 @@ export function LibraryZotero({ api, projectId, open, events }: Props) {
   const started = useRef(0);
   const applied = useRef(0);
   const eventCount = useRef(0);
-  const latest = useRef({ api, projectId, open });
-  latest.current = { api, projectId, open };
+  const latest = useRef({ api, projectId, open, firstReadMs });
+  latest.current = { api, projectId, open, firstReadMs };
   /** `afterFinished`: this read follows a finished sync (R299 e: if it fails, the lines go). */
   const startRead = useRef<(afterFinished?: boolean) => void>(() => undefined);
 
   startRead.current = (afterFinished = false) => {
-    const { api: a, projectId: pid, open: isOpen } = latest.current;
+    const { api: a, projectId: pid, open: isOpen, firstReadMs: ms } = latest.current;
     if (!pid || !isOpen || !alive.current) return;
     const mine = gen.current;
     const seq = ++started.current;
@@ -87,8 +90,7 @@ export function LibraryZotero({ api, projectId, open, events }: Props) {
       applied.current = seq;
       setShown(undefined);
     };
-    a.zotero
-      .state()
+    (ms === undefined ? a.zotero.state() : readWithin((signal) => a.zotero.state({ signal }), ms))
       .then((s) => {
         if (!alive.current || mine !== gen.current || seq < applied.current) return;
         if (!s || !Array.isArray(s.links)) return failed();

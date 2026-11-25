@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { errorText, isProjectLocked, type LibraryApi } from "../api/library";
 import type { RecheckProgress } from "../api/verification";
+import { readWithin } from "../api/firstRead";
 
 export type ProjectRecheck =
   | { state: "starting" }
@@ -21,7 +22,8 @@ const isRecheck = (d: unknown): d is RecheckProgress => {
   return !!x && x.kind === "recheck" && typeof x.jobId === "string" && typeof x.projectId === "string" && typeof x.done === "number" && typeof x.total === "number";
 };
 
-export function useProjectRecheck(api: Pick<LibraryApi, "verification">, opts: { onFinished: (projectId: string) => void; onLocked: (projectId: string) => void }) {
+/** `opts.firstReadMs` (FR-756 M4, R602): a question about the running recheck is given up silently after that long. */
+export function useProjectRecheck(api: Pick<LibraryApi, "verification">, opts: { onFinished: (projectId: string) => void; onLocked: (projectId: string) => void; firstReadMs?: number }) {
   const [jobs, setJobs] = useState<Record<string, ProjectRecheck>>({});
   const jobsRef = useRef(jobs);
   jobsRef.current = jobs;
@@ -97,7 +99,8 @@ export function useProjectRecheck(api: Pick<LibraryApi, "verification">, opts: {
     const before = jobsRef.current[projectId];
     let running: { jobId: string; done: number; total: number } | null;
     try {
-      ({ running } = await api.verification.recheckState(projectId));
+      const ms = optsRef.current.firstReadMs;
+      ({ running } = ms === undefined ? await api.verification.recheckState(projectId) : await readWithin((signal) => api.verification.recheckState(projectId, { signal }), ms));
     } catch {
       return;
     }

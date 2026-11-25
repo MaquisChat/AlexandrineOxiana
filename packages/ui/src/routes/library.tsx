@@ -189,7 +189,7 @@ function LibraryFlow({ client, loc, firstReadMs }: { client: ApiClient; loc: App
           firstReadMs={firstReadMs}
           {...(view.path ? { libraryPath: view.path } : {})}
           navigate={navigate}
-          firstUse={(hidden) => <FirstUseTools api={tools} hidden={hidden} />}
+          firstUse={(hidden) => <FirstUseTools api={tools} hidden={hidden} firstReadMs={firstReadMs} />}
           projectFromAddress={projectInQuery(loc.search)}
           onProjectSelected={(id) => {
             // Only while the library is the screen shown: never rewrite another screen's address.

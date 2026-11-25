@@ -164,6 +164,32 @@ describe("Library: first reads that never settle or fail (FR-756 B)", () => {
   });
 });
 
+describe("Library: the reads beside the screen are given up silently at the limit (FR-756 M4, R602)", () => {
+  it("a held review count, recheck state and Zotero read are each cancelled at the limit, and nothing new is shown", async () => {
+    const gate = hang();
+    const seen = new Map<string, AbortSignal>();
+    const held = (name: string, body: unknown) => async ({ request }: { request: Request }) => {
+      seen.set(name, request.signal);
+      await gate;
+      return HttpResponse.json(body as never);
+    };
+    server.use(
+      http.get(url("/projects/:id/review"), held("review", { items: [], total: 1, offset: 0, limit: 0 })),
+      http.get(url("/projects/:id/recheck"), held("recheck", { running: null })),
+      http.get(url("/zotero/sync"), held("zotero", { links: [] })),
+      ...libraryHandlers(),
+    );
+    show(300);
+    await screen.findByText("Ethnography at Work");
+    await waitFor(() => expect([...seen.keys()].sort()).toEqual(["recheck", "review", "zotero"]));
+    await waitFor(() => expect([...seen.values()].every((s) => s.aborted)).toBe(true), { timeout: 3000 });
+    expect(alerts()).toEqual([]);
+    expect(tryAgain()).toBeNull();
+    expect(screen.queryByRole("link", { name: /Review queue/ })).toBeNull();
+    expect(screen.queryByTestId("zotero-lines")).toBeNull();
+  });
+});
+
 describe("Library: an answer clears a give-up; a project switch clears the alerts of the project left (FR-756 I2, R602)", () => {
   it("a projects read given up, then answered with the service's own failure after “Try again”: only the service's sentence, no “Try again”", async () => {
     let phase: "hang" | "refuse" = "hang";

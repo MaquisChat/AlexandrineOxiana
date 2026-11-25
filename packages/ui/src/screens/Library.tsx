@@ -324,6 +324,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       refresh();
     },
     onLocked: markLocked,
+    firstReadMs,
   });
   const recheckEvent = useRef(recheck.onEvent);
   recheckEvent.current = recheck.onEvent;
@@ -561,15 +562,15 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     setWaiting(undefined);
     if (!projectId || locked) return;
     const ac = new AbortController();
-    api.reviewQueue
-      .count(projectId, { signal: ac.signal })
+    // FR-756 M4 (R602): given up silently at the limit, as when it fails.
+    readWithin((signal) => api.reviewQueue.count(projectId, { signal }), firstReadMs, ac.signal)
       .then((total) => {
         if (!ac.signal.aborted) setWaiting({ projectId, total });
       })
       // Without the count (a read-only library, a lock meanwhile) the link is not offered; the list says why.
       .catch(() => {});
     return () => ac.abort();
-  }, [api, projectId, locked, reload]);
+  }, [api, projectId, locked, reload, firstReadMs]);
 
   // ---- the index (D8): when a rebuild ends, the sources are read again ----
   const indexState = state.index?.state;
@@ -804,7 +805,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           )}
         </div>
       </header>
-      <LibraryZotero api={api} projectId={project?.id} open={libraryOpen && !closedUnder} events={zoteroEvents} />
+      <LibraryZotero api={api} projectId={project?.id} open={libraryOpen && !closedUnder} events={zoteroEvents} firstReadMs={firstReadMs} />
       {recovering && (
         <NewRecoveryCode
           api={api}

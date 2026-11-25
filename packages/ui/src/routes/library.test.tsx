@@ -193,6 +193,24 @@ describe("library routes", () => {
       expect(document.activeElement).not.toBe(document.body);
     });
 
+    it("R602 M4: the tools question's read beside the library is given up silently at the limit and cancelled", async () => {
+      const gate = hang();
+      let signal: AbortSignal | undefined;
+      server.use(
+        http.get(url("/tools"), async ({ request }) => {
+          signal = request.signal;
+          await gate;
+          return HttpResponse.json({ platform: null, tools: [] });
+        }),
+        ...libraryHandlers(),
+      );
+      render(<LibraryRoutes client={testClient()} firstReadMs={300} />);
+      expect(await screen.findByRole("navigation", { name: "Projects" })).toBeTruthy();
+      await waitFor(() => expect(signal?.aborted).toBe(true), { timeout: 3000 });
+      expect(screen.queryAllByRole("alert")).toHaveLength(0);
+      expect(tryAgain()).toBeNull();
+    });
+
     it("a list that FAILS still shows the chooser, which says why (unchanged)", async () => {
       server.use(http.get(url("/libraries"), () => HttpResponse.error()));
       render(<LibraryRoutes client={testClient()} firstReadMs={300} />);
