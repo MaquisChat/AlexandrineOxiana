@@ -12,7 +12,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
-import { LOOKUP_WAITING_TEXT, LOOK_UP_AGAIN_TEXT, lookUpAgainAfter, lookUpGaveUpText, type ReviewLookUpAgainResponse } from "@ao/shared";
+import { LIBRARY_CLOSED_TEXT, LOOKUP_WAITING_TEXT, LOOK_UP_AGAIN_TEXT, lookUpAgainAfter, lookUpGaveUpText, type ReviewLookUpAgainResponse } from "@ao/shared";
 import type { Candidate, ReviewItem } from "../../api/import";
 import { BASE as SERVICE, mockService, P1, server, type ServiceSetup } from "../../test/importService";
 import { DECIDE_SETTLE_MS, ReviewQueue } from "./ReviewQueue";
@@ -500,5 +500,34 @@ describe("the button's time (R600 m5)", () => {
     await openEntry(user);
     const b = await screen.findByRole("button", { name: /^Look up again \(after / });
     expect(b.textContent).toBe(`Look up again (after ${when(notBefore)})`);
+  });
+});
+
+describe("a press answered with a refusal or no answer (R600 m7)", () => {
+  const item = () => entry({ reasons: [UNIDENTIFIED], lookUp: { state: "failed", tries: 0, canLookUpNow: true, failed: true } });
+  const refusing = (res: () => Response) => http.post(`${SERVICE}/review/:itemId/look-up-again`, () => res());
+
+  it("409 LIBRARY_CLOSED: its sentence is shown, and the button is ready again", async () => {
+    const { user } = setup(item(), [refusing(() => HttpResponse.json({ error: { code: "LIBRARY_CLOSED", message: LIBRARY_CLOSED_TEXT } }, { status: 409 }))]);
+    await openEntry(user);
+    await user.click(await screen.findByRole("button", { name: "Look up again" }));
+    expect(await screen.findByText(LIBRARY_CLOSED_TEXT)).toBeTruthy();
+    expect((await screen.findByRole("button", { name: "Look up again" })).getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it("409 CONFLICT: the entry had already been reviewed, so it leaves the view, said", async () => {
+    const { user } = setup(item(), [refusing(() => HttpResponse.json({ error: { code: "CONFLICT", message: "This item has already been reviewed." } }, { status: 409 }))]);
+    await openEntry(user);
+    await user.click(await screen.findByRole("button", { name: "Look up again" }));
+    await waitFor(() => expect(screen.getAllByRole("status").some((r) => r.textContent?.startsWith("This entry had already been reviewed, so it left the queue: "))).toBe(true));
+    expect(screen.queryByRole("button", { name: "Show Tide-line notes" })).toBeNull();
+  });
+
+  it("no answer (a network failure): an error is said, and the button is ready again", async () => {
+    const { user } = setup(item(), [refusing(() => HttpResponse.error())]);
+    await openEntry(user);
+    await user.click(await screen.findByRole("button", { name: "Look up again" }));
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect((await screen.findByRole("button", { name: "Look up again" })).getAttribute("aria-disabled")).toBeNull();
   });
 });

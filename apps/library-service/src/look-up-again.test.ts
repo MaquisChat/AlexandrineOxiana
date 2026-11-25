@@ -981,4 +981,26 @@ describe("fix round (R600)", () => {
     expect(passes).toEqual([undefined, [sealed]]);
     expect(sent).toEqual([1, 2].map((i) => `api.openalex.org ${titleOf(i)} Souza`));
   });
+
+  it("m7: an old session's pass, when the library is closed and opened again, sends and writes nothing more; the new session's pass takes the entries once", { timeout: 30_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(2);
+    answer = () => NO_RESULTS;
+    const held = holdFirstRequest();
+    await reopen(lib, 16 * MIN);
+    await held.atGate;
+    const closing = call({ method: "POST", url: "/libraries/close" });
+    held.release();
+    expect((await closing).status).toBe(200);
+    await svc!.state.idle();
+    expect(sent).toEqual([]);
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: lib.path } });
+    expect(r.status, r.body).toBe(200);
+    await svc!.state.idle();
+    expect(sent).toEqual([1, 2].map((i) => `api.openalex.org ${titleOf(i)} Souza`));
+    const entries = await storedEntries(lib.pid);
+    const ids = lib.sources.map((sid) => entries.find((e) => e.sourceId === sid)!.id);
+    // One outcome per entry, each the new session's (the old one's send was cut before its request left).
+    expect((await lookUpAudit(lib.pid)).filter((a) => a.op === LOOK_UP_AGAIN_OP).map((a) => a.entry)).toEqual(ids);
+  });
 });
