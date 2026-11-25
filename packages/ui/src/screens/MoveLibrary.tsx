@@ -14,6 +14,7 @@
  * screen stops reading the stream (the move itself carries on in the service).
  */
 import { useEffect, useId, useRef, useState } from "react";
+import { MOVE_NOT_FINISHED_REASON, moveNotFinishedParts } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { isStreamCutOff, normaliseRoot, type GovernanceApi, type MovePlan, type MoveProgress, type MoveStatus } from "../api/governance";
 import { ConfirmDialog } from "../components/ReasonDialog";
@@ -48,7 +49,24 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
   const [plan, setPlan] = useState<MovePlan | null>(null);
   const [progress, setProgress] = useState<MoveProgress | null>(null);
   const [verified, setVerified] = useState<{ token: string; newRoot: string; message: string; warnings: string[] } | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setErrorText] = useState<string | null>(null);
+  /**
+   * FR-755 (R578): the move failed once it had closed the old copy; the library is closed and opening it at this new
+   * place finishes the move. Its sentence names the place (the researcher's own text, through UserText).
+   */
+  const [notFinished, setNotFinished] = useState<string | null>(null);
+  const setError = (e: string | null) => {
+    setErrorText(e);
+    setNotFinished(null);
+  };
+  /** A failed move's answer: the sentence of a move that did not finish, or the error with today's ending. */
+  const failedWith = (e: { message: string; reason?: string }, newRoot: string) => {
+    if (e.reason === MOVE_NOT_FINISHED_REASON) {
+      setErrorText(null);
+      setNotFinished(newRoot);
+    } else setError(`${e.message} The move stopped; nothing was deleted, and the library stays where it was.`);
+    setStage("failed");
+  };
   const [waiting, setWaiting] = useState(false);
   /** From the failure of a move request until the first status answer (R399 d). */
   const [checking, setChecking] = useState(false);
@@ -108,8 +126,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
         }
         if (failed && failed.attempt === attempt && sameRoot(failed.newRoot, target)) {
           setWaiting(false);
-          setError(`${failed.error.message} The move stopped; nothing was deleted, and the library stays where it was.`);
-          setStage("failed");
+          failedWith(failed.error, target);
           return;
         }
         if (notStarted !== undefined) {
@@ -171,8 +188,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
         started = true;
         if ("progress" in line) setProgress(line.progress);
         else if ("error" in line) {
-          setError(`${line.error.message} The move stopped; nothing was deleted, and the library stays where it was.`);
-          setStage("failed");
+          failedWith(line.error, target);
           return;
         } else if ("done" in line) {
           const r = line.result;
@@ -262,6 +278,18 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
           {error}
         </p>
       ) : null}
+      {notFinished !== null
+        ? (() => {
+            const [before, place, after] = moveNotFinishedParts(notFinished);
+            return (
+              <p role="alert" className="ao-warning">
+                {before}
+                <UserText>{place}</UserText>
+                {after}
+              </p>
+            );
+          })()
+        : null}
 
       {plan && stage === "plan" ? (
         <section className="ao-card" aria-labelledby={`${ids}-plan`}>

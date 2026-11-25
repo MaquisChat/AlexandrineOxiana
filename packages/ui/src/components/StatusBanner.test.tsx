@@ -465,3 +465,38 @@ describe("volumeOf", () => {
     expect(screen.queryByRole("button")).toBeNull();
   });
 });
+
+describe("FR-755 (R578): a move that had not finished", () => {
+  const sentenceOf = (kind: string) => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "*", project: "library", kind, detail: "ENOSPC: /Volumes/x/.move-journal.json" }] });
+    render(<StatusBanner variant={b!} />);
+    const t = screen.getByRole("status").textContent;
+    cleanup();
+    return t;
+  };
+
+  it("the opening that finished it says so once, in plain words; one that could not says why and that opening again tries again", () => {
+    expect(sentenceOf("move-finished-at-opening")).toBe("The move of this library to this folder had not finished. It was finished when the library was opened here; nothing was lost.");
+    expect(sentenceOf("move-not-finished-disk-full")).toBe(
+      "The move of this library to this folder has not finished, and it could not be finished now because the disk is full. The library is open read-only and nothing was lost; opening it again will try again.",
+    );
+    expect(sentenceOf("move-not-finished-not-writable")).toMatch(/because this folder cannot be written to\. .*opening it again will try again\.$/u);
+    expect(sentenceOf("move-not-finished-in-use")).toMatch(/because the library or its old copy is open on another computer\. /u);
+    expect(sentenceOf("move-not-finished")).toMatch(/because a step of it failed\. /u);
+    for (const k of ["move-finished-at-opening", "move-not-finished-disk-full"]) expect(sentenceOf(k)).not.toMatch(/ENOSPC|Volumes/u);
+  });
+
+  it("the old copy of a move that has not finished names the new place to open (the researcher's text, isolated)", () => {
+    const place = "/Volumes/Field SSD/Library ‮gpj";
+    const banners = bannersFor({ mode: "read-only", readOnlyReason: "moved", moveUnfinishedTo: place });
+    expect(banners).toEqual([{ kind: "read-only", reason: "moved", newRoot: place }]);
+    render(<StatusBanner variant={banners[0]!} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe(`Read-only — this is the old copy of a library whose move has not finished. Open the library at its new place, ${place}, and the move will be finished then; nothing is lost.`);
+    expect(status.querySelector("bdi, [dir='auto']")).not.toBeNull();
+    cleanup();
+    // A finished move's old copy: as before.
+    render(<StatusBanner variant={bannersFor({ mode: "read-only", readOnlyReason: "moved" })[0]!} />);
+    expect(screen.getByRole("status").textContent).toBe("Read-only — this is the old copy of a library that was moved. Changes are off.");
+  });
+});

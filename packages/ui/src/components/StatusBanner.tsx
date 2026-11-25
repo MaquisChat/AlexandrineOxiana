@@ -22,7 +22,8 @@ import "./library.css";
 export type BannerVariant =
   | { kind: "read-only-locked"; hostname?: string }
   | { kind: "read-only-newer-format" }
-  | { kind: "read-only"; reason?: string }
+  /** `newRoot`: with "moved", the new place of a move that has not finished (FR-755). */
+  | { kind: "read-only"; reason?: string; newRoot?: string }
   | { kind: "offline"; volume: string }
   /** `total` 0: the rebuild has started but not counted the sources yet. */
   | { kind: "index-rebuilding"; done: number; total: number }
@@ -96,6 +97,16 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   // Said of the opening (R465 b), so it stays true when a folder added or retried later does run.
   "watched-folders-unreadable": () =>
     "This computer's list of watched folders could not be read when this library was opened, so its watched folders were not started then. Files put in them are not imported until they run. Open the library again to start them all.",
+  // FR-755 (R578): an opening of the library at the new place of this computer's own unfinished move. For this session only.
+  "move-finished-at-opening": () => "The move of this library to this folder had not finished. It was finished when the library was opened here; nothing was lost.",
+  "move-not-finished-disk-full": () =>
+    "The move of this library to this folder has not finished, and it could not be finished now because the disk is full. The library is open read-only and nothing was lost; opening it again will try again.",
+  "move-not-finished-not-writable": () =>
+    "The move of this library to this folder has not finished, and it could not be finished now because this folder cannot be written to. The library is open read-only and nothing was lost; opening it again will try again.",
+  "move-not-finished-in-use": () =>
+    "The move of this library to this folder has not finished, and it could not be finished now because the library or its old copy is open on another computer. The library is open read-only and nothing was lost; opening it again will try again.",
+  "move-not-finished": () =>
+    "The move of this library to this folder has not finished, and it could not be finished now because a step of it failed. The library is open read-only and nothing was lost; opening it again will try again.",
   "rolled-back-incomplete-write": (p) => `An interrupted change in ${p} was undone when the library opened, so nothing half-saved was kept.`,
   "invalid-txn-marker": (p) => `A note left by an interrupted change in ${p} could not be read. It was kept aside and nothing was changed.`,
   "incomplete-write-pending": (p) => `An interrupted change in ${p} could not be finished or undone yet. It is tried again when the library is next opened with write access.`,
@@ -198,6 +209,9 @@ function text(v: BannerVariant): string {
     case "read-only-newer-format":
       return "Read-only — newer format. This library was saved by a newer version of the app; update the app to make changes.";
     case "read-only":
+      if (v.reason === "moved" && v.newRoot) {
+        return `Read-only — this is the old copy of a library whose move has not finished. Open the library at its new place, ${v.newRoot}, and the move will be finished then; nothing is lost.`;
+      }
       return `Read-only${v.reason && READ_ONLY_REASONS[v.reason] ? ` — ${READ_ONLY_REASONS[v.reason]}` : ""}. Changes are off.`;
     case "offline":
       return `Offline — reconnecting when ${v.volume} returns. Nothing can be changed until then; nothing is lost.`;
@@ -357,13 +371,14 @@ export interface BannerContext {
 }
 
 /** Banners for the library's state, in order: access, index progress, integrity warnings, project warnings. */
-export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyReason" | "integrityWarnings" | "projectWarnings" | "index" | "notices" | "destructionOldCopiesPending">>, ctx: BannerContext = {}): BannerVariant[] {
+export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyReason" | "moveUnfinishedTo" | "integrityWarnings" | "projectWarnings" | "index" | "notices" | "destructionOldCopiesPending">>, ctx: BannerContext = {}): BannerVariant[] {
   const out: BannerVariant[] = [];
   if (state.mode === "read-only") {
     const r = state.readOnlyReason;
     if (r === "locked-by-other-device") out.push(ctx.hostname ? { kind: "read-only-locked", hostname: ctx.hostname } : { kind: "read-only-locked" });
     else if (r === "newer-format") out.push({ kind: "read-only-newer-format" });
     else if (r === "offline") out.push({ kind: "offline", volume: ctx.volume ?? "the library's drive" });
+    else if (r === "moved" && state.moveUnfinishedTo) out.push({ kind: "read-only", reason: r, newRoot: state.moveUnfinishedTo });
     else out.push(r ? { kind: "read-only", reason: r } : { kind: "read-only" });
   }
   // The library's state says a rebuild runs (D8) even before progress arrives; progress events say how far.

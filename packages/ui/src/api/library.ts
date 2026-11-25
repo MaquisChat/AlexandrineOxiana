@@ -53,6 +53,8 @@ export interface CurrentLibrary {
   name: string;
   mode: "read-write" | "read-only";
   readOnlyReason?: ReadOnlyReason | (string & {});
+  /** With "moved": the new place of this old copy's move when that move has not finished (FR-755, R578 (2)). */
+  moveUnfinishedTo?: string;
   /** With "locked-by-other-device": the name of the device holding the library (R118; never a user name). */
   lockedBy?: string;
   /** The index when it is not ready (D8). */
@@ -126,6 +128,7 @@ export interface LibraryState {
   name?: string;
   mode?: CurrentLibrary["mode"];
   readOnlyReason?: CurrentLibrary["readOnlyReason"];
+  moveUnfinishedTo?: CurrentLibrary["moveUnfinishedTo"];
   lockedBy?: CurrentLibrary["lockedBy"];
   index?: IndexStatus;
   integrityWarnings?: IntegrityWarning[];
