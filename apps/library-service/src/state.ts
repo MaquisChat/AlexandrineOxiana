@@ -15,6 +15,9 @@ import {
   backupFailure,
   backupIfDue,
   backupsAwaitingRemoval,
+  dueLookUps,
+  lookUpAgain,
+  type LookUpAgainResult,
   oldCopiesAwaitingDeletion,
   oldCopiesBehindWarning,
   resumeDestruction,
@@ -189,6 +192,8 @@ export interface StateOptions {
   now: () => Date;
   /** How often the backup scheduler checks for due backups (default 1 hour). */
   backupCheckMs: number;
+  /** How often the automatic "Look up again" pass runs while a library is open (default LOOK_UP_AGAIN_CHECK_MS). */
+  lookUpAgainCheckMs?: number;
   log: { info(o: object, msg?: string): void; warn(o: object, msg?: string): void };
   watchStabilityMs?: number;
   /** How long an import may take to reach a safe point when paused (default SUSPEND_TIMEOUT_MS). */
@@ -204,6 +209,14 @@ export interface StateOptions {
   /** Test seam: the tick of the automatic Zotero sync's scheduler (Task Z10; default 60,000 ms). Not an environment variable. */
   zoteroTickMs?: number;
 }
+
+/**
+ * Decision 31 (c), R566 (3): the automatic "Look up again" pass takes at most this many entries, one after another; the
+ * next pass (the timer's, an unlock's, the next opening's) takes the rest.
+ */
+export const LOOK_UP_AGAIN_PASS_MAX = 20;
+/** Decision 31 (c): the automatic pass's quiet timer while a library is open (ten minutes). */
+export const LOOK_UP_AGAIN_CHECK_MS = 10 * 60_000;
 
 /** How long GET /libraries waits, once, for the reopen at start (D5, I1). */
 export const STARTUP_WAIT_MS = 30_000;
@@ -292,6 +305,13 @@ export class ServiceState {
   private workerStarting: Promise<ServiceWorker> | undefined;
   private readonly tasks = new Set<Promise<unknown>>();
   private backupTimer: ReturnType<typeof setInterval> | undefined;
+  /** Decision 31 (c): the automatic "Look up again" pass's timer (started in `activate`, stopped at close and quiesce). */
+  private lookUpTimer: ReturnType<typeof setInterval> | undefined;
+  /** The pass running now (one at a time), and whether another was asked for while it ran (an unlock, the timer). */
+  private lookUpPass: Promise<void> | undefined;
+  private lookUpPassAgain = false;
+  /** Look-ups take turns: the automatic pass's entries and the researcher's act, one at a time per service. */
+  private lookUpTurn: Promise<unknown> = Promise.resolve();
   /** Roots of libraries seen this run: paths inside them are shown library-relative in errors. */
   readonly roots = new Set<string>();
   readonly tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -967,12 +987,16 @@ export class ServiceState {
       this.startWork("backup", async () => {
         await this.runScheduledBackups();
       });
+      // Decision 31 (c): the entries whose left-out lookups came due while the app was closed are looked up again now,
+      // in the background (the opening's answer does not wait for it).
+      this.startLookUpAgain();
     }
     s.http.setDiskCache(true); // in use again (after a move that was not made)
     this.startFind(s);
     if (this.worker) this.attachWorker(s, this.worker);
     else if (this.opts.autoStartWorker && this.opts.worker) this.track(this.ensureWorker(), "starting the media helper");
     this.startBackupScheduler();
+    this.startLookUpAgainTimer();
     // Automatic Zotero syncs (Task Z10): the first no sooner than 2 minutes from now; read-write only. Stopped (awaited)
     // before the sync's holder at close, switch, quiesce and shutdown, and started again here after a move or a reopen.
     this.zoteroSync.startScheduler(this, s);
@@ -1200,6 +1224,7 @@ export class ServiceState {
     }
     try {
       this.stopBackupScheduler();
+      this.stopLookUpAgainTimer();
       await this.stopWatches(s);
       // A start of watches that did not end in time could still leave a watch running during the copy: refused (R515 N1).
       if (s.watchStarting.size) throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
@@ -1296,6 +1321,7 @@ export class ServiceState {
     // lands after the lock is released. Then the lookup client sends nothing more (FR-749, R546): see beginClosing.
     await this.beginClosing(s);
     this.stopBackupScheduler();
+    this.stopLookUpAgainTimer();
     // N-5: the rerun of interrupted jobs starts no further job, and a transcription is asked to stop
     // too; what is still running when the grace period ends is abandoned below.
     const stoppable = [...this.work.values()].filter((w) => STOPPED_AT_CLOSE.has(w.kind));
@@ -1931,6 +1957,108 @@ export class ServiceState {
   stopBackupScheduler(): void {
     if (this.backupTimer) clearInterval(this.backupTimer);
     this.backupTimer = undefined;
+  }
+
+  // ---- "Look up again" (decision 31 (c); R566 3, 4, 5; R577 i, iv) --------------------------
+
+  /**
+   * Starts the automatic pass as registered work of the session (`idle()` waits for it, a move's quiesce drains it): at
+   * the opening, at an unlock, and on the quiet timer. One pass at a time: asked for while one runs, another runs once
+   * that one has ended (so an unlock during a pass is not missed). Read-write libraries only.
+   */
+  startLookUpAgain(): void {
+    const s = this.session;
+    if (!s || s.lib.mode !== "read-write" || this.startsHeld || this.shuttingDown || s.closing.signal.aborted) return;
+    if (this.lookUpPass) {
+      this.lookUpPassAgain = true;
+      return;
+    }
+    this.lookUpPass = this.startWork("lookup-again", async (ctl) => {
+      try {
+        do {
+          this.lookUpPassAgain = false;
+          await this.runLookUpAgain(ctl);
+        } while (this.lookUpPassAgain && !ctl.stopping);
+      } finally {
+        this.lookUpPass = undefined;
+        this.lookUpPassAgain = false;
+      }
+    });
+  }
+
+  /**
+   * One automatic pass (R566 3): for each unlocked project of the open read-write library, the entries `dueLookUps`
+   * lists (oldest first), each looked up again by the library's `lookUpAgain` — strictly one after another, at most
+   * LOOK_UP_AGAIN_PASS_MAX entries in all. It stops at once when the library begins to close, when a move holds work
+   * back or asks the work to stop, or when another library is open. A service that asks to wait again is held by the
+   * session's lookup client, and `lookUpAgain` leaves a held service out without sending (R411), so the rest of the pass
+   * sends it nothing. A lookup that failed outright is never due (R577 iv): only the researcher's act asks it. Returns
+   * how many entries it took.
+   */
+  async runLookUpAgain(ctl: WorkControl = { stopping: false }): Promise<number> {
+    const s = this.session;
+    let taken = 0;
+    const stop = () => ctl.stopping || this.startsHeld || this.shuttingDown || s?.closing.signal.aborted === true || this.session !== s;
+    if (!s || s.lib.mode !== "read-write" || stop()) return taken;
+    for (const p of s.repo.listProjects()) {
+      if (stop()) return taken;
+      // A locked project waits for its unlock (R566 4): nothing of it is read or asked.
+      if (!s.repo.isUnlocked(p.id)) continue;
+      let due: Awaited<ReturnType<typeof dueLookUps>>;
+      try {
+        due = await dueLookUps(s.repo, p.id, this.opts.now());
+      } catch (err) {
+        this.opts.log.warn({ err: this.describe(err) }, "looking up again: the review queue could not be read");
+        continue;
+      }
+      for (const d of due) {
+        if (taken >= LOOK_UP_AGAIN_PASS_MAX || stop()) return taken;
+        taken++;
+        let r: LookUpAgainResult;
+        try {
+          r = await this.lookUpInTurn(() => lookUpAgain(s.repo, s.http, p.id, d.entryId, { by: "automatic", closing: s.closing.signal, now: this.opts.now() }));
+        } catch (err) {
+          // A refusal by the project's rules (audited by the library) or a failure of this one entry: the next goes on.
+          this.opts.log.warn({ err: this.describe(err) }, "looking up again: an entry was not looked up");
+          continue;
+        }
+        if (r.done) continue;
+        // The library began to close (or another opened): nothing more is sent or written.
+        if (r.why === "closing" || r.why === "cancelled" || r.why === "read-only") return taken;
+        // Locked meanwhile: the rest of this project waits for its unlock.
+        if (r.why === "locked") break;
+      }
+    }
+    return taken;
+  }
+
+  /** The researcher's "Look up again" (the route): takes its turn with the automatic pass's entries. */
+  lookUpAgainByHand(s: Session, projectId: string, entryId: string): Promise<LookUpAgainResult> {
+    return this.lookUpInTurn(() => lookUpAgain(s.repo, s.http, projectId, entryId, { by: "researcher", closing: s.closing.signal, now: this.opts.now() }));
+  }
+
+  /** The service's clock (the entries' times and the pass's "now"). */
+  now(): Date {
+    return this.opts.now();
+  }
+
+  /** One look-up at a time: two look-ups of one entry at once would both send (the engine report's §9 item 6). */
+  private lookUpInTurn<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.lookUpTurn.then(fn, fn);
+    this.lookUpTurn = run.catch(() => {});
+    return run;
+  }
+
+  private startLookUpAgainTimer(): void {
+    this.stopLookUpAgainTimer();
+    const t = setInterval(() => this.startLookUpAgain(), this.opts.lookUpAgainCheckMs ?? LOOK_UP_AGAIN_CHECK_MS);
+    t.unref?.();
+    this.lookUpTimer = t;
+  }
+
+  stopLookUpAgainTimer(): void {
+    if (this.lookUpTimer) clearInterval(this.lookUpTimer);
+    this.lookUpTimer = undefined;
   }
 
   // ---- shutdown --------------------------------------------------------------------------

@@ -161,6 +161,8 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     state.startWork("backup", async () => {
       await state.runScheduledBackups(id);
     });
+    // Decision 31 (c), R566 (4): a locked project's left-out lookups waited for its unlock; the automatic pass runs now.
+    state.startLookUpAgain();
     state.publishState();
     return { unlocked: true };
   });

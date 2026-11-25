@@ -59,6 +59,8 @@ export interface ServiceOptions {
   autoStartWorker?: boolean;
   now?: () => Date;
   backupCheckMs?: number;
+  /** How often the automatic "Look up again" pass runs while a library is open (decision 31 c; default ten minutes). */
+  lookUpAgainCheckMs?: number;
   pairing?: PairingOptions;
   /** How long an import may take to reach a safe point when paused (test seam). */
   suspendTimeoutMs?: number;
@@ -183,6 +185,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     autoStartWorker: opts.autoStartWorker ?? opts.worker === undefined,
     now: opts.now ?? (() => new Date()),
     backupCheckMs: opts.backupCheckMs ?? 60 * 60_000,
+    ...(opts.lookUpAgainCheckMs !== undefined ? { lookUpAgainCheckMs: opts.lookUpAgainCheckMs } : {}),
     ...(opts.watchStabilityMs !== undefined ? { watchStabilityMs: opts.watchStabilityMs } : {}),
     ...(opts.suspendTimeoutMs !== undefined ? { suspendTimeoutMs: opts.suspendTimeoutMs } : {}),
     ...(opts.openLibrary ? { openLibrary: opts.openLibrary } : {}),
