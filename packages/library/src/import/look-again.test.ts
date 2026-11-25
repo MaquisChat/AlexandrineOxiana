@@ -718,6 +718,44 @@ describe("decision 31 (c), R585 I1: two look-ups of one entry", () => {
     expect(end.reasons).not.toContain(LOOKUP_WAITING_TEXT);
     expect(end.candidates).toHaveLength(2);
   });
+
+  it("FR-758 (two handles): the look-up that really sent is the slower to write; the other answered from the cache wrote first — the time of the last real try is kept", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    expect((await entry(p, e!.id)).leftOut![0]!.lastTriedAt).toBeUndefined();
+    const repo2 = await openTestRepo(lib, ring, { scryptN: 2 ** 10, actor: "tester", clock: () => new Date(now), tz: "UTC" });
+    now += 16 * MIN;
+    answers["api.openalex.org"] = () => SEARCH;
+    // Only the first call is held once answered (B's): the second handle's call is served from the client's cache.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    let reached!: () => void;
+    const atGate = new Promise<void>((r) => (reached = r));
+    const orig = http.getJson.bind(http) as (...a: unknown[]) => Promise<unknown>;
+    let calls = 0;
+    (http as unknown as { getJson: (...a: unknown[]) => Promise<unknown> }).getJson = async (...a: unknown[]) => {
+      if (++calls > 1) return orig(...a);
+      const v = await orig(...a);
+      reached();
+      await gate;
+      return v;
+    };
+    const tB = new Date(now);
+    const runB = lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: tB });
+    await atGate; // B's request left and was answered; its write is held
+    now += 2 * MIN;
+    const sentBefore = sent.length;
+    const ra = await lookUpAgain(repo2, http, p.id, e!.id, { by: "researcher", now: new Date(now) });
+    expect(ra).toMatchObject({ done: true, sent: 0, state: { state: "found" } });
+    expect(sent.length).toBe(sentBefore);
+    release();
+    expect(await runB).toMatchObject({ done: true, sent: 1, state: { state: "found" } });
+    const end = await entry(p, e!.id);
+    expect(end.leftOut![0]).toMatchObject({ outcome: "found", lastTriedAt: tB.toISOString() });
+  });
 });
 
 describe("decision 31 (c), R585 M8: the send is audited per service, through the unchanged authorizeOnly", () => {

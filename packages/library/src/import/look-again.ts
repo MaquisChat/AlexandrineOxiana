@@ -251,7 +251,9 @@ function settle(p: Plan, cur: LeftOutLookup | undefined, a: Answered | undefined
   if (!cur) return undefined;
   const same = (x: LeftOutLookup) => JSON.stringify([x.identifier, x.title, x.creator]);
   if (same(cur) !== same(p.lookup)) return cur;
-  if (isAnswered(cur) && cur.outcome !== p.lookup.outcome) return cur;
+  // FR-758 (R641 A4): settled meanwhile (by another handle) and left as it is — but when a request of THIS act really
+  // left, the time of the last real try is its (no time moves backwards: laterTry).
+  if (isAnswered(cur) && cur.outcome !== p.lookup.outcome) return (a?.sent ?? 0) > 0 ? { ...cur, lastTriedAt: laterTry(cur, at) } : cur;
   return after(p, cur, a, at, by);
 }
 
