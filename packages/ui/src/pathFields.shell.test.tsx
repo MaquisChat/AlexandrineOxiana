@@ -28,7 +28,12 @@ afterEach(() => {
   fake.shell = undefined;
 });
 
-const integrity = () => http.get(url("/libraries/integrity"), () => HttpResponse.json({ report: { checked: 1, hashed: 0, hashedAssetIds: [], presenceOnly: 0, missing: [{ assetId: null, path: "Projects/P/sources/s1/a.pdf" }], mismatched: [], placeholders: [], errors: [] }, integrityWarnings: [], projectWarnings: {} }));
+/** The integrity check answered as the service answers the missing-files screen (R641 D3): NDJSON, its result line alone. */
+const integrity = () =>
+  http.get(url("/libraries/integrity"), () => {
+    const result = { report: { checked: 1, hashed: 0, hashedAssetIds: [], presenceOnly: 0, missing: [{ assetId: null, path: "Projects/P/sources/s1/a.pdf" }], mismatched: [], placeholders: [], errors: [] }, integrityWarnings: [], projectWarnings: {} };
+    return new HttpResponse(`${JSON.stringify({ result })}\n`, { headers: { "content-type": "application/x-ndjson" } });
+  });
 
 function appearance() {
   const request = vi.fn(async (method: string) => (method === "GET" ? { fonts: [] } : { id: "0190f0f0-0000-7000-8000-0000000000f1", name: "Junicode", format: "woff2", size: 4, addedAt: "2026-11-11T10:00:00.000Z" }));
@@ -72,6 +77,8 @@ describe("path fields outside the import wizard, in the desktop shell (D12)", ()
     server.use(integrity());
     const user = userEvent.setup();
     render(<MissingFiles api={makeApi()} />);
+    // The check's answer has come as the screen asks for it: its missing file is listed.
+    expect(within(await screen.findByRole("list", { name: "Missing files" })).getByText("Projects/P/sources/s1/a.pdf")).toBeTruthy();
     await user.click(await screen.findByRole("button", { name: "Search a folder…" }));
     await user.click(screen.getByRole("button", { name: "Choose folder…" }));
     await waitFor(() => expect((screen.getByRole("textbox", { name: "Folder to search" }) as HTMLInputElement).value).toBe("/Users/r/Old drive"));
