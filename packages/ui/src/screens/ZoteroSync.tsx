@@ -41,7 +41,9 @@ import {
   type ZoteroSyncStateResponse,
 } from "@ao/shared";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type ReactNode } from "react";
-import { ApiClientError, type ApiClient } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { useLeaveSignal } from "../components/leaveSignals";
 import { importApi, isValidId, type ProjectInfo } from "../api/import";
 import { libraryApi, type LibraryState } from "../api/library";
 import { zoteroSyncApi, zoteroSyncEventOf } from "../api/zoteroSync";
@@ -127,7 +129,9 @@ function refusedField(message: string, links: ZoteroSyncSettingsRequest["links"]
   return l![2] === "projectId" ? `project:${ref}` : `keep:${ref}`;
 }
 
-export function ZoteroSync({ client }: { client: ApiClient }) {
+/** `firstReadMs` (FR-750, R579): how long a read of the state and the history is waited for before it is given up. */
+/** `streamOpenMs` (FR-756 C, R597): how long the event stream is waited for to open before it is closed and tried afresh after the screen's pause (STREAM_OPEN_TIMEOUT_MS; smaller in tests); an open stream is never ended by it. */
+export function ZoteroSync({ client, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: { client: ApiClient; firstReadMs?: number; streamOpenMs?: number }) {
   const api = useMemo(() => zoteroSyncApi(client), [client]);
   const imp = useMemo(() => importApi(client), [client]);
   const lib = useMemo(() => libraryApi(client), [client]);
@@ -136,6 +140,8 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
   const [state, setState] = useState<ZoteroSyncStateResponse | undefined>();
   const [history, setHistory] = useState<ZoteroSyncRun[] | undefined>();
   const [loadError, setLoadError] = useState<string | undefined>();
+  /** FR-750: the state's last read got no answer (or none in time): "Try again" is offered. */
+  const [loadUnreachable, setLoadUnreachable] = useState(false);
   const [noLibrary, setNoLibraryState] = useState(false);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   /** What the last key check of this visit said (names live only here, R78: no storage). */
@@ -167,7 +173,9 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
   const appliedHistory = useRef(0);
   /** Counts `zotero.sync` events: a reading started before the latest one does not overrule it about the run. */
   const eventSeq = useRef(0);
-  const reading = useRef<{ again: boolean } | null>(null);
+  const reading = useRef<{ again: boolean; drops: number; ac: AbortController } | null>(null);
+  /** FR-750: the times the event stream failed or dropped (a read still out from before then is made again at an opening). */
+  const streamDrops = useRef(0);
   const runBusy = useRef(false);
   const runEndedAt = useRef(-Infinity);
   const checkBusy = useRef(false);
@@ -230,6 +238,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
       stateRef.current = s;
       setState(s);
       setLoadError(undefined);
+      setLoadUnreachable(false);
       if (eventSeq.current === eventsAtStart) setRunning(s.running ? { ref: s.running.ref, done: s.running.done, total: s.running.total } : null);
     },
     [setRunning],
@@ -241,6 +250,7 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
     // R269 N1 a: a save still out belongs to the library that went; its answer is dropped, and the next form is free.
     saveBusy.current = false;
     setSaving(false);
+    reading.current?.ac.abort();
     reading.current = null;
     stateRef.current = undefined;
     accessRef.current = undefined;
@@ -277,22 +287,32 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
     [lib],
   );
 
-  /** The state and the history, read again; one at a time, and one more when asked meanwhile. */
-  const read = useCallback(async (): Promise<void> => {
+  /**
+   * The state and the history, read again; one at a time, and one more when asked meanwhile. Each is given up after
+   * `firstReadMs` as a read that got no answer (FR-750); `restart`: a reading still out is given up for a new one.
+   */
+  const read = useCallback(async (o: { restart?: boolean } = {}): Promise<void> => {
     if (reading.current) {
-      reading.current.again = true;
-      return;
+      if (!o.restart) {
+        reading.current.again = true;
+        return;
+      }
+      reading.current.ac.abort();
     }
-    const mark = { again: false };
+    const mark = { again: false, drops: streamDrops.current, ac: new AbortController() };
     reading.current = mark;
     const g = gen.current;
+    const mine = () => alive.current && g === gen.current && reading.current === mark;
     try {
       do {
         mark.again = false;
         const seq = ++readSeq.current;
         const ev = eventSeq.current;
-        const [s, h] = await Promise.allSettled([api.state(), api.history()]);
-        if (!alive.current || g !== gen.current) return;
+        const [s, h] = await Promise.allSettled([
+          readWithin((signal) => api.state({ signal }), firstReadMs, mark.ac.signal),
+          readWithin((signal) => api.history({ signal }), firstReadMs, mark.ac.signal),
+        ]);
+        if (!mine()) return;
         if (s.status === "fulfilled") {
           applyState(s.value, seq, ev);
           readWaiting(s.value, seq, g);
@@ -300,24 +320,30 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
           const e = s.reason;
           if (e instanceof ApiClientError && e.code === "LIBRARY_OFFLINE") setNoLibrary(true);
           setLoadError(sentenceOf(e, "The Zotero sync settings could not be read."));
+          setLoadUnreachable(isUnreachable(e));
         }
         if (h.status === "fulfilled" && seq >= appliedHistory.current) {
           appliedHistory.current = seq;
           setHistory(h.value.runs);
         }
-      } while (mark.again);
+      } while (mark.again && mine());
     } finally {
       if (reading.current === mark) reading.current = null;
     }
-  }, [api, applyState, setNoLibrary, readWaiting]);
+  }, [api, applyState, setNoLibrary, readWaiting, firstReadMs]);
 
+  /**
+   * FR-756's remainder (R609 N4): the projects (beside the screen) are given up silently after `firstReadMs` (cancelled;
+   * what a failure showed is shown), and cancelled when the screen is left.
+   */
+  const leaving = useLeaveSignal();
   const readProjects = useCallback(() => {
     const g = gen.current;
-    imp.projects().then(
+    readWithin((signal) => imp.projects({ signal }), firstReadMs, leaving()).then(
       (p) => alive.current && g === gen.current && setProjects(p),
       () => {},
     );
-  }, [imp]);
+  }, [imp, firstReadMs, leaving]);
 
   // ---- load ----
   useEffect(() => {
@@ -333,11 +359,15 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
     const listen = async () => {
       try {
         const onOpen = () => {
+          // FR-750 (R579): after the stream failed or dropped, a state not yet read — failed, or still out from before the
+          // stream last failed (it may never settle) — is read again at once, without waiting for an event on it.
+          const m = reading.current;
+          if (streamDrops.current > 0 && !stateRef.current && (!m || m.drops < streamDrops.current)) void read({ restart: true });
           // After a lost stream, what happened meanwhile is read from the service.
-          if (opened) void read();
+          else if (opened) void read();
           opened = true;
         };
-        for await (const ev of client.events({ signal: ac.signal, onOpen })) {
+        for await (const ev of client.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs })) {
           if (!alive.current) return;
           if (ev.type === "library.state" && ev.data && typeof ev.data === "object") {
             const d = ev.data as LibraryState;
@@ -392,14 +422,17 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
       } catch {
         // the stream dropped: listen again shortly
       }
-      if (!ac.signal.aborted) retry = setTimeout(() => void listen(), RECONNECT_MS);
+      if (!ac.signal.aborted) {
+        streamDrops.current++;
+        retry = setTimeout(() => void listen(), RECONNECT_MS);
+      }
     };
     void listen();
     return () => {
       ac.abort();
       clearTimeout(retry);
     };
-  }, [client, read, readProjects, forget, say, setRunning, setNoLibrary]);
+  }, [client, read, readProjects, forget, say, setRunning, setNoLibrary, streamOpenMs]);
 
   // ---- back-off: the button comes back by one timer to that instant, not by asking again ----
   const backoffAt = state?.backoffUntil ? Date.parse(state.backoffUntil) : NaN;
@@ -646,6 +679,14 @@ export function ZoteroSync({ client }: { client: ApiClient }) {
       {!state && loadError && (
         <p role="alert" className="ao-error">
           <UserText>{loadError}</UserText>
+        </p>
+      )}
+      {/* FR-750 (R579): a read that got no answer (or none in time) is offered again; an answer the screen handles is not. */}
+      {!state && loadError && loadUnreachable && (
+        <p>
+          <button type="button" onClick={() => void read()}>
+            Try again
+          </button>
         </p>
       )}
       {state && ro && (

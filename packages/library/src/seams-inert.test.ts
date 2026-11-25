@@ -147,4 +147,8 @@ describe("R526 M5: the roll-back's look seams are inert outside NODE_ENV=test", 
     expect(Object.values(entry)).not.toContain(seams);
     expect(Object.keys(entry)).not.toContain("seams");
   });
+
+  it("FR-068 (R612 m-C): completeMove (which resumes any switching journal without the move's judgement) is not exported from the package's entry", () => {
+    expect(Object.keys(entry)).not.toContain("completeMove");
+  });
 });

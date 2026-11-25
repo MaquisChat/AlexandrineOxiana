@@ -387,3 +387,50 @@ describe("a typeface from the researcher's own file (R100, Task 57)", () => {
     expect(screen.queryByRole("option", { name: "From file: Brill" })).toBeNull();
   });
 });
+
+// FR-756's remainder (R601 b, R617): the saved settings' read has the time limit. Given up, it shows the same alert and
+// "Try loading again" as a failed read, with the true sentence; until then the defaults are shown, with no alert.
+describe("Appearance: a read of the saved settings that never settles (FR-756 remainder)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+
+  it("is given up at the limit: the failed read's alert with the true sentence and “Try loading again”, which reads again", async () => {
+    let answer = false;
+    const signals: Array<AbortSignal | undefined> = [];
+    const get = vi.fn((o?: { signal?: AbortSignal }) => {
+      signals.push(o?.signal);
+      return answer ? Promise.resolve(structuredClone({ ...DEFAULT_APPEARANCE, theme: "dark" as const })) : new Promise<AppearanceSettings>(() => undefined);
+    });
+    const client = { appearance: { get, put: vi.fn() } } as unknown as ApiClient;
+    render(
+      <AppearanceProvider client={client} firstReadMs={300}>
+        <AppearanceSettingsScreen />
+      </AppearanceProvider>,
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    const alert = await screen.findByRole("alert", {}, { timeout: 5000 });
+    expect(alert.textContent).toContain(`Couldn't load your appearance settings: ${NO_ANSWER}`);
+    expect(alert.textContent).not.toContain("could not be reached");
+    expect(signals[0]?.aborted).toBe(true);
+    answer = true;
+    await userEvent.setup().click(within(alert).getByRole("button", { name: "Try loading again" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(root().dataset.theme).toBe("dark");
+  });
+
+  it("a late answer of the read given up changes nothing", async () => {
+    let release!: (s: AppearanceSettings) => void;
+    const get = vi.fn(() => new Promise<AppearanceSettings>((r) => (release = r)));
+    const client = { appearance: { get, put: vi.fn() } } as unknown as ApiClient;
+    render(
+      <AppearanceProvider client={client} firstReadMs={300}>
+        <AppearanceSettingsScreen />
+      </AppearanceProvider>,
+    );
+    await screen.findByRole("alert", {}, { timeout: 5000 });
+    const before = root().dataset.theme;
+    await act(async () => release(structuredClone({ ...DEFAULT_APPEARANCE, theme: "dark" as const })));
+    expect(screen.getByRole("alert").textContent).toContain(NO_ANSWER);
+    expect(root().dataset.theme).toBe(before);
+  });
+});

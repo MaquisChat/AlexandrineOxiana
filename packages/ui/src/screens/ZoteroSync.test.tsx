@@ -25,7 +25,7 @@ import { zoteroSyncApi } from "../api/zoteroSync";
 import { App } from "../App";
 import { PATHS } from "../navigation";
 import { OPEN_GOVERNANCE, PSEUDONYMISING_GOVERNANCE, REPORT } from "../test/importService";
-import { BASE, libraryHandlers, server, serviceError, testClient, TOKEN, url, useMockService } from "../test/service";
+import { BASE, hang, libraryHandlers, server, serviceError, sseAttempts, testClient, TOKEN, url, useMockService } from "../test/service";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
 import { StepReport } from "./import/StepReport";
 import { ZoteroSync } from "./ZoteroSync";
@@ -1308,5 +1308,142 @@ describe("ZoteroSync", () => {
     } finally {
       window.history.replaceState(null, "", "/");
     }
+  });
+});
+
+describe("Zotero: first reads that never settle (FR-750, R579)", () => {
+  const UNREACHABLE = "The library service could not be reached.";
+  /** R586 M5: said where a read was given up at the time limit (it neither answered nor failed). */
+  const NO_ANSWER = "The library service did not answer in time.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+
+  it("a read of the state that hangs is given up after the limit: the usual alert with “Try again”; pressing it reads again, and focus is not lost", async () => {
+    const svc = useSvc();
+    let answer = false;
+    const gate = hang();
+    svc.onState = async () => {
+      if (!answer) await gate;
+      return HttpResponse.json(svc.state);
+    };
+    render(<ZoteroSync client={testClient()} firstReadMs={300} />);
+    expect(screen.getByText("Reading the Zotero sync settings…")).toBeTruthy();
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+    expect(document.activeElement).toBe(document.body);
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByTestId("zotero-libraries");
+    expect(tryAgain()).toBeNull();
+    expect(svc.count("GET", "/zotero/sync")).toBe(2);
+    expect(document.activeElement?.isConnected && document.activeElement !== document.body).toBe(true);
+  });
+
+  it("when the event stream opens anew, a read still out from before is made again, without a press and without an event", async () => {
+    const svc = useSvc();
+    const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
+    server.use(ev.handler);
+    const gate = hang();
+    let n = 0;
+    svc.onState = async () => {
+      if (++n === 1) await gate;
+      return HttpResponse.json(svc.state);
+    };
+    render(<ZoteroSync client={testClient()} />);
+    await screen.findByTestId("zotero-libraries", undefined, { timeout: 10_000 });
+    expect(ev.attempts()).toBe(2);
+    expect(svc.count("GET", "/zotero/sync")).toBe(2);
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("FR-756 C (R597): a stream that never opens is cancelled at the limit and opened afresh after the screen's pause; at that opening a read still out is made again", async () => {
+    const svc = useSvc();
+    const ev = sseAttempts((n) => (n === 1 ? "hang" : []));
+    server.use(ev.handler);
+    const gate = hang();
+    let n = 0;
+    svc.onState = async () => {
+      if (++n === 1) await gate;
+      return HttpResponse.json(svc.state);
+    };
+    render(<ZoteroSync client={testClient()} streamOpenMs={300} />);
+    await screen.findByTestId("zotero-libraries", undefined, { timeout: 10_000 });
+    expect(ev.attempts()).toBe(2);
+    expect(svc.count("GET", "/zotero/sync")).toBe(2);
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("FR-756 C (R597): a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
+    useSvc();
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<ZoteroSync client={testClient()} streamOpenMs={200} />);
+    await waitFor(() => expect(ev.attempts()).toBe(1));
+    await new Promise((r) => setTimeout(r, 3_000));
+    expect(ev.attempts()).toBe(1);
+    // R602 M2: the page has not cancelled it (a drop after the answer began would not end a mocked body).
+    expect(ev.signals()[0]!.aborted).toBe(false);
+  });
+
+  it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
+    const svc = useSvc();
+    const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
+    server.use(ev.handler);
+    svc.onState = () => HttpResponse.error();
+    render(<ZoteroSync client={testClient()} />);
+    await screen.findByRole("button", { name: "Try again" });
+    await waitFor(() => expect(svc.count("GET", "/zotero/sync")).toBe(2), { timeout: 10_000 });
+    await screen.findByRole("button", { name: "Try again" });
+    ev.drop();
+    await waitFor(() => expect(ev.attempts()).toBe(3), { timeout: 10_000 });
+    await waitFor(() => expect(svc.count("GET", "/zotero/sync")).toBe(3));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(svc.count("GET", "/zotero/sync")).toBe(3);
+  });
+
+  it("a state refused with an answer shows its sentence as today, with no “Try again”", async () => {
+    const svc = useSvc();
+    svc.onState = () => serviceError(500, "INTERNAL", "The Zotero sync settings could not be listed.");
+    render(<ZoteroSync client={testClient()} />);
+    await screen.findByText("The Zotero sync settings could not be listed.");
+    expect(tryAgain()).toBeNull();
+  });
+});
+
+// FR-756's remainder (R609 N4): the screen's silent side read of the projects is given up at the limit silently
+// (cancelled; nothing new is shown), and cancelled when the screen is left.
+describe("Zotero: the read of the projects beside the screen (FR-756 remainder)", () => {
+  function heldProjects() {
+    const gate = hang();
+    const seen: AbortSignal[] = [];
+    server.use(
+      http.get(url("/projects"), async ({ request }) => {
+        seen.push(request.signal);
+        await gate;
+        return HttpResponse.json({ projects: [] });
+      }),
+    );
+    return seen;
+  }
+
+  it("held, it is cancelled at the limit with no alert, and the screen is shown", async () => {
+    useSvc();
+    const seen = heldProjects();
+    render(<ZoteroSync client={testClient()} firstReadMs={300} />);
+    await screen.findByTestId("zotero-libraries");
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    await waitFor(() => expect(seen.every((s) => s.aborted)).toBe(true), { timeout: 3000 });
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("held, it is cancelled when the screen is left", async () => {
+    useSvc();
+    const seen = heldProjects();
+    const view = render(<ZoteroSync client={testClient()} firstReadMs={60_000} />);
+    await screen.findByTestId("zotero-libraries");
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    expect(seen.some((s) => s.aborted)).toBe(false);
+    view.unmount();
+    await waitFor(() => expect(seen.every((s) => s.aborted)).toBe(true), { timeout: 1000 });
   });
 });

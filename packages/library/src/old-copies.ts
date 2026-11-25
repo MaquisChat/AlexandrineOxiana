@@ -12,7 +12,9 @@
  */
 import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { join } from "node:path";
+import { realpath as realpathCb } from "node:fs";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import type { Deps } from "./deps.js";
 import { raiseDeviceNotice } from "./device-notices.js";
 import { writeFileAtomic } from "./fs/atomic.js";
@@ -37,6 +39,8 @@ export interface PendingOldCopy {
   moveId: string;
   /** False while the move's switch has not finished. */
   complete: boolean;
+  /** When the switch finished (its record marked complete): the day-long offer of deletion runs from it (R583). */
+  completedAt?: string;
   /**
    * Set when the app deleted the old copy (deleteOldCopy) but the record was kept (R409 a): something
    * of the library stayed at the old place (`remains`: a file it kept or could not remove, or data
@@ -166,21 +170,195 @@ export async function addPendingOldCopy(
 /**
  * Moves whose switch has started but not finished (e.g. the app crashed): the
  * old copy may already be read-only. Finish each with `completeMove(newRoot, …)`.
+ * With `at`, only the moves of the library `at.libraryId` out of or into the folder `at.folder`, matched by real path
+ * (R599 M-3).
  */
 export async function listUnfinishedMoves(
   deps: CfgDeps,
+  at?: { libraryId: string; folder: string },
 ): Promise<Array<{ libraryId: string; oldRoot: string; newRoot: string; moveId: string; startedAt: string }>> {
-  return (await load(deps))
-    .filter((r) => !r.complete)
-    .map((r) => ({ libraryId: r.libraryId, oldRoot: r.oldRoot, newRoot: r.newRoot, moveId: r.moveId, startedAt: r.createdAt }));
+  const out: Array<{ libraryId: string; oldRoot: string; newRoot: string; moveId: string; startedAt: string }> = [];
+  for (const r of await load(deps)) {
+    if (r.complete) continue;
+    if (at && (r.libraryId !== at.libraryId || !((await sameFolder(r.oldRoot, at.folder)) || (await sameFolder(r.newRoot, at.folder))))) continue;
+    out.push({ libraryId: r.libraryId, oldRoot: r.oldRoot, newRoot: r.newRoot, moveId: r.moveId, startedAt: r.createdAt });
+  }
+  return out;
 }
 
-/** Where the library at `oldRoot` was moved, from this device's records (newest first). */
-export async function movedToFor(deps: CfgDeps, oldRoot: string, libraryId: string): Promise<{ newRoot: string; unfinished: boolean } | undefined> {
-  const r = (await load(deps))
-    .filter((x) => x.oldRoot === oldRoot && x.libraryId === libraryId)
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-  return r ? { newRoot: r.newRoot, unfinished: !r.complete } : undefined;
+/**
+ * R583 M1, R590 N5: the two paths name the same folder — compared by what the folder is (its real path: links resolved,
+ * the disk's own letter case), not by their text. A path that cannot be resolved is compared as written.
+ */
+const realpathNative = promisify(realpathCb.native);
+export async function sameFolder(a: string, b: string): Promise<boolean> {
+  const real = (p: string) => realpathNative(p).catch(() => resolve(p));
+  return (await real(a)) === (await real(b));
+}
+
+/** This device's newest record of a move of the library `libraryId` out of the folder `oldRoot` (matched by real path). */
+async function recordFrom(deps: CfgDeps, oldRoot: string, libraryId: string): Promise<PendingOldCopy | undefined> {
+  const mine = (await load(deps)).filter((x) => x.libraryId === libraryId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  for (const r of mine) if (await sameFolder(r.oldRoot, oldRoot)) return r;
+  return undefined;
+}
+
+/**
+ * R583 M2, R590 N4, N5: the one judgement of whether a recorded move has finished. "unfinished": the record is not
+ * complete, or its journal is still at the new place; "damaged": a journal is at the new place but cannot be read, so the
+ * app cannot finish the move; "cannot-tell": the record is complete but the new place cannot be read (its drive is not
+ * connected), so whether its journal is still there is not known; "finished" otherwise. Everything but "finished" counts
+ * as unfinished where it decides (it fails closed): the old copy is not deletable, and an old library of a split stays
+ * read-only. The words (movedToOf) claim "has not finished" only for "unfinished" and "damaged" (R596 b).
+ */
+export type MoveFinished = "finished" | "unfinished" | "damaged" | "cannot-tell";
+export async function moveFinished(rec: Pick<PendingOldCopy, "id" | "newRoot" | "complete">): Promise<MoveFinished> {
+  const at = await journalAt(rec);
+  if (at === "damaged") return "damaged";
+  if (!rec.complete || at === "here") return "unfinished";
+  return at === "unreachable" ? "cannot-tell" : "finished";
+}
+
+/** The move's journal at the record's new place: this record's ("here"), none or another move's ("absent"), unreadable as a journal ("damaged"), or the new place itself cannot be read ("unreachable"). */
+async function journalAt(rec: Pick<PendingOldCopy, "id" | "newRoot">): Promise<"here" | "absent" | "damaged" | "unreachable"> {
+  let raw: string;
+  try {
+    raw = await fsp.readFile(join(rec.newRoot, ".move-journal.json"), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return "unreachable";
+    return (await fsp.stat(rec.newRoot).then((st) => st.isDirectory(), () => false)) ? "absent" : "unreachable";
+  }
+  let j: { libraryId?: unknown; filesDone?: unknown; switch?: { pendingId?: unknown } } | null;
+  try {
+    j = JSON.parse(raw) as typeof j;
+  } catch {
+    return "damaged";
+  }
+  // As the move reads its journal (move.ts readJournal): without these it is not a journal it can use.
+  if (typeof j?.libraryId !== "string" || !Array.isArray(j.filesDone)) return "damaged";
+  return j.switch?.pendingId === rec.id ? "here" : "absent";
+}
+
+/** Where the library at `oldRoot` was moved, from this device's records (newest first; the folder matched by real path). */
+export async function movedToFor(deps: CfgDeps, oldRoot: string, libraryId: string): Promise<MovedTo | undefined> {
+  const r = await recordFrom(deps, oldRoot, libraryId);
+  return r ? movedToOf(r, await moveFinished(r)) : undefined;
+}
+
+export interface MovedTo {
+  newRoot: string;
+  unfinished: boolean;
+  /** R590 N5: the move's journal at the new place is damaged: the app cannot finish this move. */
+  journalDamaged?: true;
+}
+/**
+ * The words say only what this computer knows (R596 b): "has not finished" only when it is seen to be unfinished (or its
+ * journal is damaged); "cannot-tell" (a complete record, the new place unreadable) gives the plain moved words. The
+ * deletion of the old copy still fails closed on it (deleteOldCopy).
+ */
+const movedToOf = (r: PendingOldCopy, state: MoveFinished): MovedTo => ({
+  newRoot: r.newRoot,
+  unfinished: state === "unfinished" || state === "damaged",
+  ...(state === "damaged" ? { journalDamaged: true as const } : {}),
+});
+
+/**
+ * R590 N1: this device's record shows an unfinished SPLIT out of the folder `root` (real path) for the library
+ * `libraryId`, and at least one moved project there is already marked: the old library is then to open read-only as
+ * moved, the projects that stayed included, until the new place has finished the move. (Once every moved project is
+ * marked, its library.json carries the remaining library's id, and this no longer matches; while no project is marked
+ * the move cannot be finished at the new place, and the old library is still the library.)
+ */
+export async function unfinishedSplitFrom(deps: CfgDeps, root: string, libraryId: string): Promise<MovedTo | undefined> {
+  const r = await recordFrom(deps, root, libraryId);
+  if (!r?.split) return undefined;
+  const state = await moveFinished(r);
+  if (state === "finished") return undefined;
+  for (const f of r.movedFolders) {
+    try {
+      const m = JSON.parse(await fsp.readFile(join(root, ...f.split("/"), "MOVED.json"), "utf8")) as { libraryId?: unknown };
+      if (m.libraryId === libraryId) return movedToOf(r, state);
+    } catch {
+      // not marked
+    }
+  }
+  return undefined;
+}
+
+/**
+ * FR-068 (R607 c): the folder `root`, of the library `libraryId`, holds the copy of this computer's move that stopped
+ * after its switch began and before the old copy was marked, and the old place is seen to be the living library still:
+ * the journal at `root` in its switching phase with no mark recorded; this computer's record of that move naming this
+ * folder; the old place reachable, holding that library (its library.json's id) and no mark of any move (no top
+ * MOVED.json, no moved project's MOVED.json). Returns the old place; undefined in every other case (no such journal,
+ * another computer's move, another folder, the old place out of reach, marked by any move, or another library there).
+ * Reads only.
+ */
+export async function staleMoveCopyAt(deps: CfgDeps, root: string, libraryId: string): Promise<string | undefined> {
+  let j: { libraryId?: unknown; phase?: unknown; switch?: { pendingId?: unknown; done?: unknown; movedFolders?: unknown } } | null;
+  try {
+    j = JSON.parse(await fsp.readFile(join(root, ".move-journal.json"), "utf8")) as typeof j;
+  } catch {
+    return undefined;
+  }
+  const sw = j?.switch;
+  if (j?.phase !== "switching" || j.libraryId !== libraryId || typeof sw?.pendingId !== "string" || !Array.isArray(sw.done) || sw.done.includes("mark-old")) return undefined;
+  const rec = await getPendingOldCopy(deps, sw.pendingId).catch(() => undefined);
+  if (!rec || rec.libraryId !== libraryId || !(await sameFolder(rec.newRoot, root))) return undefined;
+  try {
+    const meta = JSON.parse(await fsp.readFile(join(rec.oldRoot, "library.json"), "utf8")) as { libraryId?: unknown };
+    if (meta.libraryId !== libraryId) return undefined;
+  } catch {
+    return undefined;
+  }
+  // A mark is anything but a folder of that name (a folder cannot be read as one); a place that cannot be looked at counts as marked.
+  const marked = (p: string) => fsp.lstat(p).then((st) => !st.isDirectory(), (err: NodeJS.ErrnoException) => err.code !== "ENOENT");
+  const folders = [...rec.movedFolders, ...(Array.isArray(sw.movedFolders) ? sw.movedFolders.filter((f): f is string => typeof f === "string") : [])];
+  for (const p of [join(rec.oldRoot, "MOVED.json"), ...folders.map((f) => join(rec.oldRoot, ...f.split("/"), "MOVED.json"))]) {
+    if (await marked(p)) return undefined;
+  }
+  return rec.oldRoot;
+}
+
+/**
+ * R612 m-B: the folder `root`, of the library `libraryId`, holds the copy of this computer's move whose switch began and
+ * whose own mark is neither recorded in the journal nor seen at the old place: the journal at `root` in its switching
+ * phase without "mark-old" done; this computer's record of THAT move (its id) naming this folder; and the old place out
+ * of reach, or showing no mark of that move (the top's MOVED.json, or for a split a moved project's, naming the library
+ * with that move's id or with none, as the finishing at an opening counts it; for a split, nor its library.json rewritten
+ * as that split's remaining library). No audit anchor can then be newer than this copy unless the library went on
+ * elsewhere, so the copy's logs are not compared with this computer's record of them. Reads only.
+ */
+export async function unmarkedMoveCopyAt(deps: CfgDeps, root: string, libraryId: string): Promise<boolean> {
+  let j: { libraryId?: unknown; phase?: unknown; switch?: { pendingId?: unknown; moveId?: unknown; done?: unknown; movedFolders?: unknown; remainingLibraryId?: unknown } } | null;
+  try {
+    j = JSON.parse(await fsp.readFile(join(root, ".move-journal.json"), "utf8")) as typeof j;
+  } catch {
+    return false;
+  }
+  const sw = j?.switch;
+  if (j?.phase !== "switching" || j.libraryId !== libraryId || typeof sw?.pendingId !== "string" || typeof sw.moveId !== "string" || !Array.isArray(sw.done) || sw.done.includes("mark-old")) return false;
+  const rec = await getPendingOldCopy(deps, sw.pendingId).catch(() => undefined);
+  if (!rec || rec.libraryId !== libraryId || rec.moveId !== sw.moveId || !(await sameFolder(rec.newRoot, root))) return false;
+  if (!(await fsp.stat(rec.oldRoot).then((st) => st.isDirectory(), () => false))) return true;
+  const folders = Array.isArray(sw.movedFolders) ? sw.movedFolders.filter((f): f is string => typeof f === "string") : [];
+  const marks = rec.split ? folders.map((f) => join(rec.oldRoot, ...f.split("/"), "MOVED.json")) : [join(rec.oldRoot, "MOVED.json")];
+  for (const p of marks) {
+    try {
+      const m = JSON.parse(await fsp.readFile(p, "utf8")) as { libraryId?: unknown; moveId?: unknown };
+      if (m.libraryId === libraryId && (m.moveId === undefined || m.moveId === sw.moveId)) return false;
+    } catch {
+      // no mark of that move here
+    }
+  }
+  if (rec.split && typeof sw.remainingLibraryId === "string") {
+    try {
+      if ((JSON.parse(await fsp.readFile(join(rec.oldRoot, "library.json"), "utf8")) as { libraryId?: unknown }).libraryId === sw.remainingLibraryId) return false;
+    } catch {
+      // not rewritten
+    }
+  }
+  return true;
 }
 
 export async function getPendingOldCopy(deps: CfgDeps, id: string): Promise<PendingOldCopy | undefined> {
@@ -217,6 +395,7 @@ export async function markPendingComplete(deps: CfgDeps, id: string): Promise<vo
     const r = all.find((x) => x.id === id);
     if (!r || r.complete) return { records: null, result: undefined };
     r.complete = true;
+    r.completedAt = deps.clock().toISOString();
     return { records: all, result: undefined };
   });
 }
@@ -233,12 +412,17 @@ export async function readVerifiedHashes(rec: PendingOldCopy): Promise<VerifiedH
   return JSON.parse(await fsp.readFile(rec.verifiedHashesFile, "utf8")) as VerifiedHashes;
 }
 
-export const isExpired = (rec: PendingOldCopy, deps: Pick<Deps, "clock">) => deps.clock().getTime() > Date.parse(rec.createdAt) + OLD_COPY_TTL_MS;
+/** From when the offer of deletion runs: the switch's finishing (a move finished later, R583), else the record's making. */
+const offerFrom = (rec: PendingOldCopy) => {
+  const done = typeof rec.completedAt === "string" ? Date.parse(rec.completedAt) : Number.NaN;
+  return Number.isNaN(done) ? Date.parse(rec.createdAt) : done;
+};
+export const isExpired = (rec: PendingOldCopy, deps: Pick<Deps, "clock">) => deps.clock().getTime() > offerFrom(rec) + OLD_COPY_TTL_MS;
 
 /** Old copies of finished moves that can still be deleted with `deleteOldCopy(oldRoot, { confirm: true })`. */
 export async function listPendingOldCopies(deps: CfgDeps): Promise<Array<PendingOldCopy & { expiresAt: string; expired: boolean }>> {
   return (await load(deps))
     // A copy the app already deleted (kept only to be looked at again, R409 a) is not offered again.
     .filter((r) => r.complete && !r.deleted)
-    .map((r) => ({ ...r, expiresAt: new Date(Date.parse(r.createdAt) + OLD_COPY_TTL_MS).toISOString(), expired: isExpired(r, deps) }));
+    .map((r) => ({ ...r, expiresAt: new Date(offerFrom(r) + OLD_COPY_TTL_MS).toISOString(), expired: isExpired(r, deps) }));
 }

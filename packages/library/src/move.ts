@@ -20,6 +20,7 @@ import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { dateRuleZone, evaluate, newId, parseGovernance, type PolicyDecision, type ResidencyKind } from "@ao/core";
+import { MOVE_FOLDER_STALE_COPY_TEXT, MOVE_FOLDER_UNFINISHED_TEXT } from "@ao/shared";
 import { scrubPaths } from "./app-settings.js";
 import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
@@ -33,11 +34,13 @@ import {
   addPendingOldCopy,
   getPendingOldCopy,
   isExpired,
+  moveFinished,
   listPendingOldCopies,
   listUnfinishedMoves,
   markPendingComplete,
   readVerifiedHashes,
   markPendingDeleted,
+  sameFolder,
   type PendingOldCopy,
 } from "./old-copies.js";
 import { addKnownPath, registerLibrary } from "./registry.js";
@@ -77,6 +80,12 @@ export type MoveRefusal =
   | "unreadable-project"
   | "name-collision"
   | "old-copy-in-use"
+  /** finishMoveAt: the library's new place is open on another computer. */
+  | "in-use"
+  /** deleteOldCopy: the move of this old copy has not finished (its journal is still at the new place, R583 M2). */
+  | "move-unfinished"
+  /** finishMoveAt: the library at the new place was saved by a newer version of the app. */
+  | "newer-format"
   | "nothing-to-complete";
 
 /** The move may not start (or the old copy may not be deleted now); nothing was changed. */
@@ -164,7 +173,10 @@ export interface MoveOptions extends Omit<PlanOptions, "now"> {
   excludeProjectIds?: string[];
   /** Called as work progresses; throwing (or rejecting) aborts the move like an interruption. */
   onProgress?: (p: MoveProgress) => void | Promise<void>;
-  /** The library's open index; it is checkpointed so `library.sqlite` is complete without its WAL. */
+  /**
+   * The library's open index. It is checkpointed before the copy, so `library.sqlite` is complete without its WAL, and
+   * the move closes it together with the source library, before the source's lock is released (R570 b).
+   */
   index?: IndexHandle;
   /** An already-open repo on the destination library (rare); otherwise the move opens the destination itself. */
   destRepo?: Repo;
@@ -220,8 +232,28 @@ interface Journal {
   switch?: SwitchPlan;
 }
 
-/** Test seams: simulate a crash right after a switch step. */
-export const moveSeams: { crashAfter?: SwitchStep; /** deleteOldCopy: reading this old-copy folder fails. */ unreadableDir?: string } = {};
+/**
+ * Test seams: simulate a crash right after a switch step. Only tests set them (by a deep import of this module: the
+ * package's index does not export them); unset, which they are in the app, they do nothing.
+ */
+export const moveSeams: {
+  /** `"switching-journal"`: right after the switching journal is written, before the old copy is marked (FR-068, R607). */
+  crashAfter?: SwitchStep | "switching-journal";
+  /** deleteOldCopy: reading this old-copy folder fails. */
+  unreadableDir?: string;
+  /**
+   * One write of the switch fails as on a full disk (once): the journal's write after step `after`, the marking of the
+   * old copy's record as complete, or the removal of the journal (FR-755).
+   */
+  fail?: { at: "journal"; after: SwitchStep } | { at: "mark-complete" } | { at: "unlink" } | { at: "split-mark"; afterFolders: number } | { at: "mark-old"; code: string };
+} = {};
+/** Throws the seam's simulated "no space left" once, when it names `at` (and `after`: the step, or how many moved folders a split has marked). */
+function failSeam(at: "journal" | "mark-complete" | "unlink" | "split-mark", after?: SwitchStep | number): void {
+  const f = moveSeams.fail;
+  if (!f || f.at !== at || (f.at === "journal" && f.after !== after) || (f.at === "split-mark" && f.afterFolders !== after)) return;
+  moveSeams.fail = undefined;
+  throw Object.assign(new Error("no space left on device (simulated)"), { code: "ENOSPC" });
+}
 export class SimulatedMoveCrash extends Error {
   override name = "SimulatedMoveCrash";
 }
@@ -355,8 +387,86 @@ async function preflight(lib: Library, destRoot: string, repo?: Repo, checkPendi
   if (names.some((n) => sameName(n, MOVE_JOURNAL))) {
     const j = await readJournal(destRoot);
     if (j?.libraryId === lib.id && j.phase !== "switching") return j;
+    // FR-068 (R607 a): a stopped move's switch. One that may be resumed is finished by the move before its plan
+    // (finishesSwitch); its folder is still not empty to a plan. Any other is refused in words of its own.
+    // R612 I-A: in the words the judgement chose: the delete-words only where the folder is provably a stale copy.
+    const judged = j?.phase === "switching" ? await stoppedSwitch(lib, destRoot, j) : "resume";
+    if (judged === "stale") throw new MoveNotAllowedError("destination-not-empty", MOVE_FOLDER_STALE_COPY_TEXT);
+    if (judged === "unfinished") throw new MoveNotAllowedError("destination-not-empty", MOVE_FOLDER_UNFINISHED_TEXT);
   }
   throw new MoveNotAllowedError("destination-not-empty", "The destination folder is not empty; choose an empty folder");
+}
+
+/**
+ * FR-068 (R607 a): THE one judgement of a move into the folder `dest` whose journal `j` is in its switching phase. The
+ * switch is resumed ("resume") only where all of these hold: (i) the library being moved IS that move's old place (its
+ * real path, and its library id); (ii) this computer's record of that very move (the journal's `pendingId`) exists and
+ * names both places; (iii) the old copy's mark of THAT move is recorded in the journal as made, or is seen at the old
+ * place carrying that move's id (oldCopyShowsMark: a mark without an id, written by an older build, counts here only
+ * where the journal records it). In every other case "refuse": the old copy may have gone on as the library and changed
+ * since the copy was verified, or the folder is another move's or another copy's. Reads only; writes nothing. The plan
+ * (preflight) and the move (finishesSwitch, also when asked without a plan) both decide by it.
+ *
+ * R612 I-A: a refusal is "stale" ONLY where the folder is provably a stale copy — this computer's record of that move
+ * exists and its old place is seen to be the living, unmarked library of the move's library id, or is marked by a mark
+ * that names another library or carries another move's id (that move never marked it, and the finishing at an opening
+ * refuses the folder). Every other refusal is "unfinished" (that move's mark recorded or seen, a mark without a move's
+ * id, an unreadable mark, the old place out of reach or holding another library, the record missing): the folder may
+ * then hold the library itself.
+ */
+async function stoppedSwitch(lib: Pick<Library, "id" | "root" | "appConfigDir">, dest: string, j: Journal): Promise<"resume" | "stale" | "unfinished"> {
+  const sw = j.switch;
+  if (j.phase !== "switching" || !sw) return "unfinished";
+  const rec = await getPendingOldCopy({ appConfigDir: lib.appConfigDir, clock: () => new Date() }, sw.pendingId).catch(() => undefined);
+  if (!rec || rec.libraryId !== j.libraryId || rec.moveId !== sw.moveId) return "unfinished";
+  const recorded = sw.done.includes("mark-old");
+  const seen = recorded ? "this-move" : await oldPlaceShows(rec, j);
+  // The old place's library id: the library's own, or, once this very split has marked its old place, the remaining
+  // library's id that this move made there (no other folder can carry it).
+  const isOldPlace =
+    (lib.id === j.libraryId || (sw.remainingLibraryId !== undefined && lib.id === sw.remainingLibraryId)) &&
+    (await sameFolder(rec.oldRoot, lib.root)) &&
+    (await sameFolder(rec.newRoot, dest));
+  if (isOldPlace && seen === "this-move") return "resume";
+  return seen === "living" || seen === "another" ? "stale" : "unfinished";
+}
+
+/**
+ * R612 I-A: what the old place of the move `j` (this computer's record `rec`) is seen to show, read once: "this-move" (a
+ * mark of this move: the top's MOVED.json, or for a split a moved project's, naming the library and carrying this move's
+ * id, or the old folder's library.json rewritten as this split's remaining library), "no-id" (a mark naming the library
+ * without a move's id: an older build's, which may be this move's), "unclear" (a mark that cannot be read), "another" (a
+ * mark naming another library or carrying another move's id), "living" (no mark at all, and the library.json of the
+ * move's library id), "other" (no mark, and another or no library there), "unreachable". In that order of precedence.
+ * A folder named MOVED.json is no mark (as staleMoveCopyAt reads it). Reads only.
+ */
+async function oldPlaceShows(rec: PendingOldCopy, j: Journal): Promise<"this-move" | "no-id" | "unclear" | "another" | "living" | "other" | "unreachable"> {
+  if (!(await fsp.stat(rec.oldRoot).then((st) => st.isDirectory(), () => false))) return "unreachable";
+  const sw = j.switch!;
+  const marks = [join(rec.oldRoot, MOVED_MARKER), ...(rec.split ? sw.movedFolders.map((f) => join(rec.oldRoot, ...f.split("/"), MOVED_MARKER)) : [])];
+  const found = new Set<string>();
+  for (const p of marks) {
+    const there = await fsp.lstat(p).then((st) => !st.isDirectory(), (err: NodeJS.ErrnoException) => (err.code === "ENOENT" ? false : null));
+    if (there === false) continue;
+    try {
+      if (there === null) throw new Error("cannot be looked at");
+      const m = JSON.parse(await fsp.readFile(p, "utf8")) as { libraryId?: unknown; moveId?: unknown };
+      if (m.libraryId !== j.libraryId) found.add("another");
+      else if (m.moveId === undefined) found.add("no-id");
+      else found.add(m.moveId === sw.moveId ? "this-move" : "another");
+    } catch {
+      found.add("unclear");
+    }
+  }
+  let metaId: unknown;
+  try {
+    metaId = (JSON.parse(await fsp.readFile(join(rec.oldRoot, "library.json"), "utf8")) as Partial<LibraryJson>).libraryId;
+  } catch {
+    metaId = undefined;
+  }
+  if (rec.split && sw.remainingLibraryId !== undefined && metaId === sw.remainingLibraryId) found.add("this-move");
+  for (const k of ["this-move", "no-id", "unclear", "another"] as const) if (found.has(k)) return k;
+  return metaId === j.libraryId ? "living" : "other";
 }
 
 const isFile = (p: string) => fsp.lstat(p).then((s) => s.isFile(), () => false);
@@ -419,6 +529,9 @@ function skipper(excludedFolders: string[], split: boolean): (rel: string) => bo
     return excludedFolders.some((f) => rel === f || rel.startsWith(`${f}/`));
   };
 }
+
+/** The verification's words, before the paths it names. */
+const VERIFICATION_FAILED = "Verification failed; nothing was switched or deleted";
 
 function abortOnOdd(w: Walked): void {
   if (w.odd.length > 0) {
@@ -520,12 +633,13 @@ async function planWith(lib: Library, destRoot: string, env: LocationEnv, opts: 
 /** In-memory confirmation tokens → their persisted pending record. */
 const tokens = new Map<string, { pendingId: string; deps: Deps; tz?: string; actor?: string }>();
 
-/** A switch interrupted by a crash at `dest`, of this library: the move finishes it, taking no plan. */
-async function finishesSwitch(lib: Library, dest: string, deps: Deps): Promise<boolean> {
+/**
+ * A switch interrupted at `dest` that the move finishes, taking no plan: only that very move's, once its old copy is
+ * marked (stoppedSwitch, R607 a). Any other switching journal there is refused by the move's plan.
+ */
+async function finishesSwitch(lib: Library, dest: string): Promise<boolean> {
   const prior = await readJournal(dest);
-  if (prior?.phase !== "switching") return false;
-  const rec = await getPendingOldCopy(deps, prior.switch!.pendingId);
-  return prior.libraryId === lib.id || rec?.oldRoot === resolve(lib.root);
+  return prior?.phase === "switching" && (await stoppedSwitch(lib, dest, prior)) === "resume";
 }
 
 /**
@@ -579,7 +693,7 @@ export async function acceptMovePlan(lib: Library, destRoot: string, opts: MoveO
   const { deps, env } = opts;
   const dest = resolve(destRoot);
   try {
-    if (await finishesSwitch(lib, dest, deps)) return;
+    if (await finishesSwitch(lib, dest)) return;
     const exclude = [...new Set(opts.excludeProjectIds ?? [])].sort();
     const plan = await planWith(lib, dest, env, { sourceRepo: opts.sourceRepo, now: deps.clock(), tz: opts.tz, actor: opts.actor }, false);
     await refuseUnaccepted(lib, dest, plan, exclude, opts);
@@ -603,8 +717,8 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
     await opts.onProgress?.(p);
   };
 
-  // A switch interrupted by a crash: finish it (the source is closed as the move would have).
-  if (await finishesSwitch(lib, dest, deps)) {
+  // A switch interrupted by a crash, its old copy marked: finish it (the source is closed as the move would have).
+  if (await finishesSwitch(lib, dest)) {
     return completeMove(dest, deps, env, { source: lib, index: opts.index, tz: opts.tz, actor: opts.actor, destRepo: opts.destRepo });
   }
 
@@ -615,6 +729,12 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   const excludedFolders = plan.perProject.filter((p) => exclude.includes(p.projectId)).map((p) => p.folder);
   const { movedAway } = await readProjects(lib.root);
   const journal = await preflight(lib, dest, opts.sourceRepo);
+  // FR-068 (R607 b): a resumed copy writes nothing before the destination is walked: a symbolic link or special file
+  // there (one in place of a folder would take the copy outside the folder) refuses, in the verification's words.
+  if (journal) {
+    const odd = (await walk(dest, () => false)).odd;
+    if (odd.length > 0) throw new MoveVerificationError(odd.slice(0, MAX_LISTED), odd.length, VERIFICATION_FAILED);
+  }
 
   if (opts.index?.isOpen) checkpointTruncate(opts.index.db);
   const split = excludedFolders.length > 0;
@@ -717,7 +837,7 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   bad.push(...atDest.odd);
   if (bad.length > 0) {
     const uniq = [...new Set(bad)];
-    throw new MoveVerificationError(uniq.slice(0, MAX_LISTED), uniq.length, "Verification failed; nothing was switched or deleted");
+    throw new MoveVerificationError(uniq.slice(0, MAX_LISTED), uniq.length, VERIFICATION_FAILED);
   }
 
   // Switch: plan every step, record it, then run the steps.
@@ -774,6 +894,10 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
     },
   };
   await writeJournal(dest, j);
+  if (moveSeams.crashAfter === "switching-journal") {
+    moveSeams.crashAfter = undefined;
+    throw new SimulatedMoveCrash("simulated crash after the switching journal was written");
+  }
   const res = await runSwitch(dest, j, rec, deps, { source: lib, index: opts.index, tz: opts.tz, actor: opts.actor, destRepo: opts.destRepo });
   return { ...res, filesCopied };
 }
@@ -786,6 +910,10 @@ interface SwitchContext {
   tz?: string;
   actor?: string;
   destRepo?: Repo;
+  /** finishMoveAt holds the old copy's lock already (taken before the destination was opened). */
+  oldLockHeld?: boolean;
+  /** Called once the old copy is marked (finishMoveAt releases its lock then). */
+  afterMarkOld?: () => Promise<void>;
 }
 
 /**
@@ -803,7 +931,275 @@ export async function completeMove(destRoot: string, deps: Deps, _env?: Location
   if (!rec) {
     throw new MoveNotAllowedError("nothing-to-complete", "This move was started on another device or its record is missing; finish it on that device");
   }
+  // Only at the place this computer's record names, for the library it names (R578): a copy of the destination made by
+  // hand, journal and all, is not that move's destination.
+  if (!(await sameFolder(rec.newRoot, dest)) || rec.libraryId !== j.libraryId) {
+    throw new MoveNotAllowedError("nothing-to-complete", "This folder is not the destination this computer recorded for that move");
+  }
   return runSwitch(dest, j, rec, deps, ctx);
+}
+
+/**
+ * R583: why finishMoveAt did not finish a move that is this computer's own: the journal at the new place cannot be read;
+ * the old copy cannot be reached when its marks must be looked at; files at the new place no longer match the move's
+ * check (`count`, and whether the old copy at `oldRoot` still matches it: `oldWhole`); a split's projects not yet marked
+ * were changed in the library they came from after they were copied; a mark the journal records as made in the old copy
+ * is no longer there (removed by hand, R590 N3). Its message carries no path.
+ */
+export class MoveFinishRefusedError extends Error {
+  override name = "MoveFinishRefusedError";
+  constructor(
+    readonly kind: "journal-damaged" | "old-copy-unreachable" | "files-differ" | "source-changed" | "mark-missing",
+    message: string,
+    readonly detail: { count?: number; oldRoot?: string; oldWhole?: boolean } = {},
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * FR-755 (R578, R583): finishes, at an opening of `destRoot`, a move whose switch did not finish — only when it is this
+ * computer's own move and `destRoot` is the folder its record names, and only once the old copy was marked as moved (the
+ * journal records the step, or the old copy shows the marks: its top's MOVED.json, or for a split a moved project's mark
+ * or its rewritten library.json). Returns undefined, writing nothing, when there is nothing this computer may finish here
+ * (no journal; a move still copying; no record of the move here, as for a library brought from another computer; another
+ * folder than the record's, as for a copy made by hand; the old copy not yet marked, so it is still the library).
+ *
+ * Before anything is written it checks the new place again against the checksums the move recorded (every file present;
+ * the same content, except library.json and the projects' audit logs, which the switch's own steps may have written:
+ * present), and for a split whose marking stopped part-way, that the moved projects not yet marked are unchanged in the
+ * library they came from. Either failing, it refuses (MoveFinishRefusedError) and writes nothing.
+ *
+ * It holds the destination's lock for every step (the destination is opened read-write, ignoring the journal; held by
+ * another, it refuses) and, when the old copy must be marked again, that copy's own lock for that step. A step that fails
+ * throws; the journal then records only the steps that completed, and the next opening tries again.
+ */
+export async function finishMoveAt(destRoot: string, deps: Deps, opts: { tz?: string; actor?: string } = {}): Promise<MoveResult | undefined> {
+  const dest = resolve(destRoot);
+  const j = await readJournal(dest);
+  if (!j) {
+    if (await fsp.lstat(join(dest, MOVE_JOURNAL)).then(() => true, () => false)) throw new MoveFinishRefusedError("journal-damaged", "The move's journal at the new place cannot be read");
+    return undefined;
+  }
+  if (j.phase !== "switching" || !j.switch) return undefined;
+  const sw = j.switch;
+  const rec = await getPendingOldCopy(deps, sw.pendingId).catch(() => undefined);
+  if (!rec || !(await sameFolder(rec.newRoot, dest)) || rec.libraryId !== j.libraryId) return undefined;
+  const markAgain = !sw.done.includes("mark-old");
+  // FR-068 (R607 a): as the move judges (stoppedSwitch), never over an old copy not marked by THIS move; a mark without a
+  // move's id (written by an older build, which a move it left half-switched must still be finished by) counts here.
+  if (markAgain && !(await oldCopyShowsMark(rec, j, "id-or-none"))) return undefined;
+  // R590 N3: every mark the journal records as made is still there (one removed by hand would let the old copy take
+  // changes the finishing leaves behind). An old copy that cannot be reached is not looked at (R583 M4: finished without it).
+  if (!markAgain && (await fsp.stat(rec.oldRoot).then((st) => st.isDirectory(), () => false))) {
+    const marks = rec.split ? sw.movedFolders.map((f) => join(rec.oldRoot, ...f.split("/"), MOVED_MARKER)) : [join(rec.oldRoot, MOVED_MARKER)];
+    for (const m of marks) {
+      if (!(await markNames(m, j.libraryId))) throw new MoveFinishRefusedError("mark-missing", "A mark the move recorded in its old copy is no longer there", { oldRoot: rec.oldRoot });
+    }
+  }
+
+  // R583 M5: the new place checked again against the move's own record of every file it verified. R590 N2: each audit
+  // log (a project's, and the library's own, R599 M-1) must begin with exactly what was verified, followed only by the
+  // finishing's own lines; and the new place's audit logs must show no fault to a check that writes nothing (empty,
+  // shortened, chain broken, head not anchored).
+  const verified = (await readVerifiedHashes(rec)).files;
+  const differ = await notMatching(dest, verified, (rel) => (rel === "library.json" ? "present" : AUDIT_LOG.test(rel) ? "begins" : "same"));
+  for (const where of await auditFaultsAt(dest, deps)) if (!differ.some((rel) => rel.startsWith(where))) differ.push(where);
+  if (differ.length > 0) {
+    const oldWhole =
+      (await fsp.stat(rec.oldRoot).then(() => true, () => false)) &&
+      (await notMatching(rec.oldRoot, verified, (rel) => (rel === "library.json" || rel === INDEX_FILE ? "present" : "same"))).length === 0;
+    throw new MoveFinishRefusedError("files-differ", `${differ.length} file(s) at the new place no longer match the move's check`, { count: differ.length, oldRoot: rec.oldRoot, oldWhole });
+  }
+  // A split marked part-way: the moved projects not yet marked could have been opened and changed in the old library.
+  if (markAgain && rec.split) {
+    const unmarked: string[] = [];
+    for (const f of sw.movedFolders) if (!(await markNames(join(rec.oldRoot, ...f.split("/"), MOVED_MARKER), j.libraryId))) unmarked.push(f);
+    const theirs = Object.fromEntries(Object.entries(verified).filter(([rel]) => unmarked.some((f) => rel.startsWith(`${f}/`))));
+    if ((await notMatching(rec.oldRoot, theirs, () => "same")).length > 0) {
+      throw new MoveFinishRefusedError("source-changed", "Projects not yet marked as moved were changed in the library they came from", { oldRoot: rec.oldRoot });
+    }
+  }
+
+  // The old copy's lock first, when it is to be marked again: refused before anything is written anywhere; released as
+  // soon as it is marked.
+  let oldLocked = false;
+  const releaseOld = async () => {
+    if (!oldLocked) return;
+    oldLocked = false;
+    await releaseLock(rec.oldRoot, deps);
+  };
+  if (markAgain) {
+    await takeOldCopyLock(rec.oldRoot, deps);
+    oldLocked = true;
+  }
+  let lib: Library | undefined;
+  try {
+    lib = await openLibraryInternal(dest, deps, {}, { ignoreMoveJournal: true });
+    if (lib.readOnlyReason === "locked-by-other-device") throw new MoveNotAllowedError("in-use", "The library's new place is open elsewhere");
+    if (lib.readOnlyReason === "newer-format") throw new MoveNotAllowedError("newer-format", "The library at the new place was saved by a newer version of the app");
+    if (lib.mode !== "read-write" || lib.id !== j.libraryId) {
+      throw new MoveNotAllowedError("read-only", `The library's new place could not be opened for writing (${lib.readOnlyReason ?? "another library"})`);
+    }
+    const repo = await openRepo(lib, new KeyRing(), { clock: deps.clock, ...(opts.tz ? { tz: opts.tz } : {}), ...(opts.actor ? { actor: opts.actor } : {}) });
+    return await runSwitch(dest, j, rec, deps, { destRepo: repo, oldLockHeld: markAgain, afterMarkOld: releaseOld, ...(opts.tz ? { tz: opts.tz } : {}), ...(opts.actor ? { actor: opts.actor } : {}) });
+  } finally {
+    await lib?.close();
+    await releaseOld();
+  }
+}
+
+/** An audit log: a project's (appended by the switch's own audit steps) or the library's own (R599 M-1: the same rule). */
+const AUDIT_LOG = /^(?:Projects\/[^/]+\/)?audit\/[^/]+\.jsonl$/u;
+
+/**
+ * The files of `expected` (library-relative path → SHA-256, the move's own verification record) that are missing under
+ * `root` or, where `rule` says "same", differ from what was verified. Read as the move's verification reads (sha256File).
+ */
+async function notMatching(root: string, expected: Record<string, string>, rule: (rel: string) => "same" | "present" | "begins"): Promise<string[]> {
+  const bad: string[] = [];
+  for (const [rel, hash] of Object.entries(expected)) {
+    const p = abs(root, rel);
+    const st = await fsp.lstat(p).catch(() => null);
+    const r = rule(rel);
+    if (!st?.isFile()) bad.push(rel);
+    else if (r === "same" && (await sha256File(p).catch(() => "")) !== hash) bad.push(rel);
+    else if (r === "begins" && !(await beginsWithVerified(p, hash).catch(() => false))) bad.push(rel);
+  }
+  return bad;
+}
+
+/**
+ * What the finishing itself may append to an audit log at the new place: the switch's own event (audit-move), and the
+ * record its own writable opening makes when this computer's anchor of the log was lost (R599 M-1: a fact about this
+ * computer, not a change of the library). `audit.anchor-mismatch` is not among them: it is refused.
+ */
+const SWITCH_OWN_ACTIONS = new Set(["library.move", "audit.anchor-missing"]);
+
+/**
+ * R590 N2: the audit log at `p` begins with exactly what the move verified, and goes on only with the switch's own lines.
+ * The move's record holds each file's SHA-256 and no size, so the verified beginning is found by its hash: the log is
+ * read once, and the hash of every beginning that ends a line (or is empty, or is the whole file) is compared with the
+ * recorded one. Every complete line after it must be an audit event the switch writes; a last line cut off by a crash
+ * (no line end) is not a record and is left to the opening's own repair.
+ */
+async function beginsWithVerified(p: string, hash: string): Promise<boolean> {
+  const buf = await fsp.readFile(p);
+  const h = createHash("sha256");
+  let end = h.copy().digest("hex") === hash ? 0 : -1;
+  for (let from = 0; end < 0 && from < buf.length; ) {
+    const nl = buf.indexOf(0x0a, from);
+    const to = nl < 0 ? buf.length : nl + 1;
+    h.update(buf.subarray(from, to));
+    from = to;
+    if (h.copy().digest("hex") === hash) end = to;
+  }
+  if (end < 0) return false;
+  const rest = buf.subarray(end).toString("utf8").split("\n");
+  rest.pop(); // what follows the last line end: nothing, or a line cut off by a crash
+  return rest.every((line) => {
+    try {
+      return SWITCH_OWN_ACTIONS.has((JSON.parse(line) as { action?: unknown }).action as string);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** R590 N2: the faults of the new place's audit logs that the finishing refuses over. */
+const AUDIT_FAULTS = new Set(["empty", "truncated", "chain-broken", "head-mismatch"]);
+
+/**
+ * R590 N2: the new place's audit logs with a fault (`Projects/<n>/audit/`, or `audit/` for the library's own log), found
+ * by the library's own check, opened read-only so that nothing is written and no fault is recorded over (a writable
+ * opening records a fault in the log and anchors it anew, after which no later opening reports it).
+ */
+async function auditFaultsAt(dest: string, deps: Deps): Promise<string[]> {
+  const lib = await openLibraryInternal(dest, deps, {}, {});
+  try {
+    // With its journal, the new place opens read-only (no lock, nothing written); any other state is refused later.
+    if (lib.readOnlyReason !== "move-incomplete") return [];
+    const repo = await openRepo(lib, new KeyRing(), { clock: deps.clock, noHeal: true });
+    const out: string[] = [];
+    for (const w of repo.integrityWarnings) {
+      if (!AUDIT_FAULTS.has(w.kind)) continue;
+      const where = w.projectId === "*" ? "audit/" : `${(await projectFolderOf(dest, w.projectId)) ?? `Projects/${w.projectId}`}/audit/`;
+      if (!out.includes(where)) out.push(where);
+    }
+    return out;
+  } finally {
+    await lib.close();
+  }
+}
+
+/**
+ * R583 I1, FR-068 (R607 a): what the old copy demonstrably shows of THIS move's marking: the top's MOVED.json, or for a
+ * split any moved project's MOVED.json, naming the library and carrying this move's id; or the old folder's library.json
+ * already rewritten as this move's remaining library. A mark carrying another move's id never counts; one without an id
+ * (written by an older build) counts only with `unnamed` "id-or-none". The old copy cannot be reached at all: it cannot be
+ * told (MoveFinishRefusedError "old-copy-unreachable").
+ */
+async function oldCopyShowsMark(rec: PendingOldCopy, j: Journal, unnamed: "id-only" | "id-or-none"): Promise<boolean> {
+  if (!(await fsp.stat(rec.oldRoot).then((st) => st.isDirectory(), () => false))) {
+    throw new MoveFinishRefusedError("old-copy-unreachable", "The old copy cannot be reached to see whether it is marked as moved", { oldRoot: rec.oldRoot });
+  }
+  const sw = j.switch!;
+  const ofThisMove = (p: string) => markOfMove(p, j.libraryId, sw.moveId, unnamed === "id-or-none");
+  if (!rec.split) return ofThisMove(join(rec.oldRoot, MOVED_MARKER));
+  for (const f of sw.movedFolders) if (await ofThisMove(join(rec.oldRoot, ...f.split("/"), MOVED_MARKER))) return true;
+  try {
+    const meta = JSON.parse(await fsp.readFile(join(rec.oldRoot, "library.json"), "utf8")) as Partial<LibraryJson>;
+    return sw.remainingLibraryId !== undefined && meta.libraryId === sw.remainingLibraryId;
+  } catch {
+    return false;
+  }
+}
+
+/** The moved marker at `p` names the library `libraryId` and carries the move's id `moveId` (or, with `unnamedCounts`, no move id). */
+async function markOfMove(p: string, libraryId: string, moveId: string, unnamedCounts: boolean): Promise<boolean> {
+  try {
+    const m = JSON.parse(await fsp.readFile(p, "utf8")) as { libraryId?: unknown; moveId?: unknown };
+    return m.libraryId === libraryId && (m.moveId === undefined ? unnamedCounts : m.moveId === moveId);
+  } catch {
+    return false;
+  }
+}
+
+/** The moved marker at `p` names the library `libraryId`. */
+async function markNames(p: string, libraryId: string): Promise<boolean> {
+  try {
+    return (JSON.parse(await fsp.readFile(p, "utf8")) as { libraryId?: unknown }).libraryId === libraryId;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * R583 I1 (R581): after a move failed, whether its old copy is marked as moved — then it must take no more changes. Read
+ * from the journal at the destination (the step recorded) and, where the journal's write was what failed or a split's
+ * marking stopped part-way, from what the old copy shows. False when there is no switching journal of this computer's
+ * for that old copy, or the old copy cannot be reached.
+ */
+export async function oldCopyMarkedFor(destRoot: string, oldRoot: string, deps: Deps): Promise<boolean> {
+  const j = await readJournal(resolve(destRoot));
+  if (j?.phase !== "switching" || !j.switch) return false;
+  const rec = await getPendingOldCopy(deps, j.switch.pendingId).catch(() => undefined);
+  if (!rec || rec.oldRoot !== resolve(oldRoot)) return false;
+  if (j.switch.done.includes("mark-old")) return true;
+  return oldCopyShowsMark(rec, j, "id-or-none").catch(() => false);
+}
+
+/**
+ * Takes the old copy's lock for this process, to mark it (R247 c). Refused when another computer or process holds it, and
+ * when this process already holds it (a library still open here: taking it over would end that hold at its release).
+ */
+async function takeOldCopyLock(oldRoot: string, deps: Deps): Promise<void> {
+  const held = await readLock(oldRoot);
+  if (held !== null && held !== "corrupt" && held.deviceId === deps.deviceId && held.pid === deps.pid) {
+    throw new MoveNotAllowedError("old-copy-in-use", "The old copy of the library is still open, so the move cannot be finished now");
+  }
+  const got = await acquireLock(oldRoot, deps);
+  if (!got.acquired) throw new MoveNotAllowedError("old-copy-in-use", "The old copy of the library is open on another computer, so the move cannot be finished now");
 }
 
 async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: Deps, ctx: SwitchContext): Promise<MoveResult> {
@@ -817,7 +1213,10 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
     if (!sw.steps.includes(name) || sw.done.includes(name)) return;
     await fn();
     sw.done.push(name);
-    if (name !== "finalize") await writeJournal(dest, j);
+    if (name !== "finalize") {
+      failSeam("journal", name);
+      await writeJournal(dest, j);
+    }
     if (moveSeams.crashAfter === name) {
       moveSeams.crashAfter = undefined;
       throw new SimulatedMoveCrash(`simulated crash after ${name}`);
@@ -832,29 +1231,55 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
   };
 
   // The old copy is marked first, so it can never be opened read-write after the switch began.
+  // Written only under the old copy's lock (R247 c): the source's, when this process has it open; otherwise its own,
+  // taken for this step and released after it (refused when another holds it).
   await step("mark-old", async () => {
-    const marker = JSON.stringify({ libraryId: j.libraryId, movedAt: deps.clock().toISOString(), toHint: sw.details.toHint }, null, 2);
+    if (ctx.oldLockHeld || (ctx.source && resolve(ctx.source.root) === oldRoot && ctx.source.mode === "read-write" && !isClosed(ctx.source))) return markOld();
+    await takeOldCopyLock(oldRoot, deps);
+    try {
+      await markOld();
+    } finally {
+      await releaseLock(oldRoot, deps);
+    }
+  });
+  await ctx.afterMarkOld?.();
+  async function markOld(): Promise<void> {
+    // R612 m-A (test seam): the first write of the mark into the old folder fails with this code, before anything is written there.
+    const f = moveSeams.fail;
+    if (f?.at === "mark-old") {
+      moveSeams.fail = undefined;
+      throw Object.assign(new Error(`writing the mark failed (simulated ${f.code})`), { code: f.code });
+    }
+    // FR-068 (R607 a): the mark carries the move's id, so that a mark is known to be this move's. Every reader keeps working
+    // with marks that lack it (older builds wrote them), and older builds read this one (they need libraryId and movedAt).
+    const marker = JSON.stringify({ libraryId: j.libraryId, movedAt: deps.clock().toISOString(), toHint: sw.details.toHint, moveId: sw.moveId }, null, 2);
     if (!rec.split) {
       await oldWrite(MOVED_MARKER, marker);
       return;
     }
     // Moved project folders first (valid while library.json still names this library), then the
     // old folder becomes a separate library with its own id, remembering the one it was split from.
-    for (const f of sw.movedFolders) await oldWrite(`${f}/${MOVED_MARKER}`, marker);
+    for (const [i, f] of sw.movedFolders.entries()) {
+      await oldWrite(`${f}/${MOVED_MARKER}`, marker);
+      failSeam("split-mark", i + 1);
+    }
     const meta = JSON.parse(await fsp.readFile(join(oldRoot, "library.json"), "utf8")) as LibraryJson;
     const restName = meta.libraryId === sw.remainingLibraryId ? meta.name : `${sw.libraryName} (remaining projects)`;
     if (meta.libraryId !== sw.remainingLibraryId) {
       await oldWrite("library.json", JSON.stringify({ ...meta, libraryId: sw.remainingLibraryId, name: restName, splitFrom: j.libraryId }, null, 2));
     }
     await registerLibrary({ libraryId: sw.remainingLibraryId!, name: restName, path: oldRoot }, deps);
-  });
+  }
   await step("register", () => registerLibrary({ libraryId: j.libraryId, name: sw.libraryName, path: dest }, deps));
   await step("close-source", async () => {
     // The source repo, if any, is never written after this: its library handle is closed.
     // Its index goes with it, before the lock is released (R551 M7, R570 b): a later close of the same library (the
     // service's closeLibrary) only gets this close's promise, so its own step that closes the index never runs.
-    // Checkpointed before the copy and not written since (the verify compared it), it closes without changing
-    // library.sqlite; only its working files (never copied) go.
+    // On a fresh move it was checkpointed before the copy and not written since (the verify compared it), so it closes
+    // without changing library.sqlite; only its working files (never copied) go. On a RESUMED switch (executeMove →
+    // completeMove after a restart) nothing checkpointed it first: what the reopened service wrote into it since is folded
+    // into the old copy's library.sqlite as it closes, which may then differ from the new place's, and deleteOldCopy keeps
+    // that one file (it fails closed).
     if (ctx.source && resolve(ctx.source.root) === oldRoot) await ctx.source.close({ beforeRelease: () => ctx.index?.close() });
   });
   await step("audit-split", async () => {
@@ -865,7 +1290,9 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
     auditIn(dest, deps, { ...ctx, repo: ctx.destRepo }, sw.movedProjectIds, "library.move", sw.details, warnings, { expectId: j.libraryId, ignoreMoveJournal: true }),
   );
   await step("finalize", async () => {
+    failSeam("mark-complete");
     await markPendingComplete(deps, rec.id);
+    failSeam("unlink");
     await fsp.unlink(join(dest, MOVE_JOURNAL)).catch((err: NodeJS.ErrnoException) => {
       if (err.code !== "ENOENT") throw err;
     });
@@ -1085,6 +1512,17 @@ export async function deleteOldCopy(
   }
   if (!rec.complete) throw new InvalidConfirmTokenError("unknown");
   if (root !== rec.oldRoot) throw new InvalidConfirmTokenError("wrong-root");
+  // R583 M2, R590 N4: not while the move is unfinished, nor while that cannot be told (the new place cannot be read).
+  const finished = await moveFinished(rec);
+  if (finished === "cannot-tell") {
+    throw new MoveNotAllowedError(
+      "move-unfinished",
+      "The old copy cannot be deleted now: the library's new place cannot be reached, so the app cannot tell whether its move has finished. Connect the drive the new place is on and try again.",
+    );
+  }
+  if (finished !== "finished") {
+    throw new MoveNotAllowedError("move-unfinished", "The move of this library has not finished, so its old copy cannot be deleted yet. Open the library at its new place first; the move is finished then.");
+  }
   if (isExpired(rec, deps)) throw new InvalidConfirmTokenError("expired");
   if (!rec.split) {
     const meta = await fsp.readFile(join(root, "library.json"), "utf8").then((t) => JSON.parse(t) as Partial<LibraryJson>, () => null);

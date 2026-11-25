@@ -24,11 +24,15 @@ import {
   LibraryClosedError,
   ReadOnlyLibraryError,
   acceptMovePlan,
+  isClosed,
+  oldCopyMarkedFor,
+  staleMoveCopyAt,
   scrubPaths,
   type IntegritySample,
   type Library,
 } from "@ao/library";
 import type { LibraryFolderRoomRequest, LibraryFolderRoomResponse, LibrarySuggestedFolderResponse } from "@ao/shared";
+import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedSplitText, moveNotFinishedText, moveStoppedBeforeSwitchReason, moveStoppedBeforeSwitchText, type OldFolderNotWritable } from "@ao/shared";
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
 import { cheapLocationEnv } from "./watched-folders.js";
@@ -44,6 +48,12 @@ function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
     name: s.lib.name,
     mode: s.lib.mode,
     ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
+    // FR-755 (R578 (2)): the old copy of a move that has not finished: where to open the library to finish it.
+    ...(s.lib.movedTo?.unfinished ? { moveUnfinishedTo: s.lib.movedTo.newRoot } : {}),
+    // R590 N5: and where the move's journal at the new place is damaged, that the app cannot finish it.
+    ...(s.lib.movedTo?.unfinished && s.lib.movedTo.journalDamaged ? { moveCannotFinish: true } : {}),
+    // FR-068 (R607 c): the copy of a move that stopped before its old copy was marked: where the library still is.
+    ...(s.lib.staleMoveOf ? { staleMoveOf: s.lib.staleMoveOf } : {}),
     // Only the holding device's name (R118): never its id, process or a user name.
     ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
     // Being rebuilt, failed, or not writable (read-only): absent when the index is ready (D8).
@@ -66,6 +76,21 @@ function ndjson(reply: FastifyReply): (value: unknown) => Promise<void> {
 }
 
 const ndjsonError = (ctx: Ctx, err: unknown) => errorBody(toApiError(err), ctx.state.roots);
+
+/**
+ * R612 m-A: a write refused for want of space or permission, by its code or one it wraps, grouped as the move's other
+ * failures are (state.ts, notFinishedKind): ENOSPC, EDQUOT a full disk; EACCES, EPERM refused permission; EROFS a disk
+ * that can only be read. Undefined for any other cause.
+ */
+function oldFolderNotWritable(err: unknown): OldFolderNotWritable | undefined {
+  for (let e: unknown = err, depth = 0; e && typeof e === "object" && depth < 4; e = (e as { cause?: unknown }).cause, depth++) {
+    const code = (e as { code?: unknown }).code;
+    if (code === "ENOSPC" || code === "EDQUOT") return "disk-full";
+    if (code === "EACCES" || code === "EPERM") return "permission";
+    if (code === "EROFS") return "read-only-disk";
+  }
+  return undefined;
+}
 
 function absPath(o: Record<string, unknown>, key: string): string {
   const p = str(o, key, 4096);
@@ -178,7 +203,10 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     state.roots.add(path);
     await state.closeLibrary();
     if (state.shuttingDown) throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
+    // FR-755 (R578): this computer's own unfinished move into this folder is finished first.
+    const note = await state.finishUnfinishedMove(path);
     const r = await reconnect(path, libraryId, state.deps, { tz: state.tz, onLockLost: () => state.publishState() });
+    if (note) state.noteOpening(r.library, note);
     await state.adopt(r.library);
     return {
       ...libraryView(ctx),
@@ -338,6 +366,27 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
           onProgress: (p) => write({ progress: p }),
         });
       } catch (err) {
+        // FR-755 (R573, R578): failed once the old copy was marked as moved or closed (a later step of the switch: the
+        // journal's write at the destination, the record's marking, the journal's removal). The old library cannot carry
+        // on: it is closed in the service, as by "Close library", and opening the library at its new place finishes the
+        // move. What the move paused waits there, as after a move whose new place could not be opened.
+        // Marked: from the journal's record of the steps done, or what the old copy shows — its top's mark, or for a split
+        // any moved project's mark (R583 I1).
+        if (state.session === s && (isClosed(s.lib) || (await oldCopyMarkedFor(dest, oldRoot, state.deps)))) {
+          state.resumeWhenOpened(dest, paused, oldRoot);
+          await state.closeLibrary();
+          state.moving = false;
+          state.opts.log.warn({ err: state.describe(err) }, "the move did not finish after the old copy was closed");
+          const split = (excludeProjectIds?.length ?? 0) > 0;
+          const body = errorBody(
+            split ? new ApiError(503, "UNAVAILABLE", moveNotFinishedSplitText(), MOVE_NOT_FINISHED_SPLIT_REASON) : new ApiError(503, "UNAVAILABLE", moveNotFinishedText(), MOVE_NOT_FINISHED_REASON),
+            state.roots,
+          );
+          state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
+          await write(body);
+          reply.raw.end();
+          return;
+        }
         // Not moved: the old library carries on as before.
         state.moving = false;
         if (state.session === s) {
@@ -345,7 +394,18 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
           state.resumeBatches(paused);
           state.restartStoppedWork();
         }
-        const body = ndjsonError(ctx, err);
+        // FR-068 (R607 d): stopped after its switch began and before any mark of it (the switching journal at the new
+        // place, this computer's record of it, the old place unmarked and still this library): the library was not
+        // switched, and the copy there is not used; a move into that folder is refused from now on. Said in its own
+        // sentence (no path: it is recorded), in place of the failure's own words.
+        // R612 m-A: in that state the step that failed is the mark's write into the old folder (nothing else is written
+        // between the switching journal and the mark); for want of space or permission there, the sentence names that
+        // cause, since another folder would only meet the same failure.
+        const stopped = await staleMoveCopyAt(state.deps, dest, s.lib.id).catch(() => undefined);
+        const cause = stopped ? oldFolderNotWritable(err) : undefined;
+        const body = stopped
+          ? errorBody(new ApiError(409, "CONFLICT", moveStoppedBeforeSwitchText(undefined, cause), moveStoppedBeforeSwitchReason(cause)), state.roots)
+          : ndjsonError(ctx, err);
         state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
         await write(body);
         reply.raw.end();

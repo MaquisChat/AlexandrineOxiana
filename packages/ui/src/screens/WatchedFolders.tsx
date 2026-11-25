@@ -27,7 +27,9 @@
  */
 import type { WatchedFolderFileItem, WatchedFolderSummary, WatchFolderState } from "@ao/shared";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type Ref } from "react";
-import { ApiClientError, type ApiClient } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { useLeaveSignal } from "../components/leaveSignals";
 import { isProjectLocked, libraryApi, type Collection, type LibraryState, type ProjectSummary } from "../api/library";
 import { formatSize } from "../api/tools";
 import { watchedFoldersApi, watchStatusOf } from "../api/watchedFolders";
@@ -145,7 +147,9 @@ function LiveRegion({ said, testId }: { said: Said; testId: string }) {
 // ---------------------------------------------------------------------------------------------
 // The route: the project named in the address.
 
-export function WatchedFoldersRoute({ client, loc }: { client: ApiClient; loc: AppLocation }) {
+/** `firstReadMs` (FR-750, R579): how long the screen's reads are waited for before they are given up (smaller in tests). */
+/** `streamOpenMs` (FR-756 C, R597): how long the event stream is waited for to open before it is closed and tried afresh after the screen's pause (STREAM_OPEN_TIMEOUT_MS; smaller in tests); an open stream is never ended by it. */
+export function WatchedFoldersRoute({ client, loc, firstReadMs, streamOpenMs }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number }) {
   const projectId = projectInQuery(loc.search);
   if (!projectId) {
     return (
@@ -155,12 +159,12 @@ export function WatchedFoldersRoute({ client, loc }: { client: ApiClient; loc: A
       </main>
     );
   }
-  return <WatchedFolders key={projectId} client={client} projectId={projectId} />;
+  return <WatchedFolders key={projectId} client={client} projectId={projectId} {...(firstReadMs !== undefined ? { firstReadMs } : {})} {...(streamOpenMs !== undefined ? { streamOpenMs } : {})} />;
 }
 
 // ---------------------------------------------------------------------------------------------
 
-export function WatchedFolders({ client, projectId }: { client: ApiClient; projectId: string }) {
+export function WatchedFolders({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: { client: ApiClient; projectId: string; firstReadMs?: number; streamOpenMs?: number }) {
   const api = useMemo(() => watchedFoldersApi(client), [client]);
   const lib = useMemo(() => libraryApi(client), [client]);
   const shell = desktopShell();
@@ -168,6 +172,8 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
 
   const [folders, setFolders] = useState<WatchedFolderSummary[] | undefined>();
   const [loadError, setLoadError] = useState<string | undefined>();
+  /** FR-750: the list's last read got no answer (or none in time): "Try again" is offered. */
+  const [loadUnreachable, setLoadUnreachable] = useState(false);
   const [locked, setLocked] = useState(false);
   const [project, setProject] = useState<ProjectSummary | undefined>();
   const [readOnly, setReadOnly] = useState(false);
@@ -226,7 +232,10 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
   /** Lists being read (one request per press, M6). */
   const filesBusy = useRef(new Set<string>());
   const againBusy = useRef(false);
-  const relisting = useRef<{ again: boolean; done: Promise<void> } | null>(null);
+  const relisting = useRef<{ again: boolean; done: Promise<void>; drops: number; ac: AbortController } | null>(null);
+  /** FR-750: the list has been read once (or since the library changed), and the times the event stream failed or dropped. */
+  const listedOk = useRef(false);
+  const streamDrops = useRef(0);
   const foldersHeading = useRef<HTMLHeadingElement>(null);
   const sourceRef = useRef<HTMLElement>(null);
   const mainRef = useRef<HTMLElement>(null);
@@ -318,59 +327,80 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     setOpenSource(null);
     setLists(() => ({}));
     setLoadError(undefined);
+    setLoadUnreachable(false);
+    listedOk.current = false;
     setLocked(false);
     foldersRef.current = [];
     setFolders(undefined);
   }, [setDialog, setLists]);
 
-  /** The list (at load, after a lost stream, an unlock, a 409 or a 404); one at a time, a second ask joins it. */
-  const relist = useCallback(async (): Promise<void> => {
+  /**
+   * The list (at load, after a lost stream, an unlock, a 409 or a 404); one at a time, a second ask joins it. Each read is
+   * given up after `firstReadMs` as one that got no answer (FR-750); `restart`: one still out is given up for a new one.
+   */
+  const relist = useCallback(async (o: { restart?: boolean } = {}): Promise<void> => {
     if (relisting.current) {
-      relisting.current.again = true;
-      return relisting.current.done;
+      if (!o.restart) {
+        relisting.current.again = true;
+        return relisting.current.done;
+      }
+      relisting.current.ac.abort();
     }
     let settle!: () => void;
-    const mark = { again: false, done: new Promise<void>((r) => (settle = r)) };
+    const mark = { again: false, done: new Promise<void>((r) => (settle = r)), drops: streamDrops.current, ac: new AbortController() };
     relisting.current = mark;
     const g = gen.current;
+    const mine = () => alive.current && g === gen.current && relisting.current === mark;
     try {
       do {
         mark.again = false;
         try {
-          const r = await api.list(projectId);
-          if (!alive.current || g !== gen.current) return;
+          const r = await readWithin((signal) => api.list(projectId, { signal }), firstReadMs, mark.ac.signal);
+          if (!mine()) return;
           setLoadError(undefined);
+          setLoadUnreachable(false);
+          listedOk.current = true;
           take(r.folders, true, r.seq);
         } catch (err) {
-          if (!alive.current || g !== gen.current) return;
+          if (!mine()) return;
           if (isProjectLocked(err)) {
             markLocked();
             return;
           }
-          if (foldersRef.current.length === 0) setLoadError(sentenceOf(err, "The watched folders could not be read."));
+          if (foldersRef.current.length === 0) {
+            setLoadError(sentenceOf(err, "The watched folders could not be read."));
+            setLoadUnreachable(isUnreachable(err));
+          }
         }
-      } while (mark.again);
+      } while (mark.again && mine());
     } finally {
       if (relisting.current === mark) relisting.current = null;
       settle();
     }
-  }, [api, projectId, take, markLocked]);
+  }, [api, projectId, take, markLocked, firstReadMs]);
 
+  /**
+   * FR-756's remainder (R609 N4): the reads beside the folders (the collections, the project's name, the library's mode)
+   * are given up silently after `firstReadMs` (cancelled; what a failure showed is shown), and cancelled when the screen
+   * is left.
+   */
+  const leaving = useLeaveSignal();
+  const sideRead = useCallback(<T,>(read: (signal: AbortSignal) => Promise<T>) => readWithin(read, firstReadMs, leaving()), [firstReadMs, leaving]);
   const refreshCollections = useCallback(() => {
-    lib.collections.list(projectId).then(
+    sideRead((signal) => lib.collections.list(projectId, { signal })).then(
       (r) => alive.current && setCollections(r.collections),
       () => {},
     );
-  }, [lib, projectId]);
+  }, [lib, projectId, sideRead]);
 
   // ---- load: the folders, the project's name, the library's mode, the collections ----
   useEffect(() => {
     void relist();
-    lib.projects.list().then(
+    sideRead((signal) => lib.projects.list({ signal })).then(
       (r) => alive.current && setProject(r.projects.find((p) => p.id === projectId)),
       () => {},
     );
-    lib.libraries.list().then(
+    sideRead((signal) => lib.libraries.list({ signal })).then(
       (r) => {
         if (!alive.current || !r.current) return;
         libraryId.current ??= r.current.libraryId;
@@ -379,7 +409,7 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       () => {},
     );
     refreshCollections();
-  }, [lib, projectId, relist, refreshCollections]);
+  }, [lib, projectId, relist, refreshCollections, sideRead]);
 
   // ---- live updates: watch.status of this project, and the library's mode ----
   useEffect(() => {
@@ -389,11 +419,15 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
     const listen = async () => {
       try {
         const onOpen = () => {
+          // FR-750 (R579): after the stream failed or dropped, a list not yet read — failed, or still out from before the
+          // stream last failed (it may never settle) — is read again at once, without waiting for an event on it.
+          const m = relisting.current;
+          if (streamDrops.current > 0 && !listedOk.current && (!m || m.drops < streamDrops.current)) void relist({ restart: true });
           // After a lost stream, what was published meanwhile is read from the list.
-          if (opened) void relist();
+          else if (opened) void relist();
           opened = true;
         };
-        for await (const ev of client.events({ signal: ac.signal, onOpen })) {
+        for await (const ev of client.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs })) {
           if (!alive.current) return;
           if (ev.type === "library.state" && ev.data && typeof ev.data === "object") {
             const d = ev.data as LibraryState;
@@ -424,14 +458,17 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       } catch {
         // the stream dropped: listen again shortly
       }
-      if (!ac.signal.aborted) retry = setTimeout(() => void listen(), RECONNECT_MS);
+      if (!ac.signal.aborted) {
+        streamDrops.current++;
+        retry = setTimeout(() => void listen(), RECONNECT_MS);
+      }
     };
     void listen();
     return () => {
       ac.abort();
       clearTimeout(retry);
     };
-  }, [client, projectId, take, relist, forgetLibrary, refreshCollections]);
+  }, [client, projectId, take, relist, forgetLibrary, refreshCollections, streamOpenMs]);
 
   useEffect(() => {
     if (focusFolders > 0) foldersHeading.current?.focus();
@@ -791,6 +828,14 @@ export function WatchedFolders({ client, projectId }: { client: ApiClient; proje
       {loadError && (
         <p role="alert" className="ao-error">
           {loadError}
+        </p>
+      )}
+      {/* FR-750 (R579): a read that got no answer (or none in time) is offered again; an answer the screen handles is not. */}
+      {loadError && loadUnreachable && (
+        <p>
+          <button type="button" onClick={() => void relist()}>
+            Try again
+          </button>
         </p>
       )}
       {!folders && !loadError && <p role="status">{WATCH_TEXT.loading}</p>}

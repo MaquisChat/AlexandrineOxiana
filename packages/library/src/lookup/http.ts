@@ -248,6 +248,12 @@ export interface GetOptions {
    */
   askedToWait?: "wait" | "leave-out";
   /**
+   * Decision 31 (c), R585 M2: called each time a request of this call actually leaves (just before it is sent; not for
+   * an answer from the cache, a request the hold left out, or one the closing stopped first). "Look up again" counts
+   * with it what was really sent.
+   */
+  onSend?: () => void;
+  /**
    * Parameters added to the address when it is requested (F10: Unpaywall's `email`), percent-encoded. Never part of
    * the cache key, a cached entry, a log line, an error's message or any property of an error: the same answer is
    * served from the cache whatever their values. Not sent again after a redirect.
@@ -386,7 +392,7 @@ export class HttpClient {
       }
     }
 
-    const res = await this.fetchWithRetries(url, opts.final429, opts.query, opts.final5xx === true, opts.askedToWait === "leave-out");
+    const res = await this.fetchWithRetries(url, opts.final429, opts.query, opts.final5xx === true, opts.askedToWait === "leave-out", opts.onSend);
     if (res.body !== null) validate?.(res.body); // throws: nothing is cached
     const entry: CacheEntry = { v: 1, storedAt: this.clock(), status: res.status, body: res.body };
     // Never cached (R257 h; R290 a, e): an answer that holds the private query, or the key or the e-mail sent with it.
@@ -422,6 +428,27 @@ export class HttpClient {
    */
   stop(): void {
     this.stopped.abort();
+  }
+
+  /**
+   * Decision 31 (c), R411: the time (client clock, ms) before which `host` is not to be asked — the hold a 429 or a 503
+   * with a wait asked set — or undefined when it may be asked now. Only reads: "Look up again" leaves a held service out
+   * without sending, and without counting a try.
+   */
+  heldUntil(host: string): number | undefined {
+    const t = this.notBefore.get(host);
+    return t !== undefined && this.clock() < t ? t : undefined;
+  }
+
+  /**
+   * R600 I1: holds `host` until `t` (client clock, ms) — a hold carried over a reopening from the times the services
+   * named, kept on the entries. Capped at MAX_HOLD_MS from now, as every hold is; never shortens a hold already kept; a
+   * time already passed holds nothing.
+   */
+  holdUntil(host: string, t: number): void {
+    const until = Math.min(t, this.clock() + MAX_HOLD_MS);
+    if (until <= this.clock()) return;
+    this.notBefore.set(host, Math.max(this.notBefore.get(host) ?? 0, until));
   }
 
   /** What ends this call's waits: the client's stop, and the closing of the session the current work runs for. */
@@ -724,6 +751,7 @@ export class HttpClient {
     query?: Readonly<Record<string, string>>,
     final5xx = false,
     leaveOut = false,
+    onSend?: () => void,
   ): Promise<{ status: 200 | 404; body: string | null; sent?: Record<string, string> }> {
     if (this.recorded) return this.recorded.answer(url);
     this.assertOpen();
@@ -751,7 +779,7 @@ export class HttpClient {
       if (leaveOut && attempt > 0) this.leftOutIfHeld(host);
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
       try {
-        res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) }, leaveOut);
+        res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) }, leaveOut, onSend);
       } catch (e) {
         if (e instanceof LookupHttpError || e instanceof LookupLeftOutError) throw e; // refused redirect, oversized body, held: not retried
         // The library is being closed: a request in the air is abandoned and never sent again (R546 2).
@@ -806,6 +834,7 @@ export class HttpClient {
     url: string,
     send: { ua: string; key?: string },
     leaveOut = false,
+    onSend?: () => void,
   ): Promise<{ status: number; body: string | null; retryAfter?: string; rateLimit?: RateLimitAnswer }> {
     let current = new URL(url);
     let signal: AbortSignal | undefined;
@@ -819,6 +848,7 @@ export class HttpClient {
         if (!signal) {
           signal = AbortSignal.any([AbortSignal.timeout(this.attemptTimeoutMs), this.halt()]);
         }
+        onSend?.();
         const res = await request(current, {
           method: "GET",
           headers: {

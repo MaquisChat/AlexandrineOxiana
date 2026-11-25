@@ -158,6 +158,36 @@ export const WATCH_ACT_CLOSED_TEXT = "The library was closed or went offline bef
  */
 export const LOOKUP_WAITING_TEXT = "Waiting for lookup service response.";
 
+/**
+ * Decision 31 (c), "Look up again" — R577 (4), word for word. `found`, `fromFile`, `nothing`, `notAllowed` and the given-up
+ * sentence (`lookUpGaveUpText`) take the place of LOOKUP_WAITING_TEXT in an entry's reasons once its state changes;
+ * `notLookedUpYet` and `notLookedUpFailed` are said under the entry's matches; `looking` only on the screen while a look-up
+ * runs; `act` is the button, `lookUpAgainAfter` the button before the service's named time. A lookup that failed
+ * outright keeps the entry's own reason (today's sentence).
+ */
+export const LOOK_UP_AGAIN_TEXT = {
+  notLookedUpYet: "Not looked up yet: the lookup service asked to wait.",
+  looking: "Looking this up again…",
+  found: "The lookup service has now answered. Its matches are shown below; nothing changes until you accept one.",
+  fromFile: "The match was found from an identifier in the file, which may belong to a work the file cites. Check it against the document first.",
+  nothing: "The lookup service has now answered, but it found no match for this item.",
+  notAllowed: "This project's rules no longer allow this lookup, so it was not looked up again.",
+  gaveUp: "The lookup service asked to wait each time it was tried ({n} tries), so the app has stopped trying by itself. You can still use Look up again.",
+  act: "Look up again",
+  after: "Look up again (after {time})",
+  notLookedUpFailed: "Not looked up: a lookup service could not be reached. You can use Look up again.",
+} as const;
+
+/** R577 (4): the given-up sentence with its number of tries. */
+export function lookUpGaveUpText(n: number): string {
+  return LOOK_UP_AGAIN_TEXT.gaveUp.replace("{n}", String(n));
+}
+
+/** R577 (4): the button before the service's named time, with that time as the screen writes it. */
+export function lookUpAgainAfter(time: string): string {
+  return LOOK_UP_AGAIN_TEXT.after.replace("{time}", time);
+}
+
 /** The one sentence for a file whose attach the library's closing cancelled (ATTACH_CLOSED_TEXT around its name). */
 export function attachClosedSentence(fileName: string): string {
   return `${ATTACH_CLOSED_TEXT.before}${fileName}${ATTACH_CLOSED_TEXT.after}`;

@@ -10,7 +10,7 @@ import { http, HttpResponse, type JsonBodyType } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { watchedFoldersApi, watchedFoldersHref } from "../api/watchedFolders";
 import { fakeShell, type FakeShell } from "../test/desktopShell";
-import { CURRENT_RW, libraryHandlers, PROJECTS, server, serviceError, SOURCE_FILE, STYLES, testApi, testClient, url, useMockService } from "../test/service";
+import { CURRENT_RW, hang, libraryHandlers, PROJECTS, server, serviceError, SOURCE_FILE, sseAttempts, STYLES, testApi, testClient, url, useMockService } from "../test/service";
 import { routeFor } from "../App";
 import { Library } from "./Library";
 import { WatchedFoldersRoute } from "./WatchedFolders";
@@ -1348,5 +1348,166 @@ describe("the way in", () => {
     render(<Library api={testApi()} current={CURRENT_RW as never} />);
     const link = await screen.findByRole("link", { name: "Watched folders" });
     expect(link.getAttribute("href")).toBe("/settings/watched-folders?project=p1");
+  });
+});
+
+describe("Watched folders: first reads that never settle (FR-750, R579)", () => {
+  const UNREACHABLE = "The library service could not be reached.";
+  /** R586 M5: said where a read was given up at the time limit (it neither answered nor failed). */
+  const NO_ANSWER = "The library service did not answer in time.";
+  const listReads = () => calls.filter((c) => c === "GET /projects/p1/watched-folders").length;
+  let calls: string[];
+  const onReq = ({ request }: { request: Request }) => {
+    const u = new URL(request.url);
+    if (u.pathname !== "/events") calls.push(`${request.method} ${u.pathname}`);
+  };
+  beforeEach(() => {
+    calls = [];
+    server.events.on("request:start", onReq);
+  });
+  afterEach(() => {
+    server.events.removeListener("request:start", onReq);
+  });
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const showWithin = (ms: number) => render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} firstReadMs={ms} />);
+
+  it("a list that hangs is given up after the limit: the usual alert with “Try again”; pressing it reads again, and focus is not lost", async () => {
+    useService([]);
+    let answer = false;
+    const gate = hang();
+    server.use(
+      http.get(url("/projects/p1/watched-folders"), async () => {
+        if (!answer) await gate;
+        return HttpResponse.json({ seq: nextSeq(), folders: [folder()] });
+      }),
+    );
+    showWithin(300);
+    expect(screen.getByText("Reading the watched folders…")).toBeTruthy();
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+    expect(screen.queryByText("Reading the watched folders…")).toBeNull();
+    expect(document.activeElement).toBe(document.body);
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("region", { name: "Fieldwork scans" });
+    expect(tryAgain()).toBeNull();
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    expect(listReads()).toBe(2);
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Folders" }));
+  });
+
+  it("when the event stream opens anew, a list still out from before is read again, without a press and without an event", async () => {
+    useService([]);
+    const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
+    const gate = hang();
+    let n = 0;
+    server.use(
+      ev.handler,
+      http.get(url("/projects/p1/watched-folders"), async () => {
+        if (++n === 1) await gate;
+        return HttpResponse.json({ seq: nextSeq(), folders: [folder()] });
+      }),
+    );
+    show();
+    await screen.findByRole("region", { name: "Fieldwork scans" }, { timeout: 10_000 });
+    expect(ev.attempts()).toBe(2);
+    expect(listReads()).toBe(2);
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("FR-756 C (R597): a stream that never opens is cancelled at the limit and opened afresh after the screen's pause; at that opening a list still out is read again", async () => {
+    useService([]);
+    const ev = sseAttempts((n) => (n === 1 ? "hang" : []));
+    const gate = hang();
+    let n = 0;
+    server.use(
+      ev.handler,
+      http.get(url("/projects/p1/watched-folders"), async () => {
+        if (++n === 1) await gate;
+        return HttpResponse.json({ seq: nextSeq(), folders: [folder()] });
+      }),
+    );
+    render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} streamOpenMs={300} />);
+    await screen.findByRole("region", { name: "Fieldwork scans" }, { timeout: 10_000 });
+    expect(ev.attempts()).toBe(2);
+    expect(listReads()).toBe(2);
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("FR-756 C (R597): a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
+    useService([]);
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} streamOpenMs={200} />);
+    await waitFor(() => expect(ev.attempts()).toBe(1));
+    await new Promise((r) => setTimeout(r, 3_000));
+    expect(ev.attempts()).toBe(1);
+    // R602 M2: the page has not cancelled it (a drop after the answer began would not end a mocked body).
+    expect(ev.signals()[0]!.aborted).toBe(false);
+  });
+
+  it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
+    useService([]);
+    const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
+    server.use(ev.handler, http.get(url("/projects/p1/watched-folders"), () => HttpResponse.error()));
+    show();
+    await screen.findByRole("button", { name: "Try again" });
+    await waitFor(() => expect(listReads()).toBe(2), { timeout: 10_000 });
+    await screen.findByRole("button", { name: "Try again" });
+    ev.drop();
+    await waitFor(() => expect(ev.attempts()).toBe(3), { timeout: 10_000 });
+    await waitFor(() => expect(listReads()).toBe(3));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(listReads()).toBe(3);
+  });
+
+  it("a list refused with an answer shows its sentence as today, with no “Try again”", async () => {
+    useService([]);
+    server.use(http.get(url("/projects/p1/watched-folders"), () => serviceError(500, "INTERNAL", "The watched folders could not be listed.")));
+    show();
+    await screen.findByText("The watched folders could not be listed.");
+    expect(tryAgain()).toBeNull();
+  });
+});
+
+// FR-756's remainder (R609 N4): the screen's silent side reads — the projects (its name), the libraries (the mode), the
+// collections — are given up at the limit silently (cancelled; nothing new is shown), and cancelled when it is left.
+describe("Watched folders: the side reads are given up silently at the limit (FR-756 remainder)", () => {
+  function heldSide() {
+    const gate = hang();
+    const seen = new Map<string, AbortSignal>();
+    const held = (name: string, body: unknown) => async ({ request }: { request: Request }) => {
+      seen.set(name, request.signal);
+      await gate;
+      return HttpResponse.json(body as never);
+    };
+    server.use(
+      http.get(url("/projects"), held("projects", PROJECTS)),
+      http.get(url("/libraries"), held("libraries", { libraries: [], current: CURRENT_RW })),
+      http.get(url("/projects/p1/collections"), held("collections", { collections: [] })),
+    );
+    return seen;
+  }
+
+  it("held, they are cancelled at the limit with no alert, and the folders are shown", async () => {
+    useService([folder()]);
+    const seen = heldSide();
+    render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} firstReadMs={300} />);
+    await screen.findByRole("region", { name: "Fieldwork scans" });
+    await waitFor(() => expect([...seen.keys()].sort()).toEqual(["collections", "libraries", "projects"]));
+    await waitFor(() => expect([...seen.values()].every((s) => s.aborted)).toBe(true), { timeout: 3000 });
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("held, they are cancelled when the screen is left", async () => {
+    useService([folder()]);
+    const seen = heldSide();
+    const view = render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} firstReadMs={60_000} />);
+    await screen.findByRole("region", { name: "Fieldwork scans" });
+    await waitFor(() => expect([...seen.keys()].sort()).toEqual(["collections", "libraries", "projects"]));
+    expect([...seen.values()].some((s) => s.aborted)).toBe(false);
+    view.unmount();
+    await waitFor(() => expect([...seen.values()].every((s) => s.aborted)).toBe(true), { timeout: 1000 });
   });
 });

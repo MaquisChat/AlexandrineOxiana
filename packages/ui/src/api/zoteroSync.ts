@@ -30,7 +30,7 @@ export function zoteroSyncApi(client: ApiClient) {
   const r = client.request;
   return {
     /** GET /zotero/sync: settings, each link with the service's status line, the run in progress, the back-off. */
-    state: () => r<ZoteroSyncStateResponse>("GET", "/zotero/sync"),
+    state: (opts: { signal?: AbortSignal } = {}) => r<ZoteroSyncStateResponse>("GET", "/zotero/sync", opts.signal ? { signal: opts.signal } : {}),
     /** POST /zotero/key-check, with no body: what the saved key may read (never the key). */
     checkKey: () => r<ZoteroKeyCheckResponse>("POST", "/zotero/key-check"),
     /** PUT /zotero/sync/settings: answers the state, as GET does. */
@@ -43,7 +43,7 @@ export function zoteroSyncApi(client: ApiClient) {
     /** POST /zotero/sync/stop: answered once the stopped run has its record. */
     stop: () => r<ZoteroSyncStopResponse>("POST", "/zotero/sync/stop"),
     /** GET /zotero/sync/history: newest first, never the run in progress (R250 b). */
-    history: () => r<ZoteroSyncHistoryResponse>("GET", "/zotero/sync/history"),
+    history: (opts: { signal?: AbortSignal } = {}) => r<ZoteroSyncHistoryResponse>("GET", "/zotero/sync/history", opts.signal ? { signal: opts.signal } : {}),
   };
 }
 

@@ -18,7 +18,7 @@ import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { PATHS } from "../navigation";
-import { BASE, CURRENT_RW, LIBRARIES, TOKEN, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
+import { BASE, CURRENT_RW, LIBRARIES, TOKEN, asksInTurn, hang, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
 import { FindAcquire } from "./FindAcquire";
 import { SEARCH_SOURCES_TEXT, SearchSources, searchSourcesHref } from "./SearchSources";
@@ -787,5 +787,165 @@ describe("Search sources: reachable", () => {
     );
     render(<FindAcquire client={testClient()} loc={{ pathname: PATHS.find, search: `?project=${P1}` }} />);
     await waitFor(() => expect(screen.getByRole("link", { name: "Search sources" }).getAttribute("href")).toBe(`/settings/search-sources?project=${P1}`));
+  });
+});
+
+describe("Search sources: a first read that never settles (FR-756, R584, R586)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const UNREACHABLE = "The library service could not be reached.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
+
+  it("is given up at the limit: the alert and “Try again”; pressed, it reads again (with the project), the loading words meanwhile, and the settings are shown with focus kept", async () => {
+    const svc = useSvc();
+    const gate = hang();
+    let answer = false;
+    svc.onGet = async () => {
+      if (!answer) await gate;
+      return undefined;
+    };
+    render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: `?project=${P1}` }} firstReadMs={300} />);
+    expect(screen.getByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    // Given up: not taken for a project that could not be read, and not asked again without it.
+    expect(alerts()).toEqual([NO_ANSWER]);
+    expect(screen.queryByTestId("search-project-error")).toBeNull();
+    expect(svc.count("GET", "/settings/search-sources")).toBe(1);
+    await userEvent.setup().click(tryAgain()!);
+    expect(screen.getByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Search sources" }));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("checkbox", { name: "Crossref" });
+    await waitFor(() => expect(svc.count("GET", "/secrets/elicit-api-key")).toBe(1));
+    expect(tryAgain()).toBeNull();
+    expect(alerts()).toEqual([]);
+    const gets = svc.sent.filter((s) => s.method === "GET" && s.path === "/settings/search-sources");
+    expect(gets.map((s) => s.search)).toEqual([`?project=${P1}`, `?project=${P1}`, `?project=${P1}`]);
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Search sources" }));
+  });
+
+  it("a read that FAILS says what it said before, now with “Try again”", async () => {
+    const svc = useSvc();
+    let fail = true;
+    svc.onGet = async () => (fail ? HttpResponse.error() : undefined);
+    render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: "" }} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([UNREACHABLE]);
+    fail = false;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("checkbox", { name: "Crossref" });
+    await waitFor(() => expect(svc.count("GET", "/secrets/elicit-api-key")).toBe(1));
+  });
+
+  it("a read refused with an answer says its sentence as before, with no “Try again”", async () => {
+    const svc = useSvc();
+    svc.onGet = async () => HttpResponse.json({ error: { code: "INTERNAL", message: "The settings file could not be read." } }, { status: 500 });
+    render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: "" }} firstReadMs={300} />);
+    await screen.findByText("The settings file could not be read.");
+    expect(tryAgain()).toBeNull();
+  });
+});
+
+describe("Search sources: leaving the screen cancels its held read (FR-756, R605 M3)", () => {
+  it("the request's signal is aborted when the screen is left", async () => {
+    const signals: AbortSignal[] = [];
+    const gate = hang();
+    server.use(
+      http.get(url("/settings/search-sources"), async ({ request }) => {
+        signals.push(request.signal);
+        await gate;
+        return HttpResponse.json({});
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [] })),
+    );
+    const { unmount } = render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: "" }} />);
+    await waitFor(() => expect(signals).toHaveLength(1));
+    expect(signals[0]!.aborted).toBe(false);
+    unmount();
+    await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+  });
+});
+
+describe("Search sources: the project left (FR-756, R605 M4)", () => {
+  it("a give-up of the read of the project left never shows on the project chosen", async () => {
+    const P2 = "0190b000-0000-7000-8000-0000000000a2";
+    const svc = useSvc();
+    const gate = hang();
+    svc.onGet = async () => {
+      await gate;
+      return undefined;
+    };
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [] })));
+    const LIMIT = 600;
+    const { rerender } = render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: `?project=${P1}` }} firstReadMs={LIMIT} />);
+    await waitFor(() => expect(svc.count("GET", "/settings/search-sources")).toBe(1));
+    await new Promise((r) => setTimeout(r, LIMIT / 2));
+    rerender(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: `?project=${P2}` }} firstReadMs={LIMIT} />);
+    await waitFor(() => expect(svc.count("GET", "/settings/search-sources")).toBe(2));
+    // Past the first read's limit, before the second's: nothing is said of the project chosen.
+    await new Promise((r) => setTimeout(r, LIMIT / 2 + 150));
+    expect(screen.queryAllByRole("alert")).toEqual([]);
+    expect(screen.getByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
+    // Its own read is given up in its turn.
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+  });
+});
+
+describe("Search sources: the project left, given up before the switch (FR-756, R605 M4)", () => {
+  it("its alert goes when another project is chosen: the loading words for the project chosen", async () => {
+    const P2 = "0190b000-0000-7000-8000-0000000000a2";
+    const svc = useSvc();
+    const gate = hang();
+    svc.onGet = async () => {
+      await gate;
+      return undefined;
+    };
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [] })));
+    const { rerender } = render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: `?project=${P1}` }} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    rerender(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: `?project=${P2}` }} firstReadMs={300} />);
+    await waitFor(() => expect(screen.queryAllByRole("alert")).toEqual([]));
+    expect(screen.getByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+});
+
+describe("Search sources: a late answer after “Try again”, and an answered failure after a give-up (FR-756, R605 M11)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent ?? "");
+
+  it("a late answer of the read given up, after “Try again”, changes nothing (its request was cancelled)", async () => {
+    useSvc();
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [] })));
+    const asks = asksInTurn(url("/settings/search-sources"), ["late", "hold"], () => undefined);
+    server.use(asks.handler);
+    render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: "" }} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(asks.signals[0]!.aborted).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    asks.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(screen.queryByRole("heading", { level: 2 })).toBeNull();
+    expect(screen.queryByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
+  });
+
+  it("an answered failure after a give-up takes the give-up's sentence away (rule ii)", async () => {
+    useSvc();
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [] })));
+    const asks = asksInTurn(url("/settings/search-sources"), ["hold", "refuse"]);
+    server.use(asks.handler);
+    render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: "" }} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    await waitFor(() => expect(alerts().length).toBeGreaterThan(0));
+    expect(tryAgain()).toBeNull();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
   });
 });

@@ -34,6 +34,7 @@ import { createPortal } from "react-dom";
 import { effectivePolicy } from "@ao/core/governance/merge";
 import { parseGovernance } from "@ao/core/governance/schema";
 import { ApiClientError } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
 import type { Profile } from "../api/governance";
 import { errorText, type LibraryApi, type ProjectSummary } from "../api/library";
 import { RecoveryCodeStep } from "../components/RecoveryCodeStep";
@@ -155,6 +156,8 @@ export interface NewProjectProps {
    * dialog closes; a library closed meanwhile leaves the chooser a notice about it.
    */
   onUncertain?: (create: UnresolvedCreate | null) => void;
+  /** FR-756: how long a read of the library's projects (before sending, and the check after a lost answer) is waited for. */
+  firstReadMs?: number;
 }
 
 type Field = "name" | "pass" | "again";
@@ -210,7 +213,7 @@ type Uncertain = "checking" | "cannot-tell";
 
 export { LEAVE_REFUSED } from "../components/RecoveryCodeStep";
 
-export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecoveryPending, libraryClosed, onUncertain }: NewProjectProps) {
+export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecoveryPending, libraryClosed, onUncertain, firstReadMs = FIRST_READ_TIMEOUT_MS }: NewProjectProps) {
   const id = useId();
   const [name, setName] = useState("");
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -242,6 +245,17 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   const [sent, setSent] = useState(false);
   /** A request (create or check) is in flight: no second one (state is too late for two events in one tick). */
   const inFlight = useRef(false);
+  /**
+   * FR-756: the reads of the library's projects are given up after `firstReadMs` (their request cancelled), and
+   * cancelled when the dialog closes. The create itself is an act: it has no limit and is never cancelled here.
+   */
+  const leave = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const ac = new AbortController();
+    leave.current = ac;
+    return () => ac.abort();
+  }, []);
+  const readProjects = () => readWithin((signal) => api.projects.list({ signal }), firstReadMs, leave.current?.signal);
 
   const box = useRef<HTMLDivElement>(null);
   const checkButton = useRef<HTMLButtonElement>(null);
@@ -328,7 +342,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
     setUncertain("checking");
     setError(null);
     try {
-      const { projects: now } = await api.projects.list();
+      const { projects: now } = await readProjects();
       const fresh = madeSince(now, p);
       pendingCheck.current = null;
       setUncertain(null);
@@ -361,7 +375,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
     let lost = false;
     try {
       // What exists before sending: a lost answer is checked against it.
-      const listed = (await api.projects.list()).projects;
+      const listed = (await readProjects()).projects;
       // A name already in use is asked about first: it may be this project, made by an answer that was lost.
       const fold = (s: string) => s.trim().toLocaleLowerCase();
       if (!sameNameConfirmed && listed.some((x) => fold(x.name) === fold(trimmed))) {
@@ -396,8 +410,10 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
         }
       }
     } catch (err) {
-      // The list before sending could not be read: nothing was sent.
-      show(errorText(err, "The project could not be created. Nothing was changed."));
+      // The list before sending could not be read: nothing was sent. Given up at the limit: its sentence alone (never
+      // run together with "could not be reached").
+      if (leave.current?.signal.aborted) return;
+      show(isNoAnswerInTime(err) ? (err as Error).message : errorText(err, "The project could not be created. Nothing was changed."));
     } finally {
       inFlight.current = false;
       setBusy(false);

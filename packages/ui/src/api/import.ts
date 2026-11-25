@@ -11,10 +11,10 @@
 import { effectivePolicy } from "@ao/core/governance/merge";
 import { parseGovernance } from "@ao/core/governance/schema";
 import { isId } from "@ao/core/ids";
-import { PICTURE_MAX_BYTES, type GovernanceReadability, type MultiTextValue, type ProjectReviewPage, type ReviewBulkEditRequest, type ReviewBulkEditResponse, type ReviewCause, type ReviewDecideRequest, type ReviewDecideResponse, type ReviewEntryDecision, type ReviewEntryPatch, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse, type ZoteroSyncUndoNote } from "@ao/shared";
+import { PICTURE_MAX_BYTES, type GovernanceReadability, type MultiTextValue, type ProjectReviewPage, type ReviewBulkEditRequest, type ReviewBulkEditResponse, type ReviewCause, type ReviewDecideRequest, type ReviewDecideResponse, type ReviewEntryDecision, type ReviewEntryPatch, type ReviewGroup, type ReviewLookUp, type ReviewLookUpAgainRequest, type ReviewLookUpAgainResponse, type ReviewLookUpOutcome, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse, type ZoteroSyncUndoNote } from "@ao/shared";
 import type { ApiClient } from "./client";
 
-export type { ProjectReviewPage, ReviewCause, ReviewGroup, WithdrawalReviewedResponse, ZoteroDataFolder };
+export type { ProjectReviewPage, ReviewCause, ReviewGroup, ReviewLookUp, ReviewLookUpOutcome, WithdrawalReviewedResponse, ZoteroDataFolder };
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -202,6 +202,8 @@ export interface ReviewItem {
   group?: ReviewGroup;
   /** Verification entries: what queued it (R176 3). */
   cause?: ReviewCause;
+  /** Decision 31 (c): an import entry whose lookups were left out — what "Look up again" needs (no title, no identifier). */
+  lookUp?: ReviewLookUp;
 }
 
 /** A decision on an import entry, and a bulk edit's changes (@ao/shared). */
@@ -349,13 +351,13 @@ function readImportPolicy(yaml: string): ImportPolicyRead {
 export function importApi(client: ApiClient) {
   const r = client.request;
   return {
-    projects: async () => (await r<{ projects: ProjectInfo[] }>("GET", "/projects")).projects,
+    projects: async (o: { signal?: AbortSignal } = {}) => (await r<{ projects: ProjectInfo[] }>("GET", "/projects", o)).projects,
     /**
      * The service's `readable: false` reads the rules strictly and says so (R379 FR-A18); an answer
      * without the field (an older or partial one) is readable only if the rules read here (R397 f).
      */
-    policy: async (projectId: string): Promise<ImportPolicyRead> => {
-      const g = await r<{ yaml: string } & Partial<GovernanceReadability>>("GET", `/projects/${pid(projectId)}/governance`);
+    policy: async (projectId: string, o: { signal?: AbortSignal } = {}): Promise<ImportPolicyRead> => {
+      const g = await r<{ yaml: string } & Partial<GovernanceReadability>>("GET", `/projects/${pid(projectId)}/governance`, o);
       if (g.readable === false) return { pseudonymizeNames: true, encryptionRequired: true, readable: false };
       const read = readImportPolicy(g.yaml);
       return g.readable === undefined ? read : { ...read, readable: true };
@@ -367,18 +369,19 @@ export function importApi(client: ApiClient) {
       r<{ batchId: string }>("POST", `/projects/${pid(projectId)}/import`, { body: { adapter, options } }),
     deviceImport: (projectId: string, body: { dir: string; sessionId?: string; participantIds?: string[]; options: ImportOptions & { researcherName?: string } }) =>
       r<{ batchId: string }>("POST", `/projects/${pid(projectId)}/device-import`, { body }),
-    batches: async (projectId: string) => (await r<{ batches: BatchSummary[] }>("GET", `/projects/${pid(projectId)}/imports`)).batches,
+    batches: async (projectId: string, o: { signal?: AbortSignal } = {}) => (await r<{ batches: BatchSummary[] }>("GET", `/projects/${pid(projectId)}/imports`, o)).batches,
 
     pause: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${bid(batchId)}/pause`),
     resume: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${bid(batchId)}/resume`),
     cancel: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${bid(batchId)}/cancel`),
     undo: (batchId: string) => r<UndoResult>("POST", `/imports/${bid(batchId)}/undo`),
     report: (batchId: string) => r<ImportReport>("GET", `/imports/${bid(batchId)}/report`),
-    review: async (batchId: string) => (await r<{ items: ReviewItem[] }>("GET", `/imports/${bid(batchId)}/review`)).items,
+    review: async (batchId: string, o: { signal?: AbortSignal } = {}) => (await r<{ items: ReviewItem[] }>("GET", `/imports/${bid(batchId)}/review`, o)).items,
     /** One page of the project's whole review queue (Task 67, R172): every pending entry of every kind, oldest first. */
-    projectReview: async (projectId: string, q: { offset?: number; limit?: number; source?: string } = {}) => {
+    projectReview: async (projectId: string, q: { offset?: number; limit?: number; source?: string } = {}, o: { signal?: AbortSignal } = {}) => {
       const page = await r<ProjectReviewPage>("GET", `/projects/${pid(projectId)}/review`, {
         query: { ...(q.offset ? { offset: q.offset } : {}), ...(q.limit !== undefined ? { limit: q.limit } : {}), ...(q.source ? { source: q.source } : {}) },
+        ...(o.signal ? { signal: o.signal } : {}),
       });
       // Every field of the shared entry is typed through; only the candidates (lookup results) are narrowed.
       const items: ReviewItem[] = page.items.map(({ candidates, ...e }) => ({ ...e, ...(candidates ? { candidates: candidates as Candidate[] } : {}) }));
@@ -390,6 +393,18 @@ export function importApi(client: ApiClient) {
       pid(projectId);
       const body: ReviewDecideRequest = { projectId, decision };
       return r<ReviewDecideResponse>("POST", `/review/${seg(itemId)}/decide`, { body });
+    },
+    /**
+     * Decision 31 (c), "Look up again" (R577): the entry's left-out lookups asked again (or "not yet", nothing sent);
+     * answered with what happened and the entry as the queue lists it now (its candidates narrowed as in `projectReview`).
+     */
+    lookUpAgain: async (projectId: string, itemId: string, sourceId?: string): Promise<{ outcome: ReviewLookUpOutcome; entry: ReviewItem }> => {
+      pid(projectId);
+      // R600 m4: the entry's source, so that the answer reads only that source's entries.
+      const body: ReviewLookUpAgainRequest = { projectId, ...(sourceId ? { sourceId } : {}) };
+      const res = await r<ReviewLookUpAgainResponse>("POST", `/review/${seg(itemId)}/look-up-again`, { body });
+      const { candidates, ...e } = res.entry;
+      return { outcome: res.outcome, entry: { ...e, ...(candidates ? { candidates: candidates as Candidate[] } : {}) } };
     },
     /** "Reviewed after the withdrawal" (R176 2): the reason is required and sent exactly as typed. */
     reviewedAfterWithdrawal: (projectId: string, itemId: string, reason: string) => {
@@ -406,10 +421,10 @@ export function importApi(client: ApiClient) {
     source: (projectId: string, sourceId: string) => r<SourceFile>("GET", `/projects/${pid(projectId)}/sources/${seg(sourceId)}`),
     searchSources: async (projectId: string, text: string) =>
       (await r<{ items: SourceListItem[] }>("GET", `/projects/${pid(projectId)}/sources`, { query: { text, limit: 20 } })).items,
-    collections: async (projectId: string) => (await r<{ collections: Collection[] }>("GET", `/projects/${pid(projectId)}/collections`)).collections,
+    collections: async (projectId: string, o: { signal?: AbortSignal } = {}) => (await r<{ collections: Collection[] }>("GET", `/projects/${pid(projectId)}/collections`, o)).collections,
     /** The project's tags and the workspace's (both can be added to a source). */
-    tags: async (projectId: string) => {
-      const t = await r<{ tags: Tag[]; workspaceTags?: Tag[] }>("GET", `/projects/${pid(projectId)}/tags`);
+    tags: async (projectId: string, o: { signal?: AbortSignal } = {}) => {
+      const t = await r<{ tags: Tag[]; workspaceTags?: Tag[] }>("GET", `/projects/${pid(projectId)}/tags`, o);
       return [...t.tags, ...(t.workspaceTags ?? []).map((w) => ({ ...w, scope: "workspace" }))];
     },
     // ---- before an import (Task 57) ----

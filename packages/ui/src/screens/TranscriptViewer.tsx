@@ -27,7 +27,8 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { TranscriptionJob, TranscriptResponse, TranscriptSaveRequest, TranscriptVersionSummary } from "@ao/shared";
 import { TRANSCRIPTION_RUNNING } from "@ao/shared";
-import { ApiClientError } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, oneNoAnswerSentence, readWithin } from "../api/firstRead";
 import { errorText, isProjectLocked, type SourceFile } from "../api/library";
 import { TRANSCRIPTION_MODELS, transcriptionJobOf, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
 import { MediaTicketPlayer, NO_RECORDING_SENTENCE, type PlayerControl } from "../components/MediaTicketPlayer";
@@ -48,7 +49,14 @@ export interface TranscriptViewerProps {
   onLocked?: () => void;
   /** The optional tools (Task 48b): which speech models are installed. Left out: not known. */
   tools?: ToolsApi;
+  /** FR-756: how long each first read (the source, its versions, the chosen version) is waited for. */
+  firstReadMs?: number;
+  /** FR-756 (R597): how long the event stream is waited for to open before it is closed and tried afresh. */
+  streamOpenMs?: number;
 }
+
+/** FR-756: the first reads that "Try again" (and a new opening of the event stream) can make again. */
+type FirstRead = "source" | "versions" | "transcript";
 
 const MODEL_LABELS: Record<TranscriptionModel, string> = {
   tiny: "tiny (quickest, least accurate)",
@@ -155,7 +163,7 @@ export function TranscriptViewer(props: TranscriptViewerProps) {
   return <Viewer key={`${props.projectId}\u0000${props.sourceId}`} {...props} />;
 }
 
-function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerProps) {
+function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: TranscriptViewerProps) {
   const installedModels = useSpeechModels(tools);
   const id = useId();
   const key = `${projectId}\u0000${sourceId}`;
@@ -195,6 +203,23 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
   const [jobNote, setJobNote] = useState<string | undefined>();
   const jobRef = useRef(job);
   jobRef.current = job;
+  /**
+   * FR-756: the first reads that got no answer (none in time, or the service could not be reached), each with the
+   * error's own sentence — "did not answer in time" or "could not be reached", never both run together (R586 M5).
+   */
+  const [unanswered, setUnanswered] = useState<Partial<Record<FirstRead, string>>>({});
+  /** The first reads now in the air (one may never settle). */
+  const out = useRef(new Set<FirstRead>());
+  /** Bumped to make one first read again ("Try again", or a new opening of the stream). */
+  const [tries, setTries] = useState<Record<FirstRead, number>>({ source: 0, versions: 0, transcript: 0 });
+  /** The versions have been read once: until then a failed read's empty list is not shown while it is read again. */
+  const versionsRead = useRef(false);
+  /**
+   * R605 I3: the versions' read was given up or failed before they were ever read: the Version box then says nothing
+   * that claims they were read (never "No transcript yet").
+   */
+  const [versionsUnread, setVersionsUnread] = useState(false);
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
 
   const listSeq = useRef(0);
   const readSeq = useRef(0);
@@ -223,14 +248,31 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
     return true;
   }, []);
 
-  /** Reads the version list; `choose` picks a version (by id, or by a stored file's path) when it is in it. */
+  /** The version list's read in the air: a newer one (or leaving the screen) cancels it. */
+  const listAc = useRef<AbortController | null>(null);
+  useEffect(() => () => listAc.current?.abort(), []);
+  /**
+   * Reads the version list; `choose` picks a version (by id, or by a stored file's path) when it is in it. Given up after
+   * `firstReadMs` as a read that got no answer (FR-756).
+   */
   const loadVersions = useCallback(
     async (choose?: { id?: string; paths?: string[] }) => {
       const mine = ++listSeq.current;
       const k = keyRef.current;
+      listAc.current?.abort();
+      const ac = new AbortController();
+      listAc.current = ac;
+      out.current.add("versions");
+      const settled = () => {
+        if (listAc.current === ac) out.current.delete("versions");
+      };
       try {
-        const r = await apiRef.current.versions(projectId, sourceId);
+        const r = await readWithin((signal) => apiRef.current.versions(projectId, sourceId, { signal }), firstReadMs, ac.signal);
+        settled();
         if (!mounted.current || k !== keyRef.current || mine !== listSeq.current) return;
+        versionsRead.current = true;
+        // R602 (a): an answered read takes away its earlier give-up sentence.
+        setUnanswered(({ versions: _v, ...u }) => u);
         const entries = versionEntries(r.versions);
         setVersions(entries);
         setRawVersions(r.versions);
@@ -242,27 +284,55 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
           return entries.at(-1)?.id;
         });
       } catch (err) {
+        settled();
         if (!mounted.current || k !== keyRef.current || mine !== listSeq.current) return;
-        if (!sawLocked(err)) setLoadError(errorText(err, "The transcript versions could not be read."));
-        setVersions((v) => v ?? []);
+        if (isUnreachable(err)) setUnanswered((u) => ({ ...u, versions: (err as ApiClientError).message }));
+        else {
+          setUnanswered(({ versions: _v, ...u }) => u);
+          if (!sawLocked(err)) setLoadError(errorText(err, "The transcript versions could not be read."));
+        }
+        // Never read: the list is unknown, not empty (R605 I3).
+        if (!versionsRead.current) setVersionsUnread(true);
       }
     },
-    [projectId, sourceId, sawLocked],
+    [projectId, sourceId, sawLocked, firstReadMs],
   );
 
-  // The source and its versions, once (a new source is a new Viewer).
+  // The source, once (a new source is a new Viewer); again after "Try again" or a new opening of the stream (FR-756).
   useEffect(() => {
     const k = key;
-    apiRef.current.source(projectId, sourceId).then(
-      (f) => mounted.current && k === keyRef.current && setSource(f),
-      (err: unknown) => {
+    const ac = new AbortController();
+    out.current.add("source");
+    readWithin((signal) => apiRef.current.source(projectId, sourceId, { signal }), firstReadMs, ac.signal).then(
+      (f) => {
+        if (ac.signal.aborted) return;
+        out.current.delete("source");
         if (!mounted.current || k !== keyRef.current) return;
-        if (!sawLocked(err)) setLoadError(errorText(err, "This source could not be read."));
+        setUnanswered(({ source: _s, ...u }) => u);
+        setSource(f);
+      },
+      (err: unknown) => {
+        if (ac.signal.aborted) return;
+        out.current.delete("source");
+        if (!mounted.current || k !== keyRef.current) return;
+        if (isUnreachable(err)) setUnanswered((u) => ({ ...u, source: (err as ApiClientError).message }));
+        else {
+          setUnanswered(({ source: _s, ...u }) => u);
+          if (!sawLocked(err)) setLoadError(errorText(err, "This source could not be read."));
+        }
       },
     );
+    return () => {
+      ac.abort();
+      out.current.delete("source");
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, attempt, tries.source]);
+  // Its versions, likewise.
+  useEffect(() => {
     void loadVersions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, attempt]);
+  }, [key, attempt, tries.versions]);
 
   // The chosen version's segments.
   useEffect(() => {
@@ -271,17 +341,46 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
     const k = keyRef.current;
     setTranscript(undefined);
     setTranscriptError(undefined);
-    apiRef.current.read(projectId, sourceId, selected).then(
+    setUnanswered(({ transcript: _t, ...u }) => u);
+    const ac = new AbortController();
+    out.current.add("transcript");
+    readWithin((signal) => apiRef.current.read(projectId, sourceId, selected, { signal }), firstReadMs, ac.signal).then(
       (t) => {
+        if (ac.signal.aborted) return;
+        out.current.delete("transcript");
         if (!mounted.current || k !== keyRef.current || mine !== readSeq.current) return;
         setTranscript(t);
       },
       (err: unknown) => {
+        if (ac.signal.aborted) return;
+        out.current.delete("transcript");
         if (!mounted.current || k !== keyRef.current || mine !== readSeq.current) return;
-        if (!sawLocked(err)) setTranscriptError(errorText(err, "This version could not be read."));
+        if (isUnreachable(err)) setUnanswered((u) => ({ ...u, transcript: (err as ApiClientError).message }));
+        else if (!sawLocked(err)) setTranscriptError(errorText(err, "This version could not be read."));
       },
     );
-  }, [selected, projectId, sourceId, sawLocked, attempt]);
+    return () => {
+      ac.abort();
+      out.current.delete("transcript");
+    };
+  }, [selected, projectId, sourceId, sawLocked, attempt, firstReadMs, tries.transcript]);
+
+  /**
+   * FR-756: makes again each first read that got no answer, and (`stillOut`) each still in the air — after the event
+   * stream was lost, one may never settle. Its words go meanwhile, so the loading words show.
+   */
+  const readAgain = useCallback((stillOut: boolean) => {
+    const again = new Set<FirstRead>([...(Object.keys(unansweredRef.current) as FirstRead[]), ...(stillOut ? out.current : [])]);
+    if (!again.size) return;
+    if (again.has("versions") && !versionsRead.current) {
+      setVersions(undefined);
+      setVersionsUnread(false);
+    }
+    setUnanswered((u) => Object.fromEntries(Object.entries(u).filter(([r]) => !again.has(r as FirstRead))));
+    setTries((t) => ({ source: t.source + (again.has("source") ? 1 : 0), versions: t.versions + (again.has("versions") ? 1 : 0), transcript: t.transcript + (again.has("transcript") ? 1 : 0) }));
+  }, []);
+  const unansweredRef = useRef(unanswered);
+  unansweredRef.current = unanswered;
 
   // Unsaved edits are not lost: the window asks before closing; in-app links and navigate() are
   // refused; Back and Forward land on a copy of this address and are refused too.
@@ -458,13 +557,21 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
 
   // The job's state on opening, and its events while the screen is open: each (re)connection of the
   // stream reads the state again, so nothing that happened while it was down is missed.
+  // FR-756 (R597): a stream not opened within `streamOpenMs` is closed and tried afresh after the same pause; at an
+  // opening after the first try, the first reads still out or unanswered are made again, without waiting for an event.
   useEffect(() => {
     const ac = new AbortController();
     let retry: ReturnType<typeof setTimeout> | undefined;
+    let opens = 0;
     void readJob();
     const listen = async () => {
+      const again = opens++ > 0;
+      const onOpen = () => {
+        void readJob();
+        if (again) readAgain(true);
+      };
       try {
-        for await (const e of apiRef.current.events({ signal: ac.signal, onOpen: () => void readJob() })) {
+        for await (const e of apiRef.current.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs })) {
           if (e.type !== "job.progress") continue;
           const j = transcriptionJobOf(e.data);
           if (j && j.projectId === projectId && j.sourceId === sourceId) accept(j);
@@ -472,7 +579,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
           else if (!j && (e.data as { kind?: unknown; jobId?: unknown } | null)?.kind === "transcription" && (e.data as { jobId?: unknown }).jobId === jobRef.current?.jobId) void readJob();
         }
       } catch {
-        // the stream dropped: listen again shortly
+        // the stream dropped, or did not open in time (FR-756): listen again shortly
       }
       if (!ac.signal.aborted) retry = setTimeout(() => void listen(), 2000);
     };
@@ -482,7 +589,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
       clearTimeout(retry);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, attempt]);
+  }, [key, attempt, streamOpenMs]);
 
   const transcribeButton = useRef<HTMLButtonElement | null>(null);
   const stopButton = useRef<HTMLButtonElement | null>(null);
@@ -580,10 +687,12 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
   const media = useMemo(() => source?.assets.find(isPlayableRecording), [source]);
   const title = source?.source.title.variants[0];
   const human = transcript?.origin === "human-edit";
+  /** FR-756, R602 M1: one sentence for the first reads that got no answer ("could not be reached" wins). */
+  const noAnswer = oneNoAnswerSentence(Object.values(unanswered));
 
   return (
     <main className="ao-page ao-tx" aria-labelledby={`${id}-h`}>
-      <h1 id={`${id}-h`}>
+      <h1 id={`${id}-h`} ref={headingRef} tabIndex={-1}>
         Transcript{title?.value ? ": " : ""}
         {title?.value && <UserText lang={title.lang}>{title.value}</UserText>}
       </h1>
@@ -602,6 +711,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
                 setLoadError(undefined);
                 setTranscriptError(undefined);
                 setSaveError(undefined);
+                setUnanswered({});
                 setAttempt((n) => n + 1);
               }}
             >
@@ -619,6 +729,25 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
         <p role="alert" className="ao-error">
           {loadError}
         </p>
+      )}
+      {!locked && noAnswer !== undefined && (
+        <>
+          <p role="alert" className="ao-error">
+            {noAnswer}
+          </p>
+          <p>
+            <button
+              type="button"
+              onClick={() => {
+                // The button goes while the reads are made again: focus waits on the heading, never the page.
+                headingRef.current?.focus();
+                readAgain(false);
+              }}
+            >
+              Try again
+            </button>
+          </p>
+        </>
       )}
 
       {!locked && source && (
@@ -647,7 +776,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
         <div className="ao-tx__toolbar">
           <label htmlFor={`${id}-version`}>Version</label>
           <select id={`${id}-version`} ref={versionPicker} value={selected ?? ""} disabled={!versions?.length} onChange={(e) => chooseVersion(e.target.value)} aria-describedby={dirty ? `${id}-dirty` : undefined}>
-            {!versions?.length && <option value="">{versions ? "No transcript yet" : "Loading…"}</option>}
+            {!versions?.length && <option value="">{versions ? "No transcript yet" : versionsUnread ? "" : "Loading…"}</option>}
             {versions?.map((v) => (
               <option key={v.id} value={v.id}>
                 {versionLabel(v)}
@@ -700,7 +829,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
         <p className="ao-tx__note">This version was edited by a person as plain text, without timings. The checks for invented or repeated text did not run on it.</p>
       )}
 
-      {!locked && selected && !transcript && !transcriptError && <p aria-live="polite">Loading the transcript…</p>}
+      {!locked && selected && !transcript && !transcriptError && !unanswered.transcript && <p aria-live="polite">Loading the transcript…</p>}
 
       {!locked && transcript && !transcript.timed && (
         <section aria-label="Transcript text" className="ao-tx__whole">

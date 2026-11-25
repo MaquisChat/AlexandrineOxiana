@@ -44,8 +44,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
-import { test as base, expect, type Page } from "@playwright/test";
+import { test as base, expect, type Page, type Request } from "@playwright/test";
 import { FAKE_SPEECH, FAKE_TOOLS, LIBRARY_DIR, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
+import { QUIET_SETTLE_MS, QUIET_WAIT_MS, stillOutMessage } from "./quiet.js";
 
 /** The desktop shell's origin (apps/library-service/src/auth.ts SHELL_ORIGINS): the page is served here. */
 export const APP_ORIGIN = "http://tauri.localhost";
@@ -606,10 +607,66 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl
       },
       { origin: APP_ORIGIN },
     );
+    // FR-750 (R579): the page's requests to the service still in the air (the event stream, which never ends, aside),
+    // so that a screen is not opened by its address while the page before is still reading (`gotoWhenQuiet`).
+    const out = new Set<Request>();
+    /**
+     * A new document was asked for: once it is in the page, every request the page before still had out is gone
+     * (Chromium may not report their end). That holds also for requests the page before sent AFTER the new document was
+     * asked for and before it was in the page (R614: a screen between two of its reads) — the new document has sent
+     * nothing of its own yet at that moment, so all that is out then is the old page's.
+     */
+    let loading = false;
+    const settled = (r: Request) => void out.delete(r);
+    page.on("request", (r) => {
+      if (r.isNavigationRequest() && r.frame() === page.mainFrame()) loading = true;
+      const u = new URL(r.url());
+      if (u.host === service() && u.pathname !== "/events") out.add(r);
+    });
+    page.on("requestfinished", settled);
+    page.on("requestfailed", settled);
+    page.on("framenavigated", (f) => {
+      if (f !== page.mainFrame() || !loading) return;
+      out.clear();
+      loading = false;
+    });
+    inFlight.set(page, out);
     await page.goto(`${APP_ORIGIN}/`);
     await use(page);
   },
 });
+
+/** Per page, its requests to the service still in the air (the event stream aside); filled by the `page` fixture. */
+const inFlight = new WeakMap<Page, Set<Request>>();
+
+/**
+ * FR-750 (R579): opens `url` once the page before has no request to the service in the air — the true state of a page
+ * that has finished reading. Loading a new page while the one before still had requests out made WebKit fail the new
+ * page's first requests at once ("WebKit encountered an internal error"); no scenario is about that.
+ */
+export async function gotoWhenQuiet(page: Page, url: string): Promise<void> {
+  const out = inFlight.get(page);
+  if (out) {
+    try {
+      // R614: quiet means nothing out now AND nothing out a moment later — a screen between two of its reads (the list
+      // answered, the reads that depend on it not yet sent) has nothing out for a few milliseconds and is not quiet.
+      await expect
+        .poll(
+          async () => {
+            if (out.size > 0) return out.size;
+            await page.waitForTimeout(QUIET_SETTLE_MS);
+            return out.size;
+          },
+          { timeout: QUIET_WAIT_MS },
+        )
+        .toBe(0);
+    } catch {
+      // R586 M4: which requests were still out, by method and path (never a query).
+      throw new Error(stillOutMessage([...out].map((r) => ({ method: r.method(), url: r.url() }))));
+    }
+  }
+  await page.goto(url);
+}
 
 /**
  * Rules of a project without identifiable data and without online lookups: the default rules
@@ -635,7 +692,7 @@ export async function libraryWithProject(
   const encryption = o.passphrase ? { enabled: true, passphrase: o.passphrase } : { enabled: false };
   const created = await app.api<{ project: { id: string; folder: string } }>("POST", "/projects", { name: o.project, governanceYaml: o.governanceYaml ?? OPEN_RULES, encryption });
   expect(created.status, JSON.stringify(created.body)).toBe(200);
-  await page.goto(`${APP_ORIGIN}/?project=${encodeURIComponent(created.body.project.id)}`);
+  await gotoWhenQuiet(page, `${APP_ORIGIN}/?project=${encodeURIComponent(created.body.project.id)}`);
   await expect(page.getByRole("heading", { level: 1, name: o.library })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Projects" }).getByRole("button", { name: o.project })).toHaveAttribute("aria-current", "true");
   return { libraryPath, projectId: created.body.project.id, projectFolder: created.body.project.folder };

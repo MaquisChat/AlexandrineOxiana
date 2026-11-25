@@ -7,6 +7,7 @@
  * page's own ticket, the window's events) and "Sign out of my library", in the desktop app and outside it.
  */
 import { FIND_LIBRARY_TEXT, YOUR_LIBRARY_CATALOGUE_MAX, YOUR_LIBRARY_DERIVE_TEXT, YOUR_LIBRARY_TEXT, type LibraryAccess, type YourLibraryResponse } from "@ao/shared";
+import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
@@ -14,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { PATHS } from "../navigation";
 import { fakeShell, type FakeShell } from "../test/desktopShell";
-import { BASE, CURRENT_RW, LIBRARIES, TOKEN, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
+import { BASE, CURRENT_RW, LIBRARIES, TOKEN, asksInTurn, hang, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
 import { YOUR_LIBRARY_SCREEN_TEXT as T, YourLibrary, onAMac } from "./YourLibrary";
 
@@ -1422,5 +1423,134 @@ describe("Your library: reachable", () => {
     } finally {
       window.history.pushState(null, "", "/");
     }
+  });
+});
+
+describe("Your library: a first read that never settles (FR-756, R584, R586)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const UNREACHABLE = "The library service could not be reached.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
+
+  it("is given up at the limit: the alert and “Try again”; pressed, it reads again, the loading words meanwhile, and the settings are shown with focus kept", async () => {
+    const svc = useSvc(SET);
+    const gate = hang();
+    let answer = false;
+    svc.onGet = async () => {
+      if (!answer) await gate;
+      return undefined;
+    };
+    render(<YourLibrary client={testClient()} firstReadMs={300} />);
+    expect(screen.getByText(T.loading)).toBeTruthy();
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    await userEvent.setup().click(tryAgain()!);
+    expect(screen.getByText(T.loading)).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Your library" }));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("textbox", { name: "Your institution's name" });
+    expect(nameField().value).toBe("Zorblatt University");
+    expect(tryAgain()).toBeNull();
+    expect(alerts()).toEqual([]);
+    expect(svc.count("GET", "/settings/your-library")).toBe(3);
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Your library" }));
+  });
+
+  it("a read that FAILS says what it said before, now with “Try again”", async () => {
+    const svc = useSvc(SET);
+    let fail = true;
+    svc.onGet = async () => (fail ? HttpResponse.error() : undefined);
+    render(<YourLibrary client={testClient()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([UNREACHABLE]);
+    fail = false;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("textbox", { name: "Your institution's name" });
+  });
+
+  it("a read refused with an answer says its sentence as before, with no “Try again”", async () => {
+    const svc = useSvc(SET);
+    svc.onGet = async () => HttpResponse.json({ error: { code: "INTERNAL", message: "The settings file could not be read." } }, { status: 500 });
+    render(<YourLibrary client={testClient()} firstReadMs={300} />);
+    await screen.findByText("The settings file could not be read.");
+    expect(tryAgain()).toBeNull();
+  });
+});
+
+describe("Your library: leaving the screen cancels its held read (FR-756, R605 M3)", () => {
+  it("the request's signal is aborted when the screen is left", async () => {
+    const signals: AbortSignal[] = [];
+    const gate = hang();
+    server.use(
+      http.get(url("/settings/your-library"), async ({ request }) => {
+        signals.push(request.signal);
+        await gate;
+        return HttpResponse.json({});
+      }),
+    );
+    const { unmount } = render(<YourLibrary client={testClient()} />);
+    await waitFor(() => expect(signals).toHaveLength(1));
+    expect(signals[0]!.aborted).toBe(false);
+    unmount();
+    await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+  });
+});
+
+describe("Your library under React's strict mode (FR-756, R617 N1)", () => {
+  it("the read cancelled by strict mode's simulated leave says nothing while the real read is still out", async () => {
+    const svc = useSvc(SET);
+    const gate = hang();
+    svc.onGet = async () => {
+      await gate;
+      return undefined;
+    };
+    render(
+      <StrictMode>
+        <YourLibrary client={testClient()} firstReadMs={60_000} />
+      </StrictMode>,
+    );
+    await waitFor(() => expect(svc.count("GET", "/settings/your-library")).toBe(2));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(screen.queryAllByRole("alert").map((a) => a.textContent)).toEqual([]);
+    expect(screen.queryByText(T.loadFailed)).toBeNull();
+    expect(screen.getByText(T.loading)).toBeTruthy();
+  });
+});
+
+describe("Your library: a late answer after “Try again”, and an answered failure after a give-up (FR-756, R605 M11)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent ?? "");
+
+  it("a late answer of the read given up, after “Try again”, changes nothing (its request was cancelled)", async () => {
+    useSvc(SET);
+    const asks = asksInTurn(url("/settings/your-library"), ["late", "hold"], () => undefined);
+    server.use(asks.handler);
+    render(<YourLibrary client={testClient()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(asks.signals[0]!.aborted).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    asks.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(screen.queryByRole("textbox", { name: "Your institution's name" })).toBeNull();
+    expect(screen.queryByText(T.loading)).toBeTruthy();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
+  });
+
+  it("an answered failure after a give-up takes the give-up's sentence away (rule ii)", async () => {
+    useSvc(SET);
+    const asks = asksInTurn(url("/settings/your-library"), ["hold", "refuse"]);
+    server.use(asks.handler);
+    render(<YourLibrary client={testClient()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    await waitFor(() => expect(alerts().length).toBeGreaterThan(0));
+    expect(tryAgain()).toBeNull();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
   });
 });

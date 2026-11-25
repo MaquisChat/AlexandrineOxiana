@@ -234,11 +234,11 @@ const p = (projectId: string) => `/projects/${encodeURIComponent(projectId)}`;
 export function governanceApi(client: ApiClient) {
   const r = client.request;
   return {
-    projects: () => r<{ projects: ProjectSummary[] }>("GET", "/projects"),
+    projects: (o: { signal?: AbortSignal } = {}) => r<{ projects: ProjectSummary[] }>("GET", "/projects", o),
     /** Whether the open library may be changed here (its mode), for screens that say so before a change is refused. */
     libraryMode: async () => (await r<{ current?: { mode?: string } }>("GET", "/libraries")).current?.mode,
 
-    getGovernance: (projectId: string) => r<GovernanceFile>("GET", `${p(projectId)}/governance`),
+    getGovernance: (projectId: string, o: { signal?: AbortSignal } = {}) => r<GovernanceFile>("GET", `${p(projectId)}/governance`, o),
     /** Always sends the version the edit was made from (R99). */
     putGovernance: (projectId: string, yaml: string, baseSha256: string, reason?: string) =>
       r<GovernanceSaved>("PUT", `${p(projectId)}/governance`, { body: { yaml, baseSha256, ...(reason ? { reason } : {}) } }),
@@ -254,8 +254,8 @@ export function governanceApi(client: ApiClient) {
     destroyRaw: (projectId: string, assetIds: string[]) =>
       r<{ certificate: DestructionCertificate; certificateFile: string }>("POST", `${p(projectId)}/retention/destroy`, { body: { assetIds, confirm: true } }),
 
-    audit: (projectId: string, opts: { limit?: number; before?: number } = {}) =>
-      r<AuditPage>("GET", `${p(projectId)}/audit`, { query: { limit: opts.limit, before: opts.before } }),
+    audit: (projectId: string, opts: { limit?: number; before?: number; signal?: AbortSignal } = {}) =>
+      r<AuditPage>("GET", `${p(projectId)}/audit`, { query: { limit: opts.limit, before: opts.before }, ...(opts.signal ? { signal: opts.signal } : {}) }),
     verifyAudit: (projectId: string) => r<AuditCheck>("GET", `${p(projectId)}/audit/verify`),
 
     /** The project's attention marks (Task 50, R154 b). */
@@ -267,9 +267,9 @@ export function governanceApi(client: ApiClient) {
     libraryAudit: (opts: { limit?: number; before?: number } = {}) => r<LibraryAuditPage>("GET", "/libraries/audit", { query: { limit: opts.limit, before: opts.before } }),
     verifyLibraryAudit: () => r<LibraryAuditCheck>("GET", "/libraries/audit/verify"),
 
-    participants: (projectId: string) => r<{ participants: Participant[]; complete: boolean }>("GET", `${p(projectId)}/participants`),
-    sessions: (projectId: string) => r<{ sessions: Session[]; complete: boolean }>("GET", `${p(projectId)}/sessions`),
-    consents: (projectId: string) => r<{ consents: ConsentRecord[]; complete: boolean }>("GET", `${p(projectId)}/consents`),
+    participants: (projectId: string, o: { signal?: AbortSignal } = {}) => r<{ participants: Participant[]; complete: boolean }>("GET", `${p(projectId)}/participants`, o),
+    sessions: (projectId: string, o: { signal?: AbortSignal } = {}) => r<{ sessions: Session[]; complete: boolean }>("GET", `${p(projectId)}/sessions`, o),
+    consents: (projectId: string, o: { signal?: AbortSignal } = {}) => r<{ consents: ConsentRecord[]; complete: boolean }>("GET", `${p(projectId)}/consents`, o),
     /** Without a code the service gives the next `P-NNN`. */
     createParticipant: (projectId: string, body: { code?: string; details?: Record<string, string>; legalBasis?: string }) =>
       r<Participant>("POST", `${p(projectId)}/participants`, { body }),

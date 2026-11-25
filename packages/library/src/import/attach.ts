@@ -63,6 +63,7 @@ import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, project
 import { IN_LIBRARY_TEXT, attachClosedSentence } from "@ao/shared";
 import { realInsideLibrary, realOrNearest } from "../fs/inside-library.js";
 import type { CreateInTx } from "../repo/sources.js";
+import { isAskedToWait } from "./look-up-state.js";
 import { ITEM_REASONS, LOCATION_REASON, candidateKey, dupKey, itemProvenance, locationRule, reviewFor, sha256File, storeInputs as sharedStoreInputs } from "./common.js";
 import { pendingFor, proxyQueueFor, proxyTypeFor, type ProxyPlan, type ProxyQueue } from "./proxies.js";
 import { serialStore, storeTurn } from "./project-queue.js";
@@ -397,7 +398,8 @@ export function createAttach(deps: AttachDeps): Attach {
     const note = { ...proxyNote(projectId, sf.source.id, plan, rule.mode()), ...(noCollection ? { noCollection: true as const } : {}) };
     if (!needsReview) return { path, outcome: "created", sourceId: sf.source.id, ...note };
     // R556 (2) iii: a record in review while a service it would have asked had asked to wait says so, in the owner's words.
-    const reason = dup ? REASONS.likelyDuplicate : reviewItem?.leftOut?.length ? REASONS.waiting : REASONS.review;
+    // Decision 31 (c), R577 iv: only a lookup whose service asked to wait says so; one that failed outright keeps today's sentence.
+    const reason = dup ? REASONS.likelyDuplicate : reviewItem?.leftOut?.some(isAskedToWait) ? REASONS.waiting : REASONS.review;
     return { path, outcome: "needs-review", sourceId: sf.source.id, reason, ...note };
   }
 

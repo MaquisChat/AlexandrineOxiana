@@ -60,7 +60,8 @@ export interface ApiClient {
   /** Any route; `path` starts with "/". Prefer the typed methods. */
   request<T>(method: Method, path: string, opts?: RequestOptions): Promise<T>;
   appearance: {
-    get(): Promise<AppearanceSettings>;
+    /** `opts.signal` (FR-756): cancels the read (the appearance settings' read is given up at its time limit). */
+    get(opts?: { signal?: AbortSignal }): Promise<AppearanceSettings>;
     put(patch: AppearancePatch): Promise<AppearanceSettings>;
   };
   /**
@@ -71,8 +72,11 @@ export interface ApiClient {
   /**
    * Server-sent events from GET /events, until the stream ends or `signal` aborts. `onOpen` is
    * called once the service has accepted the stream (events published from then on arrive).
+   * `openWithinMs` (FR-756 C, R586 M2): a stream not opened (no answer yet) after that long is given up — its request
+   * is cancelled and the stream ends with "The library service did not answer in time." — so that the caller's own
+   * reconnect makes a fresh try. A stream that has opened is never ended by it. Without it, no limit (as before).
    */
-  events(opts?: { signal?: AbortSignal; onOpen?: () => void }): AsyncGenerator<ServiceEvent, void, undefined>;
+  events(opts?: EventsOptions): AsyncGenerator<ServiceEvent, void, undefined>;
   /**
    * The address a media element loads for a media ticket (R135): the base URL plus the ticket path
    * the service gave (`/media/<ticket>`), nothing added. Only that exact form is accepted: no query,
@@ -96,10 +100,24 @@ export interface ApiClient {
    * (status 502, INTERNAL) and never handed on. The service's own refusals (404, 413, 423…) are
    * thrown as they are; a 416 (no body) as VALIDATION with the file's length as `reason`. An answer
    * whose signal was aborted meanwhile is never returned (AbortError). Same path rules as
-   * request(); bad arguments throw before anything is sent.
+   * request(); bad arguments throw before anything is sent. `onAnswer` (FR-756) is called once the service's answer has
+   * begun (its headers arrived), before its body is read.
    */
-  byteRange(path: string, start: number, end: number, opts?: { signal?: AbortSignal }): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
+  byteRange(path: string, start: number, end: number, opts?: { signal?: AbortSignal; onAnswer?: () => void }): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
 }
+
+/** The options of `events()`. */
+export interface EventsOptions {
+  signal?: AbortSignal;
+  onOpen?: () => void;
+  openWithinMs?: number;
+}
+
+/**
+ * FR-756 C (R586 M2): how long the event stream is waited for to open before it is given up and tried afresh. The
+ * service answers it at once, with the library's state, from the same machine; twenty seconds is long.
+ */
+export const STREAM_OPEN_TIMEOUT_MS = 20_000;
 
 /** `onOpen` is called once the service has answered with a stream (its headers arrived), before any line. */
 export type NdjsonOptions = RequestOptions & { onOpen?: () => void };
@@ -126,7 +144,14 @@ function checkToken(token: string): void {
   }
 }
 
-const unreachable = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: "The library service could not be reached." });
+/** Said when the library service could not be reached (no answer at all). */
+export const SERVICE_UNREACHABLE = "The library service could not be reached.";
+/** R586 M5: said where a read was given up at its time limit (it neither answered nor failed). */
+export const SERVICE_NO_ANSWER = "The library service did not answer in time.";
+/** The error of a request that got no answer at all (status 0, UNAVAILABLE). */
+export const unreachable = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: SERVICE_UNREACHABLE });
+/** The error of a read given up at its time limit (status 0, UNAVAILABLE): the service may only have been slow. */
+export const noAnswerInTime = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: SERVICE_NO_ANSWER });
 /** Said of an answer that began and then broke off (FR-350); also said by the reader (R481 a). */
 export const ANSWER_CUT_OFF = "The library service's answer was cut off before it finished.";
 /** An answer that began and then broke off: the service was reached, so it is not said to be out of reach (FR-350). */
@@ -380,16 +405,36 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     }
   }
 
-  async function* events(o: { signal?: AbortSignal; onOpen?: () => void } = {}): AsyncGenerator<ServiceEvent, void, undefined> {
+  async function* events(o: EventsOptions = {}): AsyncGenerator<ServiceEvent, void, undefined> {
     const init: RequestInit = { method: "GET", headers: { ...auth, Accept: "text/event-stream" } };
     if (o.signal) init.signal = o.signal;
+    // FR-756 C: with a limit, the request has a signal of its own, aborted by the caller's or at the limit (until open).
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let gaveUp = false;
+    let unlink = () => {};
+    if (o.openWithinMs !== undefined) {
+      const ac = new AbortController();
+      const stop = () => ac.abort();
+      if (o.signal?.aborted) ac.abort();
+      else o.signal?.addEventListener("abort", stop, { once: true });
+      unlink = () => o.signal?.removeEventListener("abort", stop);
+      init.signal = ac.signal;
+      timer = setTimeout(() => {
+        gaveUp = true;
+        ac.abort();
+      }, o.openWithinMs);
+    }
     let res: Response;
     try {
       res = await doFetch(urlFor("/events"), init);
     } catch {
+      unlink();
       if (o.signal?.aborted) return;
-      throw unreachable();
+      throw gaveUp ? noAnswerInTime() : unreachable();
+    } finally {
+      clearTimeout(timer);
     }
+    if (!res.ok || !res.body) unlink();
     if (!res.ok) throw await errorFrom(res);
     o.onOpen?.();
     if (!res.body) return;
@@ -413,6 +458,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       }
       // Whatever is left is an event the stream ended in the middle of: discarded.
     } finally {
+      unlink();
       reader.cancel().catch(() => {});
     }
   }
@@ -479,7 +525,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     })();
   }
 
-  async function byteRange(path: string, start: number, end: number, o: { signal?: AbortSignal } = {}): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }> {
+  async function byteRange(path: string, start: number, end: number, o: { signal?: AbortSignal; onAnswer?: () => void } = {}): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }> {
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
       throw new Error("A byte range needs whole numbers with 0 ≤ start ≤ end.");
     }
@@ -494,6 +540,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       if (o.signal?.aborted) throw err;
       throw unreachable();
     }
+    o.onAnswer?.();
     if (res.status === 416) {
       // No error body: said in plain words, with the file's length (`bytes */<total>`) as the reason.
       res.body?.cancel().catch(() => {});
@@ -548,7 +595,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     bytes,
     byteRange,
     appearance: {
-      get: () => request<AppearanceSettings>("GET", "/settings/appearance"),
+      get: (opts = {}) => request<AppearanceSettings>("GET", "/settings/appearance", opts.signal ? { signal: opts.signal } : {}),
       put: (patch) => request<AppearanceSettings>("PUT", "/settings/appearance", { body: patch }),
     },
     ndjson,

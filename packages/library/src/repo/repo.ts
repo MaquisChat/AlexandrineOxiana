@@ -626,7 +626,12 @@ export async function openRepoInternal(
 ): Promise<Repo> {
   const core = new RepoCore(library, keyRing, opts);
   const writable = library.mode === "read-write" && !opts.noHeal;
-  const anchors = await readAnchors(core, writable);
+  // FR-068 (R607 c): the stale copy of a move that stopped before its old copy was marked (read-only; the library still
+  // at its old place) is not compared with this computer's record of the audit logs' heads: its logs are only older than
+  // the living library's. Their chains are still checked.
+  // R612 m-B: also for any copy of this computer's move whose own mark is neither recorded nor seen (anchorsNotCompared).
+  const compareAnchors = library.staleMoveOf === undefined && library.anchorsNotCompared !== true;
+  const anchors = compareAnchors ? await readAnchors(core, writable) : {};
   // Projects with a marker that is still unresolved: no writes, no audit appends and no trimming
   // until it is resolved. An invalid marker may name one project and point into another's folder,
   // so both its projectId and its projectFolder count.
@@ -703,6 +708,7 @@ export async function openRepoInternal(
     anchors[libraryAnchorKey(core)],
     writable,
     rootLines.filter((l) => l.trimmed && l.file.startsWith(`${LIBRARY_AUDIT_DIR}/`)),
+    compareAnchors,
   );
   const incomplete = new Map<string, IncompleteLine[]>();
   const loaded = await loadProjects(core, async (p) => {
@@ -725,7 +731,7 @@ export async function openRepoInternal(
     if (blocked && !pending && !unattributed && lines.some((l) => !l.trimmed && l.error !== undefined)) st.reopenToResume = true;
     if (unfinished.has(st.project.id)) st.unfinished = new Set(unfinished.get(st.project.id));
     const anchor = anchors[core.anchorKey(st.project.id)];
-    const problem = checkAnchor(events, verify, anchor, core.device);
+    const problem = checkAnchor(events, verify, anchor, compareAnchors ? core.device : undefined);
     const at = core.clock().toISOString();
     if (problem) core.integrityWarnings.push({ projectId: st.project.id, ...problem });
     if (!verify.ok) st.auditUnverified = true;

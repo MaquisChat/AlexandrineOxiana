@@ -20,7 +20,7 @@ import type {
   TranscriptSaveRequest,
 } from "@ao/shared";
 import { SPEECH_MODELS, type SpeechModel } from "@ao/shared";
-import type { ApiClient } from "./client";
+import type { ApiClient, EventsOptions } from "./client";
 import type { SourceFile } from "./library";
 
 /** The speech models the app accepts: the one definition in @ao/shared (R158). */
@@ -48,9 +48,9 @@ export function transcriptApi(client: ApiClient) {
   const r = client.request;
   return {
     /** The source record (title, assets: which recording to play). */
-    source: (pid: string, sid: string) => r<SourceFile>("GET", src(pid, sid)),
-    versions: (pid: string, sid: string) => r<TranscriptListResponse>("GET", `${src(pid, sid)}/transcripts`),
-    read: (pid: string, sid: string, aid: string) => r<TranscriptResponse>("GET", `${src(pid, sid)}/transcripts/${seg(aid)}`),
+    source: (pid: string, sid: string, o: { signal?: AbortSignal } = {}) => r<SourceFile>("GET", src(pid, sid), o),
+    versions: (pid: string, sid: string, o: { signal?: AbortSignal } = {}) => r<TranscriptListResponse>("GET", `${src(pid, sid)}/transcripts`, o),
+    read: (pid: string, sid: string, aid: string, o: { signal?: AbortSignal } = {}) => r<TranscriptResponse>("GET", `${src(pid, sid)}/transcripts/${seg(aid)}`, o),
     /** Stores a person's edit as a new version; the version it came from is kept. */
     save: (pid: string, sid: string, body: TranscriptSaveRequest) => r<SavedTranscript>("POST", `${src(pid, sid)}/transcripts`, { body }),
     /** Starts speech recognition again: answers at once with the job (its progress arrives as events). */
@@ -60,7 +60,7 @@ export function transcriptApi(client: ApiClient) {
     /** Asks a transcription to stop. */
     cancelTranscription: (pid: string, jobId: string) => r<TranscriptionJobResponse>("POST", `/projects/${seg(pid)}/transcriptions/${seg(jobId)}/cancel`),
     /** The service's events (the transcription's progress is `job.progress` of kind "transcription"). */
-    events: (opts: { signal?: AbortSignal; onOpen?: () => void }) => client.events(opts),
+    events: (opts: EventsOptions) => client.events(opts),
     /** A media ticket for one audio or video asset (R135). The answer's `path` is a secret. */
     ticket: (pid: string, sid: string, aid: string) => r<MediaTicketResponse>("POST", `${src(pid, sid)}/assets/${seg(aid)}/media-ticket`),
     revokeTicket: (path: string) => {

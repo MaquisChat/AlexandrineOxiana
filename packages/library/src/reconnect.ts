@@ -756,8 +756,7 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
       result.moveIncomplete = { completeWith: "completeMove", destRoot: root };
     } else {
       // The switch of a move out of this folder began (this device's record) but did not finish.
-      const here = resolve(root);
-      const rec = (await listUnfinishedMoves(deps).catch(() => [])).find((m) => m.libraryId === meta.libraryId && (m.oldRoot === here || m.newRoot === here));
+      const [rec] = await listUnfinishedMoves(deps, { libraryId: meta.libraryId, folder: root }).catch(() => []);
       if (rec) result.moveIncomplete = { completeWith: "completeMove", destRoot: rec.newRoot };
     }
 

@@ -20,7 +20,7 @@ import type {
 } from "@ao/shared";
 import { LIBRARY_CLOSED_TEXT } from "@ao/shared";
 
-import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
+import { ApiClientError, type ApiClient, type EventsOptions, type ServiceError, type ServiceEvent } from "./client";
 import { verificationApi } from "./verification";
 import { watchedFoldersApi } from "./watchedFolders";
 import { zoteroSyncApi } from "./zoteroSync";
@@ -53,6 +53,15 @@ export interface CurrentLibrary {
   name: string;
   mode: "read-write" | "read-only";
   readOnlyReason?: ReadOnlyReason | (string & {});
+  /** With "moved": the new place of this old copy's move when that move has not finished (FR-755, R578 (2)). */
+  moveUnfinishedTo?: string;
+  /** With `moveUnfinishedTo`: the record of that move at the new place is damaged, so the app cannot finish it (R590 N5). */
+  moveCannotFinish?: true;
+  /**
+   * With "move-incomplete": this folder holds the copy of a move that stopped before its old copy was marked; the library
+   * is still at this old place (FR-068, R607 c).
+   */
+  staleMoveOf?: string;
   /** With "locked-by-other-device": the name of the device holding the library (R118; never a user name). */
   lockedBy?: string;
   /** The index when it is not ready (D8). */
@@ -117,6 +126,10 @@ export interface IntegrityWarning {
   state?: IncompleteRollback;
   /** FR-729: kept with the library until dismissed: its id there. */
   keptId?: string;
+  /** R583 M5: for the opening's words about an unfinished move: how many files no longer match. */
+  count?: number;
+  /** R583: the old copy's place (the researcher's own path), for those words. */
+  place?: string;
 }
 
 /** The `library.state` event (LibraryState.libraryState in the service). */
@@ -126,6 +139,9 @@ export interface LibraryState {
   name?: string;
   mode?: CurrentLibrary["mode"];
   readOnlyReason?: CurrentLibrary["readOnlyReason"];
+  moveUnfinishedTo?: CurrentLibrary["moveUnfinishedTo"];
+  moveCannotFinish?: CurrentLibrary["moveCannotFinish"];
+  staleMoveOf?: CurrentLibrary["staleMoveOf"];
   lockedBy?: CurrentLibrary["lockedBy"];
   index?: IndexStatus;
   integrityWarnings?: IntegrityWarning[];
@@ -349,7 +365,7 @@ const proj = (id: string) => `/projects/${seg(id)}`;
 export function libraryApi(client: ApiClient) {
   const r = client.request;
   return {
-    events: (opts: { signal?: AbortSignal } = {}): AsyncGenerator<ServiceEvent, void, undefined> => client.events(opts),
+    events: (opts: EventsOptions = {}): AsyncGenerator<ServiceEvent, void, undefined> => client.events(opts),
     /** Interrupted changes recovery could not settle, resolved by the researcher's choice (R27). */
     pendingWrites: {
       list: async () => (await r<{ pendingWrites: PendingWrite[] }>("GET", "/libraries/pending-writes")).pendingWrites,
@@ -358,7 +374,7 @@ export function libraryApi(client: ApiClient) {
       close: (txn: string, projectId: string) => r<{ txn: string; projectId: string }>("POST", `/libraries/pending-writes/${seg(txn)}/close`, { body: { projectId } }),
     },
     libraries: {
-      list: () => r<LibraryList>("GET", "/libraries"),
+      list: (opts: { signal?: AbortSignal } = {}) => r<LibraryList>("GET", "/libraries", opts.signal ? { signal: opts.signal } : {}),
       /** The researcher's "Got it" for a device-level notice (Task 68): POST /settings/notices/dismiss. */
       /** FR-729: dismisses, for good, a warning kept with the library. */
       dismissWarning: (id: string) => r<{ dismissed: true }>("POST", `/libraries/recovery-warnings/${seg(id)}/dismiss`),
@@ -387,7 +403,7 @@ export function libraryApi(client: ApiClient) {
       rebuildIndex: () => r<{ indexed: number; lockedProjects: number; errors: number }>("POST", "/libraries/rebuild-index"),
     },
     projects: {
-      list: () => r<{ projects: ProjectSummary[] }>("GET", "/projects"),
+      list: (opts: { signal?: AbortSignal } = {}) => r<{ projects: ProjectSummary[] }>("GET", "/projects", opts.signal ? { signal: opts.signal } : {}),
       /** Creates a project; the recovery code in the answer is a secret shown once (never kept). */
       create: (body: NewProjectRequest) => r<NewProjectResult>("POST", "/projects", { body }),
       unlock: (id: string, secret: string) => r<{ unlocked: true }>("POST", `${proj(id)}/unlock`, { body: { secret } }),
@@ -397,13 +413,13 @@ export function libraryApi(client: ApiClient) {
       governance: (id: string) => r<{ yaml: string; sha256: string; violations: unknown[] }>("GET", `${proj(id)}/governance`),
     },
     collections: {
-      list: (pid: string) => r<{ collections: Collection[] }>("GET", `${proj(pid)}/collections`),
+      list: (pid: string, opts: { signal?: AbortSignal } = {}) => r<{ collections: Collection[] }>("GET", `${proj(pid)}/collections`, opts.signal ? { signal: opts.signal } : {}),
       create: (pid: string, name: string, parentId?: string) => r<Collection>("POST", `${proj(pid)}/collections`, { body: { name, ...(parentId ? { parentId } : {}) } }),
       update: (pid: string, cid: string, change: { name?: string; parentId?: string | null }) => r<Collection>("PATCH", `${proj(pid)}/collections/${seg(cid)}`, { body: change }),
       remove: (pid: string, cid: string) => r<{ deleted: true }>("DELETE", `${proj(pid)}/collections/${seg(cid)}`),
     },
     tags: {
-      list: (pid: string) => r<{ tags: Tag[]; workspaceTags: Tag[] }>("GET", `${proj(pid)}/tags`),
+      list: (pid: string, opts: { signal?: AbortSignal } = {}) => r<{ tags: Tag[]; workspaceTags: Tag[] }>("GET", `${proj(pid)}/tags`, opts.signal ? { signal: opts.signal } : {}),
       create: (pid: string, name: string, scope: "project" | "workspace" = "project") => r<Tag>("POST", `${proj(pid)}/tags`, { body: { name, scope } }),
       /** Project tags; workspace tags use renameWorkspace / removeWorkspace. */
       rename: (pid: string, tid: string, name: string) => r<Tag>("PATCH", `${proj(pid)}/tags/${seg(tid)}`, { body: { name } }),
@@ -419,7 +435,7 @@ export function libraryApi(client: ApiClient) {
           query: { text: q.text || undefined, type: q.type, collection: q.collection, tag: q.tag, limit: q.limit, offset: q.offset },
           ...(opts.signal ? { signal: opts.signal } : {}),
         }),
-      get: (pid: string, sid: string) => r<SourceFile>("GET", `${proj(pid)}/sources/${seg(sid)}`),
+      get: (pid: string, sid: string, opts: { signal?: AbortSignal } = {}) => r<SourceFile>("GET", `${proj(pid)}/sources/${seg(sid)}`, opts.signal ? { signal: opts.signal } : {}),
       update: (pid: string, sid: string, patch: SourcePatch) => r<SourceFile>("PATCH", `${proj(pid)}/sources/${seg(sid)}`, { body: patch }),
       attach: async (pid: string, paths: string[], toSourceId?: string) =>
         (await r<{ items: AttachOutcome[] }>("POST", `${proj(pid)}/attach`, { body: { paths, ...(toSourceId ? { toSourceId } : {}) } })).items,

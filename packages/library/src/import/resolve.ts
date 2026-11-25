@@ -79,7 +79,8 @@ import {
 } from "@ao/core";
 import { extractMetadata, type Extracted } from "../extract/index.js";
 import { parseName } from "../extract/names.js";
-import { LookupHttpError, LookupLeftOutError, lookupDoi, lookupIsbn, searchTitle, type LookupContext, type LookupResult } from "../lookup/index.js";
+import { LookupHttpError, LookupLeftOutError, failedServicesOf, lookupDoi, lookupIsbn, searchTitle, type LookupContext, type LookupResult } from "../lookup/index.js";
+import { candidateKeyOf } from "./look-up-state.js";
 import type { LeftOutLookup } from "../repo/review.js";
 import { readSidecar, type SidecarMetadata } from "./sidecar.js";
 
@@ -208,7 +209,9 @@ export interface Resolution {
   /**
    * Decision 31 (b), R556 (2) iv: lookups left out because their services asked to wait and none of whose services gave
    * the item — enough to ask again later. An identifier here is one found in the file, as a hint ("doi:10.1/x"): never on
-   * the record unless a lookup confirmed it (R55). A title search names its title (and creator).
+   * the record unless a lookup confirmed it (R55). A title search names its title (and creator). Decision 31 (c), R577 iv:
+   * with them, where the context leaves out services that ask to wait, lookups that failed outright (`why: "failed"`, no
+   * `notBefore`) — those never make the item read as waiting (`isAskedToWait`).
    */
   leftOut: LeftOutLookup[];
 }
@@ -309,7 +312,7 @@ const firstCreatorName = (cs: Creator[] | undefined) => {
 };
 
 /** arXiv id → its DataCite DOI (version dropped), e.g. 2401.12345v2 → 10.48550/arxiv.2401.12345. */
-const arxivDoi = (id: string) => `10.48550/arxiv.${id.replace(/v\d+$/u, "").toLowerCase()}`;
+export const arxivDoi = (id: string) => `10.48550/arxiv.${id.replace(/v\d+$/u, "").toLowerCase()}`;
 
 export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Promise<Resolution> {
   const at = (ctx.clock?.() ?? new Date()).toISOString();
@@ -385,22 +388,33 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       method = e;
     }
   };
+  // Decision 31 (c): the one key, shared with "Look up again"'s appending (`candidateKeyOf`).
   const addCandidate = (r: LookupResult) => {
-    const key = `${r.provider}|${r.identifiers.doi ?? ""}|${r.title.toLowerCase()}`;
-    if (!candidates.some((c) => `${c.provider}|${c.identifiers.doi ?? ""}|${c.title.toLowerCase()}` === key)) candidates.push(r);
+    const key = candidateKeyOf(r);
+    if (!candidates.some((c) => candidateKeyOf(c) === key)) candidates.push(r);
   };
   const leftOut: LeftOutLookup[] = [];
-  const ask = async <T>(fn: () => Promise<T>, empty: T, what: Omit<LeftOutLookup, "services" | "notBefore">): Promise<T> => {
+  /**
+   * Decision 31 (c), R577 iv: a lookup none of whose services answered because they failed outright (no network, a 500)
+   * is kept too, with `why: "failed"` and no time — only where services that ask to wait are left out (the attach and a
+   * watched folder: `askedToWait: "leave-out"`); Bulk Import, Zotero and Find are not changed (R556 v).
+   */
+  const keepFailed = lookup?.askedToWait === "leave-out";
+  const ask = async <T>(fn: () => Promise<T>, empty: T, what: Pick<LeftOutLookup, "identifier" | "title" | "creator">): Promise<T> => {
     try {
       return await fn();
     } catch (e) {
       if (e instanceof LookupLeftOutError) {
         // R556 (2): not waited for; kept for a later "look up again".
         leftOut.push({ services: [...e.services], ...what, notBefore: new Date(e.notBefore).toISOString() });
+        const failed = failedServicesOf(e);
+        if (keepFailed && failed.length) leftOut.push({ services: [...failed], ...what, why: "failed" });
         return empty;
       }
       if (!(e instanceof LookupHttpError)) throw e;
       lookup?.debug?.(`metadata lookup failed: ${e.message}`);
+      const failed = failedServicesOf(e);
+      if (keepFailed && failed.length) leftOut.push({ services: [...failed], ...what, why: "failed" });
       return empty;
     }
   };

@@ -14,6 +14,7 @@
  * screen stops reading the stream (the move itself carries on in the service).
  */
 import { useEffect, useId, useRef, useState } from "react";
+import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedParts, moveNotFinishedSplitParts, moveStoppedBeforeSwitchOf, moveStoppedBeforeSwitchParts, type OldFolderNotWritable } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { isStreamCutOff, normaliseRoot, type GovernanceApi, type MovePlan, type MoveProgress, type MoveStatus } from "../api/governance";
 import { ConfirmDialog } from "../components/ReasonDialog";
@@ -48,7 +49,47 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
   const [plan, setPlan] = useState<MovePlan | null>(null);
   const [progress, setProgress] = useState<MoveProgress | null>(null);
   const [verified, setVerified] = useState<{ token: string; newRoot: string; message: string; warnings: string[] } | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setErrorText] = useState<string | null>(null);
+  /**
+   * FR-755 (R578): the move failed once it had closed the old copy; the library is closed and opening it at this new
+   * place finishes the move. Its sentence names the place (the researcher's own text, through UserText).
+   */
+  const [notFinished, setNotFinished] = useState<{ newRoot: string; split: boolean } | null>(null);
+  /**
+   * FR-068 (R607 d): the move stopped before the library was switched; the copy made at this new place is not used. Its
+   * sentence names the place (through UserText), in place of the generic words.
+   */
+  const [stoppedAt, setStoppedAt] = useState<{ newRoot: string; cause?: OldFolderNotWritable } | null>(null);
+  /**
+   * R610 (2), R612: the reason of a refusal (the service's POLICY_DENIED: why the library cannot be moved there, e.g. a
+   * folder that is not empty, or one holding an earlier move), shown after the message in the same alert, as text.
+   */
+  const [refusalReason, setRefusalReason] = useState<string | null>(null);
+  const setError = (e: string | null) => {
+    setErrorText(e);
+    setRefusalReason(null);
+    setNotFinished(null);
+    setStoppedAt(null);
+  };
+  /** A refusal of the move to that place: its message, and its reason after it. */
+  const setRefusal = (e: { message: string; reason: string }) => {
+    setError(e.message);
+    setRefusalReason(e.reason);
+  };
+  const isRefusal = (e: { code?: string; reason?: string }): e is { code: string; message: string; reason: string } => e.code === "POLICY_DENIED" && typeof e.reason === "string" && e.reason !== "";
+  /** A failed move's answer: the sentence of a move that did not finish, a refusal with its reason, or the error with today's ending. */
+  const failedWith = (e: { code?: string; message: string; reason?: string }, newRoot: string) => {
+    if (e.reason === MOVE_NOT_FINISHED_REASON || e.reason === MOVE_NOT_FINISHED_SPLIT_REASON) {
+      setErrorText(null);
+      setNotFinished({ newRoot, split: e.reason === MOVE_NOT_FINISHED_SPLIT_REASON });
+    } else if (moveStoppedBeforeSwitchOf(e.reason)) {
+      // R612 m-A: with the cause when the library's old folder could not be written to.
+      setError(null);
+      setStoppedAt({ newRoot, ...moveStoppedBeforeSwitchOf(e.reason) });
+    } else if (isRefusal(e)) setRefusal(e);
+    else setError(`${e.message} The move stopped; nothing was deleted, and the library stays where it was.`);
+    setStage("failed");
+  };
   const [waiting, setWaiting] = useState(false);
   /** From the failure of a move request until the first status answer (R399 d). */
   const [checking, setChecking] = useState(false);
@@ -108,8 +149,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
         }
         if (failed && failed.attempt === attempt && sameRoot(failed.newRoot, target)) {
           setWaiting(false);
-          setError(`${failed.error.message} The move stopped; nothing was deleted, and the library stays where it was.`);
-          setStage("failed");
+          failedWith(failed.error, target);
           return;
         }
         if (notStarted !== undefined) {
@@ -149,6 +189,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
       setStage("plan");
     } catch (err) {
       if (isMoveInProgress(err)) return inProgress();
+      if (err instanceof ApiClientError && isRefusal(err)) return setRefusal({ message: err.message, reason: err.reason });
       setError(err instanceof Error ? err.message : "The destination could not be checked.");
     }
   };
@@ -171,8 +212,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
         started = true;
         if ("progress" in line) setProgress(line.progress);
         else if ("error" in line) {
-          setError(`${line.error.message} The move stopped; nothing was deleted, and the library stays where it was.`);
-          setStage("failed");
+          failedWith(line.error, target);
           return;
         } else if ("done" in line) {
           const r = line.result;
@@ -260,8 +300,38 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
       {error ? (
         <p role="alert" className="ao-warning">
           {error}
+          {refusalReason ? (
+            <>
+              {" "}
+              <UserText>{refusalReason}</UserText>
+            </>
+          ) : null}
         </p>
       ) : null}
+      {notFinished !== null
+        ? (() => {
+            const [before, place, after] = notFinished.split ? moveNotFinishedSplitParts(notFinished.newRoot) : moveNotFinishedParts(notFinished.newRoot);
+            return (
+              <p role="alert" className="ao-warning">
+                {before}
+                <UserText>{place}</UserText>
+                {after}
+              </p>
+            );
+          })()
+        : null}
+      {stoppedAt !== null
+        ? (() => {
+            const [before, place, after] = moveStoppedBeforeSwitchParts(stoppedAt.newRoot, stoppedAt.cause);
+            return (
+              <p role="alert" className="ao-warning">
+                {before}
+                <UserText>{place}</UserText>
+                {after}
+              </p>
+            );
+          })()
+        : null}
 
       {plan && stage === "plan" ? (
         <section className="ao-card" aria-labelledby={`${ids}-plan`}>

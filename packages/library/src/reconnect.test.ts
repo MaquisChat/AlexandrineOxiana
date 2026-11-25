@@ -389,6 +389,20 @@ describe("reconnect", () => {
     expect(r.rebuilt).toBe(false);
   });
 
+  it("R599 M-3: an unfinished move out of this folder is found by the folder's real path: reconnected through a symbolic link, it is reported", async () => {
+    const { lib } = await fixture();
+    await lib.close();
+    await addPendingOldCopy(
+      mkDeps(),
+      { oldRoot: lib.root, newRoot: join(tmp, "New"), libraryId: lib.id, split: false, movedFolders: [], movedProjectIds: [], moveId: "m1" },
+      { files: {}, dirs: [] },
+    );
+    await symlink(lib.root, join(tmp, "LibLink"));
+    const r = await reconnect(join(tmp, "LibLink"), lib.id, mkDeps(), { keyRing: ring });
+    expect(r.moveIncomplete).toEqual({ completeWith: "completeMove", destRoot: join(tmp, "New") });
+    await r.library.close();
+  });
+
   it("opens a newer-format library read-only and skips the integrity check", async () => {
     const { lib } = await fixture();
     await lib.close();

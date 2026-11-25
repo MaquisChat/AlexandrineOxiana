@@ -4,7 +4,7 @@
  */
 import { http, HttpResponse, type JsonBodyType } from "msw";
 import { setupServer } from "msw/node";
-import { afterAll, afterEach, beforeAll } from "vitest";
+import { afterAll, afterEach, beforeAll, onTestFinished } from "vitest";
 import { createClient } from "../api/client";
 import { libraryApi, type LibraryApi } from "../api/library";
 
@@ -63,7 +63,81 @@ export function sse(events: Array<{ type: string; data: unknown }>): HttpRespons
   return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
 }
 
+/**
+ * FR-750: GET /events whose every attempt answers by `attempt(n)` (n counts from 1) — "fail" (a network error), or a
+ * stream holding those events, left open. `drop()` ends the open stream (the screen connects again by itself).
+ * FR-756 C: "hang" — the attempt is never answered (it never opens) until the test ends. `signals()`: each attempt's
+ * request signal, so a test can see whether the page cancelled a stream (R602 M2).
+ */
+export function sseAttempts(attempt: (n: number) => "fail" | "hang" | Array<{ type: string; data: unknown }>) {
+  let n = 0;
+  let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const signals: AbortSignal[] = [];
+  return {
+    handler: http.get(url("/events"), async ({ request }) => {
+      signals.push(request.signal);
+      const a = attempt(++n);
+      if (a === "hang") {
+        await hang();
+        return HttpResponse.error();
+      }
+      if (a === "fail") return HttpResponse.error();
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          ctl = c;
+          for (const e of a) c.enqueue(enc.encode(`event: ${e.type}\ndata: ${JSON.stringify(e.data)}\n\n`));
+        },
+      });
+      return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
+    }),
+    attempts: () => n,
+    signals: () => signals,
+    drop: () => {
+      ctl?.close();
+      ctl = undefined;
+    },
+  };
+}
+
+/** FR-750: a request held unanswered until the test ends (whatever its end), standing for one the browser never settles. */
+export function hang(): Promise<void> {
+  let release!: () => void;
+  const p = new Promise<void>((r) => (release = r));
+  onTestFinished(() => release());
+  return p;
+}
+
 export const serviceError = (status: number, code: string, message: string) => HttpResponse.json({ error: { code, message } }, { status });
+
+/** FR-756 (R605 M11): the sentence `asksInTurn`'s "refuse" answers with (a failure with the service's own words). */
+export const REFUSED_READ = "The service refused this read.";
+
+/**
+ * FR-756 (R605 M11): a GET handler whose asks, in turn, are: "late" (held until `release()`, then answered), "hold"
+ * (never settled), "refuse" (a failure with the service's own words, `REFUSED_READ`) or "answer". An answer is
+ * `answer()`, or, when that gives undefined, whatever the next handler for the path answers. The last step repeats.
+ * Each ask's request signal is kept (a request given up or replaced is cancelled).
+ */
+export function asksInTurn(path: string, steps: Array<"late" | "hold" | "refuse" | "answer">, answer: () => Response | undefined = () => undefined) {
+  let n = 0;
+  const signals: AbortSignal[] = [];
+  const gate = hang();
+  let release!: () => void;
+  const released = new Promise<void>((r) => (release = r));
+  return {
+    handler: http.get(path, async ({ request }) => {
+      signals.push(request.signal);
+      const step = steps[Math.min(n++, steps.length - 1)];
+      if (step === "hold") await gate;
+      if (step === "late") await Promise.race([gate, released]);
+      if (step === "refuse") return serviceError(500, "INTERNAL", REFUSED_READ);
+      return answer();
+    }),
+    signals,
+    count: () => n,
+    release: () => release(),
+  };
+}
 
 // ---- fixtures -------------------------------------------------------------------------------
 
