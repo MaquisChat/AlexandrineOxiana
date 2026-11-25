@@ -528,8 +528,10 @@ describe("R583 M5: files at the new place that no longer match", () => {
       isolated: [place],
     });
     expect(shown("move-not-finished-files-differ", 3).text).toMatch(/: 3 files here no longer match what was checked/u);
+    // FR-766 (R641 B3): a folder whose move's mark is not recorded, opened while the library's folder cannot be reached:
+    // the app cannot tell whether that move finished, and says only that (no promise of a finishing).
     expect(shown("move-not-finished-old-copy-unreachable", 0)).toEqual({
-      text: `The move of this library to this folder has not finished, and it could not be finished now because its old copy at ${place} cannot be reached. Connect the drive it is on and open the library again; both copies are kept.`,
+      text: `The app cannot tell whether the move into this folder finished, because ${place} cannot be reached. Connect that drive, then open this folder again.`,
       isolated: [place],
     });
     expect(shown("move-not-finished-files-differ-old-unconfirmed", 2).text).toBe(
