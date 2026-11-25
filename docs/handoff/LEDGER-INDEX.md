@@ -538,3 +538,4 @@ R612 (2026-11-25 UTC): FR-068 strict approved with small points; I-A corrects R6
 R613 (2026-11-25 UTC): FR-756's other screens — fix round built (de02a65); two decisions accepted; its second look and FR-068's mend round wait for the full verification N14 of build request 13
 R614 (2026-11-25 UTC): the join's full verification N14 — all green but two Chromium scenarios of find-copies, a hole in the e2e harness's wait for a quiet page (not the app); mended in the harness (403f0f8); the browser step run again in full
 R615 (2026-11-25 UTC): container restarted ~05:56 UTC during N14c; nothing on disk lost; the join pushed to the reader branch as a safeguard (403f0f8, no build request); N14c started again
+R616 (2026-11-25 UTC): N14c green (228 of 228); build request 13 pushed (reader 2f4a00c, 06:35 UTC); CI 288/289 and Mac run 20 running; the owner's page has part 13; FR-756's other screens at their second look, FR-068's mend round started

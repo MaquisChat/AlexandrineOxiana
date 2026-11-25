@@ -2,6 +2,8 @@
 
 *Updated 24 November 2026, 7 pm Central: MAC BUILD 12 EXISTS — GitHub gave the build a Mac this time and every check passed, the test of Quit among them. Part 12 says where to download it. It replaces build 10.*
 
+*Updated 25 November 2026, just after midnight Central: part 13, at the end, is new — the move fix, the screens that no longer wait for ever (the first five), and "Look up again" are built, reviewed, tested together and pushed as build request 13. It asks whether I may merge. Start there.*
+
 *Updated 24 November 2026, evening: part 12, at the end, is new — closing the library safely (FR-749) and your decision 31 (b) are built, reviewed, tested together and pushed as build request 12; it has four small choices for "Look up again" and asks whether I may merge. Start there.*
 
 *Updated 24 November 2026, mid-afternoon: the known-gaps round is merged to `main` on your word, and decision 31 is decided ((b) now, (c) next); part 11 says so.*
@@ -94,7 +96,7 @@
    <sub>(FR-520)</sub>
 
 12. **Screens that wait for ever**
-   **What it is:** If a request never gets an answer, a screen's first read can stay at "Reading…" for ever. This was seen once in the web view the Mac uses. The app has no give-up.
+   **What it is:** If a request never gets an answer, a screen's first read can stay at "Reading…" for ever. This was seen once in the web view the Mac uses. The app has no give-up. *(From build request 13 it has one on Find and acquire, Watched folders, Zotero sync, the opening screen and the library screen: part 13. The other screens follow.)*
    **Your options:** Make every screen give up after a time and try once more by itself, or leave it as is.
    **My recommendation:** First note on your Mac whether any screen ever stays at "Reading…" (box in part 4), then decide.
    <sub>(FR-575, FR-595)</sub>
@@ -240,7 +242,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 - [ ] Run Find and acquire on 20 to 30 of your own references. Note which held files were in fact the right file. (FR-478, FR-502, FR-505)
 - [ ] Decide a run of found files one after another and note whether the short pause after each decision feels slow. (FR-536)
 - [ ] While deciding found files, scroll and then press a button right away. Note whether presses are refused too often. (FR-535)
-- [ ] Note whether any screen ever stays at "Reading…". (FR-575, FR-595)
+- [ ] Note whether any screen ever stays at "Reading…". (FR-575, FR-595) *(Part 13 says which screens now give up after twenty seconds and offer "Try again".)*
 
 ### Getting a PDF through your library (the app's own sign-in window)
 
@@ -580,7 +582,7 @@ The reviews caught, on the way: watches restarted in the middle of a move; a rul
 - 28, links waiting when a project is locked: I recommend (a), leave it so.
 - 29, tool downloads on a network that inspects secure connections: I recommend (a), unless you meet the problem.
 - 30, logging out or shutting down: I recommend (a) now; (c) later if you ever see a "the last change was not finished" notice after a shutdown.
-- **31 (new, below), attaching a file when a metadata service says "too many requests": DECIDED on 24 November — you said "b now and c next", and that the message reads "Waiting for lookup service response." (b) is being built now; (c), "look up again", is the piece after it.**
+- **31 (new, below), attaching a file when a metadata service says "too many requests": DECIDED on 24 November — you said "b now and c next", and that the message reads "Waiting for lookup service response." (b) is being built now; (c), "look up again", is the piece after it.** *(Both are built: (b) in build 12, (c) in build request 13 — part 13.)*
 
 **Listed in this round, not built (most serious first):**
 - **FR-749:** a library closed while a file is still "Attaching…" is written into after its lock is released. Being fixed and reviewed now; it comes with the next build (see "What GitHub's own check found", below). *(Built since: part 12.)*
@@ -591,7 +593,7 @@ The reviews caught, on the way: watches restarted in the middle of a move; a rul
 - **FR-742:** a few build tools and the Linux side of the helper's build are not yet pinned.
 - **FR-743:** after an older kind of restore, an export can call false-dated evidence verified. Very narrow.
 - **Small points:** FR-717, FR-725, FR-729, FR-734 and FR-740 each keep a small leftover of wording, timing or a rare join.
-- **Tests only:** FR-747 and FR-750 are three tests that failed once on a heavily loaded machine and pass alone; they are watched, not changed.
+- **Tests only:** FR-747 and FR-750 are three tests that failed once on a heavily loaded machine and pass alone; they are watched, not changed. *(Corrected since: FR-750 was a real weakness of the screen, not only of its test — a first reading that never got an answer left it waiting for ever. Mended: part 13.)*
 
 ### What GitHub's own check found after the push
 
@@ -608,7 +610,7 @@ The round passed every test on my side, and then GitHub's check of the same code
    **What it is:** When you attach a file, the app first asks public services (Crossref, OpenAlex, Open Library, the Library of Congress) for its details. If one answers "too many requests", the app waits as long as that service asks, up to a minute per try, and then asks again. Measured with a stand-in: one minute for a plain PDF with one such answer; three minutes if every service keeps answering so; nine minutes for a PDF with a DOI. Several files wait one after another. All you see meanwhile is "Attaching…" with the buttons off: no progress and no Cancel. One of these services appears to have changed its limits for requests without a key (its answers now carry a shared allowance), so this may happen more often than it used to. When a lookup fails outright (no network), the file comes in within seconds marked "needs review", and nothing looks that record up again later.
    **Your options:** (a) Wait, as now. (b) Bring the file in at once, marked "needs review", whenever a service asks to wait: small to build; the record then holds only what the file itself says, and you fill in the rest by hand. (c) As (b), and add "look up again", which completes such a record later: a medium piece of work. (d) Keep waiting, but for about ten seconds at most, with "Looking up the details…" and a Cancel.
    **My recommendation:** (b) now and (c) next. A file you chose should be in your library at once; what the services know can follow.
-   **Decided, 24 November:** (b) now and (c) next, with your words: the file comes in at once, marked "needs review", and the line reads "Waiting for lookup service response." One thing to know until (c) is built: nothing looks such a record up again by itself yet, so "waiting" becomes literally true with (c); until then you complete the record by hand in the review queue, or it stays as it is.
+   **Decided, 24 November:** (b) now and (c) next, with your words: the file comes in at once, marked "needs review", and the line reads "Waiting for lookup service response." One thing to know until (c) is built *(it is now: part 13)*: nothing looks such a record up again by itself yet, so "waiting" becomes literally true with (c); until then you complete the record by hand in the review queue, or it stays as it is.
    <sub>(FR-748)</sub>
 
 ## 12. Added on 24 November, evening: closing the library safely, and attaching without the wait
@@ -688,20 +690,147 @@ With (c), an entry that is waiting is looked up again later, and what the servic
    **Your options:** (a) not covered; (b) kept from now on and offered by hand only; (c) also tried again automatically.
    **My recommendation:** (b).
 
-I build my recommendation for each unless you say otherwise before the build starts.
+I build my recommendation for each unless you say otherwise before the build starts. *(Built so: part 13, "the four choices, as built", which also says how each can still be changed.)*
 
 ### Still open
 
 - **FR-068 (added 24 November, 9:20 pm Central; CORRECTED at 9:50 pm — what stood here was wrong on the main point):** I wrote that after a move that stopped, running it again to the same folder could finish without copying your later changes, and gave advice to avoid that. **In build 12 that cannot happen through the app:** the Move dialog always checks the destination first, and it refuses a folder that already holds the stopped move's copy ("not empty"). The fault the review proved needs a request that skips that check, which the app's screens never send. **So there is nothing for you to avoid, and the advice is withdrawn.** What is true in build 12: after a move that stops at that one late step, the copy it made stays at the new place, unused, and nothing says so; to move the library you must choose another, empty folder, and the leftover folder can be deleted. The fix being built makes the engine refuse such a request by itself (not only because the dialog checks), tells you after such a stop that the copy at the new place is not used and can be deleted, and makes the leftover folder say what it is when opened. *(Changed at 10:20 pm: a first version of the fix let the move be run again into the same folder; its review found that unsafe, so the app will go on refusing, as it does today, and say why.)*
-- **FR-755 (the first thing I build next) — corrected at 7:30 pm Central; what I wrote here before was wrong on one point:** if "Move library" fails at its very last steps — or if the app is killed or the Mac goes down in those last moments of a move — the library is left half-switched. **Nothing is lost:** the new place holds the whole copy, checked file by file before the switch began, and the old copy is untouched. But I wrote that the move "then finishes when the library is opened". It does not: today the app has no way to finish such a move, and the library opens only read-only, at the old place and at the new one, from then on. That is older than this work (it has been so since the move was built) and no review had caught it; the worker building this fix found it by trying it. The fix, being built now: opening the library at its new place finishes the move and tells you so; and a move that fails late closes the library and says where to open it. Until that build: if a move ever ends with the library read-only and the words "a move into this folder has not finished", stop and tell me — do not delete either copy.
-- **FR-750 (built with it):** the Find and acquire screen can sit at "Reading the projects…" with no error and no "Try again" when its very first requests fail. Seen three times in the test browser, never on a Mac so far; the cause is found.
+- **FR-755 (the first thing I build next) — corrected at 7:30 pm Central; what I wrote here before was wrong on one point:** if "Move library" fails at its very last steps — or if the app is killed or the Mac goes down in those last moments of a move — the library is left half-switched. **Nothing is lost:** the new place holds the whole copy, checked file by file before the switch began, and the old copy is untouched. But I wrote that the move "then finishes when the library is opened". It does not: today the app has no way to finish such a move, and the library opens only read-only, at the old place and at the new one, from then on. That is older than this work (it has been so since the move was built) and no review had caught it; the worker building this fix found it by trying it. The fix, being built now: opening the library at its new place finishes the move and tells you so; and a move that fails late closes the library and says where to open it. Until that build: if a move ever ends with the library read-only and the words "a move into this folder has not finished", stop and tell me — do not delete either copy. *(Built, with three reviews: part 13, A. The advice above — stop and tell me — is for build 12 only.)*
+- **FR-750 (built with it):** the Find and acquire screen can sit at "Reading the projects…" with no error and no "Try again" when its very first requests fail. Seen three times in the test browser, never on a Mac so far; the cause is found. *(Corrected and built: the cause was a request that never got an answer, not one that failed — part 13, B.)*
 - **FR-749:** a close waits without a time limit for a change being written, so a change stuck on a vanished network drive holds the close (Quit still gives up after a minute and a half). Unlikely.
 - **FR-749:** a picture or text-recognition job already running at a close can make and remove a scratch folder after it. The app stops these queues first, so you should not meet it.
 - **FR-749:** a Bulk Import that does not pause in time may remove its own scratch folder late. Rare.
 - **FR-749:** a forced exit during a very large cancelled backup can leave a partial file until the next backup. Very unlikely.
-- **Decision 31 (b):** the hold on a service is kept in memory, so after the library is closed and reopened one request can go early. Until (c) is built, nothing looks a waiting record up again by itself.
+- **Decision 31 (b):** the hold on a service is kept in memory, so after the library is closed and reopened one request can go early. Until (c) is built, nothing looks a waiting record up again by itself. *(Both closed by build request 13: part 13.)*
 - **FR-753:** two small corners of that hold: one request can go early when answers arrive out of order, and a file can wait a moment longer than needed. Nothing is lost.
 - **FR-751:** a destruction certificate's status can say a backup "was not removed by the app" when it was. A wording to correct.
 - **FR-752:** in an encrypted project, a source's folder name and one of its files hold its title in the clear. Whether this is as designed or a gap is being checked; it is not yet judged.
 - **FR-754:** the "automatic backup failed" warning says "make one now from the project's settings", but no screen offers a backup by hand. A sentence to correct, or a button to add.
 - **FR-747:** a test only.
+
+## 13. Added on 25 November, just after midnight: the move finished safely, screens that no longer wait for ever, and "Look up again"
+
+After build 12, three more pieces were built for the next Mac build (build request 13). The first mends the fault I told you about at 7:30 pm. A "Move library" that stopped at its very last steps left the library read-only for good. Now the move is finished when you open the library at its new place. The second: a screen that gets no answer from the app's own service no longer waits for ever. After twenty seconds it says so and offers "Try again". So far this covers Find and acquire, Watched folders, Zotero sync, the opening screen and the library screen. The third is your decision 31 (c), "Look up again", built with my recommendation for each of its four choices, since you did not change them. Reviewers who had not built the work checked each piece and tried to break it. The move fix went through three reviews. Find and acquire's part went through one. The opening screen's went through two. "Look up again" went through four: two for the part that does the lookups and two for the screen and what drives it. Every piece but Find and acquire's was sent back at least once before it was approved.
+
+- **Tested together on my side:** every step passes: the tests of every part, the service, the Mac shell's own tests, a Linux build, the app started and quit, and 228 of 228 browser scenarios. The first full run had two of those scenarios fail. I read both before believing them: the test harness had opened the next page while the page before was between two of its own readings. Nothing in the app was at fault; I mended the harness, and the whole browser step was run again and passed.
+- **Pushed as build request 13** at 12:35 am Central on 25 November.
+- **GitHub's own check** is running: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45557680438 (the same code) and https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45561718000 (the build request itself, which waits behind the first). I will say here and in the chat when they are in.
+- **The Mac build** is running; GitHub gave it a Mac at once: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45561718089 — when it is done, the download and its SHA-256 go here, and build 13 replaces build 12. Until then build 12 is the build to use.
+- **It is not in `main`** until you say so. **May I merge it when GitHub's check is green?** A yes in the chat is enough.
+
+### What you will notice
+
+**A. "Move library" when it stops at the very end**
+
+A normal move is unchanged. What follows is only for a move that stops after the copy was checked and while the library was being switched to its new place. That happens if a step fails then, or if the app is killed or the Mac goes down in those last moments.
+
+- The move does not carry on with the library half-switched. The library is closed, and the Move dialog says: "The move did not finish, so the library has been closed. Open it at its new place, {new folder}, and the move will be finished then; nothing is lost." ({new folder} is the folder you chose.)
+- If the move was taking only some projects to a new library, it says: "The move of the projects did not finish, so the library has been closed. Open the new library first, at its new place, {new folder}: the move will be finished then. Until then the library they came from opens only read-only; after that it opens again for the projects that stayed. Nothing is lost."
+- When you open the library at its new place, the move is finished first. The same happens when the app reopens that library at its start. First the app checks every file at the new place again against the move's own record. This takes as long as the move's own check did, roughly one to two minutes per 10 GB on an external drive. The opening waits for it. Then, shown once: "The move of this library to this folder had not finished. It was finished when the library was opened here; nothing was lost."
+- If it cannot be finished yet, the library opens read-only and says why, for example: "The move of this library to this folder has not finished, and it could not be finished now because the disk is full. The library is open read-only, and both copies are kept; opening it again will try again." Other versions name other causes: the folder cannot be written to; the library is open in another program or on another computer; a step failed; the old copy's drive is not connected; or a newer version of the app saved the library.
+- If files at the new place were changed by hand since the copy was checked, the move is not finished. The library opens read-only and says how many files no longer match, and whether the old copy is still whole. Where the app cannot finish a move at all (its record is damaged, or something was changed by hand), the warning ends: "Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy."
+- If you open the old place of such a move instead, it is read-only and names the new place: "Read-only — this is the old copy of a library whose move has not finished. Open the library at its new place, {new folder}, and the move will be finished then; nothing is lost." The old copy of a move that did finish says, as before: "Read-only — this is the old copy of a library that was moved. Changes are off." It says this also while the new place's drive is unplugged.
+- An old copy cannot be deleted while its move is unfinished: "The move of this library has not finished, so its old copy cannot be deleted yet. Open the library at its new place first; the move is finished then." Nor while the new place cannot be reached: "The old copy cannot be deleted now: the library's new place cannot be reached, so the app cannot tell whether its move has finished. Connect the drive the new place is on and try again."
+
+**B. Screens that got no answer**
+
+- On Find and acquire, Watched folders and Zotero sync, a screen whose first reading of the library gets no answer within twenty seconds says: "The library service did not answer in time." Below it is a "Try again" button that reads again what is missing. Before, Find and acquire could stay at "Reading the projects…" for ever.
+- Where the request could not be made at all, the screen says, as before: "The library service could not be reached." It now has the same "Try again".
+- A screen shows one of the two sentences at a time, never both, and one "Try again".
+- The opening screen ("Connecting to the library…") gives up after twenty seconds too. It then shows only "The library service did not answer in time." with "Try again". It does not show the list of libraries, because the app does not yet know whether a library is already open. The list of libraries ("Loading libraries…") gives up after twenty seconds in the same way.
+- In the library itself, "Loading projects…" and "Loading sources…" give way to the same sentence and "Try again". So does the side panel's list of collections and tags.
+- Whatever is still missing is also read again by itself as soon as the screen's connection to the service opens anew.
+- A refusal the screens already explained, for example a locked project, shows its own sentence as before, with no "Try again".
+
+**C. "Look up again"** (your decision 31 (c))
+
+This is for entries in the review queue that came in while a lookup service said "too many requests" (the line "Waiting for lookup service response." from build 12). It also covers entries whose lookup failed outright, for example with no network, from now on.
+
+- **By itself:** while the library is open, waiting entries are looked up again at the opening, when an encrypted project is unlocked, and every ten minutes. They are taken one at a time. No service is asked before the time it named. Each lookup is tried by itself at most five times: about 15 minutes after the attach, then 1, 4, 12 and 24 hours after the try before (or later, if the service names a later time).
+- **By hand:** an entry that still has something to look up has a "Look up again" button at the end of "Why it needs review". Before the service's time the button is off and reads "Look up again (after {time})". It turns on by itself when the time comes. While it works it reads "Looking this up again…".
+- **What the entry then says** (word for word):
+  - while still waiting: "Waiting for lookup service response."
+  - under the matches, while nothing has been asked yet: "Not looked up yet: the lookup service asked to wait."
+  - found: "The lookup service has now answered. Its matches are shown below; nothing changes until you accept one."
+  - where the match came from an identifier found in the file, added: "The match was found from an identifier in the file, which may belong to a work the file cites. Check it against the document first."
+  - nothing found: "The lookup service has now answered, but it found no match for this item."
+  - the project's rules no longer allow it: "This project's rules no longer allow this lookup, so it was not looked up again."
+  - after five tries that were all told to wait: "The lookup service asked to wait each time it was tried ({n} tries), so the app has stopped trying by itself. You can still use Look up again."
+  - a lookup that failed outright, under the matches, whatever else is shown: "Not looked up: a lookup service could not be reached. You can use Look up again." Where this shows, "No candidate matches were found." does not.
+- An entry can have several lookups. It shows every sentence that is true of it, each once.
+- New matches are added after the ones already shown. **Nothing in the record changes until you press "Use this match"** (or decide the entry another way), and the match you press is the one accepted.
+- A queue you have open does not refresh by itself when the automatic pass adds matches. You see them when you open the entry again.
+
+### What became safer underneath
+
+- **The move:** a move is finished only if every file at the new place still matches the move's own record. The change logs at the new place must begin with exactly what was checked, so a log emptied or cut short by hand stops the finishing. Every mark the move left in the old copy must still be there. When the finishing refuses, both folders are left exactly as they were.
+- **The move:** a copy of the new folder made by hand is never finished as if it were the library. Once any part of the old library is marked as moved, a late failure closes the library, so nothing more can be written into a copy that is about to be left behind. After a half-finished move of some projects, the library they came from opens read-only until the new library has been opened. So a backup that runs at the opening cannot block the move.
+- **The screens:** a reading that was given up is cancelled, and a late answer changes nothing. Only readings have the limit; a move, an import or an export never does.
+- **"Look up again":** each request to a public service is written into the project's change log before it leaves, with ids and counts only, never a title. Each look-up reads the entry again just before it writes, so an entry you have already decided is never reopened. Only one look-up of an entry runs at a time; a second press sends nothing.
+- **"Look up again":** a service that asked to wait is now held back also after the library is closed and opened again, after the app is restarted, and when an encrypted project is unlocked. **This closes part 12's open item on decision 31 (b)**, where after a close and reopen one request could go early.
+- **"Look up again":** nothing a look-up brought back stays in memory after an encrypted project is locked. The automatic look-ups stop at a move or a close.
+
+The reviews caught these on the way:
+- after a move of some projects that failed late, the old library could still be written to, and a change made there would have been left behind;
+- a file removed by hand at the new place, days later, and the move would still have been finished with "nothing was lost";
+- after a move of some projects that stopped part-way, simply quitting and starting the app could leave the move stuck for good;
+- a change log emptied by hand at the new place would not have been noticed;
+- the screens called a service that was only slow "could not be reached" (so there are now two sentences), and a stale "did not answer in time" followed you to the next project;
+- the opening screen's own browser test was unreliable;
+- two look-ups of one entry at once could turn a "found" back into "waiting";
+- after a close and reopen, a service that had asked to wait was asked again too early;
+- a late answer stayed in memory after an encrypted project was locked;
+- a lookup that failed outright was never mentioned beside one that answered, so the screen said "No candidate matches were found.", which was only partly true;
+- a double press sent the same requests twice.
+
+### Things only you can check in the next Mac build
+
+- [ ] Move a library to a new, empty folder, as usual. The move should finish without any new message. The library should open at its new place, and you should be able to change something there. If you open the old folder, it should say "Read-only — this is the old copy of a library that was moved. Changes are off."
+- [ ] If your review queue still holds entries from build 12 that read "Waiting for lookup service response.", open the library and leave it open for a while (up to half an hour). Each such entry should change by itself: it shows matches with "The lookup service has now answered. Its matches are shown below; nothing changes until you accept one.", or says it found no match. Check that the record itself has not changed until you press "Use this match".
+- [ ] Turn Wi-Fi off and attach a PDF. Its entry should say, under the matches: "Not looked up: a lookup service could not be reached. You can use Look up again." (I could not try this on a Mac; if it says something else, tell me the words.) Turn Wi-Fi back on. After a few minutes the entry should still say the same, because failed lookups are not retried by themselves. Then press "Look up again": the sentence should give way to matches, or to "The lookup service has now answered, but it found no match for this item."
+- [ ] An ordinary entry that has nothing waiting should show no "Look up again" button.
+- [ ] Use Find and acquire, Watched folders and the opening screen as usual. Nothing should look different. If you ever see "The library service did not answer in time.", press "Try again", and tell me where it happened.
+- [ ] The checks of part 12's list still apply to this build (Cmd-Q and the Dock's Quit, Bulk Import closed and resumed, "Speech model: tiny").
+
+### "Look up again": the four choices, as built
+
+You had these since 4:25 pm, with my recommendation as what is built unless you said otherwise. You did not change them, so each is built as recommended. Each can still be changed:
+
+31c-1. **Automatic, or by hand only**
+   **Built:** (a) both. Waiting entries are looked up by themselves while the library is open, and with the "Look up again" button.
+   **To switch later to by hand only:** very small, a one-line change.
+
+31c-2. **May a later answer fill a record by itself?**
+   **Built:** (a) never. It stays a suggested match until you accept it.
+   **To allow it later for a perfect match:** a real piece of work, a new way of writing a record that would need its own review.
+
+31c-3. **"Look up again" before the service's named time**
+   **Built:** (a) the button waits. It is off and says when it can be used.
+   **To switch later to "one request at once, as your own act":** small, a few edits and one review (the press would have to pass the hold that is now kept across reopenings).
+
+31c-4. **Lookups that failed outright** (for example, no network)
+   **Built:** (b) kept from now on and offered by hand only. They are never retried by themselves.
+   **To switch later to also trying them automatically:** very small, a one-line change.
+
+### Still open
+
+This list replaces part 12's entries on FR-755, FR-750 and decision 31 (b). The rest of part 12's list stands.
+
+**Being built beside this build, not in it:**
+- **The same "never wait for ever" fix for the other screens (FR-756).** Built for the governance screens, "Your library", search sources, tools, the extension's pairing, the researcher's name, the transcript viewer, the reader, capture and the import; a review sent it back, it has been mended, and it is at its second review. A last small piece follows (the review queue, a source's detail, a new project, the appearance settings). Missing files gets no time limit, since its check rightly takes long; it needs a check that shows its progress. Until then those screens can still sit at their loading words if the service never answers. Seen only in the test browser, never on a Mac.
+- **Moving into a stopped move's folder (FR-068).** Built, and approved at its second review with small points that are being mended; it comes with the build after this one. What it does: if you ask to move the library into a folder that holds the copy of an earlier move that did not finish, the app refuses and says so. Nothing is copied over or deleted there. The leftover folder, when opened, will say what it is: that it is not the library, and that it can be deleted. This replaces the last sentence of part 12's FR-068 note. Running the move again into the same folder will not be offered. You choose another, empty folder, or delete the leftover one first.
+
+**Left over from this round (unlikely to meet):**
+- **FR-755:** if the opening that finishes a move is itself cut short (by Quit), the move is finished but its message is missing. After a move of some projects, the library they came from does not say where they went (the Move dialog does).
+- **"Look up again":** your press can wait behind the entry the automatic pass is busy with, minutes at worst. While an encrypted project is locked, the times its services named are unknown, so an attach to another project may ask such a service early.
+- **FR-756:** the list of libraries can show "No libraries yet" beside "could not be reached" when it was not read.
+
+**Listed, not built:**
+- **FR-759:** locking an encrypted project while an attach's lookup is still out may leave that one answer in memory. It is mended for "Look up again"; for an attach it is still to be checked. You would not see it.
+- **FR-753:** two small corners of the hold on a service: one request can go early when answers arrive out of order, and a file can wait a moment longer than needed. Nothing is lost.
+- **FR-757:** a test of Find and acquire failed once; it may hide a rare case where a service is asked a little before its time. Being looked into.
+- **FR-758:** in a case the app does not reach today, the time of the last real try is not recorded. Cosmetic.
+- **FR-751:** a destruction certificate can say a backup "was not removed by the app" when it was. Only after a crash at that very step; a wording to correct.
+- **FR-752:** in an encrypted project, a source's folder name and one of its files hold its title in plain text. Still being checked: as designed, or a gap. You would only see it by looking inside the library folder.
+- **FR-754:** the "automatic backup failed" warning says "make one now from the project's settings", but no screen offers that. You would meet it only if an automatic backup fails.
+- **FR-760:** two small points of the move that are older than this work: moving the library that stayed behind after a move of some projects into that move's new place answers "done" although nothing moved; and one check after an upgrade from an older build rests on the later checks. Nothing is lost in either.
