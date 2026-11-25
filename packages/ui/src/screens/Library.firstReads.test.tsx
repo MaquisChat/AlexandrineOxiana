@@ -408,3 +408,15 @@ describe("Library: an event stream that does not open within the limit is tried 
     expect(ev.signals()[0]!.aborted).toBe(false);
   });
 });
+
+describe("Library: an event stream that opens and then delivers nothing is given up after a silence and opened afresh (R641 D2)", () => {
+  it("a stream silent for `streamQuietMs` (not even the service's keep-alive) is cancelled and, after the pause, opened again; nothing is said", async () => {
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler, ...libraryHandlers());
+    render(<Library api={testApi()} current={CURRENT_RW as never} streamQuietMs={300} />);
+    await screen.findByText("Ethnography at Work");
+    await waitFor(() => expect(ev.attempts()).toBe(2), { timeout: 10_000 });
+    expect(ev.signals()[0]!.aborted).toBe(true);
+    expect(alerts()).toEqual([]);
+  });
+});

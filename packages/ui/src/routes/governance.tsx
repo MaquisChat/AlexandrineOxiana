@@ -4,7 +4,7 @@
  * a link names it. Links and the project picker use the shared pushState navigation (navigation.tsx).
  */
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
-import { STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
+import { STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../api/firstRead";
 import { governanceApi, type GovernanceApi, type ProjectSummary } from "../api/governance";
 import { errorText, type LibraryState } from "../api/library";
@@ -45,9 +45,10 @@ const LISTEN_AGAIN_MS = 2_000;
 /**
  * `firstReadMs` (FR-756, R579): how long the list of projects, and each screen's own first reads, are waited for before
  * the read is given up (smaller in tests). `streamOpenMs` (R641 D1, R597): how long the event stream is waited for to
- * open before it is given up and, after a pause, opened afresh.
+ * open before it is given up and, after a pause, opened afresh; `streamQuietMs` (R641 D2): how long an open stream may
+ * deliver nothing (not even the service's keep-alive) before it is given up and opened afresh the same way.
  */
-export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number }) {
+export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number }) {
   const api = useMemo(() => governanceApi(client), [client]);
   const path = normalisePath(loc.pathname);
   const asked = new URLSearchParams(loc.search).get("project") ?? "";
@@ -81,7 +82,7 @@ export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT
       while (!ac.signal.aborted) {
         let first = !opened;
         try {
-          for await (const e of client.events({ signal: ac.signal, openWithinMs: streamOpenMs })) {
+          for await (const e of client.events({ signal: ac.signal, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
             if (e.type !== "library.state") continue;
             opened = true;
             const mode = e.data && typeof e.data === "object" ? (e.data as LibraryState).mode : undefined;
@@ -104,7 +105,7 @@ export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT
       }
     })();
     return () => ac.abort();
-  }, [client, onGovernance, streamOpenMs]);
+  }, [client, onGovernance, streamOpenMs, streamQuietMs]);
   useEffect(() => {
     let live = true;
     const ac = new AbortController();

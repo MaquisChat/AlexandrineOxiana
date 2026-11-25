@@ -111,6 +111,8 @@ export interface EventsOptions {
   signal?: AbortSignal;
   onOpen?: () => void;
   openWithinMs?: number;
+  /** R641 D2: how long an open stream may stay silent before it is given up (no limit unless asked; see STREAM_QUIET_TIMEOUT_MS). */
+  quietWithinMs?: number;
 }
 
 /**
@@ -118,6 +120,14 @@ export interface EventsOptions {
  * service answers it at once, with the library's state, from the same machine; twenty seconds is long.
  */
 export const STREAM_OPEN_TIMEOUT_MS = 20_000;
+
+/**
+ * R641 D2: how long an OPEN event stream may deliver nothing before it is taken as lost and given up ("did not answer
+ * in time"), so the caller's own reconnect opens it afresh. The service writes a keep-alive comment every 25 seconds
+ * (routes/libraries.ts), so a minute of silence is more than two missed beats. Like the opening limit (R597), it is
+ * turned on consumer by consumer (`quietWithinMs`), each with its own test, and only where a reconnect follows.
+ */
+export const STREAM_QUIET_TIMEOUT_MS = 60_000;
 
 /** `onOpen` is called once the service has answered with a stream (its headers arrived), before any line. */
 export type NdjsonOptions = RequestOptions & { onOpen?: () => void };
@@ -412,17 +422,25 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     let timer: ReturnType<typeof setTimeout> | undefined;
     let gaveUp = false;
     let unlink = () => {};
-    if (o.openWithinMs !== undefined) {
+    const quietMs = o.quietWithinMs;
+    let silence: (() => void) | undefined;
+    if (o.openWithinMs !== undefined || quietMs !== undefined) {
       const ac = new AbortController();
       const stop = () => ac.abort();
       if (o.signal?.aborted) ac.abort();
       else o.signal?.addEventListener("abort", stop, { once: true });
       unlink = () => o.signal?.removeEventListener("abort", stop);
       init.signal = ac.signal;
-      timer = setTimeout(() => {
+      if (o.openWithinMs !== undefined) {
+        timer = setTimeout(() => {
+          gaveUp = true;
+          ac.abort();
+        }, o.openWithinMs);
+      }
+      silence = () => {
         gaveUp = true;
         ac.abort();
-      }, o.openWithinMs);
+      };
     }
     let res: Response;
     try {
@@ -441,15 +459,29 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     const parser = new SseParser();
+    // R641 D2: each wait for the next piece of the stream (an event or a keep-alive) is limited by `quietMs`; at the
+    // limit the request is cancelled (and the read too, should the body not end with it) and the stream given up.
+    let quiet: ReturnType<typeof setTimeout> | undefined;
     try {
       for (;;) {
         let chunk: ReadableStreamReadResult<Uint8Array>;
+        if (quietMs !== undefined && silence) {
+          const giveUp = silence;
+          quiet = setTimeout(() => {
+            giveUp();
+            reader.cancel().catch(() => {});
+          }, quietMs);
+        }
         try {
           chunk = await reader.read();
         } catch (err) {
           if (o.signal?.aborted) return;
+          if (gaveUp) throw noAnswerInTime();
           throw err;
+        } finally {
+          clearTimeout(quiet);
         }
+        if (gaveUp && !o.signal?.aborted) throw noAnswerInTime();
         if (chunk.done) break;
         for (const e of parser.push(decoder.decode(chunk.value, { stream: true }))) {
           yield e;

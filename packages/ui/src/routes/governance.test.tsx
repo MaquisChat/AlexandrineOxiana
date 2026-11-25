@@ -376,4 +376,27 @@ describe("R641 D1: the Governance form's event stream reconnects by itself, with
     expect(ev.signals()[0]!.aborted).toBe(true);
     expect(ev.signals()[1]!.aborted).toBe(false);
   });
+  it("a stream that opens and then delivers nothing for `streamQuietMs` is given up (its request cancelled) and opened afresh (R641 D2)", async () => {
+    let n = 0;
+    const signals: AbortSignal[] = [];
+    serve({
+      handler: http.get(url("/events"), ({ request }) => {
+        signals.push(request.signal);
+        // The first opens and sends nothing at all, not even a keep-alive; the second sends the state as it now is.
+        const first = ++n === 1;
+        const body = new ReadableStream<Uint8Array>({
+          start: (c) => {
+            if (!first) c.enqueue(new TextEncoder().encode(`event: library.state\ndata: ${JSON.stringify({ open: true, mode: "read-only" })}\n\n`));
+          },
+        });
+        return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
+      }),
+    });
+    window.history.replaceState(null, "", "/governance?project=p1");
+    render(<GovernanceRoutes client={createClient(BASE, TOKEN)} loc={window.location} streamQuietMs={300} />);
+    expect(await screen.findByText(readOnly, undefined, { timeout: 10_000 })).toBeTruthy();
+    expect(n).toBe(2);
+    expect(signals[0]!.aborted).toBe(true);
+    expect(signals[1]!.aborted).toBe(false);
+  });
 });
