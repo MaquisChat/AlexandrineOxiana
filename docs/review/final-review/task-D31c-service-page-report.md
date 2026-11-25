@@ -178,3 +178,89 @@ End to end, in Chromium, unchanged: `review-queue.spec.ts` 11/11 and `import.spe
 - **Off and busy use `aria-disabled` rather than native `disabled`.** This keeps focus and Tab order. The brief said "disabled".
 - **The page's "under way" follow-up blocks the entry's other decisions for at most 30 s.** In this service the case does not arise.
 - The service tests' clock runs ahead of the lookup client's real clock. Waits answered during a test are therefore one hour long, so they stay ahead of the service's "now".
+
+## Joined to the fixed engine (R592)
+
+Branch `d31c-service-page`, worktree `kg-5`. Not pushed. `git status --short` is empty, and none of the running processes are mine. Nothing under `packages/library/` was changed: after each merge, `git diff d31c-look-up-again HEAD -- packages/library` is empty. No ruled words were changed, and no new sentence was added.
+
+Commits:
+- `60cc757`: merge of e62d244.
+- `681f510`: point 2.
+- `e22cec9`: point 3.
+- `808e6cb`: point 4.
+- `486d435`: point 5.
+- `a1dae56`: second merge, of 89a97d2 (R593, at the coordinator's request).
+- `8ce0311` (the head): the page test for "waiting" with "not allowed".
+
+### Conflicts
+None, in either merge. This branch had changed nothing under `packages/library/`, so the engine's version was taken whole.
+
+The merge did break two of this branch's service tests. Each expected a researcher's press to count a try, which R585 M3 removed. They now expect `tries: 0` and are changed in `e22cec9`:
+- "asks at once when the service's time has passed…"
+- "nothing found; asked to wait again; not allowed…"
+
+### Per point
+
+**Point 2: the clock rule in one place.**
+- Failing test: `look-up-again.test.ts`, "point 2 (R585 point 5): a kept time only a wrong clock could have written (years ahead) is offered NOW, and the press sends". It failed first with `canLookUpNow: false, notBefore: 2036-…`.
+- Mend: `routes/review.ts:65` `lookUpOut` calls the engine's `lookUpNow` (:68). The service's own comparison is gone.
+- The "asked-to-wait" answer's time also comes from `lookUpNow` (:237), never from the view's own `notBefore`.
+- The page already took its button's time only from the service's `lookUp.notBefore`. Page test `ReviewQueue.lookUp.test.tsx`, "point 2 …": with `canLookUpNow: true` and no time, the button is ready and a press sends. This test passed when written, because the page needed no change.
+
+**Point 3: the engine's values by name.**
+- Failing test: "point 3: a lookup the rules denied at send time, with another service answering nothing, is answered "not allowed"…". It failed first: the route answered `nothing`.
+- Mend: `lookUpOutcome` (`routes/review.ts:260`) has an exhaustive switch over the state (with `not-allowed` at :275) and an exhaustive switch over `why` (with `under-way` at :292). Both end in `unknownValue(v: never)` (:316), so a future value fails the typecheck. `LookUpAgainRefusal` is no longer cast.
+- The existing under-way test now uses the engine's own value, uncast.
+- `sent` is not passed on, and a test asserts that.
+
+**Point 4: every sentence in a mix.**
+- `also` and `gaveUpTries` are added to the shared `ReviewLookUp` (`packages/shared/src/api/review.ts:100,102`). They are passed through in `lookUpOut` (:75), and a `Same<>` ties `also` to the engine's type.
+- Page: `lookUpSaid` and `lookUpStateSentence` (`ReviewQueue.tsx:266,274`). The polite region says the main state's sentence, then each `also` state's sentence, each once and in the engine's order. The given-up {n} is `tries` when gave-up is the main state, otherwise `gaveUpTries` (:285). The reasons list is shown as before; the engine writes every sentence into it.
+- Failing tests, service: "point 4 (R585 M3): … answered with matches and another still waiting…" (a real look-up, with `also: ["found"]` and reasons `[found, waiting]`), and "point 4: a mix with "gave up"…".
+- Failing tests, page, under the describe "every true sentence in a mix": found+waiting; gave-up+not-allowed; gaveUpTries. All three failed first, because the polite region said only one sentence.
+- Added after R593: "waiting" with "not allowed". It shows both sentences and the button with its time. It passed when written; the page needed no change.
+
+**Point 5: the pass and "under way".**
+- Failing tests:
+  - "point 5: a press during the automatic pass's request for the same entry answers "under way" at once and sends nothing more" (a held request). It failed first by timing out: the press waited behind the pass.
+  - "point 5: the pass skips an entry whose look-up is under way without counting it". It failed first with `expected 2 to be 1`.
+- Mend in `state.ts`:
+  - `lookUpInTurn` (:2063) records which entry's look-up is running.
+  - `lookUpAgainByHand` (:2050) answers `{done:false, why:"under-way"}` at once for that entry. Nothing is audited, sent or written.
+  - The pass skips an "under-way" entry before counting it (:2032).
+  - The pass still loops strictly one entry after another, and one pass at a time.
+
+### Every sentence the page can now show for a mix (polite region, main state first)
+These are R577's words. In the reasons list they appear in the engine's order: found (+ the from-file sentence), waiting, nothing, not allowed, gave up.
+- "Waiting for lookup service response."
+- "The lookup service has now answered. Its matches are shown below; nothing changes until you accept one."
+- "The match was found from an identifier in the file, which may belong to a work the file cites. Check it against the document first." (in the reasons only)
+- "The lookup service has now answered, but it found no match for this item."
+- "This project's rules no longer allow this lookup, so it was not looked up again."
+- "The lookup service asked to wait each time it was tried ({n} tries), so the app has stopped trying by itself. You can still use Look up again."
+- Under the matches, unchanged: "Not looked up yet: the lookup service asked to wait.", "Not looked up: a lookup service could not be reached. You can use Look up again." and "No candidate matches were found."
+
+**A mix with a lookup that failed outright** (the coordinator's question):
+- "Not looked up: a lookup service could not be reached. You can use Look up again." comes from the page, keyed on the look-up view's `state === "failed"`. The engine gives that state only when nothing but failed lookups remain. It is never in the entry's reasons: the engine writes no state sentence for "failed", and the entry keeps the attach's own reason.
+- It is shown in two places: under the matches when there are no candidates, and in the polite region after a look-up.
+- After a look-up again that fails again, the lookup stays `why: "failed"`. So if it is the only one left, the state is still "failed" and the sentence is still shown.
+- In a mix with any other state (waiting, found and so on), "failed" is never the state and is not in `also` (the engine excludes it). That sentence is then not shown anywhere: only the other states' sentences and the attach's own reason appear.
+
+### Every place `tries` is read
+- `routes/review.ts:70`: `tries: v.tries` (the engine's view).
+- `routes/review.ts` (the not-yet answer): the fallback `{ state: "waiting", tries: 0 }` when the entry has no `lookUp`.
+- `ReviewQueue.tsx:285`: the given-up sentence's {n}, which is `tries` only when gave-up is the main state, otherwise `gaveUpTries`.
+- No other reader in the service, the page or shared. `state.ts` does not read it.
+
+### Runs (each file alone, `nice -n 10`)
+- library, after the second merge: look-again 34/34; look-up-state 20/20; attach-asked-to-wait 12/12. After the first merge they were 32, 20 and 12.
+- service: look-up-again 27/27 (run again after the second merge); review-queue 23/23; open-library 26/26; close-during-attach 13/13; server 160 passed, 1 skipped; lock-during-change 3/3.
+- page: ReviewQueue.lookUp 19/19; ReviewQueue.look 18/18; ReviewQueue 125/125; ProjectReviewQueue 26/26.
+- `pnpm -r typecheck`: all nine packages Done.
+- `lint:css` passed; `lint:colours` ok; `pnpm --filter @ao/ui build` passed.
+- e2e Chromium `review-queue.spec.ts`: 11/11.
+
+### Uncertain
+- **Order of the polite region's sentences.** Point 4's brief says main state first, so a waiting+found entry is announced "Waiting…" then "found". The reasons list uses the engine's own order (found first). The two orders differ.
+- **"Under way" answered by the service itself.** A press for an entry whose look-up runs in the service's turn gets "under-way" from the service, using the engine's value, without calling the engine. The engine's own guard still covers any call outside the turn.
+- **Not-allowed with no candidates still shows no sentence under the matches** (as in §8).
