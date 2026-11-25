@@ -11,11 +11,16 @@
  *     (R577 iii; a lookup that failed outright has no time to wait for);
  *  2. asks the project's rules again, now, per service and for title search; a lookup none of whose services is allowed
  *     is not asked and gets "not-allowed"; a service the client holds (it asked to wait since) is left out without sending;
- *  3. audits the send BEFORE it goes (R566 6): one governed authorisation of the `process/metadata_lookup` requests, op
- *     LOOK_SEND_OP, ids and service names only; refused like any change when the library closes or the project is locked;
- *  4. asks, one lookup after another, with `askedToWait: "leave-out"` and the call's own provider filter, under the
- *     session's closing scope: a service that asks to wait again sets the client's hold and the lookup a new time, one more
- *     try and no outcome — "gave-up" once the automatic bound is reached; a lookup cut by the closing writes NOTHING;
+ *  3. audits the send BEFORE it goes (R566 6), as one event PER SERVICE (R585 M8): each through the unchanged
+ *     `authorizeOnly` with that service's own `process/metadata_lookup` decision, op LOOK_SEND_OP, ids, the service's
+ *     name and the number of this act's lookups planned for it; on disk before that service's first request; refused like
+ *     any change when the library closes or the project is locked; a service the rules deny then is not asked;
+ *  4. asks, one lookup after another and each lookup's services one after another (the call's own provider filter,
+ *     `askedToWait: "leave-out"`), under the session's closing scope: a service that asks to wait again sets the
+ *     client's hold and the lookup a new time and no outcome. A try (`tries`, `lastTriedAt`) is counted only when a
+ *     request of the lookup actually LEFT (R585 M2) — not for an answer from the cache or a request the hold left out —
+ *     and `tries` counts only the AUTOMATIC pass's tries (R585 M3): "gave-up" once the automatic bound is reached; a
+ *     researcher's press moves `lastTriedAt` but is never counted. A lookup cut by the closing writes NOTHING;
  *  5. writes the result as ONE governed change that READS THE ENTRY AGAIN inside itself (R566 2, as
  *     `reviewedAfterWithdrawal`): a decided entry or a removed source → nothing is written (the answer is dropped); else
  *     one new line of the entry — candidates appended, the lookups' tries, last try and outcome, the reasons' sentence for
@@ -84,7 +89,7 @@ export type LookUpAgainResult =
       done: true;
       entryId: string;
       sourceId: string;
-      /** How many lookups were sent (each to its own left-out services, one after another). */
+      /** How many lookups were asked of a service (planned; see `sent` for requests that left). */
       asked: number;
       /** The services asked (names only). */
       services: string[];
@@ -386,6 +391,8 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
       await authorizeProcessing(repo, projectId, { action: "process", process: { op: "metadata_lookup", provider: s } }, {
         op: LOOK_SEND_OP,
         entity: { type: "source", id: e.sourceId! },
+        // `lookups`: the number of this act's lookups PLANNED to ask this service, not the number sent (a lookup whose
+        // chain found its match earlier never asks it); the outcome line's `sent` says what left.
         auditAllow: { details: { reviewEntry: e.id, by: opts.by, services: [s], lookups: toAsk.filter((p) => p.ask.includes(s)).length } },
       });
     } catch (err) {
