@@ -153,7 +153,7 @@ describe("the button (R577 i, iii)", () => {
     expect((screen.getByRole("button", { name: "Skip" }) as HTMLButtonElement).disabled).toBe(true);
     // A second press while it runs sends nothing more.
     await user.keyboard("{Enter}");
-    await waitFor(() => expect(lookUpBodies).toEqual([{ itemId: "r1", body: { projectId: P1 } }]));
+    await waitFor(() => expect(lookUpBodies).toEqual([{ itemId: "r1", body: { projectId: P1, sourceId: "s1" } }]));
     await act(async () => release());
     const off = await screen.findByRole("button", { name: lookUpAgainAfter(when(later)) });
     expect(off).toBe(b);
@@ -263,7 +263,7 @@ describe("after \"found\" (R566 1, R577 ii)", () => {
     await openEntry(user);
     await user.click(await screen.findByRole("button", { name: "Look up again" }));
     await waitFor(() => expect(within(matches()).getAllByRole("listitem")).toHaveLength(3));
-    expect(lookUpBodies).toEqual([{ itemId: "r1", body: { projectId: P1 } }]);
+    expect(lookUpBodies).toEqual([{ itemId: "r1", body: { projectId: P1, sourceId: "s1" } }]);
     const rows = within(matches()).getAllByRole("listitem");
     expect(rows.map((li) => within(li).getAllByText(/./)[0]!.textContent)).toEqual(["Rivers and memory", "Notes from the tide-line interviews", "Tide-line interviews, revisited"]);
     // The reasons carry the service's sentences, the identifier's sentence with them.
@@ -315,7 +315,7 @@ describe("joined to the fixed engine (R592)", () => {
     expect(b.getAttribute("aria-disabled")).toBeNull();
     expect(screen.queryByRole("button", { name: /\(after / })).toBeNull();
     await user.click(b);
-    await waitFor(() => expect(lookUpBodies).toEqual([{ itemId: "r1", body: { projectId: P1 } }]));
+    await waitFor(() => expect(lookUpBodies).toEqual([{ itemId: "r1", body: { projectId: P1, sourceId: "s1" } }]));
   });
 });
 

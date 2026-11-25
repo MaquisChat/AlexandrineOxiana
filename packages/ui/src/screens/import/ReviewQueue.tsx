@@ -796,7 +796,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     setLooking(item.id, true);
     setError(null);
     try {
-      const { outcome, entry } = await api.lookUpAgain(projectId, item.id);
+      const { outcome, entry } = await api.lookUpAgain(projectId, item.id, item.sourceId);
       if (g !== gen.current) return;
       setItems((cur) => cur && cur.map((x) => (x.id === item.id ? entry : x)));
       // R585 (3): a look-up of this entry was already under way: it still shows "Looking this up again…", with no second

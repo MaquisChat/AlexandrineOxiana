@@ -397,9 +397,10 @@ export function importApi(client: ApiClient) {
      * Decision 31 (c), "Look up again" (R577): the entry's left-out lookups asked again (or "not yet", nothing sent);
      * answered with what happened and the entry as the queue lists it now (its candidates narrowed as in `projectReview`).
      */
-    lookUpAgain: async (projectId: string, itemId: string): Promise<{ outcome: ReviewLookUpOutcome; entry: ReviewItem }> => {
+    lookUpAgain: async (projectId: string, itemId: string, sourceId?: string): Promise<{ outcome: ReviewLookUpOutcome; entry: ReviewItem }> => {
       pid(projectId);
-      const body: ReviewLookUpAgainRequest = { projectId };
+      // R600 m4: the entry's source, so that the answer reads only that source's entries.
+      const body: ReviewLookUpAgainRequest = { projectId, ...(sourceId ? { sourceId } : {}) };
       const res = await r<ReviewLookUpAgainResponse>("POST", `/review/${seg(itemId)}/look-up-again`, { body });
       const { candidates, ...e } = res.entry;
       return { outcome: res.outcome, entry: { ...e, ...(candidates ? { candidates: candidates as Candidate[] } : {}) } };

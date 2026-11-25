@@ -55,7 +55,7 @@ import {
   type WithdrawalReviewedResponse,
 } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
-import { bodyAs, intParam, optObj, paramsOf, projectParam, queryOf, str, strArray, type BodyOf, type Ctx, type Same } from "./util.js";
+import { bodyAs, intParam, optObj, optStr, paramsOf, projectParam, queryOf, str, strArray, type BodyOf, type Ctx, type Same } from "./util.js";
 
 /** Per service, until when (ms) the session's lookup client holds it, or undefined (R411). */
 type HeldUntil = (service: string) => number | undefined;
@@ -260,7 +260,11 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
     const r = await state.lookUpAgainByHand(s, projectId, itemId);
     const outcome = lookUpOutcome(r, itemId);
     // The entry as the queue lists it now (decided or its source removed meanwhile: it is no longer waiting).
-    const listed = (await s.bulk.listProjectReview(projectId, r.done ? { sourceId: r.sourceId } : {})).items.find((e) => e.id === itemId);
+    // R600 m4: only the entry's own source is read — the one the act names, else the one the page named; the whole
+    // queue only when the page named none, or a source that is not the entry's.
+    const hinted = optStr(b, "sourceId", 64);
+    const find = async (q: { sourceId?: string }) => (await s.bulk.listProjectReview(projectId, q)).items.find((e) => e.id === itemId);
+    const listed = r.done ? await find({ sourceId: r.sourceId }) : ((hinted && isId(hinted) ? await find({ sourceId: hinted }) : undefined) ?? (await find({})));
     if (!listed) throw new ApiError(409, "CONFLICT", ALREADY_REVIEWED);
     const entry = entryOut(listed, state.now().getTime(), heldBy(s.http));
     // Asked to wait again: the time the act may send from is `lookUpNow`'s (R592), never the view's own.

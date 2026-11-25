@@ -925,4 +925,22 @@ describe("fix round (R600)", () => {
     await svc!.state.idle();
     expect(sent).toEqual([1, 3, 2].map((i) => `api.openalex.org ${titleOf(i)} Souza`));
   });
+
+  it("m4: a \"not yet\" (or a refusal) reads only its own entry — the queue is read for the entry's source, not whole", async () => {
+    await start();
+    const lib = await libraryWithWaiting(2);
+    const e = bySource(await queue(lib.pid), lib.sources[0]!);
+    const bulk = svc!.state.session!.bulk!;
+    const queries: unknown[] = [];
+    const orig = bulk.listProjectReview;
+    bulk.listProjectReview = (p, q) => (queries.push(q ?? {}), orig(p, q));
+    onTestFinished(() => void (bulk.listProjectReview = orig));
+    const r = await call({ method: "POST", url: `/review/${e.id}/look-up-again`, body: { projectId: lib.pid, sourceId: lib.sources[0] } });
+    expect([r.status, r.json.outcome.kind]).toEqual([200, "not-yet"]);
+    expect(r.json.entry.id).toBe(e.id);
+    expect(queries).toEqual([{ sourceId: lib.sources[0] }]);
+    // A source that is not the entry's: the entry is still found (the whole queue is read then).
+    const wrong = await call({ method: "POST", url: `/review/${e.id}/look-up-again`, body: { projectId: lib.pid, sourceId: lib.sources[1] } });
+    expect([wrong.status, wrong.json.entry.id]).toEqual([200, e.id]);
+  });
 });

@@ -278,6 +278,8 @@ export interface ReviewBulkEditResponse {
  */
 export interface ReviewLookUpAgainRequest {
   projectId: string;
+  /** R600 m4: the entry's source, so that the answer reads only that source's entries (the whole queue without it). */
+  sourceId?: string;
 }
 
 export type ReviewLookUpOutcome =
