@@ -447,6 +447,20 @@ describe("checkIntegrity", () => {
     expect(pickSample(ids, "lib-1", 0.25)).not.toEqual(pickSample(ids, "lib-2", 0.25));
   });
 
+  it("R641 D3: says how far it is — `onProgress(checked, total)` before the first file, after each, and ends at the total; a stopped check ends at its signal", async () => {
+    const { lib } = await fixture();
+    const seen: Array<[number, number]> = [];
+    const r = await checkIntegrity(lib, "full", { onProgress: (n, m) => seen.push([n, m]) });
+    const total = r.checked;
+    expect(total).toBeGreaterThan(0);
+    expect(seen[0]).toEqual([0, total]);
+    expect(seen.at(-1)).toEqual([total, total]);
+    expect(seen.map(([n]) => n)).toEqual(Array.from({ length: total + 1 }, (_, i) => i));
+    const ac = new AbortController();
+    const stopped = checkIntegrity(lib, "full", { signal: ac.signal, onProgress: (n) => n === 1 && ac.abort() });
+    await expect(stopped).rejects.toMatchObject({ name: "AbortError" });
+  });
+
   it("finds same-size content changes when hashing, and size changes always", async () => {
     const { lib, assets } = await fixture();
     const p0 = join(lib.root, assets[0]!.path);

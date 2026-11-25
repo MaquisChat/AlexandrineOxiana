@@ -350,6 +350,11 @@ export interface IntegrityOptions {
    * it (reconnect's own check, where nothing else writes) the findings stand as found.
    */
   confirm?: <T>(fn: () => Promise<T>) => Promise<T>;
+  /**
+   * R641 D3: how far the check is: called with 0 and the number of files to check once they are listed, then after
+   * each file. A check made again (a project locked meanwhile, see `checkIntegrity`) starts again from 0.
+   */
+  onProgress?: (checked: number, total: number) => void;
 }
 
 export type IntegritySample = number | "full";
@@ -506,7 +511,9 @@ async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySam
     flagged.set(entry, { f, ...(hashed ? { hashed } : {}) });
   };
 
-  for (const f of files) {
+  opts.onProgress?.(0, files.length);
+  for (const [i, f] of files.entries()) {
+    if (i > 0) opts.onProgress?.(i, files.length);
     opts.signal?.throwIfAborted();
     const entry: IntegrityEntry = { assetId: f.asset?.id ?? null, path: f.path };
     const abs = absIn(lib.root, f.path);
@@ -552,6 +559,7 @@ async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySam
       else flag(report.mismatched, entry, f, st); // unreadable or fails to decrypt
     }
   }
+  if (files.length) opts.onProgress?.(files.length, files.length);
   if (opts.confirm && flagged.size) await confirmFindings(lib, report, flagged, opts.keyRing ?? new KeyRing(), stat, opts.confirm, opts.signal);
   return report;
 }

@@ -5,7 +5,7 @@
  * kept online only download, so the search warns before it starts (Task 14 deferred minor). The
  * library's other maintenance action, "Rebuild library from folder" (spec 4.3, D8), is here too.
  */
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { GovernanceApi, IntegrityAnswer, RelinkResult } from "../api/governance";
 import { RebuildIndex } from "../components/RebuildIndex";
 import { PathField } from "../components/PathField";
@@ -35,17 +35,46 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
   const [folder, setFolder] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<RelinkResult | null>(null);
+  /** R641 D3: how far the running check is (none while its files are listed), and whether it was stopped. */
+  const [progress, setProgress] = useState<{ checked: number; total: number } | null>(null);
+  const [stopped, setStopped] = useState(false);
+  const running = useRef<AbortController | null>(null);
+  const checkAgainRef = useRef<HTMLButtonElement>(null);
 
   const load = useCallback(async () => {
+    running.current?.abort();
+    const ac = new AbortController();
+    running.current = ac;
+    setStopped(false);
+    setProgress(null);
+    setIntegrity(null);
     try {
-      setIntegrity(await api.integrity());
+      // No time limit (R601): a large library on a slow disk takes as long as it takes; "Stop" ends it.
+      const answer = await api.integrityProgress({ signal: ac.signal, onProgress: (checked, total) => !ac.signal.aborted && setProgress({ checked, total }) });
+      if (!ac.signal.aborted) setIntegrity(answer);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "The library could not be checked.");
+      if (!ac.signal.aborted) setError(err instanceof Error ? err.message : "The library could not be checked.");
+    } finally {
+      if (running.current === ac) {
+        running.current = null;
+        setProgress(null);
+      }
     }
   }, [api]);
   useEffect(() => {
     void load();
+    return () => running.current?.abort();
   }, [load]);
+  /** Stops the running check: it only reads, so nothing was changed; the page says so and offers to check again. */
+  const stop = () => {
+    running.current?.abort();
+    running.current = null;
+    setProgress(null);
+    setStopped(true);
+  };
+  useEffect(() => {
+    if (stopped) checkAgainRef.current?.focus();
+  }, [stopped]);
 
   const search = async () => {
     setBusy(true);
@@ -69,8 +98,26 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
           {error}
         </p>
       ) : null}
-      {!integrity ? (
-        !error ? <p role="status">Checking the library…</p> : null
+      {stopped ? (
+        <div className="ao-actions">
+          <p role="status">The check was stopped. Nothing was changed.</p>
+          <button type="button" ref={checkAgainRef} onClick={() => void load()}>
+            Check again
+          </button>
+        </div>
+      ) : !integrity ? (
+        error ? null : progress ? (
+          <div className="ao-actions">
+            <p role="status">
+              Checked {progress.checked.toLocaleString("en-US")} of {progress.total.toLocaleString("en-US")} files…
+            </p>
+            <button type="button" onClick={stop}>
+              Stop
+            </button>
+          </div>
+        ) : (
+          <p role="status">Checking the library…</p>
+        )
       ) : missing.length === 0 ? (
         <p>No files are missing.</p>
       ) : (
