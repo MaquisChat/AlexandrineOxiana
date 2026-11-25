@@ -387,7 +387,7 @@ export function libraryApi(client: ApiClient) {
       rebuildIndex: () => r<{ indexed: number; lockedProjects: number; errors: number }>("POST", "/libraries/rebuild-index"),
     },
     projects: {
-      list: () => r<{ projects: ProjectSummary[] }>("GET", "/projects"),
+      list: (opts: { signal?: AbortSignal } = {}) => r<{ projects: ProjectSummary[] }>("GET", "/projects", opts.signal ? { signal: opts.signal } : {}),
       /** Creates a project; the recovery code in the answer is a secret shown once (never kept). */
       create: (body: NewProjectRequest) => r<NewProjectResult>("POST", "/projects", { body }),
       unlock: (id: string, secret: string) => r<{ unlocked: true }>("POST", `${proj(id)}/unlock`, { body: { secret } }),
@@ -397,7 +397,7 @@ export function libraryApi(client: ApiClient) {
       governance: (id: string) => r<{ yaml: string; sha256: string; violations: unknown[] }>("GET", `${proj(id)}/governance`),
     },
     collections: {
-      list: (pid: string) => r<{ collections: Collection[] }>("GET", `${proj(pid)}/collections`),
+      list: (pid: string, opts: { signal?: AbortSignal } = {}) => r<{ collections: Collection[] }>("GET", `${proj(pid)}/collections`, opts.signal ? { signal: opts.signal } : {}),
       create: (pid: string, name: string, parentId?: string) => r<Collection>("POST", `${proj(pid)}/collections`, { body: { name, ...(parentId ? { parentId } : {}) } }),
       update: (pid: string, cid: string, change: { name?: string; parentId?: string | null }) => r<Collection>("PATCH", `${proj(pid)}/collections/${seg(cid)}`, { body: change }),
       remove: (pid: string, cid: string) => r<{ deleted: true }>("DELETE", `${proj(pid)}/collections/${seg(cid)}`),

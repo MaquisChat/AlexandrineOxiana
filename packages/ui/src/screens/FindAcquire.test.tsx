@@ -5387,3 +5387,217 @@ describe("FindAcquire: a source whose linked file cannot be found (R470 a; FR-50
     expect((within(row(TYPED)).getByRole("button", { name: `Get a copy for this source: “${TYPED}”` }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
+
+describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
+  const UNREACHABLE = "The library service could not be reached.";
+  const count = (path: string) => calls.filter((c) => c.method === "GET" && c.path === path).length;
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const projectBox = () => screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement;
+  /** The event stream: each attempt answers by `attempt(n)` — "fail" (a network error), or a stream holding `events`. */
+  function streams(attempt: (n: number) => "fail" | Array<{ type: string; data: unknown }>) {
+    const enc = new TextEncoder();
+    let n = 0;
+    let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
+    return {
+      handler: http.get(url("/events"), () => {
+        const a = attempt(++n);
+        if (a === "fail") return HttpResponse.error();
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            ctl = c;
+            for (const e of a) c.enqueue(enc.encode(`event: ${e.type}\ndata: ${JSON.stringify(e.data)}\n\n`));
+          },
+        });
+        return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
+      }),
+      attempts: () => n,
+      /** Ends the open stream (the screen connects again by itself). */
+      drop: () => {
+        ctl?.close();
+        ctl = undefined;
+      },
+    };
+  }
+  /** A request that never answers, until released (released at the test's end whatever happens). */
+  function hang() {
+    const h = held<void>();
+    onTestFinished(() => h.release());
+    return h;
+  }
+  const showWithin = (ms: number, search = "") => render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search }} firstReadMs={ms} />);
+
+  it("reads that hang are given up after the limit: the usual alert with “Try again”; pressing it reads again and the screen fills, focus not lost", async () => {
+    useService();
+    let answer = false;
+    const gate = hang();
+    server.use(
+      http.get(url("/projects"), async () => {
+        if (!answer) await gate.p;
+        return HttpResponse.json(PROJECTS);
+      }),
+      http.get(url("/find/screen"), async () => {
+        if (!answer) await gate.p;
+        return HttpResponse.json(screenSettings);
+      }),
+    );
+    showWithin(300);
+    expect(projectBox().textContent).toBe("Reading the projects…");
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    // Both reads have been given up: the switch shows what is confirmed (off), as after a failed read.
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Check everything I have" }).getAttribute("aria-disabled")).toBeNull());
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(projectBox().textContent).toBe("No project");
+    expect(count("/projects")).toBe(1);
+    expect(count("/find/screen")).toBe(1);
+    // Nothing took focus away from where it was.
+    expect(document.activeElement).toBe(document.body);
+    answer = true;
+    const user = userEvent.setup();
+    await user.click(tryAgain()!);
+    await waitFor(() => expect(projectBox().value).toBe(PID));
+    await screen.findByRole("textbox", { name: "References" });
+    await waitFor(() => expect(tryAgain()).toBeNull());
+    expect(count("/projects")).toBe(2);
+    expect(count("/find/screen")).toBe(2);
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    // The button pressed has gone: focus is on the heading, never the page.
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Find and acquire" }));
+  });
+
+  it("an abandoned read answering late changes nothing (it was cancelled)", async () => {
+    useService();
+    const gate = hang();
+    let aborted: boolean | undefined;
+    server.use(
+      http.get(url("/projects"), async ({ request }) => {
+        await gate.p;
+        aborted = request.signal.aborted;
+        return HttpResponse.json(PROJECTS);
+      }),
+      http.get(url("/find/screen"), () => HttpResponse.json(screenSettings)),
+    );
+    showWithin(300);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    gate.release();
+    await waitFor(() => expect(aborted).toBe(true));
+    expect(projectBox().textContent).toBe("No project");
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(tryAgain()).not.toBeNull();
+  });
+
+  it("when the event stream opens anew, the reads that have not settled are made again, without a press and without an event on it", async () => {
+    useService();
+    const ev = streams((n) => (n === 1 ? "fail" : []));
+    const gate = hang();
+    let projectsN = 0;
+    let screenN = 0;
+    server.use(
+      ev.handler,
+      http.get(url("/projects"), async () => {
+        if (++projectsN === 1) await gate.p;
+        return HttpResponse.json(PROJECTS);
+      }),
+      http.get(url("/find/screen"), async () => {
+        if (++screenN === 1) await gate.p;
+        return HttpResponse.json(screenSettings);
+      }),
+    );
+    show();
+    expect(projectBox().textContent).toBe("Reading the projects…");
+    // The first stream fails; the second opens (after the screen's pause) and nothing is delivered on it.
+    await waitFor(() => expect(projectBox().value).toBe(PID), { timeout: 10_000 });
+    await screen.findByRole("textbox", { name: "References" });
+    expect(ev.attempts()).toBe(2);
+    expect(count("/projects")).toBe(2);
+    expect(count("/find/screen")).toBe(2);
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("reads that failed are made again once when the stream opens anew and delivers the library's state — not twice (R281 e and the opening fit)", async () => {
+    useService();
+    const ev = streams((n) => (n === 1 ? "fail" : [{ type: "library.state", data: { open: true, libraryId: "lib-1", name: "Thesis library", mode: "read-write" } }]));
+    let failing = true;
+    server.use(
+      ev.handler,
+      http.get(url("/projects"), () => (failing ? HttpResponse.error() : HttpResponse.json(PROJECTS))),
+      http.get(url("/find/screen"), () => (failing ? HttpResponse.error() : HttpResponse.json(screenSettings))),
+    );
+    show();
+    await screen.findByRole("button", { name: "Try again" });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    failing = false;
+    await waitFor(() => expect(projectBox().value).toBe(PID), { timeout: 10_000 });
+    await screen.findByRole("textbox", { name: "References" });
+    await waitFor(() => expect(reads()).toBe(1));
+    expect(count("/projects")).toBe(2);
+    expect(count("/find/screen")).toBe(2);
+  });
+
+  it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
+    useService();
+    const ev = streams((n) => (n === 1 ? "fail" : []));
+    server.use(
+      ev.handler,
+      http.get(url("/projects"), () => HttpResponse.error()),
+      http.get(url("/find/screen"), () => HttpResponse.error()),
+    );
+    show();
+    await screen.findByRole("button", { name: "Try again" });
+    // The second attempt opens: one more read of each, failing again.
+    await waitFor(() => expect(count("/projects")).toBe(2), { timeout: 10_000 });
+    await waitFor(() => expect(count("/find/screen")).toBe(2));
+    await screen.findByRole("button", { name: "Try again" });
+    expect(count("/projects")).toBe(2);
+    expect(count("/find/screen")).toBe(2);
+    // A third opening: one more each, and no more.
+    ev.drop();
+    await waitFor(() => expect(ev.attempts()).toBe(3), { timeout: 10_000 });
+    await waitFor(() => expect(count("/projects")).toBe(3));
+    await waitFor(() => expect(count("/find/screen")).toBe(3));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(count("/projects")).toBe(3);
+    expect(count("/find/screen")).toBe(3);
+  });
+
+  it("an ordinary opening reads each thing once, though the stream opens while the reads are out", async () => {
+    useService();
+    show();
+    await screen.findByRole("textbox", { name: "References" });
+    await waitFor(() => expect(events.open()).toBe(true));
+    await waitFor(() => expect(reads()).toBe(1));
+    expect(count("/projects")).toBe(1);
+    expect(count("/find/screen")).toBe(1);
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("a read that fails with an answer the screen already handles shows its sentence as today, with no “Try again”", async () => {
+    useService();
+    server.use(http.get(url("/projects"), () => refusal(500, "INTERNAL", "The projects could not be listed.")));
+    show();
+    await screen.findByText("The projects could not be listed.");
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("the queue's own first read that hangs is given up too, with “Try again”, which reads it again", async () => {
+    let answer = false;
+    const gate = hang();
+    useService({
+      queues: {
+        [PID]: async () => {
+          if (!answer) await gate.p;
+          return HttpResponse.json(queue([]));
+        },
+      },
+    });
+    showWithin(300, `?project=${PID}`);
+    await screen.findByRole("textbox", { name: "References" });
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByText(FIND_SCREEN_EMPTY);
+    expect(tryAgain()).toBeNull();
+    expect(reads()).toBe(2);
+  });
+});
+const FIND_SCREEN_EMPTY = "Nothing is in the queue yet.";

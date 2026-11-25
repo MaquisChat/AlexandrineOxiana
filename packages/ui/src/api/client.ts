@@ -126,7 +126,10 @@ function checkToken(token: string): void {
   }
 }
 
-const unreachable = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: "The library service could not be reached." });
+/** Said when the library service could not be reached (no answer at all). */
+export const SERVICE_UNREACHABLE = "The library service could not be reached.";
+/** The error of a request that got no answer at all (status 0, UNAVAILABLE). */
+export const unreachable = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: SERVICE_UNREACHABLE });
 /** Said of an answer that began and then broke off (FR-350); also said by the reader (R481 a). */
 export const ANSWER_CUT_OFF = "The library service's answer was cut off before it finished.";
 /** An answer that began and then broke off: the service was reached, so it is not said to be out of reach (FR-350). */
