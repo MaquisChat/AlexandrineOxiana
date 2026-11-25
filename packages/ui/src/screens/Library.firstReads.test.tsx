@@ -232,6 +232,26 @@ describe("Library: an answer clears a give-up; a project switch clears the alert
   });
 });
 
+describe("Library: one sentence at a time (FR-756 M1, R602)", () => {
+  it("one read given up and another failed with no answer: “could not be reached” alone, with one “Try again”", async () => {
+    const gate = hang();
+    server.use(
+      http.get(url("/projects/:id/tags"), async () => {
+        await gate;
+        return HttpResponse.json({ tags: [], workspaceTags: [] });
+      }),
+      // Fails at once; the tags are given up at the limit: both outcomes are then on screen together.
+      http.get(url("/projects/:id/sources"), () => HttpResponse.error()),
+      ...libraryHandlers(),
+    );
+    show(300);
+    await screen.findByRole("button", { name: "Try again" });
+    await new Promise((r) => setTimeout(r, 700));
+    expect(alerts()).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+  });
+});
+
 describe("Library: when the event stream opens anew, what has not been read is read again (FR-756 B)", () => {
   it("a projects read still out (it may never settle) is made again when the stream opens anew after it failed — no press, no event needed", async () => {
     const c = counting();

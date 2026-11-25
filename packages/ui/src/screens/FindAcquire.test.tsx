@@ -5576,6 +5576,58 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     expect(count("/find/screen")).toBe(3);
   });
 
+  it("R602 M1: the projects failed with no answer and the settings given up: “could not be reached” alone, with one “Try again”", async () => {
+    useService();
+    const gate = hang();
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.error()),
+      http.get(url("/find/screen"), async () => {
+        await gate;
+        return HttpResponse.json(screenSettings);
+      }),
+    );
+    showWithin(300);
+    await screen.findByRole("button", { name: "Try again" });
+    await new Promise((r) => setTimeout(r, 600));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+  });
+
+  it("R602 M1: the settings given up and the queue failed with no answer: “could not be reached” alone, with one “Try again”", async () => {
+    useService();
+    const gate = hang();
+    server.use(
+      http.get(url("/find/screen"), async () => {
+        await gate;
+        return HttpResponse.json(screenSettings);
+      }),
+      http.get(url("/projects/:id/find"), () => HttpResponse.error()),
+    );
+    showWithin(300, `?project=${PID}`);
+    await waitFor(() => expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]), { timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 600));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+  });
+
+  it("R602 M1: every unanswered read given up: “did not answer in time”, once", async () => {
+    useService();
+    const gate = hang();
+    server.use(
+      http.get(url("/projects"), async () => {
+        await gate;
+        return HttpResponse.json(PROJECTS);
+      }),
+      http.get(url("/find/screen"), async () => {
+        await gate;
+        return HttpResponse.json(screenSettings);
+      }),
+    );
+    showWithin(300);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+  });
+
   it("an ordinary opening reads each thing once, though the stream opens while the reads are out", async () => {
     useService();
     show();

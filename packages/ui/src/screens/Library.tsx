@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, IndexStatus, ProjectSummary, SourcePage, Tag } from "../api/library";
 import { errorText, isProjectLocked, knownProfiles } from "../api/library";
-import { ApiClientError, STREAM_OPEN_TIMEOUT_MS } from "../api/client";
+import { ApiClientError, SERVICE_NO_ANSWER, STREAM_OPEN_TIMEOUT_MS } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
@@ -232,6 +232,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /** "Try again" was pressed: once nothing is left unanswered, focus goes to the main pane if it was lost. */
   const triedAgain = useRef(false);
   const showTryAgain = Object.keys(unanswered).length > 0;
+  /**
+   * R602 M1: one sentence at a time. A read that could not be made at all explains one that got no answer in time, so
+   * "could not be reached" is said alone where any read failed so; "did not answer in time" where every one was given up.
+   */
+  const unansweredText = showTryAgain ? (Object.values(unanswered).find((t) => t !== SERVICE_NO_ANSWER) ?? SERVICE_NO_ANSWER) : undefined;
   useEffect(() => {
     if (showTryAgain || !triedAgain.current) return;
     triedAgain.current = false;
@@ -1037,11 +1042,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           </p>
         )}
         {/* FR-756 B: a read that got no answer says so (each sentence once) and is offered again. */}
-        {[...new Set(Object.values(unanswered))].map((text) => (
-          <p key={text} role="alert" className="ao-error">
-            {text}
+        {unansweredText && (
+          <p role="alert" className="ao-error">
+            {unansweredText}
           </p>
-        ))}
+        )}
         {showTryAgain && (
           <p>
             <button
