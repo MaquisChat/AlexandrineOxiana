@@ -268,14 +268,14 @@ describe("job journal", () => {
     await appendFile(journalPath(lib.root, project.folder), "foreign-line\n");
     const before = await readJobJournal(lib.root, project.folder, project.id, key);
     expect(before.lines).toBe(121);
-    expect(await compactJobJournal(lib.root, project.folder, project.id, key)).toBe(true);
+    expect(await compactJobJournal(lib.root, project.folder, project.id, key, undefined, Date.parse(at))).toBe(true);
     const after = await readJobJournal(lib.root, project.folder, project.id, key);
     expect(after.lines).toBe(41);
     expect(after.unreadable).toEqual(["foreign-line"]);
     expect([...after.records.values()].sort((a, b) => a.id.localeCompare(b.id))).toEqual(
       [...before.records.values()].sort((a, b) => a.id.localeCompare(b.id)),
     );
-    expect(await compactJobJournal(lib.root, project.folder, project.id, key)).toBe(false); // nothing to gain
+    expect(await compactJobJournal(lib.root, project.folder, project.id, key, undefined, Date.parse(at))).toBe(false); // nothing to gain
   });
 
   it("a job parameter named like a secret is refused and nothing is recorded", async () => {
