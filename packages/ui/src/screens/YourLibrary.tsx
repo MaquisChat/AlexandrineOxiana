@@ -304,10 +304,12 @@ export function YourLibrary({ client, firstReadMs = FIRST_READ_TIMEOUT_MS }: { c
     // FR-756 (R586 M5): a read that never settles is given up after `firstReadMs` (its request cancelled) and says
     // "The library service did not answer in time."; one that fails says its sentence as before.
     let r: YourLibraryResponse;
+    // R617 N1: the signal is taken before the await and that one is checked: `leaving()` after a leave is a new one.
+    const left = leaving();
     try {
-      r = await readWithin((signal) => api.read({ signal }), firstReadMs, leaving());
+      r = await readWithin((signal) => api.read({ signal }), firstReadMs, left);
     } catch (err) {
-      if (leaving().aborted) return;
+      if (left.aborted) return;
       if (!confirmedRef.current && seq >= applied.current) {
         setLoadError(sentenceOf(err, T.loadFailed));
         setLoadUnreachable(isUnreachable(err));
