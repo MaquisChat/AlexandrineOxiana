@@ -5,10 +5,26 @@
  */
 import type { FastifyInstance } from "fastify";
 import { isId, type SourceDraft } from "@ao/core";
-import { FindProjectStoppedError, FindRunnerClosedError, HeldFileSourceGoneError, ReviewEntryDecidedError, reviewCauseOf, type ListedReviewEntry, type ReviewDecision, type ReviewPatch } from "@ao/library";
+import {
+  FindProjectStoppedError,
+  FindRunnerClosedError,
+  HeldFileSourceGoneError,
+  NotFoundError,
+  ReviewEntryDecidedError,
+  lookUpNow,
+  lookUpStateOf,
+  reviewCauseOf,
+  type ListedReviewEntry,
+  type LookUpAgainResult,
+  type LookUpState,
+  type LookUpView,
+  type ReviewDecision,
+  type ReviewPatch,
+} from "@ao/library";
 import {
   FIND_ROUTE_TEXT,
   HELD_FILE_DECISIONS,
+  LIBRARY_CLOSED_TEXT,
   PROJECT_REVIEW_PAGE_MAX,
   REVIEW_DECISION_ACTIONS,
   WITHDRAWAL_REASON_MAX,
@@ -22,8 +38,12 @@ import {
   type ReviewDecisionAction,
   type ReviewDraft,
   type ReviewEntryDecision,
-
   type ReviewEntryPatch,
+  type ReviewLookUp,
+  type ReviewLookUpAgainRequest,
+  type ReviewLookUpAgainResponse,
+  type ReviewLookUpOutcome,
+  type ReviewLookUpState,
   type HeldFileDecision,
   type HeldFileDecisionRequest,
   type HeldFileDecisionResponse,
@@ -33,10 +53,52 @@ import {
   type WithdrawalReviewedResponse,
 } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
-import { bodyAs, intParam, optObj, paramsOf, projectParam, queryOf, str, strArray, type BodyOf, type Ctx, type Same } from "./util.js";
+import { heldBy, lookupHeldUntil, type HeldUntil } from "../look-up-holds.js";
+import { bodyAs, intParam, optObj, optStr, paramsOf, projectParam, queryOf, str, strArray, type BodyOf, type Ctx, type Same } from "./util.js";
+
+
+/**
+ * Decision 31 (c) (R566 8, R577 iii): what the page needs to offer "Look up again", from the entry's left-out lookups —
+ * the state (the library's `lookUpStateOf`, with every further state true of it), the tries, whether the researcher's
+ * act may send now and, when not yet, the earliest time it may. R585 point 5, R592: "may it send now" and its time are
+ * the library's `lookUpNow` — the one rule the act itself applies (a time only a wrong clock could have written counts as
+ * passed); the view's own `notBefore` is never passed on. R600 I1: `lookUpNow` knows only the entry, the service knows
+ * the lookup client's holds — as the act does, a lookup whose every service is held waits for the latest of their holds,
+ * and the entry may send now only while some lookup it would ask is not held. This is the ONE place the page's "now"
+ * and time are worked out. Never a title or an identifier. Absent when nothing was left out.
+ */
+function lookUpOut(e: ListedReviewEntry, now: number, held: HeldUntil): ReviewLookUp | undefined {
+  const v = lookUpStateOf(e);
+  if (!v) return undefined;
+  const at = new Date(now);
+  let { canLookUpNow, notBefore } = lookUpNow(e, at);
+  const left = e.leftOut ?? [];
+  if (canLookUpNow) {
+    const askable = left.filter((l) => lookUpNow({ leftOut: [l] }, at).canLookUpNow);
+    const holds = askable.map((l) => lookupHeldUntil(l, held));
+    if (holds.every((h) => h !== undefined)) {
+      const rest = lookUpNow({ leftOut: left.filter((l) => !askable.includes(l)) }, at).notBefore;
+      canLookUpNow = false;
+      notBefore = new Date(Math.min(...(holds as number[]), ...(rest ? [Date.parse(rest)] : []))).toISOString();
+    }
+  }
+  return {
+    state: v.state,
+    tries: v.tries,
+    canLookUpNow,
+    ...(notBefore ? { notBefore } : {}),
+    // R585 M3, R592: every further state true of the entry, in the library's order, and the given-up lookups' tries.
+    ...(v.also?.length ? { also: [...v.also] } : {}),
+    ...(v.gaveUpTries !== undefined ? { gaveUpTries: v.gaveUpTries } : {}),
+    // R600 I3: a lookup that failed outright is still unanswered (whatever the state word), so the page says it. R608 n1:
+    // only while it has no outcome — once the rules refuse it ("not-allowed"), the rules' sentence alone is true.
+    ...(left.some((l) => l.why === "failed" && !l.outcome) ? { failed: true as const } : {}),
+  };
+}
 
 /** What the queue sends of an entry (only pending entries are listed). */
-function entryOut(e: ListedReviewEntry): ProjectReviewEntry {
+function entryOut(e: ListedReviewEntry, now: number, held: HeldUntil): ProjectReviewEntry {
+  const lookUp = lookUpOut(e, now, held);
   // The cause as the library reads it (recorded, or inferred for an older entry: reviewCauseOf, R176 3).
   const read = reviewCauseOf(e);
   // A held file's cause is sent without the file's place in the project (F11): the screen needs only the entry.
@@ -60,6 +122,7 @@ function entryOut(e: ListedReviewEntry): ProjectReviewEntry {
     ...(e.duplicateOf ? { duplicateOf: e.duplicateOf } : {}),
     ...(e.hints?.length ? { hints: e.hints } : {}),
     ...(e.heldFile ? { heldFile: heldFileOut(e.heldFile) } : {}),
+    ...(lookUp ? { lookUp } : {}),
   };
 }
 
@@ -82,13 +145,16 @@ true satisfies Same<ReviewDecision["action"], ReviewDecisionAction>;
 true satisfies Same<Exclude<ReviewDecision, { action: "accept" }>, Exclude<ReviewEntryDecision, { action: "accept" }>>;
 true satisfies Same<Omit<ReviewPatch, "type">, Omit<ReviewEntryPatch, "type">>;
 true satisfies Same<keyof ReviewPatch, keyof ReviewEntryPatch>;
+// Decision 31 (c): the look-up states the page is told are the library's.
+true satisfies Same<LookUpState, ReviewLookUpState>;
+true satisfies Same<NonNullable<LookUpView["also"]>, NonNullable<ReviewLookUp["also"]>>;
 // Every key of the accept decision's draft is one the library's SourceDraft reads: the library skips
 // a key it does not know, so a renamed key would drop the researcher's correction silently (I2).
 true satisfies ([keyof ReviewDraft] extends [keyof SourceDraft] ? true : false);
 const ACTIONS: ReadonlySet<string> = new Set(REVIEW_DECISION_ACTIONS);
 
 /** The project of a review item: named in the body (review ids are per project). */
-function projectOf(ctx: Ctx, b: BodyOf<ReviewDecideRequest | ReviewBulkEditRequest | WithdrawalReviewedRequest | HeldFileDecisionRequest>): string {
+function projectOf(ctx: Ctx, b: BodyOf<ReviewDecideRequest | ReviewBulkEditRequest | WithdrawalReviewedRequest | HeldFileDecisionRequest | ReviewLookUpAgainRequest>): string {
   const s = ctx.state.requireWritable();
   const projectId = str(b, "projectId", 64);
   if (!s.repo.listProjects().some((p) => p.id === projectId)) throw badRequest("That project is not in this library.");
@@ -110,7 +176,8 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
     if (source !== undefined && !isId(source)) throw badRequest('"source" must be a source id.');
     if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
     const r = await s.bulk.listProjectReview(projectId, { offset, limit, ...(source ? { sourceId: source } : {}) });
-    return { items: r.items.map(entryOut), total: r.total, offset, limit };
+    const now = state.now().getTime();
+    return { items: r.items.map((e) => entryOut(e, now, heldBy(s.http))), total: r.total, offset, limit };
   });
 
   app.post("/review/:itemId/decide", async (req): Promise<ReviewDecideResponse> => {
@@ -168,6 +235,35 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
     return { decided: true };
   });
 
+  // Decision 31 (c), "Look up again" (R566, R577): the researcher's act, its OWN route (not a decision act: the older
+  // build must not meet a new act in the list it knows). Only the entry's left-out lookups are asked, of only the services
+  // left out; what is found is appended to the entry's candidates; nothing of the record changes. Before the service's
+  // named time nothing is sent and the answer says "not yet" (200: the act was understood and the entry is answered as
+  // it stands, like the other answers that are not refusals). A locked project is refused before anything is read.
+  app.post("/review/:itemId/look-up-again", async (req): Promise<ReviewLookUpAgainResponse> => {
+    const s = state.requireWritable();
+    const b = bodyAs<ReviewLookUpAgainRequest>(req);
+    const projectId = projectOf(ctx, b);
+    const itemId = paramsOf(req).itemId ?? "";
+    if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
+    const r = await state.lookUpAgainByHand(s, projectId, itemId);
+    const outcome = lookUpOutcome(r, itemId);
+    // The entry as the queue lists it now (decided or its source removed meanwhile: it is no longer waiting).
+    // R600 m4: only the entry's own source is read — the one the act names, else the one the page named; the whole
+    // queue only when the page named none, or a source that is not the entry's.
+    const hinted = optStr(b, "sourceId", 64);
+    const find = async (q: { sourceId?: string }) => (await s.bulk.listProjectReview(projectId, q)).items.find((e) => e.id === itemId);
+    const listed = r.done ? await find({ sourceId: r.sourceId }) : ((hinted && isId(hinted) ? await find({ sourceId: hinted }) : undefined) ?? (await find({})));
+    if (!listed) throw new ApiError(409, "CONFLICT", ALREADY_REVIEWED);
+    const entry = entryOut(listed, state.now().getTime(), heldBy(s.http));
+    // Asked to wait again: the time the act may send from is `lookUpNow`'s (R592), never the view's own.
+    if (outcome.kind === "asked-to-wait" && entry.lookUp?.notBefore) outcome.notBefore = entry.lookUp.notBefore;
+    // Not yet: the time is the one the act met (the service's, or the lookup client's own hold of it).
+    if (outcome.kind === "not-yet") entry.lookUp = { ...(entry.lookUp ?? { state: "waiting", tries: 0 }), canLookUpNow: false, notBefore: outcome.notBefore };
+    state.publishState();
+    return { outcome, entry };
+  });
+
   app.post("/review/bulk-edit", async (req): Promise<ReviewBulkEditResponse> => {
     const s = state.requireWritable();
     const b = bodyAs<ReviewBulkEditRequest>(req);
@@ -178,4 +274,68 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
     await s.bulk.bulkEditReview(projectId, itemIds, patch as ReviewPatch);
     return { edited: itemIds.length };
   });
+}
+
+/** The decide route's own sentence for an entry no longer waiting (BatchRefusedError "finished"). */
+const ALREADY_REVIEWED = "This item has already been reviewed.";
+
+/** What the researcher's look-up did, or the refusal the other review routes give for the same state. */
+function lookUpOutcome(r: LookUpAgainResult, itemId: string): ReviewLookUpOutcome {
+  if (r.done) {
+    // `sent` (how many requests left, R585 M2) is not passed on: the page has no use for the number.
+    if (r.found > 0) return { kind: "found", found: r.found };
+    // Nothing was asked: the rules no longer allow any of what was left to ask.
+    if (r.asked === 0 && r.notAllowed > 0) return { kind: "not-allowed" };
+    const state = r.state?.state;
+    switch (state) {
+      case "waiting":
+      case "gave-up":
+        // Its time is filled in by the route from the entry's `lookUpNow` (R592).
+        return { kind: "asked-to-wait" };
+      case "failed":
+        return { kind: "failed" };
+      // R592 (3): a service the rules denied at send time leaves the lookup "not allowed" (the entry's own state).
+      case "not-allowed":
+        return { kind: "not-allowed" };
+      case "found": // only matches already listed: no new one
+      case "nothing":
+      case undefined:
+        return { kind: "nothing" };
+      default:
+        return unknownValue(state);
+    }
+  }
+  switch (r.why) {
+    case "not-yet":
+      return { kind: "not-yet", notBefore: r.notBefore };
+    case "nothing-to-look-up":
+      return { kind: "nothing-to-look-up" };
+    // R585 (3), R592: a look-up of this entry is already under way (nothing audited, sent or written): the entry is
+    // answered as it stands, never as an error.
+    case "under-way":
+      return { kind: "under-way" };
+    case "not-found":
+      throw new NotFoundError("Review item", itemId);
+    case "decided":
+    case "source-removed":
+    case "dropped":
+      throw new ApiError(409, "CONFLICT", ALREADY_REVIEWED);
+    case "locked":
+      throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
+    case "read-only":
+      throw new ApiError(409, "READ_ONLY", "This library is open read-only, so nothing can be changed.");
+    case "closing":
+    case "cancelled":
+      throw new ApiError(409, "LIBRARY_CLOSED", LIBRARY_CLOSED_TEXT);
+    case "not-due":
+      // Only the automatic pass is answered so; the researcher's act never is.
+      return { kind: "nothing-to-look-up" };
+    default:
+      return unknownValue(r);
+  }
+}
+
+/** An exhaustive `switch`'s end: a value the library adds later fails the typecheck here. */
+function unknownValue(v: never): never {
+  throw new Error(`Unknown look-up value: ${JSON.stringify(v)}`);
 }

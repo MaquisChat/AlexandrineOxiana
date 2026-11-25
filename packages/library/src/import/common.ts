@@ -9,6 +9,7 @@ import { nonBlank, primary, type DupKey, type PolicyDecision, type PolicyRequest
 import { LOOKUP_WAITING_TEXT } from "@ao/shared";
 import type { ReviewInput } from "../repo/review.js";
 import { projectPolicy, type Repo } from "../repo/repo.js";
+import { isAskedToWait } from "./look-up-state.js";
 import { AUTO_ACCEPT_THRESHOLD, type Resolution } from "./resolve.js";
 
 /**
@@ -121,7 +122,7 @@ export function candidateKey(r: Resolution, sha256s: string[]): DupKey {
  * Whether a resolved item goes to review (a likely duplicate, below the threshold, or its
  * verification needs review) and, if so, its review entry. Decision 31 (b), R556 (2) iii, iv: an item in review whose
  * resolution left lookups out (their services asked to wait) says so first after a likely duplicate (ITEM_REASONS.waiting)
- * and keeps what was left out (`leftOut`). An item not in review shows nothing of it. Only the attach and watched folders
+ * and keeps what was left out (`leftOut`; decision 31 c: with the lookups that failed outright, which add no sentence). An item not in review shows nothing of it. Only the attach and watched folders
  * leave lookups out; Bulk Import's resolutions never have any.
  */
 export function reviewFor(
@@ -134,7 +135,8 @@ export function reviewFor(
   const fields = Object.fromEntries(
     Object.entries(r.verification.fields).filter(([, v]) => v.status === "conflict" || v.status === "unverified").map(([k, v]) => [k, v.status]),
   );
-  const waiting = r.leftOut.length > 0;
+  // Decision 31 (c), R577 iv: a lookup that failed outright is kept (`why: "failed"`) but never makes the item read as waiting.
+  const waiting = r.leftOut.some(isAskedToWait);
   const reasons = [
     ...(dup ? [ITEM_REASONS.likelyDuplicate] : []),
     ...(waiting ? [ITEM_REASONS.waiting] : []),
@@ -150,7 +152,7 @@ export function reviewFor(
     candidates: r.candidates,
     ...(dup ? { duplicateOf: { sourceId: dup.sourceId, reason: dup.reason } } : {}),
     ...(r.identifierHints.length ? { hints: r.identifierHints } : {}),
-    ...(waiting ? { leftOut: r.leftOut } : {}),
+    ...(r.leftOut.length ? { leftOut: r.leftOut } : {}),
   };
 }
 

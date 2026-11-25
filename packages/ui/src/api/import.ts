@@ -11,10 +11,10 @@
 import { effectivePolicy } from "@ao/core/governance/merge";
 import { parseGovernance } from "@ao/core/governance/schema";
 import { isId } from "@ao/core/ids";
-import { PICTURE_MAX_BYTES, type GovernanceReadability, type MultiTextValue, type ProjectReviewPage, type ReviewBulkEditRequest, type ReviewBulkEditResponse, type ReviewCause, type ReviewDecideRequest, type ReviewDecideResponse, type ReviewEntryDecision, type ReviewEntryPatch, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse, type ZoteroSyncUndoNote } from "@ao/shared";
+import { PICTURE_MAX_BYTES, type GovernanceReadability, type MultiTextValue, type ProjectReviewPage, type ReviewBulkEditRequest, type ReviewBulkEditResponse, type ReviewCause, type ReviewDecideRequest, type ReviewDecideResponse, type ReviewEntryDecision, type ReviewEntryPatch, type ReviewGroup, type ReviewLookUp, type ReviewLookUpAgainRequest, type ReviewLookUpAgainResponse, type ReviewLookUpOutcome, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse, type ZoteroSyncUndoNote } from "@ao/shared";
 import type { ApiClient } from "./client";
 
-export type { ProjectReviewPage, ReviewCause, ReviewGroup, WithdrawalReviewedResponse, ZoteroDataFolder };
+export type { ProjectReviewPage, ReviewCause, ReviewGroup, ReviewLookUp, ReviewLookUpOutcome, WithdrawalReviewedResponse, ZoteroDataFolder };
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -202,6 +202,8 @@ export interface ReviewItem {
   group?: ReviewGroup;
   /** Verification entries: what queued it (R176 3). */
   cause?: ReviewCause;
+  /** Decision 31 (c): an import entry whose lookups were left out — what "Look up again" needs (no title, no identifier). */
+  lookUp?: ReviewLookUp;
 }
 
 /** A decision on an import entry, and a bulk edit's changes (@ao/shared). */
@@ -390,6 +392,18 @@ export function importApi(client: ApiClient) {
       pid(projectId);
       const body: ReviewDecideRequest = { projectId, decision };
       return r<ReviewDecideResponse>("POST", `/review/${seg(itemId)}/decide`, { body });
+    },
+    /**
+     * Decision 31 (c), "Look up again" (R577): the entry's left-out lookups asked again (or "not yet", nothing sent);
+     * answered with what happened and the entry as the queue lists it now (its candidates narrowed as in `projectReview`).
+     */
+    lookUpAgain: async (projectId: string, itemId: string, sourceId?: string): Promise<{ outcome: ReviewLookUpOutcome; entry: ReviewItem }> => {
+      pid(projectId);
+      // R600 m4: the entry's source, so that the answer reads only that source's entries.
+      const body: ReviewLookUpAgainRequest = { projectId, ...(sourceId ? { sourceId } : {}) };
+      const res = await r<ReviewLookUpAgainResponse>("POST", `/review/${seg(itemId)}/look-up-again`, { body });
+      const { candidates, ...e } = res.entry;
+      return { outcome: res.outcome, entry: { ...e, ...(candidates ? { candidates: candidates as Candidate[] } : {}) } };
     },
     /** "Reviewed after the withdrawal" (R176 2): the reason is required and sent exactly as typed. */
     reviewedAfterWithdrawal: (projectId: string, itemId: string, reason: string) => {
