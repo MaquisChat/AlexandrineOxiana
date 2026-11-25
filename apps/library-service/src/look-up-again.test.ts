@@ -674,6 +674,28 @@ describe("the queue's entry carries `lookUp` (R566 8)", () => {
   });
 });
 
+/** Holds the lookup client's FIRST request until released (released at the test's end whatever its end). */
+function holdFirstRequest() {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let reached!: () => void;
+  const atGate = new Promise<void>((r) => (reached = r));
+  const orig = HttpClient.prototype.getJson;
+  let n = 0;
+  HttpClient.prototype.getJson = async function (this: HttpClient, ...a: Parameters<HttpClient["getJson"]>) {
+    if (++n === 1) {
+      reached();
+      await gate;
+    }
+    return orig.apply(this, a);
+  } as HttpClient["getJson"];
+  onTestFinished(() => {
+    HttpClient.prototype.getJson = orig;
+    release();
+  });
+  return { atGate, release: () => release() };
+}
+
 describe("joined to the fixed engine (R592)", () => {
   it("point 2 (R585 point 5): a kept time only a wrong clock could have written (years ahead) is offered NOW, and the press sends", async () => {
     await start();
@@ -737,28 +759,6 @@ describe("joined to the fixed engine (R592)", () => {
     expect(bySource(items, a!).lookUp).toEqual({ state: "waiting", tries: 0, canLookUpNow: false, notBefore: expect.any(String), also: ["gave-up"], gaveUpTries: 5 });
     expect(bySource(items, b!).lookUp).toEqual({ state: "gave-up", tries: 5, canLookUpNow: false, notBefore: expect.any(String), also: ["not-allowed"] });
   });
-
-  /** Holds the lookup client's FIRST request until released (released at the test's end whatever its end). */
-  function holdFirstRequest() {
-    let release!: () => void;
-    const gate = new Promise<void>((r) => (release = r));
-    let reached!: () => void;
-    const atGate = new Promise<void>((r) => (reached = r));
-    const orig = HttpClient.prototype.getJson;
-    let n = 0;
-    HttpClient.prototype.getJson = async function (this: HttpClient, ...a: Parameters<HttpClient["getJson"]>) {
-      if (++n === 1) {
-        reached();
-        await gate;
-      }
-      return orig.apply(this, a);
-    } as HttpClient["getJson"];
-    onTestFinished(() => {
-      HttpClient.prototype.getJson = orig;
-      release();
-    });
-    return { atGate, release: () => release() };
-  }
 
   it("point 5: a press during the automatic pass's request for the same entry answers \"under way\" at once and sends nothing more", { timeout: 20_000 }, async () => {
     await start();
@@ -845,5 +845,21 @@ describe("fix round (R600)", () => {
     expect(sent).toHaveLength(1);
     const third = bySource(await queue(lib.pid), lib.sources[2]!);
     expect(third.lookUp).toMatchObject({ canLookUpNow: false, notBefore: expect.any(String) });
+  });
+
+  it("I2 (probe A3): a project locked while its look-up's request is in the air keeps no sensitive answer in memory", { timeout: 30_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(2, { encrypted: true });
+    answer = () => NO_RESULTS;
+    await reopen(lib, 16 * MIN);
+    const held = holdFirstRequest();
+    expect((await call({ method: "POST", url: `/projects/${lib.pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    await held.atGate;
+    expect((await call({ method: "POST", url: `/projects/${lib.pid}/lock` })).status).toBe(200);
+    held.release();
+    await svc!.state.idle();
+    expect(sent).toEqual([`api.openalex.org ${titleOf(1)} Souza`]);
+    const memory = (svc!.state.session!.http as unknown as { memory: Map<string, { sensitive: boolean }> }).memory;
+    expect([...memory.values()].filter((e) => e.sensitive)).toHaveLength(0);
   });
 });

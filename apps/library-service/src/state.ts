@@ -2116,6 +2116,16 @@ export class ServiceState {
         return await fn();
       } finally {
         this.lookUpRunning.delete(key);
+        // R600 I2 (R30, R50): locked while the look-up was in the air — its late answer was kept as sensitive after the
+        // lock route's purge: nothing looked up for an encrypted project stays in memory once it is locked.
+        const s = this.session;
+        if (s) {
+          try {
+            if (s.repo.getProject(projectId).encryption.enabled && !s.repo.isUnlocked(projectId)) s.http.purgeSensitive();
+          } catch {
+            s.http.purgeSensitive(); // the project cannot be read (removed meanwhile): nothing of it is kept either
+          }
+        }
       }
     };
     const run = this.lookUpTurn.then(go, go);
