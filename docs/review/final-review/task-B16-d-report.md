@@ -75,3 +75,28 @@ No consumer changed what a person sees. One case: in the run step, the try count
 - ×20: the hand-off 20/20; WatchedFolders, ZoteroSync, TranscriptViewer, reader, ImportWizard 20/20 each; FindAcquire 18/20 → after making the assertion ≥ 2 attempts (more than two under load), 20/20; Capture 19/20 under load (no log kept), then 20/20 with logging; MissingFiles D3 20/20; integrity-progress 20/20
 - typecheck @ao/library, @ao/library-service, @ao/ui, @ao/cli: 0 errors; lint:css and lint:colours clean
 - Chromium (UI built): capture, watched-folders, zotero-sync, import specs: 29 passed. No spec file was touched.
+
+## Fix round (after the review)
+
+`b16-d-streams` e1806fe → 9fb7369, eight commits, not pushed.
+
+- **I1** (85cc7e0, tests only): the request is kept and `.signal` read when asserted. Places: `test/service.ts` (`sseAttempts`, `asksInTurn`); governance `attempts`, plus its D2 test; `routes/library`, `reader.firstReads` ×3; `Reader.test` ×4; Capture/ImportWizard `holding`; TranscriptViewer.firstReads ×2; MissingFiles `ndjsonCheck`; Library.firstReads ×2, WatchedFolders, ZoteroSync side reads; Library.zotero; YourLibrary; SearchSources; SourceDetail.firstReads; governance.firstReads ×2; ReviewQueue.firstReads ×3. Requests are also kept where an abort listener counts: `test/importService`, `captureService`, `msw-transcripts`, FindAcquire FR-558, ReviewQueue held-file.
+- **M1** (646f67f): `readerHandoff.ts:110–111`, the limit removed, with a reason; its test removed. The options test asserts no `quietWithinMs`; it failed first.
+- **M4** (e21b664): `governance.tsx:101–109`. Test: six live listeners became one; it failed first. `routes/reader.tsx:330` has the same leak; it was not changed.
+- **I2** (e1edf74): `MissingFiles.tsx:44,121–128`. Test: a cut-off answer, then "Check again"; it failed first.
+- **M3** (c8a77f1): `MissingFiles.tsx:24,47–60,139–143`. The visible line is no longer live; a hidden status carries it at most every 5 s. Fake-clock test; it failed first.
+- **M6** (8f24841): the fake answer is NDJSON. The test now sees the file listed; it failed first.
+- **M2** (9fb7369): `reconnect.ts:79–112,570,633`. Two tests, both failed first.
+- **M5: NEEDS A RULING, not built.** Resetting `tries` on open breaks `ImportWizard.test` R115 I5 ("closes after connecting… not on Starting…"): a stream that opens and closes at once would loop forever. (a) Reset only after a silence give-up or an event (recommended). (b) Reset on open and change that test.
+
+**Certain (answer 4, 1c3b7cd):**
+- client "keep-alive", Governance silence, Governance M4, the hand-off: fake clock.
+- client "silent": waits for the rejection; its limit is a lower bound.
+- Governance drop and never-opens: the reopened stream rests (60 s limits).
+- Library, WatchedFolders, FindAcquire, Zotero, reader, transcript, Capture: they wait for "≥N tries and the first cancelled". This only grows, and the limit is a lower bound.
+- Import run step: its second try is held unopened, so the step rests.
+- MissingFiles: the test drives each line.
+
+**Loaded (4 busy loops, killed; nothing running), 30/30 each:** client, governance, Library.firstReads, WatchedFolders, FindAcquire, ZoteroSync (resumed at run 17 after a time limit, no failure), Capture/ImportWizard/TranscriptViewer/reader firstReads, readerHandoff, MissingFiles, integrity-progress.
+
+**Other runs:** touched files pass; typecheck ui/library/service 0 errors; lint:css and lint:colours clean.
