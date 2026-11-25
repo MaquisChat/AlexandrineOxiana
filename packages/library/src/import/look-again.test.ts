@@ -547,7 +547,8 @@ describe("closing, audit and sealing (R247 c, R546, R566 6, R55)", () => {
     for (const x of send) expect(Object.keys(x.details!).sort()).toEqual(["by", "lookups", "op", "reviewEntry", "services"]);
     expect(send.map((x) => x.details!.services)).toEqual([["crossref"], ["openalex"]]);
     const { txn: _t, changes: _c, ...rest } = write[0]!.details as Record<string, unknown>;
-    expect(Object.keys(rest).sort()).toEqual(["by", "candidatesAdded", "lookups", "op", "reviewEntry", "state"]);
+    expect(Object.keys(rest).sort()).toEqual(["by", "candidatesAdded", "lookups", "op", "reviewEntry", "sent", "state"]); // R585 M2: `sent`
+    expect(rest.sent).toBe(2);
     expect(write[0]!.entity).toEqual({ type: "source", id: e!.sourceId });
   });
 
@@ -765,5 +766,49 @@ describe("decision 31 (c), R585 M8: the send is audited per service, through the
     const end = await entry(p, e!.id);
     expect(end.leftOut!.map((l) => l.outcome)).toEqual(["not-allowed", "not-allowed"]);
     expect(end.leftOut![0]!.services).toEqual(["openalex"]); // the service still to be asked; Crossref answered
+  });
+});
+
+describe("decision 31 (c), R585 M2: what was really sent", () => {
+  it("P-H: five automatic look-ups whose request the client's hold left out (another call was told to wait between the send's audit and the request): no try is counted, never \"gave-up\"; each outcome line says sent: 0", async () => {
+    const p = await project();
+    const http = client();
+    const raw = http.getJson.bind(http);
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    now += 16 * MIN;
+    for (let k = 0; k < 6; k++) {
+      sent = [];
+      const hold = holdRequests(http, "before");
+      const run = lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) });
+      await hold.atGate; // the send is audited; before the request goes another call is told to wait
+      await expect(raw(`https://api.openalex.org/works?search=other${k}`, { cacheKey: `other${k}`, sensitive: false, askedToWait: "leave-out" })).rejects.toThrow();
+      expect(sent).toHaveLength(1); // that other call's request
+      hold.release();
+      expect(await run).toMatchObject({ done: true, sent: 0, state: { state: "waiting" } });
+      expect(sent).toHaveLength(1); // the look-up's own request never left
+      now += 2 * MIN;
+    }
+    const end = await entry(p, e!.id);
+    expect(end.leftOut![0]!.tries).toBeUndefined();
+    expect(end.leftOut![0]!.lastTriedAt).toBeUndefined();
+    expect(end.leftOut![0]!.outcome).toBeUndefined();
+    expect(end.reasons[0]).toBe(LOOKUP_WAITING_TEXT);
+    const outcomes = (await auditOf(p)).events.filter((x) => x.details?.op === LOOK_UP_AGAIN_OP);
+    expect(outcomes).toHaveLength(6);
+    for (const x of outcomes) expect(x.details).toMatchObject({ sent: 0, state: "waiting" });
+  });
+
+  it("a request that left is counted: the outcome line says how many left (sent), and the try is counted", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    now += 16 * MIN;
+    answers["api.openalex.org"] = () => NO_RESULTS;
+    expect(await lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) })).toMatchObject({ done: true, sent: 1, state: { state: "nothing" } });
+    expect((await entry(p, e!.id)).leftOut![0]).toMatchObject({ tries: 1, lastTriedAt: new Date(now).toISOString(), outcome: "nothing" });
+    const [line] = (await auditOf(p)).events.filter((x) => x.details?.op === LOOK_UP_AGAIN_OP);
+    expect(line!.details).toMatchObject({ sent: 1 });
   });
 });

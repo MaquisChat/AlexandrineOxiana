@@ -47,6 +47,8 @@ export interface LookupContext {
    * watched folder's bringing-in; absent, every lookup waits as before (Bulk Import, Zotero, Find and acquire).
    */
   askedToWait?: "leave-out";
+  /** Decision 31 (c), R585 M2: passed to every request of this context (`GetOptions.onSend`): told when a request leaves. */
+  onSend?: () => void;
 }
 
 export type Provider = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit";
@@ -55,9 +57,10 @@ export type Provider = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit
 export const isSensitive = (ctx: LookupContext): boolean => ctx.sensitive !== false;
 
 /** The request options every provider passes from its context: sensitivity (R52) and the rule on waits (R556 2). */
-export const requestRules = (ctx: LookupContext): { sensitive: boolean; askedToWait?: "leave-out" } => ({
+export const requestRules = (ctx: LookupContext): { sensitive: boolean; askedToWait?: "leave-out"; onSend?: () => void } => ({
   sensitive: isSensitive(ctx),
   ...(ctx.askedToWait === "leave-out" ? { askedToWait: "leave-out" as const } : {}),
+  ...(ctx.onSend ? { onSend: ctx.onSend } : {}),
 });
 
 /** `evaluate({action:'process', process:{op:'metadata_lookup', provider}})`; a deny is a debug note, never an error. */

@@ -88,6 +88,8 @@ export type LookUpAgainResult =
       asked: number;
       /** The services asked (names only). */
       services: string[];
+      /** R585 M2: how many requests actually left (an answer from the cache, or a request the hold left out, is not one). */
+      sent: number;
       /** How many lookups the rules no longer allow (not asked; outcome "not-allowed"). */
       notAllowed: number;
       /** How many matches were appended to the entry's candidates. */
@@ -170,7 +172,11 @@ type Asked = { kind: "found"; results: LookupResult[] } | { kind: "nothing" } | 
  * A lookup's answer from its services asked one by one (R585 M8), with the services whose send the project's rules
  * denied at that moment (not asked). "denied": every service it would have asked was denied — nothing was asked.
  */
-type Answered = (Asked | { kind: "denied" }) & { denied: string[] };
+type Answered = (Asked | { kind: "denied" }) & {
+  denied: string[];
+  /** R585 M2: how many requests of this lookup actually LEFT (not an answer from the cache, nor one the hold left out). */
+  sent: number;
+};
 
 /** One lookup, asked of ONLY `only` (the call's own filter: no other caller sees it). */
 async function askOne(l: LeftOutLookup, ctx: LookupContext, only: string[]): Promise<Asked> {
@@ -199,10 +205,12 @@ function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string): 
     // Every allowed service held: not asked now; it waits for the hold (no try counted).
     return { ...l, services: p.held, notBefore: new Date(Math.max(ms(l.notBefore) || 0, p.heldUntil ?? 0)).toISOString() };
   }
-  const tries = (l.tries ?? 0) + 1;
+  // R585 M2: a try is counted only when a request of it left (not one the client's hold left out, nor an answer from
+  // the cache). A time never moves backwards (R585 2): a later try written meanwhile keeps its time.
+  const counted = a.sent > 0;
+  const tries = (l.tries ?? 0) + (counted ? 1 : 0);
   const { outcome: _o, ...base } = l;
-  // A time never moves backwards (R585 2): a later try written meanwhile keeps its time.
-  const tried = { ...base, tries, lastTriedAt: laterIso(l.lastTriedAt, at) };
+  const tried: LeftOutLookup = counted ? { ...base, tries, lastTriedAt: laterIso(l.lastTriedAt, at) } : base;
   if (a.kind === "found") return { ...tried, outcome: "found" };
   if (a.kind === "nothing" && !p.held.length) {
     // R585 M8: a service whose send the rules denied was not asked: the lookup is not answered by it ("not-allowed",
@@ -218,7 +226,7 @@ function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string): 
   const services = a.kind === "waiting" ? [...new Set([...a.services, ...p.held])] : p.held;
   const notBefore = Math.max(a.kind === "waiting" ? a.notBefore : 0, p.heldUntil ?? 0, ms(l.notBefore) || 0);
   const waiting: LeftOutLookup = { ...tried, services, notBefore: new Date(notBefore).toISOString(), ...(isAskedToWait(l) ? {} : { why: "asked-to-wait" as const }) };
-  return tries >= LOOK_UP_AGAIN_BOUNDS.maxAutomaticTries ? { ...waiting, outcome: "gave-up" } : waiting;
+  return counted && tries >= LOOK_UP_AGAIN_BOUNDS.maxAutomaticTries ? { ...waiting, outcome: "gave-up" } : waiting;
 }
 
 /**
@@ -246,23 +254,25 @@ async function askByService(p: Plan, ctx: LookupContext, sendAllowed: (s: string
   const failed: string[] = [];
   let notBefore = 0;
   let answered = false;
+  let sent = 0;
+  const counting: LookupContext = { ...ctx, onSend: () => void sent++ };
   for (const s of p.ask) {
     if (!(await sendAllowed(s))) {
       denied.push(s);
       continue;
     }
-    const a = await askOne(p.lookup, ctx, [s]);
-    if (a.kind === "found") return { ...a, denied };
+    const a = await askOne(p.lookup, counting, [s]);
+    if (a.kind === "found") return { ...a, denied, sent };
     if (a.kind === "nothing") answered = true;
     else if (a.kind === "waiting") {
       waiting.push(...a.services);
       notBefore = Math.max(notBefore, a.notBefore);
     } else failed.push(...a.services);
   }
-  if (waiting.length) return { kind: "waiting", services: [...new Set([...waiting, ...(answered ? [] : failed)])], notBefore, denied };
-  if (failed.length && !answered) return { kind: "failed", services: [...new Set(failed)], denied };
-  if (answered) return { kind: "nothing", denied };
-  return { kind: "denied", denied };
+  if (waiting.length) return { kind: "waiting", services: [...new Set([...waiting, ...(answered ? [] : failed)])], notBefore, denied, sent };
+  if (failed.length && !answered) return { kind: "failed", services: [...new Set(failed)], denied, sent };
+  if (answered) return { kind: "nothing", denied, sent };
+  return { kind: "denied", denied, sent };
 }
 
 /** Thrown inside the change to roll it back: the entry was decided or its source removed meanwhile (nothing written). */
@@ -391,13 +401,15 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
     if (a.kind === "found") found.push(...a.results);
   }
   const services = [...decided].filter(([, ok]) => ok).map(([s]) => s);
+  const sentCount = [...answered.values()].reduce((n, a) => n + a.sent, 0);
   const at = now.toISOString();
 
   // 5. One governed change that reads the entry again inside itself.
   let added = 0;
   let view: LookUpView | undefined;
   // Ids and counts only (R177); the counts are filled in by the change before its audit line is written.
-  const details: Record<string, unknown> = { reviewEntry: e.id, by: opts.by, lookups: plans.length };
+  // R585 M2: `sent` — how many requests actually left.
+  const details: Record<string, unknown> = { reviewEntry: e.id, by: opts.by, lookups: plans.length, sent: sentCount };
   try {
     await importChange(
       repo,
@@ -437,6 +449,7 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
     sourceId: e.sourceId,
     asked: toAsk.filter((p) => !deniedAll(p)).length,
     services,
+    sent: sentCount,
     notAllowed: plans.filter((p) => after(p, p.lookup, answered.get(p), at).outcome === "not-allowed").length,
     found: added,
     state: view,

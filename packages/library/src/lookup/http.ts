@@ -248,6 +248,12 @@ export interface GetOptions {
    */
   askedToWait?: "wait" | "leave-out";
   /**
+   * Decision 31 (c), R585 M2: called each time a request of this call actually leaves (just before it is sent; not for
+   * an answer from the cache, a request the hold left out, or one the closing stopped first). "Look up again" counts
+   * with it what was really sent.
+   */
+  onSend?: () => void;
+  /**
    * Parameters added to the address when it is requested (F10: Unpaywall's `email`), percent-encoded. Never part of
    * the cache key, a cached entry, a log line, an error's message or any property of an error: the same answer is
    * served from the cache whatever their values. Not sent again after a redirect.
@@ -386,7 +392,7 @@ export class HttpClient {
       }
     }
 
-    const res = await this.fetchWithRetries(url, opts.final429, opts.query, opts.final5xx === true, opts.askedToWait === "leave-out");
+    const res = await this.fetchWithRetries(url, opts.final429, opts.query, opts.final5xx === true, opts.askedToWait === "leave-out", opts.onSend);
     if (res.body !== null) validate?.(res.body); // throws: nothing is cached
     const entry: CacheEntry = { v: 1, storedAt: this.clock(), status: res.status, body: res.body };
     // Never cached (R257 h; R290 a, e): an answer that holds the private query, or the key or the e-mail sent with it.
@@ -734,6 +740,7 @@ export class HttpClient {
     query?: Readonly<Record<string, string>>,
     final5xx = false,
     leaveOut = false,
+    onSend?: () => void,
   ): Promise<{ status: 200 | 404; body: string | null; sent?: Record<string, string> }> {
     if (this.recorded) return this.recorded.answer(url);
     this.assertOpen();
@@ -761,7 +768,7 @@ export class HttpClient {
       if (leaveOut && attempt > 0) this.leftOutIfHeld(host);
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
       try {
-        res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) }, leaveOut);
+        res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) }, leaveOut, onSend);
       } catch (e) {
         if (e instanceof LookupHttpError || e instanceof LookupLeftOutError) throw e; // refused redirect, oversized body, held: not retried
         // The library is being closed: a request in the air is abandoned and never sent again (R546 2).
@@ -816,6 +823,7 @@ export class HttpClient {
     url: string,
     send: { ua: string; key?: string },
     leaveOut = false,
+    onSend?: () => void,
   ): Promise<{ status: number; body: string | null; retryAfter?: string; rateLimit?: RateLimitAnswer }> {
     let current = new URL(url);
     let signal: AbortSignal | undefined;
@@ -829,6 +837,7 @@ export class HttpClient {
         if (!signal) {
           signal = AbortSignal.any([AbortSignal.timeout(this.attemptTimeoutMs), this.halt()]);
         }
+        onSend?.();
         const res = await request(current, {
           method: "GET",
           headers: {
