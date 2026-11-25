@@ -21,14 +21,14 @@ import type { Deps } from "../deps.js";
 import { shutdownExtractors } from "../extract/index.js";
 import { createLibrary, type Library } from "../library.js";
 import { HttpClient, lookupDoi, lookupContextFor } from "../lookup/index.js";
-import { REVIEW_FILE, parseReviewFile, type ReviewEntry } from "../repo/review.js";
+import { REVIEW_FILE, parseReviewFile, type LeftOutLookup, type ReviewEntry } from "../repo/review.js";
 import { storeRequest } from "../repo/sources.js";
 import { importChange, projectDataKey, type Repo } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
 import { createAttach } from "./attach.js";
 import { decideReview } from "./bulk/review.js";
 import { LOOK_SEND_OP, LOOK_UP_AGAIN_OP, dueLookUps, lookUpAgain } from "./look-again.js";
-import { LOOK_UP_AGAIN_BOUNDS } from "./look-up-state.js";
+import { LOOK_UP_AGAIN_BOUNDS, lookUpNow } from "./look-up-state.js";
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/lookup");
 const fixture = (n: string) => readFileSync(join(FIX, n), "utf8");
@@ -810,5 +810,74 @@ describe("decision 31 (c), R585 M2: what was really sent", () => {
     expect((await entry(p, e!.id)).leftOut![0]).toMatchObject({ tries: 1, lastTriedAt: new Date(now).toISOString(), outcome: "nothing" });
     const [line] = (await auditOf(p)).events.filter((x) => x.details?.op === LOOK_UP_AGAIN_OP);
     expect(line!.details).toMatchObject({ sent: 1 });
+  });
+});
+
+describe("decision 31 (c), R585 M1: a kept time only a wrong clock could have written counts as passed", () => {
+  const FAR = "2031-01-01T00:00:00.000Z";
+  it("P-D: notBefore and lastTriedAt in 2031 — the researcher's act sends; the automatic pass takes it; with notBefore mended and lastTriedAt still in 2031, the automatic pass still takes it", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [a, b, c] = await attached(p, http, [notesPdf(), notesPdf("Market days in the northern valleys"), notesPdf("Harvest songs of the delta")]);
+    for (const e of [a!, b!]) await patch(p, e, { leftOut: [{ ...e.leftOut![0]!, notBefore: FAR, lastTriedAt: FAR, tries: 1 }] });
+    await patch(p, c!, { leftOut: [{ ...c!.leftOut![0]!, notBefore: new Date(now).toISOString(), lastTriedAt: FAR, tries: 1 }] });
+    now += 61 * MIN; // past the wait after one try (an hour, counted from the attach: the 2031 try is not kept)
+    answers["api.openalex.org"] = () => NO_RESULTS;
+    // 1. by hand
+    expect(await lookUpAgain(repo, client(), p.id, a!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true, sent: 1, state: { state: "nothing" } });
+    // 2. automatic (and listed as due)
+    expect((await dueLookUps(repo, p.id, new Date(now))).map((d) => d.entryId)).toEqual([b!.id, c!.id]);
+    expect(await lookUpAgain(repo, client(), p.id, b!.id, { by: "automatic", now: new Date(now) })).toMatchObject({ done: true, sent: 1 });
+    // 3. notBefore mended, lastTriedAt still in 2031: due all the same
+    expect(await lookUpAgain(repo, client(), p.id, c!.id, { by: "automatic", now: new Date(now) })).toMatchObject({ done: true, sent: 1 });
+    // the times written are today's, not 2031's (a time never moves back — but a wrong one is not kept)
+    expect((await entry(p, c!.id)).leftOut![0]!.lastTriedAt).toBe(new Date(now).toISOString());
+  });
+
+  it("every real wait is unchanged (R411): a notBefore less than an hour ahead holds, by hand and automatically", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    now += 16 * MIN;
+    const nb = new Date(now + 59 * MIN).toISOString();
+    await patch(p, e!, { leftOut: [{ ...e!.leftOut![0]!, notBefore: nb }] });
+    sent = [];
+    expect(await lookUpAgain(repo, client(), p.id, e!.id, { by: "researcher", now: new Date(now) })).toEqual({ done: false, why: "not-yet", notBefore: nb });
+    expect(await lookUpAgain(repo, client(), p.id, e!.id, { by: "automatic", now: new Date(now) })).toEqual({ done: false, why: "not-due" });
+    expect(sent).toEqual([]);
+  });
+
+  it("lookUpNow (for the service and the page) agrees with lookUpAgain's own answer for the researcher, over a table of entries", async () => {
+    const p = await project();
+    const T = now + 16 * MIN;
+    const iso = (d: number) => new Date(T + d).toISOString();
+    const w = (title: string, extra: Partial<LeftOutLookup> = {}): LeftOutLookup => ({ services: ["openalex"], title, creator: "Souza", notBefore: iso(30_000), ...extra });
+    const rows: Array<[string, (t: string) => LeftOutLookup[], { canLookUpNow: boolean; notBefore?: string }]> = [
+      ["waiting", (t) => [w(t)], { canLookUpNow: false, notBefore: iso(30_000) }],
+      ["due", (t) => [w(t, { notBefore: iso(-MIN) })], { canLookUpNow: true }],
+      ["wrong clock ahead", (t) => [w(t, { notBefore: FAR, lastTriedAt: FAR })], { canLookUpNow: true }],
+      ["less than an hour ahead", (t) => [w(t, { notBefore: iso(59 * MIN) })], { canLookUpNow: false, notBefore: iso(59 * MIN) }],
+      ["failed", (t) => [{ services: ["openalex"], title: t, why: "failed" }], { canLookUpNow: true }],
+      ["mixed: waiting and found", (t) => [w(t), w(`${t} b`, { outcome: "found" })], { canLookUpNow: false, notBefore: iso(30_000) }],
+      ["mixed: failed and waiting", (t) => [{ services: ["openalex"], title: t, why: "failed" }, w(`${t} b`)], { canLookUpNow: true }],
+      ["two waiting: the earliest", (t) => [w(t, { notBefore: iso(10 * MIN) }), w(`${t} b`)], { canLookUpNow: false, notBefore: iso(30_000) }],
+      ["gave up, its time passed", (t) => [w(t, { notBefore: iso(-MIN), tries: 5, outcome: "gave-up" })], { canLookUpNow: true }],
+      ["nothing left", (t) => [w(t, { outcome: "found" }), w(`${t} b`, { outcome: "nothing" })], { canLookUpNow: false }],
+    ];
+    answers["api.openalex.org"] = () => WAIT_60;
+    const made = await attached(p, client(), rows.map((_, i) => notesPdf(`Field notes number ${i}`)));
+    for (const [i, [, left]] of rows.entries()) await patch(p, made[i]!, { leftOut: left(`Field notes number ${i}`) });
+    now = T;
+    answers["api.openalex.org"] = () => NO_RESULTS;
+    for (const [i, [name, , expected]] of rows.entries()) {
+      const e = await entry(p, made[i]!.id);
+      const said = lookUpNow(e, new Date(now));
+      expect(said, name).toEqual(expected);
+      const r = await lookUpAgain(repo, client(), p.id, e.id, { by: "researcher", now: new Date(now) });
+      if (said.canLookUpNow) expect(r.done, name).toBe(true);
+      else expect(r, name).toEqual(said.notBefore ? { done: false, why: "not-yet", notBefore: said.notBefore } : { done: false, why: "nothing-to-look-up" });
+    }
   });
 });

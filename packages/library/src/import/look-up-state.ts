@@ -12,6 +12,7 @@
  */
 import { LOOKUP_WAITING_TEXT, LOOK_UP_AGAIN_TEXT, lookUpGaveUpText } from "@ao/shared";
 import type { LookupResult } from "../lookup/index.js";
+import { MAX_HOLD_MS } from "../lookup/http.js";
 import type { LeftOutLookup, ReviewEntry } from "../repo/review.js";
 
 const MINUTE = 60_000;
@@ -28,6 +29,62 @@ export const LOOK_UP_AGAIN_BOUNDS = {
   waitsMs: [15 * MINUTE, HOUR, 4 * HOUR, 12 * HOUR, 24 * HOUR] as readonly number[],
   newCandidatesPerLookUp: 3,
 } as const;
+
+/**
+ * R585 M1: a kept time that only a wrong clock could have written counts as PASSED. The client never holds a service
+ * longer than MAX_HOLD_MS (an hour), so a `notBefore` further ahead than that cannot be a service's; the longest wait
+ * between automatic tries is the last of `waitsMs` (24 hours), so a `lastTriedAt` further ahead than that, with an
+ * hour's margin, cannot be a try's. Every real wait is below these bounds and unchanged (R411).
+ */
+export const WRONG_CLOCK_BOUNDS = {
+  notBeforeAheadMs: MAX_HOLD_MS,
+  lastTriedAheadMs: Math.max(...LOOK_UP_AGAIN_BOUNDS.waitsMs) + HOUR,
+} as const;
+
+const kept = (iso: string | undefined, now: number, aheadMs: number): number | undefined => {
+  if (!iso) return undefined;
+  const t = Date.parse(iso);
+  return Number.isNaN(t) || t > now + aheadMs ? undefined : t;
+};
+/** The lookup's `notBefore` (ms), or undefined when it has none or only a wrong clock could have written it (M1). */
+export const keptNotBefore = (l: LeftOutLookup, now: number) => kept(l.notBefore, now, WRONG_CLOCK_BOUNDS.notBeforeAheadMs);
+/** The lookup's `lastTriedAt` (ms), or undefined when it has none or only a wrong clock could have written it (M1). */
+export const keptLastTriedAt = (l: LeftOutLookup, now: number) => kept(l.lastTriedAt, now, WRONG_CLOCK_BOUNDS.lastTriedAheadMs);
+
+/** Outcomes that end a lookup for everyone: it is never asked again. */
+const FINAL_OUTCOMES = new Set<LeftOutLookup["outcome"]>(["found", "nothing"]);
+export const isAnswered = (l: LeftOutLookup): boolean => FINAL_OUTCOMES.has(l.outcome);
+
+/**
+ * Whether the RESEARCHER's act may ask this lookup now: not answered yet, and its service's time has passed (R411,
+ * R577 iii; a lookup that failed outright has no time to wait for; a time only a wrong clock could have written counts
+ * as passed, M1). The one rule `lookUpAgain` (by: "researcher") and `lookUpNow` both apply.
+ */
+export function askableByHand(l: LeftOutLookup, now: number): boolean {
+  if (isAnswered(l)) return false;
+  const t = keptNotBefore(l, now);
+  return t === undefined || t <= now;
+}
+
+/**
+ * For the service and the page: whether the researcher's "Look up again" would send something for this entry now,
+ * and if not, the earliest time at which it would — exactly the rules `lookUpAgain` applies for `by: "researcher"`
+ * (it uses this function for its "not yet"). Not now and no time: nothing is left to look up (or the entry is no
+ * longer pending). Only the entry is known here: a service the client holds in memory since (it asked to wait again)
+ * can still make `lookUpAgain` answer "not yet" with the hold's time.
+ */
+export function lookUpNow(entry: { leftOut?: LeftOutLookup[]; status?: string }, now: Date): { canLookUpNow: boolean; notBefore?: string } {
+  if (entry.status !== undefined && entry.status !== "pending") return { canLookUpNow: false };
+  const t = now.getTime();
+  const left = entry.leftOut ?? [];
+  if (left.some((l) => askableByHand(l, t))) return { canLookUpNow: true };
+  const later = left
+    .filter((l) => !isAnswered(l))
+    .map((l) => [keptNotBefore(l, t), l.notBefore] as const)
+    .filter(([k]) => k !== undefined && k > t)
+    .sort(([a], [b]) => a! - b!);
+  return later.length ? { canLookUpNow: false, notBefore: later[0]![1]! } : { canLookUpNow: false };
+}
 
 /** The key two matches are the same by: the one the resolution's `addCandidate` uses (provider, DOI, title in any case). */
 export function candidateKeyOf(c: Pick<LookupResult, "provider" | "identifiers" | "title">): string {

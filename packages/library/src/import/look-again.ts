@@ -33,7 +33,7 @@ import { authorizeProcessing, importChange, projectReviewEntries, repoLibrary, t
 import type { LeftOutLookup, ReviewEntry } from "../repo/review.js";
 import { storeRequest } from "../repo/sources.js";
 import { ITEM_REASONS } from "./common.js";
-import { LOOK_UP_AGAIN_BOUNDS, appendCandidates, isAskedToWait, lookUpStateOf, reasonsWithLookUpState, type LookUpView } from "./look-up-state.js";
+import { LOOK_UP_AGAIN_BOUNDS, appendCandidates, askableByHand, isAnswered, isAskedToWait, keptLastTriedAt, keptNotBefore, lookUpNow, lookUpStateOf, reasonsWithLookUpState, type LookUpView } from "./look-up-state.js";
 import { arxivDoi } from "./resolve.js";
 
 /** The audit op of the send's authorisation (before anything goes) and of the result's change. Ids and counts only. */
@@ -102,7 +102,6 @@ export type LookUpAgainResult =
   | { done: false; why: "not-yet"; notBefore: string };
 
 const no = (why: LookUpAgainRefusal): LookUpAgainResult => ({ done: false, why });
-const FINAL = new Set<LeftOutLookup["outcome"]>(["found", "nothing"]);
 const ms = (iso: string | undefined) => (iso ? Date.parse(iso) : Number.NaN);
 
 /** Whether the automatic pass takes this lookup now (R566 5, R577 iv). */
@@ -110,14 +109,13 @@ function dueAutomatically(e: Pick<ReviewEntry, "createdAt">, l: LeftOutLookup, n
   if (!isAskedToWait(l) || l.outcome) return false;
   const tries = l.tries ?? 0;
   if (tries >= LOOK_UP_AGAIN_BOUNDS.maxAutomaticTries) return false;
-  if (l.notBefore && ms(l.notBefore) > now) return false;
-  const from = ms(l.lastTriedAt ?? e.createdAt);
+  // R585 M1: a kept time only a wrong clock could have written counts as passed.
+  const nb = keptNotBefore(l, now);
+  if (nb !== undefined && nb > now) return false;
+  const from = keptLastTriedAt(l, now) ?? ms(e.createdAt);
   const wait = LOOK_UP_AGAIN_BOUNDS.waitsMs[tries] ?? LOOK_UP_AGAIN_BOUNDS.waitsMs[LOOK_UP_AGAIN_BOUNDS.waitsMs.length - 1]!;
   return Number.isNaN(from) || from + wait <= now;
 }
-
-/** Whether the researcher's act may ask this lookup now: not answered yet, and its service's time has passed (R411). */
-const askableByHand = (l: LeftOutLookup, now: number) => !FINAL.has(l.outcome) && !(l.notBefore && ms(l.notBefore) > now);
 
 const pendingWithSource = (e: ReviewEntry, present: Set<string>) => e.kind === "import" && e.status === "pending" && !!e.sourceId && present.has(e.sourceId);
 
@@ -196,21 +194,25 @@ async function askOne(l: LeftOutLookup, ctx: LookupContext, only: string[]): Pro
   }
 }
 
-const laterIso = (a: string | undefined, b: string): string => (a && ms(a) > ms(b) ? a : b);
+/** The later of a kept try's time and `b` (a time never moves backwards, R585 2; one only a wrong clock wrote is not kept, M1). */
+const laterTry = (l: LeftOutLookup, b: string): string => {
+  const t = keptLastTriedAt(l, ms(b));
+  return t !== undefined && t > ms(b) ? l.lastTriedAt! : b;
+};
 
 /** The lookup after this act (see the module comment, step 4), worked out against `l`: the lookup as re-read (R585 2). */
 function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string): LeftOutLookup {
   if (p.notAllowed || (a?.kind === "denied" && !p.held.length)) return { ...l, outcome: "not-allowed" };
   if (!a || a.kind === "denied") {
     // Every allowed service held: not asked now; it waits for the hold (no try counted).
-    return { ...l, services: p.held, notBefore: new Date(Math.max(ms(l.notBefore) || 0, p.heldUntil ?? 0)).toISOString() };
+    return { ...l, services: p.held, notBefore: new Date(Math.max(keptNotBefore(l, ms(at)) ?? 0, p.heldUntil ?? 0)).toISOString() };
   }
   // R585 M2: a try is counted only when a request of it left (not one the client's hold left out, nor an answer from
   // the cache). A time never moves backwards (R585 2): a later try written meanwhile keeps its time.
   const counted = a.sent > 0;
   const tries = (l.tries ?? 0) + (counted ? 1 : 0);
   const { outcome: _o, ...base } = l;
-  const tried: LeftOutLookup = counted ? { ...base, tries, lastTriedAt: laterIso(l.lastTriedAt, at) } : base;
+  const tried: LeftOutLookup = counted ? { ...base, tries, lastTriedAt: laterTry(l, at) } : base;
   if (a.kind === "found") return { ...tried, outcome: "found" };
   if (a.kind === "nothing" && !p.held.length) {
     // R585 M8: a service whose send the rules denied was not asked: the lookup is not answered by it ("not-allowed",
@@ -224,7 +226,7 @@ function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string): 
   }
   // Still to be asked: those that asked to wait again, and those held.
   const services = a.kind === "waiting" ? [...new Set([...a.services, ...p.held])] : p.held;
-  const notBefore = Math.max(a.kind === "waiting" ? a.notBefore : 0, p.heldUntil ?? 0, ms(l.notBefore) || 0);
+  const notBefore = Math.max(a.kind === "waiting" ? a.notBefore : 0, p.heldUntil ?? 0, keptNotBefore(l, ms(at)) ?? 0);
   const waiting: LeftOutLookup = { ...tried, services, notBefore: new Date(notBefore).toISOString(), ...(isAskedToWait(l) ? {} : { why: "asked-to-wait" as const }) };
   return counted && tries >= LOOK_UP_AGAIN_BOUNDS.maxAutomaticTries ? { ...waiting, outcome: "gave-up" } : waiting;
 }
@@ -238,7 +240,7 @@ function settle(p: Plan, cur: LeftOutLookup | undefined, a: Answered | undefined
   if (!cur) return undefined;
   const same = (x: LeftOutLookup) => JSON.stringify([x.identifier, x.title, x.creator]);
   if (same(cur) !== same(p.lookup)) return cur;
-  if (FINAL.has(cur.outcome) && cur.outcome !== p.lookup.outcome) return cur;
+  if (isAnswered(cur) && cur.outcome !== p.lookup.outcome) return cur;
   return after(p, cur, a, at);
 }
 
@@ -326,8 +328,9 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
   const chosen = left.map((l, at) => ({ l, at })).filter(({ l }) => (opts.by === "automatic" ? dueAutomatically(e, l, t) : askableByHand(l, t)));
   if (!chosen.length) {
     if (opts.by === "automatic") return no("not-due");
-    const later = left.filter((l) => !FINAL.has(l.outcome) && l.notBefore && ms(l.notBefore) > t).map((l) => l.notBefore!).sort();
-    return later.length ? { done: false, why: "not-yet", notBefore: later[0]! } : no("nothing-to-look-up");
+    // The researcher's "not yet": the one rule the service and the page read through `lookUpNow`.
+    const { notBefore } = lookUpNow(e, now);
+    return notBefore ? { done: false, why: "not-yet", notBefore } : no("nothing-to-look-up");
   }
 
   // 2. The project's rules, asked again now, per service and for title search.
