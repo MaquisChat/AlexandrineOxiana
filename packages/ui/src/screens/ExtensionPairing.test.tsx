@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { apiError, BROWSER_A, BROWSER_B, codeIdOf, makeApi, pairingService, server, url, useMsw } from "../test/msw-extension";
+import { hang } from "../test/service";
 import { ExtensionPairing } from "./ExtensionPairing";
 
 useMsw();
@@ -1282,5 +1283,59 @@ describe("the list of paired browsers cannot be read (Task 68, Task 66 M8)", () 
     await user.click(within(dialog).getByRole("button", { name: "Reset the list" }));
     expect(await within(dialog).findByRole("alert")).toBeTruthy();
     expect(within(dialog).getByRole("alert").textContent).toMatch(/could not be set aside/);
+  });
+});
+
+describe("the pairing screen: a first read of the list that never settles (FR-756, R584, R586)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const UNREACHABLE = "The library service could not be reached.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
+
+  it("is given up at the limit: the alert and “Try again” (pairing stays usable); pressed, it reads again, the loading words meanwhile, and the list is shown with focus kept", async () => {
+    const svc = pairingService({ pairings: [BROWSER_A] });
+    let answer = false;
+    let n = 0;
+    const gate = hang();
+    server.use(
+      http.get(url("/extension/pairings"), async () => {
+        n++;
+        if (!answer) await gate;
+        return HttpResponse.json({ extensions: [BROWSER_A], port: 4318 });
+      }),
+      ...svc.handlers,
+    );
+    render(<ExtensionPairing api={makeApi()} firstReadMs={300} />);
+    expect(screen.getByText("Reading the list…")).toBeTruthy();
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    expect((screen.getByRole("button", { name: "Show a pairing code" }) as HTMLButtonElement).disabled).toBe(false);
+    await userEvent.setup().click(tryAgain()!);
+    expect(screen.getByText("Reading the list…")).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 2, name: "Paired browsers" }));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByText(BROWSER_A.origin);
+    expect(tryAgain()).toBeNull();
+    expect(alerts()).toEqual([]);
+    expect(n).toBe(3);
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 2, name: "Paired browsers" }));
+  });
+
+  it("a read that FAILS says what it said before, now with “Try again”", async () => {
+    const svc = pairingService();
+    server.use(http.get(url("/extension/pairings"), () => HttpResponse.error()), ...svc.handlers);
+    render(<ExtensionPairing api={makeApi()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([UNREACHABLE]);
+  });
+
+  it("a read refused with an answer says its sentence as before, with no “Try again”", async () => {
+    const svc = pairingService();
+    server.use(http.get(url("/extension/pairings"), () => apiError(500, "INTERNAL", "The pairings could not be listed.")), ...svc.handlers);
+    render(<ExtensionPairing api={makeApi()} firstReadMs={300} />);
+    await screen.findByText(/The pairings could not be listed\./);
+    expect(tryAgain()).toBeNull();
   });
 });
