@@ -104,7 +104,7 @@ import {
   type FindScreenSettings,
 } from "@ao/shared";
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from "react";
-import { ApiClientError, type ApiClient, type ServiceEvent } from "../api/client";
+import { ApiClientError, SERVICE_UNREACHABLE, type ApiClient, type ServiceEvent } from "../api/client";
 import { findApi, findHref, findProgressOf, type FindApi } from "../api/find";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { isValidId } from "../api/import";
@@ -342,6 +342,13 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
   const [chosen, setChosen] = useState<string | undefined>();
   const [collections, setCollections] = useState<Collection[] | undefined>();
   const [collectionId, setCollectionId] = useState("");
+  /**
+   * R586 M3: the chosen project's collections could not be read (the sentence, and whether "Try again" may help); the
+   * remembered collection is chosen only once a read has answered. `collectionsTry` moves on with "Try again".
+   */
+  const [collectionsError, setCollectionsError] = useState<string | undefined>();
+  const [collectionsUnreachable, setCollectionsUnreachable] = useState(false);
+  const [collectionsTry, setCollectionsTry] = useState(0);
   /** What is in the box: the researcher's, kept when the project or the library changes. */
   const [text, setText] = useState("");
   /** Bumped after the switch changed: the queue is read again (its locked count, its matches elsewhere). */
@@ -681,24 +688,40 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
   }, [epoch, noLibrary]);
 
   // The chosen project's collections; the remembered collection only if it is one of them.
+  // R586 M3: a read that got no answer (or none in time) says so, with "Try again"; it leaves the collections unread
+  // (not an empty list), so the remembered collection is still chosen when a later read answers.
   useEffect(() => {
     setCollections(undefined);
     setCollectionId("");
+    setCollectionsError(undefined);
+    setCollectionsUnreachable(false);
     if (!projectId) return;
     let live = true;
-    readWithin((signal) => lib.collections.list(projectId, { signal }), firstReadMs).then(
+    const ac = new AbortController();
+    readWithin((signal) => lib.collections.list(projectId, { signal }), firstReadMs, ac.signal).then(
       (r) => {
         if (!live) return;
         setCollections(r.collections);
         const want = confirmed.current.projectId === projectId ? confirmed.current.collectionId : undefined;
         if (want && r.collections.some((c) => c.id === want)) setCollectionId(want);
       },
-      () => live && setCollections([]),
+      (err: unknown) => {
+        if (!live) return;
+        // An answer the screen handles (a locked project, say) leaves the list empty, as before; a read that got no
+        // answer says so, with "Try again".
+        if (!isUnreachable(err)) {
+          setCollections([]);
+          return;
+        }
+        setCollectionsError(sentenceOf(err, SERVICE_UNREACHABLE));
+        setCollectionsUnreachable(true);
+      },
     );
     return () => {
       live = false;
+      ac.abort();
     };
-  }, [lib, projectId, epoch, firstReadMs]);
+  }, [lib, projectId, epoch, firstReadMs, collectionsTry]);
 
   /**
    * One PUT of the remembered settings, after those before it: built from the last CONFIRMED answer plus its own
@@ -860,12 +883,13 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
   }, []);
 
   // ---- FR-750: "Try again" after a read that got no answer: what has not been read is read again ----
-  const showTryAgain = (projectsUnreachable && !!projectsError) || (screenUnreachable && !!screenError);
+  const showTryAgain = (projectsUnreachable && !!projectsError) || (screenUnreachable && !!screenError) || (collectionsUnreachable && !!collectionsError);
   const triedAgain = useRef(false);
   const tryAgain = () => {
     triedAgain.current = true;
     if (!projectsRead_ok.current || projectsUnreachable) readProjects();
     if (!screenRead_ok.current) readScreen();
+    if (collectionsError) setCollectionsTry((n) => n + 1);
     // The queue's own read, when it got no answer either (its sentence may be said here only, FR-576).
     emit({ kind: "retry" });
   };
@@ -956,6 +980,11 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
       {projectsError && projectsError !== screenError && (
         <p role="alert" className="ao-error">
           <UserText>{projectsError}</UserText>
+        </p>
+      )}
+      {collectionsError && collectionsError !== screenError && collectionsError !== projectsError && (
+        <p role="alert" className="ao-error">
+          <UserText>{collectionsError}</UserText>
         </p>
       )}
       {/* FR-750 (R579): a read that got no answer (or none in time) is offered again; an answer the screen handles is not. */}

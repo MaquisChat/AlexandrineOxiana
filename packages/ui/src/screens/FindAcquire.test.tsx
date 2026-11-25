@@ -5557,6 +5557,34 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     expect(tryAgain()).toBeNull();
   });
 
+  it("R586 M3: a collections read that hangs alone is given up with the same alert and “Try again”, which reads it again; the remembered collection is kept", async () => {
+    useService({ screen: { checkEverything: false, projectId: PID, collectionId: CID } });
+    let answer = false;
+    const gate = hang();
+    server.use(
+      http.get(url("/projects/:id/collections"), async () => {
+        if (!answer) await gate;
+        return HttpResponse.json({ collections: [{ id: CID, projectId: PID, name: "Chapter 1" }] });
+      }),
+    );
+    showWithin(300);
+    await waitFor(() => expect(projectBox().value).toBe(PID));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+    const collectionBox = () => screen.getByRole("combobox", { name: "Collection" }) as HTMLSelectElement;
+    expect(count(`/projects/${PID}/collections`)).toBe(1);
+    // Nothing was remembered over: no change of the settings was sent.
+    expect(calls.filter((c) => c.method === "PUT")).toHaveLength(0);
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(collectionBox().value).toBe(CID));
+    expect(count(`/projects/${PID}/collections`)).toBe(2);
+    expect(count("/projects")).toBe(1);
+    expect(count("/find/screen")).toBe(1);
+    expect(tryAgain()).toBeNull();
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+  });
+
   it("the queue's own first read that hangs is given up too, with “Try again”, which reads it again", async () => {
     let answer = false;
     const gate = hang();
