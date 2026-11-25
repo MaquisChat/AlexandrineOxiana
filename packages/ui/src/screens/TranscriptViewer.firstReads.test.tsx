@@ -60,7 +60,7 @@ function holding(path: string, held: number, answer: () => Response | Promise<Re
   };
 }
 
-const show = (p: { firstReadMs?: number; streamOpenMs?: number } = {}) => render(<TranscriptViewer api={transcriptApi(testClient())} projectId="p1" sourceId="s1" {...p} />);
+const show = (p: { firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number } = {}) => render(<TranscriptViewer api={transcriptApi(testClient())} projectId="p1" sourceId="s1" {...p} />);
 
 describe("TranscriptViewer: first reads that never settle or fail (FR-756)", () => {
   it("a source read that hangs is given up at the limit: the alert and “Try again”; pressing it reads again, the title shows, focus is not lost", async () => {
@@ -233,5 +233,19 @@ describe("TranscriptViewer: an event stream that does not open within the limit 
     await new Promise((r) => setTimeout(r, 3_000));
     expect(signals).toHaveLength(1);
     expect(signals[0]!.aborted).toBe(false);
+  });
+
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh", async () => {
+    const signals: AbortSignal[] = [];
+    serve(
+      http.get(url("/events"), ({ request }) => {
+        signals.push(request.signal);
+        return sse([]);
+      }),
+    );
+    show({ streamQuietMs: 300 });
+    await screen.findByText("Hello and welcome.");
+    await waitFor(() => expect(signals.length).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(signals[0]!.aborted).toBe(true);
   });
 });

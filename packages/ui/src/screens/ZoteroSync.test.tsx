@@ -19,7 +19,7 @@ import {
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ImportApi, ImportReport } from "../api/import";
 import { zoteroSyncApi } from "../api/zoteroSync";
 import { App } from "../App";
@@ -102,6 +102,24 @@ function eventStream() {
       const body = new ReadableStream<Uint8Array>({
         start(c) {
           ctl = c;
+          // As the real service does (routes/libraries.ts), a keep-alive every 25 seconds, so a screen's silence limit
+          // (R641 D2) never takes this stream for lost, under the test's own clock too. It stops when the stream ends.
+          let beat: ReturnType<typeof setTimeout> | undefined;
+          const next = () => {
+            beat = setTimeout(() => {
+              try {
+                c.enqueue(enc.encode(": keep-alive\n\n"));
+                next();
+              } catch {
+                // the stream has ended
+              }
+            }, 25_000);
+          };
+          next();
+          onTestFinished(() => clearTimeout(beat));
+        },
+        cancel() {
+          // nothing more is sent (the timer's next enqueue fails and stops it)
         },
       });
       return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
@@ -1382,6 +1400,15 @@ describe("Zotero: first reads that never settle (FR-750, R579)", () => {
     expect(ev.attempts()).toBe(1);
     // R602 M2: the page has not cancelled it (a drop after the answer began would not end a mocked body).
     expect(ev.signals()[0]!.aborted).toBe(false);
+  });
+
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh", async () => {
+    useSvc();
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<ZoteroSync client={testClient()} streamQuietMs={300} />);
+    await waitFor(() => expect(ev.attempts()).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(ev.signals()[0]!.aborted).toBe(true);
   });
 
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {

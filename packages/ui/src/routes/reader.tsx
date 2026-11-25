@@ -29,7 +29,7 @@
  */
 import { matchAnnotations } from "@ao/core/annotations/match";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient } from "../api/client";
 import { allOrCancel, FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
 import { libraryApi, type Asset, type LibraryState, type ProjectSummary, type SourceAvailability } from "../api/library";
 import { readerApi, type AnnotationRecord } from "../api/reader";
@@ -116,7 +116,7 @@ function failureOf(err: unknown): ReaderStateKind | "no-source" {
  * screen, each part of the PDF for its answer to begin. `streamOpenMs` (R597): how long the library's event stream is
  * waited for to open before it is closed and tried afresh after the usual pause.
  */
-export function ReaderRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number }) {
+export function ReaderRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number }) {
   const api = useMemo(() => readerApi(client), [client]);
   const library = useMemo(() => libraryApi(client), [client]);
   const q = new URLSearchParams(loc.search);
@@ -311,7 +311,7 @@ export function ReaderRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, 
         try {
           // FR-756 (R597): a stream not opened within the limit is closed and, after the pause below, opened afresh; the
           // service sends the library's state first on every opening, which asks the project question again.
-          for await (const e of library.events({ signal: ac.signal, openWithinMs: streamOpenMs })) {
+          for await (const e of library.events({ signal: ac.signal, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
             if (e.type !== "library.state" || !e.data || typeof e.data !== "object") continue;
             const d = e.data as LibraryState;
             if (d.open === false || (d.libraryId !== undefined && d.libraryId !== watching)) return end("closed");
@@ -337,7 +337,7 @@ export function ReaderRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, 
       askNow.current = undefined;
       ac.abort();
     };
-  }, [client, library, projectId, watching, streamOpenMs]);
+  }, [client, library, projectId, watching, streamOpenMs, streamQuietMs]);
 
   if (!projectId || !sourceId) {
     return (

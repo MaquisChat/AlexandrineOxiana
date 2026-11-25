@@ -46,7 +46,7 @@ function serve(o: { events?: ReturnType<typeof sseAttempts>; source?: () => Prom
   return n;
 }
 
-const show = (p: { firstReadMs?: number; streamOpenMs?: number } = {}) =>
+const show = (p: { firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number } = {}) =>
   render(<ReaderRoute client={testClient()} loc={{ pathname: "/reader", search: "?project=p1&source=s1" }} {...p} />);
 
 describe("ReaderRoute: a first read that never settles (FR-756)", () => {
@@ -112,6 +112,22 @@ describe("ReaderRoute: an event stream that does not open within the limit is tr
     // Still the first stream, and its request not cancelled (R602).
     expect(signals).toHaveLength(1);
     expect(signals[0]!.aborted).toBe(false);
+  });
+
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh; the reader stays", async () => {
+    const signals: AbortSignal[] = [];
+    serve();
+    server.use(
+      http.get(url("/events"), ({ request }) => {
+        signals.push(request.signal);
+        return new HttpResponse(new ReadableStream(), { headers: { "content-type": "text/event-stream" } });
+      }),
+    );
+    show({ streamQuietMs: 300 });
+    await screen.findByTestId("reader-screen");
+    await waitFor(() => expect(signals.length).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(signals[0]!.aborted).toBe(true);
+    expect(screen.getByTestId("reader-screen")).toBeTruthy();
   });
 });
 

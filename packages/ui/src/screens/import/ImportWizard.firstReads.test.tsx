@@ -50,9 +50,9 @@ function holding(path: string, hold: (n: number) => boolean) {
   };
 }
 
-function open(o: ServiceSetup, p: { firstReadMs?: number; streamOpenMs?: number; batch?: boolean } = {}) {
+function open(o: ServiceSetup, p: { firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number; batch?: boolean } = {}) {
   const m = mockService(o);
-  render(<ImportWizard client={m.client} projectId={P1} {...(p.batch === false ? {} : { batchId: B1 })} {...(p.firstReadMs !== undefined ? { firstReadMs: p.firstReadMs } : {})} {...(p.streamOpenMs !== undefined ? { streamOpenMs: p.streamOpenMs } : {})} />);
+  render(<ImportWizard client={m.client} projectId={P1} {...(p.batch === false ? {} : { batchId: B1 })} {...(p.firstReadMs !== undefined ? { firstReadMs: p.firstReadMs } : {})} {...(p.streamOpenMs !== undefined ? { streamOpenMs: p.streamOpenMs } : {})} {...(p.streamQuietMs !== undefined ? { streamQuietMs: p.streamQuietMs } : {})} />);
   return m;
 }
 
@@ -213,6 +213,16 @@ describe("Import wizard, run step: its first read and its event stream (FR-756, 
     await new Promise((r) => setTimeout(r, 1_000));
     expect(events.count()).toBe(1);
     expect(events.signals[0]!.aborted).toBe(false);
+    expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
+  });
+
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled, the batch's state checked, and the stream opened afresh", async () => {
+    const events = holding("/events", () => false);
+    const batches = holding(`/projects/${P1}/imports`, () => false);
+    open({ batches: [running], extra: [events.handler, batches.handler] }, { streamQuietMs: 300 });
+    await screen.findByRole("heading", { name: "Run" });
+    await waitFor(() => expect(events.count()).toBe(2), { timeout: 10_000 });
+    expect(events.signals[0]!.aborted).toBe(true);
     expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
   });
 });

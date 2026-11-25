@@ -1446,6 +1446,16 @@ describe("Watched folders: first reads that never settle (FR-750, R579)", () => 
     expect(ev.signals()[0]!.aborted).toBe(false);
   });
 
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh", async () => {
+    useService([]);
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} streamQuietMs={300} />);
+    await waitFor(() => expect(ev.attempts()).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(ev.signals()[0]!.aborted).toBe(true);
+    expect(tryAgain()).toBeNull();
+  });
+
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
     useService([]);
     const ev = sseAttempts((n) => (n === 1 ? "fail" : []));

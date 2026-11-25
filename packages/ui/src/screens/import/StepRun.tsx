@@ -5,7 +5,7 @@
  * over to the report.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { STREAM_OPEN_TIMEOUT_MS, type ApiClient, type ApiClientError } from "../../api/client";
+import { STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient, type ApiClientError } from "../../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../../api/firstRead";
 import { isProgressFor, type BatchState, type ImportApi } from "../../api/import";
 import { ErrorNote, errorText, fmt, Section } from "./shared";
@@ -25,13 +25,15 @@ export interface StepRunProps {
   firstReadMs?: number;
   /** FR-756 (R597): how long the event stream is waited for to open before it is closed and tried afresh. */
   streamOpenMs?: number;
+  /** R641 D2: how long an open event stream may deliver nothing (not even the service's keep-alive) before it is closed and tried afresh. */
+  streamQuietMs?: number;
 }
 
 /** Reconnects after the event stream ends before the batch does (then a message and a manual check). */
 const RECONNECTS = 2;
 const RECONNECT_DELAY_MS = 300;
 
-export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArrival = false, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: StepRunProps) {
+export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArrival = false, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: StepRunProps) {
   const heading = useRef<HTMLHeadingElement>(null);
   /** Focus the heading once, when the researcher arrived on this run from an address (D1, R145). */
   const arrival = useRef(focusOnArrival);
@@ -87,7 +89,7 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
         try {
           // A batch that ended before the stream opened would never send its last event: check once open. FR-756 (R597):
           // a stream not opened within `streamOpenMs` is closed and tried afresh below.
-          for await (const e of client.events({ signal: ctl.signal, onOpen: () => void recheck(), openWithinMs: streamOpenMs })) {
+          for await (const e of client.events({ signal: ctl.signal, onOpen: () => void recheck(), openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
             if (!isProgressFor(batchId, e)) continue;
             const d = e.data;
             if (typeof d.done === "number") setDone(d.done);
@@ -119,7 +121,7 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
       stop = true;
       ctl.abort();
     };
-  }, [client, batchId, recheck, end, attempt, streamOpenMs]);
+  }, [client, batchId, recheck, end, attempt, streamOpenMs, streamQuietMs]);
 
   const checkAgain = async () => {
     setError(null);

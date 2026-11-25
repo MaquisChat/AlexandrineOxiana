@@ -98,16 +98,41 @@ const refusal = (status: number, code: string, message: string, reason?: string)
 function eventStream() {
   const enc = new TextEncoder();
   let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let beatAgain = () => {};
   return {
     handler: http.get(url("/events"), () => {
       const body = new ReadableStream<Uint8Array>({
         start(c) {
           ctl = c;
+          // As the real service does (routes/libraries.ts), a keep-alive every 25 seconds, so a screen's silence limit
+          // (R641 D2) never takes this stream for lost, under the test's own clock too. It stops when the stream ends.
+          let beat: ReturnType<typeof setTimeout> | undefined;
+          const next = () => {
+            beat = setTimeout(() => {
+              try {
+                c.enqueue(enc.encode(": keep-alive\n\n"));
+                next();
+              } catch {
+                // the stream has ended
+              }
+            }, 25_000);
+          };
+          next();
+          beatAgain = () => {
+            clearTimeout(beat);
+            next();
+          };
+          onTestFinished(() => clearTimeout(beat));
+        },
+        cancel() {
+          // nothing more is sent (the timer's next enqueue fails and stops it)
         },
       });
       return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
     }),
     open: () => ctl !== undefined,
+    /** Starts the keep-alives again on the clock now in force (after a test switched to its own clock). */
+    keepAlive: () => beatAgain(),
     /** Several events in ONE chunk. */
     push(...evs: Array<{ type: string; data: unknown }>) {
       ctl!.enqueue(enc.encode(evs.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e.data)}\n\n`).join("")));
@@ -4263,6 +4288,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       const control = () => row("hung read").querySelector<HTMLElement>('button[data-act="library"]');
       hang = true;
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      // The service's keep-alives on the test's clock (R641 D2: the screen's silence limit is a minute, as long as these waits).
+      events.keepAlive();
       try {
         // A read asked for by an event never answers…
         progress(current[0]!, "no-open-copy");
@@ -4308,6 +4335,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       const before = reads();
       hang = true;
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      // The service's keep-alives on the test's clock (R641 D2: the screen's silence limit is a minute, as long as these waits).
+      events.keepAlive();
       try {
         for (let k = 1; k <= 8; k++) {
           // A read asked for by an event never answers, and is given up after QUEUE_READ_WAIT_MS.
@@ -5550,6 +5579,17 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     expect(ev.attempts()).toBe(1);
     // R602 M2: the page has not cancelled it (a drop after the answer began would not end a mocked body).
     expect(ev.signals()[0]!.aborted).toBe(false);
+  });
+
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh", async () => {
+    useService();
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search: "" }} streamQuietMs={300} />);
+    await screen.findByRole("textbox", { name: "References" });
+    await waitFor(() => expect(ev.attempts()).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(ev.signals()[0]!.aborted).toBe(true);
+    expect(tryAgain()).toBeNull();
   });
 
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
