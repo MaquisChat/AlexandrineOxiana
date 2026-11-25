@@ -285,6 +285,82 @@ export async function unfinishedSplitFrom(deps: CfgDeps, root: string, libraryId
   return undefined;
 }
 
+/**
+ * FR-068 (R607 c): the folder `root`, of the library `libraryId`, holds the copy of this computer's move that stopped
+ * after its switch began and before the old copy was marked, and the old place is seen to be the living library still:
+ * the journal at `root` in its switching phase with no mark recorded; this computer's record of that move naming this
+ * folder; the old place reachable, holding that library (its library.json's id) and no mark of any move (no top
+ * MOVED.json, no moved project's MOVED.json). Returns the old place; undefined in every other case (no such journal,
+ * another computer's move, another folder, the old place out of reach, marked by any move, or another library there).
+ * Reads only.
+ */
+export async function staleMoveCopyAt(deps: CfgDeps, root: string, libraryId: string): Promise<string | undefined> {
+  let j: { libraryId?: unknown; phase?: unknown; switch?: { pendingId?: unknown; done?: unknown; movedFolders?: unknown } } | null;
+  try {
+    j = JSON.parse(await fsp.readFile(join(root, ".move-journal.json"), "utf8")) as typeof j;
+  } catch {
+    return undefined;
+  }
+  const sw = j?.switch;
+  if (j?.phase !== "switching" || j.libraryId !== libraryId || typeof sw?.pendingId !== "string" || !Array.isArray(sw.done) || sw.done.includes("mark-old")) return undefined;
+  const rec = await getPendingOldCopy(deps, sw.pendingId).catch(() => undefined);
+  if (!rec || rec.libraryId !== libraryId || !(await sameFolder(rec.newRoot, root))) return undefined;
+  try {
+    const meta = JSON.parse(await fsp.readFile(join(rec.oldRoot, "library.json"), "utf8")) as { libraryId?: unknown };
+    if (meta.libraryId !== libraryId) return undefined;
+  } catch {
+    return undefined;
+  }
+  // A mark is anything but a folder of that name (a folder cannot be read as one); a place that cannot be looked at counts as marked.
+  const marked = (p: string) => fsp.lstat(p).then((st) => !st.isDirectory(), (err: NodeJS.ErrnoException) => err.code !== "ENOENT");
+  const folders = [...rec.movedFolders, ...(Array.isArray(sw.movedFolders) ? sw.movedFolders.filter((f): f is string => typeof f === "string") : [])];
+  for (const p of [join(rec.oldRoot, "MOVED.json"), ...folders.map((f) => join(rec.oldRoot, ...f.split("/"), "MOVED.json"))]) {
+    if (await marked(p)) return undefined;
+  }
+  return rec.oldRoot;
+}
+
+/**
+ * R612 m-B: the folder `root`, of the library `libraryId`, holds the copy of this computer's move whose switch began and
+ * whose own mark is neither recorded in the journal nor seen at the old place: the journal at `root` in its switching
+ * phase without "mark-old" done; this computer's record of THAT move (its id) naming this folder; and the old place out
+ * of reach, or showing no mark of that move (the top's MOVED.json, or for a split a moved project's, naming the library
+ * with that move's id or with none, as the finishing at an opening counts it; for a split, nor its library.json rewritten
+ * as that split's remaining library). No audit anchor can then be newer than this copy unless the library went on
+ * elsewhere, so the copy's logs are not compared with this computer's record of them. Reads only.
+ */
+export async function unmarkedMoveCopyAt(deps: CfgDeps, root: string, libraryId: string): Promise<boolean> {
+  let j: { libraryId?: unknown; phase?: unknown; switch?: { pendingId?: unknown; moveId?: unknown; done?: unknown; movedFolders?: unknown; remainingLibraryId?: unknown } } | null;
+  try {
+    j = JSON.parse(await fsp.readFile(join(root, ".move-journal.json"), "utf8")) as typeof j;
+  } catch {
+    return false;
+  }
+  const sw = j?.switch;
+  if (j?.phase !== "switching" || j.libraryId !== libraryId || typeof sw?.pendingId !== "string" || typeof sw.moveId !== "string" || !Array.isArray(sw.done) || sw.done.includes("mark-old")) return false;
+  const rec = await getPendingOldCopy(deps, sw.pendingId).catch(() => undefined);
+  if (!rec || rec.libraryId !== libraryId || rec.moveId !== sw.moveId || !(await sameFolder(rec.newRoot, root))) return false;
+  if (!(await fsp.stat(rec.oldRoot).then((st) => st.isDirectory(), () => false))) return true;
+  const folders = Array.isArray(sw.movedFolders) ? sw.movedFolders.filter((f): f is string => typeof f === "string") : [];
+  const marks = rec.split ? folders.map((f) => join(rec.oldRoot, ...f.split("/"), "MOVED.json")) : [join(rec.oldRoot, "MOVED.json")];
+  for (const p of marks) {
+    try {
+      const m = JSON.parse(await fsp.readFile(p, "utf8")) as { libraryId?: unknown; moveId?: unknown };
+      if (m.libraryId === libraryId && (m.moveId === undefined || m.moveId === sw.moveId)) return false;
+    } catch {
+      // no mark of that move here
+    }
+  }
+  if (rec.split && typeof sw.remainingLibraryId === "string") {
+    try {
+      if ((JSON.parse(await fsp.readFile(join(rec.oldRoot, "library.json"), "utf8")) as { libraryId?: unknown }).libraryId === sw.remainingLibraryId) return false;
+    } catch {
+      // not rewritten
+    }
+  }
+  return true;
+}
+
 export async function getPendingOldCopy(deps: CfgDeps, id: string): Promise<PendingOldCopy | undefined> {
   return (await load(deps)).find((r) => r.id === id);
 }

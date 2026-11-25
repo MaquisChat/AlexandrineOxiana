@@ -562,3 +562,21 @@ describe("R590 (FR-755): what the app cannot finish", () => {
     cleanup();
   });
 });
+
+describe("FR-068 (R607 c): the folder of a move that did not finish, whose library is still at its old place", () => {
+  it("says what the folder is, where the library still is (the researcher's text, isolated), that nothing here is the library and that the folder can be deleted; other unfinished moves keep their words", () => {
+    const place = "/Volumes/Field SSD/Library ‮gpj";
+    const banners = bannersFor({ mode: "read-only", readOnlyReason: "move-incomplete", staleMoveOf: place });
+    expect(banners).toEqual([{ kind: "read-only", reason: "move-incomplete", oldRoot: place }]);
+    render(<StatusBanner variant={banners[0]!} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe(
+      `Read-only — this folder holds the copy of a move that did not finish. The library is still at ${place}, and nothing here is the library. This folder can be deleted.`,
+    );
+    expect(status.querySelector("bdi, [dir='auto']")?.textContent).toContain(place);
+    cleanup();
+    render(<StatusBanner variant={bannersFor({ mode: "read-only", readOnlyReason: "move-incomplete" })[0]!} />);
+    expect(screen.getByRole("status").textContent).toBe("Read-only — a move into this folder has not finished. Changes are off.");
+    cleanup();
+  });
+});

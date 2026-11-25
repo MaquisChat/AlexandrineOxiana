@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditEvent, Provenance, SourceDraft } from "@ao/core";
@@ -445,7 +445,9 @@ describe("executeMove", () => {
     // Old copy untouched except for its MOVED.json marker; lock released; it now opens read-only.
     expect(await hashes(lib.root, (r) => r === "MOVED.json")).toEqual(before);
     const marker = JSON.parse(await readFile(join(lib.root, "MOVED.json"), "utf8"));
-    expect(marker).toEqual({ libraryId: lib.id, movedAt: NOW, toHint: "host-A:Lib" });
+    // FR-068 (R607 a): the mark carries the move's id (the one the move's audit event records).
+    expect(marker).toEqual({ libraryId: lib.id, movedAt: NOW, toHint: "host-A:Lib", moveId: (await auditOf(dest, a.folder)).at(-1)!.details!.moveId });
+    expect(marker.moveId).toEqual(expect.any(String));
     await expect(stat(join(lib.root, ".lock"))).rejects.toThrow();
     const old = await openLibrary(lib.root, mkDeps());
     expect([old.mode, old.readOnlyReason]).toEqual(["read-only", "moved"]);
@@ -1817,5 +1819,358 @@ describe("FR-755 (R599 M-1): on a computer whose audit anchors were lost, an int
     const destAt = await hashes(dest);
     await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "files-differ", detail: { count: 1 } });
     expect(await hashes(dest)).toEqual(destAt);
+  });
+});
+
+describe("FR-068 (R607 a): a move into a folder holding a stopped move's switch resumes only that very move, once its old copy is marked; otherwise it is refused and nothing is written", () => {
+  // R612 I-A: the delete-words only where the folder is provably a stale copy; otherwise the words that never advise deleting it.
+  const STALE = "That folder holds the copy of an earlier move that did not finish. Choose another, empty folder, or delete that folder first.";
+  const UNFINISHED = "That folder holds a library whose move there has not finished. Choose another, empty folder. To finish that move, open the library at that folder.";
+  const refusedWith = (message: string) => ({ name: "MoveNotAllowedError", code: "destination-not-empty", message });
+  const journalOf = async (dest: string) => JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8"));
+  const config = () => hashes(join(tmp, "config"));
+  const sourcesOf = (r: Repo, pid: string) => r.listSourceIds(pid).length;
+
+  /**
+   * A move of `lib` that fails after its copy was verified and its journal entered the switching phase, but before the
+   * old copy was marked: a folder stands where the mark must go (the top's, or each moved project's). The obstacle is
+   * then removed; the old library is still open here, read-write.
+   */
+  async function failedBeforeMark(lib: Library, dest: string, exclude: string[] = [], movedFolders: string[] = []) {
+    const at = movedFolders.length ? movedFolders.map((f) => join(lib.root, f, "MOVED.json")) : [join(lib.root, "MOVED.json")];
+    for (const p of at) await mkdir(p);
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env, excludeProjectIds: exclude })).rejects.toThrow();
+    for (const p of at) await rm(p, { recursive: true });
+    const j = await journalOf(dest);
+    expect([j.phase, j.switch.done, lib.mode]).toEqual(["switching", [], "read-write"]);
+  }
+
+  /** The move asked again from `lib` into `dest`, by the plan, the early plan and the move itself: each refused, nothing written anywhere. */
+  async function refusedEverywhere(lib: Library, dest: string, places: string[], exclude: string[] = [], words: string = STALE) {
+    const refused = refusedWith(words);
+    const before = [await config(), ...(await Promise.all(places.map((p) => hashes(p))))];
+    await expect(planMove(lib, dest, env)).rejects.toMatchObject(refused);
+    await expect(acceptMovePlan(lib, dest, { deps: mkDeps(), env, excludeProjectIds: exclude })).rejects.toMatchObject(refused);
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env, excludeProjectIds: exclude })).rejects.toMatchObject(refused);
+    expect([await config(), ...(await Promise.all(places.map((p) => hashes(p))))]).toEqual(before);
+  }
+
+  it("the FR-068 sequence: failed before the mark; the old library takes a change; the move asked again to that folder without a plan is refused, nothing is written, and the old library is still the library with its change", async () => {
+    const { lib, repo, a } = await fixture();
+    const dest = join(tmp, "Dest");
+    await failedBeforeMark(lib, dest);
+    await repo.createSource(a.id, draft("Four"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() });
+    await refusedEverywhere(lib, dest, [lib.root, dest]);
+    expect(lib.mode).toBe("read-write");
+    expect(sourcesOf(repo, a.id)).toBe(4);
+    expect((await journalOf(dest)).switch.done).toEqual([]);
+  });
+
+  it("C-1: A→B fails before the mark; A→C succeeds and the library at C changes; the move from C to B is refused (plan and move), both folders unchanged; the opening of B does not finish B's switch over A's mark of the move to C", async () => {
+    const { lib, a } = await fixture();
+    const b = join(tmp, "B");
+    const c = join(tmp, "C");
+    await failedBeforeMark(lib, b);
+    expect((await executeMove(lib, c, { deps: mkDeps(), env })).verified).toBe(true);
+    // With nothing changed since, the opening of B must not take A's mark (of the move to C) for the mark of B's move.
+    const [aAt, bAt, cAt, cfgAt] = [await hashes(lib.root), await hashes(b), await hashes(c), await config()];
+    expect(await finishMoveAt(b, mkDeps())).toBeUndefined();
+    expect([await hashes(lib.root), await hashes(b), await hashes(c), await config()]).toEqual([aAt, bAt, cAt, cfgAt]);
+    const atC = await openLibrary(c, mkDeps());
+    open.push(atC);
+    const repoC = await openTestRepo(atC, ring, { clock: () => now, tz: "UTC", actor: "tester", scryptN: FAST });
+    await repoC.createSource(a.id, draft("Four"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() });
+    await refusedEverywhere(atC, b, [c, b, lib.root]);
+    expect(atC.mode).toBe("read-write");
+    expect(sourcesOf(repoC, a.id)).toBe(4);
+    expect((await listLibraries(mkDeps())).find((e) => e.libraryId === lib.id)!.lastKnownPaths[0]).toBe(c);
+  });
+
+  it("a mark naming another library at the old place does not count: refused", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await failedBeforeMark(lib, dest);
+    const { switch: sw } = await journalOf(dest);
+    await writeFile(join(lib.root, "MOVED.json"), JSON.stringify({ libraryId: "01ANOTHERLIBRARY0000000000", movedAt: NOW, toHint: "host-A:Dest", moveId: sw.moveId }));
+    await refusedEverywhere(lib, dest, [lib.root, dest]);
+  });
+
+  it("back and forth (A→B, then B→A, then A→C failing before its mark): a stale mark of an earlier move at A, with its id or without one, does not count: refused", async () => {
+    const { lib } = await fixture();
+    const there = join(tmp, "There");
+    const first = await executeMove(lib, there, { deps: mkDeps(), env });
+    const markOfFirst = await readFile(join(lib.root, "MOVED.json"), "utf8");
+    expect((await deleteOldCopy(lib.root, first.confirmToken)).rootRemoved).toBe(true);
+    const atThere = await openLibrary(there, mkDeps());
+    open.push(atThere);
+    await executeMove(atThere, lib.root, { deps: mkDeps(), env });
+    const markOfSecond = await readFile(join(there, "MOVED.json"), "utf8");
+    const back = await openLibrary(lib.root, mkDeps());
+    open.push(back);
+    expect(back.mode).toBe("read-write");
+    const c = join(tmp, "C");
+    await failedBeforeMark(back, c);
+    const { moveId } = JSON.parse(markOfFirst) as { moveId?: string };
+    expect(moveId).toBeDefined();
+    expect(moveId).not.toBe((await journalOf(c)).switch.moveId);
+    const { moveId: _drop, ...noId } = JSON.parse(markOfFirst) as Record<string, unknown>;
+    // R612 I-A: a mark carrying another move's id: provably stale (STALE); a mark without an id: it may be this move's (UNFINISHED).
+    for (const [stale, words] of [[markOfFirst, STALE], [markOfSecond, STALE], [JSON.stringify(noId), UNFINISHED]] as const) {
+      await writeFile(join(lib.root, "MOVED.json"), stale);
+      await refusedEverywhere(back, c, [lib.root, c], [], words);
+    }
+  });
+
+  it("a split whose library holds a project marked by an EARLIER split: the later split fails before its first mark; run again it is refused", async () => {
+    const f = await fixture();
+    const c = (await f.repo.createProject({ name: "C", governanceYaml: CLOUD_OK_GOV, encryption: { enabled: false } })).project;
+    // The earlier split: A goes; B and C stay, and the old folder becomes the remaining library, A's folder marked there.
+    await executeMove(f.lib, join(tmp, "First"), { deps: mkDeps(), env, excludeProjectIds: [f.b.id, c.id] });
+    const rest = await openLibrary(f.lib.root, mkDeps());
+    open.push(rest);
+    expect([rest.mode, rest.id === f.lib.id]).toEqual(["read-write", false]);
+    expect(JSON.parse(await readFile(join(f.lib.root, f.a.folder, "MOVED.json"), "utf8")).moveId).toEqual(expect.any(String));
+    const repo = await openTestRepo(rest, ring, { clock: () => now, tz: "UTC", actor: "tester", scryptN: FAST });
+    const dest = join(tmp, "Second");
+    await failedBeforeMark(rest, dest, [c.id], [f.b.folder]);
+    await repo.createSource(f.b.id, draft("Bee two"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() });
+    await refusedEverywhere(rest, dest, [f.lib.root, dest], [c.id]);
+    expect(sourcesOf(repo, f.b.id)).toBe(2);
+  });
+
+  it("the old place cannot be reached: whether it is marked cannot be seen: refused", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await failedBeforeMark(lib, dest);
+    await rename(lib.root, join(tmp, "Away"));
+    try {
+      await refusedEverywhere(lib, dest, [dest], [], UNFINISHED);
+    } finally {
+      await rename(join(tmp, "Away"), lib.root);
+    }
+  });
+
+  it("a copy of the library made by hand (the same id) moved to that folder: refused (it is not the move's old place)", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await failedBeforeMark(lib, dest);
+    const hand = join(tmp, "Hand");
+    await cp(lib.root, hand, { recursive: true });
+    await rm(join(hand, ".lock"));
+    const copy = await openLibrary(hand, mkDeps());
+    open.push(copy);
+    expect([copy.mode, copy.id]).toEqual(["read-write", lib.id]);
+    await refusedEverywhere(copy, dest, [hand, dest, lib.root]);
+  });
+
+  it("the process killed between the switching journal and the mark; the old library opened again and changed; the move asked again is refused, nothing written", async () => {
+    const f = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.crashAfter = "switching-journal";
+    await expect(executeMove(f.lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    expect(moveSeams.crashAfter).toBeUndefined();
+    await f.lib.close();
+    expect((await journalOf(dest)).phase).toBe("switching");
+    const lib = await openLibrary(f.lib.root, mkDeps());
+    open.push(lib);
+    expect(lib.mode).toBe("read-write");
+    const repo = await openTestRepo(lib, ring, { clock: () => now, tz: "UTC", actor: "tester", scryptN: FAST });
+    await repo.createSource(f.a.id, draft("Four"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() });
+    await refusedEverywhere(lib, dest, [lib.root, dest]);
+    expect(sourcesOf(repo, f.a.id)).toBe(4);
+  });
+
+  it("a mark written by an older build (no move id) and not recorded in the journal: the move refuses to resume, and the opening of the new place still finishes the move as before", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toMatchObject({ code: "ENOSPC" });
+    expect((await journalOf(dest)).switch.done).toEqual([]);
+    const mark = JSON.parse(await readFile(join(lib.root, "MOVED.json"), "utf8")) as Record<string, unknown>;
+    expect(mark.moveId).toBe((await journalOf(dest)).switch.moveId);
+    const { moveId: _drop, ...older } = mark;
+    await writeFile(join(lib.root, "MOVED.json"), JSON.stringify(older, null, 2));
+    await refusedEverywhere(lib, dest, [lib.root, dest], [], UNFINISHED);
+    await lib.close();
+    expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+    expect((await openLibrary(lib.root, mkDeps())).readOnlyReason).toBe("moved");
+  });
+
+  it("R612 I-A: this move's mark seen at the old place, the move asked by a copy of the library made by hand: refused in the words that never advise deleting the folder (it is the library's new place)", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    const hand = join(tmp, "Hand");
+    await cp(lib.root, hand, { recursive: true });
+    await rm(join(hand, ".lock"));
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toMatchObject({ code: "ENOSPC" });
+    expect((await journalOf(dest)).switch.done).toEqual([]);
+    expect(JSON.parse(await readFile(join(lib.root, "MOVED.json"), "utf8")).moveId).toBe((await journalOf(dest)).switch.moveId);
+    const copy = await openLibrary(hand, mkDeps());
+    open.push(copy);
+    expect([copy.mode, copy.id]).toEqual(["read-write", lib.id]);
+    await refusedEverywhere(copy, dest, [hand, dest, lib.root], [], UNFINISHED);
+  });
+
+  it("R612 I-A: this move's mark recorded in the journal, the move asked by a copy of the library made by hand: refused in the words that never advise deleting the folder", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    const hand = join(tmp, "Hand");
+    await cp(lib.root, hand, { recursive: true });
+    await rm(join(hand, ".lock"));
+    moveSeams.crashAfter = "mark-old";
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    expect((await journalOf(dest)).switch.done).toEqual(["mark-old"]);
+    const copy = await openLibrary(hand, mkDeps());
+    open.push(copy);
+    await refusedEverywhere(copy, dest, [hand, dest, lib.root], [], UNFINISHED);
+  });
+
+  it("R612 I-A: this computer's record of the move is missing: refused in the words that never advise deleting the folder", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await failedBeforeMark(lib, dest);
+    const list = join(tmp, "config", "pending-old-copies.json");
+    const v = JSON.parse(await readFile(list, "utf8")) as { records: Array<{ id: string }> };
+    const { pendingId } = (await journalOf(dest)).switch;
+    await writeFile(list, JSON.stringify({ ...v, records: v.records.filter((r) => r.id !== pendingId) }));
+    await refusedEverywhere(lib, dest, [lib.root, dest], [], UNFINISHED);
+  });
+
+  // What does not change: the mark of THIS move recorded in the journal, or seen at the old copy: the switch is resumed,
+  // with no copy and no verification.
+  for (const [what, arm, split] of [
+    ["whole library, the mark recorded", () => void (moveSeams.crashAfter = "mark-old"), false],
+    ["whole library, the mark seen but not recorded", () => void (moveSeams.fail = { at: "journal", after: "mark-old" }), false],
+    ["split, the marks recorded", () => void (moveSeams.crashAfter = "register"), true],
+    ["split, one mark seen but not recorded", () => void (moveSeams.fail = { at: "split-mark", afterFolders: 1 }), true],
+  ] as const) {
+    it(`unchanged: ${what}: run again, the switch is resumed, with no copy and no verification`, async () => {
+      const f = await fixture();
+      let exclude: string[] = [];
+      if (split) exclude = [(await f.repo.createProject({ name: "C", governanceYaml: CLOUD_OK_GOV, encryption: { enabled: false } })).project.id];
+      const dest = join(tmp, "Dest");
+      arm();
+      await expect(executeMove(f.lib, dest, { deps: mkDeps(), env, excludeProjectIds: exclude })).rejects.toThrow();
+      const switched = (rel: string) => rel === ".move-journal.json" || /\/audit\//u.test(rel) || rel === "library.json" || rel === ".lock";
+      const destAt = await hashes(dest, switched);
+      const phases = new Set<string>();
+      const res = await executeMove(f.lib, dest, { deps: mkDeps(), env, excludeProjectIds: exclude, onProgress: (p) => void phases.add(p.phase) });
+      expect([res.verified, res.filesCopied, phases.has("copy"), phases.has("verify")]).toEqual([true, 0, false, false]);
+      expect(await hashes(dest, switched)).toEqual(destAt);
+      expect(await readdir(dest)).not.toContain(".move-journal.json");
+    });
+  }
+});
+
+describe("FR-068 (R607 b): a resumed copy never writes through a link", () => {
+  it("the review's probe P2: the stopped copy's Exports replaced by a link to a folder outside holding a file; the move run again refuses before writing anything, naming it; the file outside is unchanged", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await executeMove(lib, dest, {
+      deps: mkDeps(),
+      env,
+      onProgress: (p) => {
+        if (p.phase === "copy" && p.filesDone >= 3) throw new Error("stop");
+      },
+    }).catch(() => {});
+    expect(JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8")).phase).toBe("copying");
+    const outside = join(tmp, "Outside");
+    await mkdir(outside);
+    await writeFile(join(outside, "private.txt"), "PRECIOUS OUTSIDE FILE");
+    await rm(join(dest, "Exports"), { recursive: true });
+    await symlink(outside, join(dest, "Exports"));
+    const notTheLink = (rel: string) => rel === "Exports";
+    const [destAt, srcAt] = [await hashes(dest, notTheLink), await hashes(lib.root)];
+    const err = await executeMove(lib, dest, { deps: mkDeps(), env }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MoveVerificationError);
+    expect((err as MoveVerificationError).paths).toEqual(["Exports"]);
+    expect((err as Error).message).toBe("Verification failed; nothing was switched or deleted: Exports");
+    expect(await readFile(join(outside, "private.txt"), "utf8")).toBe("PRECIOUS OUTSIDE FILE");
+    expect(await readdir(outside)).toEqual(["private.txt"]);
+    expect([await hashes(dest, notTheLink), await hashes(lib.root)]).toEqual([destAt, srcAt]);
+    expect(lib.mode).toBe("read-write");
+  });
+});
+
+describe("FR-068 (R607 c): the stale folder of a move that stopped before its old copy was marked says what it is and accuses nothing", () => {
+  async function staleCopy() {
+    const f = await fixture();
+    const dest = join(tmp, "Dest");
+    await mkdir(join(f.lib.root, "MOVED.json"));
+    await expect(executeMove(f.lib, dest, { deps: mkDeps(), env })).rejects.toThrow();
+    await rm(join(f.lib.root, "MOVED.json"), { recursive: true });
+    // The living library goes on: its audit logs, and this computer's record of their heads, move on past the copy's.
+    await f.repo.createSource(f.a.id, draft("Four"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() });
+    return { ...f, dest };
+  }
+  const openedAt = async (root: string) => {
+    const lib = await openLibrary(root, mkDeps());
+    open.push(lib);
+    return { lib, repo: await openTestRepo(lib, ring, { clock: () => now, tz: "UTC", scryptN: FAST }) };
+  };
+
+  it("opened, it is read-only, names the old place where the library still is, and no audit log is compared with this computer's record of it; nothing is written", async () => {
+    const { lib, dest } = await staleCopy();
+    const before = await hashes(dest);
+    const { lib: stale, repo } = await openedAt(dest);
+    expect([stale.mode, stale.readOnlyReason, stale.staleMoveOf]).toEqual(["read-only", "move-incomplete", lib.root]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toEqual([]);
+    expect(await hashes(dest)).toEqual(before);
+  });
+
+  // R612 m-B: no anchor can be newer than this copy unless the library went on elsewhere: wherever this move's own mark is
+  // neither recorded nor seen, no audit log is compared with this computer's record (no untrue "changed outside the app").
+  it("the old place out of reach (G6b): not said to be the library (today's words), and no audit log compared with this computer's record; nothing written", async () => {
+    const { lib, dest } = await staleCopy();
+    await lib.close();
+    await rename(lib.root, join(tmp, "Away"));
+    const before = await hashes(dest);
+    const { lib: opened, repo } = await openedAt(dest);
+    expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toEqual([]);
+    expect(await hashes(dest)).toEqual(before);
+  });
+
+  it("the old place deleted: not said to be the library, and no audit log compared with this computer's record", async () => {
+    const { lib, dest } = await staleCopy();
+    await lib.close();
+    await rm(lib.root, { recursive: true });
+    const { lib: opened, repo } = await openedAt(dest);
+    expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toEqual([]);
+  });
+
+  it("the old place marked by a later move to another folder (G6: it is no longer the library): not said to be the library, and no audit log compared with this computer's record", async () => {
+    const { lib, dest } = await staleCopy();
+    await executeMove(lib, join(tmp, "C"), { deps: mkDeps(), env });
+    const { lib: opened, repo } = await openedAt(dest);
+    expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toEqual([]);
+  });
+
+  it("this move's mark seen at the old place (not recorded): the logs are still compared: a log emptied by hand gives its warning", async () => {
+    const f = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    await expect(executeMove(f.lib, dest, { deps: mkDeps(), env })).rejects.toMatchObject({ code: "ENOSPC" });
+    expect((await readFile(join(f.lib.root, "MOVED.json"), "utf8")).length).toBeGreaterThan(0);
+    const log = join(dest, f.a.folder, "audit", (await readdir(join(dest, f.a.folder, "audit"))).filter((n) => n.endsWith(".jsonl")).sort()[0]!);
+    await writeFile(log, "");
+    const { lib: opened, repo } = await openedAt(dest);
+    expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toContain("empty");
+  });
+
+  it("once the old copy is marked by the move, the new place is not a stale copy: a log emptied by hand there still gives its warning", async () => {
+    const f = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.crashAfter = "close-source";
+    await expect(executeMove(f.lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    const log = join(dest, f.a.folder, "audit", (await readdir(join(dest, f.a.folder, "audit"))).filter((n) => n.endsWith(".jsonl")).sort()[0]!);
+    await writeFile(log, "");
+    const { lib: opened, repo } = await openedAt(dest);
+    expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toContain("empty");
   });
 });

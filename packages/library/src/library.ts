@@ -15,7 +15,7 @@ import {
   startHeartbeat,
   type LockInfo,
 } from "./lock.js";
-import { movedToFor, unfinishedSplitFrom, type MovedTo } from "./old-copies.js";
+import { movedToFor, staleMoveCopyAt, unfinishedSplitFrom, unmarkedMoveCopyAt, type MovedTo } from "./old-copies.js";
 import { registerLibrary } from "./registry.js";
 
 export const FORMAT_VERSION = 1;
@@ -47,6 +47,19 @@ export interface Library {
    * move's switch did not finish; complete it with `completeMove(newRoot, …)`.
    */
   movedTo?: MovedTo;
+  /**
+   * FR-068 (R607 c): with `move-incomplete`, this folder holds the copy of this computer's move that stopped before its
+   * old copy was marked, and the library is seen to be still at this old place: nothing here is the library. Its audit
+   * logs are then not compared with this computer's record of them (they are only older than the living library's).
+   */
+  staleMoveOf?: string;
+  /**
+   * R612 m-B: with `move-incomplete`, this folder holds the copy of this computer's move whose own mark is neither
+   * recorded in its journal nor seen at the old place (staleMoveOf, or the old place moved on, deleted or out of reach):
+   * no audit anchor can be newer than this copy unless the library went on elsewhere, so its audit logs are not compared
+   * with this computer's record of them. Their chains are still checked.
+   */
+  anchorsNotCompared?: true;
   /**
    * With `locked-by-other-device`: the name of the device holding the lock (its hostname from the
    * lock file), when known and plausible. Only the device's name: the lock records no user name.
@@ -285,7 +298,14 @@ export async function openLibraryInternal(
   // into a moving project the finishing would have to leave behind.
   const split = await unfinishedSplitFrom(deps, root, meta.libraryId).catch(() => undefined);
   if (split) return readOnly("moved", split);
-  if (!internal.ignoreMoveJournal && (await exists(join(root, MOVE_JOURNAL)))) return readOnly("move-incomplete");
+  if (!internal.ignoreMoveJournal && (await exists(join(root, MOVE_JOURNAL)))) {
+    const staleMoveOf = await staleMoveCopyAt(deps, root, meta.libraryId).catch(() => undefined);
+    // R612 m-B: the copy of this computer's move whose own mark is neither recorded nor seen: its logs are not compared
+    // with this computer's record of them (the banner's words still follow staleMoveOf alone).
+    const anchorsNotCompared = staleMoveOf !== undefined || (await unmarkedMoveCopyAt(deps, root, meta.libraryId).catch(() => false));
+    const lib = readOnly("move-incomplete");
+    return Object.assign(lib, { ...(staleMoveOf ? { staleMoveOf } : {}), ...(anchorsNotCompared ? { anchorsNotCompared: true as const } : {}) });
+  }
   // Same-process double open: the lock on disk is ours, so the lock rules
   // alone would let a second handle through.
   const onDisk = await readLock(root);

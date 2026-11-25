@@ -153,13 +153,14 @@ export async function readLibraryAudit(root: string): Promise<{ events: AuditEve
  * At open: compares the log with its anchor, reports what is wrong library-wide and, when
  * writable, records it (and trims of the log's last line) in the log, then anchors it again.
  */
-export async function checkLibraryAudit(core: RepoCore, anchor: Head | undefined, writable: boolean, trimmed: IncompleteLine[]): Promise<void> {
+export async function checkLibraryAudit(core: RepoCore, anchor: Head | undefined, writable: boolean, trimmed: IncompleteLine[], compareAnchors = true): Promise<void> {
   const { store: s, events, verify } = await AuditStore.load(dirOf(core.root), core.auditSegmentSize);
   core.libraryAudit = s;
   core.libraryAuditLast = [...events].reverse().find((e): e is AuditEvent => e !== null) ?? null;
   core.libraryAuditRecent = events.filter((e): e is AuditEvent => e !== null && e.at.slice(0, 10) === core.libraryAuditLast?.at.slice(0, 10));
   // A library that never had a log, and that this computer never anchored, has nothing to compare.
-  const problem = events.length === 0 && !anchor ? null : checkAnchor(events, verify, anchor, core.device);
+  // `compareAnchors` false (FR-068, R607 c): not compared with this computer's record (no anchor, no "this computer wrote here").
+  const problem = events.length === 0 && !anchor ? null : checkAnchor(events, verify, anchor, compareAnchors ? core.device : undefined);
   if (problem) core.integrityWarnings.push({ projectId: "*", kind: problem.kind, detail: `the library's audit log: ${problem.detail}` });
   if (!writable) return;
   // Only against a log whose chain verifies: otherwise its entries cannot say which reason is whose.

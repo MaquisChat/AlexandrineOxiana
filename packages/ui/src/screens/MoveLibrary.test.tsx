@@ -2,6 +2,7 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
+import { MOVE_FOLDER_STALE_COPY_TEXT, MOVE_FOLDER_UNFINISHED_TEXT } from "@ao/shared";
 import { makeApi, server, url, useMsw } from "../test/msw-governance";
 import { MoveLibrary } from "./MoveLibrary";
 
@@ -140,6 +141,91 @@ describe("Move library", () => {
       `The move of the projects did not finish, so the library has been closed. Open the new library first, at its new place, ${DEST}: the move will be finished then. Until then the library they came from opens only read-only; after that it opens again for the projects that stayed. Nothing is lost.`,
     );
     expect(alert.querySelector("[dir='auto']")?.textContent).toBe(DEST);
+  });
+
+  it("FR-068 (R607 d): a move that stopped before the library was switched says so in its own sentence naming the copy's place, in place of the generic words, with nothing appended", async () => {
+    const user = userEvent.setup();
+    const body = {
+      code: "CONFLICT",
+      message: "The move stopped before the library was switched. Nothing of the library was deleted, and it stays where it was. The copy made at the new place is not used and can be deleted. To move the library, choose another, empty folder.",
+      reason: "move-stopped-before-switch",
+    };
+    server.use(
+      http.post(url("/libraries/move"), () =>
+        new HttpResponse(`${JSON.stringify({ progress: { phase: "switch", filesDone: 120, fileCount: 120, bytesDone: 5, totalBytes: 5 } })}\n${JSON.stringify({ error: body })}\n`, { headers: { "content-type": "application/x-ndjson" } }),
+      ),
+    );
+    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+    await user.click(within(plan).getByRole("button", { name: "Move library" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      `The move stopped before the library was switched. Nothing of the library was deleted, and it stays where it was. The copy made at ${DEST} is not used and can be deleted. To move the library, choose another, empty folder.`,
+    );
+    expect(alert.querySelector("bdi, [dir='auto']")?.textContent).toBe(DEST);
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(screen.queryByText(/The move stopped; nothing was deleted/u)).toBeNull();
+    expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  for (const [cause, words] of [
+    ["disk-full", "the disk is full"],
+    ["permission", "permission was refused"],
+    ["read-only-disk", "the disk can only be read"],
+  ] as const) {
+    it(`R612 m-A: a move that stopped because the library's old folder could not be written to (${cause}) names the cause and the copy's place, and does not send the researcher to another folder`, async () => {
+      const user = userEvent.setup();
+      server.use(
+        http.post(url("/libraries/move"), () =>
+          new HttpResponse(`${JSON.stringify({ error: { code: "CONFLICT", message: "x", reason: `move-stopped-before-switch-${cause}` } })}\n`, { headers: { "content-type": "application/x-ndjson" } }),
+        ),
+      );
+      const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+      await user.click(within(plan).getByRole("button", { name: "Move library" }));
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toBe(
+        `The move stopped before the library was switched, because the library's old folder could not be written to (${words}). Nothing of the library was deleted, and it stays where it was. The copy made at ${DEST} is not used and can be deleted. Free space or restore access at the library's folder before moving the library again.`,
+      );
+      expect(alert.querySelector("[dir='auto']")?.textContent).toBe(DEST);
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
+      expect(screen.queryByText(/choose another, empty folder/u)).toBeNull();
+    });
+  }
+
+  describe("R610 (2), R612: a refusal shows its reason, the sentence the service gives, in the dialog's alert", () => {
+    const refusedPlan = (reason: string) => http.post(url("/libraries/move/plan"), () => HttpResponse.json({ error: { code: "POLICY_DENIED", message: "The library cannot be moved there.", reason } }, { status: 403 }));
+    for (const [what, reason] of [
+      ["a folder provably holding a stale copy (S1)", MOVE_FOLDER_STALE_COPY_TEXT],
+      ["a folder that may hold the library whose move has not finished (S2)", MOVE_FOLDER_UNFINISHED_TEXT],
+      ["an ordinary folder that is not empty", "The destination folder is not empty; choose an empty folder"],
+    ] as const) {
+      it(`Check destination refused for ${what}: the message and its reason, word for word, one alert`, async () => {
+        const user = userEvent.setup();
+        server.use(refusedPlan(reason));
+        render(<MoveLibrary api={makeApi()} />);
+        await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
+        await user.click(screen.getByRole("button", { name: "Check destination" }));
+        const alert = await screen.findByRole("alert");
+        expect(alert.textContent).toBe(`The library cannot be moved there. ${reason}`);
+        expect(alert.querySelector("[dir='auto']")?.textContent).toBe(reason);
+        expect(screen.getAllByRole("alert")).toHaveLength(1);
+        expect(screen.queryByRole("region", { name: "Move plan" })).toBeNull();
+      });
+    }
+
+    it("the move refused at its own plan (a line of the stream): the message and its reason, with nothing appended", async () => {
+      const user = userEvent.setup();
+      server.use(
+        http.post(url("/libraries/move"), () =>
+          new HttpResponse(`${JSON.stringify({ error: { code: "POLICY_DENIED", message: "The library cannot be moved there.", reason: MOVE_FOLDER_UNFINISHED_TEXT } })}\n`, { headers: { "content-type": "application/x-ndjson" } }),
+        ),
+      );
+      const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+      await user.click(within(plan).getByRole("button", { name: "Move library" }));
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toBe(`The library cannot be moved there. ${MOVE_FOLDER_UNFINISHED_TEXT}`);
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
+      expect(screen.queryByText(/The move stopped; nothing was deleted/u)).toBeNull();
+    });
   });
 
   it("FR-755: the same sentence when the move's answer is read again from move/status after the stream was cut off", async () => {

@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireLock, deviceDeps, openLibrary, type Deps } from "@ao/library";
-import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedSplitText, moveNotFinishedText } from "@ao/shared";
+import { MOVE_FOLDER_STALE_COPY_TEXT, MOVE_FOLDER_UNFINISHED_TEXT, MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, MOVE_STOPPED_BEFORE_SWITCH_REASON, moveNotFinishedSplitText, moveNotFinishedText, moveStoppedBeforeSwitchText } from "@ao/shared";
 import { moveSeams } from "../../../packages/library/src/move.js";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
@@ -396,6 +396,8 @@ describe("FR-755 (R578 (1)): opening the new place of an unfinished move finishe
       const [oldAt, destAt] = [await hashes(path), await hashes(dest)];
       const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
       expect([r.json.mode, r.json.readOnlyReason]).toEqual(["read-only", "move-incomplete"]);
+      // FR-068 (R607 c): the old copy is marked, so this is not the stale copy of a move: its faults are still said, as today.
+      expect([r.json.staleMoveOf, stateOf()]).toEqual([undefined, expect.not.objectContaining({ staleMoveOf: expect.anything() })]);
       // The read-only opening's own check reports the log's fault too (empty, or shortened).
       expect(stateOf().integrityWarnings).toContainEqual({ projectId: "*", project: "library", kind: "move-not-finished-files-differ", detail: expect.any(String), count: 1, place: path });
       expect(kindsNow().filter((k) => k !== "move-not-finished-files-differ")).toEqual([how === "cut to nothing" ? "empty" : "truncated"]);
@@ -576,5 +578,200 @@ describe("FR-755 (R583 I1): a split move (some projects stay behind) that fails 
     const r = await call({ method: "POST", url: "/libraries/open", body: { path: f.dest } });
     expect([r.json.mode, r.json.readOnlyReason]).toEqual(["read-only", "move-incomplete"]);
     expect(kindsNow()).toEqual(["move-cannot-finish-mark-missing"]);
+  });
+});
+
+describe("FR-068 (R607 a): a folder holding the copy of a move that stopped before its old copy was marked is refused, by the plan and by the move asked without it; nothing is written", () => {
+  const STALE = "That folder holds the copy of an earlier move that did not finish. Choose another, empty folder, or delete that folder first.";
+  const refusalStale = { code: "POLICY_DENIED", message: "The library cannot be moved there.", reason: STALE };
+  // R612 I-A: where the folder may hold the library itself, the words never advise deleting it.
+  const refusalUnfinished = { ...refusalStale, reason: MOVE_FOLDER_UNFINISHED_TEXT };
+  const total = async (pid: string) => (await call({ url: `/projects/${pid}/sources` })).json.total as number;
+
+  /** A whole-library move that fails before the old copy is marked (a folder stands where the mark must go); the obstacle then removed. */
+  async function failedBeforeMark(path: string, dest: string) {
+    await mkdir(join(path, "MOVED.json"));
+    expect(lastLine(await move(dest)).error).toBeDefined();
+    await rm(join(path, "MOVED.json"), { recursive: true });
+    expect(JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8")).phase).toBe("switching");
+    expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
+    expect(svc!.state.session!.lib.root).toBe(path);
+  }
+
+  /** The dialog's plan, then the move without it: both refused in those words, nothing written at `places` or this computer's records. */
+  async function refusedTwice(dest: string, places: string[], refusal = refusalStale) {
+    await svc!.state.idle();
+    const before = await Promise.all([join(tmp, "config"), ...places].map((p) => hashes(p)));
+    const plan = await call({ method: "POST", url: "/libraries/move/plan", body: { dest } });
+    expect([plan.status, plan.json.error]).toEqual([403, refusal]);
+    expect(lastLine(await move(dest))).toEqual({ error: refusal });
+    await svc!.state.idle();
+    expect(await Promise.all([join(tmp, "config"), ...places].map((p) => hashes(p)))).toEqual(before);
+  }
+
+  it("the FR-068 sequence: the move fails before the mark; the old library takes a change; the move asked again to that folder is refused; nothing changed; the old library is still the library, with its change", async () => {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    await failedBeforeMark(path, dest);
+    expect((await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await pdf("c.pdf", "Lighthouse keeper diary")] } })).status).toBe(200);
+    await refusedTwice(dest, [path, dest]);
+    expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
+    expect(svc!.state.session!.lib.root).toBe(path);
+    expect(await total(pid)).toBe(3);
+  });
+
+  it("C-1 (the review's sequence): A→B fails before the mark; A→C succeeds; a change at C; the plan to B and the move to B without it are both refused; B and C byte for byte unchanged; C is still the library", async () => {
+    await start();
+    const { path, pid, dest: b } = await libraryWithSources();
+    await failedBeforeMark(path, b);
+    const c = join(tmp, "Moved", "C");
+    expect((await call({ method: "POST", url: "/libraries/move/plan", body: { dest: c } })).status).toBe(200);
+    expect(lastLine(await move(c)).done).toBe(true);
+    expect(svc!.state.session!.lib.root).toBe(c);
+    expect((await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await pdf("c.pdf", "Lighthouse keeper diary")] } })).status).toBe(200);
+    await refusedTwice(b, [b, c, path]);
+    expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
+    expect(svc!.state.session!.lib.root).toBe(c);
+    expect(await total(pid)).toBe(3);
+  });
+
+  it("R612 I-A: this computer's record of that move missing: the plan and the move are refused in the words that never advise deleting the folder", async () => {
+    await start();
+    const { path, dest } = await libraryWithSources();
+    await failedBeforeMark(path, dest);
+    const list = join(tmp, "config", "pending-old-copies.json");
+    const v = JSON.parse(await readFile(list, "utf8")) as { records: Array<{ id: string }> };
+    const { pendingId } = JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8")).switch;
+    await writeFile(list, JSON.stringify({ ...v, records: v.records.filter((r) => r.id !== pendingId) }));
+    await refusedTwice(dest, [path, dest], refusalUnfinished);
+    expect(STALE).toBe(MOVE_FOLDER_STALE_COPY_TEXT);
+  });
+});
+
+describe("FR-068 (R607 c): the stale folder, opened, says what it is and accuses nothing", () => {
+  it("the folder of a move that stopped before its old copy was marked, the library changed since at its old place: read-only, the old place named, no warning, nothing written", async () => {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    await mkdir(join(path, "MOVED.json"));
+    expect(lastLine(await move(dest)).error).toBeDefined();
+    await rm(join(path, "MOVED.json"), { recursive: true });
+    expect((await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await pdf("c.pdf", "Lighthouse keeper diary")] } })).status).toBe(200);
+    await svc!.state.idle();
+    const before = await hashes(dest);
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect([r.status, r.json.mode, r.json.readOnlyReason, r.json.staleMoveOf]).toEqual([200, "read-only", "move-incomplete", path]);
+    expect(stateOf()).toMatchObject({ readOnlyReason: "move-incomplete", staleMoveOf: path });
+    expect(kindsNow()).toEqual([]);
+    await svc!.state.idle();
+    expect(changedFiles(before, await hashes(dest))).toEqual([]);
+  });
+});
+
+describe("R612 m-B: a stopped move's folder whose own mark is neither recorded nor seen shows no 'changed outside the app' warning", () => {
+  async function stoppedCopy() {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    await mkdir(join(path, "MOVED.json"));
+    expect(lastLine(await move(dest)).error).toBeDefined();
+    await rm(join(path, "MOVED.json"), { recursive: true });
+    expect((await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await pdf("c.pdf", "Lighthouse keeper diary")] } })).status).toBe(200);
+    await svc!.state.idle();
+    return { path, pid, dest };
+  }
+
+  it("G6: the library then moved on to another folder: opened, the stopped folder is read-only, not said to be a copy of a library still at its old place, and shows no warning", async () => {
+    const { dest } = await stoppedCopy();
+    const c = join(tmp, "Moved", "C");
+    expect(lastLine(await move(c)).done).toBe(true);
+    await svc!.state.idle();
+    const before = await hashes(dest);
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect([r.status, r.json.mode, r.json.readOnlyReason, r.json.staleMoveOf]).toEqual([200, "read-only", "move-incomplete", undefined]);
+    expect(kindsNow()).toEqual([]);
+    await svc!.state.idle();
+    expect(changedFiles(before, await hashes(dest))).toEqual([]);
+  });
+
+  it("G6b: the old place out of reach: the same, no audit-log warning (only the finishing's own note that the old copy cannot be reached, as before)", async () => {
+    const { path, dest } = await stoppedCopy();
+    await call({ method: "POST", url: "/libraries/close" });
+    await rename(path, join(tmp, "Away"));
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect([r.status, r.json.mode, r.json.readOnlyReason, r.json.staleMoveOf]).toEqual([200, "read-only", "move-incomplete", undefined]);
+    expect(kindsNow()).toEqual(["move-not-finished-old-copy-unreachable"]);
+  });
+});
+
+describe("FR-068 (R607 d): the move's answer after it stopped before the library was switched", () => {
+  const stopped = () => ({ error: { code: "CONFLICT", message: moveStoppedBeforeSwitchText(), reason: MOVE_STOPPED_BEFORE_SWITCH_REASON } });
+
+  it("a whole library: the move fails after its switch began and before any mark: its own sentence, kept as the last failed move; the library goes on where it was", async () => {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    await mkdir(join(path, "MOVED.json"));
+    const lines = await move(dest);
+    expect(lastLine(lines)).toEqual(stopped());
+    expect(JSON.stringify(lines)).not.toContain(tmp);
+    expect(moveStoppedBeforeSwitchText()).toBe(
+      "The move stopped before the library was switched. Nothing of the library was deleted, and it stays where it was. The copy made at the new place is not used and can be deleted. To move the library, choose another, empty folder.",
+    );
+    expect(moveStoppedBeforeSwitchText("/Volumes/Drive/Lib")).toBe(
+      "The move stopped before the library was switched. Nothing of the library was deleted, and it stays where it was. The copy made at /Volumes/Drive/Lib is not used and can be deleted. To move the library, choose another, empty folder.",
+    );
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toEqual({ newRoot: dest, attempt: "a1", ...stopped() });
+    expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
+    expect(svc!.state.session!.lib.root).toBe(path);
+    await svc!.state.idle();
+    expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(2);
+  });
+
+  it("a split that fails before its first mark: the same sentence", async () => {
+    await start();
+    const { path, dest } = await libraryWithSources();
+    const k = await call({ method: "POST", url: "/projects", body: { name: "Kept", governanceYaml: OPEN_GOV, encryption: { enabled: false } } });
+    const kept = k.json.project.id as string;
+    const keptFolder = k.json.project.folder as string;
+    const moving = (await readdir(join(path, "Projects"))).filter((n) => !n.startsWith(".") && `Projects/${n}` !== keptFolder);
+    for (const n of moving) await mkdir(join(path, "Projects", n, "MOVED.json"));
+    expect(lastLine(await move(dest, [kept]))).toEqual(stopped());
+  });
+
+  for (const [code, cause, words] of [
+    ["ENOSPC", "disk-full", "the disk is full"],
+    ["EACCES", "permission", "permission was refused"],
+  ] as const) {
+    it(`R612 m-A: the mark could not be written to the old folder (${code}): the sentence names that cause and does not send the researcher to another folder; the library goes on where it was`, async () => {
+      await start();
+      const { path, pid, dest } = await libraryWithSources();
+      moveSeams.fail = { at: "mark-old", code };
+      const expected = {
+        error: {
+          code: "CONFLICT",
+          message: `The move stopped before the library was switched, because the library's old folder could not be written to (${words}). Nothing of the library was deleted, and it stays where it was. The copy made at the new place is not used and can be deleted. Free space or restore access at the library's folder before moving the library again.`,
+          reason: `${MOVE_STOPPED_BEFORE_SWITCH_REASON}-${cause}`,
+        },
+      };
+      const lines = await move(dest);
+      expect(lastLine(lines)).toEqual(expected);
+      expect(JSON.stringify(lines)).not.toContain(tmp);
+      expect(moveStoppedBeforeSwitchText(undefined, cause)).toBe(expected.error.message);
+      expect((await call({ url: "/libraries/move/status" })).json.failed).toEqual({ newRoot: dest, attempt: "a1", ...expected });
+      expect(existsSync(join(path, "MOVED.json"))).toBe(false);
+      expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
+      expect(svc!.state.session!.lib.root).toBe(path);
+      await svc!.state.idle();
+      expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(2);
+    });
+  }
+
+  it("every other failure keeps its words: a folder that is not empty; a failure once the old copy is marked", async () => {
+    await start();
+    const { dest } = await libraryWithSources();
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, "notes.txt"), "mine");
+    expect(lastLine(await move(dest)).error).toEqual({ code: "POLICY_DENIED", message: "The library cannot be moved there.", reason: "The destination folder is not empty; choose an empty folder" });
+    await rm(join(dest, "notes.txt"));
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    expect(lastLine(await move(dest)).error).toEqual({ code: "UNAVAILABLE", message: moveNotFinishedText(), reason: MOVE_NOT_FINISHED_REASON });
   });
 });
