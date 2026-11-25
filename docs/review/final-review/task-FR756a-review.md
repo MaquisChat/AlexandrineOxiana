@@ -162,3 +162,106 @@ On cleanup:
 - `lint:css`: clean.
 - `lint:colours`: "ok: no hard-coded colours".
 - `@ao/ui` build: ok.
+
+---
+
+# Second look (R602)
+
+Reviewed: head 8063f77 (seven commits after 63612e2), diff `63612e2..HEAD`.
+- Probe files were written, run and deleted.
+- Mutations were made by copying a file aside, editing it, running, and copying it back.
+- The UI was rebuilt from HEAD at the end.
+- `git status --short` is empty, and no process of mine is left running.
+- Nothing was committed, nothing was pushed, and `git stash` was not used.
+
+## Verdict: APPROVED WITH SMALL POINTS
+
+Every Critical and Important finding is closed. Four new Minor points are listed below; none of them blocks the join.
+
+## Per finding
+
+| Finding | State | Evidence |
+|---|---|---|
+| I1: browser scenario not deterministic | **closed** | `e2e/library.spec.ts:502` now waits for "No libraries yet" before setting the hold. Six runs: Chromium 3/3 passed (21.6 s, 22.1 s, 22.1 s); WebKit 3/3 passed (21.9 s, 21.8 s, 22.4 s). With A taken out (the route's first look without `readWithin`, rebuilt), Chromium **failed** ("element(s) not found", the alert never came); restored afterwards. |
+| I2: a stale give-up | **closed** | `Library.tsx:424/504/536` now call `answered(r)` on an answered failure, and `:641` clears the left project's entries on a switch. Probes S, both directions: held then fail shows "could not be reached" only; fail then held shows "did not answer in time" only, for projects and for sources. Fail then refused shows only the service's own sentence, with no "Try again". Held then answered shows nothing. Probe L4 again: on p3, "Loading sources…" is shown with no alert while its read is out, then only p3's refusal. Mutation: both mends taken out, and 2 of the builder's I2 tests fail. |
+| I3: the chooser's own list read | **closed** | `LibraryChooser.tsx:191-225`. See the detail below this table. |
+| M1: one sentence per screen | **closed at rest**; one transient double (N1, below) | Library screen: all 19 combinations were probed: projects held, failed or refused; collections and tags × sources, each in 4 states. Every case gave exactly one no-answer sentence: "could not be reached" wherever any read failed with no answer, "did not answer in time" only where every unanswered read was held. One "Try again" whenever any read got no answer, none otherwise. A service refusal ("Tags refused.", "Sources refused.") is shown beside it as its own sentence, which is right. Find and acquire: all 27 combinations of settings × queue × collections in {held, failed, answered} came to the right single sentence and exactly one "Try again". After "Try again" with everything answered, in both mirrors (settings held with the queue failed, and the reverse): no alert, no button. Watched folders and Zotero sync: **the builder's claim holds** by reading. Watched folders shows the no-answer of the list read only (`WatchedFolders.tsx:357-371`); projects, libraries and collections are silent (`:382-401`). Zotero shows only the state read (`ZoteroSync.tsx:317-322`); history and projects are silent (`:323`, `:336-339`). |
+| M2: "never dropped" tests | **closed** | `sseAttempts` records each attempt's signal. With `clearTimeout(timer)` removed from `events()`, all four screen tests now fail: Library.firstReads, FindAcquire, WatchedFolders, ZoteroSync. |
+| M4: side reads given up silently | **closed** | One probe held the review count, recheck state, `/zotero/sync` and sources together. All four requests were aborted at the 400 ms limit. The only alert was the sources' "did not answer in time", at about 480 ms, so it was neither hidden nor delayed. The review link was not offered, as on a failure. The route's `/tools` read was aborted at the limit with no alert. The tools screen itself (`ToolsSetup`) is unchanged: `FirstUseTools` takes the limit only when it is given. |
+| M5: focus on "Library not found" | **closed** | `LibraryNotFound.tsx:146` gives the heading `tabIndex=-1`. Route test "R602 M5" passes. |
+
+**I3 detail (probes K, at a 300 ms limit):**
+- **Held:** "Loading libraries…" gives way to "The library service did not answer in time." with "Try again". "No libraries yet" is not shown.
+- **Then answered:** the list is shown, no alert, and focus goes to the heading "Choose a library".
+- **Then held again:** the alert comes back, and focus stays on "Try again" throughout.
+- **Then failed:** "could not be reached" with "Try again" (see N2).
+- **A late answer of the given-up read** (the handler answers at 700 ms with an "OLD LIST"): never shown; the fresh list is.
+- **Leaving the screen** while the read is held: the request is aborted, and `console.error` is not called.
+- **The route's alert and the chooser's alert never show together:**
+  - the route's `no-answer` view and the chooser are separate views;
+  - the probed sequence (route given up, then "Try again", then the chooser's read held) showed one alert at each stage;
+  - with "Still opening…" and the chooser's read held, the reopening status line and the chooser's one alert show together, which is right.
+- **Mutation:** with the chooser's read made without `readWithin`, `LibraryChooser.firstRead.test.tsx` fails.
+
+## Browser scenario, six runs plus one
+
+| Run | Result |
+|---|---|
+| Chromium 1, 2, 3 | passed: 21.6 s, 22.1 s, 22.1 s |
+| WebKit 1, 2, 3 | passed: 21.9 s, 21.8 s, 22.4 s |
+| Chromium with A taken out | **failed**: alert not found (41.8 s) |
+
+## New findings
+
+### Critical
+None.
+
+### Important
+None.
+
+### Minor (4)
+
+- **N1. Find and acquire shows two no-answer sentences, and two "Try again" buttons, for one passive-effect cycle.**
+  - **Where:** `FindAcquire.tsx:1511-1512`. The queue tells the screen of its no-answer in a `useEffect`, so it reports only after the commit in which it already rendered its own alert.
+  - **Sequence:**
+    1. The settings read fails with no answer.
+    2. The queue read is held and given up at the limit.
+  - **What happens:** the queue's "did not answer in time" alert and its own "Try again" are inserted under the screen's "could not be reached". They are removed again 4–9 ms later. A MutationObserver saw this in 6 of the 27 combinations, every case where the queue's sentence differs from the one the screen must say.
+  - **Why it matters:** a `role=alert` node that is inserted and then removed may still be announced by a screen reader. The resting state is right.
+  - **Smallest mend:** report in a `useLayoutEffect`; or better, pass the screen's own "has a no-answer" down, so that the queue never renders its no-answer sentence while the screen shows one.
+- **N2. "No libraries yet" beside "could not be reached".**
+  - **Where:** `LibraryChooser.tsx:210`. On a read that failed with no answer, the empty list is shown "as before".
+  - **What the researcher sees:** "No libraries yet. Open a library folder, or create a new library below." under "The library service could not be reached.", although the list was never read.
+  - This was already so for a failed read before this piece, and it now also follows held then failed.
+  - **Smallest mend:** do not render the "No libraries yet" line while `listNoAnswer` is set.
+- **N3. Two side reads are not cancelled when the screen is left.** The recheck-state read (`RecheckProject.tsx:102`) and the Zotero state read (`LibraryZotero.tsx:93`) use `readWithin` without an outer signal. Leaving the screen does not cancel them until the limit. This is bounded at 20 s.
+- **N4. Other screens' silent side reads still have no limit.** Watched folders (projects, libraries, collections) and Zotero sync (projects) still have silent side reads with no limit. R602 M4 named only the library screen's four. They should be listed with FR-756's remainder, since they can hold the browser's connections in the same way.
+
+## Tests run (each file alone, `nice -n 10`, `NODE_OPTIONS=--use-openssl-ca`)
+
+**All passed:**
+
+| File | Tests |
+|---|---|
+| `Library.test.tsx` | 48 |
+| `Library.firstReads.test.tsx` | 16 |
+| `routes/library.test.tsx` | 15 |
+| `LibraryChooser.test.tsx` | 24 |
+| `LibraryChooser.firstRead.test.tsx` | 3 |
+| `LibraryChooser.lostCreate` | 2 |
+| `LibraryChooser.notices` | 5 |
+| `LibraryChooser.shell` | 3 |
+| `FindAcquire.test.tsx` | 232 |
+| `WatchedFolders.test.tsx` | 63 |
+| `ZoteroSync.test.tsx` | 58 |
+| `api/client.test.ts` | 43 |
+| `LibraryNotFound` | 10 |
+| `FirstUseTools` | 23 |
+| `Library.recheck` | 12 |
+| `Library.zotero` | 14 |
+
+**Checks:**
+- `@ao/ui` typecheck: clean.
+- `lint:css`: clean.
+- `lint:colours`: "ok".
+- `@ao/ui` build: ok.

@@ -69,3 +69,107 @@ First reads the screen makes when a library is open, and whether each blocks the
 - Pre-existing: route and Library tests print MSW "unhandled request GET /zotero/sync" (LibraryZotero; `libraryHandlers` has no handler); harmless, not changed.
 - "Library not found" after a retried look: focus falls to the page (its heading is not focusable).
 - No sentence was added to `packages/shared`: both sentences are the page's existing constants in `api/client.ts`.
+
+## After R597 (consumer by consumer; the default of `events()` not flipped)
+
+Commit 63612e2 (from 8155fe1). `FindAcquire.tsx`, `WatchedFolders.tsx` (and `WatchedFoldersRoute`, which passes it on), and `ZoteroSync.tsx` each take a `streamOpenMs` prop (default `STREAM_OPEN_TIMEOUT_MS`, 20 s), the same shape as `Library.tsx`. Each passes `openWithinMs: streamOpenMs` to its `client.events()` call, and the prop is added to that effect's dependencies. Nothing else in production changed.
+
+Tests, two per screen, in each screen's FR-750 describe:
+- "FR-756 C (R597): a stream that never opens is cancelled at the limit and opened afresh after the screen's pause; at that opening … still out … again". The first attempt uses `sseAttempts` "hang", the second opens with nothing on it. All three **failed first**: FindAcquire `expected '' to be '0190a…a1'`; Watched folders: region "Fieldwork scans" not found; Zotero: `zotero-libraries` not found. They pass now, with 2 stream attempts and 2 reads of each first read.
+- "FR-756 C (R597): a stream that has opened is never dropped by the limit, however long it stays quiet". With a 200 ms limit, there is still 1 attempt after 3 s. This test passed both before and after the change.
+
+The limit is not turned on for TranscriptViewer, Capture, StepRun, the reader route, governance, or `guardPendingFind` (as ruled).
+
+Runs, each file alone: `FindAcquire.test.tsx` 229 passed; `WatchedFolders.test.tsx` 63; `ZoteroSync.test.tsx` 58; `api/client.test.ts` 43; `Library.firstReads.test.tsx` 11. The ui typecheck is clean. `git status --short` is empty.
+
+## Fix round (R602)
+
+From 63612e2. One commit per finding. Each test was seen to fail before its mend.
+
+### I1 — the browser scenario (8063f77)
+
+- **Mend.** The scenario now waits for "No libraries yet" before it sets its hold. By then the chooser's own read of the list has been answered.
+- **Runs.** Chromium `--repeat-each 5`: **5 of 5 passed**. WebKit `--repeat-each 5`: **5 of 5 passed**.
+- **With A taken out.** The route's first look was changed to run without `readWithin` (copied aside, rebuilt, run, restored and rebuilt). The scenario then **failed**: the alert was not found.
+- **Spec files.** `library.spec.ts`, `quiet.spec.ts` and `smoke.spec.ts` in Chromium: 7 passed.
+
+### I2 — stale give-ups on the library screen (554ad64)
+
+- **Mend.**
+  - An answered refusal of the projects, the collections or the sources now calls `answered(r)`, which clears that read's give-up.
+  - `selectProject` drops the project left's `collections` and `sources` entries.
+- **Tests** (`Library.firstReads.test.tsx`, "FR-756 I2"):
+  - projects given up, then a refusal after "Try again": only the service's sentence, no "Try again";
+  - the same for sources;
+  - p1's sources given up, then project p3 chosen: "Loading sources…" and no alert while p3's read is out, then only p3's refusal.
+
+### I3 — the chooser's own read of the list (ce37537)
+
+- **Mend.** `LibraryChooser.tsx` takes a `firstReadMs` prop (the route passes it on) and reads the list through `readWithin`.
+  - Given up: "The library service did not answer in time." appears in place of "Loading libraries…", with "Try again". "No libraries yet" is not shown.
+  - Failed with no answer: "The library service could not be reached." with "Try again". The empty list shows as before.
+  - Refused with an answer: its sentence as before.
+  - After a press, once the list is read, focus goes to the heading.
+- **Tests:** new file `LibraryChooser.firstRead.test.tsx`, 3 tests.
+
+### M1 — one sentence per screen (977712a)
+
+- **Library screen.** One alert. It says "could not be reached" if any unanswered read failed with no answer. It says "did not answer in time" only if every unanswered read was given up.
+- **Find screen.** The same rule covers the projects, the settings, the collections and the queue's own read. The queue tells the screen through `onNoAnswer`, and `saidAbove` then hides the queue's own copy. Tests:
+  - projects failed and settings given up: "could not be reached" alone, one "Try again";
+  - settings given up and queue failed: the same;
+  - all reads given up: "did not answer in time".
+- **Watched folders and Zotero cannot show both.**
+  - Watched folders has one read whose no-answer is shown: the list.
+  - Zotero shows only the state read's failure. A failed history read is silent.
+
+### M2 — the "never dropped" tests (fb2728d)
+
+- **Mend.** `sseAttempts` now records each attempt's request signal. The four screen tests assert that the signal is not aborted after the wait.
+- **Check.** With `clearTimeout(timer)` removed from `events()` (copied aside and restored), all four failed: Library, FindAcquire, WatchedFolders, ZoteroSync.
+
+### M3 — later reads (accepted)
+
+- On the library screen the limit also covers every later sources search (each filter change, each reload after a change) and every collections and tags read.
+- It also covers each reopening check of the libraries list.
+
+### M4 — side reads given up silently (4a7786f)
+
+- **Which reads.** The review queue's count (`Library.tsx`), the running recheck's state (`useProjectRecheck`'s `firstReadMs`; `verification.recheckState` takes an optional signal), the Zotero lines (`LibraryZotero` takes `firstReadMs`), and the tools catalogue (`FirstUseTools` takes `firstReadMs`).
+- **Behaviour.** Each read is given up and cancelled at the limit, with no alert. The screen shows what it showed on a failure before, which is nothing.
+- **Tools screen.** `FirstUseTools` takes the limit only when it is given. The library route gives it; `ToolsSetup` does not, so the tools screen is unchanged.
+- **Tests:**
+  - the review count, recheck state and Zotero read are held, all three are aborted at the limit, and nothing new is shown;
+  - the route's tools read is aborted at the limit, with no alert.
+
+### M5 — focus on "Library not found" (855ad11)
+
+- **Mend.** The "Library not found" heading now has `tabIndex=-1`, so the route's focus after a retried look lands on it.
+- **Test:** route test "R602 M5".
+
+### Runs (each file alone)
+
+| File | Tests passed |
+|---|---|
+| `Library.test.tsx` | 48 |
+| `Library.firstReads.test.tsx` | 16 |
+| `routes/library.test.tsx` | 15 |
+| `LibraryChooser.test.tsx` | 24 |
+| `LibraryChooser.firstRead.test.tsx` | 3 |
+| `LibraryChooser.lostCreate` | 2 |
+| `LibraryChooser.notices` | 5 |
+| `LibraryChooser.shell` | 3 |
+| `LibraryNotFound` | 10 |
+| `FindAcquire.test.tsx` | 232 |
+| `WatchedFolders.test.tsx` | 63 |
+| `ZoteroSync.test.tsx` | 58 |
+| `api/client.test.ts` | 43 |
+| `api/verification` | 8 |
+| `Library.recheck` | 12 |
+| `Library.zotero` | 14 |
+| `FirstUseTools` | 23 |
+| `ToolsSetup` | 30 |
+
+- The ui typecheck, `lint:css` and `lint:colours` are clean, and so is the e2e typecheck.
+- The browser runs are listed under I1.
+- `git status --short` is empty.
