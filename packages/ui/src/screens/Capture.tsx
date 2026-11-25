@@ -1207,7 +1207,7 @@ export function CaptureRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS 
     };
   }, [api, firstReadMs, tries]);
   // R605 I2: the list and the Capture screen's own first reads are one page: one sentence and one "Try again".
-  const { page, sentence: pageSentence, retryAll } = usePageHost({
+  const { page, sentence: pageSentence, screenSays, retryAll } = usePageHost({
     sentence: error !== null && unanswered ? error : undefined,
     out: () => listOut.current,
     retry: () => {
@@ -1234,7 +1234,8 @@ export function CaptureRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS 
           ))}
         </select>
       </nav>
-      {(pageSentence ?? error) && (
+      {/* R617 N2: where the screen's alert already says the page's sentence, the list's no-answer is said by it. */}
+      {(pageSentence ?? (screenSays ? undefined : error)) && (
         <p className="ao-capture__error" role="alert">
           {pageSentence ?? error}
         </p>

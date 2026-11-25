@@ -11,6 +11,11 @@
  * - Otherwise a screen shows its own alert as it did, alone on the page.
  * - Either "Try again" reads again everything of the page still out: each read unanswered or still in the air
  *   (`retryAll`).
+ * - R617 N2: the page's sentence is said by ONE alert, and a takeover never says it again. Where a screen's alert already
+ *   says the page's sentence when the host's own read goes unanswered (the screen's read failed, then the list was given
+ *   up: "could not be reached" either way), the screen's alert stays the one that says it, with its "Try again"; the host
+ *   then shows neither its sentence nor its button (`screenSays`). Whichever says the page's sentence keeps saying it
+ *   while the sentence stays the same.
  *
  * A screen shown with no host around it (alone, as in its own tests) is as before: it never yields, and its "Try
  * again" makes its own reads again.
@@ -32,10 +37,15 @@ interface Page {
   join(key: string, part: RefObject<PageRead>): void;
   leave(key: string): void;
   say(key: string, sentence: string | undefined): void;
-  /** The host shows the page's one alert: the screens yield theirs. */
+  /** The host's own read is unanswered: the page says one sentence, by the alert of `shower`; the others yield theirs. */
   hostShows: boolean;
+  /** Who says the page's sentence while `hostShows`: HOST, or the key of the screen whose alert already says it. */
+  shower: string | undefined;
   retryAll(): void;
 }
+
+/** The host, as `Page.shower`. */
+const HOST = "\u0000host";
 
 const PageContext = createContext<Page | null>(null);
 
@@ -44,9 +54,10 @@ export const PageReads = PageContext.Provider;
 
 /**
  * For the route (the page's host): `page` goes to `<PageReads value={page}>` around the screen; `sentence` is the page's
- * one sentence, shown by the host (with one "Try again" calling `retryAll`) when it is not undefined.
+ * one sentence, shown by the host (with one "Try again" calling `retryAll`) when it is not undefined. `screenSays`: a
+ * screen's alert says the page's sentence (R617 N2), so the host shows neither it nor its own unanswered read's words.
  */
-export function usePageHost(host: PageRead): { page: Page; sentence: string | undefined; retryAll: () => void } {
+export function usePageHost(host: PageRead): { page: Page; sentence: string | undefined; screenSays: boolean; retryAll: () => void } {
   const hostRef = useRef(host);
   hostRef.current = host;
   const parts = useRef(new Map<string, RefObject<PageRead>>());
@@ -73,8 +84,20 @@ export function usePageHost(host: PageRead): { page: Page; sentence: string | un
     for (const r of all) if (r.sentence !== undefined || r.out()) r.retry();
   }, []);
   const hostShows = host.sentence !== undefined;
-  const page = useMemo<Page>(() => ({ join, leave, say, hostShows, retryAll }), [join, leave, say, hostShows, retryAll]);
-  return { page, sentence: hostShows ? oneNoAnswerSentence([host.sentence, ...Object.values(said)]) : undefined, retryAll };
+  const pageSentence = hostShows ? oneNoAnswerSentence([host.sentence, ...Object.values(said)]) : undefined;
+  // R617 N2: who says the page's sentence. One that already says it keeps it while its words are the page's; a screen
+  // alone on the page (the host's read answered or out) says its own, and is remembered as the one saying it.
+  const last = useRef<string | undefined>(undefined);
+  let shower: string | undefined;
+  if (hostShows) {
+    const keepers = Object.keys(said).filter((k) => said[k] === pageSentence);
+    if (last.current !== undefined && last.current !== HOST && keepers.includes(last.current)) shower = last.current;
+    else if (host.sentence === pageSentence) shower = HOST;
+    else shower = keepers[0] ?? HOST;
+  } else shower = Object.keys(said)[0];
+  last.current = shower;
+  const page = useMemo<Page>(() => ({ join, leave, say, hostShows, shower, retryAll }), [join, leave, say, hostShows, shower, retryAll]);
+  return { page, sentence: shower === HOST ? pageSentence : undefined, screenSays: hostShows && shower !== HOST, retryAll };
 }
 
 /**
@@ -97,5 +120,5 @@ export function usePageRead(key: string, part: PageRead): { yields: boolean; ret
     say?.(key, part.sentence);
   }, [say, key, part.sentence]);
   const own = useCallback(() => ref.current.retry(), []);
-  return { yields: page?.hostShows === true, retryAll: page ? page.retryAll : own };
+  return { yields: page?.hostShows === true && page.shower !== key, retryAll: page ? page.retryAll : own };
 }

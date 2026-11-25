@@ -119,7 +119,7 @@ export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT
     };
   }, [api, stateSeq, firstReadMs, listTry]);
   // R605 I2: the list and the screen's own first reads are one page: one sentence and one "Try again" for them all.
-  const { page, sentence: pageSentence, retryAll } = usePageHost({
+  const { page, sentence: pageSentence, screenSays, retryAll } = usePageHost({
     sentence: listError && listUnreachable ? listError : undefined,
     out: () => listOut.current,
     retry: () => {
@@ -180,7 +180,8 @@ export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT
           ))}
         </select>
       </nav>
-      {(pageSentence ?? listError) && (
+      {/* R617 N2: where the screen's alert already says the page's sentence, the list's no-answer is said by it. */}
+      {(pageSentence ?? (screenSays ? undefined : listError)) && (
         <p role="alert" className="ao-screen ao-error">
           {pageSentence ?? listError}
         </p>
