@@ -108,7 +108,7 @@ describe("Missing files: the check says how far it is, and can be stopped (R641 
   /** GET /libraries/integrity answered as NDJSON lines the test writes; each request's signal and Accept are kept. */
   function ndjsonCheck() {
     const enc = new TextEncoder();
-    const asks: Array<{ signal: AbortSignal; accept: string | null; send: (line: unknown) => void; end: () => void }> = [];
+    const asks: Array<{ signal: AbortSignal; accept: string | null; send: (line: unknown) => void; end: () => void; cut: () => void }> = [];
     return {
       handler: http.get(url("/libraries/integrity"), ({ request }) => {
         let ctl!: ReadableStreamDefaultController<Uint8Array>;
@@ -121,6 +121,8 @@ describe("Missing files: the check says how far it is, and can be stopped (R641 
           accept: request.headers.get("accept"),
           send: (l) => ctl.enqueue(enc.encode(`${JSON.stringify(l)}\n`)),
           end: () => ctl.close(),
+          /** The connection is lost part-way (as when the service stops). */
+          cut: () => ctl.error(new TypeError("terminated")),
         });
         return new HttpResponse(body, { headers: { "content-type": "application/x-ndjson" } });
       }),
@@ -195,5 +197,24 @@ describe("Missing files: the check says how far it is, and can be stopped (R641 
     check.asks[0]!.send({ error: { code: "CONFLICT", message: "The check was stopped because the library was closed or moved. Open the library again and run the check again." } });
     check.asks[0]!.end();
     expect((await screen.findByRole("alert")).textContent).toBe("The check was stopped because the library was closed or moved. Open the library again and run the check again.");
+  });
+
+  it("a check that fails partway offers “Check again” under its failure; pressed, the failure goes and the library is checked again (review I2)", async () => {
+    const check = ndjsonCheck();
+    server.use(check.handler);
+    render(<MissingFiles api={makeApi()} isWindows={false} />);
+    await waitFor(() => expect(check.asks).toHaveLength(1));
+    // The service goes away mid-check: its answer is cut off.
+    check.asks[0]!.send({ progress: { checked: 3, total: 10 } });
+    check.asks[0]!.cut();
+    expect((await screen.findByRole("alert")).textContent).toBe("The library service's answer was cut off before it finished.");
+    await userEvent.setup().click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(check.asks).toHaveLength(2));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("Checking the library…")).toBeTruthy();
+    check.asks[1]!.send({ result: report([]) });
+    check.asks[1]!.end();
+    expect(await screen.findByText("No files are missing.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
   });
 });

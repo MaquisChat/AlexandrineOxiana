@@ -45,6 +45,7 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
     running.current?.abort();
     const ac = new AbortController();
     running.current = ac;
+    setError(null);
     setStopped(false);
     setProgress(null);
     setIntegrity(null);
@@ -106,7 +107,14 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
           </button>
         </div>
       ) : !integrity ? (
-        error ? null : progress ? (
+        error ? (
+          // A check that failed (partway or at once) has a way on (review I2).
+          <div className="ao-actions">
+            <button type="button" onClick={() => void load()}>
+              Check again
+            </button>
+          </div>
+        ) : progress ? (
           <div className="ao-actions">
             <p role="status">
               Checked {progress.checked.toLocaleString("en-US")} of {progress.total.toLocaleString("en-US")} files…
