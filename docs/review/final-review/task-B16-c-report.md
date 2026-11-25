@@ -57,3 +57,20 @@ Head **52593d8**.
   - 20× each, one file per command: ReviewQueue R641 20/20, backup 20/20, SourceDetail R641 20/20.
   - Typecheck @ao/ui clean. lint:css and lint:colours ok. UI build ok.
   - Chromium: library.spec 6, find.spec 6, review-queue.spec 11 passed.
+
+## Fix round (after the review)
+Head **ade47ad** (six commits on 52593d8). Not pushed.
+- **I1** (aae9de9): `api/governance.ts:252` type gains `warnings`; `GovernanceSettings.tsx:585` shows each below the success line (`ao-warning`, `UserText`). Test `GovernanceSettings.backup.test.tsx:71`; failed first.
+- **I2** (ade47ad): `ReviewQueue.tsx:1215` `heldStale`; `:1911`, `:1922` the two deciding controls are `aria-disabled` while the cards come from the last read. Test `ReviewQueue.test.tsx:1270` (presses send nothing; answered, they send); failed first.
+- **M5, not done:** keeping the cards during the re-read is one line, but it breaks five `ReviewQueue.look.test.tsx` tests (FR-739 2/4, R513: focus when a look closes during a slow re-read). That changes other states.
+- **M1** (4a3bd88): `RebuildIndex.tsx:24`. Test `MissingFiles.test.tsx:105` (StrictMode); failed first.
+- **M2** (4632587): test `FindAcquire.test.tsx:5774`. Passes on this code; fails if `tryAgainRef` is removed.
+- **M3, cannot:** with the guards removed and spies on `console.error`/`warn`, nothing is observable. React 19 drops updates to unmounted components silently. Test unchanged.
+- **M4** (e985509): `e2e/library.spec.ts:540-556` holds the request (`page.route`) until "Backing up…" with `aria-disabled` is seen, then sends it on.
+- **M6** (25c40c0): `StatusBanner.tsx:135`; the screen is labelled "Governance" (nav label, h1). `StatusBanner.test.tsx:117` asserts the exact sentence; failed first.
+
+Changed sentence: "The last automatic backup of {project} failed. Your sources are unchanged; the backup is tried again tomorrow, or make one now with “Back up now” on the project's Governance screen." Backup warnings appear in the route's existing words.
+
+Seen, not touched: while the cards come from the last read, "Show them" lays out an empty section (`layOutAgain` reads a null `itemsRef`). It is not a deciding control.
+
+Runs (single files, `nice -n 10`): GovernanceSettings.backup 7, GovernanceSettings 65, MissingFiles 6, StatusBanner 82, FindAcquire 235, Library 49, ReviewQueue 127, .look 18, .lookUp 31, .firstReads 19, ProjectReviewQueue 26, all passed. 20× each, the I1, I2, M1, M2 tests: 20/20. Typecheck @ao/ui, e2e clean; lint:css, lint:colours ok; UI build ok; Chromium library.spec.ts 6 passed.
