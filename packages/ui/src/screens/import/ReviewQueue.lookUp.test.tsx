@@ -359,4 +359,16 @@ describe("every true sentence in a mix (R585 M3, R592 point 4)", () => {
     await user.click(await screen.findByRole("button", { name: "Look up again" }));
     await waitFor(() => expect(said()).toContain(`${LOOKUP_WAITING_TEXT} ${lookUpGaveUpText(5)}`));
   });
+
+  it('R593: a lookup still waiting that also carries a service the rules deny ("waiting" with "not allowed"): both sentences, and the button with its time', async () => {
+    const later = new Date(Date.now() + 60 * 60_000).toISOString();
+    const reasons = [LOOKUP_WAITING_TEXT, LOOK_UP_AGAIN_TEXT.notAllowed, UNIDENTIFIED];
+    const { user } = setup(entry({ reasons, lookUp: { state: "waiting", tries: 0, canLookUpNow: false, notBefore: later, also: ["not-allowed"] } }));
+    await openEntry(user);
+    expect(reasonsShown()).toEqual(reasons);
+    const b = await screen.findByRole("button", { name: lookUpAgainAfter(when(later)) });
+    expect(b.getAttribute("aria-disabled")).toBe("true");
+    expect(within(matches()).getByText(LOOK_UP_AGAIN_TEXT.notLookedUpYet)).toBeTruthy();
+    expect(lookUpBodies).toEqual([]);
+  });
 });
