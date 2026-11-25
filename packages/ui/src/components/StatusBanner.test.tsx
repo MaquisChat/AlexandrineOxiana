@@ -539,6 +539,15 @@ describe("R583 M5: files at the new place that no longer match", () => {
 });
 
 describe("R590 (FR-755): what the app cannot finish", () => {
+  it("N3: a mark the move left in the old copy, removed outside the app: the opening of the new place says the app cannot finish the move", () => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "*", project: "library", kind: "move-cannot-finish-mark-missing", detail: "x" }] });
+    render(<StatusBanner variant={b!} />);
+    expect(screen.getByRole("status").textContent).toBe(
+      "The move of this library to this folder has not finished, and the app cannot finish it: a mark the move left in the old copy, which keeps that copy from being changed, was removed outside the app. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
+    );
+    cleanup();
+  });
+
   it("N5: the old copy of a move whose record at the new place is damaged does not promise that opening the new place finishes it", () => {
     const place = "/Volumes/Field SSD/Library ‮gpj";
     const banners = bannersFor({ mode: "read-only", readOnlyReason: "moved", moveUnfinishedTo: place, moveCannotFinish: true });

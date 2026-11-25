@@ -1684,6 +1684,28 @@ describe("FR-755 (R583): split moves, the check before finishing, and what canno
     expect(await hashes(dest)).toEqual(destAt);
   });
 
+  // R590 N3: every mark the journal records as made must still be there.
+  it("R590 N3: a moved project's mark the journal records, removed by hand: not finished, nothing written (C)", async () => {
+    const f = await splitFixture();
+    moveSeams.crashAfter = "register";
+    await expect(moveSplit(f)).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    await f.lib.close();
+    await rm(join(f.lib.root, f.a.folder, "MOVED.json"));
+    const [oldAt, destAt] = [await hashes(f.lib.root), await hashes(f.dest)];
+    await expect(finishMoveAt(f.dest, mkDeps())).rejects.toMatchObject({ kind: "mark-missing" });
+    expect(await hashes(f.lib.root)).toEqual(oldAt);
+    expect(await hashes(f.dest)).toEqual(destAt);
+  });
+
+  it("R590 N3: a whole library's top mark the journal records, removed by hand: not finished, nothing written (C2)", async () => {
+    const { lib, dest } = await stopped();
+    await rm(join(lib.root, "MOVED.json"));
+    const [oldAt, destAt] = [await hashes(lib.root), await hashes(dest)];
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "mark-missing" });
+    expect(await hashes(lib.root)).toEqual(oldAt);
+    expect(await hashes(dest)).toEqual(destAt);
+  });
+
   // R590 N4: where the new place cannot be read, whether the move finished cannot be told: the old copy is kept.
   it("R590 N4: the new place's drive not connected: the old copy cannot be deleted, and the refusal says why", async () => {
     const { lib } = await fixture();

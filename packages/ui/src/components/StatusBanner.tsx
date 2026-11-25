@@ -112,6 +112,9 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
     "The move of this library to this folder has not finished, and this version of the app cannot finish it: the library was saved by a newer version of the app. Update the app and open the library again; both copies are kept.",
   "move-cannot-finish-journal-damaged": () =>
     "The move of this library to this folder has not finished, and the app cannot finish it: the record of the move kept in this folder is damaged. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
+  // R590 N3: a mark the move recorded in its old copy (which keeps that copy from taking changes) was removed by hand.
+  "move-cannot-finish-mark-missing": () =>
+    "The move of this library to this folder has not finished, and the app cannot finish it: a mark the move left in the old copy, which keeps that copy from being changed, was removed outside the app. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
   "move-cannot-finish-source-changed": () =>
     "The move of these projects to this folder has not finished, and the app cannot finish it: some of them were changed in the library they came from after they were copied. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
   "move-not-finished": () =>

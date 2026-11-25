@@ -157,6 +157,8 @@ function notFinishedNote(err: unknown, detail: string): OpeningNote {
   if (err instanceof MoveFinishRefusedError && err.kind === "old-copy-unreachable") return { kind: "move-not-finished-old-copy-unreachable", detail, place: err.detail.oldRoot ?? "" };
   if (err instanceof MoveFinishRefusedError && err.kind === "journal-damaged") return { kind: "move-cannot-finish-journal-damaged", detail };
   if (err instanceof MoveFinishRefusedError && err.kind === "source-changed") return { kind: "move-cannot-finish-source-changed", detail };
+  // R590 N3: a mark the move recorded in its old copy was removed by hand.
+  if (err instanceof MoveFinishRefusedError && err.kind === "mark-missing") return { kind: "move-cannot-finish-mark-missing", detail };
   if (err instanceof MoveNotAllowedError && err.code === "newer-format") return { kind: "move-not-finished-newer-format", detail };
   return { kind: notFinishedKind(err), detail };
 }

@@ -404,6 +404,17 @@ describe("FR-755 (R578 (1)): opening the new place of an unfinished move finishe
     });
   }
 
+  it("R590 N3: the old copy's mark the journal records, removed by hand (the reviewer's C2): not finished, read-only, the words say the app cannot finish it", async () => {
+    const { path, dest } = await stoppedAfter("close-source");
+    await rm(join(path, "MOVED.json"));
+    const [oldAt, destAt] = [await hashes(path), await hashes(dest)];
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect([r.json.mode, r.json.readOnlyReason]).toEqual(["read-only", "move-incomplete"]);
+    expect(kindsNow()).toEqual(["move-cannot-finish-mark-missing"]);
+    expect(await hashes(path)).toEqual(oldAt);
+    expect(await hashes(dest)).toEqual(destAt);
+  });
+
   it("R590 N5: the old place of a move whose journal at the new place is damaged: read-only, naming the new place and that the app cannot finish the move", async () => {
     const { path, dest } = await stoppedAfter("close-source");
     await writeFile(join(dest, ".move-journal.json"), "{ damaged");
@@ -534,5 +545,18 @@ describe("FR-755 (R583 I1): a split move (some projects stay behind) that fails 
     const rest = await call({ method: "POST", url: "/libraries/open", body: { path: f.path } });
     expect([rest.status, rest.json.mode, rest.json.moveUnfinishedTo]).toEqual([200, "read-write", undefined]);
     expect(await names()).toEqual(["Kept"]);
+  });
+
+  it("R590 N3: a moved project's mark removed by hand after the journal recorded it (the reviewer's C): not finished, the words say the app cannot finish it", async () => {
+    const f = await splitLibrary();
+    moveSeams.crashAfter = "register";
+    expect(lastLine(await move(f.dest, [f.kept])).error.reason).toBe(MOVE_NOT_FINISHED_SPLIT_REASON);
+    const markedNow: string[] = [];
+    for (const n of await readdir(join(f.path, "Projects"))) if (existsSync(join(f.path, "Projects", n, "MOVED.json"))) markedNow.push(n);
+    expect(markedNow).toHaveLength(2);
+    await rm(join(f.path, "Projects", markedNow[0]!, "MOVED.json"));
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: f.dest } });
+    expect([r.json.mode, r.json.readOnlyReason]).toEqual(["read-only", "move-incomplete"]);
+    expect(kindsNow()).toEqual(["move-cannot-finish-mark-missing"]);
   });
 });

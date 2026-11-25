@@ -846,12 +846,13 @@ export async function completeMove(destRoot: string, deps: Deps, _env?: Location
  * R583: why finishMoveAt did not finish a move that is this computer's own: the journal at the new place cannot be read;
  * the old copy cannot be reached when its marks must be looked at; files at the new place no longer match the move's
  * check (`count`, and whether the old copy at `oldRoot` still matches it: `oldWhole`); a split's projects not yet marked
- * were changed in the library they came from after they were copied. Its message carries no path.
+ * were changed in the library they came from after they were copied; a mark the journal records as made in the old copy
+ * is no longer there (removed by hand, R590 N3). Its message carries no path.
  */
 export class MoveFinishRefusedError extends Error {
   override name = "MoveFinishRefusedError";
   constructor(
-    readonly kind: "journal-damaged" | "old-copy-unreachable" | "files-differ" | "source-changed",
+    readonly kind: "journal-damaged" | "old-copy-unreachable" | "files-differ" | "source-changed" | "mark-missing",
     message: string,
     readonly detail: { count?: number; oldRoot?: string; oldWhole?: boolean } = {},
   ) {
@@ -889,6 +890,14 @@ export async function finishMoveAt(destRoot: string, deps: Deps, opts: { tz?: st
   if (!rec || !(await sameFolder(rec.newRoot, dest)) || rec.libraryId !== j.libraryId) return undefined;
   const markAgain = !sw.done.includes("mark-old");
   if (markAgain && !(await oldCopyMarked(rec, j))) return undefined;
+  // R590 N3: every mark the journal records as made is still there (one removed by hand would let the old copy take
+  // changes the finishing leaves behind). An old copy that cannot be reached is not looked at (R583 M4: finished without it).
+  if (!markAgain && (await fsp.stat(rec.oldRoot).then((st) => st.isDirectory(), () => false))) {
+    const marks = rec.split ? sw.movedFolders.map((f) => join(rec.oldRoot, ...f.split("/"), MOVED_MARKER)) : [join(rec.oldRoot, MOVED_MARKER)];
+    for (const m of marks) {
+      if (!(await markNames(m, j.libraryId))) throw new MoveFinishRefusedError("mark-missing", "A mark the move recorded in its old copy is no longer there", { oldRoot: rec.oldRoot });
+    }
+  }
 
   // R583 M5: the new place checked again against the move's own record of every file it verified. R590 N2: each project's
   // audit log must begin with exactly what was verified, followed only by the switch's own lines; and the new place's
