@@ -19,7 +19,12 @@
  *  5. writes the result as ONE governed change that READS THE ENTRY AGAIN inside itself (R566 2, as
  *     `reviewedAfterWithdrawal`): a decided entry or a removed source → nothing is written (the answer is dropped); else
  *     one new line of the entry — candidates appended, the lookups' tries, last try and outcome, the reasons' sentence for
- *     the new state — audited as LOOK_UP_AGAIN_OP with ids and counts only.
+ *     the new state — audited as LOOK_UP_AGAIN_OP with ids and counts only. Each lookup's result is worked out against
+ *     the entry AS RE-READ there, at the lookup's place in `leftOut` (R585 1, 2): one another look-up settled meanwhile is
+ *     left as it is, and no time moves backwards.
+ *
+ * One look-up of an entry at a time (R585 3): a second call for the same entry while one is under way answers
+ * "under-way" at once, doing nothing.
  */
 import { LookupCancelledError, LookupHttpError, LookupLeftOutError, PROVIDER_HOSTS, failedServicesOf, isSensitive, lookupContextFor, lookupDoi, lookupIsbn, providerAllowed, searchTitle, type HttpClient, type LookupContext, type LookupResult, type Provider } from "../lookup/index.js";
 import { isClosed, whileOpen } from "../library.js";
@@ -67,7 +72,12 @@ export type LookUpAgainRefusal =
   /** Sent, but the entry was decided or its source removed before the result could be written: the answer was dropped. */
   | "dropped"
   /** Sent (audited), but the library began to close before the answer came: nothing written. */
-  | "cancelled";
+  | "cancelled"
+  /**
+   * R585 (3): a look-up of this entry is already under way (in this process, on this library handle): this call did
+   * nothing — nothing audited, nothing sent, nothing written. The one under way writes its result.
+   */
+  | "under-way";
 
 export type LookUpAgainResult =
   | {
@@ -175,9 +185,10 @@ async function askOne(l: LeftOutLookup, ctx: LookupContext, only: string[]): Pro
   }
 }
 
-/** The lookup after this act (see the module comment, step 4). */
-function after(p: Plan, a: Asked | undefined, at: string): LeftOutLookup {
-  const l = p.lookup;
+const laterIso = (a: string | undefined, b: string): string => (a && ms(a) > ms(b) ? a : b);
+
+/** The lookup after this act (see the module comment, step 4), worked out against `l`: the lookup as re-read (R585 2). */
+function after(p: Plan, l: LeftOutLookup, a: Asked | undefined, at: string): LeftOutLookup {
   if (p.notAllowed) return { ...l, outcome: "not-allowed" };
   if (!a) {
     // Every allowed service held: not asked now; it waits for the hold (no try counted).
@@ -185,7 +196,8 @@ function after(p: Plan, a: Asked | undefined, at: string): LeftOutLookup {
   }
   const tries = (l.tries ?? 0) + 1;
   const { outcome: _o, ...base } = l;
-  const tried = { ...base, tries, lastTriedAt: at };
+  // A time never moves backwards (R585 2): a later try written meanwhile keeps its time.
+  const tried = { ...base, tries, lastTriedAt: laterIso(l.lastTriedAt, at) };
   if (a.kind === "found") return { ...tried, outcome: "found" };
   if (a.kind === "nothing" && !p.held.length) return { ...tried, outcome: "nothing" };
   if (a.kind === "failed") {
@@ -200,8 +212,27 @@ function after(p: Plan, a: Asked | undefined, at: string): LeftOutLookup {
   return tries >= LOOK_UP_AGAIN_BOUNDS.maxAutomaticTries ? { ...waiting, outcome: "gave-up" } : waiting;
 }
 
+/**
+ * R585 (2): the lookup at `p`'s place in the entry as re-read inside the change, after this act. A lookup that another
+ * look-up has settled meanwhile ("found" or "nothing" now, not when this act read it) is left as the re-read has it; one
+ * that is not the same lookup any more (it cannot be: nothing reorders `leftOut`) is left too.
+ */
+function settle(p: Plan, cur: LeftOutLookup | undefined, a: Asked | undefined, at: string): LeftOutLookup | undefined {
+  if (!cur) return undefined;
+  const same = (x: LeftOutLookup) => JSON.stringify([x.identifier, x.title, x.creator]);
+  if (same(cur) !== same(p.lookup)) return cur;
+  if (FINAL.has(cur.outcome) && cur.outcome !== p.lookup.outcome) return cur;
+  return after(p, cur, a, at);
+}
+
 /** Thrown inside the change to roll it back: the entry was decided or its source removed meanwhile (nothing written). */
 class Dropped extends Error {}
+
+/**
+ * R585 (3): the entries with a look-up under way, per library handle (the service holds one per library): a second
+ * call for the same entry answers "under-way" at once. A WeakMap: a handle let go takes its set with it.
+ */
+const underWay = new WeakMap<Repo, Set<string>>();
 
 /**
  * Looks up an entry's left-out lookups again (see the module comment). Never throws for the library's state: a closing,
@@ -211,6 +242,11 @@ class Dropped extends Error {}
 export async function lookUpAgain(repo: Repo, http: HttpClient, projectId: string, entryId: string, opts: LookUpAgainOptions): Promise<LookUpAgainResult> {
   const lib = repoLibrary(repo);
   if (opts.closing?.aborted || isClosed(lib)) return no("closing");
+  let busy = underWay.get(repo);
+  if (!busy) underWay.set(repo, (busy = new Set()));
+  const key = JSON.stringify([projectId, entryId]);
+  if (busy.has(key)) return no("under-way");
+  busy.add(key);
   const progress = { sent: false };
   try {
     return await whileOpen(lib, opts.closing, () => run(repo, http, projectId, entryId, opts, progress));
@@ -220,6 +256,8 @@ export async function lookUpAgain(repo: Repo, http: HttpClient, projectId: strin
     if (err instanceof ReadOnlyLibraryError) return no("read-only");
     if (err instanceof ProjectLockedError || isLockedRefusal(err)) return no("locked");
     throw err;
+  } finally {
+    busy.delete(key);
   }
 }
 
@@ -298,7 +336,6 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
     if (a.kind === "found") found.push(...a.results);
   }
   const at = now.toISOString();
-  const next = new Map(plans.map((p) => [p.at, after(p, answered.get(p), at)]));
 
   // 5. One governed change that reads the entry again inside itself.
   let added = 0;
@@ -313,7 +350,12 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
       async (ops) => {
         const cur = (await ops.reviewEntries()).find((x) => x.id === entryId);
         if (!cur || cur.status !== "pending" || !cur.sourceId || !ops.tx.state.sources.has(cur.sourceId)) throw new Dropped();
-        const leftOut = (cur.leftOut ?? []).map((l, i) => next.get(i) ?? l);
+        // R585 (2): each lookup's result is worked out against the entry as re-read here, at its place (R585 1).
+        const leftOut = [...(cur.leftOut ?? [])];
+        for (const p of plans) {
+          const settled = settle(p, leftOut[p.at], answered.get(p), at);
+          if (settled) leftOut[p.at] = settled;
+        }
         const candidates = appendCandidates(cur.candidates, found);
         added = candidates.length - (cur.candidates?.length ?? 0);
         view = lookUpStateOf({ leftOut, ...(cur.hints ? { hints: cur.hints } : {}) });

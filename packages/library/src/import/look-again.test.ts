@@ -182,10 +182,15 @@ function holdRequests(http: HttpClient, when: "before" | "after") {
       await gate;
       return orig(...a);
     }
-    const r = await orig(...a);
+    // An answer that throws (a service asking to wait, with "leave-out") is held as well, then thrown.
+    const r = await orig(...a).then(
+      (v) => ({ v }),
+      (err: unknown) => ({ err }),
+    );
     reached();
     await gate;
-    return r;
+    if ("err" in r) throw r.err;
+    return r.v;
   };
   onTestFinished(() => release());
   return { atGate, release: () => release() };
@@ -616,5 +621,77 @@ describe("decision 31 (c), R585: each left-out lookup is known by its PLACE in l
     expect(end.leftOut![2]).toMatchObject({ services: ["openalex"], title: "Rivers and Memory in Upland Villages", outcome: "nothing" });
     expect(end.reasons.slice(0, 2)).toEqual([LOOK_UP_AGAIN_TEXT.found, LOOK_UP_AGAIN_TEXT.fromFile]);
     expect(end.reasons).not.toContain(LOOKUP_WAITING_TEXT);
+  });
+});
+
+describe("decision 31 (c), R585 I1: two look-ups of one entry", () => {
+  it("P-B, with the in-process guard: while the automatic look-up of an entry is under way, the researcher's act answers \"under-way\" at once — nothing audited, sent or written; the first then writes its own result", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    now += 16 * MIN;
+    const hold = holdRequests(http, "after");
+    const runB = lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) });
+    await hold.atGate; // B was answered "wait"; its write is held
+    const sentBefore = sent.length;
+    const auditBefore = (await auditOf(p)).bytes;
+    const reviewBefore = await readFile(reviewPath(p));
+    answers["api.openalex.org"] = () => SEARCH;
+    expect(await lookUpAgain(repo, client(), p.id, e!.id, { by: "researcher", now: new Date(now + 2 * MIN) })).toEqual({ done: false, why: "under-way" });
+    expect(sent.length).toBe(sentBefore);
+    expect((await auditOf(p)).bytes).toBe(auditBefore);
+    expect(await readFile(reviewPath(p))).toEqual(reviewBefore);
+    hold.release();
+    expect(await runB).toMatchObject({ done: true, state: { state: "waiting" } });
+    // Once it is over, the entry can be looked up again.
+    now += 30 * MIN;
+    expect(await lookUpAgain(repo, client(), p.id, e!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true, state: { state: "found" } });
+  });
+
+  it("P-A: two look-ups of one entry at once — ONE send audit line, ONE request", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    now += 16 * MIN;
+    answers["api.openalex.org"] = () => SEARCH;
+    sent = [];
+    const [r1, r2] = await Promise.all([
+      lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) }),
+      lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) }),
+    ]);
+    expect([r1, r2].filter((r) => r.done)).toHaveLength(1);
+    expect([r1, r2].filter((r) => !r.done)).toEqual([{ done: false, why: "under-way" }]);
+    expect(sent).toHaveLength(1);
+    const { events } = await auditOf(p);
+    expect(events.filter((x) => x.details?.op === LOOK_SEND_OP)).toHaveLength(1);
+    expect(events.filter((x) => x.details?.op === LOOK_UP_AGAIN_OP)).toHaveLength(1);
+  });
+
+  it("(a) without the guard (two handles of the library): the slower look-up's result is worked out against the entry as re-read — a \"found\" written meanwhile stands, no time moves back, matches are appended once", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    const repo2 = await openTestRepo(lib, ring, { scryptN: 2 ** 10, actor: "tester", clock: () => new Date(now), tz: "UTC" });
+    now += 16 * MIN;
+    const tB = new Date(now);
+    const hold = holdRequests(http, "after");
+    const runB = lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: tB });
+    await hold.atGate; // B was answered "wait"; its write is held
+    answers["api.openalex.org"] = () => SEARCH;
+    now += 2 * MIN;
+    const tA = new Date(now);
+    const ra = await lookUpAgain(repo2, client(), p.id, e!.id, { by: "researcher", now: tA });
+    expect(ra).toMatchObject({ done: true, found: 2, state: { state: "found" } });
+    hold.release();
+    expect(await runB).toMatchObject({ done: true, state: { state: "found" } });
+    const end = await entry(p, e!.id);
+    expect(end.leftOut).toHaveLength(1);
+    expect(end.leftOut![0]).toMatchObject({ outcome: "found", lastTriedAt: tA.toISOString() });
+    expect(end.reasons[0]).toBe(LOOK_UP_AGAIN_TEXT.found);
+    expect(end.reasons).not.toContain(LOOKUP_WAITING_TEXT);
+    expect(end.candidates).toHaveLength(2);
   });
 });
