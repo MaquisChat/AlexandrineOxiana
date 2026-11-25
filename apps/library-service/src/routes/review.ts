@@ -102,8 +102,9 @@ function lookUpOut(e: ListedReviewEntry, now: number, held: HeldUntil): ReviewLo
     // R585 M3, R592: every further state true of the entry, in the library's order, and the given-up lookups' tries.
     ...(v.also?.length ? { also: [...v.also] } : {}),
     ...(v.gaveUpTries !== undefined ? { gaveUpTries: v.gaveUpTries } : {}),
-    // R600 I3: a lookup that failed outright is still unanswered (whatever the state word), so the page says it.
-    ...(left.some((l) => l.why === "failed" && l.outcome !== "found" && l.outcome !== "nothing") ? { failed: true as const } : {}),
+    // R600 I3: a lookup that failed outright is still unanswered (whatever the state word), so the page says it. R608 n1:
+    // only while it has no outcome — once the rules refuse it ("not-allowed"), the rules' sentence alone is true.
+    ...(left.some((l) => l.why === "failed" && !l.outcome) ? { failed: true as const } : {}),
   };
 }
 

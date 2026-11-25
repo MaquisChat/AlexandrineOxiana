@@ -1004,3 +1004,32 @@ describe("fix round (R600)", () => {
     expect((await lookUpAudit(lib.pid)).filter((a) => a.op === LOOK_UP_AGAIN_OP).map((a) => a.entry)).toEqual(ids);
   });
 });
+
+describe("second look (R608)", () => {
+  it("n1: `failed` only for a lookup that failed outright and has no outcome — after the rules refuse it, the entry no longer says it could not be reached", { timeout: 60_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(1);
+    // The reviewer's sequence (R595 continued): A asked to wait (the title search); B failed outright (another title).
+    await patchEntry(lib.pid, lib.sources[0]!, (e) => {
+      const { notBefore: _n, ...a } = e.leftOut![0]!;
+      return { leftOut: [e.leftOut![0]!, { ...a, title: "Second harbour ledger", why: "failed" as const }] };
+    });
+    await reopen(lib, 2 * MIN);
+    await svc!.state.idle();
+    const id = bySource(await queue(lib.pid), lib.sources[0]!).id as string;
+    // 1. A answers nothing; B fails again.
+    answer = (_h, path) => (path.includes("Second") ? { statusCode: 500, data: "down" } : NO_RESULTS);
+    const first = await lookUpAgain(lib.pid, id);
+    expect([first.status, first.json.outcome]).toEqual([200, { kind: "nothing" }]);
+    expect(first.json.entry.lookUp.failed).toBe(true);
+    // 2. The project's rules now allow no lookup. 3. A press: B is refused by the rules.
+    const g = await call({ url: `/projects/${lib.pid}/governance` });
+    expect((await call({ method: "PUT", url: `/projects/${lib.pid}/governance`, body: { yaml: NO_LOOKUP_GOV, baseSha256: g.json.sha256 } })).status).toBe(200);
+    const before = sent.length;
+    const r = await lookUpAgain(lib.pid, id);
+    expect([r.status, r.json.outcome]).toEqual([200, { kind: "not-allowed" }]);
+    expect(sent).toHaveLength(before);
+    expect(r.json.entry.lookUp).not.toHaveProperty("failed");
+    expect(bySource(await queue(lib.pid), lib.sources[0]!).lookUp).not.toHaveProperty("failed");
+  });
+});
