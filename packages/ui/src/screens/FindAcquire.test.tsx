@@ -5728,5 +5728,44 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     expect(tryAgain()).toBeNull();
     expect(reads()).toBe(2);
   });
+
+  it("R641 C2 (iv): the settings given up, then a source's panel given up too: the page says one sentence with one “Try again” (the screen's), which reads both again", async () => {
+    const e = entry({ typed: "done", state: "record-complete", sourceId: SID, candidates: [cand({ id: "c1" })], chosen: "c1" });
+    useService({ queues: { [PID]: queue([e]) } });
+    let answer = false;
+    const gate = hang();
+    server.use(
+      http.get(url("/find/screen"), async () => {
+        if (!answer) await gate;
+        return HttpResponse.json(screenSettings);
+      }),
+      http.get(url("/projects/:id/sources/:sid"), async () => {
+        if (!answer) await gate;
+        return HttpResponse.json(SOURCE_FILE);
+      }),
+      http.get(url("/projects/:id/sources/:sid/watch-origin"), () => HttpResponse.json({ origins: [] })),
+    );
+    showWithin(300, `?project=${PID}`);
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+    const user = userEvent.setup();
+    await user.click(within(row("done")).getByRole("button", { name: "Open: “done”" }));
+    const region = await screen.findByRole("region", { name: "Record" });
+    // Past the panel's limit: still one sentence and one button, and neither is inside the panel.
+    await new Promise((r) => setTimeout(r, 900));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+    expect(within(region).queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(within(region).queryByRole("alert")).toBeNull();
+    const detailBefore = count(`/projects/${PID}/sources/${SID}`);
+    answer = true;
+    await user.click(tryAgain()!);
+    await waitFor(() => expect(count("/find/screen")).toBe(2));
+    await waitFor(() => expect(count(`/projects/${PID}/sources/${SID}`)).toBe(detailBefore + 1));
+    await within(region).findByRole("heading", { level: 2 });
+    expect(tryAgain()).toBeNull();
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+  });
 });
 const FIND_SCREEN_EMPTY = "Nothing is in the queue yet.";
