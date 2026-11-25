@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
-import { hang, server, testClient, url, useMockService } from "../test/service";
+import { asksInTurn, hang, server, testClient, url, useMockService } from "../test/service";
 import { ResearcherNameSetting } from "./ResearcherName";
 
 useMockService();
@@ -127,5 +127,41 @@ describe("researcher name: a first read that never settles (FR-756, R584, R586)"
     await user.click(screen.getByRole("button", { name: "Save name" }));
     await screen.findByRole("alert");
     expect(tryAgain()).toBeNull();
+  });
+});
+
+describe("researcher name: a late answer after “Try again”, and an answered failure after a give-up (FR-756, R605 M11)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent ?? "");
+
+  it("a late answer of the read given up, after “Try again”, changes nothing (its request was cancelled)", async () => {
+
+    const asks = asksInTurn(url("/settings/researcher"), ["late", "hold"], () => HttpResponse.json({ name: "Ana Souza" }));
+    server.use(asks.handler);
+    render(<ResearcherNameSetting client={testClient()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(asks.signals[0]!.aborted).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    asks.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect((screen.getByRole("textbox", { name: "Your name as researcher" }) as HTMLInputElement).value || null).toBeNull();
+    expect((screen.getByRole("textbox", { name: "Your name as researcher" }) as HTMLInputElement).disabled || null).toBeTruthy();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
+  });
+
+  it("an answered failure after a give-up takes the give-up's sentence away (rule ii)", async () => {
+
+    const asks = asksInTurn(url("/settings/researcher"), ["hold", "refuse"]);
+    server.use(asks.handler);
+    render(<ResearcherNameSetting client={testClient()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    await waitFor(() => expect(alerts().length).toBeGreaterThan(0));
+    expect(alerts()).toEqual(["Your name as researcher could not be read, so it cannot be changed here now. Nothing was changed."]);
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
   });
 });

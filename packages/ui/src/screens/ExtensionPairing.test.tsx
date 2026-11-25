@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { apiError, BROWSER_A, BROWSER_B, codeIdOf, makeApi, pairingService, server, url, useMsw } from "../test/msw-extension";
-import { hang } from "../test/service";
+import { asksInTurn, hang } from "../test/service";
 import { ExtensionPairing } from "./ExtensionPairing";
 
 useMsw();
@@ -1337,5 +1337,41 @@ describe("the pairing screen: a first read of the list that never settles (FR-75
     render(<ExtensionPairing api={makeApi()} firstReadMs={300} />);
     await screen.findByText(/The pairings could not be listed\./);
     expect(tryAgain()).toBeNull();
+  });
+});
+
+describe("the pairing screen: a late answer after “Try again”, and an answered failure after a give-up (FR-756, R605 M11)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent ?? "");
+
+  it("a late answer of the read given up, after “Try again”, changes nothing (its request was cancelled)", async () => {
+    server.use(...pairingService({ pairings: [BROWSER_A] }).handlers);
+    const asks = asksInTurn(url("/extension/pairings"), ["late", "hold"], () => undefined);
+    server.use(asks.handler);
+    render(<ExtensionPairing api={makeApi()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(asks.signals[0]!.aborted).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    asks.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(screen.queryByText(BROWSER_A.origin)).toBeNull();
+    expect(screen.queryByText("Reading the list…")).toBeTruthy();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
+  });
+
+  it("an answered failure after a give-up takes the give-up's sentence away (rule ii)", async () => {
+    server.use(...pairingService({ pairings: [BROWSER_A] }).handlers);
+    const asks = asksInTurn(url("/extension/pairings"), ["hold", "refuse"]);
+    server.use(asks.handler);
+    render(<ExtensionPairing api={makeApi()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    await waitFor(() => expect(alerts().length).toBeGreaterThan(0));
+    expect(tryAgain()).toBeNull();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
   });
 });

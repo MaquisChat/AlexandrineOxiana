@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { PATHS } from "../navigation";
 import { fakeShell, type FakeShell } from "../test/desktopShell";
-import { BASE, CURRENT_RW, LIBRARIES, TOKEN, hang, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
+import { BASE, CURRENT_RW, LIBRARIES, TOKEN, asksInTurn, hang, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
 import { YOUR_LIBRARY_SCREEN_TEXT as T, YourLibrary, onAMac } from "./YourLibrary";
 
@@ -1494,5 +1494,41 @@ describe("Your library: leaving the screen cancels its held read (FR-756, R605 M
     expect(signals[0]!.aborted).toBe(false);
     unmount();
     await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+  });
+});
+
+describe("Your library: a late answer after “Try again”, and an answered failure after a give-up (FR-756, R605 M11)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent ?? "");
+
+  it("a late answer of the read given up, after “Try again”, changes nothing (its request was cancelled)", async () => {
+    useSvc(SET);
+    const asks = asksInTurn(url("/settings/your-library"), ["late", "hold"], () => undefined);
+    server.use(asks.handler);
+    render(<YourLibrary client={testClient()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(asks.signals[0]!.aborted).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    asks.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(screen.queryByRole("textbox", { name: "Your institution's name" })).toBeNull();
+    expect(screen.queryByText(T.loading)).toBeTruthy();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
+  });
+
+  it("an answered failure after a give-up takes the give-up's sentence away (rule ii)", async () => {
+    useSvc(SET);
+    const asks = asksInTurn(url("/settings/your-library"), ["hold", "refuse"]);
+    server.use(asks.handler);
+    render(<YourLibrary client={testClient()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    await waitFor(() => expect(alerts().length).toBeGreaterThan(0));
+    expect(tryAgain()).toBeNull();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
   });
 });

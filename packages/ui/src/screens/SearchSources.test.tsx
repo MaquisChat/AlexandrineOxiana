@@ -18,7 +18,7 @@ import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { PATHS } from "../navigation";
-import { BASE, CURRENT_RW, LIBRARIES, TOKEN, hang, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
+import { BASE, CURRENT_RW, LIBRARIES, TOKEN, asksInTurn, hang, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
 import { FindAcquire } from "./FindAcquire";
 import { SEARCH_SOURCES_TEXT, SearchSources, searchSourcesHref } from "./SearchSources";
@@ -909,5 +909,43 @@ describe("Search sources: the project left, given up before the switch (FR-756, 
     await waitFor(() => expect(screen.queryAllByRole("alert")).toEqual([]));
     expect(screen.getByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+});
+
+describe("Search sources: a late answer after “Try again”, and an answered failure after a give-up (FR-756, R605 M11)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent ?? "");
+
+  it("a late answer of the read given up, after “Try again”, changes nothing (its request was cancelled)", async () => {
+    useSvc();
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [] })));
+    const asks = asksInTurn(url("/settings/search-sources"), ["late", "hold"], () => undefined);
+    server.use(asks.handler);
+    render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: "" }} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(asks.signals[0]!.aborted).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    asks.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(screen.queryByRole("heading", { level: 2 })).toBeNull();
+    expect(screen.queryByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
+  });
+
+  it("an answered failure after a give-up takes the give-up's sentence away (rule ii)", async () => {
+    useSvc();
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [] })));
+    const asks = asksInTurn(url("/settings/search-sources"), ["hold", "refuse"]);
+    server.use(asks.handler);
+    render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: "" }} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    await waitFor(() => expect(alerts().length).toBeGreaterThan(0));
+    expect(tryAgain()).toBeNull();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
   });
 });

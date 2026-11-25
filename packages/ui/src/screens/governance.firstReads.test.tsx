@@ -12,7 +12,7 @@ import { createClient } from "../api/client";
 import { GovernanceRoutes } from "../routes/governance";
 import { useLocation } from "../navigation";
 import { BASE, TOKEN, makeApi, server, url, useMsw } from "../test/msw-governance";
-import { hang } from "../test/service";
+import { asksInTurn, hang, REFUSED_READ } from "../test/service";
 import { AuditLog } from "./AuditLog";
 import { Fieldwork } from "./Fieldwork";
 import { GovernanceSettings } from "./GovernanceSettings";
@@ -512,5 +512,89 @@ describe("FR-756, R605 M6: fieldwork's three requests are one read: the failure 
     expect(alerts()).toEqual([UNREACHABLE]);
     expect(signals).toHaveLength(2);
     await waitFor(() => expect(signals.every((s) => s.aborted)).toBe(true), { timeout: 1000 });
+  });
+});
+
+describe("FR-756, R605 M11: a late answer after “Try again”, and an answered failure after a give-up", () => {
+  const LIST_BODY = { projects: [{ id: "p1", name: "Coastal kinship" }] };
+  const side = () =>
+    server.use(
+      http.get(P("/protocol/documents"), () => HttpResponse.json({ documents: [] })),
+      http.get(P("/retention"), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+      http.get(P("/attention"), () => HttpResponse.json({ marks: [] })),
+      http.get(P("/sessions"), () => HttpResponse.json({ sessions: [], complete: true })),
+      http.get(P("/consents"), () => HttpResponse.json({ consents: [], complete: true })),
+      http.get(url("/projects/p1/audit"), () => HttpResponse.json({ events: [], total: 0 })),
+      http.get(url("/projects/p1/attention"), () => HttpResponse.json({ marks: [] })),
+    );
+  function ListHost() {
+    return <GovernanceRoutes client={createClient(BASE, TOKEN)} loc={useLocation()} firstReadMs={LIMIT} />;
+  }
+  const CASES = [
+    {
+      name: "the project's rules",
+      read: P("/governance"),
+      body: { yaml: "profiles: []\n", sha256: "a".repeat(64), violations: [] },
+      el: () => <GovernanceSettings api={makeApi()} projectId={PID} firstReadMs={LIMIT} />,
+      shown: () => screen.queryByRole("button", { name: "Save changes" }),
+      loading: () => screen.queryByText("Loading the project's rules…"),
+    },
+    {
+      name: "the audit log",
+      read: P("/audit"),
+      body: { events: [], total: 0 },
+      el: () => <AuditLog api={makeApi()} projectId={PID} firstReadMs={LIMIT} />,
+      shown: () => screen.queryByRole("table", { name: "Audit events" }),
+      // The audit log has no loading words.
+      loading: () => screen.getByRole("heading", { level: 1, name: "Audit log" }),
+    },
+    {
+      name: "fieldwork",
+      read: P("/participants"),
+      body: { participants: [], complete: true },
+      el: () => <Fieldwork api={makeApi()} projectId={PID} firstReadMs={LIMIT} />,
+      shown: () => screen.queryByRole("heading", { level: 2, name: "Participants" }),
+      loading: () => screen.queryByText("Loading…"),
+    },
+    {
+      name: "the governance route's list of projects",
+      read: url("/projects"),
+      body: LIST_BODY,
+      el: () => {
+        window.history.replaceState(null, "", "/audit");
+        return <ListHost />;
+      },
+      shown: () => screen.queryByRole("option", { name: "Coastal kinship" }),
+      loading: () => screen.queryByText("Choose a project first."),
+    },
+  ];
+
+  it.each(CASES)("$name: a late answer of the read given up, after “Try again”, changes nothing (its request was cancelled)", async (c) => {
+    side();
+    const asks = asksInTurn(c.read, ["late", "hold"], () => HttpResponse.json(c.body as never));
+    server.use(asks.handler);
+    render(c.el());
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(asks.signals[0]!.aborted).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    asks.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(c.shown()).toBeNull();
+    expect(c.loading()).toBeTruthy();
+    expect(alerts()).toEqual([]);
+  });
+
+  it.each(CASES)("$name: an answered failure after a give-up takes the give-up's sentence away (rule ii)", async (c) => {
+    side();
+    const asks = asksInTurn(c.read, ["hold", "refuse"]);
+    server.use(asks.handler);
+    render(c.el());
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(alerts().some((a) => a?.includes(REFUSED_READ))).toBe(true));
+    expect(alerts().some((a) => a?.includes(NO_ANSWER))).toBe(false);
+    expect(tryAgain()).toBeNull();
   });
 });
