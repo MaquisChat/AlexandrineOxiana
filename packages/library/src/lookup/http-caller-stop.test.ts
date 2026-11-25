@@ -269,3 +269,37 @@ describe("FR-764: a stop that lands just before the request keeps it from the ne
     });
   }
 });
+
+// FR-767 (R30, R50): a caller stopped after its answer was read, before the continuation that would remember it ran (a
+// lock lands between the two: the lock route stops Find, then purges): the answer is not remembered, in memory or on
+// disk. `validate` runs right between the read and the remember, so the stop lands there deterministically.
+describe("FR-767: an answer read for a caller that has stopped is not remembered", () => {
+  const memoryOf = (c: HttpClient) => (c as unknown as { memory: Map<string, { sensitive: boolean }> }).memory;
+
+  for (const sensitive of [true, false]) {
+    it(`a ${sensitive ? "sensitive" : "non-sensitive"} answer: nothing is kept in memory${sensitive ? "" : " or on disk"}, and the next call asks again`, async () => {
+      let asked = 0;
+      agent
+        .get(OA)
+        .intercept({ path: "/works?search=late", method: "GET" })
+        .reply(() => (asked++, json({ results: [] })))
+        .persist();
+      const c = client();
+      const ac = new AbortController();
+      const url = `${OA}/works?search=late`;
+      await c.getText(url, { cacheKey: "late", sensitive, signal: ac.signal, validate: () => ac.abort(new Error("the run was stopped")) });
+      expect(memoryOf(c).size).toBe(0);
+      // Not on disk either: a fresh client (memory empty) asks the service again.
+      const fresh = client();
+      await fresh.getText(url, { cacheKey: "late", sensitive });
+      expect(asked).toBe(2);
+    });
+  }
+
+  it("a call without a caller's signal is remembered as before", async () => {
+    agent.get(OA).intercept({ path: "/works?search=kept", method: "GET" }).reply(200, JSON.stringify({ results: [] }));
+    const c = client();
+    await c.getText(`${OA}/works?search=kept`, { cacheKey: "kept", sensitive: true, validate: () => {} });
+    expect([...memoryOf(c).values()].filter((e) => e.sensitive)).toHaveLength(1);
+  });
+});

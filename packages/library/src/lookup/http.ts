@@ -405,6 +405,8 @@ export class HttpClient {
     const entry: CacheEntry = { v: 1, storedAt: this.clock(), status: res.status, body: res.body };
     // Never cached (R257 h; R290 a, e): an answer that holds the private query, or the key or the e-mail sent with it.
     if (res.body !== null && (echoesQuery(res.body, opts.query) || echoesQuery(res.body, res.sent))) return entry.body;
+    // FR-767 (R30, R50): a caller stopped once its answer was read (a lock: Find stopped, then the purge) keeps nothing.
+    if (opts.signal?.aborted) return entry.body;
     this.remember(name, entry, sensitive);
     if (!sensitive) await this.writeCache(name, entry);
     return entry.body;
