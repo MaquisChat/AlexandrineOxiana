@@ -5767,5 +5767,46 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     expect(tryAgain()).toBeNull();
     expect(screen.queryAllByRole("alert")).toHaveLength(0);
   });
+
+  // Review M2: the other order — the panel's read given up first, then the screen's own read (the projects, read again
+  // with the time limit on a `library.state` event) given up too: the page takes the sentence over, one alert and one
+  // "Try again" outside the panel, and focus moves from the panel's "Try again" to the page's.
+  it("R641 C2 (iv), the panel first: a source's panel given up, then the projects' re-read given up: one sentence and one “Try again”, outside the panel, focus moved to it", async () => {
+    const e = entry({ typed: "done", state: "record-complete", sourceId: SID, candidates: [cand({ id: "c1" })], chosen: "c1" });
+    useService({ queues: { [PID]: queue([e]) } });
+    const gate = hang();
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), async () => {
+        await gate;
+        return HttpResponse.json(SOURCE_FILE);
+      }),
+      http.get(url("/projects/:id/sources/:sid/watch-origin"), () => HttpResponse.json({ origins: [] })),
+    );
+    showWithin(300, `?project=${PID}`);
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await waitFor(() => expect(events.open()).toBe(true));
+    // The library is known to the screen (its first state), so a later state of the same library reads the projects again.
+    events.push({ type: "library.state", data: { open: true, libraryId: "lib-1", name: "L", mode: "read-write" } });
+    const user = userEvent.setup();
+    await user.click(within(row("done")).getByRole("button", { name: "Open: “done”" }));
+    const region = await screen.findByRole("region", { name: "Record" });
+    const panelTryAgain = await within(region).findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    panelTryAgain.focus();
+    expect(document.activeElement).toBe(panelTryAgain);
+    const projectReads = count("/projects");
+    server.use(
+      http.get(url("/projects"), async () => {
+        await gate;
+        return HttpResponse.json(PROJECTS);
+      }),
+    );
+    events.push({ type: "library.state", data: { open: true, libraryId: "lib-1", name: "L", mode: "read-write" } });
+    await waitFor(() => expect(count("/projects")).toBe(projectReads + 1));
+    await waitFor(() => expect(within(region).queryByRole("button", { name: "Try again" })).toBeNull(), { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+    expect(within(region).queryByRole("alert")).toBeNull();
+    expect(document.activeElement).toBe(tryAgain());
+  });
 });
 const FIND_SCREEN_EMPTY = "Nothing is in the queue yet.";
