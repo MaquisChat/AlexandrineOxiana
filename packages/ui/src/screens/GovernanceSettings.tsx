@@ -492,7 +492,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
         </ControlCard>
       </div>
 
-      <BackUpNow api={api} projectId={projectId} />
+      <BackUpNow api={api} projectId={projectId} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} />
 
       <div className="ao-actions">
         <button type="button" onClick={() => void save()} disabled={busy || text === saved.yaml || off}>
@@ -539,8 +539,10 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
  * FR-754 (R641 C3): "Back up now" asks the service for a backup of the project (the route is governed and audited, R125).
  * While it runs the button reads "Backing up…" and a press sends nothing (aria-disabled, so focus stays on it); a
  * success says so; a failure shows the route's own sentence (a backup cut by the library's closing included, R551).
+ * `whyId`: as for ProtocolDocuments (a locked project, a read-only library): the button is then off, as the screen's
+ * other changing controls are; the route's refusal still answers anything that slips through.
  */
-function BackUpNow({ api, projectId }: { api: GovernanceApi; projectId: string }) {
+function BackUpNow({ api, projectId, whyId }: { api: GovernanceApi; projectId: string; whyId?: string }) {
   const [running, setRunning] = useState(false);
   const [outcome, setOutcome] = useState<{ made: true } | { error: string } | null>(null);
   // A ref, not state: a double click fires before the button re-renders (N8, R113).
@@ -551,7 +553,7 @@ function BackUpNow({ api, projectId }: { api: GovernanceApi; projectId: string }
     return () => void (alive.current = false);
   }, []);
   const backUp = async () => {
-    if (sending.current) return;
+    if (sending.current || whyId) return;
     sending.current = true;
     setRunning(true);
     setOutcome(null);
@@ -567,7 +569,7 @@ function BackUpNow({ api, projectId }: { api: GovernanceApi; projectId: string }
   };
   return (
     <div className="ao-actions">
-      <button type="button" aria-disabled={running || undefined} onClick={() => void backUp()}>
+      <button type="button" disabled={!!whyId} aria-describedby={whyId} aria-disabled={running || undefined} onClick={() => void backUp()}>
         {running ? "Backing up…" : "Back up now"}
       </button>
       <span role="status">{outcome && "made" in outcome ? "A backup of this project was made." : null}</span>

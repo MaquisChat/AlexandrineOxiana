@@ -92,6 +92,27 @@ describe("Back up now (FR-754, R641 C3)", () => {
     expect(asked).toHaveLength(2);
   });
 
+  // R641 second round: where the screen's other changing controls are off (the reason the governance route gives for a
+  // read-only library and for a locked project), "Back up now" is off too, described by the same reason.
+  for (const [state, why] of [
+    ["a read-only library", "This library is open read-only here, so its rules cannot be changed."],
+    ["a locked project", "This project is locked, so its rules cannot be changed until it is unlocked."],
+  ] as const) {
+    it(`${state}: “Back up now” is disabled like the other changing controls, and a press sends nothing`, async () => {
+      const asked = serve(ok);
+      render(<GovernanceSettings api={makeApi()} projectId={PID} readOnlyReason={why} />);
+      const button = (await screen.findByRole("button", { name: "Back up now" })) as HTMLButtonElement;
+      expect(button.disabled).toBe(true);
+      expect(screen.getByRole("button", { name: "Save changes" })).toHaveProperty("disabled", true);
+      const describedBy = button.getAttribute("aria-describedby") ?? "";
+      expect(describedBy.split(" ").map((id) => document.getElementById(id)?.textContent)).toContain(why);
+      await userEvent.setup().click(button);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(asked).toHaveLength(0);
+      expect(screen.queryByText(MADE)).toBeNull();
+    });
+  }
+
   it("an answer that arrives after the screen was left changes nothing and throws nothing", async () => {
     const h = held();
     const asked = serve(async () => {
