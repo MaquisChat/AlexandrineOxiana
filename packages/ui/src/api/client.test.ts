@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { CREDENTIAL_QUERY_KEYS } from "@ao/shared";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
-import { ApiClientError, SseParser, createClient } from "./client";
+import { ApiClientError, SERVICE_NO_ANSWER, SseParser, createClient } from "./client";
 
 const TOKEN = "t".repeat(40) + "SECRET";
 const BASE = "http://127.0.0.1:4317";
@@ -412,6 +412,71 @@ describe("events() — SSE over fetch streaming (not EventSource)", () => {
       ac.abort();
     }
     expect(got).toHaveLength(1);
+  });
+
+  describe("FR-756 C (R586 M2): a stream that does not open within `openWithinMs`", () => {
+    /** A fetch the browser never settles: it ends only when its signal aborts. */
+    const neverOpens = () =>
+      fakeFetch(
+        (_u, init) =>
+          new Promise<Response>((_, reject) => {
+            init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+          }),
+      );
+
+    it("is given up at the limit: its request is cancelled and the stream ends with “did not answer in time”", async () => {
+      const f = neverOpens();
+      const opened = vi.fn();
+      const it = createClient(BASE, TOKEN, { fetch: f.fetch }).events({ openWithinMs: 50, onOpen: opened });
+      await expect(it.next()).rejects.toMatchObject({ status: 0, code: "UNAVAILABLE", message: SERVICE_NO_ANSWER });
+      expect(f.calls[0]!.init.signal?.aborted).toBe(true);
+      expect(opened).not.toHaveBeenCalled();
+    });
+
+    it("that is open is never dropped by the limit, however quiet it is", async () => {
+      let sent: AbortSignal | undefined;
+      const f = fakeFetch((_u, init) => {
+        sent = init.signal ?? undefined;
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode("event: library.state\ndata: {}\n\n"));
+            init.signal?.addEventListener("abort", () => c.error(new DOMException("aborted", "AbortError")));
+          },
+        });
+        return new Response(body, { headers: { "content-type": "text/event-stream" } });
+      });
+      const ac = new AbortController();
+      const opened = vi.fn();
+      const it = createClient(BASE, TOKEN, { fetch: f.fetch }).events({ signal: ac.signal, openWithinMs: 50, onOpen: opened });
+      expect((await it.next()).value).toEqual({ type: "library.state", data: {} });
+      expect(opened).toHaveBeenCalledTimes(1);
+      // Six times the limit with nothing on the stream: it is still open, still waiting for the next event.
+      const quiet = await Promise.race([it.next().then(() => "ended"), new Promise((r) => setTimeout(() => r("still open"), 300))]);
+      expect(quiet).toBe("still open");
+      expect(sent?.aborted).toBe(false);
+      // The researcher's own leaving still ends it, quietly.
+      ac.abort();
+      expect(sent?.aborted).toBe(true);
+    });
+
+    it("left before it opens ends quietly (the page's own abort is not an error)", async () => {
+      const f = neverOpens();
+      const ac = new AbortController();
+      const it = createClient(BASE, TOKEN, { fetch: f.fetch }).events({ signal: ac.signal, openWithinMs: 5_000 });
+      const next = it.next();
+      ac.abort();
+      await expect(next).resolves.toMatchObject({ done: true });
+    });
+
+    it("without `openWithinMs` waits as before (no limit unless asked)", async () => {
+      const f = neverOpens();
+      const ac = new AbortController();
+      const next = createClient(BASE, TOKEN, { fetch: f.fetch }).events({ signal: ac.signal }).next();
+      const r = await Promise.race([next.then(() => "settled"), new Promise((res) => setTimeout(() => res("waiting"), 200))]);
+      expect(r).toBe("waiting");
+      ac.abort();
+      await expect(next).resolves.toMatchObject({ done: true });
+    });
   });
 
   it("a CRLF split across chunks is one line break, not a blank line (no event is cut short)", async () => {

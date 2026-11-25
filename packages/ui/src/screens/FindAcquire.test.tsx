@@ -5512,6 +5512,46 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     expect(count("/find/screen")).toBe(2);
   });
 
+  it("FR-756 C (R597): a stream that never opens is cancelled at the limit and opened afresh after the screen's pause; at that opening the reads still out are made again", async () => {
+    useService();
+    const ev = sseAttempts((n) => (n === 1 ? "hang" : []));
+    const gate = hang();
+    let projectsN = 0;
+    let screenN = 0;
+    server.use(
+      ev.handler,
+      http.get(url("/projects"), async () => {
+        if (++projectsN === 1) await gate;
+        return HttpResponse.json(PROJECTS);
+      }),
+      http.get(url("/find/screen"), async () => {
+        if (++screenN === 1) await gate;
+        return HttpResponse.json(screenSettings);
+      }),
+    );
+    render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search: "" }} streamOpenMs={300} />);
+    expect(projectBox().textContent).toBe("Reading the projects…");
+    await waitFor(() => expect(projectBox().value).toBe(PID), { timeout: 10_000 });
+    await screen.findByRole("textbox", { name: "References" });
+    expect(ev.attempts()).toBe(2);
+    expect(count("/projects")).toBe(2);
+    expect(count("/find/screen")).toBe(2);
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("FR-756 C (R597): a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
+    useService();
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search: "" }} streamOpenMs={200} />);
+    await screen.findByRole("textbox", { name: "References" });
+    await waitFor(() => expect(ev.attempts()).toBe(1));
+    await new Promise((r) => setTimeout(r, 3_000));
+    expect(ev.attempts()).toBe(1);
+    // R602 M2: the page has not cancelled it (a drop after the answer began would not end a mocked body).
+    expect(ev.signals()[0]!.aborted).toBe(false);
+  });
+
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
     useService();
     const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
@@ -5536,6 +5576,58 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
     expect(count("/projects")).toBe(3);
     expect(count("/find/screen")).toBe(3);
+  });
+
+  it("R602 M1: the projects failed with no answer and the settings given up: “could not be reached” alone, with one “Try again”", async () => {
+    useService();
+    const gate = hang();
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.error()),
+      http.get(url("/find/screen"), async () => {
+        await gate;
+        return HttpResponse.json(screenSettings);
+      }),
+    );
+    showWithin(300);
+    await screen.findByRole("button", { name: "Try again" });
+    await new Promise((r) => setTimeout(r, 600));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+  });
+
+  it("R602 M1: the settings given up and the queue failed with no answer: “could not be reached” alone, with one “Try again”", async () => {
+    useService();
+    const gate = hang();
+    server.use(
+      http.get(url("/find/screen"), async () => {
+        await gate;
+        return HttpResponse.json(screenSettings);
+      }),
+      http.get(url("/projects/:id/find"), () => HttpResponse.error()),
+    );
+    showWithin(300, `?project=${PID}`);
+    await waitFor(() => expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]), { timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 600));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+  });
+
+  it("R602 M1: every unanswered read given up: “did not answer in time”, once", async () => {
+    useService();
+    const gate = hang();
+    server.use(
+      http.get(url("/projects"), async () => {
+        await gate;
+        return HttpResponse.json(PROJECTS);
+      }),
+      http.get(url("/find/screen"), async () => {
+        await gate;
+        return HttpResponse.json(screenSettings);
+      }),
+    );
+    showWithin(300);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
   });
 
   it("an ordinary opening reads each thing once, though the stream opens while the reads are out", async () => {

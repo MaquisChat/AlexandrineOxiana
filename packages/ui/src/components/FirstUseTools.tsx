@@ -19,6 +19,7 @@ import type { ToolId, ToolInfo } from "@ao/shared";
 import { useEffect, useId, useRef, useState } from "react";
 import { DEFAULT_SPEECH_MODEL, describeHosts, formatSize, hostsOf, PUBLISHER_SERVERS, remainingOf, speechTool, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
 import { navigate, PATHS } from "../navigation";
+import { readWithin } from "../api/firstRead";
 import { toolsHref } from "./MissingToolNotice";
 import { DialogShell } from "./ReasonDialog";
 import { UserText } from "./UserText";
@@ -100,7 +101,8 @@ const focusToolsLink = () => setTimeout(() => document.querySelector<HTMLElement
  * it is not announced a second time. It is mounted only on the open library's screen, so it is never
  * on the chooser or any other screen.
  */
-export function FirstUseTools({ api, memory = localFirstUseMemory, hidden = false }: { api: ToolsApi; memory?: FirstUseMemory; hidden?: boolean }) {
+/** `firstReadMs` (FR-756 M4, R602): the catalogue's read is given up silently after this long (as a failed one); none if not given. */
+export function FirstUseTools({ api, memory = localFirstUseMemory, hidden = false, firstReadMs }: { api: ToolsApi; memory?: FirstUseMemory; hidden?: boolean; firstReadMs?: number }) {
   const [tools, setTools] = useState<ToolInfo[] | null>(null);
   const [open, setOpen] = useState(false);
   const [closed, setClosed] = useState(false);
@@ -118,7 +120,7 @@ export function FirstUseTools({ api, memory = localFirstUseMemory, hidden = fals
     if (closed || memory.get()) return;
     let live = true;
     const ac = new AbortController();
-    api.catalogue(ac.signal).then(
+    (firstReadMs === undefined ? api.catalogue(ac.signal) : readWithin((signal) => api.catalogue(signal), firstReadMs, ac.signal)).then(
       (r) => {
         if (!live || memory.get()) return;
         const list = Array.isArray(r.tools) ? r.tools : [];

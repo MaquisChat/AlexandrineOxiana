@@ -63,7 +63,7 @@ export function verificationApi(client: ApiClient) {
     recheckSource: (pid: string, sid: string) => r<VerifiedSource>("POST", `${src(pid, sid)}/recheck`),
     recheckProject: (pid: string) => r<RecheckJob>("POST", `/projects/${seg(pid)}/recheck`),
     /** The project's recheck running now, if any (FR-717): asked when the library screen shows the project. */
-    recheckState: (pid: string) => r<ProjectRecheckState>("GET", `/projects/${seg(pid)}/recheck`),
+    recheckState: (pid: string, opts: { signal?: AbortSignal } = {}) => r<ProjectRecheckState>("GET", `/projects/${seg(pid)}/recheck`, opts.signal ? { signal: opts.signal } : {}),
     /** Runs a source's failed viewing-proxy and OCR jobs again (R84). */
     retryJobs: (pid: string, sid: string) => {
       const body: JobsRetryRequest = { projectId: pid, sourceId: sid };

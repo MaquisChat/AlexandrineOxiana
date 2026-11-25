@@ -12,7 +12,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, IndexStatus, ProjectSummary, SourcePage, Tag } from "../api/library";
 import { errorText, isProjectLocked, knownProfiles } from "../api/library";
-import { ApiClientError } from "../api/client";
+import { ApiClientError, SERVICE_NO_ANSWER, STREAM_OPEN_TIMEOUT_MS } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
 import { JobsIndicator, type Job } from "../components/JobsIndicator";
@@ -70,9 +71,27 @@ export interface LibraryProps {
    * while a locked project's unlock screen is shown (it stays mounted, so it is not asked anew).
    */
   firstUse?: (hidden: boolean) => ReactNode;
+  /**
+   * FR-756 B: how long each of the screen's reads of what it shows (the projects, the collections and tags, the sources)
+   * is waited for before it is given up as a read that got no answer (FIRST_READ_TIMEOUT_MS; smaller in tests).
+   */
+  firstReadMs?: number;
+  /**
+   * FR-756 C (R586 M2): how long the event stream is waited for to open before it is closed and tried afresh, after the
+   * screen's usual pause (STREAM_OPEN_TIMEOUT_MS; smaller in tests). A stream that has opened is never ended by it.
+   */
+  streamOpenMs?: number;
 }
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
+/**
+ * FR-756 B (R586 M5): a read that got no answer says its own sentence — "did not answer in time" where the limit ended
+ * it, "could not be reached" where it failed — never both run together.
+ */
+const noAnswerText = (err: unknown) => (err as ApiClientError).message;
+
+/** FR-756 B: the screen's reads that "Try again" (and a new opening of the event stream) can make again. */
+type FirstRead = "projects" | "collections" | "sources";
 
 /** Sources asked for per page; "Load more" asks for the next page by offset. */
 export const SOURCE_PAGE_SIZE = 100;
@@ -90,7 +109,7 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
 
 const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing", transcription: "Transcribing recordings" };
 
-export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected, firstUse }: LibraryProps) {
+export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected, firstUse, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: LibraryProps) {
   const [state, setState] = useState<LibraryState>({
     mode: current.mode,
     ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}),
@@ -175,6 +194,55 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /** What the Zotero sync's events said (Task Z12: the lines under the header read again after a finished one), and whether the library is still open. */
   const [zoteroEvents, setZoteroEvents] = useState<ZoteroEvents>({ n: 0, finished: 0 });
   const [libraryOpen, setLibraryOpen] = useState(true);
+  /**
+   * FR-756 B: the reads that got no answer (none at all, or none in time), with what is said for each; "Try again" is
+   * offered while there is one. `tries` moves each read on: a press, or a new opening of the event stream.
+   */
+  const [unanswered, setUnanswered] = useState<Partial<Record<FirstRead, string>>>({});
+  const [tries, setTries] = useState<Record<FirstRead, number>>({ projects: 0, collections: 0, sources: 0 });
+  /** The reads out now (begun and not settled): a new opening of the stream makes them again, as they may never settle. */
+  const out = useRef(new Set<FirstRead>());
+  const answered = useCallback((r: FirstRead) => {
+    out.current.delete(r);
+    setUnanswered((u) => {
+      if (!(r in u)) return u;
+      const { [r]: _gone, ...rest } = u;
+      return rest;
+    });
+  }, []);
+  const noAnswer = useCallback((r: FirstRead, err: unknown) => {
+    out.current.delete(r);
+    setUnanswered((u) => ({ ...u, [r]: noAnswerText(err) }));
+  }, []);
+  const unansweredRef = useRef(unanswered);
+  unansweredRef.current = unanswered;
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  /**
+   * FR-756 B: what has not been read is read again — a read that got no answer, one still out (it may never settle),
+   * and the projects whenever they have not been read. Once per press, once per new opening of the event stream.
+   */
+  const readAgain = useCallback(() => {
+    const again = (r: FirstRead) => r in unansweredRef.current || out.current.has(r) || (r === "projects" && !projectsRef.current);
+    const which = (["projects", "collections", "sources"] as const).filter(again);
+    if (which.length) setTries((t) => ({ ...t, ...Object.fromEntries(which.map((r) => [r, t[r] + 1])) }));
+  }, []);
+  const readAgainRef = useRef(readAgain);
+  readAgainRef.current = readAgain;
+  /** "Try again" was pressed: once nothing is left unanswered, focus goes to the main pane if it was lost. */
+  const triedAgain = useRef(false);
+  const showTryAgain = Object.keys(unanswered).length > 0;
+  /**
+   * R602 M1: one sentence at a time. A read that could not be made at all explains one that got no answer in time, so
+   * "could not be reached" is said alone where any read failed so; "did not answer in time" where every one was given up.
+   */
+  const unansweredText = showTryAgain ? (Object.values(unanswered).find((t) => t !== SERVICE_NO_ANSWER) ?? SERVICE_NO_ANSWER) : undefined;
+  useEffect(() => {
+    if (showTryAgain || !triedAgain.current) return;
+    triedAgain.current = false;
+    const now = document.activeElement;
+    if (!now || now === document.body || !now.isConnected) mainRef.current?.focus();
+  }, [showTryAgain]);
 
   const readOnly = state.mode !== "read-write";
   const project = projects?.find((p) => p.id === projectId);
@@ -256,6 +324,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       refresh();
     },
     onLocked: markLocked,
+    firstReadMs,
   });
   const recheckEvent = useRef(recheck.onEvent);
   recheckEvent.current = recheck.onEvent;
@@ -270,8 +339,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     const listen = async () => {
       const again = streams++ > 0;
       let first = true;
+      // FR-756 B: at an opening after the stream was lost, without waiting for an event on it, what has not been read is
+      // read again (as FR-750's screens do). The first opening, with the first reads still out, reads nothing more.
+      const onOpen = () => {
+        if (again) readAgainRef.current();
+      };
       try {
-        for await (const e of api.events({ signal: ac.signal })) {
+        for await (const e of api.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs })) {
           // A stream after a drop is open once its first event (the fresh state) arrives: what was missed is asked for.
           if (first) {
             first = false;
@@ -318,7 +392,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           }
         }
       } catch {
-        // the stream dropped: listen again shortly (a fresh state arrives first)
+        // the stream dropped, or did not open in time (FR-756 C): listen again shortly (a fresh state arrives first)
       }
       if (!ac.signal.aborted) retry = setTimeout(() => void listen(), 2000);
     };
@@ -327,7 +401,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       ac.abort();
       clearTimeout(retry);
     };
-  }, [api, noteUnknownCreates]);
+  }, [api, noteUnknownCreates, streamOpenMs]);
 
   // ---- projects and their profile badges ----
   const showProjects = useCallback((list: ProjectSummary[]) => {
@@ -336,15 +410,26 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     setProfiles(Object.fromEntries(list.map((p) => [p.id, knownProfiles(p.profiles)])));
   }, []);
   useEffect(() => {
-    let live = true;
-    api.projects
-      .list()
-      .then(({ projects: list }) => live && showProjects(list))
-      .catch((err: unknown) => live && setError(message(err, "The projects could not be read.")));
+    const ac = new AbortController();
+    out.current.add("projects");
+    readWithin((signal) => api.projects.list({ signal }), firstReadMs, ac.signal)
+      .then(({ projects: list }) => {
+        if (ac.signal.aborted) return;
+        answered("projects");
+        showProjects(list);
+      })
+      .catch((err: unknown) => {
+        if (ac.signal.aborted) return;
+        if (isUnreachable(err)) return noAnswer("projects", err);
+        // An answer, though a refusal: the give-up it followed is no longer true (R602 I2).
+        answered("projects");
+        setError(message(err, "The projects could not be read."));
+      });
     return () => {
-      live = false;
+      ac.abort();
+      out.current.delete("projects");
     };
-  }, [api, showProjects]);
+  }, [api, showProjects, firstReadMs, tries.projects, answered, noAnswer]);
   const mounted = useRef(true);
   useEffect(
     () => () => {
@@ -402,42 +487,62 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
 
   // ---- the selected project's collections and tags ----
   useEffect(() => {
-    if (!projectId || locked) return;
+    if (!projectId || locked) return answered("collections");
     let live = true;
-    Promise.all([api.collections.list(projectId), api.tags.list(projectId)])
+    const ac = new AbortController();
+    out.current.add("collections");
+    readWithin((signal) => Promise.all([api.collections.list(projectId, { signal }), api.tags.list(projectId, { signal })]), firstReadMs, ac.signal)
       .then(([c, t]) => {
         if (!live) return;
+        answered("collections");
         setCollections(c.collections);
         setTags({ tags: t.tags, workspaceTags: t.workspaceTags });
       })
-      .catch((err: unknown) => live && fail(err, "The collections and tags could not be read."));
+      .catch((err: unknown) => {
+        if (!live) return;
+        if (isUnreachable(err)) return noAnswer("collections", err);
+        // An answer, though a refusal: the give-up it followed is no longer true (R602 I2).
+        answered("collections");
+        fail(err, "The collections and tags could not be read.");
+      });
     return () => {
       live = false;
+      ac.abort();
+      out.current.delete("collections");
     };
-  }, [api, projectId, locked, reload]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, projectId, locked, reload, firstReadMs, tries.collections]);
 
   // ---- the sources for the current search and filters ----
   useEffect(() => {
     staleMore();
     setListCurrent(false);
-    if (!projectId || locked) return;
+    if (!projectId || locked) return answered("sources");
     const ac = new AbortController();
     const asked = filter.text;
-    api.sources
-      .search(projectId, { ...query(), limit: SOURCE_PAGE_SIZE }, { signal: ac.signal })
+    out.current.add("sources");
+    readWithin((signal) => api.sources.search(projectId, { ...query(), limit: SOURCE_PAGE_SIZE }, { signal }), firstReadMs, ac.signal)
       .then((r) => {
         if (ac.signal.aborted) return;
+        answered("sources");
         setSources(r);
         setListCurrent(true);
         setSearched(asked);
         setSourcesError(undefined); // only the sources' own error: other errors stay until dismissed or replaced
       })
       .catch((err: unknown) => {
-        if (!ac.signal.aborted) fail(err, "The sources could not be read.", setSourcesError);
+        if (ac.signal.aborted) return;
+        if (isUnreachable(err)) return noAnswer("sources", err);
+        // An answer, though a refusal: the give-up it followed is no longer true (R602 I2).
+        answered("sources");
+        fail(err, "The sources could not be read.", setSourcesError);
       });
-    return () => ac.abort();
+    return () => {
+      ac.abort();
+      out.current.delete("sources");
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, projectId, locked, filter, reload]);
+  }, [api, projectId, locked, filter, reload, firstReadMs, tries.sources]);
 
   // ---- Task R12: "Show in the reader" for a hit in an annotation (no request per row: a row does not say whether it has a PDF) ----
   /** The text of the search whose answer is shown (what the reader is handed). */
@@ -457,15 +562,15 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     setWaiting(undefined);
     if (!projectId || locked) return;
     const ac = new AbortController();
-    api.reviewQueue
-      .count(projectId, { signal: ac.signal })
+    // FR-756 M4 (R602): given up silently at the limit, as when it fails.
+    readWithin((signal) => api.reviewQueue.count(projectId, { signal }), firstReadMs, ac.signal)
       .then((total) => {
         if (!ac.signal.aborted) setWaiting({ projectId, total });
       })
       // Without the count (a read-only library, a lock meanwhile) the link is not offered; the list says why.
       .catch(() => {});
     return () => ac.abort();
-  }, [api, projectId, locked, reload]);
+  }, [api, projectId, locked, reload, firstReadMs]);
 
   // ---- the index (D8): when a rebuild ends, the sources are read again ----
   const indexState = state.index?.state;
@@ -532,6 +637,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       projectIdRef.current = id;
       clearPendingFind();
       staleMore();
+      // R602 I2: what the project left got no answer for is not said of the next one.
+      setUnanswered(({ projects }) => (projects ? { projects } : {}));
       setProjectId(id);
       setCollections([]);
       setTags({ tags: [], workspaceTags: [] });
@@ -698,7 +805,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           )}
         </div>
       </header>
-      <LibraryZotero api={api} projectId={project?.id} open={libraryOpen && !closedUnder} events={zoteroEvents} />
+      <LibraryZotero api={api} projectId={project?.id} open={libraryOpen && !closedUnder} events={zoteroEvents} firstReadMs={firstReadMs} />
       {recovering && (
         <NewRecoveryCode
           api={api}
@@ -761,7 +868,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       {firstUse?.(locked)}
       <aside className="ao-library__side">
         {projects === undefined ? (
-          <p aria-live="polite">Loading projects…</p>
+          !unanswered.projects && <p aria-live="polite">Loading projects…</p>
         ) : (
           <ProjectNav projects={projects} profiles={profiles} selectedId={projectId} onSelect={selectProject} />
         )}
@@ -935,6 +1042,25 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             {error}
           </p>
         )}
+        {/* FR-756 B: a read that got no answer says so (each sentence once) and is offered again. */}
+        {unansweredText && (
+          <p role="alert" className="ao-error">
+            {unansweredText}
+          </p>
+        )}
+        {showTryAgain && (
+          <p>
+            <button
+              type="button"
+              onClick={() => {
+                triedAgain.current = true;
+                readAgain();
+              }}
+            >
+              Try again
+            </button>
+          </p>
+        )}
         {unknownProject && (
           <p role="alert" className="ao-error">
             The project named in the address is not in this library. Choose a project from the list.
@@ -1005,7 +1131,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               <p className="ao-muted">This library is open read-only, so its search index cannot be built here: sources are listed from the library's files, and search looks at titles only.</p>
             )}
             {sources === undefined ? (
-              !sourcesError && <p aria-live="polite">Loading sources…</p>
+              !sourcesError && !unanswered.sources && <p aria-live="polite">Loading sources…</p>
             ) : (sources.total === 0 || listPartial) && (listRebuilding || indexState === "rebuilding") ? (
               // An index being rebuilt is never passed off as an empty library (D8).
               <p role="status">The library's search index is being rebuilt from its files. The sources appear here as soon as it has finished; nothing in the library has been lost.</p>

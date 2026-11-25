@@ -71,8 +71,11 @@ export interface ApiClient {
   /**
    * Server-sent events from GET /events, until the stream ends or `signal` aborts. `onOpen` is
    * called once the service has accepted the stream (events published from then on arrive).
+   * `openWithinMs` (FR-756 C, R586 M2): a stream not opened (no answer yet) after that long is given up — its request
+   * is cancelled and the stream ends with "The library service did not answer in time." — so that the caller's own
+   * reconnect makes a fresh try. A stream that has opened is never ended by it. Without it, no limit (as before).
    */
-  events(opts?: { signal?: AbortSignal; onOpen?: () => void }): AsyncGenerator<ServiceEvent, void, undefined>;
+  events(opts?: EventsOptions): AsyncGenerator<ServiceEvent, void, undefined>;
   /**
    * The address a media element loads for a media ticket (R135): the base URL plus the ticket path
    * the service gave (`/media/<ticket>`), nothing added. Only that exact form is accepted: no query,
@@ -100,6 +103,19 @@ export interface ApiClient {
    */
   byteRange(path: string, start: number, end: number, opts?: { signal?: AbortSignal }): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
 }
+
+/** The options of `events()`. */
+export interface EventsOptions {
+  signal?: AbortSignal;
+  onOpen?: () => void;
+  openWithinMs?: number;
+}
+
+/**
+ * FR-756 C (R586 M2): how long the event stream is waited for to open before it is given up and tried afresh. The
+ * service answers it at once, with the library's state, from the same machine; twenty seconds is long.
+ */
+export const STREAM_OPEN_TIMEOUT_MS = 20_000;
 
 /** `onOpen` is called once the service has answered with a stream (its headers arrived), before any line. */
 export type NdjsonOptions = RequestOptions & { onOpen?: () => void };
@@ -387,16 +403,36 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     }
   }
 
-  async function* events(o: { signal?: AbortSignal; onOpen?: () => void } = {}): AsyncGenerator<ServiceEvent, void, undefined> {
+  async function* events(o: EventsOptions = {}): AsyncGenerator<ServiceEvent, void, undefined> {
     const init: RequestInit = { method: "GET", headers: { ...auth, Accept: "text/event-stream" } };
     if (o.signal) init.signal = o.signal;
+    // FR-756 C: with a limit, the request has a signal of its own, aborted by the caller's or at the limit (until open).
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let gaveUp = false;
+    let unlink = () => {};
+    if (o.openWithinMs !== undefined) {
+      const ac = new AbortController();
+      const stop = () => ac.abort();
+      if (o.signal?.aborted) ac.abort();
+      else o.signal?.addEventListener("abort", stop, { once: true });
+      unlink = () => o.signal?.removeEventListener("abort", stop);
+      init.signal = ac.signal;
+      timer = setTimeout(() => {
+        gaveUp = true;
+        ac.abort();
+      }, o.openWithinMs);
+    }
     let res: Response;
     try {
       res = await doFetch(urlFor("/events"), init);
     } catch {
+      unlink();
       if (o.signal?.aborted) return;
-      throw unreachable();
+      throw gaveUp ? noAnswerInTime() : unreachable();
+    } finally {
+      clearTimeout(timer);
     }
+    if (!res.ok || !res.body) unlink();
     if (!res.ok) throw await errorFrom(res);
     o.onOpen?.();
     if (!res.body) return;
@@ -420,6 +456,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       }
       // Whatever is left is an event the stream ended in the middle of: discarded.
     } finally {
+      unlink();
       reader.cancel().catch(() => {});
     }
   }

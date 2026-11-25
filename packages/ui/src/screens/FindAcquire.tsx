@@ -104,7 +104,7 @@ import {
   type FindScreenSettings,
 } from "@ao/shared";
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from "react";
-import { ApiClientError, SERVICE_UNREACHABLE, type ApiClient, type ServiceEvent } from "../api/client";
+import { ApiClientError, SERVICE_NO_ANSWER, SERVICE_UNREACHABLE, STREAM_OPEN_TIMEOUT_MS, type ApiClient, type ServiceEvent } from "../api/client";
 import { findApi, findHref, findProgressOf, type FindApi } from "../api/find";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { isValidId } from "../api/import";
@@ -317,8 +317,10 @@ interface QueueBus {
 /**
  * `firstReadMs` (FR-750, R579): how long a read of the projects, of the remembered settings or of the queue is waited for
  * before it is given up as a read that got no answer (FIRST_READ_TIMEOUT_MS; smaller in tests).
+ * `streamOpenMs` (FR-756 C, R597): how long the event stream is waited for to open before it is closed and tried afresh
+ * after the screen's pause (STREAM_OPEN_TIMEOUT_MS; smaller in tests); an open stream is never ended by it.
  */
-export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number }) {
+export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number }) {
   const api = useMemo(() => findApi(client), [client]);
   const libApi = useMemo(() => findLibraryApi(client), [client]);
   const lib = useMemo(() => libraryApi(client), [client]);
@@ -595,7 +597,7 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
           }
           opened = true;
         };
-        for await (const ev of client.events({ signal: ac.signal, onOpen })) {
+        for await (const ev of client.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs })) {
           if (!alive.current) return;
           if (ev.type === "library.state" && ev.data && typeof ev.data === "object") {
             const d = ev.data as LibraryState;
@@ -660,7 +662,7 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
       clearTimeout(retry);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, readProjects, readScreen, forgetLibrary]);
+  }, [client, readProjects, readScreen, forgetLibrary, streamOpenMs]);
 
   const asked = projectInQuery(loc.search);
   // A project named in the address again (a link) takes over from the one chosen here.
@@ -884,6 +886,18 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
 
   // ---- FR-750: "Try again" after a read that got no answer: what has not been read is read again ----
   const showTryAgain = (projectsUnreachable && !!projectsError) || (screenUnreachable && !!screenError) || (collectionsUnreachable && !!collectionsError);
+  /** The queue's own read got no answer: its sentence (it says it itself unless the screen says one above). */
+  const [queueNoAnswer, setQueueNoAnswer] = useState<string | undefined>();
+  /**
+   * R602 M1: one sentence at a time. Of the reads that got no answer, one that could not be made at all explains one that
+   * got none in time: "could not be reached" is said alone where any failed so, "did not answer in time" where every one
+   * was given up. Each such read's sentence is shown as this one (said once: equal sentences are not repeated).
+   */
+  const noAnswers = [projectsUnreachable && projectsError, screenUnreachable && screenError, collectionsUnreachable && collectionsError, showTryAgain && queueNoAnswer].filter((t): t is string => !!t);
+  const noAnswerSaid = noAnswers.find((t) => t !== SERVICE_NO_ANSWER) ?? SERVICE_NO_ANSWER;
+  const shownScreenError = screenUnreachable && screenError ? noAnswerSaid : screenError;
+  const shownProjectsError = projectsUnreachable && projectsError ? noAnswerSaid : projectsError;
+  const shownCollectionsError = collectionsUnreachable && collectionsError ? noAnswerSaid : collectionsError;
   const triedAgain = useRef(false);
   const tryAgain = () => {
     triedAgain.current = true;
@@ -961,9 +975,9 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
           {switchNote}
         </p>
       )}
-      {screenError && (
+      {shownScreenError && (
         <p role="alert" className="ao-error">
-          <UserText>{screenError}</UserText>
+          <UserText>{shownScreenError}</UserText>
         </p>
       )}
       {switchError && (
@@ -977,14 +991,14 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
         </p>
       )}
       {/* The same sentence (the service cannot be reached) is said once, not for the settings and again for the projects. */}
-      {projectsError && projectsError !== screenError && (
+      {shownProjectsError && shownProjectsError !== shownScreenError && (
         <p role="alert" className="ao-error">
-          <UserText>{projectsError}</UserText>
+          <UserText>{shownProjectsError}</UserText>
         </p>
       )}
-      {collectionsError && collectionsError !== screenError && collectionsError !== projectsError && (
+      {shownCollectionsError && shownCollectionsError !== shownScreenError && shownCollectionsError !== shownProjectsError && (
         <p role="alert" className="ao-error">
-          <UserText>{collectionsError}</UserText>
+          <UserText>{shownCollectionsError}</UserText>
         </p>
       )}
       {/* FR-750 (R579): a read that got no answer (or none in time) is offered again; an answer the screen handles is not. */}
@@ -1012,7 +1026,8 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }
           onStoredCheck={onStoredCheck}
           onUnlocked={readProjects}
           waitForSwitch={waitForSwitch}
-          saidAbove={screenError}
+          saidAbove={showTryAgain && queueNoAnswer ? queueNoAnswer : screenError}
+          onNoAnswer={setQueueNoAnswer}
           firstReadMs={firstReadMs}
         />
       )}
@@ -1106,10 +1121,12 @@ function ProjectQueue(props: {
   waitForSwitch: () => Promise<SwitchResult> | undefined;
   /** FR-576: the sentence the screen already says above the queue (its settings could not be read), not said again. */
   saidAbove?: string | undefined;
+  /** R602 M1: the queue's read got no answer (its sentence), or did again (undefined), so the screen says one sentence. */
+  onNoAnswer?: (sentence: string | undefined) => void;
   /** FR-750: how long a read of the queue asked for at once (at load, after the switch, an unlock, "Try again") is waited for. */
   firstReadMs: number;
 }) {
-  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch, saidAbove, firstReadMs } = props;
+  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch, saidAbove, onNoAnswer, firstReadMs } = props;
   /** The desktop shell's bridge (F16); undefined outside the desktop app. */
   const shell = useMemo(() => desktopShell(), []);
   const projectId = project.id;
@@ -1488,6 +1505,12 @@ function ProjectQueue(props: {
   }, [api, projectId, applyQueue, markLocked]);
 
   readOnceRef.current = readOnce;
+  // R602 M1: the queue's read that got no answer is told to the screen, which then says one sentence for all.
+  const reportNoAnswer = useRef(onNoAnswer);
+  reportNoAnswer.current = onNoAnswer;
+  const noAnswerHere = loadUnreachable && loadError && !entries?.length ? loadError : undefined;
+  useEffect(() => reportNoAnswer.current?.(noAnswerHere), [noAnswerHere]);
+  useEffect(() => () => reportNoAnswer.current?.(undefined), []);
   /**
    * One read, waited for at most QUEUE_READ_WAIT_MS (FR-558). A read given up then is cancelled (R472), so that reads
    * that never answer do not pile up against the web view's few connections to the service; the next read shows what

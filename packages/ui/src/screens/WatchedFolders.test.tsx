@@ -1415,6 +1415,37 @@ describe("Watched folders: first reads that never settle (FR-750, R579)", () => 
     expect(tryAgain()).toBeNull();
   });
 
+  it("FR-756 C (R597): a stream that never opens is cancelled at the limit and opened afresh after the screen's pause; at that opening a list still out is read again", async () => {
+    useService([]);
+    const ev = sseAttempts((n) => (n === 1 ? "hang" : []));
+    const gate = hang();
+    let n = 0;
+    server.use(
+      ev.handler,
+      http.get(url("/projects/p1/watched-folders"), async () => {
+        if (++n === 1) await gate;
+        return HttpResponse.json({ seq: nextSeq(), folders: [folder()] });
+      }),
+    );
+    render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} streamOpenMs={300} />);
+    await screen.findByRole("region", { name: "Fieldwork scans" }, { timeout: 10_000 });
+    expect(ev.attempts()).toBe(2);
+    expect(listReads()).toBe(2);
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("FR-756 C (R597): a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
+    useService([]);
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} streamOpenMs={200} />);
+    await waitFor(() => expect(ev.attempts()).toBe(1));
+    await new Promise((r) => setTimeout(r, 3_000));
+    expect(ev.attempts()).toBe(1);
+    // R602 M2: the page has not cancelled it (a drop after the answer began would not end a mocked body).
+    expect(ev.signals()[0]!.aborted).toBe(false);
+  });
+
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
     useService([]);
     const ev = sseAttempts((n) => (n === 1 ? "fail" : []));

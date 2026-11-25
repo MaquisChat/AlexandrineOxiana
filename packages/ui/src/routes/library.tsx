@@ -7,7 +7,8 @@
  * question is placed on the open library's screen only, never over the chooser (Task 48c, D9).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ApiClient } from "../api/client";
+import { SERVICE_NO_ANSWER, type ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
 import { libraryApi, type CurrentLibrary, type LibraryEntry, type LibraryList } from "../api/library";
 import { toolsApi } from "../api/tools";
 import { FirstUseTools } from "../components/FirstUseTools";
@@ -28,12 +29,18 @@ export const isLibraryPath = (path: string): boolean => (LIBRARY_PATHS as readon
 
 type View =
   | { kind: "loading" }
+  /** FR-756 A: the first look at the libraries was given up at its time limit; whether a library is open is not known. */
+  | { kind: "no-answer" }
   /** `reopening`: the library open last time is still being opened by the service (I1); the chooser stays usable. */
   | { kind: "chooser"; reopening?: { libraryId: string; name: string } }
   | { kind: "not-found"; library: LibraryEntry } | { kind: "library"; current: CurrentLibrary; path?: string | undefined };
 
-export function LibraryRoutes({ client, loc }: { client: ApiClient; loc?: AppLocation }) {
-  return <LibraryFlow client={client} loc={loc ?? { pathname: window.location.pathname, search: window.location.search }} />;
+/**
+ * `firstReadMs` (FR-756 A): how long each look at the libraries (the first, and each check while the last library is
+ * still being opened) is waited for before it is given up (FIRST_READ_TIMEOUT_MS; smaller in tests).
+ */
+export function LibraryRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; loc?: AppLocation; firstReadMs?: number }) {
+  return <LibraryFlow client={client} loc={loc ?? { pathname: window.location.pathname, search: window.location.search }} firstReadMs={firstReadMs} />;
 }
 
 /** The address with this project in its query, on the same library path. */
@@ -45,7 +52,7 @@ const withProject = (loc: AppLocation, projectId?: string) => {
   return `${normalisePath(loc.pathname)}${s ? `?${s}` : ""}`;
 };
 
-function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
+function LibraryFlow({ client, loc, firstReadMs }: { client: ApiClient; loc: AppLocation; firstReadMs: number }) {
   const api = useMemo(() => libraryApi(client), [client]);
   const tools = useMemo(() => toolsApi(client), [client]);
   const [view, setView] = useState<View>({ kind: "loading" });
@@ -64,20 +71,40 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
           : { kind: "chooser" };
   }, []);
 
+  // The first look. FR-756 A: one that FAILED shows the chooser, which reads the list itself and says why (as before);
+  // one given up at the time limit (it neither answered nor failed) says so, with "Try again" (`looks` counts them).
+  const [looks, setLooks] = useState(0);
   useEffect(() => {
-    let live = true;
-    api.libraries
-      .list()
+    const ac = new AbortController();
+    readWithin((signal) => api.libraries.list({ signal }), firstReadMs, ac.signal)
       .then((r) => {
-        if (!live) return;
+        if (ac.signal.aborted) return;
         setKnown(r.libraries);
         setView(viewOf(r));
       })
-      .catch(() => live && setView({ kind: "chooser" }));
-    return () => {
-      live = false;
-    };
-  }, [api, viewOf]);
+      .catch((err: unknown) => {
+        if (ac.signal.aborted) return;
+        setView(isNoAnswerInTime(err) ? { kind: "no-answer" } : { kind: "chooser" });
+      });
+    return () => ac.abort();
+  }, [api, viewOf, firstReadMs, looks]);
+  /** "Try again" was pressed: focus follows the screen (the loading words, then what replaces them), never the page. */
+  const retried = useRef(false);
+  const loadingRef = useRef<HTMLParagraphElement>(null);
+  const tryAgainRef = useRef<HTMLButtonElement>(null);
+  const tryAgain = () => {
+    retried.current = true;
+    setView({ kind: "loading" });
+    setLooks((n) => n + 1);
+  };
+  useEffect(() => {
+    if (!retried.current) return;
+    if (view.kind === "loading") return loadingRef.current?.focus();
+    if (view.kind === "no-answer") return tryAgainRef.current?.focus();
+    retried.current = false;
+    const now = document.activeElement;
+    if (!now || now === document.body || !now.isConnected) document.querySelector<HTMLElement>("main h1[tabindex], main[tabindex]")?.focus();
+  }, [view.kind]);
 
   // While the last library is still being opened, check again, less and less often (I1, R469 a). An
   // answer that comes after the researcher chose something else (the view changed, or the screen went
@@ -92,23 +119,25 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
     if (checks.current.libraryId !== reopeningId) checks.current = { libraryId: reopeningId, made: 0 };
     const delay = REOPEN_CHECK_MS[Math.min(checks.current.made, REOPEN_CHECK_MS.length - 1)];
     let live = true;
+    const ac = new AbortController();
     const timer = setTimeout(() => {
       checks.current.made++;
-      api.libraries
-        .list()
+      // FR-756 A: each check has the time limit too, so one that never settles does not stop the checking.
+      readWithin((signal) => api.libraries.list({ signal }), firstReadMs, ac.signal)
         .then((r) => {
           if (!live) return;
           setKnown(r.libraries);
           setView((v) => (v.kind === "chooser" && v.reopening?.libraryId === reopeningId ? viewOf(r) : v));
         })
-        // Not answered: keep checking (a new view object re-arms this effect).
+        // Not answered (or not in time): keep checking (a new view object re-arms this effect).
         .catch(() => live && setView((v) => (v.kind === "chooser" && v.reopening ? { ...v } : v)));
     }, delay);
     return () => {
       live = false;
       clearTimeout(timer);
+      ac.abort();
     };
-  }, [api, viewOf, reopeningId, view]);
+  }, [api, viewOf, reopeningId, view, firstReadMs]);
 
   const opened = (current: CurrentLibrary) => setView({ kind: "library", current, path: known.find((l) => l.libraryId === current.libraryId)?.lastKnownPaths[0] });
   const chooser = () => {
@@ -120,9 +149,22 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
   switch (view.kind) {
     case "loading":
       return (
-        <p className="ao-page" aria-live="polite">
+        <p className="ao-page" aria-live="polite" ref={loadingRef} tabIndex={-1}>
           Connecting to the library…
         </p>
+      );
+    case "no-answer":
+      return (
+        <main className="ao-page">
+          <p role="alert" className="ao-error">
+            {SERVICE_NO_ANSWER}
+          </p>
+          <p>
+            <button type="button" ref={tryAgainRef} onClick={tryAgain}>
+              Try again
+            </button>
+          </p>
+        </main>
       );
     case "chooser":
       return (
@@ -133,7 +175,7 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
               it opens here as soon as it is ready. You can choose another library meanwhile.
             </p>
           )}
-          <LibraryChooser api={api} onOpened={opened} onNotFound={(library) => setView({ kind: "not-found", library })} />
+          <LibraryChooser api={api} firstReadMs={firstReadMs} onOpened={opened} onNotFound={(library) => setView({ kind: "not-found", library })} />
         </>
       );
     case "not-found":
@@ -144,9 +186,10 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
           key={view.current.libraryId}
           api={api}
           current={view.current}
+          firstReadMs={firstReadMs}
           {...(view.path ? { libraryPath: view.path } : {})}
           navigate={navigate}
-          firstUse={(hidden) => <FirstUseTools api={tools} hidden={hidden} />}
+          firstUse={(hidden) => <FirstUseTools api={tools} hidden={hidden} firstReadMs={firstReadMs} />}
           projectFromAddress={projectInQuery(loc.search)}
           onProjectSelected={(id) => {
             // Only while the library is the screen shown: never rewrite another screen's address.

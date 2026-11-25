@@ -7,6 +7,7 @@
  */
 import { useEffect, useId, useRef, useState, type FormEvent, type RefObject } from "react";
 import { ApiClientError } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../api/firstRead";
 import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry, type LibraryState } from "../api/library";
 import { PathField } from "../components/PathField";
 import { DeviceNoticeBanners, useNoticeDismiss } from "../components/StatusBanner";
@@ -19,6 +20,11 @@ export interface LibraryChooserProps {
   api: Pick<LibraryApi, "libraries">;
   onOpened: (current: CurrentLibrary) => void;
   onNotFound: (library: LibraryEntry) => void;
+  /**
+   * FR-756 I3 (R602): how long the read of the list of libraries is waited for before it is given up as a read that got
+   * no answer (FIRST_READ_TIMEOUT_MS; smaller in tests).
+   */
+  firstReadMs?: number;
 }
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
@@ -85,7 +91,7 @@ function LostCreateNotices({ heading }: { heading: RefObject<HTMLHeadingElement 
   );
 }
 
-export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProps) {
+export function LibraryChooser({ api, onOpened, onNotFound, firstReadMs = FIRST_READ_TIMEOUT_MS }: LibraryChooserProps) {
   const [libraries, setLibraries] = useState<LibraryEntry[] | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
@@ -182,24 +188,41 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
     };
   }, [api, path]);
 
+  // FR-756 I3 (R602): the list has the time limit. A read that got no answer (none at all, or none in time) says its own
+  // sentence with "Try again" (`listTry` moves it on); one refused with an answer says so as before.
+  const [listNoAnswer, setListNoAnswer] = useState<string | undefined>();
+  const [listTry, setListTry] = useState(0);
+  const triedList = useRef(false);
   useEffect(() => {
-    let live = true;
-    api.libraries
-      .list()
+    const ac = new AbortController();
+    readWithin((signal) => api.libraries.list({ signal }), firstReadMs, ac.signal)
       .then((r) => {
-        if (!live) return;
+        if (ac.signal.aborted) return;
+        setListNoAnswer(undefined);
         setLibraries(r.libraries);
         setNotices(r.notices ?? []);
       })
       .catch((err: unknown) => {
-        if (!live) return;
+        if (ac.signal.aborted) return;
+        if (isUnreachable(err)) {
+          setListNoAnswer((err as ApiClientError).message);
+          // Given up, nothing is known of the list; failed, it is shown empty as before.
+          if (!isNoAnswerInTime(err)) setLibraries((l) => l ?? []);
+          return;
+        }
+        setListNoAnswer(undefined);
         setLibraries([]);
         setError(message(err, "The list of libraries could not be read."));
       });
-    return () => {
-      live = false;
-    };
-  }, [api]);
+    return () => ac.abort();
+  }, [api, firstReadMs, listTry]);
+  // The "Try again" pressed has gone (the list was read): focus goes to the heading, never the page.
+  useEffect(() => {
+    if (listNoAnswer || !triedList.current) return;
+    triedList.current = false;
+    const now = document.activeElement;
+    if (!now || now === document.body || !now.isConnected) heading.current?.focus();
+  }, [listNoAnswer]);
 
   const open = async (entry: LibraryEntry) => {
     const at = entry.lastKnownPaths[0];
@@ -240,7 +263,7 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
       <DeviceNoticeBanners notices={notices} onDismiss={notice.onDismiss} error={notice.error} />
       <LostCreateNotices heading={heading} />
       {libraries === undefined ? (
-        <p aria-live="polite">Loading libraries…</p>
+        !listNoAnswer && <p aria-live="polite">Loading libraries…</p>
       ) : libraries.length === 0 ? (
         <p>No libraries yet. Open a library folder, or create a new library below.</p>
       ) : (
@@ -261,6 +284,24 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
             </li>
           ))}
         </ul>
+      )}
+      {listNoAnswer && (
+        <>
+          <p role="alert" className="ao-error">
+            {listNoAnswer}
+          </p>
+          <p>
+            <button
+              type="button"
+              onClick={() => {
+                triedList.current = true;
+                setListTry((n) => n + 1);
+              }}
+            >
+              Try again
+            </button>
+          </p>
+        </>
       )}
       {error && (
         <p role="alert" className="ao-error">
