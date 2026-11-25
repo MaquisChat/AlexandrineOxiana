@@ -103,7 +103,7 @@ import {
   type FindQueueResponse,
   type FindScreenSettings,
 } from "@ao/shared";
-import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from "react";
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from "react";
 import { ApiClientError, SERVICE_NO_ANSWER, SERVICE_UNREACHABLE, STREAM_OPEN_TIMEOUT_MS, type ApiClient, type ServiceEvent } from "../api/client";
 import { findApi, findHref, findProgressOf, type FindApi } from "../api/find";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
@@ -1027,6 +1027,7 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, 
           onUnlocked={readProjects}
           waitForSwitch={waitForSwitch}
           saidAbove={showTryAgain && queueNoAnswer ? queueNoAnswer : screenError}
+          screenSays={showTryAgain}
           onNoAnswer={setQueueNoAnswer}
           firstReadMs={firstReadMs}
         />
@@ -1123,10 +1124,15 @@ function ProjectQueue(props: {
   saidAbove?: string | undefined;
   /** R602 M1: the queue's read got no answer (its sentence), or did again (undefined), so the screen says one sentence. */
   onNoAnswer?: (sentence: string | undefined) => void;
+  /**
+   * R609 N1: the screen says its one no-answer sentence (with its "Try again"): a no-answer of the queue's own is said by
+   * it, so the queue never shows its own alert for it, not even before the screen has heard of it.
+   */
+  screenSays?: boolean;
   /** FR-750: how long a read of the queue asked for at once (at load, after the switch, an unlock, "Try again") is waited for. */
   firstReadMs: number;
 }) {
-  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch, saidAbove, onNoAnswer, firstReadMs } = props;
+  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch, saidAbove, onNoAnswer, screenSays, firstReadMs } = props;
   /** The desktop shell's bridge (F16); undefined outside the desktop app. */
   const shell = useMemo(() => desktopShell(), []);
   const projectId = project.id;
@@ -1509,7 +1515,8 @@ function ProjectQueue(props: {
   const reportNoAnswer = useRef(onNoAnswer);
   reportNoAnswer.current = onNoAnswer;
   const noAnswerHere = loadUnreachable && loadError && !entries?.length ? loadError : undefined;
-  useEffect(() => reportNoAnswer.current?.(noAnswerHere), [noAnswerHere]);
+  // Told before the page is painted (R609 N1), so the screen's one sentence is right when it is first seen.
+  useLayoutEffect(() => reportNoAnswer.current?.(noAnswerHere), [noAnswerHere]);
   useEffect(() => () => reportNoAnswer.current?.(undefined), []);
   /**
    * One read, waited for at most QUEUE_READ_WAIT_MS (FR-558). A read given up then is cancelled (R472), so that reads
@@ -2434,7 +2441,7 @@ function ProjectQueue(props: {
 
       <h2 id={`${ids}-queue`}>Queue</h2>
       {/* FR-576: the same sentence (the service cannot be reached) is said once, not by the screen and again here. */}
-      {loadError && loadError !== saidAbove && !entries?.length && (
+      {loadError && loadError !== saidAbove && !entries?.length && !(loadUnreachable && screenSays) && (
         <>
           <p role="alert" className="ao-error">
             <UserText>{loadError}</UserText>
