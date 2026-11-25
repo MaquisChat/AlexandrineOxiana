@@ -133,6 +133,41 @@ describe("Import wizard: first reads that never settle or fail (FR-756)", () => 
   });
 });
 
+describe("Import wizard: rules that could not be read are said where the options are forced (FR-756, R605 M2)", () => {
+  const STRICT_NOTE = "This project's rules could not be read, so the strictest options are used. Try again to read them.";
+  async function toOptions() {
+    const user = userEvent.setup();
+    await screen.findByRole("option", { name: "Thesis" });
+    await user.click(screen.getByRole("radio", { name: "Folder" }));
+    await user.type(screen.getByRole("textbox", { name: "Folder path" }), "/data/papers");
+    await user.click(screen.getByRole("button", { name: "Scan" }));
+    await screen.findByRole("heading", { name: "Scan results" });
+    await user.click(screen.getByRole("button", { name: "Next" }));
+    await user.click(await screen.findByRole("button", { name: "Next" }));
+    await screen.findByRole("heading", { name: "Options" });
+    return user;
+  }
+  const linkInPlace = () => screen.getByRole("radio", { name: /Link in place/ }) as HTMLInputElement;
+
+  it.each([
+    ["given up at the limit", (n: number) => n === 1, false],
+    ["failed with no answer", () => false, true],
+  ])("rules %s: the Options step says the strictest options are used, with “Try again”, which reads them and shows the options they allow", async (_what, hold, fail) => {
+    let asks = 0;
+    const rules = holding(`/projects/${P1}/governance`, hold);
+    const failing = http.get(url(`/projects/${P1}/governance`), () => (++asks === 1 ? Response.error() : undefined));
+    open({ extra: [fail ? failing : rules.handler] }, { firstReadMs: 300, batch: false });
+    const user = await toOptions();
+    await screen.findByText(STRICT_NOTE, {}, { timeout: 5000 });
+    expect(linkInPlace().disabled).toBe(true);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+    await user.click(tryAgain()!);
+    await waitFor(() => expect(linkInPlace().disabled).toBe(false));
+    expect(screen.queryByText(STRICT_NOTE)).toBeNull();
+    expect(tryAgain()).toBeNull();
+  });
+});
+
 describe("Import wizard, run step: its first read and its event stream (FR-756, R597)", () => {
   it("the batch's state on arrival, never answered, is given up at the limit and the run is followed (it no longer waits before listening)", async () => {
     // The first ask is the opening's; the second, the run step's on arrival.

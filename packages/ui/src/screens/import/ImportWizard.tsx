@@ -42,6 +42,8 @@ const STEPS: Array<{ step: Step; label: string; note?: string }> = [
 ];
 
 const STRICT: ImportPolicy = { pseudonymizeNames: true, encryptionRequired: true };
+/** R605 M2 (NEW sentence): the rules' read failed or was given up, so they are taken strictly — said where the options are forced. */
+export const RULES_NOT_READ_TEXT = "This project's rules could not be read, so the strictest options are used. Try again to read them.";
 
 function describeChoice(c: SourceChoice): string {
   switch (c.kind) {
@@ -116,6 +118,9 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
    */
   const [unanswered, setUnanswered] = useState<{ open?: string; projects?: string }>({});
   const [projectsTry, setProjectsTry] = useState(0);
+  /** R605 M2: the project's rules could not be read (failed, or given up at the limit): they are taken strictly. */
+  const [rulesNotRead, setRulesNotRead] = useState(false);
+  const [rulesTry, setRulesTry] = useState(0);
 
   /** Any edit after a scan makes it stale: the scan and its approvals are dropped. */
   const invalidate = () => {
@@ -192,6 +197,7 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
     document.getElementById("ao-import-title")?.focus();
     if (unanswered.open) setOpening(true);
     if (unanswered.projects) setProjectsTry((n) => n + 1);
+    if (rulesNotRead) setRulesTry((n) => n + 1);
     setUnanswered({});
   };
 
@@ -214,6 +220,7 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
     let live = true;
     setPolicy(null);
     setRulesUnreadable(false);
+    setRulesNotRead(false);
     setOptions(null); // defaults follow the project's rules
     const ac = new AbortController();
     // FR-756: given up after `firstReadMs` as a read that failed: the rules are then taken strictly, as before.
@@ -223,12 +230,16 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
         setPolicy(p);
         setRulesUnreadable(!p.readable);
       })
-      .catch(() => live && setPolicy(STRICT));
+      .catch(() => {
+        if (!live) return;
+        setPolicy(STRICT);
+        setRulesNotRead(true);
+      });
     return () => {
       live = false;
       ac.abort();
     };
-  }, [api, projectId, firstReadMs]);
+  }, [api, projectId, firstReadMs, rulesTry]);
 
   const effectivePolicy = policy ?? STRICT;
   const opts = options ?? defaultOptions(effectivePolicy);
@@ -357,6 +368,19 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
       )}
       {step === "options" && (
         <>
+          {rulesNotRead && (
+            <p className="ao-import__warning" role="note">
+              {RULES_NOT_READ_TEXT}
+            </p>
+          )}
+          {/* One "Try again" on the page: the one above, when shown, reads the rules again too. */}
+          {rulesNotRead && !(!opening && noAnswer !== undefined) && (
+            <p>
+              <button type="button" onClick={readAgain}>
+                Try again
+              </button>
+            </p>
+          )}
           <StepOptions options={opts} onOptions={setOptions} policy={effectivePolicy} linkedAttachments={scanned?.summary.linkedFiles ?? 0} />
           <ErrorNote error={error} />
           <div className="ao-import__actions">
