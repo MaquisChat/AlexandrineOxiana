@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { PATHS } from "../navigation";
 import { fakeShell, type FakeShell } from "../test/desktopShell";
-import { BASE, CURRENT_RW, LIBRARIES, TOKEN, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
+import { BASE, CURRENT_RW, LIBRARIES, TOKEN, hang, libraryHandlers, server, testClient, url, useMockService } from "../test/service";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
 import { YOUR_LIBRARY_SCREEN_TEXT as T, YourLibrary, onAMac } from "./YourLibrary";
 
@@ -1422,5 +1422,58 @@ describe("Your library: reachable", () => {
     } finally {
       window.history.pushState(null, "", "/");
     }
+  });
+});
+
+describe("Your library: a first read that never settles (FR-756, R584, R586)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const UNREACHABLE = "The library service could not be reached.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
+
+  it("is given up at the limit: the alert and “Try again”; pressed, it reads again, the loading words meanwhile, and the settings are shown with focus kept", async () => {
+    const svc = useSvc(SET);
+    const gate = hang();
+    let answer = false;
+    svc.onGet = async () => {
+      if (!answer) await gate;
+      return undefined;
+    };
+    render(<YourLibrary client={testClient()} firstReadMs={300} />);
+    expect(screen.getByText(T.loading)).toBeTruthy();
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    await userEvent.setup().click(tryAgain()!);
+    expect(screen.getByText(T.loading)).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Your library" }));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("textbox", { name: "Your institution's name" });
+    expect(nameField().value).toBe("Zorblatt University");
+    expect(tryAgain()).toBeNull();
+    expect(alerts()).toEqual([]);
+    expect(svc.count("GET", "/settings/your-library")).toBe(3);
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Your library" }));
+  });
+
+  it("a read that FAILS says what it said before, now with “Try again”", async () => {
+    const svc = useSvc(SET);
+    let fail = true;
+    svc.onGet = async () => (fail ? HttpResponse.error() : undefined);
+    render(<YourLibrary client={testClient()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([UNREACHABLE]);
+    fail = false;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("textbox", { name: "Your institution's name" });
+  });
+
+  it("a read refused with an answer says its sentence as before, with no “Try again”", async () => {
+    const svc = useSvc(SET);
+    svc.onGet = async () => HttpResponse.json({ error: { code: "INTERNAL", message: "The settings file could not be read." } }, { status: 500 });
+    render(<YourLibrary client={testClient()} firstReadMs={300} />);
+    await screen.findByText("The settings file could not be read.");
+    expect(tryAgain()).toBeNull();
   });
 });

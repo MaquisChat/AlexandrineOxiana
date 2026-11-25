@@ -46,6 +46,8 @@ import {
 } from "@ao/shared";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import { desktopShell, type DesktopShell } from "../desktopShell";
 import { inAppLink, PATHS } from "../navigation";
@@ -125,7 +127,7 @@ export interface YourLibrarySaveRequest {
 /** The typed calls of F15's and F18a's routes (every path, method and body as their handlers take them). */
 export function yourLibraryApi(client: ApiClient) {
   return {
-    read: () => client.request<YourLibraryResponse>("GET", "/settings/your-library"),
+    read: (o: { signal?: AbortSignal } = {}) => client.request<YourLibraryResponse>("GET", "/settings/your-library", o),
     save: (body: YourLibrarySaveRequest) => client.request<YourLibraryResponse>("PUT", "/settings/your-library", { body }),
     /** The pasted link, and nothing else, in the body of this one request. */
     derive: (link: string) => {
@@ -223,7 +225,8 @@ function newTicket(): string {
   return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 
-export function YourLibrary({ client }: { client: ApiClient }) {
+/** `firstReadMs` (FR-756, R579): how long a read of the settings is waited for before it is given up (smaller in tests). */
+export function YourLibrary({ client, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; firstReadMs?: number }) {
   const api = useMemo(() => yourLibraryApi(client), [client]);
   const shell = useMemo(() => desktopShell(), []);
   const mac = useMemo(() => onAMac(), []);
@@ -232,6 +235,9 @@ export function YourLibrary({ client }: { client: ApiClient }) {
   const [confirmed, setConfirmed] = useState<YourLibraryResponse | undefined>();
   const [draft, setDraftState] = useState<Draft | null>(null);
   const [loadError, setLoadError] = useState<string | undefined>();
+  /** FR-756: the settings' last read got no answer (or none in time): "Try again" is offered. */
+  const [loadUnreachable, setLoadUnreachable] = useState(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | undefined>();
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<Field, string>>>({});
@@ -292,10 +298,20 @@ export function YourLibrary({ client }: { client: ApiClient }) {
 
   const read = useCallback(async (): Promise<void> => {
     const seq = ++readSeq.current;
-    const r = await within(api.read());
-    if (r !== "gave-up" && "value" in r) apply(r.value, seq);
-    else if (!confirmedRef.current && seq >= applied.current) setLoadError(r === "gave-up" ? T.loadFailed : sentenceOf(r.error, T.loadFailed));
-  }, [api, apply]);
+    // FR-756 (R586 M5): a read that never settles is given up after `firstReadMs` (its request cancelled) and says
+    // "The library service did not answer in time."; one that fails says its sentence as before.
+    let r: YourLibraryResponse;
+    try {
+      r = await readWithin((signal) => api.read({ signal }), firstReadMs);
+    } catch (err) {
+      if (!confirmedRef.current && seq >= applied.current) {
+        setLoadError(sentenceOf(err, T.loadFailed));
+        setLoadUnreachable(isUnreachable(err));
+      }
+      return;
+    }
+    apply(r, seq);
+  }, [api, apply, firstReadMs]);
 
   useEffect(() => {
     void read();
@@ -648,7 +664,7 @@ export function YourLibrary({ client }: { client: ApiClient }) {
 
   return (
     <main ref={mainRef} className="ao-page ao-yl" aria-labelledby={titleId}>
-      <h1 id={titleId} tabIndex={-1}>
+      <h1 id={titleId} ref={headingRef} tabIndex={-1}>
         Your library
       </h1>
       <p>{T.intro}</p>
@@ -660,6 +676,15 @@ export function YourLibrary({ client }: { client: ApiClient }) {
         <p role="alert" className="ao-error">
           <UserText>{loadError}</UserText>
         </p>
+      )}
+      {!confirmed && loadError && loadUnreachable && (
+        <TryAgain
+          focusTo={headingRef}
+          onPress={() => {
+            setLoadError(undefined);
+            void read();
+          }}
+        />
       )}
       {confirmed?.problem && (
         <p className="ao-yl__problem" data-testid="yl-problem">
