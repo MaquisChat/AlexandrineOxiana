@@ -111,6 +111,24 @@ describe("FR-756: the audit log", () => {
     expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Audit log" }));
   });
 
+  // FR-756's remainder (R601 b): the log had no loading words; "Reading the audit log…" is ruled, polite as the others'.
+  it("says “Reading the audit log…” (polite) while its page is read and after “Try again”, never beside the alert or the log", async () => {
+    server.use(http.get(P("/attention"), () => HttpResponse.json({ marks: [] })));
+    const h = held(P("/audit"), PAGE);
+    render(<AuditLog api={makeApi()} projectId={PID} firstReadMs={LIMIT} />);
+    const words = () => screen.queryByText("Reading the audit log…");
+    expect(words()?.getAttribute("role")).toBe("status");
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(words()).toBeNull();
+    await userEvent.setup().click(tryAgain()!);
+    expect(words()?.getAttribute("role")).toBe("status");
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    h.answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("table", { name: "Audit events" });
+    expect(words()).toBeNull();
+  });
+
   it("a read of the log that FAILS says what it said before, now with “Try again”", async () => {
     server.use(
       http.get(P("/attention"), () => HttpResponse.json({ marks: [] })),

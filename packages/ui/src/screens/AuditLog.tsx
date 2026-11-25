@@ -465,6 +465,8 @@ export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_R
    * "Try again". Kept apart from `error` (R605 M5): a re-read after an act, given up, never replaces the screen's message.
    */
   const [unanswered, setUnanswered] = useState<string | null>(null);
+  /** FR-756's remainder (R601 b): a read of the log's page is out: "Reading the audit log…" is said meanwhile. */
+  const [reading, setReading] = useState(false);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const before = cursors[cursors.length - 1];
   const ids = useId();
@@ -473,15 +475,18 @@ export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_R
   const reads = useLatestRead();
   const load = useCallback(async () => {
     const outer = reads.begin();
+    setReading(true);
     try {
       // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
       const p = await readWithin((signal) => api.audit(projectId, { limit: pageSize, ...(before !== undefined ? { before } : {}), signal }), firstReadMs, outer);
       if (!reads.settled(outer)) return;
+      setReading(false);
       setPage(p);
       setError(null);
       setUnanswered(null);
     } catch (err) {
       if (!reads.settled(outer)) return;
+      setReading(false);
       if (isUnreachable(err)) setUnanswered((err as Error).message);
       else {
         setUnanswered(null);
@@ -544,6 +549,7 @@ export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_R
         </p>
       ) : null}
       {unanswered && !yields && <TryAgain focusTo={headingRef} onPress={retryAll} />}
+      {reading && !unanswered && <p role="status">Reading the audit log…</p>}
       <NeedsAttention api={api} projectId={projectId} onChanged={() => void load()} />
       {page ? (
         <>
