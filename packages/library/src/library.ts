@@ -15,7 +15,7 @@ import {
   startHeartbeat,
   type LockInfo,
 } from "./lock.js";
-import { movedToFor } from "./old-copies.js";
+import { movedToFor, type MovedTo } from "./old-copies.js";
 import { registerLibrary } from "./registry.js";
 
 export const FORMAT_VERSION = 1;
@@ -46,7 +46,7 @@ export interface Library {
    * For a `moved` old copy: where it went, from this device's records. `unfinished` means the
    * move's switch did not finish; complete it with `completeMove(newRoot, …)`.
    */
-  movedTo?: { newRoot: string; unfinished: boolean };
+  movedTo?: MovedTo;
   /**
    * With `locked-by-other-device`: the name of the device holding the lock (its hostname from the
    * lock file), when known and plausible. Only the device's name: the lock records no user name.
@@ -121,7 +121,7 @@ export class LibraryMovedError extends Error {
   override name = "LibraryMovedError";
   constructor(
     readonly root: string,
-    readonly movedTo?: { newRoot: string; unfinished: boolean },
+    readonly movedTo?: MovedTo,
     readonly toHint?: string,
   ) {
     super(

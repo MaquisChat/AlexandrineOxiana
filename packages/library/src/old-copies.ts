@@ -12,7 +12,9 @@
  */
 import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { join } from "node:path";
+import { realpath as realpathCb } from "node:fs";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import type { Deps } from "./deps.js";
 import { raiseDeviceNotice } from "./device-notices.js";
 import { writeFileAtomic } from "./fs/atomic.js";
@@ -178,9 +180,26 @@ export async function listUnfinishedMoves(
 }
 
 /**
- * R583 M2, R590 N4: the one judgement of whether a recorded move has finished. "unfinished": the record is not
- * complete, or its journal is still at the new place; "damaged": a journal is at the new place but cannot be read;
- * "cannot-tell": the record is complete but the new place cannot be read (its drive is not
+ * R583 M1, R590 N5: the two paths name the same folder — compared by what the folder is (its real path: links resolved,
+ * the disk's own letter case), not by their text. A path that cannot be resolved is compared as written.
+ */
+const realpathNative = promisify(realpathCb.native);
+export async function sameFolder(a: string, b: string): Promise<boolean> {
+  const real = (p: string) => realpathNative(p).catch(() => resolve(p));
+  return (await real(a)) === (await real(b));
+}
+
+/** This device's newest record of a move of the library `libraryId` out of the folder `oldRoot` (matched by real path). */
+async function recordFrom(deps: CfgDeps, oldRoot: string, libraryId: string): Promise<PendingOldCopy | undefined> {
+  const mine = (await load(deps)).filter((x) => x.libraryId === libraryId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  for (const r of mine) if (await sameFolder(r.oldRoot, oldRoot)) return r;
+  return undefined;
+}
+
+/**
+ * R583 M2, R590 N4, N5: the one judgement of whether a recorded move has finished. "unfinished": the record is not
+ * complete, or its journal is still at the new place; "damaged": a journal is at the new place but cannot be read, so the
+ * app cannot finish the move; "cannot-tell": the record is complete but the new place cannot be read (its drive is not
  * connected), so whether its journal is still there is not known; "finished" otherwise. Everything but "finished" counts
  * as unfinished (it fails closed): the old copy is not deletable, and an old library of a split stays read-only.
  */
@@ -212,13 +231,19 @@ async function journalAt(rec: Pick<PendingOldCopy, "id" | "newRoot">): Promise<"
   return j.switch?.pendingId === rec.id ? "here" : "absent";
 }
 
-/** Where the library at `oldRoot` was moved, from this device's records (newest first). */
-export async function movedToFor(deps: CfgDeps, oldRoot: string, libraryId: string): Promise<{ newRoot: string; unfinished: boolean } | undefined> {
-  const r = (await load(deps))
-    .filter((x) => x.oldRoot === oldRoot && x.libraryId === libraryId)
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-  return r ? { newRoot: r.newRoot, unfinished: (await moveFinished(r)) !== "finished" } : undefined;
+/** Where the library at `oldRoot` was moved, from this device's records (newest first; the folder matched by real path). */
+export async function movedToFor(deps: CfgDeps, oldRoot: string, libraryId: string): Promise<MovedTo | undefined> {
+  const r = await recordFrom(deps, oldRoot, libraryId);
+  return r ? movedToOf(r, await moveFinished(r)) : undefined;
 }
+
+export interface MovedTo {
+  newRoot: string;
+  unfinished: boolean;
+  /** R590 N5: the move's journal at the new place is damaged: the app cannot finish this move. */
+  journalDamaged?: true;
+}
+const movedToOf = (r: PendingOldCopy, state: MoveFinished): MovedTo => ({ newRoot: r.newRoot, unfinished: state !== "finished", ...(state === "damaged" ? { journalDamaged: true as const } : {}) });
 
 export async function getPendingOldCopy(deps: CfgDeps, id: string): Promise<PendingOldCopy | undefined> {
   return (await load(deps)).find((r) => r.id === id);

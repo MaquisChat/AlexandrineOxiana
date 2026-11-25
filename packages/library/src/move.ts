@@ -16,8 +16,7 @@
  * old copy is marked with MOVED.json and opens read-only (`moved`).
  */
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream, realpath as realpathCb } from "node:fs";
-import { promisify } from "node:util";
+import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { dateRuleZone, evaluate, newId, parseGovernance, type PolicyDecision, type ResidencyKind } from "@ao/core";
@@ -40,6 +39,7 @@ import {
   markPendingComplete,
   readVerifiedHashes,
   markPendingDeleted,
+  sameFolder,
   type PendingOldCopy,
 } from "./old-copies.js";
 import { addKnownPath, registerLibrary } from "./registry.js";
@@ -1010,16 +1010,6 @@ async function takeOldCopyLock(oldRoot: string, deps: Deps): Promise<void> {
   }
   const got = await acquireLock(oldRoot, deps);
   if (!got.acquired) throw new MoveNotAllowedError("old-copy-in-use", "The old copy of the library is open on another computer, so the move cannot be finished now");
-}
-
-/**
- * R583 M1: the two paths name the same folder — compared by what the folder is (its real path: links resolved, the
- * disk's own letter case), not by their text. A path that cannot be resolved is compared as written.
- */
-const realpathNative = promisify(realpathCb.native);
-async function sameFolder(a: string, b: string): Promise<boolean> {
-  const real = (p: string) => realpathNative(p).catch(() => resolve(p));
-  return (await real(a)) === (await real(b));
 }
 
 async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: Deps, ctx: SwitchContext): Promise<MoveResult> {

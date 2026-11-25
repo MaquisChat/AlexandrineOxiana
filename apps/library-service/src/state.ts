@@ -1841,6 +1841,8 @@ export class ServiceState {
       mode: s.lib.mode,
       ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
       ...(s.lib.movedTo?.unfinished ? { moveUnfinishedTo: s.lib.movedTo.newRoot } : {}),
+      // R590 N5: the move's journal at the new place is damaged: the app cannot finish that move.
+      ...(s.lib.movedTo?.unfinished && s.lib.movedTo.journalDamaged ? { moveCannotFinish: true } : {}),
       ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
       ...(s.indexStatus ? { index: s.indexStatus } : {}),
       integrityWarnings: this.integrityWarnings(s, names),

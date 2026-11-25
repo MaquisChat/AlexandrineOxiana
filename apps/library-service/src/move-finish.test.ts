@@ -384,6 +384,14 @@ describe("FR-755 (R578 (1)): opening the new place of an unfinished move finishe
     expect(await hashes(dest)).toEqual(destAt);
     expect(await hashes(path)).toEqual(oldAt);
   });
+
+  it("R590 N5: the old place of a move whose journal at the new place is damaged: read-only, naming the new place and that the app cannot finish the move", async () => {
+    const { path, dest } = await stoppedAfter("close-source");
+    await writeFile(join(dest, ".move-journal.json"), "{ damaged");
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path } });
+    expect([r.json.mode, r.json.readOnlyReason, r.json.moveUnfinishedTo, r.json.moveCannotFinish]).toEqual(["read-only", "moved", dest, true]);
+    expect(stateOf()).toMatchObject({ moveUnfinishedTo: dest, moveCannotFinish: true });
+  });
 });
 
 describe("R573 Minor 2: during a successful move, between the close of the old copy and the switch", () => {

@@ -537,3 +537,19 @@ describe("R583 M5: files at the new place that no longer match", () => {
     );
   });
 });
+
+describe("R590 (FR-755): what the app cannot finish", () => {
+  it("N5: the old copy of a move whose record at the new place is damaged does not promise that opening the new place finishes it", () => {
+    const place = "/Volumes/Field SSD/Library ‮gpj";
+    const banners = bannersFor({ mode: "read-only", readOnlyReason: "moved", moveUnfinishedTo: place, moveCannotFinish: true });
+    expect(banners).toEqual([{ kind: "read-only", reason: "moved", newRoot: place, cannotFinish: true }]);
+    render(<StatusBanner variant={banners[0]!} />);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe(
+      `Read-only — this is the old copy of a library whose move has not finished, and the app cannot finish it: the record of the move kept at its new place, ${place}, is damaged. Both copies are kept as they are. Tell the developer before changing or deleting either copy.`,
+    );
+    expect(status.textContent).not.toMatch(/will be finished/u);
+    expect(status.querySelector("bdi, [dir='auto']")).not.toBeNull();
+    cleanup();
+  });
+});

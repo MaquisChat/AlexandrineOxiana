@@ -49,6 +49,8 @@ function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
     ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
     // FR-755 (R578 (2)): the old copy of a move that has not finished: where to open the library to finish it.
     ...(s.lib.movedTo?.unfinished ? { moveUnfinishedTo: s.lib.movedTo.newRoot } : {}),
+    // R590 N5: and where the move's journal at the new place is damaged, that the app cannot finish it.
+    ...(s.lib.movedTo?.unfinished && s.lib.movedTo.journalDamaged ? { moveCannotFinish: true } : {}),
     // Only the holding device's name (R118): never its id, process or a user name.
     ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
     // Being rebuilt, failed, or not writable (read-only): absent when the index is ready (D8).

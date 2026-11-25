@@ -1612,4 +1612,17 @@ describe("FR-755 (R583): split moves, the check before finishing, and what canno
     });
     expect(await hashes(lib.root)).toEqual(before);
   });
+
+  // R590 N5: the old place's words, and how the old place is found.
+  it("R590 N5: the old place of a move whose journal is damaged says so: it does not promise that opening the new place finishes the move", async () => {
+    const { lib, dest } = await stopped();
+    await writeFile(join(dest, ".move-journal.json"), "{ not json");
+    expect((await openLibrary(lib.root, mkDeps())).movedTo).toEqual({ newRoot: dest, unfinished: true, journalDamaged: true });
+  });
+
+  it("R590 N5: the old place is matched by its real path: opened through a symbolic link, it names the new place", async () => {
+    const { lib, dest } = await stopped();
+    await symlink(lib.root, join(tmp, "OldLink"));
+    expect((await openLibrary(join(tmp, "OldLink"), mkDeps())).movedTo).toEqual({ newRoot: dest, unfinished: true });
+  });
 });
