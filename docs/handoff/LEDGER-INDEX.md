@@ -518,3 +518,4 @@ R592 (2026-11-25 UTC): "Look up again" — the engine's fix round built (e62d244
 R593 (2026-11-25 UTC): "Look up again" engine approved with small points at its second look; m1 (wording) and m2 (a denied service kept in a lookup that met a wait or a failure) mended now; m3 listed as FR-758
 R594 (2026-11-25 UTC): main 88a6bed — CI run 287 green (71 min); with the Mac job (run 19) both checks of main are green
 R595 (2026-11-25 UTC): "Look up again" engine ready at 89a97d2 (m1, m2 in, read by the coordinator); one question on the "failed" sentence in a mix goes to the review of the service and the page
+R596 (2026-11-25 UTC): FR-755's third round built (87181b8); N3's new sentence confirmed; N4's banner words corrected ("cannot tell" never says "has not finished"; deletion stays fail-closed); three questions to the third look
