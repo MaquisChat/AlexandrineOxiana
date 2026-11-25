@@ -18,6 +18,7 @@ import {
   completeMove,
   deleteOldCopy,
   executeMove,
+  finishMoveAt,
   listPendingOldCopies,
   listUnfinishedMoves,
   moveSeams,
@@ -166,6 +167,7 @@ afterEach(async () => {
   seams.crashAt = undefined;
   moveSeams.crashAfter = undefined;
   moveSeams.unreadableDir = undefined;
+  moveSeams.fail = undefined;
   for (const l of open) await l.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
@@ -1300,5 +1302,127 @@ describe("the list of old library copies cannot be read (Task 68, ruling 1)", ()
     expect(await listLibraries(mkDeps())).toEqual(regBefore);
     expect((await stat(join(cfgDir, "pending-old-copies.json"))).isDirectory()).toBe(true);
     expect(await readdir(join(cfgDir, "old-copies")).catch(() => [])).toEqual([]);
+  });
+});
+
+describe("FR-755 (R578): finishMoveAt finishes only this computer's own unfinished move, at its own new place", () => {
+  /** A whole-library move whose switch stopped after `step` (the process died there; its lock went with it). */
+  async function stoppedAfter(step: "mark-old" | "register" | "close-source" | "audit-move") {
+    const f = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.crashAfter = step;
+    await expect(executeMove(f.lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    await f.lib.close();
+    return { ...f, dest };
+  }
+  const journalOf = async (dest: string) => JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8"));
+
+  for (const step of ["mark-old", "register", "close-source", "audit-move"] as const) {
+    it(`a switch stopped after "${step}" is finished: the new place opens read-write, the old copy is marked, no lock is left`, async () => {
+      const { lib, a, b, dest } = await stoppedAfter(step);
+      const res = await finishMoveAt(dest, mkDeps());
+      expect(res?.verified).toBe(true);
+      expect(await readdir(dest)).not.toContain(".move-journal.json");
+      expect(await readdir(dest)).not.toContain(".lock");
+      expect(await readdir(lib.root)).not.toContain(".lock");
+      for (const fo of [a.folder, b.folder]) expect((await auditOf(dest, fo)).filter((e) => e.action === "library.move")).toHaveLength(1);
+      expect((await listLibraries(mkDeps())).find((e) => e.libraryId === lib.id)!.lastKnownPaths[0]).toBe(dest);
+      expect(await listUnfinishedMoves(mkDeps())).toEqual([]);
+      const d = await openLibrary(dest, mkDeps());
+      expect(d.mode).toBe("read-write");
+      await d.close();
+      expect((await openLibrary(lib.root, mkDeps())).readOnlyReason).toBe("moved");
+    });
+  }
+
+  it("nothing to finish (no journal): undefined, nothing written", async () => {
+    const { lib } = await fixture();
+    await lib.close();
+    const before = await hashes(lib.root);
+    expect(await finishMoveAt(lib.root, mkDeps())).toBeUndefined();
+    expect(await hashes(lib.root)).toEqual(before);
+  });
+
+  it("a copy made by hand of the new place, with its journal, is not finished (not the record's place); completeMove refuses it too", async () => {
+    const { lib, dest } = await stoppedAfter("close-source");
+    const copy = join(tmp, "Copy");
+    await mkdir(copy);
+    for (const rel of await walkFiles(dest)) {
+      await mkdir(join(copy, rel, ".."), { recursive: true });
+      await writeFile(join(copy, rel), await readFile(join(dest, rel)));
+    }
+    const [copyBefore, destBefore, oldBefore] = [await hashes(copy), await hashes(dest), await hashes(lib.root)];
+    const regBefore = await listLibraries(mkDeps());
+    expect(await finishMoveAt(copy, mkDeps())).toBeUndefined();
+    await expect(completeMove(copy, mkDeps(), env)).rejects.toMatchObject({ code: "nothing-to-complete" });
+    expect(await hashes(copy)).toEqual(copyBefore);
+    expect(await hashes(dest)).toEqual(destBefore);
+    expect(await hashes(lib.root)).toEqual(oldBefore);
+    expect(await listLibraries(mkDeps())).toEqual(regBefore);
+  });
+
+  it("a move this computer has no record of (brought from another computer) is not finished", async () => {
+    const { dest } = await stoppedAfter("close-source");
+    const before = await hashes(dest);
+    const other = { ...mkDeps(), appConfigDir: join(tmp, "other-config"), deviceId: "dev-B" };
+    expect(await finishMoveAt(dest, other)).toBeUndefined();
+    expect(await hashes(dest)).toEqual(before);
+  });
+
+  it("an old copy not yet marked (the switch stopped before it) is not finished: it is still the library", async () => {
+    const { lib, dest } = await stoppedAfter("mark-old");
+    const j = await journalOf(dest);
+    j.switch.done = [];
+    await writeFile(join(dest, ".move-journal.json"), JSON.stringify(j));
+    await rm(join(lib.root, "MOVED.json"));
+    const [destBefore, oldBefore] = [await hashes(dest), await hashes(lib.root)];
+    expect(await finishMoveAt(dest, mkDeps())).toBeUndefined();
+    expect(await hashes(dest)).toEqual(destBefore);
+    expect(await hashes(lib.root)).toEqual(oldBefore);
+  });
+
+  it("an old copy marked but not yet recorded as marked: marked again only under its own lock; held by another computer, nothing is written", async () => {
+    const { lib, dest } = await stoppedAfter("mark-old");
+    const j = await journalOf(dest);
+    j.switch.done = [];
+    await writeFile(join(dest, ".move-journal.json"), JSON.stringify(j));
+    const other = { ...mkDeps(), deviceId: "dev-B", hostname: "host-B", pid: 4242 };
+    expect((await acquireLock(lib.root, other)).acquired).toBe(true);
+    const [destBefore, oldBefore] = [await hashes(dest), await hashes(lib.root)];
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ code: "old-copy-in-use" });
+    const destAfter = await hashes(dest);
+    expect([...new Set([...Object.keys(destAfter), ...Object.keys(destBefore)])].filter((k) => destAfter[k] !== destBefore[k])).toEqual([]);
+    expect(await hashes(lib.root)).toEqual(oldBefore);
+    await releaseLock(lib.root, other);
+    expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+    expect(await readdir(lib.root)).not.toContain(".lock");
+    expect((await openLibrary(dest, mkDeps())).mode).toBe("read-write");
+  });
+
+  it("the new place held by another computer: refused, nothing written", async () => {
+    const { lib, dest } = await stoppedAfter("close-source");
+    const other = { ...mkDeps(), deviceId: "dev-B", hostname: "host-B", pid: 4242 };
+    expect((await acquireLock(dest, other)).acquired).toBe(true);
+    const [destBefore, oldBefore] = [await hashes(dest), await hashes(lib.root)];
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toThrow(/another computer|read-only/i);
+    expect(await hashes(dest)).toEqual(destBefore);
+    expect(await hashes(lib.root)).toEqual(oldBefore);
+  });
+
+  it("a step that fails while finishing (no room) leaves the journal as it was, or advanced only by the steps that completed", async () => {
+    const { lib, dest } = await stoppedAfter("close-source");
+    const [destBefore, oldBefore] = [await hashes(dest, notLock), await hashes(lib.root)];
+    moveSeams.fail = { at: "mark-complete" };
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ code: "ENOSPC" });
+    expect(await hashes(lib.root)).toEqual(oldBefore);
+    // audit-move completed and is recorded (the journal, the moved projects' audit logs and the new place's entry in
+    // library.json's location history, which every read-write opening there writes, advanced); nothing else changed.
+    const j = await journalOf(dest);
+    expect(j.switch.done).toEqual(["mark-old", "close-source", "register", "audit-move"]);
+    const after = await hashes(dest, notLock);
+    const changed = [...new Set([...Object.keys(after), ...Object.keys(destBefore)])].filter((k) => destBefore[k] !== after[k]);
+    expect(changed.filter((k) => !(k === ".move-journal.json" || k === "library.json" || /\/audit\//u.test(k)))).toEqual([]);
+    expect(await readdir(dest)).not.toContain(".lock");
+    expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
   });
 });

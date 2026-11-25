@@ -64,6 +64,7 @@ export {
   deleteOldCopy,
   acceptMovePlan,
   executeMove,
+  finishMoveAt,
   listPendingOldCopies,
   listUnfinishedMoves,
   planMove,

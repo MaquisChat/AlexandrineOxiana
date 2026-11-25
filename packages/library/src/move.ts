@@ -164,7 +164,10 @@ export interface MoveOptions extends Omit<PlanOptions, "now"> {
   excludeProjectIds?: string[];
   /** Called as work progresses; throwing (or rejecting) aborts the move like an interruption. */
   onProgress?: (p: MoveProgress) => void | Promise<void>;
-  /** The library's open index; it is checkpointed so `library.sqlite` is complete without its WAL. */
+  /**
+   * The library's open index. It is checkpointed before the copy, so `library.sqlite` is complete without its WAL, and
+   * the move closes it together with the source library, before the source's lock is released (R570 b).
+   */
   index?: IndexHandle;
   /** An already-open repo on the destination library (rare); otherwise the move opens the destination itself. */
   destRepo?: Repo;
@@ -221,7 +224,23 @@ interface Journal {
 }
 
 /** Test seams: simulate a crash right after a switch step. */
-export const moveSeams: { crashAfter?: SwitchStep; /** deleteOldCopy: reading this old-copy folder fails. */ unreadableDir?: string } = {};
+export const moveSeams: {
+  crashAfter?: SwitchStep;
+  /** deleteOldCopy: reading this old-copy folder fails. */
+  unreadableDir?: string;
+  /**
+   * One write of the switch fails as on a full disk (once): the journal's write after step `after`, the marking of the
+   * old copy's record as complete, or the removal of the journal (FR-755).
+   */
+  fail?: { at: "journal"; after: SwitchStep } | { at: "mark-complete" } | { at: "unlink" };
+} = {};
+/** Throws the seam's simulated "no space left" once, when it names `at` (and `after`). */
+function failSeam(at: "journal" | "mark-complete" | "unlink", after?: SwitchStep): void {
+  const f = moveSeams.fail;
+  if (!f || f.at !== at || (f.at === "journal" && f.after !== after)) return;
+  moveSeams.fail = undefined;
+  throw Object.assign(new Error("no space left on device (simulated)"), { code: "ENOSPC" });
+}
 export class SimulatedMoveCrash extends Error {
   override name = "SimulatedMoveCrash";
 }
@@ -786,6 +805,8 @@ interface SwitchContext {
   tz?: string;
   actor?: string;
   destRepo?: Repo;
+  /** finishMoveAt holds the old copy's lock already (taken before the destination was opened). */
+  oldLockHeld?: boolean;
 }
 
 /**
@@ -803,7 +824,76 @@ export async function completeMove(destRoot: string, deps: Deps, _env?: Location
   if (!rec) {
     throw new MoveNotAllowedError("nothing-to-complete", "This move was started on another device or its record is missing; finish it on that device");
   }
+  // Only at the place this computer's record names, for the library it names (R578): a copy of the destination made by
+  // hand, journal and all, is not that move's destination.
+  if (resolve(rec.newRoot) !== dest || rec.libraryId !== j.libraryId) {
+    throw new MoveNotAllowedError("nothing-to-complete", "This folder is not the destination this computer recorded for that move");
+  }
   return runSwitch(dest, j, rec, deps, ctx);
+}
+
+/**
+ * FR-755 (R578): finishes, at an opening of `destRoot`, a move whose switch did not finish — only when it is this
+ * computer's own move and `destRoot` is the place its record names, and only once the old copy was marked as moved (from
+ * then on it opens read-only everywhere, so nothing can have been changed there since the copy was verified). Returns
+ * undefined, writing nothing, when there is nothing this computer may finish here (no switching journal; no record of the
+ * move here, as for a library brought from another computer; another folder than the record's, as for a copy made by
+ * hand; the old copy not yet marked, so it is still the library). Otherwise it holds the destination's lock for every
+ * step (the destination is opened read-write, ignoring the journal; held by another, it refuses) and, when the old copy
+ * must be marked again, that copy's own lock (runSwitch). A step that fails throws; the journal then records only the
+ * steps that completed, and the next opening tries again.
+ */
+export async function finishMoveAt(destRoot: string, deps: Deps, opts: { tz?: string; actor?: string } = {}): Promise<MoveResult | undefined> {
+  const dest = resolve(destRoot);
+  const j = await readJournal(dest);
+  if (j?.phase !== "switching" || !j.switch) return undefined;
+  const rec = await getPendingOldCopy(deps, j.switch.pendingId).catch(() => undefined);
+  if (!rec || resolve(rec.newRoot) !== dest || rec.libraryId !== j.libraryId) return undefined;
+  const markAgain = !j.switch.done.includes("mark-old");
+  if (markAgain && !(await oldCopyMarked(rec, j.libraryId))) return undefined;
+  // The old copy's lock first, when it is to be marked again: refused before anything is written anywhere.
+  if (markAgain) await takeOldCopyLock(rec.oldRoot, deps);
+  let lib: Library | undefined;
+  try {
+    lib = await openLibraryInternal(dest, deps, {}, { ignoreMoveJournal: true });
+    if (lib.mode !== "read-write" || lib.id !== j.libraryId) {
+      throw new MoveNotAllowedError(
+        "read-only",
+        lib.readOnlyReason === "locked-by-other-device"
+          ? "The library's new place is open on another computer"
+          : `The library's new place could not be opened for writing (${lib.readOnlyReason ?? "another library"})`,
+      );
+    }
+    const repo = await openRepo(lib, new KeyRing(), { clock: deps.clock, ...(opts.tz ? { tz: opts.tz } : {}), ...(opts.actor ? { actor: opts.actor } : {}) });
+    return await runSwitch(dest, j, rec, deps, { destRepo: repo, oldLockHeld: markAgain, ...(opts.tz ? { tz: opts.tz } : {}), ...(opts.actor ? { actor: opts.actor } : {}) });
+  } finally {
+    await lib?.close();
+    if (markAgain) await releaseLock(rec.oldRoot, deps);
+  }
+}
+
+/**
+ * Takes the old copy's lock for this process, to mark it (R247 c). Refused when another computer or process holds it, and
+ * when this process already holds it (a library still open here: taking it over would end that hold at its release).
+ */
+async function takeOldCopyLock(oldRoot: string, deps: Deps): Promise<void> {
+  const held = await readLock(oldRoot);
+  if (held !== null && held !== "corrupt" && held.deviceId === deps.deviceId && held.pid === deps.pid) {
+    throw new MoveNotAllowedError("old-copy-in-use", "The old copy of the library is still open, so the move cannot be finished now");
+  }
+  const got = await acquireLock(oldRoot, deps);
+  if (!got.acquired) throw new MoveNotAllowedError("old-copy-in-use", "The old copy of the library is open on another computer, so the move cannot be finished now");
+}
+
+/** The whole-library old copy carries this library's moved marker (a split's marking is judged by the journal alone). */
+async function oldCopyMarked(rec: PendingOldCopy, libraryId: string): Promise<boolean> {
+  if (rec.split) return false;
+  try {
+    const m = JSON.parse(await fsp.readFile(join(rec.oldRoot, MOVED_MARKER), "utf8")) as { libraryId?: unknown };
+    return m.libraryId === libraryId;
+  } catch {
+    return false;
+  }
 }
 
 async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: Deps, ctx: SwitchContext): Promise<MoveResult> {
@@ -817,7 +907,10 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
     if (!sw.steps.includes(name) || sw.done.includes(name)) return;
     await fn();
     sw.done.push(name);
-    if (name !== "finalize") await writeJournal(dest, j);
+    if (name !== "finalize") {
+      failSeam("journal", name);
+      await writeJournal(dest, j);
+    }
     if (moveSeams.crashAfter === name) {
       moveSeams.crashAfter = undefined;
       throw new SimulatedMoveCrash(`simulated crash after ${name}`);
@@ -832,7 +925,18 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
   };
 
   // The old copy is marked first, so it can never be opened read-write after the switch began.
+  // Written only under the old copy's lock (R247 c): the source's, when this process has it open; otherwise its own,
+  // taken for this step and released after it (refused when another holds it).
   await step("mark-old", async () => {
+    if (ctx.oldLockHeld || (ctx.source && resolve(ctx.source.root) === oldRoot && ctx.source.mode === "read-write" && !isClosed(ctx.source))) return markOld();
+    await takeOldCopyLock(oldRoot, deps);
+    try {
+      await markOld();
+    } finally {
+      await releaseLock(oldRoot, deps);
+    }
+  });
+  async function markOld(): Promise<void> {
     const marker = JSON.stringify({ libraryId: j.libraryId, movedAt: deps.clock().toISOString(), toHint: sw.details.toHint }, null, 2);
     if (!rec.split) {
       await oldWrite(MOVED_MARKER, marker);
@@ -847,14 +951,17 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
       await oldWrite("library.json", JSON.stringify({ ...meta, libraryId: sw.remainingLibraryId, name: restName, splitFrom: j.libraryId }, null, 2));
     }
     await registerLibrary({ libraryId: sw.remainingLibraryId!, name: restName, path: oldRoot }, deps);
-  });
+  }
   await step("register", () => registerLibrary({ libraryId: j.libraryId, name: sw.libraryName, path: dest }, deps));
   await step("close-source", async () => {
     // The source repo, if any, is never written after this: its library handle is closed.
     // Its index goes with it, before the lock is released (R551 M7, R570 b): a later close of the same library (the
     // service's closeLibrary) only gets this close's promise, so its own step that closes the index never runs.
-    // Checkpointed before the copy and not written since (the verify compared it), it closes without changing
-    // library.sqlite; only its working files (never copied) go.
+    // On a fresh move it was checkpointed before the copy and not written since (the verify compared it), so it closes
+    // without changing library.sqlite; only its working files (never copied) go. On a RESUMED switch (executeMove →
+    // completeMove after a restart) nothing checkpointed it first: what the reopened service wrote into it since is folded
+    // into the old copy's library.sqlite as it closes, which may then differ from the new place's, and deleteOldCopy keeps
+    // that one file (it fails closed).
     if (ctx.source && resolve(ctx.source.root) === oldRoot) await ctx.source.close({ beforeRelease: () => ctx.index?.close() });
   });
   await step("audit-split", async () => {
@@ -865,7 +972,9 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
     auditIn(dest, deps, { ...ctx, repo: ctx.destRepo }, sw.movedProjectIds, "library.move", sw.details, warnings, { expectId: j.libraryId, ignoreMoveJournal: true }),
   );
   await step("finalize", async () => {
+    failSeam("mark-complete");
     await markPendingComplete(deps, rec.id);
+    failSeam("unlink");
     await fsp.unlink(join(dest, MOVE_JOURNAL)).catch((err: NodeJS.ErrnoException) => {
       if (err.code !== "ENOENT") throw err;
     });
