@@ -351,6 +351,10 @@ export async function fetchFile(
     let current = first;
     for (let hop = 0; ; hop++) {
       release ??= await place(current.hostname, ac.signal);
+      // FR-757: an abort during the waits above (the folder, a place) ends the call here. Given a request whose signal is
+      // already aborted, undici dispatches it all the same, and the agent opens a connection to the host (DNS, TCP,
+      // TLS) before it notices the abort; no request line or header would be written, but the host would be reached.
+      if (ac.signal.aborted) throw ac.signal.reason;
       headersTimer = setTimeout(() => ac.abort(refuse("headers-timeout", SENTENCES.headers)), FETCH_FILE_HEADERS_MS);
       let res: Awaited<ReturnType<typeof request>>;
       try {

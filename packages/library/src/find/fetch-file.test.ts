@@ -415,6 +415,20 @@ describe("fetchFile: time and abort", () => {
     expect(requests).toEqual([]);
   });
 
+  // FR-757: the place is given at once, before the call goes on; an abort right then (a stop, a lock, a close) must
+  // end the call before its request — nothing is handed to the network after the caller stopped.
+  it("FR-757: an abort right after the start, once the place is given, sends nothing and leaves nothing", async () => {
+    pdfAt("https://arxiv.org", "/pdf/late-abort");
+    const ac = new AbortController();
+    const p = get("https://arxiv.org/pdf/late-abort", { signal: ac.signal });
+    p.catch(() => {});
+    const reason = new Error("stopped by the runner");
+    ac.abort(reason);
+    await expect(p).rejects.toBe(reason);
+    expect(requests).toEqual([]);
+    await empty();
+  });
+
   it("a write that fails at the end (the final name taken meanwhile) leaves no part file", async () => {
     holdKeys.add("https://arxiv.org/late");
     const p = get("https://arxiv.org/late");
