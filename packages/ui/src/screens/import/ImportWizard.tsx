@@ -15,7 +15,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { STREAM_OPEN_TIMEOUT_MS, type ApiClient, type ApiClientError } from "../../api/client";
-import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../../api/firstRead";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, oneNoAnswerSentence, readWithin } from "../../api/firstRead";
 import { IMPORT_RULES_UNREADABLE_TEXT } from "@ao/shared";
 import { importApi, isValidId, type BatchState, type BatchSummary, type ImportPolicy, type ProjectInfo, type ScanSummary } from "../../api/import";
 import { UserText } from "../../components/UserText";
@@ -110,8 +110,11 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
   const [runError, setRunError] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  /** FR-756: the reads that got no answer and that "Try again" makes again (the import in the address, the projects). */
-  const [unanswered, setUnanswered] = useState<{ open?: true; projects?: true }>({});
+  /**
+   * FR-756: the reads that got no answer and that "Try again" makes again (the import in the address, the projects),
+   * each with the error's own sentence. Shown as ONE sentence (R602 M1: "could not be reached" wins).
+   */
+  const [unanswered, setUnanswered] = useState<{ open?: string; projects?: string }>({});
   const [projectsTry, setProjectsTry] = useState(0);
 
   /** Any edit after a scan makes it stale: the scan and its approvals are dropped. */
@@ -134,13 +137,18 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
     readWithin((signal) => api.projects({ signal }), firstReadMs, ac.signal)
       .then((list) => {
         if (!live) return;
+        // R602 (a): an answered read takes away its earlier give-up sentence.
+        setUnanswered(({ projects: _p, ...u }) => u);
         setProjects(list);
         setProjectIdState((cur) => (cur && list.some((p) => p.id === cur) ? cur : (list.find((p) => p.unlocked !== false && isValidId(p.id))?.id ?? "")));
       })
       .catch((e: unknown) => {
         if (!live) return;
-        if (isUnreachable(e)) setUnanswered((u) => ({ ...u, projects: true }));
-        setError(isUnreachable(e) ? noAnswerText(e) : errorText(e));
+        if (isUnreachable(e)) setUnanswered((u) => ({ ...u, projects: noAnswerText(e) }));
+        else {
+          setUnanswered(({ projects: _p, ...u }) => u);
+          setError(errorText(e));
+        }
       });
     return () => {
       live = false;
@@ -168,8 +176,8 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
       })
       .catch((e: unknown) => {
         if (!live) return;
-        if (isUnreachable(e)) setUnanswered((u) => ({ ...u, open: true }));
-        setError(`The import could not be read. ${isUnreachable(e) ? noAnswerText(e) : errorText(e)}`);
+        if (isUnreachable(e)) setUnanswered((u) => ({ ...u, open: noAnswerText(e) }));
+        else setError(`The import could not be read. ${errorText(e)}`);
       })
       .finally(() => live && setOpening(false));
     return () => {
@@ -182,7 +190,6 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
   const readAgain = () => {
     // The button goes while the reads are made again: focus waits on the wizard's heading, never the page.
     document.getElementById("ao-import-title")?.focus();
-    setError(null);
     if (unanswered.open) setOpening(true);
     if (unanswered.projects) setProjectsTry((n) => n + 1);
     setUnanswered({});
@@ -283,6 +290,8 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
     setStep("report");
   };
 
+  /** R602 M1: one sentence for the reads that got no answer. */
+  const noAnswer = oneNoAnswerSentence([unanswered.open, unanswered.projects]);
   const current = STEPS.findIndex((s) => s.step === step);
   const project = projects.find((p) => p.id === (runProject || projectId));
 
@@ -309,7 +318,8 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
       </ol>
 
       {opening && <p role="status">Opening the import…</p>}
-      {!opening && (unanswered.open || unanswered.projects) && (
+      {!opening && noAnswer !== undefined && <ErrorNote error={unanswered.open ? `The import could not be read. ${noAnswer}` : noAnswer} />}
+      {!opening && noAnswer !== undefined && (
         <p>
           <button type="button" onClick={readAgain}>
             Try again

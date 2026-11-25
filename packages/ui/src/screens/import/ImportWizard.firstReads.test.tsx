@@ -28,16 +28,20 @@ const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
 /** A GET whose asks are counted; the asks `hold(n)` picks are held until `release()` (or the test's end), else answered by the mocked service. */
 function holding(path: string, hold: (n: number) => boolean) {
   let n = 0;
+  const signals: AbortSignal[] = [];
   const gate = hang();
   let release!: () => void;
   const released = new Promise<void>((r) => (release = r));
   let freed = false;
   return {
-    handler: http.get(url(path), async () => {
+    handler: http.get(url(path), async ({ request }) => {
+      signals.push(request.signal);
       if (hold(++n) && !freed) await Promise.race([gate, released]);
       return undefined;
     }),
     count: () => n,
+    /** Each ask's request signal (an open stream's must not be aborted). */
+    signals,
     /** Lets every held ask, and every later one, be answered. */
     release: () => {
       freed = true;
@@ -78,6 +82,20 @@ describe("Import wizard: first reads that never settle or fail (FR-756)", () => 
     await userEvent.setup().click(tryAgain()!);
     await screen.findByRole("heading", { name: "Run" });
     expect(alerts()).toEqual([]);
+  });
+
+  it("one sentence at a time (R602 M1): an opening given up at the limit and a list of projects that failed with no answer show “could not be reached” alone, with one “Try again”", async () => {
+    let failing = true;
+    const batches = holding(`/projects/${P1}/imports`, (n) => n === 1);
+    open({ batches: [running], extra: [batches.handler, http.get(url("/projects"), () => (failing ? Response.error() : undefined))] }, { firstReadMs: 300 });
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    await waitFor(() => expect(screen.queryByText("Opening the import…")).toBeNull());
+    expect(alerts()).toEqual([`The import could not be read. ${UNREACHABLE}`]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+    failing = false;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("heading", { name: "Run" });
+    await waitFor(() => expect(alerts()).toEqual([]));
   });
 
   it("an opening the service refused with its own words shows them as before, with no “Try again” (unchanged)", async () => {
@@ -159,6 +177,7 @@ describe("Import wizard, run step: its first read and its event stream (FR-756, 
     // Ten times the limit, and more than the step's pause before a new try: still the first stream.
     await new Promise((r) => setTimeout(r, 1_000));
     expect(events.count()).toBe(1);
+    expect(events.signals[0]!.aborted).toBe(false);
     expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
   });
 });

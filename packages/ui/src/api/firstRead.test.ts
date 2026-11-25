@@ -4,8 +4,8 @@
  * the caller's own abort still cancels it after it began.
  */
 import { describe, expect, it } from "vitest";
-import { SERVICE_NO_ANSWER } from "./client";
-import { answerWithin, isNoAnswerInTime } from "./firstRead";
+import { SERVICE_NO_ANSWER, SERVICE_UNREACHABLE } from "./client";
+import { answerWithin, isNoAnswerInTime, oneNoAnswerSentence } from "./firstRead";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -53,5 +53,13 @@ describe("answerWithin (FR-756)", () => {
     const err = await p.catch((e: unknown) => e);
     expect((err as Error).name).toBe("AbortError");
     expect(seen?.aborted).toBe(true);
+  });
+});
+
+describe("oneNoAnswerSentence (R602 M1)", () => {
+  it("“could not be reached” alone where any read failed with no answer; “did not answer in time” only where every one was given up", () => {
+    expect(oneNoAnswerSentence([SERVICE_NO_ANSWER, SERVICE_UNREACHABLE, SERVICE_NO_ANSWER])).toBe(SERVICE_UNREACHABLE);
+    expect(oneNoAnswerSentence([SERVICE_NO_ANSWER, undefined, SERVICE_NO_ANSWER])).toBe(SERVICE_NO_ANSWER);
+    expect(oneNoAnswerSentence([])).toBeUndefined();
   });
 });

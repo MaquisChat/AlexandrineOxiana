@@ -10,7 +10,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { transcriptApi } from "../api/transcripts";
-import { hang, server, sseAttempts, testClient, url, useMockService } from "../test/service";
+import { hang, server, sse, sseAttempts, testClient, url, useMockService } from "../test/service";
 import { serviceErrorBody, sourceFile, transcriptService } from "../test/msw-transcripts";
 import { TranscriptViewer } from "./TranscriptViewer";
 
@@ -147,6 +147,24 @@ describe("TranscriptViewer: first reads that never settle or fail (FR-756)", () 
     expect(alerts()).toEqual([]);
   });
 
+  it("one sentence at a time (R602 M1): a read that failed with no answer and another given up at the limit show “could not be reached” alone, with one “Try again”", async () => {
+    let failing = true;
+    serve(
+      http.get(url("/projects/:id/sources/:sid"), () => (failing ? HttpResponse.error() : HttpResponse.json(sourceFile("s1", TITLE, "none")))),
+      holding("/projects/:id/sources/:sid/transcripts", 1, () => HttpResponse.json({ versions: [] })).handler,
+    );
+    show({ firstReadMs: 300 });
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1), { timeout: 5000 });
+    // The versions read is given up after the source failed: still the one sentence.
+    await new Promise((r) => setTimeout(r, 500));
+    expect(alerts()).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+    failing = false;
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(heading().textContent).toBe(`Transcript: ${TITLE}`));
+    await waitFor(() => expect(alerts()).toEqual([]));
+  });
+
   it("a read the service refused with its own words shows them as before, with no “Try again” (unchanged)", async () => {
     serve(http.get(url("/projects/:id/sources/:sid/transcripts"), () => serviceErrorBody(500, "INTERNAL", "The transcript list is damaged.")));
     show({ firstReadMs: 300 });
@@ -183,13 +201,20 @@ describe("TranscriptViewer: an event stream that does not open within the limit 
   });
 
   it("a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
-    const ev = sseAttempts(() => []);
-    serve(ev.handler);
+    const signals: AbortSignal[] = [];
+    serve(
+      http.get(url("/events"), ({ request }) => {
+        signals.push(request.signal);
+        return sse([]);
+      }),
+    );
     show({ streamOpenMs: 200 });
     await screen.findByText("Hello and welcome.");
-    await waitFor(() => expect(ev.attempts()).toBe(1));
-    // Fifteen times the limit, and more than the screen's pause before a new try (two seconds): still the first stream.
+    await waitFor(() => expect(signals).toHaveLength(1));
+    // Fifteen times the limit, and more than the screen's pause before a new try (two seconds): still the first stream,
+    // and its request not cancelled (R602: the body of a mocked stream goes on after an abort, so the signal is what tells).
     await new Promise((r) => setTimeout(r, 3_000));
-    expect(ev.attempts()).toBe(1);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]!.aborted).toBe(false);
   });
 });

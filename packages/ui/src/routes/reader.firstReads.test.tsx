@@ -97,12 +97,20 @@ describe("ReaderRoute: an event stream that does not open within the limit is tr
   });
 
   it("a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
-    const ev = sseAttempts(() => []);
-    serve({ events: ev });
+    const signals: AbortSignal[] = [];
+    serve();
+    server.use(
+      http.get(url("/events"), ({ request }) => {
+        signals.push(request.signal);
+        return new HttpResponse(new ReadableStream(), { headers: { "content-type": "text/event-stream" } });
+      }),
+    );
     show({ streamOpenMs: 200 });
     await screen.findByTestId("reader-screen");
-    await waitFor(() => expect(ev.attempts()).toBe(1));
+    await waitFor(() => expect(signals).toHaveLength(1));
     await new Promise((r) => setTimeout(r, 3_000));
-    expect(ev.attempts()).toBe(1);
+    // Still the first stream, and its request not cancelled (R602).
+    expect(signals).toHaveLength(1);
+    expect(signals[0]!.aborted).toBe(false);
   });
 });

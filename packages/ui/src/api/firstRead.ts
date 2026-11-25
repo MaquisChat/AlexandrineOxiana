@@ -3,7 +3,7 @@
  * (neither answered nor failed) would otherwise leave the screen at "Reading…" for ever. These are reads from the
  * service on the same machine, so twenty seconds is long; acts (an add, an attach, a move) have no such limit.
  */
-import { ApiClientError, noAnswerInTime, SERVICE_NO_ANSWER } from "./client";
+import { ApiClientError, noAnswerInTime, SERVICE_NO_ANSWER, SERVICE_UNREACHABLE } from "./client";
 
 /** How long a screen's first read is waited for before it is given up. */
 export const FIRST_READ_TIMEOUT_MS = 20_000;
@@ -61,3 +61,14 @@ export const isUnreachable = (err: unknown): boolean => err instanceof ApiClient
 
 /** FR-756: a read given up at its time limit (it neither answered nor failed), as `readWithin` gives it up. */
 export const isNoAnswerInTime = (err: unknown): boolean => isUnreachable(err) && (err as ApiClientError).message === SERVICE_NO_ANSWER;
+
+/**
+ * R602 M1: one sentence per screen at a time. Of the sentences of a screen's unanswered first reads, "The library
+ * service could not be reached." alone where any read failed with no answer; "The library service did not answer in
+ * time." only where every one was given up at the limit. None: undefined.
+ */
+export function oneNoAnswerSentence(sentences: Iterable<string | undefined>): string | undefined {
+  const all = [...sentences].filter((x): x is string => x !== undefined);
+  if (all.includes(SERVICE_UNREACHABLE)) return SERVICE_UNREACHABLE;
+  return all.includes(SERVICE_NO_ANSWER) ? SERVICE_NO_ANSWER : all[0];
+}

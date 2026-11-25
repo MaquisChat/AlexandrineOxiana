@@ -33,15 +33,19 @@ const heading = () => screen.getByRole("heading", { level: 1, name: "Capture" })
  */
 function holding(path: string, hold: (n: number) => boolean) {
   let n = 0;
+  const signals: AbortSignal[] = [];
   const gate = hang();
   let release!: () => void;
   const released = new Promise<void>((r) => (release = r));
   return {
-    handler: http.get(url(path), async () => {
+    handler: http.get(url(path), async ({ request }) => {
+      signals.push(request.signal);
       if (hold(++n)) await Promise.race([gate, released]);
       return undefined;
     }),
     count: () => n,
+    /** Each ask's request signal (an open stream's must not be aborted). */
+    signals,
     release: () => release(),
   };
 }
@@ -94,6 +98,23 @@ describe("Capture: first reads that never settle or fail (FR-756)", () => {
     await userEvent.setup().click(tryAgain()!);
     await waitFor(() => expect((screen.getByRole("button", { name: "Capture links" }) as HTMLButtonElement).disabled).toBe(false));
     expect(alerts()).toEqual([]);
+  });
+
+  it("one sentence at a time (R602 M1): a project read that failed with no answer and a rules read given up at the limit show “could not be reached” alone, with one “Try again”", async () => {
+    let failing = true;
+    const rules = holding(`/projects/${P1}/governance`, (n) => n === 1);
+    const m = mockCapture({ extra: [http.get(url("/projects"), () => (failing ? HttpResponse.error() : undefined)), rules.handler] });
+    show(m, { firstReadMs: 300 });
+    await waitFor(() => expect(rules.count()).toBe(1));
+    await screen.findByRole("button", { name: "Try again" });
+    // The rules read is given up after the project failed: still the one sentence.
+    await new Promise((r) => setTimeout(r, 500));
+    expect(alerts()).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+    failing = false;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByText("Thesis");
+    await waitFor(() => expect(alerts()).toEqual([]));
   });
 
   it("a rules read the service refused with its own words shows them as before, with no “Try again” (unchanged)", async () => {
@@ -150,5 +171,6 @@ describe("Capture: an event stream that does not open within the limit is tried 
     await new Promise((r) => setTimeout(r, 1_000));
     expect(events.count()).toBe(1);
     expect(m.streams()).toBe(1);
+    expect(events.signals[0]!.aborted).toBe(false);
   });
 });

@@ -22,7 +22,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import { CAPTURE_RULES_UNREADABLE_TEXT, CAPTURE_RUNNING, CAPTURE_STOPPING } from "@ao/shared";
 import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
-import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, oneNoAnswerSentence, readWithin } from "../api/firstRead";
 import {
   applyProgress,
   BROWSERS,
@@ -428,6 +428,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         if (ac.signal.aborted) return;
         out.current.delete("project");
         if (!live.current) return;
+        // R602 (a): an answered read takes away its earlier give-up sentence.
+        setUnanswered(({ project: _p, ...u }) => u);
         const p = list.find((x) => x.id === projectId) ?? null;
         setProject(p);
         setAcknowledged(!!p?.acknowledgements?.includes("cookies"));
@@ -437,7 +439,10 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         out.current.delete("project");
         if (!live.current) return;
         if (isUnreachable(err)) setUnanswered((u) => ({ ...u, project: (err as ApiClientError).message }));
-        else setLoadError(plainError(err, "The project could not be read."));
+        else {
+          setUnanswered(({ project: _p, ...u }) => u);
+          setLoadError(plainError(err, "The project could not be read."));
+        }
       },
     );
     return () => {
@@ -453,7 +458,9 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       (p) => {
         if (ac.signal.aborted) return;
         out.current.delete("policy");
-        if (live.current) setPolicy(p);
+        if (!live.current) return;
+        setUnanswered(({ policy: _p, ...u }) => u);
+        setPolicy(p);
       },
       (err: unknown) => {
         if (ac.signal.aborted) return;
@@ -462,7 +469,10 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         // Unreadable rules are read strictly (the service then refuses everything anyway).
         setPolicy({ legalBasisRequired: true, defaultLegalBasis: undefined, downloaderAllowed: false, readable: false });
         if (isUnreachable(err)) setUnanswered((u) => ({ ...u, policy: (err as ApiClientError).message }));
-        else setLoadError(plainError(err, "This project's rules could not be read."));
+        else {
+          setUnanswered(({ policy: _p, ...u }) => u);
+          setLoadError(plainError(err, "This project's rules could not be read."));
+        }
       },
     );
     return () => {
@@ -482,8 +492,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
     setUnanswered((u) => Object.fromEntries(Object.entries(u).filter(([r]) => !again.has(r as FirstRead))));
     setTries((t) => ({ project: t.project + (again.has("project") ? 1 : 0), policy: t.policy + (again.has("policy") ? 1 : 0) }));
   }, []);
-  /** FR-756: each sentence of the first reads that got no answer, once. */
-  const noAnswer = [...new Set(Object.values(unanswered))];
+  /** FR-756, R602 M1: one sentence for the first reads that got no answer ("could not be reached" wins). */
+  const noAnswer = oneNoAnswerSentence(Object.values(unanswered));
 
   /** A LEGAL_BASIS_REQUIRED refusal of a queue this screen started opens the legal-basis field (review M7). */
   const noteRefusal = (e: CaptureProgress) => {
@@ -833,12 +843,12 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
           {loadError}
         </p>
       )}
-      {noAnswer.map((sentence) => (
-        <p key={sentence} className="ao-capture__error" role="alert">
-          {sentence}
+      {noAnswer !== undefined && (
+        <p className="ao-capture__error" role="alert">
+          {noAnswer}
         </p>
-      ))}
-      {noAnswer.length > 0 && (
+      )}
+      {noAnswer !== undefined && (
         <p>
           <button
             type="button"

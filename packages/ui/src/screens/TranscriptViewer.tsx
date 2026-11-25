@@ -28,7 +28,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import type { TranscriptionJob, TranscriptResponse, TranscriptSaveRequest, TranscriptVersionSummary } from "@ao/shared";
 import { TRANSCRIPTION_RUNNING } from "@ao/shared";
 import { ApiClientError, STREAM_OPEN_TIMEOUT_MS } from "../api/client";
-import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, oneNoAnswerSentence, readWithin } from "../api/firstRead";
 import { errorText, isProjectLocked, type SourceFile } from "../api/library";
 import { TRANSCRIPTION_MODELS, transcriptionJobOf, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
 import { MediaTicketPlayer, NO_RECORDING_SENTENCE, type PlayerControl } from "../components/MediaTicketPlayer";
@@ -266,6 +266,8 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
         settled();
         if (!mounted.current || k !== keyRef.current || mine !== listSeq.current) return;
         versionsRead.current = true;
+        // R602 (a): an answered read takes away its earlier give-up sentence.
+        setUnanswered(({ versions: _v, ...u }) => u);
         const entries = versionEntries(r.versions);
         setVersions(entries);
         setRawVersions(r.versions);
@@ -280,7 +282,10 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
         settled();
         if (!mounted.current || k !== keyRef.current || mine !== listSeq.current) return;
         if (isUnreachable(err)) setUnanswered((u) => ({ ...u, versions: (err as ApiClientError).message }));
-        else if (!sawLocked(err)) setLoadError(errorText(err, "The transcript versions could not be read."));
+        else {
+          setUnanswered(({ versions: _v, ...u }) => u);
+          if (!sawLocked(err)) setLoadError(errorText(err, "The transcript versions could not be read."));
+        }
         setVersions((v) => v ?? []);
       }
     },
@@ -296,14 +301,19 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
       (f) => {
         if (ac.signal.aborted) return;
         out.current.delete("source");
-        if (mounted.current && k === keyRef.current) setSource(f);
+        if (!mounted.current || k !== keyRef.current) return;
+        setUnanswered(({ source: _s, ...u }) => u);
+        setSource(f);
       },
       (err: unknown) => {
         if (ac.signal.aborted) return;
         out.current.delete("source");
         if (!mounted.current || k !== keyRef.current) return;
         if (isUnreachable(err)) setUnanswered((u) => ({ ...u, source: (err as ApiClientError).message }));
-        else if (!sawLocked(err)) setLoadError(errorText(err, "This source could not be read."));
+        else {
+          setUnanswered(({ source: _s, ...u }) => u);
+          if (!sawLocked(err)) setLoadError(errorText(err, "This source could not be read."));
+        }
       },
     );
     return () => {
@@ -668,8 +678,8 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
   const media = useMemo(() => source?.assets.find(isPlayableRecording), [source]);
   const title = source?.source.title.variants[0];
   const human = transcript?.origin === "human-edit";
-  /** FR-756: each sentence of the first reads that got no answer, once. */
-  const noAnswer = [...new Set(Object.values(unanswered))];
+  /** FR-756, R602 M1: one sentence for the first reads that got no answer ("could not be reached" wins). */
+  const noAnswer = oneNoAnswerSentence(Object.values(unanswered));
 
   return (
     <main className="ao-page ao-tx" aria-labelledby={`${id}-h`}>
@@ -711,13 +721,11 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
           {loadError}
         </p>
       )}
-      {!locked && noAnswer.length > 0 && (
+      {!locked && noAnswer !== undefined && (
         <>
-          {noAnswer.map((sentence) => (
-            <p key={sentence} role="alert" className="ao-error">
-              {sentence}
-            </p>
-          ))}
+          <p role="alert" className="ao-error">
+            {noAnswer}
+          </p>
           <p>
             <button
               type="button"
