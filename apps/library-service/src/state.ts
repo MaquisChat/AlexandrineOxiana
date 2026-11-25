@@ -210,6 +210,9 @@ export interface StateOptions {
   zoteroTickMs?: number;
 }
 
+/** An entry's key for the look-ups under way. */
+const lookUpKey = (projectId: string, entryId: string) => JSON.stringify([projectId, entryId]);
+
 /**
  * Decision 31 (c), R566 (3): the automatic "Look up again" pass takes at most this many entries, one after another; the
  * next pass (the timer's, an unlock's, the next opening's) takes the rest.
@@ -312,6 +315,8 @@ export class ServiceState {
   private lookUpPassAgain = false;
   /** Look-ups take turns: the automatic pass's entries and the researcher's act, one at a time per service. */
   private lookUpTurn: Promise<unknown> = Promise.resolve();
+  /** The entry (project and id) whose look-up runs in its turn now (R592: a press for it answers "under way"). */
+  private readonly lookUpRunning = new Set<string>();
   /** Roots of libraries seen this run: paths inside them are shown library-relative in errors. */
   readonly roots = new Set<string>();
   readonly tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -2013,15 +2018,19 @@ export class ServiceState {
       }
       for (const d of due) {
         if (taken >= LOOK_UP_AGAIN_PASS_MAX || stop()) return taken;
-        taken++;
         let r: LookUpAgainResult;
         try {
-          r = await this.lookUpInTurn(() => lookUpAgain(s.repo, s.http, p.id, d.entryId, { by: "automatic", closing: s.closing.signal, now: this.opts.now() }));
+          r = await this.lookUpInTurn(p.id, d.entryId, () => lookUpAgain(s.repo, s.http, p.id, d.entryId, { by: "automatic", closing: s.closing.signal, now: this.opts.now() }));
         } catch (err) {
+          taken++;
           // A refusal by the project's rules (audited by the library) or a failure of this one entry: the next goes on.
           this.opts.log.warn({ err: this.describe(err) }, "looking up again: an entry was not looked up");
           continue;
         }
+        // R585 (3), R592: a look-up of this entry is already under way (nothing sent, nothing written): skipped, and
+        // not counted toward the pass's bound.
+        if (!r.done && r.why === "under-way") continue;
+        taken++;
         if (r.done) continue;
         // The library began to close (or another opened): nothing more is sent or written.
         if (r.why === "closing" || r.why === "cancelled" || r.why === "read-only") return taken;
@@ -2032,9 +2041,14 @@ export class ServiceState {
     return taken;
   }
 
-  /** The researcher's "Look up again" (the route): takes its turn with the automatic pass's entries. */
+  /**
+   * The researcher's "Look up again" (the route): takes its turn with the automatic pass's entries. R585 (3), R592: while
+   * a look-up of the SAME entry runs (the pass's, or an earlier press), it does not wait for its turn: it answers at once
+   * that one is under way — nothing audited, nothing sent, nothing written (the library's own refusal, by its name).
+   */
   lookUpAgainByHand(s: Session, projectId: string, entryId: string): Promise<LookUpAgainResult> {
-    return this.lookUpInTurn(() => lookUpAgain(s.repo, s.http, projectId, entryId, { by: "researcher", closing: s.closing.signal, now: this.opts.now() }));
+    if (this.lookUpRunning.has(lookUpKey(projectId, entryId))) return Promise.resolve({ done: false, why: "under-way" });
+    return this.lookUpInTurn(projectId, entryId, () => lookUpAgain(s.repo, s.http, projectId, entryId, { by: "researcher", closing: s.closing.signal, now: this.opts.now() }));
   }
 
   /** The service's clock (the entries' times and the pass's "now"). */
@@ -2042,9 +2056,21 @@ export class ServiceState {
     return this.opts.now();
   }
 
-  /** One look-up at a time: two look-ups of one entry at once would both send (the engine report's §9 item 6). */
-  private lookUpInTurn<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.lookUpTurn.then(fn, fn);
+  /**
+   * One look-up at a time (the pass's entries and the researcher's presses take turns): two look-ups of one entry at
+   * once would both send (the engine report's §9 item 6). The entry whose look-up runs now is known (`lookUpRunning`).
+   */
+  private lookUpInTurn<T>(projectId: string, entryId: string, fn: () => Promise<T>): Promise<T> {
+    const key = lookUpKey(projectId, entryId);
+    const go = async () => {
+      this.lookUpRunning.add(key);
+      try {
+        return await fn();
+      } finally {
+        this.lookUpRunning.delete(key);
+      }
+    };
+    const run = this.lookUpTurn.then(go, go);
     this.lookUpTurn = run.catch(() => {});
     return run;
   }

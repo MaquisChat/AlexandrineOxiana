@@ -14,9 +14,9 @@ import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { LIBRARY_CLOSED_TEXT, LOOKUP_WAITING_TEXT, LOOK_UP_AGAIN_TEXT } from "@ao/shared";
-import { HttpClient, LOOK_SEND_OP, LOOK_UP_AGAIN_OP, deviceDeps, type Deps } from "@ao/library";
+import { HttpClient, LOOK_SEND_OP, LOOK_UP_AGAIN_OP, deviceDeps, lookUpAgain as engineLookUpAgain, type Deps } from "@ao/library";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "../../../packages/library/node_modules/undici/index.js";
 // Package-internal: an entry's lookup written as an earlier build would have (a lookup that failed outright).
 import { importChange, projectReviewEntries } from "../../../packages/library/src/repo/repo.js";
@@ -736,5 +736,68 @@ describe("joined to the fixed engine (R592)", () => {
     const items = await queue(lib.pid);
     expect(bySource(items, a!).lookUp).toEqual({ state: "waiting", tries: 0, canLookUpNow: false, notBefore: expect.any(String), also: ["gave-up"], gaveUpTries: 5 });
     expect(bySource(items, b!).lookUp).toEqual({ state: "gave-up", tries: 5, canLookUpNow: false, notBefore: expect.any(String), also: ["not-allowed"] });
+  });
+
+  /** Holds the lookup client's FIRST request until released (released at the test's end whatever its end). */
+  function holdFirstRequest() {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let reached!: () => void;
+    const atGate = new Promise<void>((r) => (reached = r));
+    const orig = HttpClient.prototype.getJson;
+    let n = 0;
+    HttpClient.prototype.getJson = async function (this: HttpClient, ...a: Parameters<HttpClient["getJson"]>) {
+      if (++n === 1) {
+        reached();
+        await gate;
+      }
+      return orig.apply(this, a);
+    } as HttpClient["getJson"];
+    onTestFinished(() => {
+      HttpClient.prototype.getJson = orig;
+      release();
+    });
+    return { atGate, release: () => release() };
+  }
+
+  it("point 5: a press during the automatic pass's request for the same entry answers \"under way\" at once and sends nothing more", { timeout: 20_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(2);
+    answer = () => NO_RESULTS;
+    const held = holdFirstRequest();
+    // Opened past the first wait: the pass takes the first entry, and its request is held.
+    await reopen(lib, 16 * MIN);
+    await held.atGate;
+    const first = bySource(await queue(lib.pid), lib.sources[0]!);
+    const r = await lookUpAgain(lib.pid, first.id);
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toEqual({ outcome: { kind: "under-way" }, entry: first });
+    expect(sent).toEqual([]);
+    held.release();
+    await svc!.state.idle();
+    // Only the pass's own requests: one per entry; nothing of the researcher's press was sent or audited.
+    expect(sent).toEqual([1, 2].map((i) => `api.openalex.org ${titleOf(i)} Souza`));
+    expect((await lookUpAudit(lib.pid)).filter((a) => a.by === "researcher")).toEqual([]);
+  });
+
+  it("point 5: the pass skips an entry whose look-up is under way without counting it, and goes on to the next", { timeout: 20_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(2);
+    answer = () => NO_RESULTS;
+    // Opened before the first wait has passed (the opening's pass takes nothing), then the time comes.
+    await reopen(lib, MIN);
+    await svc!.state.idle();
+    clock += 16 * MIN;
+    const s = svc!.state.session!;
+    const [a] = (await storedEntries(lib.pid)).filter((e) => e.sourceId === lib.sources[0]);
+    const held = holdFirstRequest();
+    // A look-up of the first entry under way on the same library handle (its request held).
+    const other = engineLookUpAgain(s.repo, s.http, lib.pid, a!.id, { by: "automatic", closing: s.closing.signal, now: new Date(clock) });
+    await held.atGate;
+    expect(await svc!.state.runLookUpAgain()).toBe(1);
+    expect(sent).toEqual([`api.openalex.org ${titleOf(2)} Souza`]);
+    held.release();
+    expect(await other).toMatchObject({ done: true, sent: 1 });
+    expect(sent).toHaveLength(2);
   });
 });
