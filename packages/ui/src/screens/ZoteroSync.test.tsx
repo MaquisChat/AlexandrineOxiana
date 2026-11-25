@@ -25,7 +25,7 @@ import { zoteroSyncApi } from "../api/zoteroSync";
 import { App } from "../App";
 import { PATHS } from "../navigation";
 import { OPEN_GOVERNANCE, PSEUDONYMISING_GOVERNANCE, REPORT } from "../test/importService";
-import { BASE, libraryHandlers, server, serviceError, testClient, TOKEN, url, useMockService } from "../test/service";
+import { BASE, hang, libraryHandlers, server, serviceError, sseAttempts, testClient, TOKEN, url, useMockService } from "../test/service";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
 import { StepReport } from "./import/StepReport";
 import { ZoteroSync } from "./ZoteroSync";
@@ -1308,5 +1308,74 @@ describe("ZoteroSync", () => {
     } finally {
       window.history.replaceState(null, "", "/");
     }
+  });
+});
+
+describe("Zotero: first reads that never settle (FR-750, R579)", () => {
+  const UNREACHABLE = "The library service could not be reached.";
+  /** R586 M5: said where a read was given up at the time limit (it neither answered nor failed). */
+  const NO_ANSWER = "The library service did not answer in time.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+
+  it("a read of the state that hangs is given up after the limit: the usual alert with “Try again”; pressing it reads again, and focus is not lost", async () => {
+    const svc = useSvc();
+    let answer = false;
+    const gate = hang();
+    svc.onState = async () => {
+      if (!answer) await gate;
+      return HttpResponse.json(svc.state);
+    };
+    render(<ZoteroSync client={testClient()} firstReadMs={300} />);
+    expect(screen.getByText("Reading the Zotero sync settings…")).toBeTruthy();
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+    expect(document.activeElement).toBe(document.body);
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByTestId("zotero-libraries");
+    expect(tryAgain()).toBeNull();
+    expect(svc.count("GET", "/zotero/sync")).toBe(2);
+    expect(document.activeElement?.isConnected && document.activeElement !== document.body).toBe(true);
+  });
+
+  it("when the event stream opens anew, a read still out from before is made again, without a press and without an event", async () => {
+    const svc = useSvc();
+    const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
+    server.use(ev.handler);
+    const gate = hang();
+    let n = 0;
+    svc.onState = async () => {
+      if (++n === 1) await gate;
+      return HttpResponse.json(svc.state);
+    };
+    render(<ZoteroSync client={testClient()} />);
+    await screen.findByTestId("zotero-libraries", undefined, { timeout: 10_000 });
+    expect(ev.attempts()).toBe(2);
+    expect(svc.count("GET", "/zotero/sync")).toBe(2);
+    expect(tryAgain()).toBeNull();
+  });
+
+  it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
+    const svc = useSvc();
+    const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
+    server.use(ev.handler);
+    svc.onState = () => HttpResponse.error();
+    render(<ZoteroSync client={testClient()} />);
+    await screen.findByRole("button", { name: "Try again" });
+    await waitFor(() => expect(svc.count("GET", "/zotero/sync")).toBe(2), { timeout: 10_000 });
+    await screen.findByRole("button", { name: "Try again" });
+    ev.drop();
+    await waitFor(() => expect(ev.attempts()).toBe(3), { timeout: 10_000 });
+    await waitFor(() => expect(svc.count("GET", "/zotero/sync")).toBe(3));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+    expect(svc.count("GET", "/zotero/sync")).toBe(3);
+  });
+
+  it("a state refused with an answer shows its sentence as today, with no “Try again”", async () => {
+    const svc = useSvc();
+    svc.onState = () => serviceError(500, "INTERNAL", "The Zotero sync settings could not be listed.");
+    render(<ZoteroSync client={testClient()} />);
+    await screen.findByText("The Zotero sync settings could not be listed.");
+    expect(tryAgain()).toBeNull();
   });
 });

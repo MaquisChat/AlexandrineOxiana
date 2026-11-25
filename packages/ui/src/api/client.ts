@@ -126,7 +126,14 @@ function checkToken(token: string): void {
   }
 }
 
-const unreachable = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: "The library service could not be reached." });
+/** Said when the library service could not be reached (no answer at all). */
+export const SERVICE_UNREACHABLE = "The library service could not be reached.";
+/** R586 M5: said where a read was given up at its time limit (it neither answered nor failed). */
+export const SERVICE_NO_ANSWER = "The library service did not answer in time.";
+/** The error of a request that got no answer at all (status 0, UNAVAILABLE). */
+export const unreachable = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: SERVICE_UNREACHABLE });
+/** The error of a read given up at its time limit (status 0, UNAVAILABLE): the service may only have been slow. */
+export const noAnswerInTime = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: SERVICE_NO_ANSWER });
 /** Said of an answer that began and then broke off (FR-350); also said by the reader (R481 a). */
 export const ANSWER_CUT_OFF = "The library service's answer was cut off before it finished.";
 /** An answer that began and then broke off: the service was reached, so it is not said to be out of reach (FR-350). */

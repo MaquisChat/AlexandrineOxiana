@@ -15,7 +15,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
-import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
+import { APP_ORIGIN, expect, gotoWhenQuiet, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR } from "./paths.js";
 import { pressByMouse, SCROLL_SETTLE_MS } from "./press.js";
 
@@ -272,7 +272,7 @@ async function fourWaiting(page: Page, app: AppHarness, library: string): Promis
   expect(attached.status, JSON.stringify(attached.body)).toBe(200);
   const ids = await waitingIds(app, projectId);
   expect(ids).toHaveLength(4);
-  await page.goto(`${APP_ORIGIN}/import/review?project=${encodeURIComponent(projectId)}`);
+  await gotoWhenQuiet(page, `${APP_ORIGIN}/import/review?project=${encodeURIComponent(projectId)}`);
   await expect(page.getByRole("heading", { level: 1, name: "Review queue" })).toBeVisible();
   await expect(page.getByText("4 entries are waiting in this project.")).toBeVisible({ timeout: 60_000 });
   await expect(accept(page)).toBeEnabled({ timeout: 60_000 });

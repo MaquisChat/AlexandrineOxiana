@@ -104,8 +104,9 @@ import {
   type FindScreenSettings,
 } from "@ao/shared";
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from "react";
-import { ApiClientError, type ApiClient, type ServiceEvent } from "../api/client";
+import { ApiClientError, SERVICE_UNREACHABLE, type ApiClient, type ServiceEvent } from "../api/client";
 import { findApi, findHref, findProgressOf, type FindApi } from "../api/find";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { isValidId } from "../api/import";
 import { isProjectLocked, libraryApi, type Collection, type LibraryApi, type LibraryState, type ProjectSummary } from "../api/library";
 import { ChoosePersonDialog } from "../components/ChoosePersonDialog";
@@ -308,18 +309,25 @@ const isElsewhere = (e: FindEntryView) => !!e.elsewhere && (e.state === "already
 // The screen: project, collection, the switch; the queue of the chosen project below
 
 /** What the screen passes on to the queue from the one event stream it listens to. */
-type QueueSignal = { kind: "event"; ev: ServiceEvent } | { kind: "refresh" } | { kind: "say"; words: Words };
+type QueueSignal = { kind: "event"; ev: ServiceEvent } | { kind: "refresh" } | { kind: "say"; words: Words } | { kind: "retry" };
 interface QueueBus {
   subscribe(fn: (s: QueueSignal) => void): () => void;
 }
 
-export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocation }) {
+/**
+ * `firstReadMs` (FR-750, R579): how long a read of the projects, of the remembered settings or of the queue is waited for
+ * before it is given up as a read that got no answer (FIRST_READ_TIMEOUT_MS; smaller in tests).
+ */
+export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number }) {
   const api = useMemo(() => findApi(client), [client]);
   const libApi = useMemo(() => findLibraryApi(client), [client]);
   const lib = useMemo(() => libraryApi(client), [client]);
   const ids = useId();
   const [projects, setProjects] = useState<ProjectSummary[] | undefined>();
   const [projectsError, setProjectsError] = useState<string | undefined>();
+  /** FR-750: the last read of the projects, or of the remembered settings, got no answer: "Try again" is offered. */
+  const [projectsUnreachable, setProjectsUnreachable] = useState(false);
+  const [screenUnreachable, setScreenUnreachable] = useState(false);
   /** What this computer remembers, as the service last confirmed it (the controls show this). */
   const [remembered, setRemembered] = useState<FindScreenSettings | undefined>();
   /** The remembered settings could not be read: the service's sentence, said once (R258 M3). */
@@ -334,6 +342,13 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
   const [chosen, setChosen] = useState<string | undefined>();
   const [collections, setCollections] = useState<Collection[] | undefined>();
   const [collectionId, setCollectionId] = useState("");
+  /**
+   * R586 M3: the chosen project's collections could not be read (the sentence, and whether "Try again" may help); the
+   * remembered collection is chosen only once a read has answered. `collectionsTry` moves on with "Try again".
+   */
+  const [collectionsError, setCollectionsError] = useState<string | undefined>();
+  const [collectionsUnreachable, setCollectionsUnreachable] = useState(false);
+  const [collectionsTry, setCollectionsTry] = useState(0);
   /** What is in the box: the researcher's, kept when the project or the library changes. */
   const [text, setText] = useState("");
   /** Bumped after the switch changed: the queue is read again (its locked count, its matches elsewhere). */
@@ -392,37 +407,57 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     };
   }, []);
 
+  /**
+   * FR-750 (R579): the times the event stream failed or dropped, and the times it opened. A read records both when it
+   * starts: at an opening, a read still out that began before the stream last failed is made again (it may never
+   * settle), and the library's state delivered on that opening does not make again a read begun at it.
+   */
+  const streamDrops = useRef(0);
+  const streamOpenings = useRef(0);
   /** The project list, read again when the service says the library changed; one read at a time, one more after it. */
-  const projectsRead = useRef<{ again: boolean } | null>(null);
-  const readProjects = useCallback(() => {
-    if (projectsRead.current) {
-      projectsRead.current.again = true;
-      return;
-    }
-    const mark = { again: false };
-    projectsRead.current = mark;
-    const g = libGen.current;
-    void (async () => {
-      try {
-        do {
-          mark.again = false;
-          try {
-            const r = await lib.projects.list();
-            if (!alive.current || g !== libGen.current) return;
-            setProjects(r.projects);
-            setProjectsError(undefined);
-            projectsRead_ok.current = true;
-          } catch (err) {
-            if (!alive.current || g !== libGen.current) return;
-            setProjects((cur) => cur ?? []);
-            setProjectsError(sentenceOf(err, FIND_SCREEN_TEXT.projectsUnreadable));
-          }
-        } while (mark.again && alive.current && g === libGen.current);
-      } finally {
-        if (projectsRead.current === mark) projectsRead.current = null;
+  const projectsRead = useRef<{ again: boolean; drops: number; opening: number; ac: AbortController } | null>(null);
+  /**
+   * `restart` (FR-750): a read still out is given up (cancelled) and a new one made at once, in place of one more after it.
+   * Every read is given up after `firstReadMs` as a read that got no answer.
+   */
+  const readProjects = useCallback(
+    (o: { restart?: boolean } = {}) => {
+      if (projectsRead.current) {
+        if (!o.restart) {
+          projectsRead.current.again = true;
+          return;
+        }
+        projectsRead.current.ac.abort();
       }
-    })();
-  }, [lib]);
+      const mark = { again: false, drops: streamDrops.current, opening: streamOpenings.current, ac: new AbortController() };
+      projectsRead.current = mark;
+      const g = libGen.current;
+      const mine = () => alive.current && g === libGen.current && projectsRead.current === mark;
+      void (async () => {
+        try {
+          do {
+            mark.again = false;
+            try {
+              const r = await readWithin((signal) => lib.projects.list({ signal }), firstReadMs, mark.ac.signal);
+              if (!mine()) return;
+              setProjects(r.projects);
+              setProjectsError(undefined);
+              setProjectsUnreachable(false);
+              projectsRead_ok.current = true;
+            } catch (err) {
+              if (!mine()) return;
+              setProjects((cur) => cur ?? []);
+              setProjectsError(sentenceOf(err, FIND_SCREEN_TEXT.projectsUnreadable));
+              setProjectsUnreachable(isUnreachable(err));
+            }
+          } while (mark.again && mine());
+        } finally {
+          if (projectsRead.current === mark) projectsRead.current = null;
+        }
+      })();
+    },
+    [lib, firstReadMs],
+  );
 
   /**
    * One read of the remembered settings (`timeoutMs`: given up after that long, as a failure). Its answer is the new
@@ -430,25 +465,30 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
    * "gone": the screen or the library went meanwhile, and nothing was changed.
    */
   const screenOnce = useCallback(
-    async (timeoutMs?: number): Promise<"ok" | "failed" | "gone"> => {
+    async (timeoutMs?: number, first?: { ac: AbortController }): Promise<"ok" | "failed" | "gone"> => {
       const g = libGen.current;
-      const ac = new AbortController();
+      const ac = first?.ac ?? new AbortController();
       const timer = timeoutMs === undefined ? undefined : setTimeout(() => ac.abort(), timeoutMs);
       putTimers.current.add(timer);
       putAborts.current.add(ac);
+      // FR-750: a read of what is not yet read is given up after `firstReadMs`, as a read that got no answer; it is
+      // "gone" when it was given up for a new one (`first.ac` aborted at an opening of the stream).
+      const superseded = () => !!first && ac.signal.aborted;
       try {
-        const s = await api.screen({ signal: ac.signal });
-        if (!alive.current || g !== libGen.current) return "gone";
+        const s = first ? await readWithin((signal) => api.screen({ signal }), firstReadMs, ac.signal) : await api.screen({ signal: ac.signal });
+        if (!alive.current || g !== libGen.current || superseded()) return "gone";
         confirmed.current = { ...s };
         screenUnread.current = false;
         screenRead_ok.current = true;
         setScreenError(undefined);
+        setScreenUnreachable(false);
         setRemembered(s);
         return "ok";
       } catch (err) {
-        if (!alive.current || g !== libGen.current) return "gone";
+        if (!alive.current || g !== libGen.current || superseded()) return "gone";
         screenUnread.current = true;
         setScreenError(sentenceOf(err, FIND_SCREEN_TEXT.screenUnreadable));
+        setScreenUnreachable(!!first && isUnreachable(err));
         setRemembered((cur) => cur ?? { ...confirmed.current });
         return "failed";
       } finally {
@@ -457,20 +497,27 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
         putAborts.current.delete(ac);
       }
     },
-    [api],
+    [api, firstReadMs],
   );
-  /** A read of the settings in the order of the PUTs (an older answer never wins over a newer one); one at a time. */
-  const screenReading = useRef(false);
+  /**
+   * A read of the settings not yet read, in the order of the PUTs (an older answer never wins over a newer one); one at a
+   * time. `restart` (FR-750): one still out is given up (cancelled) and a new one made.
+   */
+  const screenReading = useRef<{ drops: number; opening: number; ac: AbortController } | null>(null);
   const readScreen = useCallback(
-    (timeoutMs?: number) => {
-      if (screenReading.current) return;
-      screenReading.current = true;
+    (o: { restart?: boolean } = {}) => {
+      if (screenReading.current) {
+        if (!o.restart) return;
+        screenReading.current.ac.abort();
+      }
+      const mark = { drops: streamDrops.current, opening: streamOpenings.current, ac: new AbortController() };
+      screenReading.current = mark;
       const g = libGen.current;
       const run = async () => {
         try {
-          if (alive.current && g === libGen.current) await screenOnce(timeoutMs);
+          if (alive.current && g === libGen.current && !mark.ac.signal.aborted) await screenOnce(undefined, mark);
         } finally {
-          if (g === libGen.current) screenReading.current = false;
+          if (screenReading.current === mark) screenReading.current = null;
         }
       };
       putChain.current = putChain.current.then(run, run);
@@ -487,9 +534,11 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
   /** Another library (or none): nothing of the old one is kept — lists, settings, answers still out (R258 I1). */
   const forgetLibrary = useCallback(() => {
     libGen.current++;
+    projectsRead.current?.ac.abort();
     projectsRead.current = null;
     putChain.current = Promise.resolve();
-    screenReading.current = false;
+    screenReading.current?.ac.abort();
+    screenReading.current = null;
     // What is still out about the old library is given up, and its time limits cleared.
     for (const t of putTimers.current) clearTimeout(t);
     putTimers.current.clear();
@@ -504,8 +553,10 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     screenUnread.current = false;
     setProjects(undefined);
     setProjectsError(undefined);
+    setProjectsUnreachable(false);
     setRemembered(undefined);
     setScreenError(undefined);
+    setScreenUnreachable(false);
     setCheckSending(undefined);
     setSwitchError(undefined);
     setSwitchNote(undefined);
@@ -527,9 +578,19 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     const listen = async () => {
       try {
         const onOpen = () => {
+          streamOpenings.current++;
+          // FR-750 (R579): at each opening after the stream failed or dropped, without waiting for an event on it, what
+          // has not been read is read again — a read that failed, or one still out that began before the stream last
+          // failed (it may never settle). A read that succeeded, or one begun since, is not made again. (The first
+          // opening at load, with the first reads still out or just failed, reads nothing more, as before.)
+          const anew = streamDrops.current > 0;
+          const stale = (m: { drops: number } | null) => anew && (!m || m.drops < streamDrops.current);
+          const projectsAgain = !projectsRead_ok.current && stale(projectsRead.current);
+          if (projectsAgain) readProjects({ restart: true });
+          if (!screenRead_ok.current && stale(screenReading.current)) readScreen({ restart: true });
           // After a lost stream, what happened meanwhile is read.
           if (opened) {
-            readProjects();
+            if (!projectsAgain) readProjects();
             emit({ kind: "refresh" });
           }
           opened = true;
@@ -555,10 +616,14 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
             // still reopening the library, say): everything is read again (R281 e). When something was read, only what
             // has not been read successfully is read again — the screen is not reset: dialogs, focus and what is typed
             // stay (R291 b).
-            const nothingRead = !projectsRead_ok.current && !screenRead_ok.current;
+            // FR-750: a read made again at this stream's opening (above) is about the library as it is now, so it is not
+            // made a third time here: nothing read and both such reads out is not a reason to start afresh.
+            const freshProjects = !!projectsRead.current && projectsRead.current.opening === streamOpenings.current;
+            const freshScreen = !!screenReading.current && screenReading.current.opening === streamOpenings.current;
+            const nothingRead = !projectsRead_ok.current && !screenRead_ok.current && !(freshProjects && freshScreen);
             const rereadMissing = () => {
-              if (!projectsRead_ok.current) readProjects();
-              if (!screenRead_ok.current) readScreen(SWITCH_TIMEOUT_MS);
+              if (!projectsRead_ok.current && !freshProjects) readProjects();
+              if (!screenRead_ok.current) readScreen();
             };
             if (d.libraryId && known === undefined) {
               known = d.libraryId;
@@ -574,8 +639,8 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
               continue;
             }
             // The same library: a project may have been locked, unlocked, created or removed, or the mode changed (M8).
-            if (!screenRead_ok.current) readScreen(SWITCH_TIMEOUT_MS);
-            readProjects();
+            if (!screenRead_ok.current) readScreen();
+            if (projectsRead_ok.current || !freshProjects) readProjects();
             emit({ kind: "refresh" });
             continue;
           }
@@ -584,7 +649,10 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
       } catch {
         // the stream dropped: listen again shortly
       }
-      if (!ac.signal.aborted) retry = setTimeout(() => void listen(), RECONNECT_MS);
+      if (!ac.signal.aborted) {
+        streamDrops.current++;
+        retry = setTimeout(() => void listen(), RECONNECT_MS);
+      }
     };
     void listen();
     return () => {
@@ -620,24 +688,40 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
   }, [epoch, noLibrary]);
 
   // The chosen project's collections; the remembered collection only if it is one of them.
+  // R586 M3: a read that got no answer (or none in time) says so, with "Try again"; it leaves the collections unread
+  // (not an empty list), so the remembered collection is still chosen when a later read answers.
   useEffect(() => {
     setCollections(undefined);
     setCollectionId("");
+    setCollectionsError(undefined);
+    setCollectionsUnreachable(false);
     if (!projectId) return;
     let live = true;
-    lib.collections.list(projectId).then(
+    const ac = new AbortController();
+    readWithin((signal) => lib.collections.list(projectId, { signal }), firstReadMs, ac.signal).then(
       (r) => {
         if (!live) return;
         setCollections(r.collections);
         const want = confirmed.current.projectId === projectId ? confirmed.current.collectionId : undefined;
         if (want && r.collections.some((c) => c.id === want)) setCollectionId(want);
       },
-      () => live && setCollections([]),
+      (err: unknown) => {
+        if (!live) return;
+        // An answer the screen handles (a locked project, say) leaves the list empty, as before; a read that got no
+        // answer says so, with "Try again".
+        if (!isUnreachable(err)) {
+          setCollections([]);
+          return;
+        }
+        setCollectionsError(sentenceOf(err, SERVICE_UNREACHABLE));
+        setCollectionsUnreachable(true);
+      },
     );
     return () => {
       live = false;
+      ac.abort();
     };
-  }, [lib, projectId, epoch]);
+  }, [lib, projectId, epoch, firstReadMs, collectionsTry]);
 
   /**
    * One PUT of the remembered settings, after those before it: built from the last CONFIRMED answer plus its own
@@ -798,6 +882,25 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
     setRemembered((r) => (r ? { ...r, checkEverything: v } : r));
   }, []);
 
+  // ---- FR-750: "Try again" after a read that got no answer: what has not been read is read again ----
+  const showTryAgain = (projectsUnreachable && !!projectsError) || (screenUnreachable && !!screenError) || (collectionsUnreachable && !!collectionsError);
+  const triedAgain = useRef(false);
+  const tryAgain = () => {
+    triedAgain.current = true;
+    if (!projectsRead_ok.current || projectsUnreachable) readProjects();
+    if (!screenRead_ok.current) readScreen();
+    if (collectionsError) setCollectionsTry((n) => n + 1);
+    // The queue's own read, when it got no answer either (its sentence may be said here only, FR-576).
+    emit({ kind: "retry" });
+  };
+  // The button pressed has gone (everything was read): focus goes to the heading, never the page.
+  useEffect(() => {
+    if (showTryAgain || !triedAgain.current) return;
+    triedAgain.current = false;
+    const now = document.activeElement;
+    if (!now || now === document.body || !now.isConnected) headingRef.current?.focus();
+  }, [showTryAgain]);
+
   if (noLibrary) {
     return (
       <main className="ao-page ao-find" aria-labelledby={`${ids}-h`}>
@@ -879,6 +982,19 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
           <UserText>{projectsError}</UserText>
         </p>
       )}
+      {collectionsError && collectionsError !== screenError && collectionsError !== projectsError && (
+        <p role="alert" className="ao-error">
+          <UserText>{collectionsError}</UserText>
+        </p>
+      )}
+      {/* FR-750 (R579): a read that got no answer (or none in time) is offered again; an answer the screen handles is not. */}
+      {showTryAgain && (
+        <p>
+          <button type="button" onClick={tryAgain}>
+            Try again
+          </button>
+        </p>
+      )}
       {projects && remembered && !projectId && !projectsError && <p>{FIND_SCREEN_TEXT.noProject}</p>}
       {projectId && project && (
         <ProjectQueue
@@ -897,6 +1013,7 @@ export function FindAcquire({ client, loc }: { client: ApiClient; loc: AppLocati
           onUnlocked={readProjects}
           waitForSwitch={waitForSwitch}
           saidAbove={screenError}
+          firstReadMs={firstReadMs}
         />
       )}
     </main>
@@ -989,8 +1106,10 @@ function ProjectQueue(props: {
   waitForSwitch: () => Promise<SwitchResult> | undefined;
   /** FR-576: the sentence the screen already says above the queue (its settings could not be read), not said again. */
   saidAbove?: string | undefined;
+  /** FR-750: how long a read of the queue asked for at once (at load, after the switch, an unlock, "Try again") is waited for. */
+  firstReadMs: number;
 }) {
-  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch, saidAbove } = props;
+  const { bus, api, libApi, lib, project, collectionId, text, setText, checkEverything, switchVersion, onStoredCheck, onUnlocked, waitForSwitch, saidAbove, firstReadMs } = props;
   /** The desktop shell's bridge (F16); undefined outside the desktop app. */
   const shell = useMemo(() => desktopShell(), []);
   const projectId = project.id;
@@ -1002,6 +1121,10 @@ function ProjectQueue(props: {
   /** The queue cannot be read at all (409): the service's sentence in its place. */
   const [unreadable, setUnreadable] = useState<string | undefined>();
   const [loadError, setLoadError] = useState<string | undefined>();
+  /** FR-750: the last read failed for want of any answer (or of one in time): "Try again" is offered. */
+  const [loadUnreachable, setLoadUnreachable] = useState(false);
+  const loadUnreachableRef = useRef(false);
+  loadUnreachableRef.current = loadUnreachable;
   /** The library cannot be reached (503 LIBRARY_OFFLINE): the service's sentence (R258 M4). */
   const [offline, setOffline] = useState<string | undefined>();
   const [busy, setBusyState] = useState<Record<string, FindActKind>>({});
@@ -1299,6 +1422,7 @@ function ProjectQueue(props: {
         setOffline(undefined);
         setUnreadable(undefined);
         setLoadError(undefined);
+        setLoadUnreachable(false);
         setLocked(false);
       }
       commit();
@@ -1334,11 +1458,11 @@ function ProjectQueue(props: {
   }, [setDialog]);
 
   /** One read of the queue (it may overlap another; the numbers keep the order). A read cancelled by `signal` changes nothing. */
-  const readOnce = useCallback(async (signal?: AbortSignal): Promise<void> => {
+  const readOnce = useCallback(async (signal?: AbortSignal, limitMs?: number): Promise<void> => {
     const start = ++clock.current;
     const g = gen.current;
     try {
-      const r = await api.queue(projectId, signal ? { signal } : {});
+      const r = limitMs === undefined ? await api.queue(projectId, signal ? { signal } : {}) : await readWithin((s) => api.queue(projectId, { signal: s }), limitMs, signal);
       if (!alive.current || g !== gen.current || signal?.aborted) return;
       applyQueue(r, start);
     } catch (err) {
@@ -1359,6 +1483,7 @@ function ProjectQueue(props: {
         return;
       }
       setLoadError(sentenceOf(err, "The queue could not be read."));
+      setLoadUnreachable(isUnreachable(err));
     }
   }, [api, projectId, applyQueue, markLocked]);
 
@@ -1385,7 +1510,8 @@ function ProjectQueue(props: {
       clearTimeout(timer);
     }
   }, [readOnce]);
-  const readNow = useCallback(() => void readOnce(), [readOnce]);
+  // FR-750: a read asked for at once is given up after `firstReadMs` (a read that never settles would leave "Reading the queue…").
+  const readNow = useCallback(() => void readOnce(undefined, firstReadMs), [readOnce, firstReadMs]);
   /**
    * A read asked for by an event (or after an act), coalesced: it starts EVENT_COALESCE_MS after the first ask (asks
    * meanwhile join it), and asks while it is out make ONE more read after it — however many asks. While asks keep
@@ -1433,9 +1559,11 @@ function ProjectQueue(props: {
       bus.subscribe((sig) => {
         if (!alive.current) return;
         if (sig.kind === "say") sayAct(sig.words);
-        else if (sig.kind === "refresh" || findProgressOf(sig.ev, projectId)) readSoon();
+        else if (sig.kind === "retry") {
+          if (loadUnreachableRef.current) readNow();
+        } else if (sig.kind === "refresh" || findProgressOf(sig.ev, projectId)) readSoon();
       }),
-    [bus, projectId, readSoon, sayAct],
+    [bus, projectId, readSoon, readNow, sayAct],
   );
   useEffect(() => {
     if (openSource) sourceRef.current?.focus();
@@ -2284,9 +2412,19 @@ function ProjectQueue(props: {
       <h2 id={`${ids}-queue`}>Queue</h2>
       {/* FR-576: the same sentence (the service cannot be reached) is said once, not by the screen and again here. */}
       {loadError && loadError !== saidAbove && !entries?.length && (
-        <p role="alert" className="ao-error">
-          <UserText>{loadError}</UserText>
-        </p>
+        <>
+          <p role="alert" className="ao-error">
+            <UserText>{loadError}</UserText>
+          </p>
+          {/* FR-750 (R579): a read that got no answer (or none in time) is offered again. */}
+          {loadUnreachable && (
+            <p>
+              <button type="button" onClick={readNow}>
+                Try again
+              </button>
+            </p>
+          )}
+        </>
       )}
       {!locked && !unreadable && !offline && (
         <>

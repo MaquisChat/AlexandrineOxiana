@@ -32,7 +32,7 @@ import { fileURLToPath } from "node:url";
 import type { Request } from "@playwright/test";
 import ts from "typescript";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
-import { APP_ORIGIN, expect, libraryWithProject, test as base, type AppHarness, type Page } from "./fixtures.js";
+import { APP_ORIGIN, expect, gotoWhenQuiet, libraryWithProject, test as base, type AppHarness, type Page } from "./fixtures.js";
 import type { Locator } from "@playwright/test";
 
 /*
@@ -259,7 +259,7 @@ async function setUp(app: AppHarness, page: Page, folders: string[], folderName 
 const watchedHref = (projectId: string) => `${APP_ORIGIN}/settings/watched-folders?project=${encodeURIComponent(projectId)}`;
 
 async function openWatched(page: Page, projectId: string): Promise<void> {
-  await page.goto(watchedHref(projectId));
+  await gotoWhenQuiet(page, watchedHref(projectId));
   await expect(page.getByRole("heading", { level: 1, name: "Watched folders" })).toBeVisible();
 }
 
