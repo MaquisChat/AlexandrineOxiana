@@ -15,7 +15,6 @@ import {
   lookUpStateOf,
   reviewCauseOf,
   type ListedReviewEntry,
-  type LookUpAgainRefusal,
   type LookUpAgainResult,
   type LookUpState,
   type ReviewDecision,
@@ -250,25 +249,38 @@ const ALREADY_REVIEWED = "This item has already been reviewed.";
 /** What the researcher's look-up did, or the refusal the other review routes give for the same state. */
 function lookUpOutcome(r: LookUpAgainResult, itemId: string): ReviewLookUpOutcome {
   if (r.done) {
+    // `sent` (how many requests left, R585 M2) is not passed on: the page has no use for the number.
     if (r.found > 0) return { kind: "found", found: r.found };
     // Nothing was asked: the rules no longer allow any of what was left to ask.
     if (r.asked === 0 && r.notAllowed > 0) return { kind: "not-allowed" };
-    switch (r.state?.state) {
+    const state = r.state?.state;
+    switch (state) {
       case "waiting":
       case "gave-up":
         // Its time is filled in by the route from the entry's `lookUpNow` (R592).
         return { kind: "asked-to-wait" };
       case "failed":
         return { kind: "failed" };
-      default:
+      // R592 (3): a service the rules denied at send time leaves the lookup "not allowed" (the entry's own state).
+      case "not-allowed":
+        return { kind: "not-allowed" };
+      case "found": // only matches already listed: no new one
+      case "nothing":
+      case undefined:
         return { kind: "nothing" };
+      default:
+        return unknownValue(state);
     }
   }
-  switch (r.why as LookUpAgainRefusal | "not-yet") {
+  switch (r.why) {
     case "not-yet":
-      return { kind: "not-yet", notBefore: (r as { notBefore: string }).notBefore };
+      return { kind: "not-yet", notBefore: r.notBefore };
     case "nothing-to-look-up":
       return { kind: "nothing-to-look-up" };
+    // R585 (3), R592: a look-up of this entry is already under way (nothing audited, sent or written): the entry is
+    // answered as it stands, never as an error.
+    case "under-way":
+      return { kind: "under-way" };
     case "not-found":
       throw new NotFoundError("Review item", itemId);
     case "decided":
@@ -286,8 +298,11 @@ function lookUpOutcome(r: LookUpAgainResult, itemId: string): ReviewLookUpOutcom
       // Only the automatic pass is answered so; the researcher's act never is.
       return { kind: "nothing-to-look-up" };
     default:
-      // R585 (3): "a look-up of this entry is already under way" (nothing sent, nothing written), and any other "nothing
-      // done" this build does not know yet: the entry is answered as it stands, never as an error.
-      return { kind: "under-way" };
+      return unknownValue(r);
   }
+}
+
+/** An exhaustive `switch`'s end: a value the library adds later fails the typecheck here. */
+function unknownValue(v: never): never {
+  throw new Error(`Unknown look-up value: ${JSON.stringify(v)}`);
 }

@@ -517,7 +517,8 @@ describe("POST /review/:itemId/look-up-again (R577 iii)", () => {
     expect(r.json.entry).toMatchObject({ id, sourceId: lib.sources[0], kind: "import", group: "attach" });
     expect(r.json.entry.reasons[0]).toBe(LOOK_UP_AGAIN_TEXT.found);
     expect(r.json.entry.candidates.map((c: { title: string }) => c.title)).toEqual(["Rivers and Memory in Upland Villages", expect.any(String)]);
-    expect(r.json.entry.lookUp).toEqual({ state: "found", tries: 1, canLookUpNow: false });
+    // R585 M3 (R592): a researcher's press is never counted as a try.
+    expect(r.json.entry.lookUp).toEqual({ state: "found", tries: 0, canLookUpNow: false });
     // The queue lists the same entry, the matches in the same order (accepted by position).
     expect(bySource(await queue(lib.pid), lib.sources[0]!)).toEqual(r.json.entry);
     expect(await lookUpAudit(lib.pid)).toEqual([
@@ -554,7 +555,8 @@ describe("POST /review/:itemId/look-up-again (R577 iii)", () => {
     answer = () => WAIT_HOUR;
     const wait = await lookUpAgain(lib.pid, b!);
     expect([wait.status, wait.json.outcome]).toEqual([200, { kind: "asked-to-wait", notBefore: expect.any(String) }]);
-    expect(wait.json.entry.lookUp).toEqual({ state: "waiting", tries: 1, canLookUpNow: false, notBefore: wait.json.outcome.notBefore });
+    // R585 M3 (R592): a researcher's press is never counted as a try.
+    expect(wait.json.entry.lookUp).toEqual({ state: "waiting", tries: 0, canLookUpNow: false, notBefore: wait.json.outcome.notBefore });
     expect(sent).toHaveLength(2);
     // A third press at once: the service's time has not come, nothing is sent.
     const again = await lookUpAgain(lib.pid, b!);
@@ -594,12 +596,12 @@ describe("POST /review/:itemId/look-up-again (R577 iii)", () => {
     expect(sent).toEqual([`api.openalex.org ${titleOf(1)} Souza`]);
   });
 
-  it('R585 (3): "a look-up of this entry is already under way" (or any "nothing done" this build does not know) answers the entry as it stands, not an error', async () => {
+  it('R585 (3), R592: the library\'s "under-way" (a look-up of this entry is already under way) answers the entry as it stands, not an error', async () => {
     await start();
     const lib = await libraryWithWaiting(1);
     const e = bySource(await queue(lib.pid), lib.sources[0]!);
-    // The library's new answer, as the fix round adds it (its exact word is not known here: any unknown one is answered so).
-    svc!.state.lookUpAgainByHand = async () => ({ done: false, why: "under-way" }) as unknown as Awaited<ReturnType<LibraryService["state"]["lookUpAgainByHand"]>>;
+    // The library's own refusal (R585 3), by its name; the route's switch over it is exhaustive.
+    svc!.state.lookUpAgainByHand = async () => ({ done: false, why: "under-way" }) as Awaited<ReturnType<LibraryService["state"]["lookUpAgainByHand"]>>;
     const r = await lookUpAgain(lib.pid, e.id);
     expect(r.status, r.body).toBe(200);
     expect(r.json).toEqual({ outcome: { kind: "under-way" }, entry: e });
@@ -690,5 +692,20 @@ describe("joined to the fixed engine (R592)", () => {
     const r = await lookUpAgain(lib.pid, e.id);
     expect([r.status, r.json.outcome]).toEqual([200, { kind: "found", found: 2 }]);
     expect(sent).toEqual([`api.openalex.org ${titleOf(1)} Souza`]);
+  });
+
+  it('point 3: a lookup the rules denied at send time, with another service answering nothing, is answered "not allowed" (the entry\'s state), not "nothing"', async () => {
+    await start();
+    const lib = await libraryWithWaiting(1);
+    const e = bySource(await queue(lib.pid), lib.sources[0]!);
+    // The engine's answer for it (R592 ruled 3): one lookup asked (a service said nothing), the other service denied at send.
+    svc!.state.lookUpAgainByHand = async () =>
+      ({ done: true, entryId: e.id, sourceId: lib.sources[0]!, asked: 1, services: ["crossref"], sent: 1, notAllowed: 1, found: 0, state: { state: "not-allowed", tries: 0, fromFile: false } }) as Awaited<
+        ReturnType<LibraryService["state"]["lookUpAgainByHand"]>
+      >;
+    const r = await lookUpAgain(lib.pid, e.id);
+    expect([r.status, r.json.outcome]).toEqual([200, { kind: "not-allowed" }]);
+    // `sent` is not passed on: the page has no use for the number.
+    expect(JSON.stringify(r.json)).not.toContain('"sent"');
   });
 });
