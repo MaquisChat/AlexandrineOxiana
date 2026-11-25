@@ -476,3 +476,26 @@ The commits were cut from the tested final tree. The intermediate states were re
   - In "cannot-tell" its banner would read the plain moved words.
   - That case cannot arise with a marked project. The record becomes complete only in "finalize", after "mark-old" has rewritten the old `library.json` to the remaining library's id, so the record (keyed by the original id) no longer matches. Only a hand-reverted `library.json` could reach it.
 - **Runs:** move 118, device-and-old-copies 18, move-finish 37, StatusBanner 81; library and library-service typecheck clean.
+
+## After the third look (R599)
+Branch `fr-755-move-failure`, two commits on 704506d (not pushed). **Head: `4588572`.** `git status --short` empty.
+
+| commit | finding |
+|---|---|
+| 53adad0 | M-1: a finishing interrupted on a computer whose audit anchors were lost still finishes |
+| 4588572 | M-3: an unfinished move is matched to its folder by real path |
+
+### M-1
+- **Failing tests** (`packages/library/src/move.test.ts:1764`, describe "FR-755 (R599 M-1): …"), the reviewer's probe of question (e): a whole-library switch stopped after mark-old with the step not recorded; the library's own audit log holds an entry by this computer (a refused project creation); `config/audit-anchors.json` removed; the finishing then interrupted after "mark-old", "register", "close-source", "audit-move", and by a failure at mark-complete. Each asserts the finishing's own opening wrote `audit.anchor-missing` into a project's log AND the library's own log, then that the next `finishMoveAt` finishes (journal gone, one `library.move` per moved project, old place opens `moved`). Before the mend all five refused: "3 file(s) at the new place no longer match the move's check" (two projects' logs + the library's own).
+- **Guards (pass before and after):** "audit.anchor-mismatch after the verified beginning of a project's log is still refused" (files-differ, count 1); "the library's own audit log takes the same rule: a line of another action after its verified beginning is refused" (files-differ, count 1, nothing written at the new place). The existing R590 N2 test with a hand-appended `source.delete` still refuses.
+- **Mend:** `packages/library/src/move.ts:978` `SWITCH_OWN_ACTIONS = new Set(["library.move", "audit.anchor-missing"])`; `move.ts:954` `AUDIT_LOG` now also matches the library's own `audit/*.jsonl`, so it takes the "begins" rule (`move.ts:906`) instead of the whole-hash rule. The opening's read-only fault check (`auditFaultsAt`) is unchanged and already covered the library's own log.
+- Noticed, not changed: a hand-made line in the library's own log without an `at` field makes the read-only opening throw a TypeError (`library-audit.ts` `checkLibraryAudit`, `e.at.slice`) instead of reporting a fault; the finishing then fails with that error, writing nothing. Pre-existing; the test uses a well-formed event.
+
+### M-3
+- **Failing test:** `packages/library/src/reconnect.test.ts:392` "R599 M-3: an unfinished move out of this folder is found by the folder's real path: reconnected through a symbolic link, it is reported". Before the mend `moveIncomplete` was `undefined`.
+- **Mend:** `packages/library/src/old-copies.ts:176` `listUnfinishedMoves(deps, at?)`: with `at = { libraryId, folder }` it returns only that library's unfinished moves whose `oldRoot` or `newRoot` is the folder by `sameFolder`. `packages/library/src/reconnect.ts:759` uses it (the text comparison is gone).
+
+### Runs (each alone, `nice -n 10`, `NODE_OPTIONS=--use-openssl-ca`)
+- `@ao/library`: move 125 (7 new), device-and-old-copies 18, reconnect 55 (1 new). All passed.
+- `@ao/library-service`: move-finish 37. Passed.
+- Typecheck: library, library-service clean.
