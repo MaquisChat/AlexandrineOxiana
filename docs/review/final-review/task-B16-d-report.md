@@ -100,3 +100,27 @@ No consumer changed what a person sees. One case: in the run step, the try count
 **Loaded (4 busy loops, killed; nothing running), 30/30 each:** client, governance, Library.firstReads, WatchedFolders, FindAcquire, ZoteroSync (resumed at run 17 after a time limit, no failure), Capture/ImportWizard/TranscriptViewer/reader firstReads, readerHandoff, MissingFiles, integrity-progress.
 
 **Other runs:** touched files pass; typecheck ui/library/service 0 errors; lint:css and lint:colours clean.
+
+## Second fix round (R658)
+
+Commits (worktree kg-8, branch b16-d-streams, not pushed): 25695d6 (mend 1), c6ff19b (mend 2), 64d525a (mend 3). Head 64d525a.
+
+**Mend 1 — import run step's count of tries starts again (review M5).** `packages/ui/src/screens/import/StepRun.tsx:87–124`: the `for (tries…)` loop is now `while`, with `opened` (set in `onOpen`) and `proved` per try. `proved` is set on any event the loop receives (before the batch filter), or when the try ended with the client's did-not-answer-in-time error after it had opened (`opened && isNoAnswerInTime(err)`: after opening, the client gives that error only at its quiet limit). A proved try sets `tries = 0`; otherwise `tries++ >= RECONNECTS` ends in the notice as before. `client.ts` not changed. No words changed.
+Tests, `ImportWizard.firstReads.test.tsx:232–268`, both failed first ("expected 3 to be 6": the notice after 3 tries):
+- "R658: more silences in a row than the step's tries, each after the stream opened, do not end in the notice: the step keeps following" (5 quiet streams, sixth held unopened; first five requests cancelled, sixth not; no notice).
+- "R658: a stream that delivered an event and then dropped, more times than the step's tries, …" (each of five streams sends another batch's `import.progress` then ends; sixth held; no notice, still "Starting…").
+- Unchanged and passing: `ImportWizard.test.tsx` › "run screen (R115 I5)" › "a stream that closes after connecting does not leave the screen on Starting…". Not opened in time, more than the limit, still ends in the notice: existing `ImportWizard.firstReads.test.tsx` › "a stream that never opens at all ends, after the step's own tries, in its existing notice, saying it did not answer in time …" (passes).
+
+**Mend 2 — the reader's pause removes its listener (as review M4).** `packages/ui/src/routes/reader.tsx:326–335`, mended exactly as `governance.tsx` (e21b664). Test `reader.firstReads.test.tsx:133` "R658: each pause before the stream is listened to again leaves no abort listener behind once it is over (as review M4)", on the pattern of e21b664's test (fake clock, live listeners counted); failed first ("expected 6 to be 1").
+
+**Mend 3 — "Check again" on Missing files hands focus on (coordinator's addition).** No existing component fitted (`TryAgain` carries the words "Try again"); followed the fallback ruled: `packages/ui/src/screens/MissingFiles.tsx:46,100–104,122,133,141` — the `<h1>` has `tabIndex={-1}` and a ref; both "Check again" buttons call `checkAgain`, which focuses the heading and starts the check. The first check at mount and `search()`'s re-check do not move focus; "after Stop, focus goes to Check again" unchanged. No words changed.
+Tests `MissingFiles.test.tsx:223–260`: "R658: “Check again” after a stop, pressed, hands focus to the screen's heading…" and "R658: “Check again” under a failed check, pressed, …" — both failed first (focus on `<body>`). A third, "R658: the screen's first check, at its opening, does not take focus to the heading", is a guard and passed before the mend too.
+
+**30× under load (4 busy loops, killed; nothing left running):**
+- `ImportWizard.firstReads.test.tsx`: 30/30 — last: Tests 16 passed (16)
+- `reader.firstReads.test.tsx`: 30/30 — last: Tests 7 passed (7)
+- `MissingFiles.test.tsx`: 30/30 — last: Tests 14 passed (14)
+
+**Verify (once, no load):** `ImportWizard.test.tsx` Tests 56 passed (56); `reader.firstReads.test.tsx` 7 passed; `reader.test.tsx` 13 passed (13); `Reader.test.tsx` 59 passed (59); `MissingFiles.test.tsx` 14 passed; `@ao/ui typecheck` 0 errors; `lint:css`, `lint:colours` clean; `git status --short` empty.
+
+Uncertain: the import's "proved by silence" relies on the client's only post-open did-not-answer-in-time being the quiet limit (true at this head, `client.ts:466–484`); a future change there would need this read again.
