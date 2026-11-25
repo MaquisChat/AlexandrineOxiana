@@ -893,6 +893,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         {creating && (
           <NewProject
             api={api}
+            firstReadMs={firstReadMs}
             returnFocusTo={() => {
               // The opener, unless it was disabled meanwhile (the library turned read-only): then the project list.
               const b = newProjectButton.current;
