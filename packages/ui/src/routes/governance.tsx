@@ -99,8 +99,13 @@ export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT
         }
         if (ac.signal.aborted) return;
         await new Promise<void>((r) => {
-          const t = setTimeout(r, LISTEN_AGAIN_MS);
-          ac.signal.addEventListener("abort", () => (clearTimeout(t), r()), { once: true });
+          const stop = () => (clearTimeout(t), r());
+          // The pause's listener goes when its timer fires, so a long outage leaves none behind (review M4).
+          const t = setTimeout(() => {
+            ac.signal.removeEventListener("abort", stop);
+            r();
+          }, LISTEN_AGAIN_MS);
+          ac.signal.addEventListener("abort", stop, { once: true });
         });
       }
     })();

@@ -1,7 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createClient } from "../api/client";
 import { useLocation } from "../navigation";
 import { BASE, TOKEN, server, url, useMsw } from "../test/msw-governance";
@@ -398,5 +398,44 @@ describe("R641 D1: the Governance form's event stream reconnects by itself, with
     expect(n).toBe(2);
     expect(requests[0]!.signal.aborted).toBe(true);
     expect(requests[1]!.signal.aborted).toBe(false);
+  });
+
+  it("each pause before the stream is opened again leaves no abort listener behind once it is over (review M4)", async () => {
+    serve({ handler: http.get(url("/events"), () => HttpResponse.error()) });
+    // The screen's own signal, as it is handed to the stream; its live "abort" listeners are counted.
+    const client = createClient(BASE, TOKEN);
+    let live = 0;
+    let watched: AbortSignal | undefined;
+    const opened = vi.fn((o: Parameters<typeof client.events>[0]) => {
+      const signal = o?.signal;
+      if (signal && !watched) {
+        watched = signal;
+        const add = signal.addEventListener.bind(signal);
+        const remove = signal.removeEventListener.bind(signal);
+        signal.addEventListener = ((type: string, fn: EventListenerOrEventListenerObject, opts?: AddEventListenerOptions | boolean) => {
+          if (type === "abort") live++;
+          add(type, fn, opts);
+        }) as AbortSignal["addEventListener"];
+        signal.removeEventListener = ((type: string, fn: EventListenerOrEventListenerObject, opts?: EventListenerOptions | boolean) => {
+          if (type === "abort") live--;
+          remove(type, fn, opts);
+        }) as AbortSignal["removeEventListener"];
+      }
+      return client.events(o);
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      window.history.replaceState(null, "", "/governance?project=p1");
+      render(<GovernanceRoutes client={{ ...client, events: opened }} loc={window.location} />);
+      // Each try fails at once; after it the screen pauses (2 s), then tries again. Five pauses go by.
+      for (let n = 1; n <= 6; n++) {
+        await vi.waitFor(() => expect(opened).toHaveBeenCalledTimes(n));
+        if (n < 6) await vi.advanceTimersByTimeAsync(2_000);
+      }
+      // At rest in the sixth pause: its own listener, and none left from the five pauses before.
+      await vi.waitFor(() => expect(live).toBe(1));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
