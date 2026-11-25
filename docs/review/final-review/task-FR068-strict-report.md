@@ -201,3 +201,118 @@ None of the brief's stop conditions arose:
 - an older build reads the new mark;
 - (iii) relies only on the journal's `done` (written atomically) and on marks carrying this move's id;
 - the route tells (d)'s state by `staleMoveCopyAt`.
+
+# Mend round (R612)
+
+Branch `fr-068-strict` in `kg-3a`, five commits on 87c1b26, one per mend, not pushed. `git status --short` is empty. No process of mine is left running (other agents' test runs were seen on the machine; none was mine).
+
+| commit | mend |
+|---|---|
+| 8cea032 | I-A: which sentence a refusal gets |
+| 7cf2f4a | R610 (2): the dialog shows the refusal's reason |
+| 9ee588b | m-A: the sentence after the failure names the cause at the old place |
+| 715d515 | m-B: no anchor-comparison warning at any unmarked switching copy |
+| 4b1496c | m-C: `completeMove` no longer exported |
+
+## I-A: the refused cases and their sentences
+
+The one judgement `stoppedSwitch` (`packages/library/src/move.ts:417`) now returns "resume", "stale" or "unfinished". It reads the old place ONCE (`oldPlaceShows`, `move.ts:443`) and both resumes and chooses the words from that one reading; `preflight` (`move.ts:388-392`) throws S1 for "stale", S2 for "unfinished". The resume rule is unchanged (the 4 "unchanged" guards and every resume test pass).
+- "stale" (S1) only where this computer's record of that move exists and its old place is seen to be the living, unmarked library of the move's id (`living`), or shows a mark naming another library or carrying another move's id (`another`).
+- "unfinished" (S2) otherwise: the mark recorded in the journal; a mark of this move seen; a mark without an id; a mark that cannot be read; the old place out of reach, or holding another/no library; the record missing (or not that move's).
+- Precedence when several marks are seen (a split): this move's > no id > unreadable > another.
+
+Sentences (`packages/shared/src/api/library-move.ts`, `MOVE_FOLDER_STALE_COPY_TEXT`, `MOVE_FOLDER_UNFINISHED_TEXT`):
+- S1: "That folder holds the copy of an earlier move that did not finish. Choose another, empty folder, or delete that folder first."
+- S2: "That folder holds a library whose move there has not finished. Choose another, empty folder. To finish that move, open the library at that folder."
+
+| refused case | sentence | test (engine `move.test.ts`, describe "FR-068 (R607 a)…", unless named) |
+|---|---|---|
+| FR-068 sequence (old place living, unmarked) | S1 | "the FR-068 sequence: …"; service "the FR-068 sequence: …" |
+| C-1 (A→B failed before the mark, A→C succeeded; plan to B from C) | S1 | "C-1: …"; service "C-1 (the review's sequence): …" |
+| a mark naming another library | S1 | "a mark naming another library at the old place does not count: refused" |
+| back and forth: a stale mark with another move's id (two marks) | S1 | "back and forth …" (first two marks) |
+| back and forth: a mark without an id | S2 | "back and forth …" (third mark) |
+| split beside an earlier split's mark | S1 | "a split whose library holds a project marked by an EARLIER split: …" |
+| hand copy, old place unmarked | S1 | "a copy of the library made by hand …" |
+| crash seam | S1 | "the process killed between the switching journal and the mark; …" |
+| an older build's mark (no id), not recorded | S2 | "a mark written by an older build (no move id) …" |
+| this move's mark SEEN, asked by a hand copy (G2b) | S2 | "R612 I-A: this move's mark seen at the old place, the move asked by a copy of the library made by hand: …" (new) |
+| this move's mark RECORDED, asked by a hand copy | S2 | "R612 I-A: this move's mark recorded in the journal, …" (new) |
+| the old place out of reach | S2 | "the old place cannot be reached: …" |
+| this computer's record missing | S2 | "R612 I-A: this computer's record of the move is missing: …" (new); service "R612 I-A: this computer's record of that move missing: …" (new) |
+
+Failed first: 6 engine tests (the three new; back and forth, out of reach, older build) failed with S1 received where S2 was expected. Existing tests changed: those three now expect S2 (they had asserted the delete-words). The service's new test was written after the engine change (it checks the same judgement through the routes).
+
+## R610 (2): what the dialog shows for each refusal, word for word
+
+`packages/ui/src/screens/MoveLibrary.tsx`: a refusal (`POLICY_DENIED` with a reason) shows the message and, after one space, the reason in `UserText`, in the dialog's one existing alert. At "Check destination" (`check`), and when the move is refused at its own plan (`failedWith`), then without the old ending "The move stopped; nothing was deleted, and the library stays where it was." (it spoke of a move that never began). Other failures keep that ending.
+- S1: "The library cannot be moved there. That folder holds the copy of an earlier move that did not finish. Choose another, empty folder, or delete that folder first."
+- S2: "The library cannot be moved there. That folder holds a library whose move there has not finished. Choose another, empty folder. To finish that move, open the library at that folder."
+- ordinary: "The library cannot be moved there. The destination folder is not empty; choose an empty folder"
+  (the engine's reason has no final full stop; it was so before and I did not change it.)
+- Any other refusal reason (overlap, a project's rules…) is shown the same way.
+
+Tests (`MoveLibrary.test.tsx`, describe "R610 (2), R612: …"): the three at Check destination (failed first: only the message), and the move's own refusal with S2 (failed first: the old ending).
+
+## m-A: the sentence and its causes
+
+Route (`apps/library-service/src/routes/libraries.ts`, the "Not moved" branch; `oldFolderNotWritable` at `:85`): when the folder is the stale copy (`staleMoveCopyAt`) and the error's code (or one it wraps) is:
+- ENOSPC, EDQUOT → "the disk is full"
+- EACCES, EPERM → "permission was refused"
+- EROFS → "the disk can only be read"
+
+the answer is 409 CONFLICT, reason `move-stopped-before-switch-<cause>` (`disk-full`, `permission`, `read-only-disk`), sentence (shared `moveStoppedBeforeSwitchParts(newRoot, cause)`):
+
+"The move stopped before the library was switched, because the library's old folder could not be written to ({cause}). Nothing of the library was deleted, and it stays where it was. The copy made at {newRoot} is not used and can be deleted. Free space or restore access at the library's folder before moving the library again."
+
+The service's own answer says "the new place" for {newRoot}; the dialog names the folder through UserText. The one tightening: "there" became "at the library's folder", since after "The copy made at {newRoot}" the word "there" read as the copy's place. Any other cause keeps the general sentence (the existing test "every other failure keeps its words" and the (d) tests still pass).
+
+Why the code is the old place's: in that state (switching journal, no mark recorded, the old place unmarked) the only step that ran after the switching journal is the mark's write into the old folder (and, when the source is not open, its lock there). The record and known-path writes come before the switching journal; the split's registration comes after its marks. I did not tag the error in the engine.
+
+A test seam `moveSeams.fail = { at: "mark-old", code }` (`move.ts`, in `markOld`, before any write) makes the mark's write fail. Tests: service `move-finish.test.ts` "R612 m-A: the mark could not be written to the old folder (ENOSPC|EACCES): …" (failed first: the move finished); page "R612 m-A: … (disk-full|permission|read-only-disk) …" (failed first).
+
+## m-B: the rule and the banner
+
+- `unmarkedMoveCopyAt` (`packages/library/src/old-copies.ts:332`): a switching journal at the folder, without "mark-old" done; this computer's record of that move (same library, same move id, naming this folder); and the old place out of reach, or showing no mark of that move (whole: the top's MOVED.json; split: a moved project's; naming the library with that move's id or with none, as the finishing at an opening counts it; for a split, nor its library.json rewritten as the remaining library).
+- The opening (`packages/library/src/library.ts:302-307`) sets `anchorsNotCompared` when `staleMoveOf` is set or that holds; `openRepoInternal` (`packages/library/src/repo/repo.ts:633`) then compares no anchor (chains still checked).
+- The banner is unchanged and follows `staleMoveOf` alone:
+  - old place seen as the living, unmarked library: "Read-only — this folder holds the copy of a move that did not finish. The library is still at {oldRoot}, and nothing here is the library. This folder can be deleted."
+  - old place moved on, deleted or out of reach: "Read-only — a move into this folder has not finished. Changes are off." (true in each).
+- Tests: engine (describe "FR-068 (R607 c)…"): the old place out of reach (G6b), deleted, marked by a later move (G6): no warnings (the three failed first with "truncated"/anchor warnings); "this move's mark seen at the old place (not recorded): … a log emptied by hand gives its warning" and the existing "once the old copy is marked by the move …" still give "empty". Service: "G6: …" and "G6b: …" (both failed with `repo.ts` put back, then restored).
+- Changed existing test: "the old place out of reach: not said to be the library; today's words and checks stay" asserted the warnings (the gap); it now asserts none.
+
+## m-C
+
+`completeMove` removed from `packages/library/src/index.ts` (a comment says why). No caller outside the package; the tests already imported it from `./move.js`. Test: `seams-inert.test.ts` "FR-068 (R612 m-C): completeMove … is not exported from the package's entry" (failed with the old index). `pnpm -r typecheck`: all nine packages Done.
+
+## New or changed sentences, word for word
+- S2 (new): "That folder holds a library whose move there has not finished. Choose another, empty folder. To finish that move, open the library at that folder."
+- S1 (now only in its cases): "That folder holds the copy of an earlier move that did not finish. Choose another, empty folder, or delete that folder first."
+- Dialog: "The library cannot be moved there. {reason}" (reason in UserText), without "The move stopped; …" for a refusal.
+- m-A, with {cause} one of "the disk is full", "permission was refused", "the disk can only be read": "The move stopped before the library was switched, because the library's old folder could not be written to ({cause}). Nothing of the library was deleted, and it stays where it was. The copy made at {newRoot} is not used and can be deleted. Free space or restore access at the library's folder before moving the library again."
+
+## Runs (each file alone, `nice -n 10`, `NODE_OPTIONS=--use-openssl-ca`, on the final tree)
+
+| package | file | result |
+|---|---|---|
+| `@ao/library` | `move.test.ts` | 148 passed (3 new I-A, 2 new m-B cases plus 1 changed) |
+| | `device-and-old-copies.test.ts` | 18 passed |
+| | `retention-old-copies.test.ts` | 40 passed |
+| | `reconnect.test.ts` (the only reconnect file) | 55 passed |
+| | `library.test.ts` | 35 passed |
+| | `library-place.test.ts` | 19 passed |
+| | `seams-inert.test.ts` | 10 passed (1 new) |
+| `@ao/library-service` | `move-finish.test.ts` | 48 passed (1 I-A, 2 m-A, 2 m-B new) |
+| | `library-place-routes.test.ts` | 8 passed |
+| | `open-library.test.ts` | 26 passed |
+| `@ao/ui` | `StatusBanner.test.tsx` | 82 passed |
+| | `MoveLibrary.test.tsx` | 37 passed (4 R610 (2), 3 m-A new) |
+
+Also: `pnpm -r typecheck` clean; `lint:css` and `lint:colours` clean; `@ao/ui` built; e2e `maintenance.spec.ts` (Chromium, app only): 3 passed.
+
+## Uncertain
+1. **EROFS's words.** The house groups EROFS with the permission faults ("cannot be written to"). I gave it its own words, "the disk can only be read", since "permission was refused" is not what a read-only disk says. Three reasons rather than two.
+2. **m-A tells the cause by the state, not by the engine.** The argument is above (only the mark's write runs in that window). If a later change writes elsewhere between the switching journal and the mark, the route would need the engine to tag the error.
+3. **G6b's other note.** Opening the stopped folder with the old place out of reach still gives the finishing's own session note "move-not-finished-old-copy-unreachable" ("…could not be finished now because its old copy at {place} cannot be reached. Connect the drive…"). It is not an anchor warning, so m-B leaves it; "could not be finished now" is true, but once the drive is back the folder would be judged stale and still not finished. Not changed (not asked).
+4. **"another or no library" at the old place, no mark** gets S2 (the ruling's "every other case"). Such a folder is probably stale too, but it is not proved.
+5. **The ordinary "not empty" reason** has no final full stop, so the dialog's line ends without one. Older than this work.
