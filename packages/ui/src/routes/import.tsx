@@ -74,6 +74,8 @@ function ReviewRoute({ client, project, batch, firstReadMs }: { client: ApiClien
   const [projectId, setProjectId] = useState(project);
   const [batches, setBatches] = useState<BatchSummary[]>([]);
   const [batchId, setBatchId] = useState(batch);
+  /** R623 (Minor 4): the chosen project's list of imports is being read ("Loading…" in the import's picker). */
+  const [listOut, setListOut] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /**
    * FR-756: the picker's reads that got no answer (given up at `firstReadMs`, or the service could not be reached), each
@@ -118,6 +120,7 @@ function ReviewRoute({ client, project, batch, firstReadMs }: { client: ApiClien
     let live = true;
     const ac = new AbortController();
     out.current.add("batches");
+    setListOut(true);
     // Another project chosen: the give-up of the one left is not said of this one.
     setUnanswered(({ batches: _gone, ...rest }) => rest);
     readWithin((signal) => api.batches(projectId, { signal }), firstReadMs, ac.signal)
@@ -135,7 +138,11 @@ function ReviewRoute({ client, project, batch, firstReadMs }: { client: ApiClien
           setError(errorText(e));
         }
       })
-      .finally(() => live && out.current.delete("batches"));
+      .finally(() => {
+        if (!live) return;
+        out.current.delete("batches");
+        setListOut(false);
+      });
     return () => {
       live = false;
       out.current.delete("batches");
@@ -163,7 +170,17 @@ function ReviewRoute({ client, project, batch, firstReadMs }: { client: ApiClien
       <div className="ao-import ao-import__picker">
         <label className="ao-import__field">
           <span>Project</span>
-          <select ref={pickerRef} value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+          <select
+            ref={pickerRef}
+            value={projectId}
+            onChange={(e) => {
+              // R623 (Minor 4): the import chosen, and the list it was chosen from, were the project left's: both are
+              // cleared until the new project's list is read, so no queue is shown for a pair never read together.
+              setProjectId(e.target.value);
+              setBatches([]);
+              setBatchId("");
+            }}
+          >
             {projects.map((p) => (
               <option key={p.id} value={p.id} disabled={p.unlocked === false}>
                 {p.name}
@@ -174,7 +191,7 @@ function ReviewRoute({ client, project, batch, firstReadMs }: { client: ApiClien
         <label className="ao-import__field">
           <span>Import</span>
           <select value={batchId} onChange={(e) => setBatchId(e.target.value)}>
-            <option value="">Choose an import</option>
+            <option value="">{listOut ? "Loading…" : "Choose an import"}</option>
             {batches.map((b) => (
               <option key={b.batchId} value={b.batchId}>
                 {batchLabel(b)}

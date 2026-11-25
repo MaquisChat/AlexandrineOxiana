@@ -1,9 +1,10 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { http, HttpResponse } from "msw";
 import { useLocation } from "../navigation";
 import type { ApiClient } from "../api/client";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mockService, server, B1, B7, P1 } from "../test/importService";
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
+import { mockService, server, B1, B7, BASE, P1, P2 } from "../test/importService";
 import { importRoute, IMPORT_PATHS } from "./import";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -119,6 +120,52 @@ describe("import routes", () => {
     fireEvent.change(pick, { target: { value: B7 } });
     const link = await screen.findByRole("link", { name: "Back to the import's report and undo" });
     expect(link.getAttribute("href")).toBe(`/import?project=${P1}&batch=${B7}`);
+  });
+
+  it("/import/review's picker, switching project while the new project's imports are still read: the old project's import is not shown under the new one; then the new project's imports (R623 Minor 4)", async () => {
+    const batch = (batchId: string, number: number) => ({ batchId, number, kind: "folder", state: "finished", startedAt: "2026-11-10T09:00:00.000Z", counts: { created: 1, merged: 0, skipped: 0, failed: 0, needsReview: 1 } });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    const reviewed: string[] = [];
+    const m = mockService({
+      extra: [
+        http.get(`${BASE}/projects`, () =>
+          HttpResponse.json({
+            projects: [
+              { id: P1, name: "Thesis", encrypted: false, unlocked: true },
+              { id: P2, name: "Fieldwork", encrypted: false, unlocked: true },
+            ],
+          }),
+        ),
+        http.get(`${BASE}/projects/:id/imports`, async ({ params }) => {
+          if (params.id === P2) {
+            await gate;
+            return HttpResponse.json({ batches: [batch(B7, 7)] });
+          }
+          return HttpResponse.json({ batches: [batch(B1, 1)] });
+        }),
+        http.get(`${BASE}/imports/:batchId/review`, ({ params }) => {
+          reviewed.push(params.batchId as string);
+          return HttpResponse.json({ items: [] });
+        }),
+      ],
+    });
+    render(<>{importRoute({ pathname: "/import/review", search: "" }, m.client)}</>);
+    await screen.findByText("Nothing is waiting for review in this import.");
+    const imports = () => screen.getByRole("combobox", { name: "Import" }) as HTMLSelectElement;
+    expect(imports().value).toBe(B1);
+    await userEvent.setup().selectOptions(screen.getByRole("combobox", { name: "Project" }), P2);
+    expect(screen.queryByRole("heading", { level: 1, name: "Review queue" })).toBeNull();
+    expect(screen.queryByText("Nothing is waiting for review in this import.")).toBeNull();
+    expect(imports().value).toBe("");
+    expect(within(imports()).getAllByRole("option").map((o) => o.textContent)).toEqual(["Loading…"]);
+    release();
+    await screen.findByRole("option", { name: /Import 7/ });
+    await waitFor(() => expect(imports().value).toBe(B7));
+    expect(within(imports()).getAllByRole("option").map((o) => o.textContent)).toEqual(["Choose an import", expect.stringMatching(/^Import 7/)]);
+    await screen.findByText("Nothing is waiting for review in this import.");
+    expect(reviewed).toEqual([B1, B7]);
   });
 
   it("Start import, through the route as App renders it: the address names the import, and the wizard opened on it shows the run (D1; a deliberate remount, M1)", async () => {
