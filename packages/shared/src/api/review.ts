@@ -71,6 +71,27 @@ export interface ProjectReviewEntry {
   hints?: string[];
   /** Cause "acquired-file-mismatch" (F11): what the check found about the held file, for the researcher to judge by. */
   heldFile?: ReviewHeldFile;
+  /**
+   * Decision 31 (c), "Look up again" (R566, R577): an import entry with lookups left out (a service asked to wait, or the
+   * lookup failed outright). Absent for an entry with nothing left out. Holds no title and no identifier: the entry's
+   * `reasons` already carry the state's sentence (the library writes it there).
+   */
+  lookUp?: ReviewLookUp;
+}
+
+/** The look-up state of an entry (the library's `lookUpStateOf`): see `ReviewLookUp`. */
+export type ReviewLookUpState = "waiting" | "found" | "nothing" | "not-allowed" | "gave-up" | "failed";
+
+/**
+ * What the page needs to offer "Look up again" (R577): the state; the tries made so far (the most of any lookup); whether
+ * the researcher's act may send now; and, when it may not yet, the earliest time it may (the service's named time, R411,
+ * R577 iii). `canLookUpNow` false with no `notBefore`: nothing is left to look up (every lookup has its answer).
+ */
+export interface ReviewLookUp {
+  state: ReviewLookUpState;
+  tries: number;
+  canLookUpNow: boolean;
+  notBefore?: string;
 }
 
 /**
@@ -227,6 +248,44 @@ export interface ReviewBulkEditRequest {
 export interface ReviewBulkEditResponse {
   /** How many entries were named (every one was edited, or the request failed as a whole). */
   edited: number;
+}
+
+// ---- "Look up again" (decision 31 (c); R566, R577) ----
+
+/**
+ * `POST /review/:itemId/look-up-again` with the project in the body: the researcher's act. Only the entry's left-out
+ * lookups are asked, of only the services left out; what is found is appended to the entry's candidates and nothing of
+ * the record changes until a candidate is accepted with the existing decision. Its own route, not a decision act.
+ *
+ * Answered 200 with what happened and the entry as the queue lists it afterwards — also when nothing could be sent yet
+ * ("not-yet": the service's named time has not come; nothing was sent) and when every lookup already has its answer
+ * ("nothing-to-look-up"). Refused as the other review routes refuse: a read-only library 409 READ_ONLY, a locked project
+ * 423 PROJECT_LOCKED, an entry not in the queue 404 NOT_FOUND, an entry already decided (or its source removed) 409
+ * CONFLICT, a library that is closing 409 LIBRARY_CLOSED, the project's rules refusing the send 403 POLICY_DENIED.
+ */
+export interface ReviewLookUpAgainRequest {
+  projectId: string;
+}
+
+export type ReviewLookUpOutcome =
+  /** `found` matches were appended to the entry's candidates. */
+  | { kind: "found"; found: number }
+  /** The services answered, with no new match. */
+  | { kind: "nothing" }
+  /** The project's rules no longer allow the lookup: nothing was asked. */
+  | { kind: "not-allowed" }
+  /** A service asked to wait again: it may be asked from `notBefore` on. */
+  | { kind: "asked-to-wait"; notBefore?: string }
+  /** The services could not be reached. */
+  | { kind: "failed" }
+  /** Nothing was sent: the service's named time has not come (R411, R577 iii). */
+  | { kind: "not-yet"; notBefore: string }
+  /** Every lookup of the entry already has its answer: nothing was sent. */
+  | { kind: "nothing-to-look-up" };
+
+export interface ReviewLookUpAgainResponse {
+  outcome: ReviewLookUpOutcome;
+  entry: ProjectReviewEntry;
 }
 
 // Refusals the review routes name: a library open read-only (409 READ_ONLY, the queue too), a locked
