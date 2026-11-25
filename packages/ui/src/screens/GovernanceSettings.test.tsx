@@ -349,7 +349,7 @@ describe("Governance settings", () => {
 
   // FR-751 (R641 B4, second round): the backups line is a sentence for each status, never the raw code.
   for (const [status, sentence] of [
-    ["none", "Backups holding them: none held these files."],
+    ["none", "Backups holding them: no listed backup held these files."],
     ["pending", "Backups holding them: at least one listed backup is still to be removed; the app will try again."],
     ["unknown-pending", "Backups holding them: at least one listed backup that may still hold them is still there."],
     ["deleted", "Backups holding them: none is left that holds them; the app removed each one that did."],

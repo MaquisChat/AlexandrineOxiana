@@ -83,7 +83,7 @@ export function oldCopiesPendingText(s: Pick<DestructionOldCopiesState, "oldCopi
  * know is said as such.
  */
 const BACKUPS_STATUS_TEXT: Readonly<Record<string, string>> = {
-  none: "Backups holding them: none held these files.",
+  none: "Backups holding them: no listed backup held these files.",
   pending: "Backups holding them: at least one listed backup is still to be removed; the app will try again.",
   "unknown-pending": "Backups holding them: at least one listed backup that may still hold them is still there.",
   deleted: "Backups holding them: none is left that holds them; the app removed each one that did.",
