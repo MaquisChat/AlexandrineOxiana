@@ -244,7 +244,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
    * "Try again" reads it again as well (R605 I2). The panel is a side panel: once the screen's own read is unanswered the
    * screen says the page's sentence in its own place, even where the panel said it first (R641 C2 i).
    */
-  const { page, sentence: pageSentence, retryAll } = usePageHost({
+  const { page, sentence: pageSentence, retryAll, tryAgainRef } = usePageHost({
     sentence: unansweredText,
     out: () => out.current.size > 0 || !projectsRef.current,
     retry: () => {
@@ -1068,7 +1068,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         )}
         {pageSentence !== undefined && (
           <p>
-            <button type="button" onClick={retryAll}>
+            <button type="button" ref={tryAgainRef} onClick={retryAll}>
               Try again
             </button>
           </p>

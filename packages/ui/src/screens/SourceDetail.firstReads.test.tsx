@@ -5,7 +5,7 @@
  * library screen says its one sentence, the panel says none of its own and the page's one "Try again" reads it again too
  * (R602 M1, R605 I2: one sentence and one "Try again" per page).
  */
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
@@ -188,16 +188,21 @@ describe("the source's detail inside the library screen: one sentence and one â€
     render(<Library api={testApi()} current={CURRENT_RW as never} firstReadMs={LIMIT} />);
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "Ethnography at Work" }));
-    // The panel's read is given up first: its own alert, alone on the page.
-    await within(panel()).findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    // The panel's read is given up first: its own alert, alone on the page. Focus is on its "Try again".
+    const panelAgain = await within(panel()).findByRole("button", { name: "Try again" }, { timeout: 5000 });
     expect(alerts()).toEqual([NO_ANSWER]);
+    panelAgain.focus();
     // Then the library's own read of the sources (a search) is given up too.
     searchHangs = true;
-    await user.type(screen.getByRole("searchbox", { name: "Search sources" }), "x");
+    // Typed without taking the focus away from the panel's "Try again".
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search sources" }), { target: { value: "x" } });
+    expect(document.activeElement).toBe(panelAgain);
     await waitFor(() => expect(within(panel()).queryByRole("alert")).toBeNull(), { timeout: 5000 });
     expect(alerts()).toEqual([NO_ANSWER]);
     expect(tryAgains()).toHaveLength(1);
     expect(within(panel()).queryByRole("button", { name: "Try again" })).toBeNull();
+    // R641 second round: the focus that was on the panel's "Try again" is on the page's "Try again", never dropped.
+    expect(document.activeElement).toBe(tryAgains()[0]);
     const said = screen.getByRole("alert");
     expect(said.closest("main")).not.toBeNull();
     // Closing the panel leaves the same alert where it is: the sentence is not said again.

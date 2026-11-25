@@ -910,7 +910,7 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, 
    * While the screen says its one sentence, the panel says none of its own, the sentence covers the panel's read too,
    * and the screen's one "Try again" reads it again as well (R602 M1, R605 I2).
    */
-  const { page, sentence: pageSentence, retryAll } = usePageHost({ sentence: showTryAgain ? ownNoAnswer : undefined, out: () => false, retry: tryAgain }, { panelsOnly: true });
+  const { page, sentence: pageSentence, retryAll, tryAgainRef } = usePageHost({ sentence: showTryAgain ? ownNoAnswer : undefined, out: () => false, retry: tryAgain }, { panelsOnly: true });
   const noAnswerSaid = pageSentence ?? ownNoAnswer;
   const shownScreenError = screenUnreachable && screenError ? noAnswerSaid : screenError;
   const shownProjectsError = projectsUnreachable && projectsError ? noAnswerSaid : projectsError;
@@ -1012,7 +1012,7 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, 
       {/* FR-750 (R579): a read that got no answer (or none in time) is offered again; an answer the screen handles is not. */}
       {showTryAgain && (
         <p>
-          <button type="button" onClick={retryAll}>
+          <button type="button" ref={tryAgainRef} onClick={retryAll}>
             Try again
           </button>
         </p>

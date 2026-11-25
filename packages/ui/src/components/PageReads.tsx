@@ -19,11 +19,12 @@
  * - R641 C2 (i): where the screens inside are SIDE PANELS of the host's own page (a source's detail beside the library's
  *   list), the host's own unanswered read is the page's: the host says the page's sentence and its one "Try again" in
  *   the page's own place, and the panels yield (`panelsOnly`). The sentence then stays there when a panel is closed.
+ *   Focus that was on the panel's "Try again" goes to the page's "Try again" (`handFocus`, `tryAgainRef`): never dropped.
  *
  * A screen shown with no host around it (alone, as in its own tests) is as before: it never yields, and its "Try
  * again" makes its own reads again.
  */
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { oneNoAnswerSentence } from "../api/firstRead";
 
 /** One part of a page's first reads, as it stands now. */
@@ -45,6 +46,8 @@ interface Page {
   /** Who says the page's sentence while `hostShows`: HOST, or the key of the screen whose alert already says it. */
   shower: string | undefined;
   retryAll(): void;
+  /** A screen's "Try again" that had focus goes because the page now says the sentence: the page's button takes focus. */
+  handFocus(): void;
 }
 
 /** The host, as `Page.shower`. */
@@ -62,7 +65,10 @@ export const PageReads = PageContext.Provider;
  * `panelsOnly`: the screens inside are side panels; while the host's own read is unanswered the host says the page's
  * sentence itself, whoever said it before (R641 C2 i).
  */
-export function usePageHost(host: PageRead, opts: { panelsOnly?: boolean } = {}): { page: Page; sentence: string | undefined; screenSays: boolean; retryAll: () => void } {
+export function usePageHost(
+  host: PageRead,
+  opts: { panelsOnly?: boolean } = {},
+): { page: Page; sentence: string | undefined; screenSays: boolean; retryAll: () => void; tryAgainRef: RefObject<HTMLButtonElement | null> } {
   const hostRef = useRef(host);
   hostRef.current = host;
   const parts = useRef(new Map<string, RefObject<PageRead>>());
@@ -102,15 +108,25 @@ export function usePageHost(host: PageRead, opts: { panelsOnly?: boolean } = {})
     else shower = keepers[0] ?? HOST;
   } else shower = Object.keys(said)[0];
   last.current = shower;
-  const page = useMemo<Page>(() => ({ join, leave, say, hostShows, shower, retryAll }), [join, leave, say, hostShows, shower, retryAll]);
-  return { page, sentence: shower === HOST ? pageSentence : undefined, screenSays: hostShows && shower !== HOST, retryAll };
+  // R641 C2 (second round): a screen's "Try again" that held focus was taken away in this commit (its clean-up runs before
+  // the page's layout effects): the page's own "Try again", put there in the same commit, takes the focus.
+  const tryAgainRef = useRef<HTMLButtonElement | null>(null);
+  const takeFocus = useRef(false);
+  const handFocus = useCallback(() => void (takeFocus.current = true), []);
+  useLayoutEffect(() => {
+    if (!takeFocus.current) return;
+    takeFocus.current = false;
+    tryAgainRef.current?.focus();
+  });
+  const page = useMemo<Page>(() => ({ join, leave, say, hostShows, shower, retryAll, handFocus }), [join, leave, say, hostShows, shower, retryAll, handFocus]);
+  return { page, sentence: shower === HOST ? pageSentence : undefined, screenSays: hostShows && shower !== HOST, retryAll, tryAgainRef };
 }
 
 /**
  * For a screen: reports its part to the page around it, if any. `yields`: the host shows the page's one alert, so the
  * screen shows neither its sentence nor its "Try again". `retryAll`: what the screen's own "Try again" calls.
  */
-export function usePageRead(key: string, part: PageRead): { yields: boolean; retryAll: () => void } {
+export function usePageRead(key: string, part: PageRead): { yields: boolean; retryAll: () => void; handFocus: (() => void) | undefined } {
   const page = useContext(PageContext);
   const ref = useRef(part);
   ref.current = part;
@@ -126,5 +142,5 @@ export function usePageRead(key: string, part: PageRead): { yields: boolean; ret
     say?.(key, part.sentence);
   }, [say, key, part.sentence]);
   const own = useCallback(() => ref.current.retry(), []);
-  return { yields: page?.hostShows === true && page.shower !== key, retryAll: page ? page.retryAll : own };
+  return { yields: page?.hostShows === true && page.shower !== key, retryAll: page ? page.retryAll : own, handFocus: page?.handFocus };
 }
