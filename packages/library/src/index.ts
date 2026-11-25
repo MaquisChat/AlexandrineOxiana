@@ -61,7 +61,8 @@ export {
   MOVE_JOURNAL,
   MoveNotAllowedError,
   MoveVerificationError,
-  completeMove,
+  // completeMove is not exported (FR-068, R612 m-C): it resumes any switching journal without the move's judgement; the
+  // app finishes a move through executeMove (stoppedSwitch) and finishMoveAt.
   deleteOldCopy,
   acceptMovePlan,
   executeMove,
