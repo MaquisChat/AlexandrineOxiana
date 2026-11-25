@@ -671,3 +671,24 @@ describe("the queue's entry carries `lookUp` (R566 8)", () => {
     for (const x of await queue(pid)) expect(x).not.toHaveProperty("lookUp");
   });
 });
+
+describe("joined to the fixed engine (R592)", () => {
+  it("point 2 (R585 point 5): a kept time only a wrong clock could have written (years ahead) is offered NOW, and the press sends", async () => {
+    await start();
+    const lib = await libraryWithWaiting(1);
+    const far = new Date(clock + 10 * 365 * 24 * 60 * MIN).toISOString();
+    await patchEntry(lib.pid, lib.sources[0]!, (e) => ({ leftOut: e.leftOut!.map((l) => ({ ...l, notBefore: far })) }));
+    // A fresh client at the same moment: nothing held in memory; the automatic pass's first wait has not passed.
+    await reopen(lib, 0);
+    await svc!.state.idle();
+    expect(sent).toEqual([]);
+    const e = bySource(await queue(lib.pid), lib.sources[0]!);
+    // The engine's `lookUpNow`: the wrong-clock time counts as passed, and is never passed on as the button's time.
+    expect(e.lookUp).toEqual({ state: "waiting", tries: 0, canLookUpNow: true });
+    expect(JSON.stringify(e)).not.toContain(far);
+    answer = () => FOUND;
+    const r = await lookUpAgain(lib.pid, e.id);
+    expect([r.status, r.json.outcome]).toEqual([200, { kind: "found", found: 2 }]);
+    expect(sent).toEqual([`api.openalex.org ${titleOf(1)} Souza`]);
+  });
+});

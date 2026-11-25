@@ -11,6 +11,7 @@ import {
   HeldFileSourceGoneError,
   NotFoundError,
   ReviewEntryDecidedError,
+  lookUpNow,
   lookUpStateOf,
   reviewCauseOf,
   type ListedReviewEntry,
@@ -57,18 +58,15 @@ import { bodyAs, intParam, optObj, paramsOf, projectParam, queryOf, str, strArra
 /**
  * Decision 31 (c) (R566 8, R577 iii): what the page needs to offer "Look up again", from the entry's left-out lookups —
  * the state (the library's `lookUpStateOf`), the tries, whether the researcher's act may send now and, when not yet, the
- * earliest time it may. A lookup may be asked by hand while it has no final answer ("found", "nothing") and its service's
- * named time has passed (the rule of the library's act, `askableByHand`, which is not exported). Never a title or an
- * identifier. Absent when nothing was left out.
+ * earliest time it may. R585 point 5, R592: "may it send now" and its time are the library's `lookUpNow` — the one rule
+ * the act itself applies (a time only a wrong clock could have written counts as passed); the view's own `notBefore` is
+ * never passed on. Never a title or an identifier. Absent when nothing was left out.
  */
 function lookUpOut(e: ListedReviewEntry, now: number): ReviewLookUp | undefined {
   const v = lookUpStateOf(e);
   if (!v) return undefined;
-  const open = (e.leftOut ?? []).filter((l) => l.outcome !== "found" && l.outcome !== "nothing");
-  const at = (l: { notBefore?: string }) => (l.notBefore ? Date.parse(l.notBefore) : Number.NaN);
-  const canLookUpNow = open.some((l) => !(at(l) > now));
-  const later = canLookUpNow ? [] : open.map((l) => l.notBefore!).sort();
-  return { state: v.state, tries: v.tries, canLookUpNow, ...(later.length ? { notBefore: later[0]! } : {}) };
+  const { canLookUpNow, notBefore } = lookUpNow(e, new Date(now));
+  return { state: v.state, tries: v.tries, canLookUpNow, ...(notBefore ? { notBefore } : {}) };
 }
 
 /** What the queue sends of an entry (only pending entries are listed). */
@@ -226,6 +224,8 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
     const listed = (await s.bulk.listProjectReview(projectId, r.done ? { sourceId: r.sourceId } : {})).items.find((e) => e.id === itemId);
     if (!listed) throw new ApiError(409, "CONFLICT", ALREADY_REVIEWED);
     const entry = entryOut(listed, state.now().getTime());
+    // Asked to wait again: the time the act may send from is `lookUpNow`'s (R592), never the view's own.
+    if (outcome.kind === "asked-to-wait" && entry.lookUp?.notBefore) outcome.notBefore = entry.lookUp.notBefore;
     // Not yet: the time is the one the act met (the service's, or the lookup client's own hold of it).
     if (outcome.kind === "not-yet") entry.lookUp = { ...(entry.lookUp ?? { state: "waiting", tries: 0 }), canLookUpNow: false, notBefore: outcome.notBefore };
     state.publishState();
@@ -256,7 +256,8 @@ function lookUpOutcome(r: LookUpAgainResult, itemId: string): ReviewLookUpOutcom
     switch (r.state?.state) {
       case "waiting":
       case "gave-up":
-        return { kind: "asked-to-wait", ...(r.state.notBefore ? { notBefore: r.state.notBefore } : {}) };
+        // Its time is filled in by the route from the entry's `lookUpNow` (R592).
+        return { kind: "asked-to-wait" };
       case "failed":
         return { kind: "failed" };
       default:

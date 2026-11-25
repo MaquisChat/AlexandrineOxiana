@@ -303,3 +303,18 @@ describe("not offered where nothing may be changed", () => {
     expect(screen.queryByText("Tide-line notes")).toBeNull();
   });
 });
+
+describe("joined to the fixed engine (R592)", () => {
+  it("point 2 (R585 point 5): an entry whose kept time only a wrong clock could have written is offered NOW — the button's time is only the service's", async () => {
+    // What the service now sends for such an entry (its `lookUpNow`): may send now, no time. The page has no other time.
+    const item = entry({ lookUp: { state: "waiting", tries: 0, canLookUpNow: true } });
+    const answered = entry({ reasons: [LOOK_UP_AGAIN_TEXT.nothing, UNIDENTIFIED], lookUp: { state: "nothing", tries: 0, canLookUpNow: false } });
+    const { user } = setup(item, [lookUpRoute({ outcome: { kind: "nothing" }, entry: asEntry(answered) })]);
+    await openEntry(user);
+    const b = await screen.findByRole("button", { name: "Look up again" });
+    expect(b.getAttribute("aria-disabled")).toBeNull();
+    expect(screen.queryByRole("button", { name: /\(after / })).toBeNull();
+    await user.click(b);
+    await waitFor(() => expect(lookUpBodies).toEqual([{ itemId: "r1", body: { projectId: P1 } }]));
+  });
+});
