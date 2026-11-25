@@ -431,3 +431,58 @@ describe("the busy state covers the entry, not the screen (R600 m2)", () => {
     await waitFor(() => expect(lookUpBodies).toHaveLength(1));
   });
 });
+
+describe('the "under way" re-reading (R600 m3)', () => {
+  const before = entry({ reasons: [LOOKUP_WAITING_TEXT, UNIDENTIFIED], lookUp: { state: "waiting", tries: 0, canLookUpNow: true } });
+  const later = () => new Date(Date.now() + 60 * 60_000).toISOString();
+  /** The queue read: the opening's read, then `next(n)` for the n-th re-read (1-based). */
+  function reads(next: (n: number) => ReviewItem) {
+    const log = { n: 0 };
+    const route = http.get(`${SERVICE}/projects/:id/review`, () => {
+      log.n++;
+      return HttpResponse.json({ items: [log.n === 1 ? before : next(log.n - 1)], total: 1, offset: 0, limit: 500 });
+    });
+    return { log, route };
+  }
+  function render2(extra: ServiceSetup["extra"]) {
+    lookUpBodies = [];
+    const m = mockService({ batches: [], projectReview: { [P1]: [before] }, sources: { s1: record }, extra });
+    const user = userEvent.setup();
+    const view = render(<ReviewQueue client={m.client} projectId={P1} lookUpRecheckMs={5} />);
+    return { user, view };
+  }
+
+  it("a re-read where only the time changed is not an answer: still busy; the entry whose state changed is shown and said", async () => {
+    const t = later();
+    const { route } = reads((n) => (n < 3 ? { ...before, lookUp: { state: "waiting", tries: 0, canLookUpNow: false, notBefore: t } } : entry({ reasons: [LOOK_UP_AGAIN_TEXT.nothing, UNIDENTIFIED], lookUp: { state: "nothing", tries: 1, canLookUpNow: false } })));
+    const { user } = render2([route, lookUpRoute({ outcome: { kind: "under-way" }, entry: asEntry(before) })]);
+    await openEntry(user);
+    await user.click(await screen.findByRole("button", { name: "Look up again" }));
+    await waitFor(() => expect(within(matches()).getByText("No candidate matches were found.")).toBeTruthy());
+    expect(screen.getAllByRole("status").map((r) => r.textContent)).toContain(LOOK_UP_AGAIN_TEXT.nothing);
+  });
+
+  it("after the thirtieth re-read nothing is said, and the button is as the entry last read says", async () => {
+    const t = later();
+    const { log, route } = reads(() => ({ ...before, lookUp: { state: "waiting", tries: 0, canLookUpNow: false, notBefore: t } }));
+    const { user } = render2([route, lookUpRoute({ outcome: { kind: "under-way" }, entry: asEntry(before) })]);
+    await openEntry(user);
+    await user.click(await screen.findByRole("button", { name: "Look up again" }));
+    const off = await screen.findByRole("button", { name: lookUpAgainAfter(when(t)) });
+    expect(off.getAttribute("aria-busy")).toBeNull();
+    expect(log.n).toBe(31);
+    expect(screen.getAllByRole("status").map((r) => r.textContent).filter(Boolean)).toEqual([]);
+  });
+
+  it("no re-reading outlives the screen", async () => {
+    const { log, route } = reads(() => before);
+    const { user, view } = render2([route, lookUpRoute({ outcome: { kind: "under-way" }, entry: asEntry(before) })]);
+    await openEntry(user);
+    await user.click(await screen.findByRole("button", { name: "Look up again" }));
+    await waitFor(() => expect(log.n).toBeGreaterThanOrEqual(3));
+    view.unmount();
+    const at = log.n;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(log.n).toBeLessThanOrEqual(at + 1);
+  });
+});

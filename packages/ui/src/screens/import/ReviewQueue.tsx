@@ -160,6 +160,8 @@ export interface ReviewQueueProps {
   sourceId?: string;
   /** Entries per page of the project's queue (tests shorten it). */
   pageSize?: number;
+  /** R585 (3): how often an entry another look-up is working on is read again (tests shorten it). */
+  lookUpRecheckMs?: number;
 }
 
 /** Source requests in flight at once (R115 I4). */
@@ -324,7 +326,7 @@ function groupsOf(items: ReviewItem[], batches: BatchSummary[]): Group[] {
   return [...imports.values(), rest.attach, rest.capture, rest["found-file"], rest.withdrawal].filter((g) => g.items.length > 0);
 }
 
-export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = PROJECT_PAGE }: ReviewQueueProps) {
+export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = PROJECT_PAGE, lookUpRecheckMs = LOOK_UP_RECHECK_MS }: ReviewQueueProps) {
   const api = useMemo(() => importApi(client), [client]);
   /** R470 b: a look at a held file reads the file's own ranges (the reader's other calls are never made in a look). */
   const lookFor = useMemo<LookFor>(() => {
@@ -815,14 +817,18 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   };
 
   /**
-   * R585 (3): while another look-up of the entry is under way, the entry is read again every LOOK_UP_RECHECK_MS (at most
-   * LOOK_UP_RECHECKS times) until the queue lists it changed; that entry is shown. Undefined when the view moved on or the
-   * entry left the queue (decided meanwhile: it leaves the view).
+   * R585 (3): while another look-up of the entry is under way, the entry is read again every `lookUpRecheckMs` (at most
+   * LOOK_UP_RECHECKS times) until the queue lists it answered — R600 m3: its reasons, its candidates or its look-up state
+   * changed (a time that only moved is not an answer); that entry is shown. After the last re-read the entry as last read
+   * is shown and nothing is said (the button is as it says). Undefined when the view moved on (the screen left, or the
+   * queue read again) or the entry left the queue (decided meanwhile: it leaves the view).
    */
   const afterUnderWay = async (entry: ReviewItem, g: number): Promise<ReviewItem | undefined> => {
-    const same = JSON.stringify(entry);
+    const answer = (x: ReviewItem) => JSON.stringify([x.reasons, x.candidates ?? [], x.lookUp?.state]);
+    const same = answer(entry);
+    let last = entry;
     for (let i = 0; i < LOOK_UP_RECHECKS; i++) {
-      await new Promise((r) => setTimeout(r, LOOK_UP_RECHECK_MS));
+      await new Promise((r) => setTimeout(r, lookUpRecheckMs));
       if (g !== gen.current) return undefined;
       const page = await api.projectReview(projectId, { source: entry.sourceId!, limit: PROJECT_REVIEW_PAGE_MAX }).catch(() => null);
       if (g !== gen.current) return undefined;
@@ -832,11 +838,13 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         leave([entry.id], (n) => `This entry had already been reviewed, so it left the queue: ${titleFor(entry, n)}`);
         return undefined;
       }
-      if (JSON.stringify(now) !== same) {
+      last = now;
+      if (answer(now) !== same) {
         setItems((cur) => cur && cur.map((x) => (x.id === entry.id ? now : x)));
         return now;
       }
     }
+    if (last !== entry) setItems((cur) => cur && cur.map((x) => (x.id === entry.id ? last : x)));
     return entry;
   };
 
