@@ -14,7 +14,7 @@
  * screen stops reading the stream (the move itself carries on in the service).
  */
 import { useEffect, useId, useRef, useState } from "react";
-import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, MOVE_STOPPED_BEFORE_SWITCH_REASON, moveNotFinishedParts, moveNotFinishedSplitParts, moveStoppedBeforeSwitchParts } from "@ao/shared";
+import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedParts, moveNotFinishedSplitParts, moveStoppedBeforeSwitchOf, moveStoppedBeforeSwitchParts, type OldFolderNotWritable } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { isStreamCutOff, normaliseRoot, type GovernanceApi, type MovePlan, type MoveProgress, type MoveStatus } from "../api/governance";
 import { ConfirmDialog } from "../components/ReasonDialog";
@@ -59,7 +59,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
    * FR-068 (R607 d): the move stopped before the library was switched; the copy made at this new place is not used. Its
    * sentence names the place (through UserText), in place of the generic words.
    */
-  const [stoppedAt, setStoppedAt] = useState<string | null>(null);
+  const [stoppedAt, setStoppedAt] = useState<{ newRoot: string; cause?: OldFolderNotWritable } | null>(null);
   /**
    * R610 (2), R612: the reason of a refusal (the service's POLICY_DENIED: why the library cannot be moved there, e.g. a
    * folder that is not empty, or one holding an earlier move), shown after the message in the same alert, as text.
@@ -82,9 +82,10 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
     if (e.reason === MOVE_NOT_FINISHED_REASON || e.reason === MOVE_NOT_FINISHED_SPLIT_REASON) {
       setErrorText(null);
       setNotFinished({ newRoot, split: e.reason === MOVE_NOT_FINISHED_SPLIT_REASON });
-    } else if (e.reason === MOVE_STOPPED_BEFORE_SWITCH_REASON) {
+    } else if (moveStoppedBeforeSwitchOf(e.reason)) {
+      // R612 m-A: with the cause when the library's old folder could not be written to.
       setError(null);
-      setStoppedAt(newRoot);
+      setStoppedAt({ newRoot, ...moveStoppedBeforeSwitchOf(e.reason) });
     } else if (isRefusal(e)) setRefusal(e);
     else setError(`${e.message} The move stopped; nothing was deleted, and the library stays where it was.`);
     setStage("failed");
@@ -321,7 +322,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
         : null}
       {stoppedAt !== null
         ? (() => {
-            const [before, place, after] = moveStoppedBeforeSwitchParts(stoppedAt);
+            const [before, place, after] = moveStoppedBeforeSwitchParts(stoppedAt.newRoot, stoppedAt.cause);
             return (
               <p role="alert" className="ao-warning">
                 {before}

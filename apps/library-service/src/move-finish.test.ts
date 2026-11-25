@@ -701,6 +701,34 @@ describe("FR-068 (R607 d): the move's answer after it stopped before the library
     expect(lastLine(await move(dest, [kept]))).toEqual(stopped());
   });
 
+  for (const [code, cause, words] of [
+    ["ENOSPC", "disk-full", "the disk is full"],
+    ["EACCES", "permission", "permission was refused"],
+  ] as const) {
+    it(`R612 m-A: the mark could not be written to the old folder (${code}): the sentence names that cause and does not send the researcher to another folder; the library goes on where it was`, async () => {
+      await start();
+      const { path, pid, dest } = await libraryWithSources();
+      moveSeams.fail = { at: "mark-old", code };
+      const expected = {
+        error: {
+          code: "CONFLICT",
+          message: `The move stopped before the library was switched, because the library's old folder could not be written to (${words}). Nothing of the library was deleted, and it stays where it was. The copy made at the new place is not used and can be deleted. Free space or restore access at the library's folder before moving the library again.`,
+          reason: `${MOVE_STOPPED_BEFORE_SWITCH_REASON}-${cause}`,
+        },
+      };
+      const lines = await move(dest);
+      expect(lastLine(lines)).toEqual(expected);
+      expect(JSON.stringify(lines)).not.toContain(tmp);
+      expect(moveStoppedBeforeSwitchText(undefined, cause)).toBe(expected.error.message);
+      expect((await call({ url: "/libraries/move/status" })).json.failed).toEqual({ newRoot: dest, attempt: "a1", ...expected });
+      expect(existsSync(join(path, "MOVED.json"))).toBe(false);
+      expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
+      expect(svc!.state.session!.lib.root).toBe(path);
+      await svc!.state.idle();
+      expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(2);
+    });
+  }
+
   it("every other failure keeps its words: a folder that is not empty; a failure once the old copy is marked", async () => {
     await start();
     const { dest } = await libraryWithSources();

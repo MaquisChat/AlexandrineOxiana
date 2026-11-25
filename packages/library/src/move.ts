@@ -245,7 +245,7 @@ export const moveSeams: {
    * One write of the switch fails as on a full disk (once): the journal's write after step `after`, the marking of the
    * old copy's record as complete, or the removal of the journal (FR-755).
    */
-  fail?: { at: "journal"; after: SwitchStep } | { at: "mark-complete" } | { at: "unlink" } | { at: "split-mark"; afterFolders: number };
+  fail?: { at: "journal"; after: SwitchStep } | { at: "mark-complete" } | { at: "unlink" } | { at: "split-mark"; afterFolders: number } | { at: "mark-old"; code: string };
 } = {};
 /** Throws the seam's simulated "no space left" once, when it names `at` (and `after`: the step, or how many moved folders a split has marked). */
 function failSeam(at: "journal" | "mark-complete" | "unlink" | "split-mark", after?: SwitchStep | number): void {
@@ -1244,6 +1244,12 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
   });
   await ctx.afterMarkOld?.();
   async function markOld(): Promise<void> {
+    // R612 m-A (test seam): the first write of the mark into the old folder fails with this code, before anything is written there.
+    const f = moveSeams.fail;
+    if (f?.at === "mark-old") {
+      moveSeams.fail = undefined;
+      throw Object.assign(new Error(`writing the mark failed (simulated ${f.code})`), { code: f.code });
+    }
     // FR-068 (R607 a): the mark carries the move's id, so that a mark is known to be this move's. Every reader keeps working
     // with marks that lack it (older builds wrote them), and older builds read this one (they need libraryId and movedAt).
     const marker = JSON.stringify({ libraryId: j.libraryId, movedAt: deps.clock().toISOString(), toHint: sw.details.toHint, moveId: sw.moveId }, null, 2);

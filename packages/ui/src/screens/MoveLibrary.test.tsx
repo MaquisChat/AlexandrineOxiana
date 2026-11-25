@@ -167,6 +167,30 @@ describe("Move library", () => {
     expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  for (const [cause, words] of [
+    ["disk-full", "the disk is full"],
+    ["permission", "permission was refused"],
+    ["read-only-disk", "the disk can only be read"],
+  ] as const) {
+    it(`R612 m-A: a move that stopped because the library's old folder could not be written to (${cause}) names the cause and the copy's place, and does not send the researcher to another folder`, async () => {
+      const user = userEvent.setup();
+      server.use(
+        http.post(url("/libraries/move"), () =>
+          new HttpResponse(`${JSON.stringify({ error: { code: "CONFLICT", message: "x", reason: `move-stopped-before-switch-${cause}` } })}\n`, { headers: { "content-type": "application/x-ndjson" } }),
+        ),
+      );
+      const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+      await user.click(within(plan).getByRole("button", { name: "Move library" }));
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toBe(
+        `The move stopped before the library was switched, because the library's old folder could not be written to (${words}). Nothing of the library was deleted, and it stays where it was. The copy made at ${DEST} is not used and can be deleted. Free space or restore access at the library's folder before moving the library again.`,
+      );
+      expect(alert.querySelector("[dir='auto']")?.textContent).toBe(DEST);
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
+      expect(screen.queryByText(/choose another, empty folder/u)).toBeNull();
+    });
+  }
+
   describe("R610 (2), R612: a refusal shows its reason, the sentence the service gives, in the dialog's alert", () => {
     const refusedPlan = (reason: string) => http.post(url("/libraries/move/plan"), () => HttpResponse.json({ error: { code: "POLICY_DENIED", message: "The library cannot be moved there.", reason } }, { status: 403 }));
     for (const [what, reason] of [

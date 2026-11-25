@@ -32,7 +32,7 @@ import {
   type Library,
 } from "@ao/library";
 import type { LibraryFolderRoomRequest, LibraryFolderRoomResponse, LibrarySuggestedFolderResponse } from "@ao/shared";
-import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, MOVE_STOPPED_BEFORE_SWITCH_REASON, moveNotFinishedSplitText, moveNotFinishedText, moveStoppedBeforeSwitchText } from "@ao/shared";
+import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedSplitText, moveNotFinishedText, moveStoppedBeforeSwitchReason, moveStoppedBeforeSwitchText, type OldFolderNotWritable } from "@ao/shared";
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
 import { cheapLocationEnv } from "./watched-folders.js";
@@ -76,6 +76,21 @@ function ndjson(reply: FastifyReply): (value: unknown) => Promise<void> {
 }
 
 const ndjsonError = (ctx: Ctx, err: unknown) => errorBody(toApiError(err), ctx.state.roots);
+
+/**
+ * R612 m-A: a write refused for want of space or permission, by its code or one it wraps, grouped as the move's other
+ * failures are (state.ts, notFinishedKind): ENOSPC, EDQUOT a full disk; EACCES, EPERM refused permission; EROFS a disk
+ * that can only be read. Undefined for any other cause.
+ */
+function oldFolderNotWritable(err: unknown): OldFolderNotWritable | undefined {
+  for (let e: unknown = err, depth = 0; e && typeof e === "object" && depth < 4; e = (e as { cause?: unknown }).cause, depth++) {
+    const code = (e as { code?: unknown }).code;
+    if (code === "ENOSPC" || code === "EDQUOT") return "disk-full";
+    if (code === "EACCES" || code === "EPERM") return "permission";
+    if (code === "EROFS") return "read-only-disk";
+  }
+  return undefined;
+}
 
 function absPath(o: Record<string, unknown>, key: string): string {
   const p = str(o, key, 4096);
@@ -383,9 +398,13 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         // place, this computer's record of it, the old place unmarked and still this library): the library was not
         // switched, and the copy there is not used; a move into that folder is refused from now on. Said in its own
         // sentence (no path: it is recorded), in place of the failure's own words.
+        // R612 m-A: in that state the step that failed is the mark's write into the old folder (nothing else is written
+        // between the switching journal and the mark); for want of space or permission there, the sentence names that
+        // cause, since another folder would only meet the same failure.
         const stopped = await staleMoveCopyAt(state.deps, dest, s.lib.id).catch(() => undefined);
+        const cause = stopped ? oldFolderNotWritable(err) : undefined;
         const body = stopped
-          ? errorBody(new ApiError(409, "CONFLICT", moveStoppedBeforeSwitchText(), MOVE_STOPPED_BEFORE_SWITCH_REASON), state.roots)
+          ? errorBody(new ApiError(409, "CONFLICT", moveStoppedBeforeSwitchText(undefined, cause), moveStoppedBeforeSwitchReason(cause)), state.roots)
           : ndjsonError(ctx, err);
         state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
         await write(body);
