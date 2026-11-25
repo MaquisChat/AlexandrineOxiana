@@ -185,3 +185,13 @@ progress {
   width: 100%;
   accent-color: var(--accent);
 }
+
+/* Text told to a screen reader only (the missing-files check's progress, review M3). */
+.ao-screen .ao-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

@@ -20,6 +20,9 @@ const SKIP_REASON: Record<string, string> = {
   "target-exists": "a different file already sits where it belongs",
 };
 
+/** Review M3: the check's progress is told to a screen reader at most this often (it is shown as it comes). */
+const SAY_PROGRESS_MS = 5_000;
+
 const files = (n: number) => (n === 1 ? "1 file" : `${n.toLocaleString("en-US")} files`);
 
 /** Whether the app runs on Windows (the webview's user agent names it). */
@@ -40,11 +43,28 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
   const [stopped, setStopped] = useState(false);
   const running = useRef<AbortController | null>(null);
   const checkAgainRef = useRef<HTMLButtonElement>(null);
+  /** Review M3: the progress line as last told to a screen reader, and when. */
+  const [said, setSaid] = useState("");
+  const saidAt = useRef(Number.NEGATIVE_INFINITY);
+  const line = progress ? `Checked ${progress.checked.toLocaleString("en-US")} of ${progress.total.toLocaleString("en-US")} files…` : null;
+  useEffect(() => {
+    if (line === null) return;
+    const say = () => {
+      saidAt.current = Date.now();
+      setSaid(line);
+    };
+    const wait = saidAt.current + SAY_PROGRESS_MS - Date.now();
+    if (wait <= 0) return say();
+    const t = setTimeout(say, wait);
+    return () => clearTimeout(t);
+  }, [line]);
 
   const load = useCallback(async () => {
     running.current?.abort();
     const ac = new AbortController();
     running.current = ac;
+    saidAt.current = Number.NEGATIVE_INFINITY;
+    setSaid("");
     setError(null);
     setStopped(false);
     setProgress(null);
@@ -116,8 +136,10 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
           </div>
         ) : progress ? (
           <div className="ao-actions">
-            <p role="status">
-              Checked {progress.checked.toLocaleString("en-US")} of {progress.total.toLocaleString("en-US")} files…
+            {/* Shown as it comes; told to a screen reader by the status below, at most every SAY_PROGRESS_MS (review M3). */}
+            <p>{line}</p>
+            <p role="status" className="ao-visually-hidden">
+              {said}
             </p>
             <button type="button" onClick={stop}>
               Stop

@@ -1,7 +1,7 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { makeApi, server, url, useMsw } from "../test/msw-governance";
 import { MissingFiles } from "./MissingFiles";
 
@@ -130,6 +130,8 @@ describe("Missing files: the check says how far it is, and can be stopped (R641 
     };
   }
   const STOPPED = "The check was stopped. Nothing was changed.";
+  /** The visible progress line only: the status told to a screen reader may carry the same words (review M3). */
+  const SHOWN = { ignore: "script, style, .ao-visually-hidden" };
 
   it("while the files are listed: “Checking the library…”; while they are checked: “Checked {n} of {m} files…” with “Stop”; then the result", async () => {
     const check = ndjsonCheck();
@@ -139,10 +141,10 @@ describe("Missing files: the check says how far it is, and can be stopped (R641 
     await waitFor(() => expect(check.asks).toHaveLength(1));
     expect(check.asks[0]!.accept).toBe("application/x-ndjson");
     check.asks[0]!.send({ progress: { checked: 0, total: 1500 } });
-    expect(await screen.findByText("Checked 0 of 1,500 files…")).toBeTruthy();
+    expect(await screen.findByText("Checked 0 of 1,500 files…", SHOWN)).toBeTruthy();
     expect(screen.queryByText("Checking the library…")).toBeNull();
     check.asks[0]!.send({ progress: { checked: 1204, total: 1500 } });
-    expect(await screen.findByText("Checked 1,204 of 1,500 files…")).toBeTruthy();
+    expect(await screen.findByText("Checked 1,204 of 1,500 files…", SHOWN)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     check.asks[0]!.send({ progress: { checked: 1500, total: 1500 } });
     check.asks[0]!.send({ result: report(["Projects/A/x.pdf"]) });
@@ -216,5 +218,38 @@ describe("Missing files: the check says how far it is, and can be stopped (R641 
     check.asks[1]!.end();
     expect(await screen.findByText("No files are missing.")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+  });
+
+  it("the progress is shown as it comes, but told to a screen reader at most every five seconds; the stopped sentence at once (review M3)", async () => {
+    const check = ndjsonCheck();
+    server.use(check.handler);
+    const said = () => screen.queryAllByRole("status").map((s) => s.textContent);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      render(<MissingFiles api={makeApi()} isWindows={false} />);
+      await vi.waitFor(() => expect(check.asks).toHaveLength(1));
+      check.asks[0]!.send({ progress: { checked: 0, total: 1500 } });
+      // The first line is told at once.
+      await vi.waitFor(() => expect(said()).toContain("Checked 0 of 1,500 files…"));
+      check.asks[0]!.send({ progress: { checked: 250, total: 1500 } });
+      check.asks[0]!.send({ progress: { checked: 500, total: 1500 } });
+      // Shown at once, told not yet.
+      await vi.waitFor(() => expect(screen.getByText("Checked 500 of 1,500 files…", SHOWN)).toBeTruthy());
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(said()).toContain("Checked 0 of 1,500 files…");
+      expect(said().some((t) => t?.includes("500 of"))).toBe(false);
+      // Five seconds after the last telling, the line as it now is.
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(said()).toContain("Checked 500 of 1,500 files…"));
+      check.asks[0]!.send({ progress: { checked: 750, total: 1500 } });
+      await vi.waitFor(() => expect(screen.getByText("Checked 750 of 1,500 files…", SHOWN)).toBeTruthy());
+      expect(said()).toContain("Checked 500 of 1,500 files…");
+      // "Stop": the stopped sentence is told at once.
+      fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+      await vi.waitFor(() => expect(said()).toContain(STOPPED));
+      expect(said().some((t) => t?.startsWith("Checked"))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
