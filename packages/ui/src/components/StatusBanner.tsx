@@ -214,9 +214,11 @@ const PLACE_WARNINGS: Record<string, (n: number, place: string) => string> = {
     `The move of this library to this folder has not finished, and the app did not finish it: ${files(n)} what was checked when the library was copied. The old copy at ${place} still holds every file as it was checked. Both copies are kept as they are, and this library is open read-only.`,
   "move-not-finished-files-differ-old-unconfirmed": (n, place) =>
     `The move of this library to this folder has not finished, and the app did not finish it: ${files(n)} what was checked when the library was copied, and the old copy at ${place} could not be confirmed to hold every file either. Both copies are kept as they are, and this library is open read-only. Ask for help before changing or deleting either copy.`,
-  // R583 M4: the old copy's marks must be looked at and its drive is not connected.
+  // R583 M4: the old copy's marks must be looked at and its drive is not connected. FR-766 (R641 B3): the journal does not
+  // record the mark, so the move may have stopped before the switch (with the drive back, the folder is a leftover) or
+  // marked its old copy unrecorded (then it finishes): the app cannot tell which, and promises no finishing.
   "move-not-finished-old-copy-unreachable": (_n, place) =>
-    `The move of this library to this folder has not finished, and it could not be finished now because its old copy at ${place} cannot be reached. Connect the drive it is on and open the library again; both copies are kept.`,
+    `The app cannot tell whether the move into this folder finished, because ${place} cannot be reached. Connect that drive, then open this folder again.`,
 };
 
 /**

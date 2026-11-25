@@ -413,18 +413,23 @@ async function preflight(lib: Library, destRoot: string, repo?: Repo, checkPendi
  * refuses the folder). Every other refusal is "unfinished" (that move's mark recorded or seen, a mark without a move's
  * id, an unreadable mark, the old place out of reach or holding another library, the record missing): the folder may
  * then hold the library itself.
+ *
+ * FR-760 (1), R641 B1: "occupied" for the library that stayed behind after that very split: the plan refuses it in the
+ * ordinary "not empty" words, and the move never resumes for it.
  */
-async function stoppedSwitch(lib: Pick<Library, "id" | "root" | "appConfigDir">, dest: string, j: Journal): Promise<"resume" | "stale" | "unfinished"> {
+async function stoppedSwitch(lib: Pick<Library, "id" | "root" | "appConfigDir">, dest: string, j: Journal): Promise<"resume" | "stale" | "unfinished" | "occupied"> {
   const sw = j.switch;
   if (j.phase !== "switching" || !sw) return "unfinished";
+  // FR-760 (1), R641 B1: the library that stayed behind after this very split (its id is the one the split made) is not
+  // the library this move moved: the folder is the other library's new place, and to it it holds something like any
+  // other ("not empty"). Resuming here finished the other library's split and answered "done" for a move never made.
+  if (sw.remainingLibraryId !== undefined && lib.id === sw.remainingLibraryId) return "occupied";
   const rec = await getPendingOldCopy({ appConfigDir: lib.appConfigDir, clock: () => new Date() }, sw.pendingId).catch(() => undefined);
   if (!rec || rec.libraryId !== j.libraryId || rec.moveId !== sw.moveId) return "unfinished";
   const recorded = sw.done.includes("mark-old");
   const seen = recorded ? "this-move" : await oldPlaceShows(rec, j);
-  // The old place's library id: the library's own, or, once this very split has marked its old place, the remaining
-  // library's id that this move made there (no other folder can carry it).
   const isOldPlace =
-    (lib.id === j.libraryId || (sw.remainingLibraryId !== undefined && lib.id === sw.remainingLibraryId)) &&
+    lib.id === j.libraryId &&
     (await sameFolder(rec.oldRoot, lib.root)) &&
     (await sameFolder(rec.newRoot, dest));
   if (isOldPlace && seen === "this-move") return "resume";
@@ -1144,7 +1149,10 @@ async function oldCopyShowsMark(rec: PendingOldCopy, j: Journal, unnamed: "id-on
     throw new MoveFinishRefusedError("old-copy-unreachable", "The old copy cannot be reached to see whether it is marked as moved", { oldRoot: rec.oldRoot });
   }
   const sw = j.switch!;
-  const ofThisMove = (p: string) => markOfMove(p, j.libraryId, sw.moveId, unnamed === "id-or-none");
+  // FR-760 (2), R641 B2: a mark without an id counts only where the folder's own record of the move (its journal) agrees
+  // on where that move went: the mark's toHint is the journal's (every build wrote the mark's toHint from it). An older
+  // build's later move to another folder marked the old copy too; that mark is not this move's.
+  const ofThisMove = (p: string) => markOfMove(p, j.libraryId, sw.moveId, unnamed === "id-or-none" ? sw.details.toHint : undefined);
   if (!rec.split) return ofThisMove(join(rec.oldRoot, MOVED_MARKER));
   for (const f of sw.movedFolders) if (await ofThisMove(join(rec.oldRoot, ...f.split("/"), MOVED_MARKER))) return true;
   try {
@@ -1155,11 +1163,14 @@ async function oldCopyShowsMark(rec: PendingOldCopy, j: Journal, unnamed: "id-on
   }
 }
 
-/** The moved marker at `p` names the library `libraryId` and carries the move's id `moveId` (or, with `unnamedCounts`, no move id). */
-async function markOfMove(p: string, libraryId: string, moveId: string, unnamedCounts: boolean): Promise<boolean> {
+/**
+ * The moved marker at `p` names the library `libraryId` and carries the move's id `moveId` (or, with `unnamedTo` given,
+ * no move id and the destination hint `unnamedTo`).
+ */
+async function markOfMove(p: string, libraryId: string, moveId: string, unnamedTo: unknown): Promise<boolean> {
   try {
-    const m = JSON.parse(await fsp.readFile(p, "utf8")) as { libraryId?: unknown; moveId?: unknown };
-    return m.libraryId === libraryId && (m.moveId === undefined ? unnamedCounts : m.moveId === moveId);
+    const m = JSON.parse(await fsp.readFile(p, "utf8")) as { libraryId?: unknown; moveId?: unknown; toHint?: unknown };
+    return m.libraryId === libraryId && (m.moveId === undefined ? unnamedTo !== undefined && m.toHint === unnamedTo : m.moveId === moveId);
   } catch {
     return false;
   }

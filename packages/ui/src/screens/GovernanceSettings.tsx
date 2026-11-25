@@ -15,7 +15,7 @@
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { isMap, isScalar, isSeq, parseDocument, type Document } from "yaml";
-import { GOVERNANCE_UNREADABLE_TEXT, GOVERNANCE_WARNINGS_TEXT, type GovernanceReadability } from "@ao/shared";
+import { GOVERNANCE_UNREADABLE_TEXT, backupsStatusText, GOVERNANCE_WARNINGS_TEXT, type GovernanceReadability } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import type { DestructionCertificate, GovernanceApi, Profile, ProtocolDocument, ProtocolDocumentResult, RetentionDue, Violation } from "../api/governance";
@@ -1231,7 +1231,7 @@ function Retention({ api, projectId, whyId }: { api: GovernanceApi; projectId: s
           <p>
             {cert.certificate.assets.length === 1 ? "1 file destroyed" : `${cert.certificate.assets.length} files destroyed`} on {cert.certificate.at} by <UserText>{cert.certificate.actor}</UserText>.
           </p>
-          <p>Backups holding them: {cert.certificate.backups.status}.</p>
+          <p>{backupsStatusText(cert.certificate.backups.status)}</p>
           <p className="ao-hint">{cert.certificate.notice}</p>
           {cert.certificateFile ? (
             <p>
