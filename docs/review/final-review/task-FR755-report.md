@@ -228,3 +228,109 @@ One caveat: a read-write opening of a place appends that place to `library.json`
   - LibraryChooser.test 24, LibraryChooser.notices 5, Library.test 48, Library.notices 4, dialogs.r145 42, pathFields.shell 5 — all passed.
 - Typecheck: `@ao/shared`, `@ao/library`, `@ao/library-service`, `@ao/cli`, `@ao/ui` clean. `lint:css` and `lint:colours` clean.
 - End to end: `@ao/ui` built, then `maintenance.spec.ts` in Chromium: 3 passed.
+
+---
+
+# Fix round (R583)
+
+Branch `fr-755-move-failure`, seven commits on 9b1a1fa (not pushed); `git status --short` empty, nothing left running.
+
+| commit | finding |
+|---|---|
+| 565e804 | M1: the new place is recognised by what the folder is |
+| 559f62e | M2: an old copy cannot be deleted while its move is unfinished |
+| 25ae942 | I1, M5, M4 (the engine) |
+| d013d1f | I1 (service and page) |
+| 12ed4fd | M5 (service and page) |
+| c1a1285 | M4 (service and page) |
+| 6e33ae2 | the day-long offer runs from the finishing |
+
+The engine's part of I1, M5 and M4 is one commit because it is one function (`finishMoveAt` and its helpers); the service and page parts are one commit per finding.
+
+Each new test was seen to fail before its mend, by restoring the previous file for the run and then putting it back. The engine's new split tests failed partly because the split-marking seam did not exist before. The journal-write split test failed for the real reason: `oldCopyMarked` refused every split.
+
+## I1 — split moves
+- **Failing tests.**
+  - `move-finish.test.ts`, "R583 I1": seven late steps × (the split's sentence; no library open; an attach into a marked project answers 503 LIBRARY_OFFLINE, which was the reviewer's probe that got 200; the new place's opening finishes; both libraries whole). All 7 failed against the old route: DISK_FULL / INTERNAL / the whole-library sentence.
+  - `move.test.ts`, "R583 … split": 5 tests.
+  - `MoveLibrary.test.tsx`, "R583 I1".
+- **Mend.**
+  - `packages/library/src/move.ts:993` `oldCopyMarkedFor(dest, oldRoot, deps)`: the journal's own record of the steps done (`mark-old`). Failing that (the journal's write failed, or a split's marking stopped part-way), what the old copy demonstrably shows: its top's MOVED.json naming the library; for a split, any moved project's MOVED.json naming it, or the old library.json already rewritten as the remaining library (`oldCopyMarked`, `:963`).
+  - `apps/library-service/src/routes/libraries.ts:355`: the route asks it, so any marked project closes the library in the service (R581).
+  - `finishMoveAt` (`move.ts:879`) finishes a split from every such state. The marking is redone under the old copy's lock, which is released as soon as the step is done (`afterMarkOld`, `:1065`). The kept projects are untouched (the engine test compares their folder, audit logs aside: audit-split appends `library.split` there by design).
+  - A split marked part-way is finished only when the moved projects not yet marked are unchanged in the library they came from. Otherwise it is refused (`source-changed`; see M4's words).
+  - Test seam: `moveSeams.fail = { at: "split-mark", afterFolders: n }`.
+- **Sentence (service answer without the path; the dialog with it, through UserText), reason `move-not-finished-split`:** "The move of the projects did not finish, so the library has been closed. Open the new library at its new place, {newRoot}, and the move will be finished then. The library they came from can be opened again for the projects that stayed; nothing is lost."
+
+### A split's states (each a service test unless noted)
+
+| failure | journal on disk | old folder | the new place's opening | the old folder's opening |
+|---|---|---|---|---|
+| after the first moved project's mark | (none) | first project marked; library.json still the original | checks that the unmarked project is unchanged at the old place, marks it and rewrites library.json (old lock), then register…finalize | the remaining library, "Kept" only |
+| after the last project's mark | (none) | all moved projects marked; library.json original | rewrites library.json, then as above | "Kept" only |
+| journal's write after the marking | (none) | marked; library.json rewritten | marks again (idempotent), then as above | "Kept" only |
+| after register | mark-old, register | marked | register, close-source (nothing), audit-split, audit-move, finalize | "Kept" only |
+| after close-source | …, close-source | marked | audit-split, audit-move, finalize | "Kept" only |
+| record's marking complete fails | …, audit-move | marked | register, finalize | "Kept" only |
+| journal's removal fails | …, audit-move (record complete) | marked | register, finalize | "Kept" only |
+| nothing marked yet (engine test) | (none) | unmarked | not finished (undefined): it is still the library | the original library |
+| part-way, the unmarked project changed at the old place (engine test) | (none) | partly marked | refused `source-changed`, nothing written | — |
+
+Remaining risk: in the part-way state, opening the OLD folder before the new one shows the not-yet-marked moved project as its own, and a change to it there then stops the finishing safely, with the "cannot finish" words. Nothing is lost, but that move is then stuck.
+
+## M5 — check again before finishing
+- **Failing tests.**
+  - `move-finish.test.ts`, "R583 M5": a PDF removed by hand at the new place; then a file changed; then put right, which finishes.
+  - `move.test.ts`: the same in the engine, plus the old copy changed too.
+  - `StatusBanner.test.tsx`, "R583 M5".
+- **Mend.**
+  - `move.ts:879`: before anything is written, `notMatching` (`:947`) checks the new place against the move's own verification record (`readVerifiedHashes`, read as the move's verification reads with `sha256File`). Every file must be present with the same content. Two kinds of file are only checked for presence, because the switch's own steps write them: `library.json` (its location history) and the projects' audit logs (audit-move appends). The library's integrity check at opening verifies the audit chains.
+  - A mismatch refuses (`MoveFinishRefusedError("files-differ", { count, oldRoot, oldWhole })`), and the old copy is checked the same way for the words. Its index file and library.json are only checked for presence, because of Minor 3.
+  - Service: `state.ts:152` `notFinishedNote`. The count and the place go into the session warning for the screen only. The log gets `describe(err)`, which carries no path.
+- **Sentences** (banner, the place through UserText):
+  - "The move of this library to this folder has not finished, and the app did not finish it: {n} files here no longer match what was checked when the library was copied. The old copy at {oldRoot} still holds every file as it was checked. Both copies are kept as they are, and this library is open read-only." (n = 1: "1 file here no longer matches").
+  - When the old copy does not match either: "…: {n} files here no longer match what was checked when the library was copied, and the old copy at {oldRoot} could not be confirmed to hold every file either. Both copies are kept as they are, and this library is open read-only. Ask for help before changing or deleting either copy."
+  - "move-finished-at-opening" ("…nothing was lost.") is now said only after a clean check.
+- **Time:** the check reads every moved file once, as the move's verification phase did. Here SHA-256 runs at about 500 MB/s from the page cache (256 MB in 0.51 s). Off a disk it runs at the disk's read speed, for example about 1–2 minutes per 10 GB on a 100–200 MB/s external drive. It runs only when an interrupted move is finished, and the opening's answer waits for it.
+
+## M1 — real paths
+- **Failing test:** `move.test.ts` "R583 M1 … opened by its real path" (it failed; opened by the link it already passed). The hand-made copy at another path is still refused (the existing tests).
+- **Mend:** `move.ts:1020` `sameFolder` compares `fs.realpath.native` of both sides, falling back to the text when a path cannot be resolved. It is used in `completeMove` and `finishMoveAt`. The service keys its shared finishing by real path too (`state.ts`, `finishUnfinishedMove`).
+
+## M2 — unfinished while the journal is there
+- **Failing tests:**
+  - `move.test.ts` "R583 M2" (a failure at the unlink: `movedTo.unfinished` was false; `deleteOldCopy({confirm})` deleted the old copy);
+  - `move-finish.test.ts` "R583 M2" (`moveUnfinishedTo` was undefined).
+- **Mend:**
+  - `old-copies.ts:192` `journalStillAt(rec)`: the journal at `newRoot` names this record.
+  - `movedToFor` (`:185`) counts the move as unfinished then.
+  - `deleteOldCopy` (`move.ts:1327`) refuses (`move-unfinished`), mapped to 409 CONFLICT in the service.
+- **Sentence:** "The move of this library has not finished, so its old copy cannot be deleted yet. Open the library at its new place first; the move is finished then."
+
+## M4 — each sentence true in its case
+- **Failing tests:**
+  - `move-finish.test.ts` "R583 M4": damaged journal, old copy unreachable, newer format (3 failed first); a lock held by another program on this computer.
+  - `move.test.ts` (3);
+  - `StatusBanner.test.tsx`.
+- **Mend:** the engine refusals `journal-damaged`, `old-copy-unreachable` (the old folder cannot be reached when its marks must be looked at; with the mark recorded, the move finishes without the old copy), `newer-format` and `in-use`. `notFinishedNote` maps each to its kind.
+- **Sentences (banner):**
+  - in-use: "The move of this library to this folder has not finished, and it could not be finished now because the library or its old copy is open in another program or on another computer. Close it there; the library is open read-only, both copies are kept, and opening it again will try again."
+  - newer format: "The move of this library to this folder has not finished, and this version of the app cannot finish it: the library was saved by a newer version of the app. Update the app and open the library again; both copies are kept."
+  - damaged journal: "The move of this library to this folder has not finished, and the app cannot finish it: the record of the move kept in this folder is damaged. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy."
+  - old copy unreachable: "The move of this library to this folder has not finished, and it could not be finished now because its old copy at {oldRoot} cannot be reached. Connect the drive it is on and open the library again; both copies are kept."
+  - a split's project changed at the old place: "The move of these projects to this folder has not finished, and the app cannot finish it: some of them were changed in the library they came from after they were copied. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy."
+  - disk full, not writable, and a step failed now end "The library is open read-only, and both copies are kept; opening it again will try again." They no longer say "nothing was lost" before any check.
+- I changed my own earlier tests' expectations of these words: the in-use regex, the disk-full sentence, and the engine's "held by another computer" matcher, which is now `code: "in-use"`.
+- The dialog's sentence after a failed move still promises "the move will be finished then". If the next opening meets one of these cases, its banner says why it was not.
+
+## The day-long offer
+It was a few lines (`old-copies.ts`, `completedAt` set in `markPendingComplete`; `offerFrom` at `:253`), so it is done: the offer runs from the finishing. Test: `move.test.ts` "the old copy's day-long offer … runs from the finishing" (it failed first: expired).
+
+## Runs (each file alone)
+- `@ao/library`: move.test 102; reconnect 54; retention-old-copies 40; device-and-old-copies 18.
+- `@ao/library-service`: move-finish 29; open-library 26; close-during-attach 13; lock-during-change 3; server 160 + 1 skipped; transcription-jobs 40; zotero-sync-scheduler 43; library-audit 11; capture-queues 31; device-notices 17; zotero-sync-routes 43; find-routes 47; fieldwork-governance 23 — all passed.
+- `@ao/ui`: StatusBanner 79; MoveLibrary 29; LibraryChooser 24; LibraryChooser.notices 5; Library 48; Library.notices 4; dialogs.r145 42 — all passed.
+- Typecheck: shared, library, library-service, cli, ui clean. `lint:css` and `lint:colours` clean.
+- End to end: `@ao/ui` built, `maintenance.spec.ts` in Chromium: 3 passed.
+
+Not done, as ruled: M3, M6.
