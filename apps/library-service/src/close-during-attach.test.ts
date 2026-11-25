@@ -14,7 +14,7 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
 import { LIBRARY_CLOSED_TEXT, attachClosedSentence, backupClosedSentence } from "@ao/shared";
 import { KeyRing, deviceDeps, openLibrary, openRepo, type Deps } from "@ao/library";
-import { MockAgent, getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "../../../packages/library/node_modules/undici/index.js";
+import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "../../../packages/library/node_modules/undici/index.js";
 import { seams } from "../../../packages/library/src/repo/testing.js";
 import { backupSeams } from "../../../packages/library/src/export/backup.js";
 import { pendingMarkers } from "../../../packages/library/src/repo/txn.js";
@@ -551,5 +551,66 @@ retention:
     expect(r.json.error).toEqual({ code: "LIBRARY_CLOSED", message: LIBRARY_CLOSED_TEXT });
     expect(await snapshot(path)).toEqual(afterClose);
     expect(afterClose.some((l) => l.includes("/retention/destruction-"))).toBe(false);
+  });
+});
+
+// FR-759 (R600 I2, R30, R50): an encrypted project locked while an attach's metadata lookup is in the air. The lock route
+// purges the lookup client's sensitive answers at once; the late answer lands after it and was kept in memory. Once the
+// attach has ended and the project is no longer unlocked, nothing looked up for it stays in memory.
+describe("FR-759: a lock while an attach's lookup is in the air", () => {
+  const PASS = "correct horse battery staple";
+
+  /** Holds every OpenAlex request until released; the answer then comes from the mock (nothing found). */
+  class Held extends Dispatcher {
+    private gate: Promise<void>;
+    release!: () => void;
+    arrived!: () => void;
+    readonly atGate: Promise<void>;
+    constructor(private readonly inner: Dispatcher) {
+      super();
+      this.gate = new Promise<void>((r) => (this.release = r));
+      this.atGate = new Promise<void>((r) => (this.arrived = r));
+    }
+    override dispatch(opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
+      if (!String(opts.origin).includes("api.openalex.org")) return this.inner.dispatch(opts, handler);
+      this.arrived();
+      void this.gate.then(() => this.inner.dispatch(opts, handler));
+      return true;
+    }
+    override close(): Promise<void> {
+      return this.inner.close();
+    }
+    override destroy(): Promise<void> {
+      return this.inner.destroy();
+    }
+  }
+
+  it("the late answer is not kept in memory once the attach has ended", async () => {
+    const path = join(tmp, "Lib");
+    expect((await call({ method: "POST", url: "/libraries", body: { path, name: "Lib" } })).status).toBe(200);
+    const p = await call({ method: "POST", url: "/projects", body: { name: "Sealed", governanceYaml: LOOKUP_GOV, encryption: { enabled: true, passphrase: PASS } } });
+    expect(p.status, p.body).toBe(200);
+    const pid = p.json.project.id as string;
+    agent
+      .get("https://api.openalex.org")
+      .intercept({ path: (x: string) => x.startsWith("/works"), method: "GET" })
+      .reply(200, JSON.stringify({ meta: { count: 0 }, results: [] }), { headers: { "content-type": "application/json" } })
+      .persist();
+    const held = new Held(agent);
+    onTestFinished(() => held.release());
+    setGlobalDispatcher(held);
+    try {
+      const file = await pdf("sealed-notes.pdf", "Notes from the sealed harbour interviews");
+      const attaching = call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [file] } });
+      await held.atGate;
+      expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+      held.release();
+      await attaching;
+      await svc!.state.idle();
+    } finally {
+      setGlobalDispatcher(agent);
+    }
+    const memory = (svc!.state.session!.http as unknown as { memory: Map<string, { sensitive: boolean }> }).memory;
+    expect([...memory.values()].filter((e) => e.sensitive)).toHaveLength(0);
   });
 });

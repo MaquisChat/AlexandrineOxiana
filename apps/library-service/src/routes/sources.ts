@@ -353,6 +353,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const toSourceId = optStr(b, "toSourceId", 64);
     // FR-749 (R546 2): a close that begins while the files are looked up cancels those not yet written.
     const attach = createAttach({ repo: s.repo, http: s.http, proxies: proxyQueueFor(s.repo), closing: s.closing.signal });
+    // FR-759 (as R600 I2; R30, R50): when the attach ends, its project no longer unlocked, nothing looked up for it stays
+    // in memory (attachFiles itself drops the sensitive answers: forgetSensitiveIfLocked).
     const items = await attach.attachFiles(projectId, paths, toSourceId ? { toSourceId } : {});
     // PDFs without a text layer are offered for OCR by the import flow; attach leaves that choice to the researcher.
     return { items };

@@ -345,7 +345,8 @@ export class ZoteroApi {
    * passing reason (tag colours). Since is held back and nothing is yielded gone by absence.
    */
   lossy = false;
-  private readonly sleep: (ms: number) => Promise<void>;
+  /** The test seam's sleep; without one, `wait` keeps its own timer (cleared at the stop). */
+  private readonly sleep: ((ms: number) => Promise<void>) | undefined;
   private readonly maxRetries: number;
   private readonly maxWait: number;
 
@@ -356,20 +357,40 @@ export class ZoteroApi {
     /** Where back-offs and refused hosts are reported (the adapter's scan result). */
     private readonly result: ZoteroWebScanResult,
   ) {
-    this.sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.sleep = o.sleep;
     this.maxRetries = o.maxRetries ?? MAX_RETRIES;
     this.maxWait = o.maxWaitMs ?? MAX_WAIT_MS;
   }
 
+  /**
+   * FR-764: `sleep(ms)`, ended at once by the sync's stop (it then throws the stop's reason): a stopped sync does not sit
+   * out a retry's wait, and asks nothing after it. The built-in wait's timer is cleared at the stop, so it keeps no
+   * short-lived process (the command-line tool) alive for up to MAX_WAIT_MS after it.
+   */
+  private wait(ms: number): Promise<void> {
+    const signal = this.signal;
+    if (signal.aborted) return Promise.reject(signal.reason);
+    return new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stop = () => {
+        clearTimeout(timer);
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", stop, { once: true });
+      const slept = this.sleep ? this.sleep(ms) : new Promise<void>((r) => (timer = setTimeout(r, ms)));
+      slept.then(resolve, reject).finally(() => signal.removeEventListener("abort", stop));
+    });
+  }
+
   private async waitTurn(): Promise<void> {
     const wait = this.nextAt - Date.now();
-    if (wait > 0) await this.sleep(wait);
+    if (wait > 0) await this.wait(wait);
     this.signal.throwIfAborted();
   }
 
   /** Waits as a retry does after `attempt` failures (1 s, 2 s, 4 s …, capped). */
   async pause(attempt: number): Promise<void> {
-    await this.sleep(this.retryWait(attempt, undefined));
+    await this.wait(this.retryWait(attempt, undefined));
     this.signal.throwIfAborted();
   }
 
@@ -406,6 +427,9 @@ export class ZoteroApi {
   async get(url: URL, withKey: boolean, accept: (s: number) => boolean, extra: Record<string, string> = {}): Promise<Dispatcher.ResponseData> {
     for (let attempt = 0; ; attempt++) {
       if (withKey) await this.waitTurn();
+      // FR-764: right before every request, the storage host's (no turn to wait) included: undici hands a request whose
+      // signal is already aborted to the dispatcher all the same, which opens a connection to the host.
+      this.signal.throwIfAborted();
       let res: Dispatcher.ResponseData | undefined;
       try {
         res = await request(url, {
@@ -419,7 +443,7 @@ export class ZoteroApi {
       } catch (err) {
         if (this.signal.aborted) throw this.signal.reason ?? err;
         if (attempt >= this.maxRetries) throw new ZoteroWebError(ZOTERO_WEB_REASONS.unavailable);
-        await this.sleep(this.retryWait(attempt, undefined));
+        await this.wait(this.retryWait(attempt, undefined));
         continue;
       }
       if (withKey) this.noteBackoff(res.headers);
@@ -428,7 +452,7 @@ export class ZoteroApi {
       const s = res.statusCode;
       if (withKey && (s === 429 || s === 503)) this.askedToWait(retryAfterMs(header(res.headers, "retry-after"), Date.now()));
       if ((s === 429 || s >= 500) && attempt < this.maxRetries) {
-        await this.sleep(this.retryWait(attempt, res.headers));
+        await this.wait(this.retryWait(attempt, res.headers));
         continue;
       }
       if (s === 412) throw new LibraryChanged();
@@ -450,7 +474,7 @@ export class ZoteroApi {
         if (!(err instanceof CutAnswer)) throw err;
         if (this.signal.aborted) throw this.signal.reason ?? err;
         if (attempt >= this.maxRetries) throw new ZoteroWebError(ZOTERO_WEB_REASONS.unavailable);
-        await this.sleep(this.retryWait(attempt, undefined));
+        await this.wait(this.retryWait(attempt, undefined));
       }
     }
   }

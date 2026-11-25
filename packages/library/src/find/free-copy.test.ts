@@ -601,6 +601,15 @@ describe("findFreeCopies: bounds, failures and order", () => {
     expect((await findFreeCopies(ARTICLE, ctx(), ["europepmc"])).failed).toEqual([]);
   });
 
+  it("FR-765: a lookup ended by its caller's stop leaves no note that the service could not be reached", async () => {
+    const ac = new AbortController();
+    ac.abort(new Error("the run was stopped"));
+    const got = await findFreeCopies(ARTICLE, { ...ctx(), signal: ac.signal }, ["openalex", "semanticscholar"]);
+    expect(got.offers).toEqual([]);
+    expect(requests).toEqual([]);
+    expect(notes.filter((n) => n.includes("could not be reached"))).toEqual([]);
+  });
+
   it("a 429 from a source leaves it alone for this call (asked once, no retries)", async () => {
     const http = client({ maxRetries: 3 });
     agent.get("https://api.openalex.org").intercept({ path: `/works/doi:${DOI}`, method: "GET" }).reply(429, "slow down", { headers: { "retry-after": "1" } }).persist();

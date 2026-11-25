@@ -49,6 +49,12 @@ export interface LookupContext {
   askedToWait?: "leave-out";
   /** Decision 31 (c), R585 M2: passed to every request of this context (`GetOptions.onSend`): told when a request leaves. */
   onSend?: () => void;
+  /**
+   * FR-765: the stop of the work this context serves (a Find run: "Stop", a project's lock, a library move, a close).
+   * Passed to every request of this context (`GetOptions.signal`): once it is aborted nothing more is sent for it.
+   * Absent for every other lookup (an attach, "Look up again", an import), which behave as before.
+   */
+  signal?: AbortSignal;
 }
 
 export type Provider = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit";
@@ -56,11 +62,15 @@ export type Provider = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit
 /** True unless the context explicitly says `sensitive: false` (R52, fail-closed). */
 export const isSensitive = (ctx: LookupContext): boolean => ctx.sensitive !== false;
 
-/** The request options every provider passes from its context: sensitivity (R52) and the rule on waits (R556 2). */
-export const requestRules = (ctx: LookupContext): { sensitive: boolean; askedToWait?: "leave-out"; onSend?: () => void } => ({
+/** The context's stop as request options (FR-765): `{ signal }`, or nothing when the context has none. */
+export const stopOf = (ctx: LookupContext): { signal?: AbortSignal } => (ctx.signal ? { signal: ctx.signal } : {});
+
+/** The request options every provider passes from its context: sensitivity (R52), the rule on waits (R556 2), its stop. */
+export const requestRules = (ctx: LookupContext): { sensitive: boolean; askedToWait?: "leave-out"; onSend?: () => void; signal?: AbortSignal } => ({
   sensitive: isSensitive(ctx),
   ...(ctx.askedToWait === "leave-out" ? { askedToWait: "leave-out" as const } : {}),
   ...(ctx.onSend ? { onSend: ctx.onSend } : {}),
+  ...stopOf(ctx),
 });
 
 /** `evaluate({action:'process', process:{op:'metadata_lookup', provider}})`; a deny is a debug note, never an error. */
@@ -82,6 +92,24 @@ export function providerAllowed(ctx: LookupContext, provider: Provider): boolean
     return false;
   }
   return true;
+}
+
+/**
+ * FR-759, FR-767 (as R600 I2; R30, R50): called when work that looked things up for `projectId` ends, whether it
+ * succeeded, failed or was cancelled. The lock route drops the client's sensitive answers at the lock, but an answer
+ * that was in the air then lands after it. So when the project is encrypted and no longer unlocked (or can no longer
+ * be read: removed meanwhile), every sensitive answer is dropped again, and nothing looked up for a locked project
+ * stays in memory. Coarse, as the lock route's purge is: another unlocked project's sensitive answers go too, and are
+ * simply looked up again.
+ */
+export function forgetSensitiveIfLocked(repo: Repo, http: HttpClient, projectId: string): void {
+  let locked: boolean;
+  try {
+    locked = repo.getProject(projectId).encryption.enabled && !repo.isUnlocked(projectId);
+  } catch {
+    locked = true; // the project cannot be read: nothing of it is kept either
+  }
+  if (locked) http.purgeSensitive();
 }
 
 /** The lookup context for one of the repository's projects. Throws NotFoundError for an unknown project. */

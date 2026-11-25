@@ -86,7 +86,7 @@ import {
 } from "@ao/library";
 import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent, IncompleteRollback } from "@ao/shared";
 import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, oldCopiesPendingText } from "@ao/shared";
-import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
+import { AppSettingUnreadableError, forgetSensitiveIfLocked, readDeviceNotices } from "@ao/library";
 
 import { ApiError } from "./errors.js";
 import { heldBy, lookupHeldUntil } from "./look-up-holds.js";
@@ -2290,13 +2290,7 @@ export class ServiceState {
         // R600 I2 (R30, R50): locked while the look-up was in the air — its late answer was kept as sensitive after the
         // lock route's purge: nothing looked up for an encrypted project stays in memory once it is locked.
         const s = this.session;
-        if (s) {
-          try {
-            if (s.repo.getProject(projectId).encryption.enabled && !s.repo.isUnlocked(projectId)) s.http.purgeSensitive();
-          } catch {
-            s.http.purgeSensitive(); // the project cannot be read (removed meanwhile): nothing of it is kept either
-          }
-        }
+        if (s) forgetSensitiveIfLocked(s.repo, s.http, projectId);
       }
     };
     const run = this.lookUpTurn.then(go, go);
