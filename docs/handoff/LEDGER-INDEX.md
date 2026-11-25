@@ -516,3 +516,4 @@ R590 (2026-11-25 UTC): FR-755's second look not approved — a split marked part
 R591 (2026-11-25 UTC): FR-756's first piece begun beside the next build (the opening screen, the library screen's first reads, a limit on the event stream's connecting; branch fr-756-library-first-reads from d0cad89); the other twelve screens wait for it; the Mac job on main 88a6bed passed (run 19)
 R592 (2026-11-25 UTC): "Look up again" — the engine's fix round built (e62d244); six uncertain points ruled; to its second look; the service and the page are joined to it meanwhile by a fresh implementer
 R593 (2026-11-25 UTC): "Look up again" engine approved with small points at its second look; m1 (wording) and m2 (a denied service kept in a lookup that met a wait or a failure) mended now; m3 listed as FR-758
+R594 (2026-11-25 UTC): main 88a6bed — CI run 287 green (71 min); with the Mac job (run 19) both checks of main are green
