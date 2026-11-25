@@ -252,12 +252,13 @@ const looksRight = (i: ReviewItem): boolean => (i as HeldItem).heldFile?.why ===
 const DATE = new Intl.DateTimeFormat("en", { dateStyle: "medium" });
 
 /**
- * Decision 31 (c): the service's named time as the researcher reads times — their own time zone and their own format
- * (the browser's locale, as the pairing screen writes a time), with the date, since the time may be on another day.
+ * Decision 31 (c): the service's named time in the researcher's own time zone, with the date (the time may be on another
+ * day). R600 m5: written like the screen's other dates (`DATE`, in "en"), never in the browser's own language.
  */
+const LOOK_UP_TIME = new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "short" });
 const lookUpTime = (iso: string): string => {
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  return Number.isNaN(d.getTime()) ? iso : LOOK_UP_TIME.format(d);
 };
 
 /**

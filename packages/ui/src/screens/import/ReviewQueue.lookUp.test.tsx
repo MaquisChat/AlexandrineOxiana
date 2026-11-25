@@ -11,7 +11,7 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 import { LOOKUP_WAITING_TEXT, LOOK_UP_AGAIN_TEXT, lookUpAgainAfter, lookUpGaveUpText, type ReviewLookUpAgainResponse } from "@ao/shared";
 import type { Candidate, ReviewItem } from "../../api/import";
 import { BASE as SERVICE, mockService, P1, server, type ServiceSetup } from "../../test/importService";
@@ -35,7 +35,7 @@ const pressPanel = async (user: ReturnType<typeof userEvent.setup>, el: Element)
 const UNIDENTIFIED = "The item could not be identified with enough confidence.";
 const match = (title: string, provider = "openalex"): Candidate => ({ title, creators: [{ family: "Souza", given: "Ana", role: "author" }], type: "article-journal", provider });
 /** The researcher's own time zone and format, as the page writes the service's named time. */
-const when = (iso: string) => new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+const when = (iso: string) => new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "short" }).format(new Date(iso));
 
 const entry = (extra: Partial<ReviewItem> = {}): ReviewItem => ({
   id: "r1",
@@ -484,5 +484,21 @@ describe('the "under way" re-reading (R600 m3)', () => {
     const at = log.n;
     await new Promise((r) => setTimeout(r, 100));
     expect(log.n).toBeLessThanOrEqual(at + 1);
+  });
+});
+
+describe("the button's time (R600 m5)", () => {
+  it("is written like the screen's other dates, whatever the browser's own language", async () => {
+    // A browser in another language: a time written in the browser's own format would read in French.
+    const orig = Date.prototype.toLocaleString;
+    const spy = vi.spyOn(Date.prototype, "toLocaleString").mockImplementation(function (this: Date, locales?: Intl.LocalesArgument, o?: Intl.DateTimeFormatOptions) {
+      return orig.call(this, locales ?? "fr", o);
+    });
+    onTestFinished(() => spy.mockRestore());
+    const notBefore = new Date(Date.now() + 60 * 60_000).toISOString();
+    const { user } = setup(entry({ lookUp: { state: "waiting", tries: 0, canLookUpNow: false, notBefore } }));
+    await openEntry(user);
+    const b = await screen.findByRole("button", { name: /^Look up again \(after / });
+    expect(b.textContent).toBe(`Look up again (after ${when(notBefore)})`);
   });
 });
