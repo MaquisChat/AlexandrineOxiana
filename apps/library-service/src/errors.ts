@@ -199,6 +199,7 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof MoveNotAllowedError) {
     // Changes still being written are a passing conflict, not a rule (R106).
     if (err.code === "pending-writes") return new ApiError(409, "CONFLICT", "Some changes are still being written. Try the move again in a moment.");
+    if (err.code === "move-unfinished") return new ApiError(409, "CONFLICT", err.message);
     return new ApiError(403, "POLICY_DENIED", "The library cannot be moved there.", err.message);
   }
   if (err instanceof InvalidConfirmTokenError) return new ApiError(400, "VALIDATION", "That confirmation is not valid (it is single use and expires).");

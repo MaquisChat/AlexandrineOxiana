@@ -110,6 +110,55 @@ describe("Move library", () => {
     expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it("FR-755: a move that did not finish once the old copy was closed says so in one sentence naming the new place, never that the library stays where it was", async () => {
+    const user = userEvent.setup();
+    const body = { code: "UNAVAILABLE", message: "The move did not finish, so the library has been closed. Open it at its new place, and the move will be finished then; nothing is lost.", reason: "move-not-finished" };
+    server.use(
+      http.post(url("/libraries/move"), () =>
+        new HttpResponse(`${JSON.stringify({ progress: { phase: "switch", filesDone: 120, fileCount: 120, bytesDone: 5, totalBytes: 5 } })}\n${JSON.stringify({ error: body })}\n`, { headers: { "content-type": "application/x-ndjson" } }),
+      ),
+    );
+    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+    await user.click(within(plan).getByRole("button", { name: "Move library" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(`The move did not finish, so the library has been closed. Open it at its new place, ${DEST}, and the move will be finished then; nothing is lost.`);
+    expect(alert.querySelector("bdi, [dir='auto']")?.textContent).toBe(DEST);
+    expect(screen.queryByText(/stays where it was/u)).toBeNull();
+    expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("R583 I1: a split move that did not finish says so for the projects, and that the library they came from opens again", async () => {
+    const user = userEvent.setup();
+    const body = { code: "UNAVAILABLE", message: "x", reason: "move-not-finished-split" };
+    server.use(
+      http.post(url("/libraries/move"), () => new HttpResponse(`${JSON.stringify({ error: body })}\n`, { headers: { "content-type": "application/x-ndjson" } })),
+    );
+    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+    await user.click(within(plan).getByRole("button", { name: "Move library" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      `The move of the projects did not finish, so the library has been closed. Open the new library first, at its new place, ${DEST}: the move will be finished then. Until then the library they came from opens only read-only; after that it opens again for the projects that stayed. Nothing is lost.`,
+    );
+    expect(alert.querySelector("[dir='auto']")?.textContent).toBe(DEST);
+  });
+
+  it("FR-755: the same sentence when the move's answer is read again from move/status after the stream was cut off", async () => {
+    const user = userEvent.setup();
+    let attempt = "";
+    server.use(
+      http.post(url("/libraries/move"), async ({ request }) => {
+        attempt = ((await request.json()) as { attempt: string }).attempt;
+        return new HttpResponse(`${JSON.stringify({ progress: { phase: "switch", filesDone: 1, fileCount: 1, bytesDone: 1, totalBytes: 1 } })}\n`, { headers: { "content-type": "application/x-ndjson" } });
+      }),
+      http.get(url("/libraries/move/status"), () =>
+        HttpResponse.json({ pending: null, running: false, failed: { newRoot: DEST, attempt, error: { code: "UNAVAILABLE", message: "The move did not finish, so the library has been closed. Open it at its new place, and the move will be finished then; nothing is lost.", reason: "move-not-finished" } } }),
+      ),
+    );
+    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+    await user.click(within(plan).getByRole("button", { name: "Move library" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(`The move did not finish, so the library has been closed. Open it at its new place, ${DEST}, and the move will be finished then; nothing is lost.`));
+  });
+
   it("after the stream is cut off, re-fetches the move's token from move/status", async () => {
     const user = userEvent.setup();
     let deleted: any;

@@ -24,11 +24,14 @@ import {
   LibraryClosedError,
   ReadOnlyLibraryError,
   acceptMovePlan,
+  isClosed,
+  oldCopyMarkedFor,
   scrubPaths,
   type IntegritySample,
   type Library,
 } from "@ao/library";
 import type { LibraryFolderRoomRequest, LibraryFolderRoomResponse, LibrarySuggestedFolderResponse } from "@ao/shared";
+import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedSplitText, moveNotFinishedText } from "@ao/shared";
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
 import { cheapLocationEnv } from "./watched-folders.js";
@@ -44,6 +47,10 @@ function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
     name: s.lib.name,
     mode: s.lib.mode,
     ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
+    // FR-755 (R578 (2)): the old copy of a move that has not finished: where to open the library to finish it.
+    ...(s.lib.movedTo?.unfinished ? { moveUnfinishedTo: s.lib.movedTo.newRoot } : {}),
+    // R590 N5: and where the move's journal at the new place is damaged, that the app cannot finish it.
+    ...(s.lib.movedTo?.unfinished && s.lib.movedTo.journalDamaged ? { moveCannotFinish: true } : {}),
     // Only the holding device's name (R118): never its id, process or a user name.
     ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
     // Being rebuilt, failed, or not writable (read-only): absent when the index is ready (D8).
@@ -178,7 +185,10 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     state.roots.add(path);
     await state.closeLibrary();
     if (state.shuttingDown) throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
+    // FR-755 (R578): this computer's own unfinished move into this folder is finished first.
+    const note = await state.finishUnfinishedMove(path);
     const r = await reconnect(path, libraryId, state.deps, { tz: state.tz, onLockLost: () => state.publishState() });
+    if (note) state.noteOpening(r.library, note);
     await state.adopt(r.library);
     return {
       ...libraryView(ctx),
@@ -338,6 +348,27 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
           onProgress: (p) => write({ progress: p }),
         });
       } catch (err) {
+        // FR-755 (R573, R578): failed once the old copy was marked as moved or closed (a later step of the switch: the
+        // journal's write at the destination, the record's marking, the journal's removal). The old library cannot carry
+        // on: it is closed in the service, as by "Close library", and opening the library at its new place finishes the
+        // move. What the move paused waits there, as after a move whose new place could not be opened.
+        // Marked: from the journal's record of the steps done, or what the old copy shows — its top's mark, or for a split
+        // any moved project's mark (R583 I1).
+        if (state.session === s && (isClosed(s.lib) || (await oldCopyMarkedFor(dest, oldRoot, state.deps)))) {
+          state.resumeWhenOpened(dest, paused, oldRoot);
+          await state.closeLibrary();
+          state.moving = false;
+          state.opts.log.warn({ err: state.describe(err) }, "the move did not finish after the old copy was closed");
+          const split = (excludeProjectIds?.length ?? 0) > 0;
+          const body = errorBody(
+            split ? new ApiError(503, "UNAVAILABLE", moveNotFinishedSplitText(), MOVE_NOT_FINISHED_SPLIT_REASON) : new ApiError(503, "UNAVAILABLE", moveNotFinishedText(), MOVE_NOT_FINISHED_REASON),
+            state.roots,
+          );
+          state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
+          await write(body);
+          reply.raw.end();
+          return;
+        }
         // Not moved: the old library carries on as before.
         state.moving = false;
         if (state.session === s) {

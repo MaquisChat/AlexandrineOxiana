@@ -15,7 +15,7 @@ import {
   startHeartbeat,
   type LockInfo,
 } from "./lock.js";
-import { movedToFor } from "./old-copies.js";
+import { movedToFor, unfinishedSplitFrom, type MovedTo } from "./old-copies.js";
 import { registerLibrary } from "./registry.js";
 
 export const FORMAT_VERSION = 1;
@@ -46,7 +46,7 @@ export interface Library {
    * For a `moved` old copy: where it went, from this device's records. `unfinished` means the
    * move's switch did not finish; complete it with `completeMove(newRoot, …)`.
    */
-  movedTo?: { newRoot: string; unfinished: boolean };
+  movedTo?: MovedTo;
   /**
    * With `locked-by-other-device`: the name of the device holding the lock (its hostname from the
    * lock file), when known and plausible. Only the device's name: the lock records no user name.
@@ -121,7 +121,7 @@ export class LibraryMovedError extends Error {
   override name = "LibraryMovedError";
   constructor(
     readonly root: string,
-    readonly movedTo?: { newRoot: string; unfinished: boolean },
+    readonly movedTo?: MovedTo,
     readonly toHint?: string,
   ) {
     super(
@@ -280,6 +280,11 @@ export async function openLibraryInternal(
     const movedTo = await movedToFor(deps, resolve(root), meta.libraryId).catch(() => undefined);
     return readOnly("moved", movedTo);
   }
+  // R590 N1: the old library of this computer's unfinished split (some moved project marked, not all): read-only as moved,
+  // the projects that stayed included, until the new place has finished the move. Then no backup and no change can write
+  // into a moving project the finishing would have to leave behind.
+  const split = await unfinishedSplitFrom(deps, root, meta.libraryId).catch(() => undefined);
+  if (split) return readOnly("moved", split);
   if (!internal.ignoreMoveJournal && (await exists(join(root, MOVE_JOURNAL)))) return readOnly("move-incomplete");
   // Same-process double open: the lock on disk is ours, so the lock rules
   // alone would let a second handle through.

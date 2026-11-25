@@ -53,6 +53,10 @@ export interface CurrentLibrary {
   name: string;
   mode: "read-write" | "read-only";
   readOnlyReason?: ReadOnlyReason | (string & {});
+  /** With "moved": the new place of this old copy's move when that move has not finished (FR-755, R578 (2)). */
+  moveUnfinishedTo?: string;
+  /** With `moveUnfinishedTo`: the record of that move at the new place is damaged, so the app cannot finish it (R590 N5). */
+  moveCannotFinish?: true;
   /** With "locked-by-other-device": the name of the device holding the library (R118; never a user name). */
   lockedBy?: string;
   /** The index when it is not ready (D8). */
@@ -117,6 +121,10 @@ export interface IntegrityWarning {
   state?: IncompleteRollback;
   /** FR-729: kept with the library until dismissed: its id there. */
   keptId?: string;
+  /** R583 M5: for the opening's words about an unfinished move: how many files no longer match. */
+  count?: number;
+  /** R583: the old copy's place (the researcher's own path), for those words. */
+  place?: string;
 }
 
 /** The `library.state` event (LibraryState.libraryState in the service). */
@@ -126,6 +134,8 @@ export interface LibraryState {
   name?: string;
   mode?: CurrentLibrary["mode"];
   readOnlyReason?: CurrentLibrary["readOnlyReason"];
+  moveUnfinishedTo?: CurrentLibrary["moveUnfinishedTo"];
+  moveCannotFinish?: CurrentLibrary["moveCannotFinish"];
   lockedBy?: CurrentLibrary["lockedBy"];
   index?: IndexStatus;
   integrityWarnings?: IntegrityWarning[];

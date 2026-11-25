@@ -22,7 +22,8 @@ import "./library.css";
 export type BannerVariant =
   | { kind: "read-only-locked"; hostname?: string }
   | { kind: "read-only-newer-format" }
-  | { kind: "read-only"; reason?: string }
+  /** `newRoot`: with "moved", the new place of a move that has not finished (FR-755); `cannotFinish`: the app cannot finish it (R590 N5). */
+  | { kind: "read-only"; reason?: string; newRoot?: string; cannotFinish?: true }
   | { kind: "offline"; volume: string }
   /** `total` 0: the rebuild has started but not counted the sources yet. */
   | { kind: "index-rebuilding"; done: number; total: number }
@@ -44,6 +45,8 @@ export type BannerVariant =
       state?: IncompleteRollback;
       /** FR-729: kept with the library until dismissed ("Dismiss"). */
       keptId?: string;
+      /** R583: a place the sentence names (the researcher's own path, shown through UserText). */
+      place?: string;
     }
   /** This computer's own notice (Task 68, R154, R178): fixed words by kind; goes by "Got it". */
   | { kind: "notice"; notice: DeviceNoticeKind };
@@ -96,6 +99,26 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   // Said of the opening (R465 b), so it stays true when a folder added or retried later does run.
   "watched-folders-unreadable": () =>
     "This computer's list of watched folders could not be read when this library was opened, so its watched folders were not started then. Files put in them are not imported until they run. Open the library again to start them all.",
+  // FR-755 (R578): an opening of the library at the new place of this computer's own unfinished move. For this session only.
+  "move-finished-at-opening": () => "The move of this library to this folder had not finished. It was finished when the library was opened here; nothing was lost.",
+  "move-not-finished-disk-full": () =>
+    "The move of this library to this folder has not finished, and it could not be finished now because the disk is full. The library is open read-only, and both copies are kept; opening it again will try again.",
+  "move-not-finished-not-writable": () =>
+    "The move of this library to this folder has not finished, and it could not be finished now because this folder cannot be written to. The library is open read-only, and both copies are kept; opening it again will try again.",
+  // R583 M4: held by another program on this computer or by another computer: words true of both.
+  "move-not-finished-in-use": () =>
+    "The move of this library to this folder has not finished, and it could not be finished now because the library or its old copy is open in another program or on another computer. Close it there; the library is open read-only, both copies are kept, and opening it again will try again.",
+  "move-not-finished-newer-format": () =>
+    "The move of this library to this folder has not finished, and this version of the app cannot finish it: the library was saved by a newer version of the app. Update the app and open the library again; both copies are kept.",
+  "move-cannot-finish-journal-damaged": () =>
+    "The move of this library to this folder has not finished, and the app cannot finish it: the record of the move kept in this folder is damaged. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
+  // R590 N3: a mark the move recorded in its old copy (which keeps that copy from taking changes) was removed by hand.
+  "move-cannot-finish-mark-missing": () =>
+    "The move of this library to this folder has not finished, and the app cannot finish it: a mark the move left in the old copy, which keeps that copy from being changed, was removed outside the app. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
+  "move-cannot-finish-source-changed": () =>
+    "The move of these projects to this folder has not finished, and the app cannot finish it: some of them were changed in the library they came from after they were copied. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
+  "move-not-finished": () =>
+    "The move of this library to this folder has not finished, and it could not be finished now because a step of it failed. The library is open read-only, and both copies are kept; opening it again will try again.",
   "rolled-back-incomplete-write": (p) => `An interrupted change in ${p} was undone when the library opened, so nothing half-saved was kept.`,
   "invalid-txn-marker": (p) => `A note left by an interrupted change in ${p} could not be read. It was kept aside and nothing was changed.`,
   "incomplete-write-pending": (p) => `An interrupted change in ${p} could not be finished or undone yet. It is tried again when the library is next opened with write access.`,
@@ -167,25 +190,45 @@ const CLOSED_UNCONFIRMED = (p: string) =>
 const ROLLBACK_KINDS: ReadonlySet<string> = new Set(["rolled-back-incomplete-write", "incomplete-write-pending"]);
 
 /** The sentence for a warning kind; an unknown kind gets a generic sentence (never the detail). */
-export function warningText(kind: string, project: string, count = 1, state?: IncompleteRollback): string {
+export function warningText(kind: string, project: string, count = 1, state?: IncompleteRollback, place?: string): string {
   // FR-736: an undo that is not complete says its state, in the library's shared sentence.
   if (state && ROLLBACK_KINDS.has(kind) && Object.hasOwn(INCOMPLETE_ROLLBACK_BANNER, state)) return INCOMPLETE_ROLLBACK_BANNER[state](project);
   // R527: a change closed where something stood at the place: never "that file is lost".
   if (kind === "interrupted-change-closed" && state === "unconfirmed") return CLOSED_UNCONFIRMED(project);
+  if (Object.hasOwn(PLACE_WARNINGS, kind)) return PLACE_WARNINGS[kind]!(count, place ?? "its old place");
   const known = Object.hasOwn(WARNINGS, kind) ? WARNINGS[kind] : undefined;
   return known ? known(project, count) : `Something in ${project} needs attention. Open the verification report for details.`;
 }
+
+const files = (n: number) => (n === 1 ? "1 file here no longer matches" : `${n} files here no longer match`);
+/**
+ * R583 (FR-755): the opening's words that name a place — the old copy's, as the researcher chose it — and how many files
+ * no longer match. `n`: the count; `place`: the path (shown through UserText by warningSentence).
+ */
+const PLACE_WARNINGS: Record<string, (n: number, place: string) => string> = {
+  "move-not-finished-files-differ": (n, place) =>
+    `The move of this library to this folder has not finished, and the app did not finish it: ${files(n)} what was checked when the library was copied. The old copy at ${place} still holds every file as it was checked. Both copies are kept as they are, and this library is open read-only.`,
+  "move-not-finished-files-differ-old-unconfirmed": (n, place) =>
+    `The move of this library to this folder has not finished, and the app did not finish it: ${files(n)} what was checked when the library was copied, and the old copy at ${place} could not be confirmed to hold every file either. Both copies are kept as they are, and this library is open read-only. Ask for help before changing or deleting either copy.`,
+  // R583 M4: the old copy's marks must be looked at and its drive is not connected.
+  "move-not-finished-old-copy-unreachable": (_n, place) =>
+    `The move of this library to this folder has not finished, and it could not be finished now because its old copy at ${place} cannot be reached. Connect the drive it is on and open the library again; both copies are kept.`,
+};
 
 /**
  * A warning's sentence with only the project's name laid out by its own direction (FR-158): a right-to-left name at the
  * start of the sentence no longer turns the whole English sentence round. Each place the name stands is isolated.
  * `count`: how many warnings of this kind in this project the sentence stands for (R484 f).
  */
-function warningSentence(kind: string, project: string, count = 1, state?: IncompleteRollback): ReactNode {
+function warningSentence(kind: string, project: string, count = 1, state?: IncompleteRollback, place?: string): ReactNode {
   const mark = "\u0000";
-  return warningText(kind, mark, count, state)
+  const placeMark = "\u0001";
+  return warningText(kind, mark, count, state, place === undefined ? undefined : placeMark)
     .split(mark)
-    .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={i}>{project}</UserText>, part]));
+    .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={`p${i}`}>{project}</UserText>, part]))
+    .flatMap((part, i) =>
+      typeof part === "string" && place !== undefined ? part.split(placeMark).flatMap((bit, k) => (k === 0 ? [bit] : [<UserText key={`l${i}-${k}`}>{place}</UserText>, bit])) : [part],
+    );
 }
 
 /** Kinds the library records once per source folder, shown once per project with their number (R484 f). */
@@ -198,6 +241,12 @@ function text(v: BannerVariant): string {
     case "read-only-newer-format":
       return "Read-only — newer format. This library was saved by a newer version of the app; update the app to make changes.";
     case "read-only":
+      if (v.reason === "moved" && v.newRoot && v.cannotFinish) {
+        return `Read-only — this is the old copy of a library whose move has not finished, and the app cannot finish it: the record of the move kept at its new place, ${v.newRoot}, is damaged. Both copies are kept as they are. Tell the developer before changing or deleting either copy.`;
+      }
+      if (v.reason === "moved" && v.newRoot) {
+        return `Read-only — this is the old copy of a library whose move has not finished. Open the library at its new place, ${v.newRoot}, and the move will be finished then; nothing is lost.`;
+      }
       return `Read-only${v.reason && READ_ONLY_REASONS[v.reason] ? ` — ${READ_ONLY_REASONS[v.reason]}` : ""}. Changes are off.`;
     case "offline":
       return `Offline — reconnecting when ${v.volume} returns. Nothing can be changed until then; nothing is lost.`;
@@ -287,7 +336,7 @@ export function StatusBanner({
   // Project names and service details are user text, shown with dir=auto; in a warning only the project's name (FR-158).
   return (
     <div role="status" className={`ao-banner ao-banner--${TONE[variant.kind]}`}>
-      {variant.kind === "warning" && !variant.oldCopies ? <span>{warningSentence(variant.warning, variant.project, variant.count, variant.state)}</span> : <UserText>{text(variant)}</UserText>}
+      {variant.kind === "warning" && !variant.oldCopies ? <span>{warningSentence(variant.warning, variant.project, variant.count, variant.state, variant.place)}</span> : <UserText>{text(variant)}</UserText>}
       {variant.kind === "warning" && !!variant.oldCopies?.places.length && (
         <ul>
           {variant.oldCopies.places.map((p) => (
@@ -357,13 +406,14 @@ export interface BannerContext {
 }
 
 /** Banners for the library's state, in order: access, index progress, integrity warnings, project warnings. */
-export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyReason" | "integrityWarnings" | "projectWarnings" | "index" | "notices" | "destructionOldCopiesPending">>, ctx: BannerContext = {}): BannerVariant[] {
+export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyReason" | "moveUnfinishedTo" | "moveCannotFinish" | "integrityWarnings" | "projectWarnings" | "index" | "notices" | "destructionOldCopiesPending">>, ctx: BannerContext = {}): BannerVariant[] {
   const out: BannerVariant[] = [];
   if (state.mode === "read-only") {
     const r = state.readOnlyReason;
     if (r === "locked-by-other-device") out.push(ctx.hostname ? { kind: "read-only-locked", hostname: ctx.hostname } : { kind: "read-only-locked" });
     else if (r === "newer-format") out.push({ kind: "read-only-newer-format" });
     else if (r === "offline") out.push({ kind: "offline", volume: ctx.volume ?? "the library's drive" });
+    else if (r === "moved" && state.moveUnfinishedTo) out.push({ kind: "read-only", reason: r, newRoot: state.moveUnfinishedTo, ...(state.moveCannotFinish ? { cannotFinish: true as const } : {}) });
     else out.push(r ? { kind: "read-only", reason: r } : { kind: "read-only" });
   }
   // The library's state says a rebuild runs (D8) even before progress arrives; progress events say how far.
@@ -377,7 +427,16 @@ export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyR
   const grouped = new Map<string, { count: number }>();
   for (const w of state.integrityWarnings ?? ([] as IntegrityWarning[])) {
     if (!PER_PROJECT.has(w.kind)) {
-      out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail, ...(w.state ? { state: w.state } : {}), ...(w.keptId ? { keptId: w.keptId } : {}) });
+      out.push({
+        kind: "warning",
+        warning: w.kind,
+        project: w.project,
+        detail: w.detail,
+        ...(w.state ? { state: w.state } : {}),
+        ...(w.keptId ? { keptId: w.keptId } : {}),
+        ...(w.count !== undefined ? { count: w.count } : {}),
+        ...(w.place !== undefined ? { place: w.place } : {}),
+      });
       continue;
     }
     const key = JSON.stringify([w.projectId, w.kind]);

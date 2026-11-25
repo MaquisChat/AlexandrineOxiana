@@ -41,6 +41,7 @@ export {
   NotALibraryError,
   WrongLibraryError,
   createLibrary,
+  isClosed,
   openLibrary,
 } from "./library.js";
 export type { Library, LibraryJson, OpenOptions } from "./library.js";
@@ -64,6 +65,9 @@ export {
   deleteOldCopy,
   acceptMovePlan,
   executeMove,
+  finishMoveAt,
+  MoveFinishRefusedError,
+  oldCopyMarkedFor,
   listPendingOldCopies,
   listUnfinishedMoves,
   planMove,

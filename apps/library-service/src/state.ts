@@ -4,7 +4,8 @@
  * batches), the media worker, the event bus and the daily backup scheduler (R96 carry-overs).
  * Everything that changes the library goes through `@ao/library`.
  */
-import { resolve as resolvePath } from "node:path";
+import { access, realpath } from "node:fs/promises";
+import { join as joinPath, resolve as resolvePath } from "node:path";
 import { userInfo } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -70,6 +71,12 @@ import {
   type SearchSettings,
   type SearchSettingsRead,
   writeQueueTurn,
+  finishMoveAt,
+  isClosed,
+  MOVE_JOURNAL,
+  MOVED_MARKER,
+  MoveNotAllowedError,
+  MoveFinishRefusedError,
 } from "@ao/library";
 import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent, IncompleteRollback } from "@ao/shared";
 import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, oldCopiesPendingText } from "@ao/shared";
@@ -123,6 +130,49 @@ export const defaultWorkerProvider = (onLog?: (line: string) => void): WorkerPro
 /** The session warning when this computer's watched folders could not be read at open (Rm4). */
 export const WATCHED_FOLDERS_UNREADABLE = "watched-folders-unreadable";
 
+/**
+ * FR-755 (R578): the session warnings of an opening that met this computer's own unfinished move at the library's new
+ * place: finished there, or not finished yet, by the plain cause (the page says each in words; the detail is never shown).
+ */
+export const MOVE_FINISHED_AT_OPENING = "move-finished-at-opening";
+export type MoveNotFinishedKind = "move-not-finished-disk-full" | "move-not-finished-not-writable" | "move-not-finished-in-use" | "move-not-finished";
+
+/**
+ * What an opening tells once (a session warning). `count` and `place` are for the screen only (R583 M5: how many files no
+ * longer match, and the old copy's place, which the researcher chose): never logged or recorded.
+ */
+export interface OpeningNote {
+  kind: string;
+  detail: string;
+  count?: number;
+  place?: string;
+}
+
+/** The note of a failed finishing: its kind by the plain cause, with what its words need. */
+function notFinishedNote(err: unknown, detail: string): OpeningNote {
+  if (err instanceof MoveFinishRefusedError && err.kind === "files-differ") {
+    return { kind: err.detail.oldWhole ? "move-not-finished-files-differ" : "move-not-finished-files-differ-old-unconfirmed", detail, count: err.detail.count ?? 0, place: err.detail.oldRoot ?? "" };
+  }
+  // R583 M4: what the app cannot finish, or not now, each in its own words.
+  if (err instanceof MoveFinishRefusedError && err.kind === "old-copy-unreachable") return { kind: "move-not-finished-old-copy-unreachable", detail, place: err.detail.oldRoot ?? "" };
+  if (err instanceof MoveFinishRefusedError && err.kind === "journal-damaged") return { kind: "move-cannot-finish-journal-damaged", detail };
+  if (err instanceof MoveFinishRefusedError && err.kind === "source-changed") return { kind: "move-cannot-finish-source-changed", detail };
+  // R590 N3: a mark the move recorded in its old copy was removed by hand.
+  if (err instanceof MoveFinishRefusedError && err.kind === "mark-missing") return { kind: "move-cannot-finish-mark-missing", detail };
+  if (err instanceof MoveNotAllowedError && err.code === "newer-format") return { kind: "move-not-finished-newer-format", detail };
+  return { kind: notFinishedKind(err), detail };
+}
+
+/** The plain cause of a failed finishing, as the kind of its session warning. */
+function notFinishedKind(err: unknown): MoveNotFinishedKind {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code === "ENOSPC" || code === "EDQUOT") return "move-not-finished-disk-full";
+  if (code === "EACCES" || code === "EPERM" || code === "EROFS" || (err instanceof MoveNotAllowedError && err.code === "read-only")) return "move-not-finished-not-writable";
+  if (err instanceof MoveNotAllowedError && (err.code === "old-copy-in-use" || err.code === "in-use")) return "move-not-finished-in-use";
+  return "move-not-finished";
+}
+const exists = (p: string) => access(p).then(() => true, () => false);
+
 export interface Session {
   lib: Library;
   repo: Repo;
@@ -155,7 +205,7 @@ export interface Session {
    * Warnings for this session only, shown with the library's integrity warnings (Task 68 fix round 2,
    * Rm4): e.g. this computer's watched folders could not be read at open, so none run now.
    */
-  sessionWarnings?: Array<{ kind: string; detail: string }>;
+  sessionWarnings?: OpeningNote[];
   /** FR-720: the start of the watches that did not start at open, under way after the list could be read again. */
   watchRestart?: Promise<void>;
   /** R508 M3: each project's start of its watches under way (the opening's or a restart's): one per project at a time. */
@@ -322,8 +372,56 @@ export class ServiceState {
   /** Opens a library folder (honours the shutdown gate before and after the lock is taken). */
   async openLibrary(root: string): Promise<Library> {
     if (this.shuttingDown) throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
+    const note = await this.finishUnfinishedMove(root);
     const open = this.opts.openLibrary ?? openLibrary;
-    return open(root, this.deps, { onLockLost: () => this.publishState() });
+    const lib = await open(root, this.deps, { onLockLost: () => this.publishState() });
+    if (note) this.noteOpening(lib, note);
+    return lib;
+  }
+
+  /** What an opening of a library found to tell once, by the handle it opened (taken up by `adopt`). */
+  private readonly openingNotes = new WeakMap<Library, OpeningNote>();
+  /** The finishing of an unfinished move under way, by folder: a second opening of the same folder waits for it. */
+  private readonly finishing = new Map<string, Promise<OpeningNote | undefined>>();
+
+  /** `note` is shown with the library opened as `lib`, for that session only (FR-755). */
+  noteOpening(lib: Library, note: OpeningNote): void {
+    this.openingNotes.set(lib, note);
+  }
+
+  /**
+   * FR-755 (R578): before a folder is opened (the open route, reconnect, the reopening at start), finishes this computer's
+   * own move into it whose switch did not finish (the engine's finishMoveAt: only at the place its record names, once the
+   * old copy is marked; otherwise it writes nothing). Says what to tell the researcher: finished, or not finished yet and
+   * why; nothing when there was no such move. Never throws: a failed finishing leaves the folder to open read-only as
+   * before. Two openings of one folder at once share one finishing; the second has nothing more to tell.
+   */
+  async finishUnfinishedMove(root: string): Promise<OpeningNote | undefined> {
+    // By what the folder is (R583 M1): an opening through a link and one by the real path share the finishing.
+    const key = await realpath(root).catch(() => resolvePath(root));
+    const running = this.finishing.get(key);
+    if (running) {
+      await running;
+      return undefined;
+    }
+    const run = (async () => {
+      if (!(await exists(joinPath(key, MOVE_JOURNAL))) || (await exists(joinPath(key, MOVED_MARKER)))) return undefined;
+      try {
+        const done = await finishMoveAt(key, this.deps, { tz: this.tz, actor: actor() });
+        if (!done) return undefined;
+        this.opts.log.info({}, "an unfinished move was finished at the library's new place");
+        return { kind: MOVE_FINISHED_AT_OPENING, detail: "" };
+      } catch (err) {
+        this.opts.log.warn({ err: this.describe(err) }, "an unfinished move could not be finished at the library's new place");
+        return notFinishedNote(err, this.describe(err));
+      }
+    })();
+    this.finishing.set(key, run);
+    try {
+      return await run;
+    } finally {
+      this.finishing.delete(key);
+    }
   }
 
   // ---- the work registry (R106 C1) -----------------------------------------------------
@@ -657,6 +755,9 @@ export class ServiceState {
   requireSession(): Session {
     const s = this.session;
     if (!s) throw new ApiError(503, "LIBRARY_OFFLINE", "No library is open.");
+    // R573 Minor 2: once a move has closed the old copy (its library and its index), until the service has switched to
+    // the new place, a read is refused as every change is, rather than meeting the closed index.
+    if (this.moving && (isClosed(s.lib) || s.index?.isOpen === false)) this.assertNotMoving();
     if (s.lib.mode === "read-only" && s.lib.readOnlyReason === "offline") throw new ApiError(503, "LIBRARY_OFFLINE", "The library's folder is not reachable.", "offline");
     return s;
   }
@@ -745,6 +846,11 @@ export class ServiceState {
     if (opts.stillWanted && !opts.stillWanted()) {
       index?.close();
       return unwanted();
+    }
+    const note = this.openingNotes.get(lib);
+    if (note) {
+      this.openingNotes.delete(lib);
+      s.sessionWarnings = [...(s.sessionWarnings ?? []), note];
     }
     this.session = s;
     this.notFound = undefined;
@@ -1736,6 +1842,9 @@ export class ServiceState {
       name: s.lib.name,
       mode: s.lib.mode,
       ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
+      ...(s.lib.movedTo?.unfinished ? { moveUnfinishedTo: s.lib.movedTo.newRoot } : {}),
+      // R590 N5: the move's journal at the new place is damaged: the app cannot finish that move.
+      ...(s.lib.movedTo?.unfinished && s.lib.movedTo.journalDamaged ? { moveCannotFinish: true } : {}),
       ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
       ...(s.indexStatus ? { index: s.indexStatus } : {}),
       integrityWarnings: this.integrityWarnings(s, names),
@@ -1809,7 +1918,7 @@ export class ServiceState {
   integrityWarnings(
     s: Session,
     names = new Map(s.repo.listProjects().map((p) => [p.id, p.name])),
-  ): Array<{ projectId: string; project: string; kind: string; detail: string; state?: IncompleteRollback; keptId?: string }> {
+  ): Array<{ projectId: string; project: string; kind: string; detail: string; state?: IncompleteRollback; keptId?: string; count?: number; place?: string }> {
     return [
       ...s.repo.integrityWarnings.map((w) => ({
         projectId: w.projectId,
@@ -1821,7 +1930,15 @@ export class ServiceState {
         // FR-729: kept with the library until dismissed (POST /libraries/recovery-warnings/:id/dismiss).
         ...(w.keptId ? { keptId: w.keptId } : {}),
       })),
-      ...(s.sessionWarnings ?? []).map((w) => ({ projectId: "*", project: "library", kind: w.kind, detail: scrubPaths(w.detail, this.roots) })),
+      ...(s.sessionWarnings ?? []).map((w) => ({
+        projectId: "*",
+        project: "library",
+        kind: w.kind,
+        detail: scrubPaths(w.detail, this.roots),
+        ...(w.count !== undefined ? { count: w.count } : {}),
+        // The old copy's place, for its sentence on the screen (R583 M5): the researcher's own path, shown as theirs.
+        ...(w.place !== undefined ? { place: w.place } : {}),
+      })),
     ];
   }
 
