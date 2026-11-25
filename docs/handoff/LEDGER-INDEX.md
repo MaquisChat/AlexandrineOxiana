@@ -540,3 +540,4 @@ R614 (2026-11-25 UTC): the join's full verification N14 — all green but two Ch
 R615 (2026-11-25 UTC): container restarted ~05:56 UTC during N14c; nothing on disk lost; the join pushed to the reader branch as a safeguard (403f0f8, no build request); N14c started again
 R616 (2026-11-25 UTC): N14c green (228 of 228); build request 13 pushed (reader 2f4a00c, 06:35 UTC); CI 288/289 and Mac run 20 running; the owner's page has part 13; FR-756's other screens at their second look, FR-068's mend round started
 R617 (2026-11-25 UTC): FR-756's other screens approved with small points at the second look and merged on kg-join (for the build after 13); the remainder task begins on fr-756-remainder
+R618 (2026-11-25 UTC): Mac build 13 exists and passed all checks (run 20; dmg SHA-256 cc6d1f09…0288; scenario Q 2 of 2); it replaces build 12; the owner's page updated

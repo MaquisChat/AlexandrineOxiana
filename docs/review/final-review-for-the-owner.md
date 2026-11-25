@@ -2,7 +2,7 @@
 
 *Updated 24 November 2026, 7 pm Central: MAC BUILD 12 EXISTS — GitHub gave the build a Mac this time and every check passed, the test of Quit among them. Part 12 says where to download it. It replaces build 10.*
 
-*Updated 25 November 2026, just after midnight Central: part 13, at the end, is new — the move fix, the screens that no longer wait for ever (the first five), and "Look up again" are built, reviewed, tested together and pushed as build request 13. It asks whether I may merge. Start there.*
+*Updated 25 November 2026, just after midnight Central: part 13, at the end, is new — the move fix, the screens that no longer wait for ever (the first five), and "Look up again" are built, reviewed, tested together and pushed as build request 13. **Mac build 13 exists and replaces build 12** (part 13 says where). It asks whether I may merge. Start there.*
 
 *Updated 24 November 2026, evening: part 12, at the end, is new — closing the library safely (FR-749) and your decision 31 (b) are built, reviewed, tested together and pushed as build request 12; it has four small choices for "Look up again" and asks whether I may merge. Start there.*
 
@@ -183,7 +183,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 
 ## 4. Things only you can check
 
-*Use Mac build 12 for these (part 12 says where to download it). Note your findings beside each box.*
+*Use Mac build 13 for these (part 13 says where to download it). Note your findings beside each box.*
 
 ### Installing and opening the app on your Mac
 
@@ -383,7 +383,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 Everything built up to 23 November is on `main`, checked by GitHub and on a Mac. The rough-edge fixes of 24 November are in Mac build 10 and, by your word, on `main` too (part 10). What is left is yours. In the order I would do it:
 
-- [ ] **1. Install Mac build 12** (part 12 says where: run 18's download). It replaces builds 8, 9 and 10: build 9 mended the optional tools' downloads, build 10 added the rough-edge fixes, and build 12 adds the known gaps, the safe closing of the library and attaching without the wait.
+- [ ] **1. Install Mac build 13** (part 13 says where: run 20's download). It replaces builds 8, 9, 10 and 12: build 9 mended the optional tools' downloads, build 10 added the rough-edge fixes, build 12 added the known gaps, the safe closing of the library and attaching without the wait, and build 13 adds the move fix, the screens that no longer wait for ever, and "Look up again".
 - [ ] **2. Undo the import that stopped when the disk filled, then import again** with enough free space, or with "leave the files where they are".
 - [ ] **3. Work through the hands-on checklist in part 4** (51 boxes, about ten areas). Tell me what you find, in any form; a sentence per problem is enough. Three areas matter most because nothing but your Mac can test them: "Get through my library" (the sign-in window), watched cloud folders, and the macOS prompts.
 - [ ] **4. Answer the decisions.** There are 30 (28, 29 and 30 are new, in part 10); two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26), part 8 (27) and part 10 (28–30).
@@ -619,7 +619,7 @@ After the merge you asked for, two more pieces are built. The first mends an old
 
 - **Tested together on my side:** every step passes. The first full run caught two faults of the close work, and both were mended before anything was pushed (they are in the list of what was caught, below); the second full run passed everything except one of 224 browser scenarios, which failed once in one browser for a cause that is older than this work and is now understood (FR-750, under "Still open").
 - **GitHub's own check passed** (24 November, 7:40 pm Central): https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45520284119
-- **Mac build 12 exists, and it is the build to use now** (it replaces build 10; there never was a build 11). Run 18 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45520284023 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon`, unzip it and open the `.dmg` inside. Its SHA-256 is `5c418d3874c28ccc6edaa28cb36d5bca7e6883769b35aeee4a5308274b9e7b44`. GitHub gave the job a Mac this time, after five refusals during the day. Every check of the build passed: the app starts from the disk image and its helpers start, answer and stop; every ready-made library inside the media helper is the pinned version (56 of 56); and, for the first time on a Mac, **the test of Quit ran and passed**: a quit sent as a system request closed the app the orderly way twice, and when closing was slowed the window "Closing Alexandrine Oxiana" appeared after two seconds.
+- **Mac build 12 exists** *(since 25 November, 12:50 am Central, Mac build 13 replaces it: part 13)* — it was the build to use (it replaces build 10; there never was a build 11). Run 18 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45520284023 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon`, unzip it and open the `.dmg` inside. Its SHA-256 is `5c418d3874c28ccc6edaa28cb36d5bca7e6883769b35aeee4a5308274b9e7b44`. GitHub gave the job a Mac this time, after five refusals during the day. Every check of the build passed: the app starts from the disk image and its helpers start, answer and stop; every ready-made library inside the media helper is the pinned version (56 of 56); and, for the first time on a Mac, **the test of Quit ran and passed**: a quit sent as a system request closed the app the orderly way twice, and when closing was slowed the window "Closing Alexandrine Oxiana" appeared after two seconds.
 - **It is in `main`** (the approved version) since 24 November, about 7:50 pm Central: you said "merge when ready", and I merged once GitHub's check was green. The app's code in `main` is, file for file, the code Mac build 12 was made from.
 
 ### What you will notice
@@ -715,7 +715,7 @@ After build 12, three more pieces were built for the next Mac build (build reque
 - **Tested together on my side:** every step passes: the tests of every part, the service, the Mac shell's own tests, a Linux build, the app started and quit, and 228 of 228 browser scenarios. The first full run had two of those scenarios fail. I read both before believing them: the test harness had opened the next page while the page before was between two of its own readings. Nothing in the app was at fault; I mended the harness, and the whole browser step was run again and passed.
 - **Pushed as build request 13** at 12:35 am Central on 25 November.
 - **GitHub's own check** is running: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45557680438 (the same code) and https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45561718000 (the build request itself, which waits behind the first). I will say here and in the chat when they are in.
-- **The Mac build** is running; GitHub gave it a Mac at once: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45561718089 — when it is done, the download and its SHA-256 go here, and build 13 replaces build 12. Until then build 12 is the build to use.
+- **Mac build 13 exists, and it is the build to use now** (it replaces build 12). Run 20 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45561718089 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon` (you must be signed in to GitHub). The disk image's SHA-256 is `cc6d1f090860486c8706511a2a6b396cc99c0f6a32253f0022cf2059d7250288`. GitHub's Mac built it at 12:36 am Central on 25 November and ran every check on it: the app starts from the disk image, its helpers start and stop cleanly, Quit by a system request goes the orderly way (2 of 2 runs), and nothing is left running.
 - **It is not in `main`** until you say so. **May I merge it when GitHub's check is green?** A yes in the chat is enough.
 
 ### What you will notice
