@@ -151,6 +151,15 @@ async function auditOf(p: { folder: string }): Promise<{ events: AuditEvent[]; b
   for (const f of (await readdir(dir)).sort()) bytes += await readFile(join(dir, f), "utf8");
   return { events: bytes.split("\n").filter(Boolean).map((l) => JSON.parse(l) as AuditEvent), bytes };
 }
+/** The send lines on disk now, read synchronously — called from the stand-in's reply, as the request arrives. */
+function sendLinesNow(p: { folder: string }): AuditEvent[] {
+  const dir = join(lib.root, p.folder, "audit");
+  return readdirSync(dir)
+    .sort()
+    .flatMap((f) => readFileSync(join(dir, f), "utf8").split("\n").filter(Boolean))
+    .map((l) => JSON.parse(l) as AuditEvent)
+    .filter((x) => x.details?.op === LOOK_SEND_OP);
+}
 async function sourceJson(p: { id: string }, sourceId: string): Promise<Buffer> {
   const sf = await repo.getSource(p.id, sourceId);
   const dir = join(lib.root, ...sf.source.folder.split("/"));
@@ -533,10 +542,19 @@ describe("closing, audit and sealing (R247 c, R546, R566 6, R55)", () => {
     const [e] = await attached(p, http, [buildDoiPdf()]);
     const titles = e!.leftOut!.map((l) => l.title).filter((t): t is string => !!t);
     now += 16 * MIN;
-    answers["api.crossref.org"] = () => ({ statusCode: 200, data: fixture("crossref-work.json") });
-    answers["api.openalex.org"] = () => SEARCH;
+    // R585 M6: each request, as it arrives, finds its service's send line already on disk.
+    const onDisk: string[][] = [];
+    answers["api.crossref.org"] = () => {
+      onDisk.push(sendLinesNow(p).map((x) => (x.details!.services as string[]).join()));
+      return { statusCode: 200, data: fixture("crossref-work.json") };
+    };
+    answers["api.openalex.org"] = () => {
+      onDisk.push(sendLinesNow(p).map((x) => (x.details!.services as string[]).join()));
+      return SEARCH;
+    };
     const r = await lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) });
     expect(r).toMatchObject({ done: true });
+    expect(onDisk).toEqual([["crossref"], ["crossref", "openalex"]]);
     const { events, bytes } = await auditOf(p);
     expect(bytes).not.toContain(FIXTURE_DOI);
     expect(bytes.toLowerCase()).not.toContain(FIXTURE_DOI.toLowerCase());
@@ -703,16 +721,6 @@ describe("decision 31 (c), R585 I1: two look-ups of one entry", () => {
 });
 
 describe("decision 31 (c), R585 M8: the send is audited per service, through the unchanged authorizeOnly", () => {
-  /** The send lines on disk now, read synchronously — called from the stand-in's reply, as the request arrives. */
-  const sendLinesNow = (p: { folder: string }) => {
-    const dir = join(lib.root, p.folder, "audit");
-    const lines = readdirSync(dir)
-      .sort()
-      .flatMap((f) => readFileSync(join(dir, f), "utf8").split("\n").filter(Boolean))
-      .map((l) => JSON.parse(l) as AuditEvent);
-    return lines.filter((x) => x.details?.op === LOOK_SEND_OP);
-  };
-
   it("two services asked: two send lines, each on disk BEFORE its own service's request leaves, each with that service's own decision", async () => {
     const p = await project();
     const http = client();
@@ -927,5 +935,28 @@ describe("decision 31 (c), R585 M3: the sentences in mixes; only the app's own a
     now += 2 * MIN;
     expect(await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true, state: { state: "gave-up", tries: 5 } });
     expect((await entry(p, e!.id)).reasons[0]).toBe(lookUpGaveUpText(5));
+  });
+});
+
+describe("decision 31 (c), R585 M6: only the part of a chain that was left out is asked", () => {
+  it("a DOI lookup of which only OpenAlex was left out (Crossref had answered): the look-up asks OpenAlex alone; Crossref receives 0 requests", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.crossref.org"] = () => WAIT_60;
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [buildDoiPdf()]);
+    // Only part of the chain left out, as an attach writes it when Crossref answered and OpenAlex asked to wait. (Set by
+    // hand: a Crossref answer at the attach would sit in the lookup cache and hide a request made in error.)
+    const at = e!.leftOut!.findIndex((l) => l.identifier);
+    await patch(p, e!, { leftOut: e!.leftOut!.map((l, i) => (i === at ? { ...l, services: ["openalex"] } : l)) });
+    now += 16 * MIN;
+    sent = [];
+    answers["api.crossref.org"] = () => ({ statusCode: 200, data: fixture("crossref-work.json") });
+    answers["api.openalex.org"] = (path) => (path.includes("search") ? NO_RESULTS : { statusCode: 200, data: fixture("openalex-work.json") });
+    // a fresh client (as after reopening): Crossref's earlier answer is not in its memory, so a request would show
+    const r = await lookUpAgain(repo, client(), p.id, e!.id, { by: "automatic", now: new Date(now) });
+    expect(r).toMatchObject({ done: true, services: ["openalex"] });
+    expect(to("api.crossref.org")).toBe(0);
+    expect(sent.filter((s) => s.startsWith("api.openalex.org/works/doi"))).toHaveLength(1);
   });
 });
