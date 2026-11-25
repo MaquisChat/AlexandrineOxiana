@@ -175,7 +175,7 @@ function LibraryFlow({ client, loc, firstReadMs }: { client: ApiClient; loc: App
               it opens here as soon as it is ready. You can choose another library meanwhile.
             </p>
           )}
-          <LibraryChooser api={api} onOpened={opened} onNotFound={(library) => setView({ kind: "not-found", library })} />
+          <LibraryChooser api={api} firstReadMs={firstReadMs} onOpened={opened} onNotFound={(library) => setView({ kind: "not-found", library })} />
         </>
       );
     case "not-found":
