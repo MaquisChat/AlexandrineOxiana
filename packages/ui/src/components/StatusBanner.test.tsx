@@ -114,7 +114,8 @@ describe("StatusBanner", () => {
   });
 
   it.each([
-    ["backup-failed", /last automatic backup of Dissertation failed/],
+    // Review M6: the button is on the project's Governance screen, and the sentence names it so.
+    ["backup-failed", /^The last automatic backup of Dissertation failed\. Your sources are unchanged; the backup is tried again tomorrow, or make one now with “Back up now” on the project's Governance screen\.$/],
     ["deleted-records-unreadable", /record of deleted items in Dissertation could not be read/],
     ["annotations-unreadable", /annotations in Dissertation could not be read/],
     ["destroy-incomplete", /destruction of raw data in Dissertation did not finish/],
