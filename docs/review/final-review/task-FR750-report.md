@@ -159,3 +159,63 @@ The only new words are the button's "Try again", which other screens already use
 - **The helper's change reaches every spec.** `libraryWithProject` is used by many specs; only the four spec files above were run with the change.
 - **A long-lived request other than the event stream** (an NDJSON stream left open) would make `gotoWhenQuiet` time out with its own message. None was seen.
 - **"Try again" pressed while the other read is still within its limit** reads only what has settled. If the other read then fails, the button stays; it does not loop.
+
+## After the review (R586)
+
+Three mends were made on the same branch, which now has its head at d0cad89. The review's M1, M2, M6 and M7 were left alone, as ruled.
+
+### M5 — two sentences (1614452)
+
+There are now two sentences, declared next to each other in `packages/ui/src/api/client.ts`:
+
+- **"The library service did not answer in time."** This is the new sentence, `SERVICE_NO_ANSWER`. It is shown where a read was given up at the time limit. `readWithin` now rejects with `noAnswerInTime()`.
+- **"The library service could not be reached."** This stays for a read that failed with a network error.
+
+Both still come with "Try again" (`isUnreachable` checks the code, `UNAVAILABLE`). This applies on the Find, Watched folders and Zotero screens.
+
+Tests:
+- The hung-read tests on all three screens now expect the new sentence.
+- The failed-read tests still expect the old one.
+- The Find test "an abandoned read answering late" now goes further. After the late answer, nothing has changed and only 1 projects read was made. A press then reads again (2 reads) and the screen fills.
+- These tests failed first because the sentence was different.
+
+### M3 — the Find screen's collections read (b13ff15)
+
+- A collections read that gets no answer, or none in time, now shows the usual alert with "Try again". The alert is said once, as with the other first reads. Before, it ended silently as "(none)".
+- "Try again" reads the collections again, together with the other first reads (`collectionsTry`).
+- While the read has failed, the collections stay unread rather than becoming an empty list. The remembered collection is chosen once a read answers.
+- A refusal the screen already handles, such as a locked project, still leaves the list empty, with no alert.
+- Test: the collections read hangs on its own, while the projects and settings answer. The alert and "Try again" appear, and no PUT is sent. The press makes one more collections read and none of the others. The Collection box then shows the remembered collection.
+- This test failed first: there was no "Try again".
+
+### M4 — the end-to-end helper's message (d0cad89)
+
+- If the page before never finishes its requests, `gotoWhenQuiet` now fails with "The page before still had requests to the service out after 30 seconds: GET /path; …". It gives each request's method and path, never its query.
+- The sentence is built in `e2e/quiet.ts`.
+- It is checked by `e2e/quiet.spec.ts`, which needs no app or browser. This test failed first because the module was missing. It passes in about 8 ms.
+- This adds one scenario per browser to the full end-to-end count.
+
+### Runs
+
+Each was run alone.
+
+Unit tests:
+- `FindAcquire.test.tsx`: 227 passed.
+- `WatchedFolders.test.tsx`: 61 passed.
+- `ZoteroSync.test.tsx`: 56 passed.
+- `dialogs.r145.test.tsx`: 42 passed.
+- `SearchSources.test.tsx`: 34 passed.
+- `api/client.test.ts`: 39 passed.
+- `api/library.test.ts`: 10 passed.
+- `App.test.tsx`: 16 passed.
+
+Checks:
+- Typecheck, `lint:css` and `lint:colours` are clean.
+- The end-to-end `tsc` is clean.
+- The interface was built.
+
+End-to-end, Chromium: `find.spec.ts` with `quiet.spec.ts`, 7 passed.
+
+### Wording
+
+The only new sentence a researcher can see is "The library service did not answer in time.". The new collections alert reuses one of the two existing sentences.
