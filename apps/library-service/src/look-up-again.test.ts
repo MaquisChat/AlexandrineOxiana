@@ -1093,4 +1093,32 @@ describe("second look (R608)", () => {
     const sid = repo.listSourceIds(lib.pid).find((x) => !lib.sources.includes(x))!;
     expect(bySource(await queue(lib.pid), sid).reasons[0]).toBe(LOOKUP_WAITING_TEXT);
   });
+
+  it("n3: the pass skips, unread and uncounted, an entry whose every due lookup's every service is held; an entry with an un-held service is still taken", { timeout: 180_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(51);
+    // The last entry has a second lookup, of a DOI at Crossref (not held).
+    const last = lib.sources[50]!;
+    await patchEntry(lib.pid, last, (e) => ({ leftOut: [e.leftOut![0]!, { ...e.leftOut![0]!, identifier: "doi:10.5555/free.1", services: ["crossref"] }] }));
+    answer = () => NO_RESULTS;
+    // Opened a minute later: nothing is due yet; then OpenAlex is held for an hour and the entries come due.
+    await reopen(lib, MIN);
+    await svc!.state.idle();
+    expect(sent).toEqual([]);
+    svc!.state.session!.http.holdUntil("api.openalex.org", Date.now() + 60 * MIN);
+    clock += 16 * MIN;
+    // Every entry the pass takes goes through its turn (and the engine's `lookUpAgain`, which reads the whole queue).
+    const state = svc!.state as unknown as { lookUpInTurn: (p: string, e: string, fn: () => Promise<unknown>) => Promise<unknown> };
+    const taken: string[] = [];
+    const orig = state.lookUpInTurn.bind(svc!.state);
+    state.lookUpInTurn = (p, e, fn) => (taken.push(e), orig(p, e, fn));
+    onTestFinished(() => void (state.lookUpInTurn = orig));
+    // What the timer does on its tick.
+    svc!.state.startLookUpAgain();
+    await svc!.state.idle();
+    const lastId = bySource(await queue(lib.pid), last).id as string;
+    expect(taken).toEqual([lastId]);
+    expect(sent.filter((x) => x.startsWith("api.openalex.org"))).toEqual([]);
+    expect(sent.filter((x) => x.startsWith("api.crossref.org"))).toHaveLength(1);
+  });
 });

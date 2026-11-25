@@ -10,12 +10,10 @@ import {
   FindRunnerClosedError,
   HeldFileSourceGoneError,
   NotFoundError,
-  PROVIDER_HOSTS,
   ReviewEntryDecidedError,
   lookUpNow,
   lookUpStateOf,
   reviewCauseOf,
-  type HttpClient,
   type ListedReviewEntry,
   type LookUpAgainResult,
   type LookUpState,
@@ -55,16 +53,9 @@ import {
   type WithdrawalReviewedResponse,
 } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
+import { heldBy, lookupHeldUntil, type HeldUntil } from "../look-up-holds.js";
 import { bodyAs, intParam, optObj, optStr, paramsOf, projectParam, queryOf, str, strArray, type BodyOf, type Ctx, type Same } from "./util.js";
 
-/** Per service, until when (ms) the session's lookup client holds it, or undefined (R411). */
-type HeldUntil = (service: string) => number | undefined;
-const heldBy =
-  (http: HttpClient): HeldUntil =>
-  (service) => {
-    const host = (PROVIDER_HOSTS as Record<string, string>)[service];
-    return host ? http.heldUntil(host) : undefined;
-  };
 
 /**
  * Decision 31 (c) (R566 8, R577 iii): what the page needs to offer "Look up again", from the entry's left-out lookups —
@@ -84,10 +75,7 @@ function lookUpOut(e: ListedReviewEntry, now: number, held: HeldUntil): ReviewLo
   const left = e.leftOut ?? [];
   if (canLookUpNow) {
     const askable = left.filter((l) => lookUpNow({ leftOut: [l] }, at).canLookUpNow);
-    const holds = askable.map((l) => {
-      const hs = l.services.map(held);
-      return hs.length > 0 && hs.every((h) => h !== undefined) ? Math.max(...(hs as number[])) : undefined;
-    });
+    const holds = askable.map((l) => lookupHeldUntil(l, held));
     if (holds.every((h) => h !== undefined)) {
       const rest = lookUpNow({ leftOut: left.filter((l) => !askable.includes(l)) }, at).notBefore;
       canLookUpNow = false;

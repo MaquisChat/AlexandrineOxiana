@@ -40,6 +40,7 @@ import {
   type PendingRemoval,
   type BatchHandle,
   type BulkImport,
+  type ListedReviewEntry,
   type Deps,
   type FolderWatch,
   type BatchResult,
@@ -81,6 +82,7 @@ import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, oldCopiesPendingText } from "@a
 import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
 
 import { ApiError } from "./errors.js";
+import { heldBy, lookupHeldUntil } from "./look-up-holds.js";
 import { EventBus } from "./events.js";
 import { MediaTickets } from "./media.js";
 import { ZoteroSyncHolder } from "./routes/zotero-sync.js";
@@ -2075,8 +2077,12 @@ export class ServiceState {
         this.opts.log.warn({ err: this.describe(err) }, "looking up again: the review queue could not be read");
         continue;
       }
+      // R608 n3: while the client holds a service, the entries' lookups are read once for the project, and an entry whose
+      // every due lookup's every service is held is skipped without being taken (no queue read, nothing counted).
+      const held = due.length ? await this.heldEntries(s, p.id) : undefined;
       for (const d of due) {
         if (taken >= LOOK_UP_AGAIN_PASS_MAX || stop()) return taken;
+        if (held?.(d.entryId)) continue;
         let r: LookUpAgainResult;
         try {
           r = await this.lookUpInTurn(p.id, d.entryId, () => lookUpAgain(s.repo, s.http, p.id, d.entryId, { by: "automatic", closing: s.closing.signal, now: this.opts.now() }));
@@ -2098,6 +2104,33 @@ export class ServiceState {
       }
     }
     return taken;
+  }
+
+  /**
+   * R608 n3: when the session's lookup client holds some service, whether the pass skips an entry of this project: every
+   * service of every one of its due lookups is held (the one rule the queue's `lookUp` applies, `lookupHeldUntil`). The
+   * project's entries are read once for the whole pass of it, not once per entry. The due lookups are taken as the
+   * asked-to-wait lookups with no outcome (the only ones the pass may take): when each of those waits for a hold, the
+   * engine would answer "not due". Undefined when no service is held, or the entries cannot be read (nothing is skipped).
+   */
+  private async heldEntries(s: Session, projectId: string): Promise<((entryId: string) => boolean) | undefined> {
+    if (!s.bulk || !Object.values(PROVIDER_HOSTS).some((h) => s.http.heldUntil(h) !== undefined)) return undefined;
+    let items: ListedReviewEntry[];
+    try {
+      items = (await s.bulk.listProjectReview(projectId)).items;
+    } catch {
+      return undefined;
+    }
+    const held = heldBy(s.http);
+    const skipped = new Set(
+      items
+        .filter((e) => {
+          const due = (e.leftOut ?? []).filter((l) => l.why !== "failed" && !l.outcome);
+          return due.length > 0 && due.every((l) => lookupHeldUntil(l, held) !== undefined);
+        })
+        .map((e) => e.id),
+    );
+    return (entryId) => skipped.has(entryId);
   }
 
   /**
