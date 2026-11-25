@@ -345,7 +345,8 @@ export class ZoteroApi {
    * passing reason (tag colours). Since is held back and nothing is yielded gone by absence.
    */
   lossy = false;
-  private readonly sleep: (ms: number) => Promise<void>;
+  /** The test seam's sleep; without one, `wait` keeps its own timer (cleared at the stop). */
+  private readonly sleep: ((ms: number) => Promise<void>) | undefined;
   private readonly maxRetries: number;
   private readonly maxWait: number;
 
@@ -356,22 +357,28 @@ export class ZoteroApi {
     /** Where back-offs and refused hosts are reported (the adapter's scan result). */
     private readonly result: ZoteroWebScanResult,
   ) {
-    this.sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.sleep = o.sleep;
     this.maxRetries = o.maxRetries ?? MAX_RETRIES;
     this.maxWait = o.maxWaitMs ?? MAX_WAIT_MS;
   }
 
   /**
    * FR-764: `sleep(ms)`, ended at once by the sync's stop (it then throws the stop's reason): a stopped sync does not sit
-   * out a retry's wait, and asks nothing after it.
+   * out a retry's wait, and asks nothing after it. The built-in wait's timer is cleared at the stop, so it keeps no
+   * short-lived process (the command-line tool) alive for up to MAX_WAIT_MS after it.
    */
   private wait(ms: number): Promise<void> {
     const signal = this.signal;
     if (signal.aborted) return Promise.reject(signal.reason);
     return new Promise<void>((resolve, reject) => {
-      const stop = () => reject(signal.reason);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stop = () => {
+        clearTimeout(timer);
+        reject(signal.reason);
+      };
       signal.addEventListener("abort", stop, { once: true });
-      this.sleep(ms).then(resolve, reject).finally(() => signal.removeEventListener("abort", stop));
+      const slept = this.sleep ? this.sleep(ms) : new Promise<void>((r) => (timer = setTimeout(r, ms)));
+      slept.then(resolve, reject).finally(() => signal.removeEventListener("abort", stop));
     });
   }
 

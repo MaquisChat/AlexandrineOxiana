@@ -561,7 +561,8 @@ export async function findFreeCopies(
     } catch (e) {
       const why =
         e instanceof Throttled ? "it asked the app to slow down (left alone for now)" : e instanceof BadAnswer ? "its answer was not of the expected shape" : e instanceof LookupHttpError && e.status ? `HTTP ${e.status}` : "it could not be reached";
-      ctx.debug?.(`free copy via ${s} skipped: ${why}`);
+      // FR-765: a lookup ended by the caller's stop was not unreachable, so it leaves no such note.
+      if (!ctx.signal?.aborted) ctx.debug?.(`free copy via ${s} skipped: ${why}`);
       failedSet.add(s);
       const wait = e instanceof Throttled ? e.retryAfter : e instanceof LookupHttpError ? e.retryAfter : undefined;
       if (wait !== undefined) retryAfter.push(wait);

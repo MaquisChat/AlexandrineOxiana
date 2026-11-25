@@ -2332,12 +2332,34 @@ describe("FR-764: a stopped sync asks the storage host nothing more", () => {
     return `/users/42/items/A${key}/file`;
   }
 
-  async function scanWith(net: Dispatcher, signal: AbortSignal, sleep: (ms: number) => Promise<void>): Promise<void> {
+  async function scanWith(net: Dispatcher, signal: AbortSignal, sleep: ((ms: number) => Promise<void>) | undefined): Promise<void> {
     const work = join(tmp, "work");
     await mkdir(work, { recursive: true, mode: 0o700 });
-    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: net, sleep });
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: net, ...(sleep ? { sleep } : {}) });
     for await (const _ of a.scan(signal, { workDir: async () => work })) void _;
   }
+
+  it("a sync stopped during the wait before a storage retry leaves no timer behind (the built-in wait)", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await serveOneFile("TIMER64");
+    agent.get(STORAGE).intercept({ path: "/signed/TIMER64?sig=1", method: "GET" }).reply(503, "busy").persist();
+    const net = new Watched(agent);
+    const ac = new AbortController();
+    const reason = new Error("the sync was stopped");
+    const run = scanWith(net, ac.signal, undefined).then(
+      () => "finished",
+      (e: unknown) => e,
+    );
+    // The storage host answered 503: the retry's wait (a timer) is pending.
+    await vi.waitFor(() => {
+      expect(net.storage).toBe(1);
+      expect(vi.getTimerCount()).toBe(1);
+    });
+    ac.abort(reason);
+    expect(await run).toBe(reason);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(net.storage).toBe(1);
+  });
 
   it("a sync stopped during the wait before a storage retry ends there, and the storage host is not asked again", async () => {
     await serveOneFile("WAIT64");
