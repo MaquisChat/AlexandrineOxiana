@@ -353,7 +353,18 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const toSourceId = optStr(b, "toSourceId", 64);
     // FR-749 (R546 2): a close that begins while the files are looked up cancels those not yet written.
     const attach = createAttach({ repo: s.repo, http: s.http, proxies: proxyQueueFor(s.repo), closing: s.closing.signal });
-    const items = await attach.attachFiles(projectId, paths, toSourceId ? { toSourceId } : {});
+    let items: Awaited<ReturnType<typeof attach.attachFiles>>;
+    try {
+      items = await attach.attachFiles(projectId, paths, toSourceId ? { toSourceId } : {});
+    } finally {
+      // FR-759 (as R600 I2; R30, R50): locked while a lookup of the attach was in the air — its late answer was kept as
+      // sensitive after the lock route's purge: nothing looked up for an encrypted project stays in memory once locked.
+      try {
+        if (s.repo.getProject(projectId).encryption.enabled && !s.repo.isUnlocked(projectId)) s.http.purgeSensitive();
+      } catch {
+        s.http.purgeSensitive(); // the project cannot be read (removed meanwhile): nothing of it is kept either
+      }
+    }
     // PDFs without a text layer are offered for OCR by the import flow; attach leaves that choice to the researcher.
     return { items };
   });
