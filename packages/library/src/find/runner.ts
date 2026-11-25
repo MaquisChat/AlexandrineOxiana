@@ -864,6 +864,12 @@ interface Run {
   stopped: boolean;
   stopSignal: Promise<void>;
   signalStop: () => void;
+  /**
+   * FR-765: aborted (with Abandoned) together with `stopSignal`, for this generation of the run: the stop its lookups
+   * carry (`LookupContext.signal`), so that a stop, a lock, a move or a close ends every lookup of the run in the air —
+   * its waits cut, no retry, redirect hop or request made. The shared lookup client is not halted: other projects use it.
+   */
+  halted: AbortSignal;
   pending: string[];
   timers: Map<string, unknown>;
   /** When this project was last given a place (fairness: the one served longest ago goes first). */
@@ -1103,10 +1109,19 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     fileOutcomes.delete(keyOfRun(pid, eid));
   }
 
+  /** A generation's stop: the promise the runner races its awaits against, and the signal its lookups carry (FR-765). */
+  function stopOfGeneration(): Pick<Run, "stopSignal" | "signalStop" | "halted"> {
+    let resolve!: () => void;
+    const stopSignal = new Promise<void>((r) => (resolve = r));
+    const ac = new AbortController();
+    const signalStop = () => {
+      resolve();
+      if (!ac.signal.aborted) ac.abort(new Abandoned());
+    };
+    return { stopSignal, signalStop, halted: ac.signal };
+  }
   function freshRun(): Run {
-    let signalStop!: () => void;
-    const stopSignal = new Promise<void>((r) => (signalStop = r));
-    return { gen: 0, stopped: false, stopSignal, signalStop, pending: [], timers: new Map(), served: -1, adoptable: new Map() };
+    return { gen: 0, stopped: false, ...stopOfGeneration(), pending: [], timers: new Map(), served: -1, adoptable: new Map() };
   }
   function runOf(pid: string): Run {
     let r = runs.get(pid);
@@ -1717,7 +1732,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
       return;
     }
 
-    const ctx = await guard(r, lookupContextFor(repo, pid, http, deps.debug ? { debug } : {}));
+    // FR-765: every lookup of this entry carries the run's stop (`live()` below: still this generation's).
+    const ctx: LookupContext = { ...(await guard(r, lookupContextFor(repo, pid, http, deps.debug ? { debug } : {}))), signal: r.halted };
     if (!live()) return;
     if (!ctx.policy) {
       // Rules that cannot be read: nothing is asked, and nothing can be written (the queue is governed too).
@@ -2135,7 +2151,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
         return;
       }
     }
-    const ctx = await guard(r, lookupContextFor(repo, pid, http, deps.debug ? { debug } : {}));
+    // FR-765: every lookup of this entry carries the run's stop (`live()` below: still this generation's).
+    const ctx: LookupContext = { ...(await guard(r, lookupContextFor(repo, pid, http, deps.debug ? { debug } : {}))), signal: r.halted };
     if (!live()) return;
     if (!ctx.policy) {
       block(pid, "rules-unreadable");
@@ -2183,7 +2200,8 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     const email = typeof s.unpaywallEmail === "string" && s.unpaywallEmail ? s.unpaywallEmail : undefined;
     let found: Awaited<ReturnType<typeof findFreeCopies>>;
     try {
-      // findFreeCopies takes no signal and never rejects: bounded here by the runner's own limit (R254 c).
+      // findFreeCopies never rejects: bounded here by the runner's own limit (R254 c); the run's stop goes with its
+      // requests through the context (FR-765).
       found = await guard(r, findFreeCopies(workOfSource(sf), ctx, sources, email), FIND_LOOKUP_TIMEOUT_MS);
     } catch (err) {
       if (err instanceof TimedOut) {
@@ -2758,9 +2776,7 @@ export function createFindRunner(deps: FindRunnerDeps): FindRunner {
     const r = runOf(projectId);
     r.signalStop(); // the previous generation's work is let go at once
     r.gen++;
-    let signalStop!: () => void;
-    r.stopSignal = new Promise<void>((res) => (signalStop = res));
-    r.signalStop = signalStop;
+    Object.assign(r, stopOfGeneration());
     r.stopped = false;
     r.adoptable = new Map();
     const gen = r.gen;

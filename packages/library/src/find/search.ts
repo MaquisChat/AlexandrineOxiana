@@ -30,7 +30,7 @@
  */
 import { createHash } from "node:crypto";
 import { normalizeTitle, titleSimilarity, type Creator } from "@ao/core";
-import { isSensitive, providerAllowed, type LookupContext, type LookupResult } from "../lookup/context.js";
+import { isSensitive, providerAllowed, stopOf, type LookupContext, type LookupResult } from "../lookup/context.js";
 import { mapCrossref } from "../lookup/crossref.js";
 import { LookupHttpError, retryAfterMs, type GetOptions, type HttpClient, type RateLimitAnswer } from "../lookup/http.js";
 import { mapOpenAlex } from "../lookup/openalex.js";
@@ -324,7 +324,8 @@ export async function fetchItems(ctx: LookupContext, url: string, opts: GetOptio
     got.items = pick(json);
     if (!got.items) throw new BadAnswer();
   };
-  const body = await ctx.http.getText(url, { ...opts, validate: check });
+  // FR-765: the context's stop (a Find run's) goes with every request.
+  const body = await ctx.http.getText(url, { ...opts, ...stopOf(ctx), validate: check });
   if (body === null) return null;
   if (!got.items) check(body); // served from the memory cache: validated when it was stored
   return got.items;

@@ -10,7 +10,7 @@ import { Dispatcher, MockAgent, getGlobalDispatcher, setGlobalDispatcher } from 
 import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { activeTemp } from "../tmp-registry.js";
 import { FIND_HELD_MAX, holdMismatchedFile, readReviewEntries, resolveHeldFile } from "../repo/review.js";
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
 import { KeyRing } from "../crypto/keys.js";
@@ -24,7 +24,7 @@ import { addCapturedOriginal, recoveryPendingProjects, repoLibrary, type Repo } 
 import type { RepoCore } from "../repo/state.js";
 import { SimulatedCrash, openTestRepo, seams } from "../repo/testing.js";
 import { parseReference } from "./reference.js";
-import { decideMatch, scoreCandidate, searchWorks } from "./search.js";
+import { decideMatch, openAlexSearchUrl, scoreCandidate, searchWorks } from "./search.js";
 import { FindQueueFullError, appendFindEntries, readFindQueue } from "./queue-store.js";
 import {
   FIND_CONCURRENCY,
@@ -247,6 +247,8 @@ function mockServices(): void {
         asked.push({ service, text });
         const a = answers.get(text)?.[service];
         if (a === "fail") return { statusCode: 503, data: "unavailable" };
+        // FR-765: a same-site redirect (followed by the client) to the search for "<text> onward".
+        if (a === "moved") return { statusCode: 302, data: "", responseOptions: { headers: { location: `/works?search=${encodeURIComponent(`${text} onward`)}` } } };
         // OpenAlex's free daily allowance is spent (F2 pauses OpenAlex until 00:00 UTC by the client's clock).
         if (a === "budget") return { statusCode: 429, data: JSON.stringify({ error: "Rate limit exceeded", message: "You have exceeded your daily budget." }) };
         const body = a ?? (service === "crossref" ? cr() : OA_EMPTY);
@@ -1245,6 +1247,115 @@ const plainProvenance = (captureMethod: "manual_upload" | "browser_capture" = "m
   fileHashes: {},
   legal: { status: "unknown" as const },
   identifiable: false,
+});
+
+// FR-765: a run that is stopped (its project locked, the library moved or closed: `stop`, `stopAll`) hands nothing more
+// to the network for its lookups — no retry, no redirect hop, no request — while the shared lookup client goes on
+// serving the other projects.
+describe("FR-765: nothing is asked for a stopped run's lookups", () => {
+  /** A client on the same made-up services that tries again after a failure; every lookup it starts is kept. */
+  function retryingClient(o: { sleep?: (ms: number) => Promise<void> } = {}): { client: HttpClient; calls: Array<{ url: string; p: Promise<unknown> }> } {
+    const client = new HttpClient({ libraryRoot: lib.root, dispatcher: gated, clock: () => timers.now, sleep: o.sleep ?? (async () => {}), env: {}, maxRetries: 2 });
+    const calls: Array<{ url: string; p: Promise<unknown> }> = [];
+    const getText = client.getText.bind(client);
+    client.getText = ((url: string, opts: Parameters<HttpClient["getText"]>[1]) => {
+      const p = getText(url, opts);
+      calls.push({ url, p });
+      return p;
+    }) as HttpClient["getText"];
+    return { client, calls };
+  }
+  const textOfLine = (line: string) => parseReference(line)!.text;
+  const sentTo = (service: "crossref" | "openalex", text: string) => gated.sent.filter((x) => x.service === service && x.text === text).length;
+
+  for (const how of ["stop", "stopAll"] as const) {
+    it(`a lookup in the air when the run is stopped (${how === "stop" ? "the project locked" : "a move or a close"}): no request after the stop, no retry`, async () => {
+      know(LINE, cr(ZORBLATT), "fail");
+      const p = await project();
+      const { client, calls } = retryingClient();
+      const release = gated.hold(textOfLine(LINE), "openalex");
+      onTestFinished(release);
+      const r = runner({ http: client });
+      await r.add(p.id, [LINE]);
+      await until(() => sentTo("openalex", textOfLine(LINE)) === 1, "OpenAlex to be asked");
+      if (how === "stop") r.stop(p.id);
+      else await r.stopAll();
+      release(); // the answer (a 503) lands after the stop
+      await Promise.allSettled(calls.map((c) => c.p));
+      expect(sentTo("openalex", textOfLine(LINE))).toBe(1);
+    });
+  }
+
+  it("a lookup waiting to try again when the run is stopped: the wait ends at once and no retry is sent", async () => {
+    know(LINE, cr(ZORBLATT), "fail");
+    const p = await project();
+    const waits: number[] = [];
+    const parked: Array<() => void> = [];
+    const releaseWaits = () => {
+      for (const go of parked.splice(0)) go();
+    };
+    onTestFinished(releaseWaits);
+    const { client, calls } = retryingClient({ sleep: (ms) => new Promise<void>((res) => (waits.push(ms), parked.push(res))) });
+    const r = runner({ http: client });
+    await r.add(p.id, [LINE]);
+    await until(() => waits.length > 0, "the wait before asking OpenAlex again");
+    r.stop(p.id);
+    // The wait ends by the stop alone: nothing has released it. (Crossref answered before the stop: its call may still
+    // be writing its answer to the cache, which asks nothing.)
+    const waiting = calls.filter((c) => c.url === openAlexSearchUrl(textOfLine(LINE)));
+    expect(waiting).toHaveLength(1);
+    let ended = false;
+    void waiting[0]!.p.then(
+      () => (ended = true),
+      () => (ended = true),
+    );
+    await new Promise((res) => setImmediate(res));
+    expect(ended).toBe(true);
+    releaseWaits();
+    await Promise.allSettled(calls.map((c) => c.p));
+    expect(sentTo("openalex", textOfLine(LINE))).toBe(1);
+  });
+
+  it("a redirect answered after the stop: the hop is not followed", async () => {
+    know(LINE, cr(ZORBLATT), "moved");
+    const p = await project();
+    const { client, calls } = retryingClient();
+    const release = gated.hold(textOfLine(LINE), "openalex");
+    onTestFinished(release);
+    const r = runner({ http: client });
+    await r.add(p.id, [LINE]);
+    await until(() => sentTo("openalex", textOfLine(LINE)) === 1, "OpenAlex to be asked");
+    r.stop(p.id);
+    release();
+    await Promise.allSettled(calls.map((c) => c.p));
+    expect(sentTo("openalex", `${textOfLine(LINE)} onward`)).toBe(0);
+  });
+
+  it("another project's lookup on the same client, in the air at the same time, completes untouched", async () => {
+    const OTHER = "Brindlewick, Tidal Ledgers of the Fen, 2004";
+    know(LINE, cr(ZORBLATT), "fail");
+    know(OTHER, cr(), OA_EMPTY);
+    const p1 = await project();
+    const p2 = await project();
+    const { client, calls } = retryingClient();
+    const release1 = gated.hold(textOfLine(LINE), "openalex");
+    const release2 = gated.hold(textOfLine(OTHER), "openalex");
+    onTestFinished(() => (release1(), release2()));
+    const r = runner({ http: client });
+    await r.add(p1.id, [LINE]);
+    const { added } = await r.add(p2.id, [OTHER]);
+    await until(() => sentTo("openalex", textOfLine(LINE)) === 1 && sentTo("openalex", textOfLine(OTHER)) === 1, "both lookups to be in the air");
+    r.stop(p1.id);
+    release1();
+    release2();
+    await Promise.allSettled(calls.map((c) => c.p));
+    const theirs = calls.filter((c) => c.url === openAlexSearchUrl(textOfLine(OTHER)));
+    expect(theirs).toHaveLength(1);
+    await expect(theirs[0]!.p).resolves.toBe(JSON.stringify(OA_EMPTY));
+    await settled(p2, added[0]!.id);
+    expect((await entryOf(p2, added[0]!.id))!.state).toBe("not-found");
+    expect(sentTo("openalex", textOfLine(LINE))).toBe(1);
+  });
 });
 
 describe("R237 (a): a record made by Find and acquire is stored under the project's own rules, like every other import", () => {

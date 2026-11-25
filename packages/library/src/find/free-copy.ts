@@ -43,7 +43,10 @@
  *
  * Every request carries the client's User-Agent (no `mailto`), no cookie and no key. A service that fails, answers
  * nonsense or answers 429 (not retried: `final429`) is skipped for this call and the others still answer; a broken
- * answer is never cached. `findFreeCopies` never rejects (it takes no signal; the caller bounds it in time).
+ * answer is never cached. `findFreeCopies` never rejects (it takes no signal of its own; the caller bounds it in time).
+ * FR-765: the context's stop (`LookupContext.signal`, a Find run's) goes with every request; once it is aborted each
+ * request still to be made or in the air ends at once, nothing more is sent, and the services cut off are named in
+ * `failed` as ones that could not be reached (the stopped caller no longer reads the result).
  * Rates live in the shared lookup client: `DEFAULT_RATE_LIMITS` (arXiv one request every 3 s, OpenAlex 5/s, every
  * other host here 1/s, the client's default) and `DEFAULT_CONCURRENCY` (arXiv one at a time, R254 a). Every request
  * here is asked once per call: a 429 or a 5xx is not retried (`final429`, `final5xx`).
@@ -51,7 +54,7 @@
 import { normalizeTitle, type Creator } from "@ao/core";
 import { DOMParser, type Element } from "@xmldom/xmldom";
 import { prescanXml } from "../import/zotero-rdf.js";
-import { isSensitive, providerAllowed, type LookupContext } from "../lookup/context.js";
+import { isSensitive, providerAllowed, stopOf, type LookupContext } from "../lookup/context.js";
 import { encodeDoi } from "../lookup/crossref.js";
 import { EMAIL_RE, LookupHttpError, type GetOptions } from "../lookup/http.js";
 import type { WorkCandidate } from "./candidates.js";
@@ -238,7 +241,7 @@ async function ask<T>(ctx: LookupContext, url: string, cacheKey: string, check: 
       throw new BadAnswer();
     }
   };
-  const opts: GetOptions & { validate: (b: string) => void } = { cacheKey, ttlDays: TTL_DAYS, sensitive: isSensitive(ctx), final429: noRetry429, final5xx: true, validate, ...(query ? { query } : {}) };
+  const opts: GetOptions & { validate: (b: string) => void } = { cacheKey, ttlDays: TTL_DAYS, sensitive: isSensitive(ctx), final429: noRetry429, final5xx: true, validate, ...(query ? { query } : {}), ...stopOf(ctx) };
   let body: string | null;
   try {
     body = await ctx.http.getText(url, opts);

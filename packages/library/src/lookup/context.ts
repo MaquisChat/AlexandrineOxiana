@@ -49,6 +49,12 @@ export interface LookupContext {
   askedToWait?: "leave-out";
   /** Decision 31 (c), R585 M2: passed to every request of this context (`GetOptions.onSend`): told when a request leaves. */
   onSend?: () => void;
+  /**
+   * FR-765: the stop of the work this context serves (a Find run: "Stop", a project's lock, a library move, a close).
+   * Passed to every request of this context (`GetOptions.signal`): once it is aborted nothing more is sent for it.
+   * Absent for every other lookup (an attach, "Look up again", an import), which behave as before.
+   */
+  signal?: AbortSignal;
 }
 
 export type Provider = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit";
@@ -56,11 +62,15 @@ export type Provider = "crossref" | "openalex" | "openlibrary" | "loc" | "elicit
 /** True unless the context explicitly says `sensitive: false` (R52, fail-closed). */
 export const isSensitive = (ctx: LookupContext): boolean => ctx.sensitive !== false;
 
-/** The request options every provider passes from its context: sensitivity (R52) and the rule on waits (R556 2). */
-export const requestRules = (ctx: LookupContext): { sensitive: boolean; askedToWait?: "leave-out"; onSend?: () => void } => ({
+/** The context's stop as request options (FR-765): `{ signal }`, or nothing when the context has none. */
+export const stopOf = (ctx: LookupContext): { signal?: AbortSignal } => (ctx.signal ? { signal: ctx.signal } : {});
+
+/** The request options every provider passes from its context: sensitivity (R52), the rule on waits (R556 2), its stop. */
+export const requestRules = (ctx: LookupContext): { sensitive: boolean; askedToWait?: "leave-out"; onSend?: () => void; signal?: AbortSignal } => ({
   sensitive: isSensitive(ctx),
   ...(ctx.askedToWait === "leave-out" ? { askedToWait: "leave-out" as const } : {}),
   ...(ctx.onSend ? { onSend: ctx.onSend } : {}),
+  ...stopOf(ctx),
 });
 
 /** `evaluate({action:'process', process:{op:'metadata_lookup', provider}})`; a deny is a debug note, never an error. */

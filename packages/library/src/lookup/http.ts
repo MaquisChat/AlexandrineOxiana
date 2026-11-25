@@ -259,6 +259,14 @@ export interface GetOptions {
    * served from the cache whatever their values. Not sent again after a redirect.
    */
   query?: Readonly<Record<string, string>>;
+  /**
+   * FR-765: the caller's stop (a Find run stopped by "Stop", a project's lock, a library move or a close). Once it is
+   * aborted nothing more is handed to the network for this call: a wait for a place, a slot, a Retry-After or a back-off
+   * ends at once, no retry, redirect hop or request is made (it is looked at right before each one), and a request in
+   * the air is aborted; the call rejects with the signal's reason and caches nothing. Other calls on the client are not
+   * touched, and what a service already told the client (a host's hold) stays.
+   */
+  signal?: AbortSignal;
 }
 
 /** One POST (F12: Elicit's search). */
@@ -392,7 +400,7 @@ export class HttpClient {
       }
     }
 
-    const res = await this.fetchWithRetries(url, opts.final429, opts.query, opts.final5xx === true, opts.askedToWait === "leave-out", opts.onSend);
+    const res = await this.fetchWithRetries(url, opts.final429, opts.query, opts.final5xx === true, opts.askedToWait === "leave-out", opts.onSend, opts.signal);
     if (res.body !== null) validate?.(res.body); // throws: nothing is cached
     const entry: CacheEntry = { v: 1, storedAt: this.clock(), status: res.status, body: res.body };
     // Never cached (R257 h; R290 a, e): an answer that holds the private query, or the key or the e-mail sent with it.
@@ -451,23 +459,37 @@ export class HttpClient {
     this.notBefore.set(host, Math.max(this.notBefore.get(host) ?? 0, until));
   }
 
-  /** What ends this call's waits: the client's stop, and the closing of the session the current work runs for. */
-  private halt(): AbortSignal {
+  /**
+   * What ends this call's waits: the client's stop, the closing of the session the current work runs for, and the
+   * caller's own stop (`GetOptions.signal`, FR-765).
+   */
+  private halt(caller?: AbortSignal): AbortSignal {
     const scope = closingSignalAt(this.libraryRoot);
-    return scope ? AbortSignal.any([this.stopped.signal, scope]) : this.stopped.signal;
+    const all = [this.stopped.signal, ...(scope ? [scope] : []), ...(caller ? [caller] : [])];
+    return all.length > 1 ? AbortSignal.any(all) : this.stopped.signal;
   }
 
-  /** Throws LookupCancelledError once the client is stopped or the current work's session is closing. */
-  private assertOpen(): void {
-    if (this.stopped.signal.aborted || closingSignalAt(this.libraryRoot)?.aborted) throw new LookupCancelledError();
+  /** Why a call was let go: LookupCancelledError when the library is closing, else the caller's stop reason (FR-765). */
+  private cancelled(caller?: AbortSignal): unknown {
+    if (this.stopped.signal.aborted || closingSignalAt(this.libraryRoot)?.aborted || !caller?.aborted) return new LookupCancelledError();
+    return caller.reason;
   }
 
-  /** `p`, or LookupCancelledError as soon as the client is stopped or the current work's session closes (the wait is cut). */
-  private untilClosing<T>(p: Promise<T>): Promise<T> {
-    const sig = this.halt();
-    if (sig.aborted) return Promise.reject(new LookupCancelledError());
+  /**
+   * Throws LookupCancelledError once the client is stopped or the current work's session is closing, and the caller's
+   * stop reason once the caller has stopped (FR-765). Called right before every request (FR-764: undici hands a request
+   * whose signal is already aborted to the dispatcher all the same, which opens a connection to the host).
+   */
+  private assertOpen(caller?: AbortSignal): void {
+    if (this.stopped.signal.aborted || closingSignalAt(this.libraryRoot)?.aborted || caller?.aborted) throw this.cancelled(caller);
+  }
+
+  /** `p`, or the call is let go (`cancelled`) as soon as the client stops, the work's session closes or the caller stops. */
+  private untilClosing<T>(p: Promise<T>, caller?: AbortSignal): Promise<T> {
+    const sig = this.halt(caller);
+    if (sig.aborted) return Promise.reject(this.cancelled(caller));
     return new Promise<T>((resolve, reject) => {
-      const stop = () => reject(new LookupCancelledError());
+      const stop = () => reject(this.cancelled(caller));
       sig.addEventListener("abort", stop, { once: true });
       p.then(resolve, reject).finally(() => sig.removeEventListener("abort", stop));
     });
@@ -672,7 +694,7 @@ export class HttpClient {
   }
 
   /** Waits for the host's next free slot; slots are handed out in call order. */
-  private async throttle(host: string): Promise<void> {
+  private async throttle(host: string, caller?: AbortSignal): Promise<void> {
     const prev = this.hostQueue.get(host) ?? Promise.resolve();
     const turn = prev.then(async () => {
       const gap = 1000 / (this.rates[host] ?? DEFAULT_RATE);
@@ -681,7 +703,7 @@ export class HttpClient {
       this.nextSlot.set(host, this.clock() + gap);
     });
     this.hostQueue.set(host, turn.catch(() => {}));
-    await this.untilClosing(turn);
+    await this.untilClosing(turn, caller);
   }
 
   /**
@@ -689,7 +711,7 @@ export class HttpClient {
    * function gives it back. A place given back goes straight to the longest waiter (the count of
    * open places does not drop in between), so a newcomer can never overtake a waiter.
    */
-  private async hold(host: string): Promise<() => void> {
+  private async hold(host: string, caller?: AbortSignal): Promise<() => void> {
     const limit = this.concurrency[host];
     if (limit === undefined || !(limit >= 1)) return () => {};
     const queue = this.waiting.get(host) ?? [];
@@ -698,14 +720,14 @@ export class HttpClient {
     else {
       // Resolved with the place already counted as ours. A wait the library's closing cuts short leaves the line, so no
       // place is ever handed to a caller that has gone (R546 2).
-      const sig = this.halt();
-      this.assertOpen();
+      const sig = this.halt(caller);
+      this.assertOpen(caller);
       await new Promise<void>((r, reject) => {
         const leave = () => {
           const i = queue.indexOf(granted);
           if (i >= 0) {
             queue.splice(i, 1);
-            reject(new LookupCancelledError());
+            reject(this.cancelled(caller));
           }
         };
         const granted = () => {
@@ -752,9 +774,10 @@ export class HttpClient {
     final5xx = false,
     leaveOut = false,
     onSend?: () => void,
+    caller?: AbortSignal,
   ): Promise<{ status: 200 | 404; body: string | null; sent?: Record<string, string> }> {
     if (this.recorded) return this.recorded.answer(url);
-    this.assertOpen();
+    this.assertOpen(caller);
     const first = new URL(url);
     const host = first.hostname;
     // R556 (2) ii: within a host's "not before", a caller that does not wait is left out at once: nothing is sent.
@@ -779,11 +802,12 @@ export class HttpClient {
       if (leaveOut && attempt > 0) this.leftOutIfHeld(host);
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
       try {
-        res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) }, leaveOut, onSend);
+        res = await this.fetchFollowingRedirects(target, { ua, ...(key ? { key } : {}) }, leaveOut, onSend, caller);
       } catch (e) {
         if (e instanceof LookupHttpError || e instanceof LookupLeftOutError) throw e; // refused redirect, oversized body, held: not retried
-        // The library is being closed: a request in the air is abandoned and never sent again (R546 2).
-        if (e instanceof LookupCancelledError || this.halt().aborted) throw new LookupCancelledError();
+        // The library is being closed, or the caller stopped: a request in the air is abandoned and never sent again
+        // (R546 2, FR-765).
+        if (e instanceof LookupCancelledError || this.halt(caller).aborted) throw this.cancelled(caller);
         // The library's own words can hold the address it was asked; with a query (an e-mail), a key or a contact
         // e-mail they are not passed on.
         const why = params.length || key || email ? "" : `: ${e instanceof Error ? e.message : String(e)}`;
@@ -821,7 +845,7 @@ export class HttpClient {
       }
       // The wait before asking again (a Retry-After, a back-off) is cut short when the library is being closed; that
       // ends the lookup: nothing is asked again sooner than the service allows (R411, R546 2).
-      if (attempt < this.maxRetries) await this.untilClosing(this.sleep(this.retryDelay(attempt, res?.retryAfter)));
+      if (attempt < this.maxRetries) await this.untilClosing(this.sleep(this.retryDelay(attempt, res?.retryAfter)), caller);
     }
     throw lastError!;
   }
@@ -835,18 +859,22 @@ export class HttpClient {
     send: { ua: string; key?: string },
     leaveOut = false,
     onSend?: () => void,
+    caller?: AbortSignal,
   ): Promise<{ status: number; body: string | null; retryAfter?: string; rateLimit?: RateLimitAnswer }> {
     let current = new URL(url);
     let signal: AbortSignal | undefined;
     for (let hop = 0; ; hop++) {
-      const giveBack = await this.hold(current.hostname);
+      const giveBack = await this.hold(current.hostname, caller);
       try {
-        await this.throttle(current.hostname);
+        await this.throttle(current.hostname, caller);
         // R563 I1: a call with the choice looks at the hold immediately before it sends (another call may have set it
         // while this one waited for its place or its slot).
         if (leaveOut) this.leftOutIfHeld(current.hostname);
+        // FR-764, FR-765: nothing is handed to the network once the client is stopped, the session is closing or the
+        // caller has stopped — looked at right before every request, each redirect hop included.
+        this.assertOpen(caller);
         if (!signal) {
-          signal = AbortSignal.any([AbortSignal.timeout(this.attemptTimeoutMs), this.halt()]);
+          signal = AbortSignal.any([AbortSignal.timeout(this.attemptTimeoutMs), this.halt(caller)]);
         }
         onSend?.();
         const res = await request(current, {

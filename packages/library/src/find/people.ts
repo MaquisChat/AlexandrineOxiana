@@ -17,7 +17,7 @@
 import { SourceType, normalizeTitle } from "@ao/core";
 import { InvalidInputError } from "../repo/errors.js";
 import { parseName } from "../extract/names.js";
-import { isSensitive, providerAllowed, type LookupContext } from "../lookup/context.js";
+import { isSensitive, providerAllowed, stopOf, type LookupContext } from "../lookup/context.js";
 import { LookupHttpError } from "../lookup/http.js";
 import { mapOpenAlex } from "../lookup/openalex.js";
 import type { WorkCandidate } from "./candidates.js";
@@ -390,6 +390,7 @@ export async function fetchWork(workId: string, ctx: LookupContext): Promise<Wor
       sensitive: isSensitive(ctx),
       validate: check,
       final429: (a) => isOpenAlexBudgetSpent(a, nowOf(ctx)),
+      ...stopOf(ctx), // FR-765: the Find run's stop
     });
     if (body === null) return null;
     if (!found && !other) check(body);
