@@ -165,6 +165,54 @@ describe("the source's detail inside the library screen: one sentence and one �
     expect(searchAsks).toBeGreaterThan(searchBefore);
   });
 
+  it("R641 C2 (i): the library's own read given up AFTER the panel's: the page's one sentence and one “Try again” are the library's, not the panel's; closing the panel does not say it again", async () => {
+    styles();
+    let answer = false;
+    let searchHangs = false;
+    const gate = hang();
+    let detailAsks = 0;
+    let searchAsks = 0;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), async () => {
+        detailAsks++;
+        if (!answer) await gate;
+        return HttpResponse.json(SOURCE_FILE);
+      }),
+      http.get(url("/projects/:id/sources"), async () => {
+        searchAsks++;
+        if (searchHangs && !answer) await gate;
+        return HttpResponse.json(SOURCES);
+      }),
+      ...libraryHandlers(),
+    );
+    render(<Library api={testApi()} current={CURRENT_RW as never} firstReadMs={LIMIT} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Ethnography at Work" }));
+    // The panel's read is given up first: its own alert, alone on the page.
+    await within(panel()).findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    // Then the library's own read of the sources (a search) is given up too.
+    searchHangs = true;
+    await user.type(screen.getByRole("searchbox", { name: "Search sources" }), "x");
+    await waitFor(() => expect(within(panel()).queryByRole("alert")).toBeNull(), { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    expect(tryAgains()).toHaveLength(1);
+    expect(within(panel()).queryByRole("button", { name: "Try again" })).toBeNull();
+    const said = screen.getByRole("alert");
+    expect(said.closest("main")).not.toBeNull();
+    // Closing the panel leaves the same alert where it is: the sentence is not said again.
+    await user.click(within(panel()).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("region", { name: "Source details" })).toBeNull();
+    expect(screen.getAllByRole("alert")).toEqual([said]);
+    expect(tryAgains()).toHaveLength(1);
+    const searchBefore = searchAsks;
+    answer = true;
+    await user.click(tryAgains()[0]!);
+    await waitFor(() => expect(alerts()).toEqual([]));
+    expect(searchAsks).toBeGreaterThan(searchBefore);
+    expect(detailAsks).toBe(1);
+  });
+
   it("the panel's read given up while the library says nothing: the panel's own alert and “Try again”, alone on the page", async () => {
     styles();
     let answer = false;

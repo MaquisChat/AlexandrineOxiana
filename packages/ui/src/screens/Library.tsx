@@ -241,7 +241,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /**
    * FR-756's remainder: the source's detail, opened beside the list, is part of this page. While the screen says its
    * one sentence, the panel says none of its own, the sentence covers the panel's read too (R602 M1), and the one
-   * "Try again" reads it again as well (R605 I2).
+   * "Try again" reads it again as well (R605 I2). The panel is a side panel: once the screen's own read is unanswered the
+   * screen says the page's sentence in its own place, even where the panel said it first (R641 C2 i).
    */
   const { page, sentence: pageSentence, retryAll } = usePageHost({
     sentence: unansweredText,
@@ -250,7 +251,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       triedAgain.current = true;
       readAgain();
     },
-  });
+  }, { panelsOnly: true });
   useEffect(() => {
     if (showTryAgain || !triedAgain.current) return;
     triedAgain.current = false;

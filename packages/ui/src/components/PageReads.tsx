@@ -16,6 +16,9 @@
  *   up: "could not be reached" either way), the screen's alert stays the one that says it, with its "Try again"; the host
  *   then shows neither its sentence nor its button (`screenSays`). Whichever says the page's sentence keeps saying it
  *   while the sentence stays the same.
+ * - R641 C2 (i): where the screens inside are SIDE PANELS of the host's own page (a source's detail beside the library's
+ *   list), the host's own unanswered read is the page's: the host says the page's sentence and its one "Try again" in
+ *   the page's own place, and the panels yield (`panelsOnly`). The sentence then stays there when a panel is closed.
  *
  * A screen shown with no host around it (alone, as in its own tests) is as before: it never yields, and its "Try
  * again" makes its own reads again.
@@ -56,8 +59,10 @@ export const PageReads = PageContext.Provider;
  * For the route (the page's host): `page` goes to `<PageReads value={page}>` around the screen; `sentence` is the page's
  * one sentence, shown by the host (with one "Try again" calling `retryAll`) when it is not undefined. `screenSays`: a
  * screen's alert says the page's sentence (R617 N2), so the host shows neither it nor its own unanswered read's words.
+ * `panelsOnly`: the screens inside are side panels; while the host's own read is unanswered the host says the page's
+ * sentence itself, whoever said it before (R641 C2 i).
  */
-export function usePageHost(host: PageRead): { page: Page; sentence: string | undefined; screenSays: boolean; retryAll: () => void } {
+export function usePageHost(host: PageRead, opts: { panelsOnly?: boolean } = {}): { page: Page; sentence: string | undefined; screenSays: boolean; retryAll: () => void } {
   const hostRef = useRef(host);
   hostRef.current = host;
   const parts = useRef(new Map<string, RefObject<PageRead>>());
@@ -89,7 +94,8 @@ export function usePageHost(host: PageRead): { page: Page; sentence: string | un
   // alone on the page (the host's read answered or out) says its own, and is remembered as the one saying it.
   const last = useRef<string | undefined>(undefined);
   let shower: string | undefined;
-  if (hostShows) {
+  if (hostShows && opts.panelsOnly) shower = HOST;
+  else if (hostShows) {
     const keepers = Object.keys(said).filter((k) => said[k] === pageSentence);
     if (last.current !== undefined && last.current !== HOST && keepers.includes(last.current)) shower = last.current;
     else if (host.sentence === pageSentence) shower = HOST;
