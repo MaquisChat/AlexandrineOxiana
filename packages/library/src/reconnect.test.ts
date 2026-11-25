@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs";
 import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { Readable } from "node:stream";
 import type { AuditEvent, Provenance, SourceDraft } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeyRing } from "./crypto/keys.js";
@@ -459,6 +460,42 @@ describe("checkIntegrity", () => {
     const ac = new AbortController();
     const stopped = checkIntegrity(lib, "full", { signal: ac.signal, onProgress: (n) => n === 1 && ac.abort() });
     await expect(stopped).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("review M2: a stop while a large file is being hashed abandons that file: the check ends at once, the file's read is closed, nothing is reported", async () => {
+    const { lib } = await fixture();
+    const ac = new AbortController();
+    const reads: Readable[] = [];
+    // The first file hashed is "large": one chunk comes, then the rest never does until the read is closed.
+    const openRead = (p: string) => {
+      if (reads.length) return createReadStream(p);
+      const r = new Readable({ read() {} });
+      r.push(Buffer.alloc(64 * 1024));
+      reads.push(r);
+      queueMicrotask(() => ac.abort());
+      return r;
+    };
+    await expect(checkIntegrity(lib, "full", { openRead, signal: ac.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(reads).toHaveLength(1);
+    expect(reads[0]!.destroyed).toBe(true);
+  });
+
+  it("review M2: a stop that comes while the confirming turn is waited for: the turn does nothing (no file looked at again) and the check ends stopped", async () => {
+    const { lib, assets } = await fixture();
+    await unlink(join(lib.root, assets[0]!.path));
+    const ac = new AbortController();
+    let lookedAfterStop = 0;
+    const statFn = async (p: string) => {
+      if (ac.signal.aborted) lookedAfterStop++;
+      return stat(p);
+    };
+    // The stop comes after the turn was asked for and before it runs.
+    const confirm = async <T,>(fn: () => Promise<T>) => {
+      ac.abort();
+      return fn();
+    };
+    await expect(checkIntegrity(lib, "full", { stat: statFn, confirm, signal: ac.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(lookedAfterStop).toBe(0);
   });
 
   it("finds same-size content changes when hashing, and size changes always", async () => {

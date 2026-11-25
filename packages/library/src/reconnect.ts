@@ -75,25 +75,38 @@ export function encryptedSize(bytes: number): number {
   return HEADER_LEN + bytes + Math.max(1, Math.ceil(bytes / CHUNK_SIZE)) * TAG_LEN;
 }
 
-/** SHA-256 of a file's content (decrypted first when `key` is given), streamed. */
+/**
+ * SHA-256 of a file's content (decrypted first when `key` is given), streamed. An aborted `signal` abandons the file
+ * at once (its read closed) and rejects with the signal's reason (review M2: "Stop" ends a large file's hash too).
+ */
 async function hashStream(
   file: string,
   openRead: OpenReadFn,
   key?: { key: Uint8Array; keyId: string },
+  signal?: AbortSignal,
 ): Promise<string> {
+  signal?.throwIfAborted();
   const h = createHash("sha256");
-  let src: Readable = openRead(file);
+  const raw: Readable = openRead(file);
+  let src: Readable = raw;
   if (key) {
-    const raw = src;
     const dec = decryptStream((id) => (id === key.keyId ? key.key : undefined));
     raw.on("error", (err) => dec.destroy(err));
     src = raw.pipe(dec);
   }
+  const stop = () => {
+    src.destroy(signal!.reason);
+    raw.destroy();
+  };
+  signal?.addEventListener("abort", stop, { once: true });
   try {
     for await (const chunk of src as AsyncIterable<Buffer>) h.update(chunk);
   } finally {
+    signal?.removeEventListener("abort", stop);
     src.destroy();
+    raw.destroy();
   }
+  signal?.throwIfAborted();
   return h.digest("hex");
 }
 
@@ -552,8 +565,9 @@ async function checkOnce(lib: Pick<Library, "id" | "root">, sample: IntegritySam
     report.hashed++;
     report.hashedAssetIds.push(a.id);
     try {
-      if ((await hashStream(abs, openRead, a.encrypted ? f.key : undefined)) !== a.sha256) flag(report.mismatched, entry, f, st);
+      if ((await hashStream(abs, openRead, a.encrypted ? f.key : undefined, opts.signal)) !== a.sha256) flag(report.mismatched, entry, f, st);
     } catch (err) {
+      opts.signal?.throwIfAborted(); // stopped: the file was abandoned, not found wrong
       if (isLockedRefusal(err)) throw err; // locked meanwhile: checked again (see checkIntegrity)
       if (isGone(err)) flag(report.missing, entry, f, st);
       else flag(report.mismatched, entry, f, st); // unreadable or fails to decrypt
@@ -616,6 +630,8 @@ async function confirmFindings(
     await endIfClosed(lib);
     const batch = groups.slice(i, i + CONFIRM_BATCH_SOURCES);
     const got = await confirm(async () => {
+      // Stopped while this turn was waited for: the turn does nothing (review M2).
+      signal?.throwIfAborted();
       await endIfClosed(lib);
       const out = new Map<IntegrityEntry, Still>();
       for (const list of batch) {
