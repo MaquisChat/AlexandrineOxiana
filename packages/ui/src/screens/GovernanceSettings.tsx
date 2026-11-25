@@ -20,6 +20,7 @@ import { ApiClientError } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import type { DestructionCertificate, GovernanceApi, Profile, ProtocolDocument, ProtocolDocumentResult, RetentionDue, Violation } from "../api/governance";
 import { FileDrop } from "../components/FileDrop";
+import { useLatestRead } from "../components/leaveSignals";
 import { usePageRead } from "../components/PageReads";
 import { TryAgain } from "../components/TryAgain";
 import { ConfirmDialog, ReasonDialog } from "../components/ReasonDialog";
@@ -137,10 +138,14 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
   const [cancelled, setCancelled] = useState(0);
   const rawId = useId();
 
+  /** R605 M3: one read at a time (a newer one replaces it), cancelled when the screen is left. */
+  const reads = useLatestRead();
   const load = useCallback(async () => {
+    const outer = reads.begin();
     try {
       // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
-      const g = await readWithin((signal) => api.getGovernance(projectId, { signal }), firstReadMs);
+      const g = await readWithin((signal) => api.getGovernance(projectId, { signal }), firstReadMs, outer);
+      if (!reads.settled(outer)) return;
       setSaved({ yaml: g.yaml, sha256: g.sha256 });
       setText(g.yaml);
       setViolations(g.violations);
@@ -149,10 +154,11 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
       setStatus(null);
       setLoadError(null);
     } catch (err) {
+      if (!reads.settled(outer)) return;
       setLoadError(err instanceof Error ? err.message : "The rules could not be loaded.");
       setLoadUnreachable(isUnreachable(err));
     }
-  }, [api, projectId, setText, firstReadMs]);
+  }, [api, projectId, setText, firstReadMs, reads]);
 
   useEffect(() => {
     void load();
@@ -160,7 +166,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
   // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects).
   const { yields, retryAll } = usePageRead("rules", {
     sentence: loadError !== null && loadUnreachable ? loadError : undefined,
-    out: () => !saved && loadError === null,
+    out: () => !saved && reads.out(),
     retry: () => {
       setLoadError(null);
       setLoadUnreachable(false);

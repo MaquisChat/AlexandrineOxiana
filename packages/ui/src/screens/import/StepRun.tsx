@@ -9,6 +9,7 @@ import { STREAM_OPEN_TIMEOUT_MS, type ApiClient, type ApiClientError } from "../
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../../api/firstRead";
 import { isProgressFor, type BatchState, type ImportApi } from "../../api/import";
 import { ErrorNote, errorText, fmt, Section } from "./shared";
+import { useLeaveSignal } from "../../components/leaveSignals";
 
 const ENDED: ReadonlySet<BatchState> = new Set(["finished", "cancelled", "failed", "undone"]);
 
@@ -56,11 +57,13 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
   }, []);
 
   /** The batch's state as the service records it; ends the run screen if the batch has ended. */
+  /** R605 M3: the checks are cancelled when the step is left. */
+  const leaving = useLeaveSignal();
   const recheck = useCallback(async (): Promise<boolean> => {
     try {
       // FR-756: given up after `firstReadMs` (the check on arrival comes before listening: one that never settled kept
       // the step from ever following the run).
-      const b = (await readWithin((signal) => api.batches(projectId, { signal }), firstReadMs)).find((x) => x.batchId === batchId);
+      const b = (await readWithin((signal) => api.batches(projectId, { signal }), firstReadMs, leaving())).find((x) => x.batchId === batchId);
       if (!b) return false;
       if (ENDED.has(b.state)) {
         end(b.state);
@@ -71,7 +74,7 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
       // the stream or the next check will tell
     }
     return false;
-  }, [api, projectId, batchId, end, firstReadMs]);
+  }, [api, projectId, batchId, end, firstReadMs, leaving]);
 
   useEffect(() => {
     const ctl = new AbortController();

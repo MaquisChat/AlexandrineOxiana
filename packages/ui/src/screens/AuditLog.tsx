@@ -13,6 +13,7 @@ import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 
 import type { AttentionMarkView, AuditCheck, AuditEvent, AuditPage, GovernanceApi, LibraryAuditPage } from "../api/governance";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { DialogShell } from "../components/ReasonDialog";
+import { useLatestRead } from "../components/leaveSignals";
 import { usePageRead } from "../components/PageReads";
 import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
@@ -465,24 +466,30 @@ export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_R
   const before = cursors[cursors.length - 1];
   const ids = useId();
 
+  /** R605 M3: one read at a time (a newer one replaces it), cancelled when the screen is left. */
+  const reads = useLatestRead();
   const load = useCallback(async () => {
+    const outer = reads.begin();
     try {
       // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
-      setPage(await readWithin((signal) => api.audit(projectId, { limit: pageSize, ...(before !== undefined ? { before } : {}), signal }), firstReadMs));
+      const p = await readWithin((signal) => api.audit(projectId, { limit: pageSize, ...(before !== undefined ? { before } : {}), signal }), firstReadMs, outer);
+      if (!reads.settled(outer)) return;
+      setPage(p);
       setError(null);
       setLoadUnreachable(false);
     } catch (err) {
+      if (!reads.settled(outer)) return;
       setError(err instanceof Error ? err.message : "The audit log could not be read.");
       setLoadUnreachable(isUnreachable(err));
     }
-  }, [api, projectId, pageSize, before, firstReadMs]);
+  }, [api, projectId, pageSize, before, firstReadMs, reads]);
   useEffect(() => {
     void load();
   }, [load]);
   // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects).
   const { yields, retryAll } = usePageRead("audit", {
     sentence: loadUnreachable && error !== null ? error : undefined,
-    out: () => !page && error === null,
+    out: () => !page && reads.out(),
     retry: () => {
       setError(null);
       setLoadUnreachable(false);

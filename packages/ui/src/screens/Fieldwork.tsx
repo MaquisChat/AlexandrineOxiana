@@ -11,6 +11,7 @@ import type { ConsentRecord, GovernanceApi, Participant, Session } from "../api/
 import { ApiClientError } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { FileDrop } from "../components/FileDrop";
+import { useLatestRead } from "../components/leaveSignals";
 import { usePageRead } from "../components/PageReads";
 import { TryAgain } from "../components/TryAgain";
 import { READABLE_SCOPE_TEXT, useReadableNote } from "../components/ReadableNameNote";
@@ -154,28 +155,33 @@ export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = F
 
   /** The last change put sources in the review queue: the result links to it (Task 67). */
   const [flagged, setFlagged] = useState(false);
+  /** R605 M3: one read at a time (a newer one replaces it), cancelled when the screen is left. */
+  const reads = useLatestRead();
   const load = useCallback(async () => {
+    const outer = reads.begin();
     try {
       // FR-756: the three reads are given up together after `firstReadMs` when they have not all settled.
-      const [p, s, c] = await readWithin((signal) => Promise.all([api.participants(projectId, { signal }), api.sessions(projectId, { signal }), api.consents(projectId, { signal })]), firstReadMs);
+      const [p, s, c] = await readWithin((signal) => Promise.all([api.participants(projectId, { signal }), api.sessions(projectId, { signal }), api.consents(projectId, { signal })]), firstReadMs, outer);
+      if (!reads.settled(outer)) return;
       setParticipants(p.participants);
       setSessions(s.sessions);
       setConsents(c.consents);
       setComplete(p.complete && s.complete && c.complete);
     } catch (err) {
+      if (!reads.settled(outer)) return;
       // A pending focus target must never fire later, by surprise (n2).
       setDetachedFrom(null);
       setError(err instanceof Error ? err.message : "The fieldwork records could not be loaded.");
       setLoadUnreachable(isUnreachable(err));
     }
-  }, [api, projectId, firstReadMs]);
+  }, [api, projectId, firstReadMs, reads]);
   useEffect(() => {
     void load();
   }, [load]);
   // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects).
   const { yields, retryAll } = usePageRead("fieldwork", {
     sentence: !participants && loadUnreachable && error !== null ? error : undefined,
-    out: () => !participants && error === null,
+    out: () => !participants && reads.out(),
     retry: () => {
       setError(null);
       void load();

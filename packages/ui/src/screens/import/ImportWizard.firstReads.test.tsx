@@ -216,3 +216,17 @@ describe("Import wizard, run step: its first read and its event stream (FR-756, 
     expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
   });
 });
+
+describe("Import wizard, run step: leaving it cancels its held read (FR-756, R605 M3)", () => {
+  it("the batch's state on arrival, held: its request's signal is aborted when the screen is left", async () => {
+    // The first ask is the opening's; the second, the run step's on arrival.
+    const batches = holding(`/projects/${P1}/imports`, (n) => n === 2);
+    const m = mockService({ batches: [running], extra: [batches.handler] });
+    const { unmount } = render(<ImportWizard client={m.client} projectId={P1} batchId={B1} />);
+    await screen.findByRole("heading", { name: "Run" });
+    await waitFor(() => expect(batches.count()).toBe(2));
+    expect(batches.signals[1]!.aborted).toBe(false);
+    unmount();
+    await waitFor(() => expect(batches.signals[1]!.aborted).toBe(true));
+  });
+});

@@ -396,3 +396,38 @@ describe("FR-756, R605 I2: one sentence and one “Try again” for the page —
     await waitFor(() => expect(alerts()).toEqual([]));
   });
 });
+
+describe("FR-756, R605 M3: leaving a governance screen cancels its held read", () => {
+  /** A GET that never settles; each ask's request signal is kept. */
+  function heldSignals(path: string) {
+    const signals: AbortSignal[] = [];
+    const gate = hang();
+    server.use(
+      http.get(path, async ({ request }) => {
+        signals.push(request.signal);
+        await gate;
+        return HttpResponse.json({});
+      }),
+    );
+    return signals;
+  }
+  it.each([
+    ["the project's rules", "/governance", () => <GovernanceSettings api={makeApi()} projectId={PID} />],
+    ["the audit log", "/audit", () => <AuditLog api={makeApi()} projectId={PID} />],
+    ["fieldwork", "/participants", () => <Fieldwork api={makeApi()} projectId={PID} />],
+  ])("%s: the request's signal is aborted when the screen is left", async (_name, path, el) => {
+    server.use(
+      http.get(P("/protocol/documents"), () => HttpResponse.json({ documents: [] })),
+      http.get(P("/retention"), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+      http.get(P("/attention"), () => HttpResponse.json({ marks: [] })),
+      http.get(P("/sessions"), () => HttpResponse.json({ sessions: [], complete: true })),
+      http.get(P("/consents"), () => HttpResponse.json({ consents: [], complete: true })),
+    );
+    const signals = heldSignals(P(path));
+    const { unmount } = render(el());
+    await waitFor(() => expect(signals).toHaveLength(1));
+    expect(signals[0]!.aborted).toBe(false);
+    unmount();
+    await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+  });
+});

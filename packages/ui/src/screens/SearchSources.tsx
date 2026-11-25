@@ -47,6 +47,7 @@ import { ApiClientError, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../api/firstRead";
 import { importApi } from "../api/import";
 import { KeyField, type KeyFieldWords } from "../components/KeyField";
+import { useLeaveSignal } from "../components/leaveSignals";
 import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import { inAppLink, PATHS, projectInQuery, type AppLocation } from "../navigation";
@@ -251,13 +252,15 @@ export function SearchSources({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS
   }, []);
 
   /** The settings, read again; with the project's rules when the screen is opened for one. */
+  /** R605 M3: the reads are cancelled when the screen is left. */
+  const leaving = useLeaveSignal();
   const read = useCallback(
     async (withProject = true): Promise<void> => {
       const project = withProject ? projectRef.current : undefined;
       const seq = ++readSeq.current;
       try {
         // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
-        const r = await readWithin((signal) => api.read(project, { signal }), firstReadMs);
+        const r = await readWithin((signal) => api.read(project, { signal }), firstReadMs, leaving());
         if (!alive.current) return;
         if (apply(r, seq) && project !== undefined) setProjectError(undefined);
       } catch (err) {
@@ -275,7 +278,7 @@ export function SearchSources({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS
         }
       }
     },
-    [api, apply, firstReadMs],
+    [api, apply, firstReadMs, leaving],
   );
 
   useEffect(() => {

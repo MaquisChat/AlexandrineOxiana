@@ -47,6 +47,7 @@ import {
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { useLeaveSignal } from "../components/leaveSignals";
 import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import { desktopShell, type DesktopShell } from "../desktopShell";
@@ -296,14 +297,17 @@ export function YourLibrary({ client, firstReadMs = FIRST_READ_TIMEOUT_MS }: { c
     return true;
   }, []);
 
+  /** R605 M3: the reads are cancelled when the screen is left. */
+  const leaving = useLeaveSignal();
   const read = useCallback(async (): Promise<void> => {
     const seq = ++readSeq.current;
     // FR-756 (R586 M5): a read that never settles is given up after `firstReadMs` (its request cancelled) and says
     // "The library service did not answer in time."; one that fails says its sentence as before.
     let r: YourLibraryResponse;
     try {
-      r = await readWithin((signal) => api.read({ signal }), firstReadMs);
+      r = await readWithin((signal) => api.read({ signal }), firstReadMs, leaving());
     } catch (err) {
+      if (leaving().aborted) return;
       if (!confirmedRef.current && seq >= applied.current) {
         setLoadError(sentenceOf(err, T.loadFailed));
         setLoadUnreachable(isUnreachable(err));
@@ -311,7 +315,7 @@ export function YourLibrary({ client, firstReadMs = FIRST_READ_TIMEOUT_MS }: { c
       return;
     }
     apply(r, seq);
-  }, [api, apply, firstReadMs]);
+  }, [api, apply, firstReadMs, leaving]);
 
   useEffect(() => {
     void read();

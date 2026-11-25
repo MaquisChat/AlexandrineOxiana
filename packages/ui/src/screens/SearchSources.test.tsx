@@ -847,3 +847,23 @@ describe("Search sources: a first read that never settles (FR-756, R584, R586)",
     expect(tryAgain()).toBeNull();
   });
 });
+
+describe("Search sources: leaving the screen cancels its held read (FR-756, R605 M3)", () => {
+  it("the request's signal is aborted when the screen is left", async () => {
+    const signals: AbortSignal[] = [];
+    const gate = hang();
+    server.use(
+      http.get(url("/settings/search-sources"), async ({ request }) => {
+        signals.push(request.signal);
+        await gate;
+        return HttpResponse.json({});
+      }),
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [] })),
+    );
+    const { unmount } = render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: "" }} />);
+    await waitFor(() => expect(signals).toHaveLength(1));
+    expect(signals[0]!.aborted).toBe(false);
+    unmount();
+    await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+  });
+});
