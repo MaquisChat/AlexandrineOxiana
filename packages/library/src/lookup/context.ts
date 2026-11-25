@@ -52,7 +52,9 @@ export interface LookupContext {
   /**
    * FR-765: the stop of the work this context serves (a Find run: "Stop", a project's lock, a library move, a close).
    * Passed to every request of this context (`GetOptions.signal`): once it is aborted nothing more is sent for it.
-   * Absent for every other lookup (an attach, "Look up again", an import), which behave as before.
+   * FR-769: a Bulk Import run (so a device import, a Zotero Web import, its resume, a Zotero sync), an attach and "Look
+   * up again" carry their project's lock stop (`Repo.lockStopOf`): at the project's lock nothing more is sent for them.
+   * Absent for the settings' test, which behaves as before.
    */
   signal?: AbortSignal;
 }

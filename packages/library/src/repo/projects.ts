@@ -534,6 +534,11 @@ export function lockProject(core: RepoCore, projectId: string): Promise<void> {
   // R435 a: a lock takes effect at once, an unlock in flight included: that unlock is overtaken (it adds no key and
   // ends as locked), and the returned promise settles once it has ended and the key is wiped.
   core.lockAsks.set(projectId, (core.lockAsks.get(projectId) ?? 0) + 1);
+  // FR-769 (R641 A1): the lookups of the project's running imports and attaches end now; nothing more is sent for it.
+  if (core.encrypted(st)) {
+    core.lockStops.get(projectId)?.abort(new ProjectLockedError(projectId));
+    core.lockStops.delete(projectId);
+  }
   const unlocking = core.pendingUnlocks.get(projectId);
   const done = lockAtOnce(core, projectId, st);
   return unlocking ? unlocking.then(() => done) : done;
@@ -577,6 +582,21 @@ function lockAtOnce(core: RepoCore, projectId: string, st: ProjectState): Promis
 /** The project's count of locks asked so far (R443 a): read-only, for an unlock to note when its request arrives. */
 export function lockAsksOf(core: RepoCore, projectId: string): number {
   return core.lockAsks.get(projectId) ?? 0;
+}
+
+/**
+ * FR-769 (R641 A1): the stop a project's running imports and attaches carry in their lookup context
+ * (`LookupContext.signal`). It is aborted, with ProjectLockedError as its reason, at the lock of the project when it is
+ * encrypted (a project that is not encrypted has nothing to lock: its stop never aborts); already aborted while the
+ * project is locked or a lock of it is pending. Other projects' stops are untouched, and the lookup client itself is never halted.
+ */
+export function lockStopOf(core: RepoCore, projectId: string): AbortSignal {
+  // A lock asked and waiting for the running write turn counts too: inside that turn the key is still visible, and a
+  // stop made then would never be aborted (the lock has already aborted and dropped the project's stop).
+  if ((core.pendingLocks.has(projectId) && core.encrypted(core.state(projectId))) || !isUnlocked(core, projectId)) return AbortSignal.abort(new ProjectLockedError(projectId));
+  let c = core.lockStops.get(projectId);
+  if (!c) core.lockStops.set(projectId, (c = new AbortController()));
+  return c.signal;
 }
 
 export function isUnlocked(core: RepoCore, projectId: string): boolean {

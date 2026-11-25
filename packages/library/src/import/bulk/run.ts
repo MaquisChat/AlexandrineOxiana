@@ -969,7 +969,9 @@ class Run {
     try {
       const dedupe = new BatchDedupe(this.deps.index.db, this.projectId, (id) => hasSource(this.repo, this.projectId, id));
       this.dedupe = dedupe;
-      this.lookup = await lookupContextFor(this.repo, this.projectId, this.deps.http, this.deps.debug ? { debug: this.deps.debug } : {});
+      // FR-769 (R641 A1): the project's lock ends this run's lookups at once (nothing more is sent for it); the run then
+      // ends as at any lock (ProjectLockedError: no item's failure, resumable).
+      this.lookup = { ...(await lookupContextFor(this.repo, this.projectId, this.deps.http, this.deps.debug ? { debug: this.deps.debug } : {})), signal: this.repo.lockStopOf(this.projectId) };
       // R379 (ii): the report says once that title searches were withheld because the project holds identifiable data.
       if (this.lookup.policy && !this.lookup.titleSearchAllowed && providerAllowed(this.lookup, "openalex")) this.note(TITLES_WITHHELD_NOTE);
       if (this.adapter.viewingProxies) this.policyMode = (await projectPolicyOrDefault(this.repo, this.projectId))?.sharing.locationMetadata ?? "strip";

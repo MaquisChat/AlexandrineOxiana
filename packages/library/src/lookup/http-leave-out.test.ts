@@ -11,8 +11,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_GOVERNANCE } from "@ao/core";
-import { MockAgent } from "undici";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { Dispatcher, MockAgent } from "undici";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
 import { HttpClient, LookupHttpError, LookupLeftOutError } from "./http.js";
 import { lookupDoi, searchTitle, type LookupContext } from "./index.js";
 
@@ -418,5 +418,64 @@ describe("a hold carried over a reopening: holdUntil (R600 I1)", () => {
     expect(http.heldUntil("api.crossref.org")).toBe(now + 3_600_000);
     http.holdUntil("api.openalex.org", now - 1);
     expect(http.heldUntil("api.openalex.org")).toBeUndefined();
+  });
+});
+
+/**
+ * FR-753 (1) (R641 A3): a hold on a service is cleared only by a good answer whose request LEFT after the hold was set.
+ * An answer to a request sent before the 429 that set the hold (answers out of order) leaves the hold as it is.
+ */
+describe("a hold is cleared only by an answer to a request sent after it was set (FR-753 1)", () => {
+  /** Holds the requests for one path until released; every other request goes straight to the stand-in. */
+  class Gate extends Dispatcher {
+    private gate!: Promise<void>;
+    release!: () => void;
+    private arrived!: () => void;
+    atGate!: Promise<void>;
+    constructor(
+      private readonly inner: Dispatcher,
+      private readonly path: string,
+    ) {
+      super();
+      this.gate = new Promise<void>((r) => (this.release = r));
+      this.atGate = new Promise<void>((r) => (this.arrived = r));
+    }
+    override dispatch(opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
+      if (String(opts.path) !== this.path) return this.inner.dispatch(opts, handler);
+      this.arrived();
+      void this.gate.then(() => this.inner.dispatch(opts, handler));
+      return true;
+    }
+    override close(): Promise<void> {
+      return this.inner.close();
+    }
+    override destroy(): Promise<void> {
+      return this.inner.destroy();
+    }
+  }
+
+  it("a late good answer to a request sent before the 429 keeps the hold; one sent after the hold clears it", async () => {
+    const OA_HOST = "api.openalex.org";
+    agent
+      .get(OA)
+      .intercept({ path: (p: string) => p.startsWith("/works/"), method: "GET" })
+      .reply((o: { path: string }) => (o.path === "/works/b" ? { statusCode: 429, data: "slow down", responseOptions: { headers: { "retry-after": "3600" } } } : { statusCode: 200, data: "{}", responseOptions: JSON_HEADERS }))
+      .persist();
+    const gate = new Gate(agent, "/works/a");
+    onTestFinished(() => gate.release());
+    const http = new HttpClient({ libraryRoot: join(tmp, "Lib"), dispatcher: gate, clock: () => now, sleep });
+    // A request is in the air when another call meets the 429 that sets the hold.
+    const early = http.getJson(`${OA}/works/a`, { cacheKey: "a", sensitive: true });
+    await gate.atGate;
+    const left = (await http.getJson(`${OA}/works/b`, { cacheKey: "b", sensitive: true, askedToWait: "leave-out" }).catch((e: unknown) => e)) as LookupLeftOutError;
+    expect(left).toBeInstanceOf(LookupLeftOutError);
+    expect(http.heldUntil(OA_HOST)).toBe(left.notBefore);
+    // The early request's good answer lands after the hold was set: the hold stays.
+    gate.release();
+    await expect(early).resolves.toEqual({});
+    expect(http.heldUntil(OA_HOST)).toBe(left.notBefore);
+    // A request that left after the hold (a caller that does not wait for holds, R563 I2) answers well: cleared.
+    await expect(http.getJson(`${OA}/works/c`, { cacheKey: "c", sensitive: true })).resolves.toEqual({});
+    expect(http.heldUntil(OA_HOST)).toBeUndefined();
   });
 });

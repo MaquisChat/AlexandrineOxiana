@@ -378,6 +378,30 @@ describe("lookUpAgain refuses early and writes nothing", () => {
     expect(await snapshot(lib.root)).toEqual(snap);
   });
 
+  for (const by of ["researcher", "automatic"] as const) {
+    it(`FR-769 (${by}): a project locked while the look-up's first request waits to leave — nothing is sent after the lock, it answers "locked" and writes nothing`, async () => {
+      const p = await project(true);
+      const http = client();
+      answers["api.crossref.org"] = () => WAIT_60;
+      answers["api.openalex.org"] = () => WAIT_60;
+      const [e] = await attached(p, http, [buildDoiPdf()]);
+      expect(e!.leftOut!.length).toBeGreaterThan(0);
+      now += 16 * MIN;
+      answers["api.crossref.org"] = () => ({ statusCode: 404, data: "{}" });
+      answers["api.openalex.org"] = () => SEARCH;
+      sent = [];
+      const hold = holdRequests(http, "before");
+      const run = lookUpAgain(repo, http, p.id, e!.id, { by, now: new Date(now) });
+      await hold.atGate; // its send is audited; its first request has not left
+      await repo.lockProject(p.id);
+      const snap = await snapshot(lib.root);
+      hold.release();
+      expect(await run).toEqual({ done: false, why: "locked" });
+      expect(sent).toEqual([]);
+      expect(await snapshot(lib.root)).toEqual(snap); // nothing written: no failure, no try counted
+    });
+  }
+
   it("(5) nothing is sent before the time kept on the entry: automatic — not due; the researcher — \"not yet\", with the time", async () => {
     const p = await project();
     const http = client();
@@ -717,6 +741,44 @@ describe("decision 31 (c), R585 I1: two look-ups of one entry", () => {
     expect(end.reasons[0]).toBe(LOOK_UP_AGAIN_TEXT.found);
     expect(end.reasons).not.toContain(LOOKUP_WAITING_TEXT);
     expect(end.candidates).toHaveLength(2);
+  });
+
+  it("FR-758 (two handles): the look-up that really sent is the slower to write; the other answered from the cache wrote first — the time of the last real try is kept", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    expect((await entry(p, e!.id)).leftOut![0]!.lastTriedAt).toBeUndefined();
+    const repo2 = await openTestRepo(lib, ring, { scryptN: 2 ** 10, actor: "tester", clock: () => new Date(now), tz: "UTC" });
+    now += 16 * MIN;
+    answers["api.openalex.org"] = () => SEARCH;
+    // Only the first call is held once answered (B's): the second handle's call is served from the client's cache.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    let reached!: () => void;
+    const atGate = new Promise<void>((r) => (reached = r));
+    const orig = http.getJson.bind(http) as (...a: unknown[]) => Promise<unknown>;
+    let calls = 0;
+    (http as unknown as { getJson: (...a: unknown[]) => Promise<unknown> }).getJson = async (...a: unknown[]) => {
+      if (++calls > 1) return orig(...a);
+      const v = await orig(...a);
+      reached();
+      await gate;
+      return v;
+    };
+    const tB = new Date(now);
+    const runB = lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: tB });
+    await atGate; // B's request left and was answered; its write is held
+    now += 2 * MIN;
+    const sentBefore = sent.length;
+    const ra = await lookUpAgain(repo2, http, p.id, e!.id, { by: "researcher", now: new Date(now) });
+    expect(ra).toMatchObject({ done: true, sent: 0, state: { state: "found" } });
+    expect(sent.length).toBe(sentBefore);
+    release();
+    expect(await runB).toMatchObject({ done: true, sent: 1, state: { state: "found" } });
+    const end = await entry(p, e!.id);
+    expect(end.leftOut![0]).toMatchObject({ outcome: "found", lastTriedAt: tB.toISOString() });
   });
 });
 

@@ -243,8 +243,9 @@ export function createAttach(deps: AttachDeps): Attach {
         })()),
       // Decision 31 (b), R556 (2) i: an attach (and so a watched folder's bringing-in) never waits for a service that asks
       // to wait: that service is left out for the file, which comes in at once.
+      // FR-769 (R641 A1): the project's lock ends the attach's lookups at once; its file ends as locked.
       lookup: () =>
-        (lookup ??= lookupContextFor(repo, projectId, http, deps.debug ? { debug: deps.debug } : {}).then((c): LookupContext => ({ ...c, askedToWait: "leave-out" }))),
+        (lookup ??= lookupContextFor(repo, projectId, http, deps.debug ? { debug: deps.debug } : {}).then((c): LookupContext => ({ ...c, askedToWait: "leave-out", signal: repo.lockStopOf(projectId) }))),
       /** Inside a queue turn: forget the cached duplicate keys if anyone else stored since this call's last turn. */
       refreshKeys: () => {
         const t = storeTurn(repo, projectId);
