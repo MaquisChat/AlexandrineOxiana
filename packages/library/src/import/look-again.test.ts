@@ -475,19 +475,23 @@ describe("the automatic pass: due, bounded, growing waits; the hold (R411, R566 
     expect(r).toMatchObject({ done: true, asked: 1, found: 2, state: { state: "found" } });
     expect(sent).toHaveLength(1);
     const after = await entry(p, e!.id);
-    expect(after.leftOut![0]).toMatchObject({ why: "failed", tries: 1, outcome: "found" });
+    // R585 M3: a researcher's press is not counted in tries; it moves the last try's time
+    expect(after.leftOut![0]).toMatchObject({ why: "failed", lastTriedAt: new Date(now).toISOString(), outcome: "found" });
+    expect(after.leftOut![0]!.tries).toBeUndefined();
     expect(after.reasons[0]).toBe(LOOK_UP_AGAIN_TEXT.found);
   });
 
-  it("a failed lookup that fails again stays failed (tries counted); the entry never reads \"Waiting…\"", async () => {
+  it("a failed lookup that fails again stays failed (the researcher's press moves its last try, not its tries, R585 M3); the entry never reads \"Waiting…\"", async () => {
     const p = await project();
     const http = client();
     answers["api.openalex.org"] = () => ({ statusCode: 500, data: "broken" });
     const [e] = await attached(p, http, [notesPdf()]);
-    const r = await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) });
-    expect(r).toMatchObject({ done: true, asked: 1, found: 0, state: { state: "failed", tries: 1 } });
+    const pressed = new Date(now); // the client's back-off waits move the test's clock after this
+    const r = await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: pressed });
+    expect(r).toMatchObject({ done: true, asked: 1, found: 0, state: { state: "failed", tries: 0 } });
     const after = await entry(p, e!.id);
-    expect(after.leftOut![0]).toMatchObject({ why: "failed", tries: 1 });
+    expect(after.leftOut![0]).toMatchObject({ why: "failed", lastTriedAt: pressed.toISOString() });
+    expect(after.leftOut![0]!.tries).toBeUndefined();
     expect(after.leftOut![0]!.outcome).toBeUndefined();
     expect(after.reasons).not.toContain(LOOKUP_WAITING_TEXT);
     expect(after.reasons).toEqual(e!.reasons);
@@ -564,7 +568,7 @@ describe("closing, audit and sealing (R247 c, R546, R566 6, R55)", () => {
     const raw = await readFile(reviewPath(p), "utf8");
     for (const word of [TITLE, "Rivers and Memory", "lastTriedAt", "outcome", "openalex", "found", LOOK_UP_AGAIN_TEXT.found]) expect(raw).not.toContain(word);
     const after = await entry(p, e!.id); // opened with the project's key
-    expect(after.leftOut![0]).toMatchObject({ tries: 1, outcome: "found" });
+    expect(after.leftOut![0]).toMatchObject({ lastTriedAt: new Date(now).toISOString(), outcome: "found" });
     expect(after.candidates).toHaveLength(2);
   });
 });
@@ -879,5 +883,49 @@ describe("decision 31 (c), R585 M1: a kept time only a wrong clock could have wr
       if (said.canLookUpNow) expect(r.done, name).toBe(true);
       else expect(r, name).toEqual(said.notBefore ? { done: false, why: "not-yet", notBefore: said.notBefore } : { done: false, why: "nothing-to-look-up" });
     }
+  });
+});
+
+describe("decision 31 (c), R585 M3: the sentences in mixes; only the app's own automatic tries count toward giving up", () => {
+  it("P-K: Crossref finds the file's DOI while the title search is told to wait: found, the warning about the file's identifier, and waiting — each once", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.crossref.org"] = () => WAIT_60;
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [buildDoiPdf()]);
+    now += 16 * MIN;
+    answers["api.crossref.org"] = () => ({ statusCode: 200, data: fixture("crossref-work.json") });
+    const r = await lookUpAgain(repo, client(), p.id, e!.id, { by: "automatic", now: new Date(now) });
+    expect(r).toMatchObject({ done: true, found: 1, state: { state: "waiting", fromFile: true } });
+    const end = await entry(p, e!.id);
+    expect(end.reasons.slice(0, 3)).toEqual([LOOK_UP_AGAIN_TEXT.found, LOOK_UP_AGAIN_TEXT.fromFile, LOOKUP_WAITING_TEXT]);
+    for (const s of [LOOK_UP_AGAIN_TEXT.found, LOOK_UP_AGAIN_TEXT.fromFile, LOOKUP_WAITING_TEXT]) expect(end.reasons.filter((x) => x === s)).toHaveLength(1);
+  });
+
+  it("P-M: five presses of the researcher, each told to wait, never end \"gave-up\" and are not counted in tries; they move lastTriedAt and notBefore", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    for (let k = 0; k < 6; k++) {
+      now += 2 * MIN;
+      expect(await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true, sent: 1, state: { state: "waiting" } });
+      const l = (await entry(p, e!.id)).leftOut![0]!;
+      expect(l.tries).toBeUndefined();
+      expect(l.outcome).toBeUndefined();
+      expect(l).toMatchObject({ lastTriedAt: new Date(now).toISOString(), notBefore: new Date(now + MIN).toISOString() });
+    }
+    expect((await entry(p, e!.id)).reasons[0]).toBe(LOOKUP_WAITING_TEXT);
+  });
+
+  it("after the app gave up, a researcher's press told to wait leaves it \"gave-up\" (the automatic pass does not take it again) with the app's own tries", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    await patch(p, e!, { leftOut: [{ ...e!.leftOut![0]!, tries: 5, outcome: "gave-up" }] });
+    now += 2 * MIN;
+    expect(await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true, state: { state: "gave-up", tries: 5 } });
+    expect((await entry(p, e!.id)).reasons[0]).toBe(lookUpGaveUpText(5));
   });
 });

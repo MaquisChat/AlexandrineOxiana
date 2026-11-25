@@ -128,49 +128,74 @@ export interface LookUpView {
   tries: number;
   /** "waiting": the latest time a lookup still waiting may be asked again (R411); never for "failed". */
   notBefore?: string;
-  /** "found": some match came from an identifier found in the file (a hint, R55): the second sentence is said. */
+  /**
+   * Some match came from an identifier found in the file (a hint, R55): the warning sentence is said. R585 M3: whenever
+   * such a lookup was answered "found", whatever the one-word state (also with "waiting").
+   */
   fromFile: boolean;
+  /**
+   * R585 M3: every OTHER state true of the entry besides `state` (never "failed"), in the order of the sentences: found,
+   * waiting, nothing, not-allowed, gave-up. Present only in a mix: an entry in one state has no `also`.
+   */
+  also?: Array<Exclude<LookUpState, "failed">>;
+  /** R585 M3: with "gave-up" in `also`, the tries of the lookups the app gave up on (for its sentence's {n}). */
+  gaveUpTries?: number;
 }
 
+/** R585 M3: the order of the states' sentences in an entry's reasons. */
+const SENTENCE_ORDER = ["found", "waiting", "nothing", "not-allowed", "gave-up"] as const;
+
 /**
- * The entry's look-up state, or undefined when nothing was left out. In order: "waiting" (an asked-to-wait lookup has no
- * outcome yet), then the outcomes "found", "gave-up", "nothing", "not-allowed"; "failed" when only lookups that failed
- * outright are left, none answered.
+ * The entry's look-up state, or undefined when nothing was left out. The ONE word for the service, in this order of
+ * precedence: "waiting" (an asked-to-wait lookup has no outcome yet), then "found", then the rest — "gave-up", "nothing",
+ * "not-allowed"; "failed" when only lookups that failed outright are left, none answered. Why waiting first: while a
+ * lookup still waits the entry is not settled — the automatic pass will take it and the page's act follows its time —
+ * so that is what the service must act on; found next, because it is the news the researcher acts on (a match to check).
+ * R585 M3: every other state true of the entry is in `also`, so its reasons carry every sentence.
  */
 export function lookUpStateOf(entry: Pick<ReviewEntry, "leftOut" | "hints">): LookUpView | undefined {
   const all = entry.leftOut ?? [];
   if (all.length === 0) return undefined;
   const most = (ls: LeftOutLookup[]) => ls.reduce((n, l) => Math.max(n, l.tries ?? 0), 0);
-  const waiting = all.filter((l) => isAskedToWait(l) && !l.outcome);
+  const hints = new Set(entry.hints ?? []);
+  const fromFile = all.some((l) => l.outcome === "found" && !!l.identifier && hints.has(l.identifier));
+  const of = (st: Exclude<LookUpState, "failed">) => all.filter((l) => (st === "waiting" ? isAskedToWait(l) && !l.outcome : l.outcome === st));
+  const present = SENTENCE_ORDER.filter((st) => of(st).length > 0);
+  const extra = (state: LookUpState) => {
+    const also = present.filter((st) => st !== state);
+    if (!also.length) return {};
+    return { also, ...(also.includes("gave-up") ? { gaveUpTries: most(of("gave-up")) } : {}) };
+  };
+  const waiting = of("waiting");
   if (waiting.length) {
     const times = waiting.map((l) => l.notBefore).filter((t): t is string => !!t).sort();
-    return { state: "waiting", tries: most(waiting), ...(times.length ? { notBefore: times[times.length - 1]! } : {}), fromFile: false };
+    return { state: "waiting", tries: most(waiting), ...(times.length ? { notBefore: times[times.length - 1]! } : {}), fromFile, ...extra("waiting") };
   }
   for (const state of ["found", "gave-up", "nothing", "not-allowed"] as const) {
-    const ls = all.filter((l) => l.outcome === state);
+    const ls = of(state);
     if (!ls.length) continue;
-    const hints = new Set(entry.hints ?? []);
-    return { state, tries: most(ls), fromFile: state === "found" && ls.some((l) => !!l.identifier && hints.has(l.identifier)) };
+    return { state, tries: most(ls), fromFile, ...extra(state) };
   }
   return { state: "failed", tries: most(all), fromFile: false };
 }
 
-/** The sentences that stand for a state in an entry's reasons ("failed": none — the entry keeps its own reason). */
+/**
+ * The sentences that stand for an entry's look-up state in its reasons ("failed": none — the entry keeps its own
+ * reason). R585 M3: every state true of it (`state` and `also`), each once, in the order found (and the warning when a
+ * match came from the file's identifier); still waiting; nothing found; not allowed; gave up.
+ */
 export function lookUpSentences(v: LookUpView): string[] {
-  switch (v.state) {
-    case "waiting":
-      return [LOOKUP_WAITING_TEXT];
-    case "found":
-      return v.fromFile ? [LOOK_UP_AGAIN_TEXT.found, LOOK_UP_AGAIN_TEXT.fromFile] : [LOOK_UP_AGAIN_TEXT.found];
-    case "nothing":
-      return [LOOK_UP_AGAIN_TEXT.nothing];
-    case "not-allowed":
-      return [LOOK_UP_AGAIN_TEXT.notAllowed];
-    case "gave-up":
-      return [lookUpGaveUpText(v.tries)];
-    case "failed":
-      return [];
+  const states = new Set<LookUpState>([v.state, ...(v.also ?? [])]);
+  const out: string[] = [];
+  for (const st of SENTENCE_ORDER) {
+    if (!states.has(st)) continue;
+    if (st === "found") out.push(LOOK_UP_AGAIN_TEXT.found, ...(v.fromFile ? [LOOK_UP_AGAIN_TEXT.fromFile] : []));
+    else if (st === "waiting") out.push(LOOKUP_WAITING_TEXT);
+    else if (st === "nothing") out.push(LOOK_UP_AGAIN_TEXT.nothing);
+    else if (st === "not-allowed") out.push(LOOK_UP_AGAIN_TEXT.notAllowed);
+    else out.push(lookUpGaveUpText(v.state === "gave-up" ? v.tries : (v.gaveUpTries ?? v.tries)));
   }
+  return out;
 }
 
 const [GAVE_UP_HEAD, GAVE_UP_TAIL] = LOOK_UP_AGAIN_TEXT.gaveUp.split("{n}") as [string, string];

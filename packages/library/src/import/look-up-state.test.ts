@@ -121,3 +121,28 @@ describe("the bounds and waits of the automatic pass (one place)", () => {
     expect(LOOK_UP_AGAIN_BOUNDS.waitsMs).toEqual([15 * 60_000, 3_600_000, 4 * 3_600_000, 12 * 3_600_000, 24 * 3_600_000]);
   });
 });
+
+describe("R585 M3: the sentences in mixes — every sentence true of the entry, each once, in order", () => {
+  const other = "The title in the file differs from the one found.";
+  const sentencesOf = (e: { leftOut: LeftOutLookup[]; hints?: string[] }) => reasonsWithLookUpState([LOOKUP_WAITING_TEXT, other], lookUpStateOf(e)!);
+  it("not allowed + nothing found: both sentences, nothing first", () => {
+    const v = lookUpStateOf({ leftOut: [wait({ outcome: "not-allowed" }), wait({ outcome: "nothing", tries: 1 })] })!;
+    expect(v.state).toBe("nothing"); // the one word for the service stays as it was
+    expect(sentencesOf({ leftOut: [wait({ outcome: "not-allowed" }), wait({ outcome: "nothing", tries: 1 })] })).toEqual([LOOK_UP_AGAIN_TEXT.nothing, LOOK_UP_AGAIN_TEXT.notAllowed, other]);
+  });
+  it("P-K: found from the file's identifier and still waiting: found, the warning, waiting; the state is \"waiting\"", () => {
+    const e = { hints: ["doi:10.1/x"], leftOut: [wait({ identifier: "doi:10.1/x", title: undefined, outcome: "found", tries: 1 }), wait()] };
+    expect(lookUpStateOf(e)).toMatchObject({ state: "waiting", fromFile: true });
+    expect(sentencesOf(e)).toEqual([LOOK_UP_AGAIN_TEXT.found, LOOK_UP_AGAIN_TEXT.fromFile, LOOKUP_WAITING_TEXT, other]);
+  });
+  it("all five at once, in the ruled order: found; still waiting; nothing found; not allowed; gave up (with its own tries)", () => {
+    const e = { leftOut: [wait({ outcome: "gave-up", tries: 5 }), wait({ outcome: "not-allowed" }), wait({ outcome: "nothing", tries: 1 }), wait({ tries: 2 }), wait({ outcome: "found", tries: 1 })] };
+    expect(lookUpStateOf(e)).toMatchObject({ state: "waiting", tries: 2 });
+    expect(sentencesOf(e)).toEqual([LOOK_UP_AGAIN_TEXT.found, LOOKUP_WAITING_TEXT, LOOK_UP_AGAIN_TEXT.nothing, LOOK_UP_AGAIN_TEXT.notAllowed, lookUpGaveUpText(5), other]);
+    // written again: each sentence still once, nothing else moved
+    expect(reasonsWithLookUpState(sentencesOf(e), lookUpStateOf(e)!)).toEqual(sentencesOf(e));
+  });
+  it("a single state reads as before (the view has no `also`)", () => {
+    expect(lookUpStateOf({ leftOut: [wait({ outcome: "nothing", tries: 1 })] })).toEqual({ state: "nothing", tries: 1, fromFile: false });
+  });
+});

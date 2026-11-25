@@ -201,7 +201,7 @@ const laterTry = (l: LeftOutLookup, b: string): string => {
 };
 
 /** The lookup after this act (see the module comment, step 4), worked out against `l`: the lookup as re-read (R585 2). */
-function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string): LeftOutLookup {
+function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string, by: LookUpBy): LeftOutLookup {
   if (p.notAllowed || (a?.kind === "denied" && !p.held.length)) return { ...l, outcome: "not-allowed" };
   if (!a || a.kind === "denied") {
     // Every allowed service held: not asked now; it waits for the hold (no try counted).
@@ -209,10 +209,13 @@ function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string): 
   }
   // R585 M2: a try is counted only when a request of it left (not one the client's hold left out, nor an answer from
   // the cache). A time never moves backwards (R585 2): a later try written meanwhile keeps its time.
-  const counted = a.sent > 0;
+  // R585 M3: only the app's own AUTOMATIC tries are counted in `tries` (toward giving up); a researcher's press that
+  // sent moves the last try's time (and the service's answer its `notBefore`) but is never counted, never "gave-up".
+  const left = a.sent > 0;
+  const counted = left && by === "automatic";
   const tries = (l.tries ?? 0) + (counted ? 1 : 0);
-  const { outcome: _o, ...base } = l;
-  const tried: LeftOutLookup = counted ? { ...base, tries, lastTriedAt: laterTry(l, at) } : base;
+  const { outcome: prior, ...base } = l;
+  const tried: LeftOutLookup = { ...base, ...(counted ? { tries } : {}), ...(left ? { lastTriedAt: laterTry(l, at) } : {}) };
   if (a.kind === "found") return { ...tried, outcome: "found" };
   if (a.kind === "nothing" && !p.held.length) {
     // R585 M8: a service whose send the rules denied was not asked: the lookup is not answered by it ("not-allowed",
@@ -228,7 +231,9 @@ function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string): 
   const services = a.kind === "waiting" ? [...new Set([...a.services, ...p.held])] : p.held;
   const notBefore = Math.max(a.kind === "waiting" ? a.notBefore : 0, p.heldUntil ?? 0, keptNotBefore(l, ms(at)) ?? 0);
   const waiting: LeftOutLookup = { ...tried, services, notBefore: new Date(notBefore).toISOString(), ...(isAskedToWait(l) ? {} : { why: "asked-to-wait" as const }) };
-  return counted && tries >= LOOK_UP_AGAIN_BOUNDS.maxAutomaticTries ? { ...waiting, outcome: "gave-up" } : waiting;
+  if (counted && tries >= LOOK_UP_AGAIN_BOUNDS.maxAutomaticTries) return { ...waiting, outcome: "gave-up" };
+  // The app gave up before and the researcher's press was told to wait again: it stays given up (the pass does not take it).
+  return !counted && prior === "gave-up" ? { ...waiting, outcome: "gave-up" } : waiting;
 }
 
 /**
@@ -236,12 +241,12 @@ function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string): 
  * look-up has settled meanwhile ("found" or "nothing" now, not when this act read it) is left as the re-read has it; one
  * that is not the same lookup any more (it cannot be: nothing reorders `leftOut`) is left too.
  */
-function settle(p: Plan, cur: LeftOutLookup | undefined, a: Answered | undefined, at: string): LeftOutLookup | undefined {
+function settle(p: Plan, cur: LeftOutLookup | undefined, a: Answered | undefined, at: string, by: LookUpBy): LeftOutLookup | undefined {
   if (!cur) return undefined;
   const same = (x: LeftOutLookup) => JSON.stringify([x.identifier, x.title, x.creator]);
   if (same(cur) !== same(p.lookup)) return cur;
   if (isAnswered(cur) && cur.outcome !== p.lookup.outcome) return cur;
-  return after(p, cur, a, at);
+  return after(p, cur, a, at, by);
 }
 
 /**
@@ -424,7 +429,7 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
         // R585 (2): each lookup's result is worked out against the entry as re-read here, at its place (R585 1).
         const leftOut = [...(cur.leftOut ?? [])];
         for (const p of plans) {
-          const settled = settle(p, leftOut[p.at], answered.get(p), at);
+          const settled = settle(p, leftOut[p.at], answered.get(p), at, opts.by);
           if (settled) leftOut[p.at] = settled;
         }
         const candidates = appendCandidates(cur.candidates, found);
@@ -453,7 +458,7 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
     asked: toAsk.filter((p) => !deniedAll(p)).length,
     services,
     sent: sentCount,
-    notAllowed: plans.filter((p) => after(p, p.lookup, answered.get(p), at).outcome === "not-allowed").length,
+    notAllowed: plans.filter((p) => after(p, p.lookup, answered.get(p), at, opts.by).outcome === "not-allowed").length,
     found: added,
     state: view,
   };
