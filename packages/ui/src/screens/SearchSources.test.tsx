@@ -867,3 +867,47 @@ describe("Search sources: leaving the screen cancels its held read (FR-756, R605
     await waitFor(() => expect(signals[0]!.aborted).toBe(true));
   });
 });
+
+describe("Search sources: the project left (FR-756, R605 M4)", () => {
+  it("a give-up of the read of the project left never shows on the project chosen", async () => {
+    const P2 = "0190b000-0000-7000-8000-0000000000a2";
+    const svc = useSvc();
+    const gate = hang();
+    svc.onGet = async () => {
+      await gate;
+      return undefined;
+    };
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [] })));
+    const LIMIT = 600;
+    const { rerender } = render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: `?project=${P1}` }} firstReadMs={LIMIT} />);
+    await waitFor(() => expect(svc.count("GET", "/settings/search-sources")).toBe(1));
+    await new Promise((r) => setTimeout(r, LIMIT / 2));
+    rerender(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: `?project=${P2}` }} firstReadMs={LIMIT} />);
+    await waitFor(() => expect(svc.count("GET", "/settings/search-sources")).toBe(2));
+    // Past the first read's limit, before the second's: nothing is said of the project chosen.
+    await new Promise((r) => setTimeout(r, LIMIT / 2 + 150));
+    expect(screen.queryAllByRole("alert")).toEqual([]);
+    expect(screen.getByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
+    // Its own read is given up in its turn.
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+  });
+});
+
+describe("Search sources: the project left, given up before the switch (FR-756, R605 M4)", () => {
+  it("its alert goes when another project is chosen: the loading words for the project chosen", async () => {
+    const P2 = "0190b000-0000-7000-8000-0000000000a2";
+    const svc = useSvc();
+    const gate = hang();
+    svc.onGet = async () => {
+      await gate;
+      return undefined;
+    };
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [] })));
+    const { rerender } = render(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: `?project=${P1}` }} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    rerender(<SearchSources client={testClient()} loc={{ pathname: PATHS.searchSources, search: `?project=${P2}` }} firstReadMs={300} />);
+    await waitFor(() => expect(screen.queryAllByRole("alert")).toEqual([]));
+    expect(screen.getByText(SEARCH_SOURCES_TEXT.loading)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+});

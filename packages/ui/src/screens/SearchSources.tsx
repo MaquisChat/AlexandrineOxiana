@@ -47,7 +47,6 @@ import { ApiClientError, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../api/firstRead";
 import { importApi } from "../api/import";
 import { KeyField, type KeyFieldWords } from "../components/KeyField";
-import { useLeaveSignal } from "../components/leaveSignals";
 import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import { inAppLink, PATHS, projectInQuery, type AppLocation } from "../navigation";
@@ -251,20 +250,24 @@ export function SearchSources({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS
     return true;
   }, []);
 
+  /**
+   * The project's reads: cancelled when another project is chosen (R605 M4: a give-up of the project left never shows on
+   * the one chosen) and when the screen is left (R605 M3).
+   */
+  const projectReads = useRef(new AbortController());
   /** The settings, read again; with the project's rules when the screen is opened for one. */
-  /** R605 M3: the reads are cancelled when the screen is left. */
-  const leaving = useLeaveSignal();
   const read = useCallback(
     async (withProject = true): Promise<void> => {
       const project = withProject ? projectRef.current : undefined;
       const seq = ++readSeq.current;
+      const outer = projectReads.current.signal;
       try {
         // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
-        const r = await readWithin((signal) => api.read(project, { signal }), firstReadMs, leaving());
-        if (!alive.current) return;
+        const r = await readWithin((signal) => api.read(project, { signal }), firstReadMs, outer);
+        if (!alive.current || outer.aborted) return;
         if (apply(r, seq) && project !== undefined) setProjectError(undefined);
       } catch (err) {
-        if (!alive.current) return;
+        if (!alive.current || outer.aborted) return;
         // Given up at the limit (R586 M5): the service did not answer, which says nothing of the project.
         if (project !== undefined && project === projectRef.current && !isNoAnswerInTime(err)) {
           // The project could not be read (not found, not an id, no library open): its sentence, and the settings anyway.
@@ -278,12 +281,18 @@ export function SearchSources({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS
         }
       }
     },
-    [api, apply, firstReadMs, leaving],
+    [api, apply, firstReadMs],
   );
 
   useEffect(() => {
+    const ac = new AbortController();
+    projectReads.current = ac;
     setProjectError(undefined);
+    // The alert of the project left goes with it (R605 M4): the loading words while the one chosen is read.
+    setLoadError(undefined);
+    setLoadUnreachable(false);
     void read();
+    return () => ac.abort();
   }, [read, projectId]);
 
   // The project's name, for the rules' note (the settings are shown whatever happens here).
