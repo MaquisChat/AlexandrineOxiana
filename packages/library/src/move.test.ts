@@ -1597,6 +1597,45 @@ describe("FR-755 (R583): split moves, the check before finishing, and what canno
     await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ code: "newer-format" });
   });
 
+  // R590 N1: the old library of an unfinished split opens read-only until the new place has finished the move.
+  for (const n of [1, 2]) {
+    it(`R590 N1: the old library of a split whose marking stopped after ${n === 1 ? "the first" : "the last"} moved project opens read-only as moved, naming the new place, and nothing in it changes; once the new place has finished the move it opens for changes with the projects that stayed`, async () => {
+      const f = await splitFixture();
+      moveSeams.fail = { at: "split-mark", afterFolders: n };
+      await expect(moveSplit(f)).rejects.toMatchObject({ code: "ENOSPC" });
+      await f.lib.close();
+      const before = await hashes(f.lib.root);
+      const old = await openLibrary(f.lib.root, mkDeps());
+      expect([old.mode, old.readOnlyReason, old.movedTo]).toEqual(["read-only", "moved", { newRoot: f.dest, unfinished: true }]);
+      await old.close();
+      expect(await hashes(f.lib.root)).toEqual(before);
+      expect((await finishMoveAt(f.dest, mkDeps()))?.verified).toBe(true);
+      await assertSplitFinished(f);
+    });
+  }
+
+  it("R590 N1: the old library of an unfinished split is matched by its real path: opened through a symbolic link, it is read-only too", async () => {
+    const f = await splitFixture();
+    moveSeams.fail = { at: "split-mark", afterFolders: 1 };
+    await expect(moveSplit(f)).rejects.toMatchObject({ code: "ENOSPC" });
+    await f.lib.close();
+    await symlink(f.lib.root, join(tmp, "OldLink"));
+    const old = await openLibrary(join(tmp, "OldLink"), mkDeps());
+    expect([old.mode, old.readOnlyReason]).toEqual(["read-only", "moved"]);
+    await old.close();
+  });
+
+  it("R590 N1: a split stopped before any project was marked: the old library is still the library and opens for changes", async () => {
+    const f = await splitFixture();
+    moveSeams.fail = { at: "split-mark", afterFolders: 1 };
+    await expect(moveSplit(f)).rejects.toMatchObject({ code: "ENOSPC" });
+    await f.lib.close();
+    await rm(join(f.lib.root, f.a.folder, "MOVED.json"));
+    const old = await openLibrary(f.lib.root, mkDeps());
+    expect(old.mode).toBe("read-write");
+    await old.close();
+  });
+
   // R590 N4: where the new place cannot be read, whether the move finished cannot be told: the old copy is kept.
   it("R590 N4: the new place's drive not connected: the old copy cannot be deleted, and the refusal says why", async () => {
     const { lib } = await fixture();

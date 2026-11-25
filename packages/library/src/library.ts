@@ -15,7 +15,7 @@ import {
   startHeartbeat,
   type LockInfo,
 } from "./lock.js";
-import { movedToFor, type MovedTo } from "./old-copies.js";
+import { movedToFor, unfinishedSplitFrom, type MovedTo } from "./old-copies.js";
 import { registerLibrary } from "./registry.js";
 
 export const FORMAT_VERSION = 1;
@@ -280,6 +280,11 @@ export async function openLibraryInternal(
     const movedTo = await movedToFor(deps, resolve(root), meta.libraryId).catch(() => undefined);
     return readOnly("moved", movedTo);
   }
+  // R590 N1: the old library of this computer's unfinished split (some moved project marked, not all): read-only as moved,
+  // the projects that stayed included, until the new place has finished the move. Then no backup and no change can write
+  // into a moving project the finishing would have to leave behind.
+  const split = await unfinishedSplitFrom(deps, root, meta.libraryId).catch(() => undefined);
+  if (split) return readOnly("moved", split);
   if (!internal.ignoreMoveJournal && (await exists(join(root, MOVE_JOURNAL)))) return readOnly("move-incomplete");
   // Same-process double open: the lock on disk is ours, so the lock rules
   // alone would let a second handle through.

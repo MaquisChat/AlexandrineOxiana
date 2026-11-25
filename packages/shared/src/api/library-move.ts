@@ -23,14 +23,14 @@ export function moveNotFinishedText(newRoot?: string): string {
 }
 
 /**
- * R583 I1: the sentence for a split, in three parts. The moved projects' folders in the old library are marked (or are
- * marked when the move is finished), so that library opens again with the projects that stayed only.
+ * R583 I1, R590 N1: the sentence for a split, in three parts. The new library is to be opened FIRST: until the move is
+ * finished there, the library the projects came from opens read-only (this computer's record of the unfinished split);
+ * once it is finished, that library opens again, with the projects that stayed only.
  */
 export function moveNotFinishedSplitParts(newRoot?: string): [string, string, string] {
-  const after = ", and the move will be finished then. The library they came from can be opened again for the projects that stayed; nothing is lost.";
-  return newRoot
-    ? ["The move of the projects did not finish, so the library has been closed. Open the new library at its new place, ", newRoot, after]
-    : [`The move of the projects did not finish, so the library has been closed. Open the new library at its new place${after}`, "", ""];
+  const before = "The move of the projects did not finish, so the library has been closed. Open the new library first, at its new place";
+  const after = ": the move will be finished then. Until then the library they came from opens only read-only; after that it opens again for the projects that stayed. Nothing is lost.";
+  return newRoot ? [`${before}, `, newRoot, after] : [`${before}${after}`, "", ""];
 }
 
 export function moveNotFinishedSplitText(newRoot?: string): string {

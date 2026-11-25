@@ -245,6 +245,29 @@ export interface MovedTo {
 }
 const movedToOf = (r: PendingOldCopy, state: MoveFinished): MovedTo => ({ newRoot: r.newRoot, unfinished: state !== "finished", ...(state === "damaged" ? { journalDamaged: true as const } : {}) });
 
+/**
+ * R590 N1: this device's record shows an unfinished SPLIT out of the folder `root` (real path) for the library
+ * `libraryId`, and at least one moved project there is already marked: the old library is then to open read-only as
+ * moved, the projects that stayed included, until the new place has finished the move. (Once every moved project is
+ * marked, its library.json carries the remaining library's id, and this no longer matches; while no project is marked
+ * the move cannot be finished at the new place, and the old library is still the library.)
+ */
+export async function unfinishedSplitFrom(deps: CfgDeps, root: string, libraryId: string): Promise<MovedTo | undefined> {
+  const r = await recordFrom(deps, root, libraryId);
+  if (!r?.split) return undefined;
+  const state = await moveFinished(r);
+  if (state === "finished") return undefined;
+  for (const f of r.movedFolders) {
+    try {
+      const m = JSON.parse(await fsp.readFile(join(root, ...f.split("/"), "MOVED.json"), "utf8")) as { libraryId?: unknown };
+      if (m.libraryId === libraryId) return movedToOf(r, state);
+    } catch {
+      // not marked
+    }
+  }
+  return undefined;
+}
+
 export async function getPendingOldCopy(deps: CfgDeps, id: string): Promise<PendingOldCopy | undefined> {
   return (await load(deps)).find((r) => r.id === id);
 }

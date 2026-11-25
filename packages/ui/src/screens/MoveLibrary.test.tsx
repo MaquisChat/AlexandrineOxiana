@@ -137,7 +137,7 @@ describe("Move library", () => {
     await user.click(within(plan).getByRole("button", { name: "Move library" }));
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toBe(
-      `The move of the projects did not finish, so the library has been closed. Open the new library at its new place, ${DEST}, and the move will be finished then. The library they came from can be opened again for the projects that stayed; nothing is lost.`,
+      `The move of the projects did not finish, so the library has been closed. Open the new library first, at its new place, ${DEST}: the move will be finished then. Until then the library they came from opens only read-only; after that it opens again for the projects that stayed. Nothing is lost.`,
     );
     expect(alert.querySelector("[dir='auto']")?.textContent).toBe(DEST);
   });

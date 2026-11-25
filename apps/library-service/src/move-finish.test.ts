@@ -479,12 +479,41 @@ describe("FR-755 (R583 I1): a split move (some projects stay behind) that fails 
     });
   }
 
-  it("the sentence for a split, word for word", () => {
+  it("the sentence for a split, word for word (R590 N1: the new library first)", () => {
     expect(moveNotFinishedSplitText()).toBe(
-      "The move of the projects did not finish, so the library has been closed. Open the new library at its new place, and the move will be finished then. The library they came from can be opened again for the projects that stayed; nothing is lost.",
+      "The move of the projects did not finish, so the library has been closed. Open the new library first, at its new place: the move will be finished then. Until then the library they came from opens only read-only; after that it opens again for the projects that stayed. Nothing is lost.",
     );
     expect(moveNotFinishedSplitText("/Volumes/Drive/Lib")).toBe(
-      "The move of the projects did not finish, so the library has been closed. Open the new library at its new place, /Volumes/Drive/Lib, and the move will be finished then. The library they came from can be opened again for the projects that stayed; nothing is lost.",
+      "The move of the projects did not finish, so the library has been closed. Open the new library first, at its new place, /Volumes/Drive/Lib: the move will be finished then. Until then the library they came from opens only read-only; after that it opens again for the projects that stayed. Nothing is lost.",
     );
+  });
+
+  it("R590 N1: after a split whose marking failed after the first moved project, the old place opens read-only naming the new place: no backup runs and nothing under it changes, at the opening and at the reopening at start; the new place then finishes; then the old place opens for changes with the project that stayed only", async () => {
+    const f = await splitLibrary();
+    moveSeams.fail = { at: "split-mark", afterFolders: 1 };
+    expect(lastLine(await move(f.dest, [f.kept])).error.reason).toBe(MOVE_NOT_FINISHED_SPLIT_REASON);
+    const before = await hashes(f.path);
+    const old = await call({ method: "POST", url: "/libraries/open", body: { path: f.path } });
+    expect([old.status, old.json.mode, old.json.readOnlyReason, old.json.moveUnfinishedTo]).toEqual([200, "read-only", "moved", f.dest]);
+    await svc!.state.idle();
+    expect(changedFiles(before, await hashes(f.path))).toEqual([]);
+    const late = await call({ method: "POST", url: `/projects/${f.study}/attach`, body: { paths: [await pdf("late.pdf", "Late")] } });
+    expect(late.status).toBe(409);
+    // Quit and start: the reopening at start opens the old place (the new one was not yet registered), read-only too.
+    await restart();
+    await svc!.state.reopenLast();
+    expect(stateOf()).toMatchObject({ open: true, mode: "read-only", readOnlyReason: "moved", moveUnfinishedTo: f.dest });
+    expect(svc!.state.session!.lib.root).toBe(f.path);
+    await svc!.state.idle();
+    expect(changedFiles(before, await hashes(f.path))).toEqual([]);
+    // The new library first: the move is finished.
+    const opened = await call({ method: "POST", url: "/libraries/open", body: { path: f.dest } });
+    expect([opened.status, opened.json.mode]).toEqual([200, "read-write"]);
+    expect(kindsNow()).toEqual(["move-finished-at-opening"]);
+    expect(await names()).toEqual(["Field", "Study"]);
+    // Then the library they came from opens again, for changes, with the project that stayed only.
+    const rest = await call({ method: "POST", url: "/libraries/open", body: { path: f.path } });
+    expect([rest.status, rest.json.mode, rest.json.moveUnfinishedTo]).toEqual([200, "read-write", undefined]);
+    expect(await names()).toEqual(["Kept"]);
   });
 });
