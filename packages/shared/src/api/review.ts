@@ -89,6 +89,7 @@ export type ReviewLookUpState = "waiting" | "found" | "nothing" | "not-allowed" 
  */
 export interface ReviewLookUp {
   state: ReviewLookUpState;
+  /** The app's own automatic tries (R585 M3: the researcher's presses are not counted); never "times asked". */
   tries: number;
   canLookUpNow: boolean;
   notBefore?: string;
@@ -281,7 +282,12 @@ export type ReviewLookUpOutcome =
   /** Nothing was sent: the service's named time has not come (R411, R577 iii). */
   | { kind: "not-yet"; notBefore: string }
   /** Every lookup of the entry already has its answer: nothing was sent. */
-  | { kind: "nothing-to-look-up" };
+  | { kind: "nothing-to-look-up" }
+  /**
+   * A look-up of this entry is already under way (R585 3): nothing was sent or written by this request; the entry is
+   * answered as it stands. Also the answer to any other "nothing done" the library may give that this build does not know.
+   */
+  | { kind: "under-way" };
 
 export interface ReviewLookUpAgainResponse {
   outcome: ReviewLookUpOutcome;

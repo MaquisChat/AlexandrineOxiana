@@ -14,6 +14,7 @@ import {
   lookUpStateOf,
   reviewCauseOf,
   type ListedReviewEntry,
+  type LookUpAgainRefusal,
   type LookUpAgainResult,
   type LookUpState,
   type ReviewDecision,
@@ -262,9 +263,9 @@ function lookUpOutcome(r: LookUpAgainResult, itemId: string): ReviewLookUpOutcom
         return { kind: "nothing" };
     }
   }
-  switch (r.why) {
+  switch (r.why as LookUpAgainRefusal | "not-yet") {
     case "not-yet":
-      return { kind: "not-yet", notBefore: r.notBefore };
+      return { kind: "not-yet", notBefore: (r as { notBefore: string }).notBefore };
     case "nothing-to-look-up":
       return { kind: "nothing-to-look-up" };
     case "not-found":
@@ -283,5 +284,9 @@ function lookUpOutcome(r: LookUpAgainResult, itemId: string): ReviewLookUpOutcom
     case "not-due":
       // Only the automatic pass is answered so; the researcher's act never is.
       return { kind: "nothing-to-look-up" };
+    default:
+      // R585 (3): "a look-up of this entry is already under way" (nothing sent, nothing written), and any other "nothing
+      // done" this build does not know yet: the entry is answered as it stands, never as an error.
+      return { kind: "under-way" };
   }
 }

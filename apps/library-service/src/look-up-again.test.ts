@@ -191,13 +191,17 @@ async function patchEntry(pid: string, sourceId: string, f: (e: ReviewEntry) => 
   await importChange(repo, pid, storeRequest(sf.source.provenance), async (ops) => ops.updateReview({ ...e, ...f(e) }), { op: "test.patch" });
 }
 
-/** The look-up ops of the project's audit log, in order, with the entry each names. */
+/**
+ * The look-up ops of the project's audit log, in order, with the entry each names. Consecutive lines of the same op for
+ * the same entry are one step: the send may be audited as one line per service asked (R585 M8).
+ */
 async function lookUpAudit(pid: string): Promise<Array<{ op: string; entry: string; by: string }>> {
   const { events } = await svc!.state.session!.repo.readAudit(pid);
-  return [...events]
+  const steps = [...events]
     .sort((a, b) => a.seq - b.seq)
     .filter((e) => e.details?.op === LOOK_SEND_OP || e.details?.op === LOOK_UP_AGAIN_OP)
     .map((e) => ({ op: e.details!.op as string, entry: e.details!.reviewEntry as string, by: e.details!.by as string }));
+  return steps.filter((x, i) => i === 0 || x.op !== steps[i - 1]!.op || x.entry !== steps[i - 1]!.entry);
 }
 
 /** Every file under `root` with its bytes' digest: equal snapshots mean nothing was written in between. */
@@ -588,6 +592,18 @@ describe("POST /review/:itemId/look-up-again (R577 iii)", () => {
     const r = await lookUpAgain(lib.pid, e.id);
     expect([r.status, r.json.outcome]).toEqual([200, { kind: "found", found: 2 }]);
     expect(sent).toEqual([`api.openalex.org ${titleOf(1)} Souza`]);
+  });
+
+  it('R585 (3): "a look-up of this entry is already under way" (or any "nothing done" this build does not know) answers the entry as it stands, not an error', async () => {
+    await start();
+    const lib = await libraryWithWaiting(1);
+    const e = bySource(await queue(lib.pid), lib.sources[0]!);
+    // The library's new answer, as the fix round adds it (its exact word is not known here: any unknown one is answered so).
+    svc!.state.lookUpAgainByHand = async () => ({ done: false, why: "under-way" }) as unknown as Awaited<ReturnType<LibraryService["state"]["lookUpAgainByHand"]>>;
+    const r = await lookUpAgain(lib.pid, e.id);
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toEqual({ outcome: { kind: "under-way" }, entry: e });
+    expect(sent).toEqual([]);
   });
 
   it("refused as the other review routes refuse: missing, decided, locked, read-only; the extension's token", async () => {
