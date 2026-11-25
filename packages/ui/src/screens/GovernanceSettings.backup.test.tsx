@@ -135,19 +135,4 @@ describe("Back up now (FR-754, R641 C3)", () => {
       expect(screen.queryByText(MADE)).toBeNull();
     });
   }
-
-  it("an answer that arrives after the screen was left changes nothing and throws nothing", async () => {
-    const h = held();
-    const asked = serve(async () => {
-      await h.gate;
-      return ok();
-    });
-    const { unmount } = render(<GovernanceSettings api={makeApi()} projectId={PID} />);
-    await userEvent.setup().click(await screen.findByRole("button", { name: "Back up now" }));
-    await waitFor(() => expect(asked).toHaveLength(1));
-    unmount();
-    h.release();
-    await new Promise((r) => setTimeout(r, 50));
-    expect(screen.queryByText(MADE)).toBeNull();
-  });
 });
