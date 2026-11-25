@@ -66,13 +66,18 @@ export function sse(events: Array<{ type: string; data: unknown }>): HttpRespons
 /**
  * FR-750: GET /events whose every attempt answers by `attempt(n)` (n counts from 1) — "fail" (a network error), or a
  * stream holding those events, left open. `drop()` ends the open stream (the screen connects again by itself).
+ * FR-756 C: "hang" — the attempt is never answered (it never opens) until the test ends.
  */
-export function sseAttempts(attempt: (n: number) => "fail" | Array<{ type: string; data: unknown }>) {
+export function sseAttempts(attempt: (n: number) => "fail" | "hang" | Array<{ type: string; data: unknown }>) {
   let n = 0;
   let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
   return {
-    handler: http.get(url("/events"), () => {
+    handler: http.get(url("/events"), async () => {
       const a = attempt(++n);
+      if (a === "hang") {
+        await hang();
+        return HttpResponse.error();
+      }
       if (a === "fail") return HttpResponse.error();
       const body = new ReadableStream<Uint8Array>({
         start(c) {

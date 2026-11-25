@@ -231,3 +231,40 @@ describe("Library: when the event stream opens anew, what has not been read is r
     expect(c.count("sources")).toBe(1);
   });
 });
+
+describe("Library: an event stream that does not open within the limit is tried afresh (FR-756 C, R586 M2)", () => {
+  const showStream = (streamOpenMs: number) => render(<Library api={testApi()} current={CURRENT_RW as never} streamOpenMs={streamOpenMs} />);
+
+  it("a stream that never opens is closed at the limit and opened afresh; at that opening the reads still out are made again", async () => {
+    const c = counting();
+    const ev = sseAttempts((n) => (n === 1 ? "hang" : []));
+    const gate = hang();
+    server.use(
+      ev.handler,
+      http.get(url("/projects"), async () => {
+        if (c.hit("projects") === 1) await gate;
+        return HttpResponse.json(PROJECTS);
+      }),
+      ...libraryHandlers(),
+    );
+    showStream(300); // the reads keep the default limit (twenty seconds): the first projects read is still out
+    expect(screen.getByText("Loading projects…")).toBeTruthy();
+    await screen.findByRole("navigation", { name: "Projects" }, { timeout: 10_000 });
+    await screen.findByText("Ethnography at Work");
+    expect(ev.attempts()).toBe(2);
+    expect(c.count("projects")).toBe(2);
+    // Nothing is said about the stream itself.
+    expect(alerts()).toEqual([]);
+  });
+
+  it("a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler, ...libraryHandlers());
+    showStream(200);
+    await screen.findByText("Ethnography at Work");
+    await waitFor(() => expect(ev.attempts()).toBe(1));
+    // Five times the limit, and more than the screen's pause before a new try (two seconds): still the first stream.
+    await new Promise((r) => setTimeout(r, 3_000));
+    expect(ev.attempts()).toBe(1);
+  });
+});

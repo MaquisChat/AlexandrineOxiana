@@ -20,7 +20,7 @@ import type {
 } from "@ao/shared";
 import { LIBRARY_CLOSED_TEXT } from "@ao/shared";
 
-import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
+import { ApiClientError, type ApiClient, type EventsOptions, type ServiceError, type ServiceEvent } from "./client";
 import { verificationApi } from "./verification";
 import { watchedFoldersApi } from "./watchedFolders";
 import { zoteroSyncApi } from "./zoteroSync";
@@ -349,7 +349,7 @@ const proj = (id: string) => `/projects/${seg(id)}`;
 export function libraryApi(client: ApiClient) {
   const r = client.request;
   return {
-    events: (opts: { signal?: AbortSignal; onOpen?: () => void } = {}): AsyncGenerator<ServiceEvent, void, undefined> => client.events(opts),
+    events: (opts: EventsOptions = {}): AsyncGenerator<ServiceEvent, void, undefined> => client.events(opts),
     /** Interrupted changes recovery could not settle, resolved by the researcher's choice (R27). */
     pendingWrites: {
       list: async () => (await r<{ pendingWrites: PendingWrite[] }>("GET", "/libraries/pending-writes")).pendingWrites,
