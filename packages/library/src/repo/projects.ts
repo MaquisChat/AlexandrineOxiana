@@ -588,10 +588,12 @@ export function lockAsksOf(core: RepoCore, projectId: string): number {
  * FR-769 (R641 A1): the stop a project's running imports and attaches carry in their lookup context
  * (`LookupContext.signal`). It is aborted, with ProjectLockedError as its reason, at the lock of the project when it is
  * encrypted (a project that is not encrypted has nothing to lock: its stop never aborts); already aborted while the
- * project is locked. Other projects' stops are untouched, and the lookup client itself is never halted.
+ * project is locked or a lock of it is pending. Other projects' stops are untouched, and the lookup client itself is never halted.
  */
 export function lockStopOf(core: RepoCore, projectId: string): AbortSignal {
-  if (!isUnlocked(core, projectId)) return AbortSignal.abort(new ProjectLockedError(projectId));
+  // A lock asked and waiting for the running write turn counts too: inside that turn the key is still visible, and a
+  // stop made then would never be aborted (the lock has already aborted and dropped the project's stop).
+  if ((core.pendingLocks.has(projectId) && core.encrypted(core.state(projectId))) || !isUnlocked(core, projectId)) return AbortSignal.abort(new ProjectLockedError(projectId));
   let c = core.lockStops.get(projectId);
   if (!c) core.lockStops.set(projectId, (c = new AbortController()));
   return c.signal;

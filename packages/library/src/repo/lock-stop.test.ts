@@ -5,6 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PASS, makeKit, makeProject, type Kit } from "../export/test-kit.js";
+import { importChange } from "./repo.js";
 import { ProjectLockedError } from "./errors.js";
 
 let kit: Kit;
@@ -47,5 +48,35 @@ describe("FR-769: a project's lock stop", () => {
     const stop = kit.repo.lockStopOf(p.id);
     await kit.repo.lockProject(p.id).catch(() => {});
     expect(stop.aborted).toBe(false);
+  });
+
+  async function askedInsidePendingLock(encrypted: boolean): Promise<AbortSignal | undefined> {
+    const a = await makeProject(kit, undefined, encrypted, "A");
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => (entered = r));
+    let stopInside: AbortSignal | undefined;
+    const done = importChange(kit.repo, a.id, { action: "store", store: { identifiable: false, hasLocation: false } }, async () => {
+      entered();
+      await gate;
+      stopInside = kit.repo.lockStopOf(a.id); // the lock below is pending: it waits for this turn
+    }, { op: "test.lock-stop" });
+    await inside;
+    const locked = kit.repo.lockProject(a.id);
+    release();
+    await done;
+    await locked.catch(() => {});
+    return stopInside;
+  }
+
+  it("asked inside the write turn a pending lock waits for (the key still visible there): already aborted, no stop is made that the lock never aborts", async () => {
+    const stop = await askedInsidePendingLock(true);
+    expect(stop?.aborted).toBe(true);
+    expect(stop?.reason).toBeInstanceOf(ProjectLockedError);
+  });
+
+  it("the same for a project that is not encrypted: its stop is not aborted", async () => {
+    expect((await askedInsidePendingLock(false))?.aborted).toBe(false);
   });
 });
