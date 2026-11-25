@@ -31,6 +31,31 @@ export function readWithin<T>(read: (signal: AbortSignal) => Promise<T>, ms: num
   });
 }
 
+/**
+ * FR-756: like `readWithin`, but the limit is on the ANSWER BEGINNING, not on the whole read: `read` is given a signal
+ * and `answered`, which it calls once the service's answer has begun (its headers arrived). From then on the limit no
+ * longer applies, however long the body takes to arrive (a large file on a slow drive is never cut while it arrives).
+ * An answer not begun after `ms` is given up as `readWithin` gives a read up ("did not answer in time").
+ */
+export function answerWithin<T>(read: (signal: AbortSignal, answered: () => void) => Promise<T>, ms: number, outer?: AbortSignal): Promise<T> {
+  const ac = new AbortController();
+  const stop = () => ac.abort();
+  if (outer?.aborted) ac.abort();
+  else outer?.addEventListener("abort", stop, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      ac.abort();
+      reject(noAnswerInTime());
+    }, ms);
+  });
+  // The caller's abort still cancels the read after its answer began; only the limit stops at the beginning.
+  return Promise.race([read(ac.signal, () => clearTimeout(timer)), limit]).finally(() => {
+    clearTimeout(timer);
+    outer?.removeEventListener("abort", stop);
+  });
+}
+
 /** A read that got no answer (the service could not be reached, or it did not answer in time): "Try again" may help. */
 export const isUnreachable = (err: unknown): boolean => err instanceof ApiClientError && err.status === 0 && err.code === "UNAVAILABLE";
 
