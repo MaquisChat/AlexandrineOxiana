@@ -19,6 +19,7 @@ import { ZOTERO_SYNC_REASON_TEXT, type ZoteroSyncStateResponse } from "@ao/share
 import { useEffect, useRef, useState } from "react";
 import type { LibraryApi } from "../api/library";
 import { readWithin } from "../api/firstRead";
+import { useLeaveSignal } from "../components/leaveSignals";
 import { UserText } from "../components/UserText";
 import "./LibraryZotero.css";
 import { LOCKED_TEXT, PAUSED_UNKNOWN_TEXT, ZoteroProgressText, hasUnknownPause, labelOfRef } from "./zoteroWords";
@@ -57,6 +58,8 @@ export function LibraryZotero({ api, projectId, open, events, firstReadMs }: Pro
   const [shown, setShown] = useState<{ projectId: string; links: Link[]; running?: ZoteroSyncStateResponse["running"] } | undefined>();
   const [run, setRun] = useState<ZoteroEvents["run"]>();
   const alive = useRef(true);
+  /** FR-756's remainder (R609 N3): a read still out is cancelled when the screen is left. */
+  const leaving = useLeaveSignal();
   /** Which project (and whether open) the reads belong to; moved on by a change of either and by unmount. */
   const gen = useRef(0);
   const out = useRef(false);
@@ -90,7 +93,8 @@ export function LibraryZotero({ api, projectId, open, events, firstReadMs }: Pro
       applied.current = seq;
       setShown(undefined);
     };
-    (ms === undefined ? a.zotero.state() : readWithin((signal) => a.zotero.state({ signal }), ms))
+    const left = leaving();
+    (ms === undefined ? a.zotero.state({ signal: left }) : readWithin((signal) => a.zotero.state({ signal }), ms, left))
       .then((s) => {
         if (!alive.current || mine !== gen.current || seq < applied.current) return;
         if (!s || !Array.isArray(s.links)) return failed();

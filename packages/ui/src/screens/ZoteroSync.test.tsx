@@ -1408,3 +1408,42 @@ describe("Zotero: first reads that never settle (FR-750, R579)", () => {
     expect(tryAgain()).toBeNull();
   });
 });
+
+// FR-756's remainder (R609 N4): the screen's silent side read of the projects is given up at the limit silently
+// (cancelled; nothing new is shown), and cancelled when the screen is left.
+describe("Zotero: the read of the projects beside the screen (FR-756 remainder)", () => {
+  function heldProjects() {
+    const gate = hang();
+    const seen: AbortSignal[] = [];
+    server.use(
+      http.get(url("/projects"), async ({ request }) => {
+        seen.push(request.signal);
+        await gate;
+        return HttpResponse.json({ projects: [] });
+      }),
+    );
+    return seen;
+  }
+
+  it("held, it is cancelled at the limit with no alert, and the screen is shown", async () => {
+    useSvc();
+    const seen = heldProjects();
+    render(<ZoteroSync client={testClient()} firstReadMs={300} />);
+    await screen.findByTestId("zotero-libraries");
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    await waitFor(() => expect(seen.every((s) => s.aborted)).toBe(true), { timeout: 3000 });
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("held, it is cancelled when the screen is left", async () => {
+    useSvc();
+    const seen = heldProjects();
+    const view = render(<ZoteroSync client={testClient()} firstReadMs={60_000} />);
+    await screen.findByTestId("zotero-libraries");
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    expect(seen.some((s) => s.aborted)).toBe(false);
+    view.unmount();
+    await waitFor(() => expect(seen.every((s) => s.aborted)).toBe(true), { timeout: 1000 });
+  });
+});

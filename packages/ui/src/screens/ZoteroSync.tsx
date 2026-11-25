@@ -43,6 +43,7 @@ import {
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type ReactNode } from "react";
 import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { useLeaveSignal } from "../components/leaveSignals";
 import { importApi, isValidId, type ProjectInfo } from "../api/import";
 import { libraryApi, type LibraryState } from "../api/library";
 import { zoteroSyncApi, zoteroSyncEventOf } from "../api/zoteroSync";
@@ -331,13 +332,18 @@ export function ZoteroSync({ client, firstReadMs = FIRST_READ_TIMEOUT_MS, stream
     }
   }, [api, applyState, setNoLibrary, readWaiting, firstReadMs]);
 
+  /**
+   * FR-756's remainder (R609 N4): the projects (beside the screen) are given up silently after `firstReadMs` (cancelled;
+   * what a failure showed is shown), and cancelled when the screen is left.
+   */
+  const leaving = useLeaveSignal();
   const readProjects = useCallback(() => {
     const g = gen.current;
-    imp.projects().then(
+    readWithin((signal) => imp.projects({ signal }), firstReadMs, leaving()).then(
       (p) => alive.current && g === gen.current && setProjects(p),
       () => {},
     );
-  }, [imp]);
+  }, [imp, firstReadMs, leaving]);
 
   // ---- load ----
   useEffect(() => {

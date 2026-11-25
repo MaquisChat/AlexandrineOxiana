@@ -10,6 +10,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errorText, isProjectLocked, type LibraryApi } from "../api/library";
 import type { RecheckProgress } from "../api/verification";
 import { readWithin } from "../api/firstRead";
+import { useLeaveSignal } from "./leaveSignals";
 
 export type ProjectRecheck =
   | { state: "starting" }
@@ -32,6 +33,8 @@ export function useProjectRecheck(api: Pick<LibraryApi, "verification">, opts: {
   const optsRef = useRef(opts);
   optsRef.current = opts;
   const starting = useRef(new Set<string>());
+  /** FR-756's remainder (R609 N3): the reads of the recheck's state are cancelled when the screen is left. */
+  const leaving = useLeaveSignal();
 
   const apply = useCallback((projectId: string, e: RecheckProgress) => {
     if (e.finished) {
@@ -100,7 +103,8 @@ export function useProjectRecheck(api: Pick<LibraryApi, "verification">, opts: {
     let running: { jobId: string; done: number; total: number } | null;
     try {
       const ms = optsRef.current.firstReadMs;
-      ({ running } = ms === undefined ? await api.verification.recheckState(projectId) : await readWithin((signal) => api.verification.recheckState(projectId, { signal }), ms));
+      const left = leaving();
+      ({ running } = ms === undefined ? await api.verification.recheckState(projectId, { signal: left }) : await readWithin((signal) => api.verification.recheckState(projectId, { signal }), ms, left));
     } catch {
       return;
     }
@@ -123,7 +127,7 @@ export function useProjectRecheck(api: Pick<LibraryApi, "verification">, opts: {
     const shown: ProjectRecheck = { state: "running", jobId: running.jobId, done: running.done, total: running.total };
     jobsRef.current = { ...jobsRef.current, [projectId]: shown };
     setJobs((all) => ({ ...all, [projectId]: shown }));
-  }, [api]);
+  }, [api, leaving]);
 
   return { jobs, start, onEvent, ask };
 }

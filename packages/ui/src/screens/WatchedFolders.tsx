@@ -29,6 +29,7 @@ import type { WatchedFolderFileItem, WatchedFolderSummary, WatchFolderState } fr
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type Ref } from "react";
 import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { useLeaveSignal } from "../components/leaveSignals";
 import { isProjectLocked, libraryApi, type Collection, type LibraryState, type ProjectSummary } from "../api/library";
 import { formatSize } from "../api/tools";
 import { watchedFoldersApi, watchStatusOf } from "../api/watchedFolders";
@@ -378,21 +379,28 @@ export function WatchedFolders({ client, projectId, firstReadMs = FIRST_READ_TIM
     }
   }, [api, projectId, take, markLocked, firstReadMs]);
 
+  /**
+   * FR-756's remainder (R609 N4): the reads beside the folders (the collections, the project's name, the library's mode)
+   * are given up silently after `firstReadMs` (cancelled; what a failure showed is shown), and cancelled when the screen
+   * is left.
+   */
+  const leaving = useLeaveSignal();
+  const sideRead = useCallback(<T,>(read: (signal: AbortSignal) => Promise<T>) => readWithin(read, firstReadMs, leaving()), [firstReadMs, leaving]);
   const refreshCollections = useCallback(() => {
-    lib.collections.list(projectId).then(
+    sideRead((signal) => lib.collections.list(projectId, { signal })).then(
       (r) => alive.current && setCollections(r.collections),
       () => {},
     );
-  }, [lib, projectId]);
+  }, [lib, projectId, sideRead]);
 
   // ---- load: the folders, the project's name, the library's mode, the collections ----
   useEffect(() => {
     void relist();
-    lib.projects.list().then(
+    sideRead((signal) => lib.projects.list({ signal })).then(
       (r) => alive.current && setProject(r.projects.find((p) => p.id === projectId)),
       () => {},
     );
-    lib.libraries.list().then(
+    sideRead((signal) => lib.libraries.list({ signal })).then(
       (r) => {
         if (!alive.current || !r.current) return;
         libraryId.current ??= r.current.libraryId;
@@ -401,7 +409,7 @@ export function WatchedFolders({ client, projectId, firstReadMs = FIRST_READ_TIM
       () => {},
     );
     refreshCollections();
-  }, [lib, projectId, relist, refreshCollections]);
+  }, [lib, projectId, relist, refreshCollections, sideRead]);
 
   // ---- live updates: watch.status of this project, and the library's mode ----
   useEffect(() => {
