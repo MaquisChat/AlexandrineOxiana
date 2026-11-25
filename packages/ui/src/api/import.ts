@@ -421,10 +421,10 @@ export function importApi(client: ApiClient) {
     source: (projectId: string, sourceId: string) => r<SourceFile>("GET", `/projects/${pid(projectId)}/sources/${seg(sourceId)}`),
     searchSources: async (projectId: string, text: string) =>
       (await r<{ items: SourceListItem[] }>("GET", `/projects/${pid(projectId)}/sources`, { query: { text, limit: 20 } })).items,
-    collections: async (projectId: string) => (await r<{ collections: Collection[] }>("GET", `/projects/${pid(projectId)}/collections`)).collections,
+    collections: async (projectId: string, o: { signal?: AbortSignal } = {}) => (await r<{ collections: Collection[] }>("GET", `/projects/${pid(projectId)}/collections`, o)).collections,
     /** The project's tags and the workspace's (both can be added to a source). */
-    tags: async (projectId: string) => {
-      const t = await r<{ tags: Tag[]; workspaceTags?: Tag[] }>("GET", `/projects/${pid(projectId)}/tags`);
+    tags: async (projectId: string, o: { signal?: AbortSignal } = {}) => {
+      const t = await r<{ tags: Tag[]; workspaceTags?: Tag[] }>("GET", `/projects/${pid(projectId)}/tags`, o);
       return [...t.tags, ...(t.workspaceTags ?? []).map((w) => ({ ...w, scope: "workspace" }))];
     },
     // ---- before an import (Task 57) ----

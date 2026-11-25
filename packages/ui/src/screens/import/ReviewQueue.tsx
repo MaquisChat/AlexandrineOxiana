@@ -647,10 +647,10 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         else setError(errorText(e));
       },
     );
-    // FR-756 (R602 M4): the reads beside the queue are given up at the limit silently, as they fail.
+    // FR-756 (R602 M4, R623 Minor 3): the reads beside the queue are given up at the limit silently, as they fail.
     readWithin((signal) => api.policy(projectId, { signal }), firstReadMs, ac.signal).then((x) => ok() && setPolicy(x), () => ok() && setPolicy({ pseudonymizeNames: true, encryptionRequired: true }));
-    api.collections(projectId).then((c) => ok() && setCollections(c), () => {});
-    api.tags(projectId).then((t) => ok() && setTags(t), () => {});
+    readWithin((signal) => api.collections(projectId, { signal }), firstReadMs, ac.signal).then((c) => ok() && setCollections(c), () => {});
+    readWithin((signal) => api.tags(projectId, { signal }), firstReadMs, ac.signal).then((t) => ok() && setTags(t), () => {});
     setBatchesKnown(false);
     readWithin((signal) => api.batches(projectId, { signal }), firstReadMs, ac.signal).then(
       (b) => {

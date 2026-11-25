@@ -5,7 +5,7 @@
  * queue again ("Loading…" meanwhile). The picker's reads (`/import/review` with no project) have it too, and the page
  * (picker and queue) says one sentence with one "Try again" (R602 M1, R605 I2).
  */
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -124,6 +124,44 @@ describe("the review queue's own first read (FR-756 remainder)", () => {
     expect(q.h.signals[0]!.aborted).toBe(false);
     unmount();
     await waitFor(() => expect(q.h.signals[0]!.aborted).toBe(true));
+  });
+});
+
+describe("the review queue's side reads of collections and tags (the bulk bar's lists): the limit, silently (FR-756 remainder, R623 Minor 3)", () => {
+  /** The collections and tags, each held (never settling); their requests' signals. */
+  function heldLists() {
+    const signals: AbortSignal[] = [];
+    const held = async ({ request }: { request: Request }) => {
+      signals.push(request.signal);
+      await hang();
+      return undefined;
+    };
+    return { signals, handlers: [http.get(url("/projects/:id/collections"), held), http.get(url("/projects/:id/tags"), held)] };
+  }
+  const options = (name: string) => within(screen.getByRole("combobox", { name })).getAllByRole("option").map((o) => o.textContent);
+
+  it("held, they are given up at the limit: no alert, and the bulk bar's lists show what a failure showed (nothing to choose)", async () => {
+    const lists = heldLists();
+    const m = mockService({ extra: [queueAsks(["answer"]).handler, ...lists.handlers], sources: { s1: RECORD } });
+    render(<ReviewQueue client={m.client} projectId={P1} firstReadMs={LIMIT} />);
+    await screen.findByText("1 entry is waiting", { exact: false });
+    await waitFor(() => expect(lists.signals).toHaveLength(2));
+    expect(lists.signals.some((s) => s.aborted)).toBe(false);
+    await waitFor(() => expect(lists.signals.every((s) => s.aborted)).toBe(true), { timeout: 5000 });
+    expect(alerts()).toEqual([]);
+    expect(tryAgains()).toHaveLength(0);
+    expect(options("Add tag")).toEqual(["Choose a tag"]);
+    expect(options("Move to collection")).toEqual(["Choose a collection"]);
+  });
+
+  it("leaving the queue cancels them", async () => {
+    const lists = heldLists();
+    const m = mockService({ extra: [queueAsks(["answer"]).handler, ...lists.handlers], sources: { s1: RECORD } });
+    const { unmount } = render(<ReviewQueue client={m.client} projectId={P1} />);
+    await waitFor(() => expect(lists.signals).toHaveLength(2));
+    expect(lists.signals.some((s) => s.aborted)).toBe(false);
+    unmount();
+    await waitFor(() => expect(lists.signals.every((s) => s.aborted)).toBe(true));
   });
 });
 
