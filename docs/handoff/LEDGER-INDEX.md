@@ -519,3 +519,4 @@ R593 (2026-11-25 UTC): "Look up again" engine approved with small points at its 
 R594 (2026-11-25 UTC): main 88a6bed — CI run 287 green (71 min); with the Mac job (run 19) both checks of main are green
 R595 (2026-11-25 UTC): "Look up again" engine ready at 89a97d2 (m1, m2 in, read by the coordinator); one question on the "failed" sentence in a mix goes to the review of the service and the page
 R596 (2026-11-25 UTC): FR-755's third round built (87181b8); N3's new sentence confirmed; N4's banner words corrected ("cannot tell" never says "has not finished"; deletion stays fail-closed); three questions to the third look
+R597 (2026-11-25 UTC): FR-756's first piece built (8155fe1); the event stream's opening limit is turned on consumer by consumer with a test each (now: Library and FR-750's three screens), never by default; the other screens begin in kg-7
