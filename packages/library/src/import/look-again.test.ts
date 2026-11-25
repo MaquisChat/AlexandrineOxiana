@@ -378,6 +378,30 @@ describe("lookUpAgain refuses early and writes nothing", () => {
     expect(await snapshot(lib.root)).toEqual(snap);
   });
 
+  for (const by of ["researcher", "automatic"] as const) {
+    it(`FR-769 (${by}): a project locked while the look-up's first request waits to leave — nothing is sent after the lock, it answers "locked" and writes nothing`, async () => {
+      const p = await project(true);
+      const http = client();
+      answers["api.crossref.org"] = () => WAIT_60;
+      answers["api.openalex.org"] = () => WAIT_60;
+      const [e] = await attached(p, http, [buildDoiPdf()]);
+      expect(e!.leftOut!.length).toBeGreaterThan(0);
+      now += 16 * MIN;
+      answers["api.crossref.org"] = () => ({ statusCode: 404, data: "{}" });
+      answers["api.openalex.org"] = () => SEARCH;
+      sent = [];
+      const hold = holdRequests(http, "before");
+      const run = lookUpAgain(repo, http, p.id, e!.id, { by, now: new Date(now) });
+      await hold.atGate; // its send is audited; its first request has not left
+      await repo.lockProject(p.id);
+      const snap = await snapshot(lib.root);
+      hold.release();
+      expect(await run).toEqual({ done: false, why: "locked" });
+      expect(sent).toEqual([]);
+      expect(await snapshot(lib.root)).toEqual(snap); // nothing written: no failure, no try counted
+    });
+  }
+
   it("(5) nothing is sent before the time kept on the entry: automatic — not due; the researcher — \"not yet\", with the time", async () => {
     const p = await project();
     const http = client();

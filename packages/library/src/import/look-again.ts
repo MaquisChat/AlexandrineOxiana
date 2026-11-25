@@ -347,7 +347,9 @@ async function run(repo: Repo, http: HttpClient, projectId: string, entryId: str
   }
 
   // 2. The project's rules, asked again now, per service and for title search.
-  const ctx: LookupContext = { ...(await lookupContextFor(repo, projectId, http, opts.debug ? { debug: opts.debug } : {})), askedToWait: "leave-out" };
+  // FR-769 (R641 A1, review I1): the project's lock ends this act's lookups at once — nothing more is sent for it; the
+  // client's ProjectLockedError is answered "locked" below and nothing is written (no failure, no try counted).
+  const ctx: LookupContext = { ...(await lookupContextFor(repo, projectId, http, opts.debug ? { debug: opts.debug } : {})), askedToWait: "leave-out", signal: repo.lockStopOf(projectId) };
   const allowed = (l: LeftOutLookup, s: string): boolean => {
     if (!l.identifier) return s === "openalex" && ctx.titleSearchAllowed === true && providerAllowed(ctx, "openalex");
     if (!(s in PROVIDER_HOSTS)) return false;
