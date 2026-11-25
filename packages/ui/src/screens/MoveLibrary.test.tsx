@@ -2,6 +2,7 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
+import { MOVE_FOLDER_STALE_COPY_TEXT, MOVE_FOLDER_UNFINISHED_TEXT } from "@ao/shared";
 import { makeApi, server, url, useMsw } from "../test/msw-governance";
 import { MoveLibrary } from "./MoveLibrary";
 
@@ -164,6 +165,43 @@ describe("Move library", () => {
     expect(screen.getAllByRole("alert")).toHaveLength(1);
     expect(screen.queryByText(/The move stopped; nothing was deleted/u)).toBeNull();
     expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  describe("R610 (2), R612: a refusal shows its reason, the sentence the service gives, in the dialog's alert", () => {
+    const refusedPlan = (reason: string) => http.post(url("/libraries/move/plan"), () => HttpResponse.json({ error: { code: "POLICY_DENIED", message: "The library cannot be moved there.", reason } }, { status: 403 }));
+    for (const [what, reason] of [
+      ["a folder provably holding a stale copy (S1)", MOVE_FOLDER_STALE_COPY_TEXT],
+      ["a folder that may hold the library whose move has not finished (S2)", MOVE_FOLDER_UNFINISHED_TEXT],
+      ["an ordinary folder that is not empty", "The destination folder is not empty; choose an empty folder"],
+    ] as const) {
+      it(`Check destination refused for ${what}: the message and its reason, word for word, one alert`, async () => {
+        const user = userEvent.setup();
+        server.use(refusedPlan(reason));
+        render(<MoveLibrary api={makeApi()} />);
+        await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
+        await user.click(screen.getByRole("button", { name: "Check destination" }));
+        const alert = await screen.findByRole("alert");
+        expect(alert.textContent).toBe(`The library cannot be moved there. ${reason}`);
+        expect(alert.querySelector("[dir='auto']")?.textContent).toBe(reason);
+        expect(screen.getAllByRole("alert")).toHaveLength(1);
+        expect(screen.queryByRole("region", { name: "Move plan" })).toBeNull();
+      });
+    }
+
+    it("the move refused at its own plan (a line of the stream): the message and its reason, with nothing appended", async () => {
+      const user = userEvent.setup();
+      server.use(
+        http.post(url("/libraries/move"), () =>
+          new HttpResponse(`${JSON.stringify({ error: { code: "POLICY_DENIED", message: "The library cannot be moved there.", reason: MOVE_FOLDER_UNFINISHED_TEXT } })}\n`, { headers: { "content-type": "application/x-ndjson" } }),
+        ),
+      );
+      const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+      await user.click(within(plan).getByRole("button", { name: "Move library" }));
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toBe(`The library cannot be moved there. ${MOVE_FOLDER_UNFINISHED_TEXT}`);
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
+      expect(screen.queryByText(/The move stopped; nothing was deleted/u)).toBeNull();
+    });
   });
 
   it("FR-755: the same sentence when the move's answer is read again from move/status after the stream was cut off", async () => {
