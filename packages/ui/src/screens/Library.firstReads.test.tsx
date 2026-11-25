@@ -164,6 +164,74 @@ describe("Library: first reads that never settle or fail (FR-756 B)", () => {
   });
 });
 
+describe("Library: an answer clears a give-up; a project switch clears the alerts of the project left (FR-756 I2, R602)", () => {
+  it("a projects read given up, then answered with the service's own failure after “Try again”: only the service's sentence, no “Try again”", async () => {
+    let phase: "hang" | "refuse" = "hang";
+    const gate = hang();
+    server.use(
+      http.get(url("/projects"), async () => {
+        if (phase === "hang") await gate;
+        return serviceError(500, "INTERNAL", "The projects could not be listed.");
+      }),
+      ...libraryHandlers(),
+    );
+    show(300);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    phase = "refuse";
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByText("The projects could not be listed.");
+    await waitFor(() => expect(tryAgain()).toBeNull());
+    expect(alerts()).toEqual(["The projects could not be listed."]);
+  });
+
+  it("a sources read given up, then answered with the service's own failure after “Try again”: only the service's sentence", async () => {
+    let phase: "hang" | "refuse" = "hang";
+    const gate = hang();
+    server.use(
+      http.get(url("/projects/:id/sources"), async () => {
+        if (phase === "hang") await gate;
+        return serviceError(500, "INTERNAL", "The sources could not be searched.");
+      }),
+      ...libraryHandlers(),
+    );
+    show(300);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    phase = "refuse";
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByText("The sources could not be searched.");
+    await waitFor(() => expect(tryAgain()).toBeNull());
+    expect(alerts()).toEqual(["The sources could not be searched."]);
+  });
+
+  it("p1's sources given up, then another project chosen: “Loading sources…” while its read is out, then only its own outcome", async () => {
+    const LIST = { projects: [...PROJECTS.projects, { id: "p3", name: "Archive work", folder: "Archive work", encrypted: false, unlocked: true, profiles: [] }] };
+    const gate = hang();
+    let releaseP3!: () => void;
+    const p3 = new Promise<void>((r) => (releaseP3 = r));
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json(LIST)),
+      http.get(url("/projects/:id/sources"), async ({ params }) => {
+        if (params.id === "p1") await gate;
+        else await p3;
+        return serviceError(500, "INTERNAL", "The sources could not be searched.");
+      }),
+      ...libraryHandlers(),
+    );
+    show(300);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    const nav = screen.getByRole("navigation", { name: "Projects" });
+    await userEvent.setup().click(within(nav).getByRole("button", { name: /Archive work/ }));
+    expect(await screen.findByText("Loading sources…")).toBeTruthy();
+    expect(alerts()).toEqual([]);
+    expect(tryAgain()).toBeNull();
+    releaseP3();
+    await screen.findByText("The sources could not be searched.");
+    expect(alerts()).toEqual(["The sources could not be searched."]);
+  });
+});
+
 describe("Library: when the event stream opens anew, what has not been read is read again (FR-756 B)", () => {
   it("a projects read still out (it may never settle) is made again when the stream opens anew after it failed — no press, no event needed", async () => {
     const c = counting();

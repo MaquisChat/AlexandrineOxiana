@@ -415,7 +415,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       .catch((err: unknown) => {
         if (ac.signal.aborted) return;
         if (isUnreachable(err)) return noAnswer("projects", err);
-        out.current.delete("projects");
+        // An answer, though a refusal: the give-up it followed is no longer true (R602 I2).
+        answered("projects");
         setError(message(err, "The projects could not be read."));
       });
     return () => {
@@ -494,7 +495,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       .catch((err: unknown) => {
         if (!live) return;
         if (isUnreachable(err)) return noAnswer("collections", err);
-        out.current.delete("collections");
+        // An answer, though a refusal: the give-up it followed is no longer true (R602 I2).
+        answered("collections");
         fail(err, "The collections and tags could not be read.");
       });
     return () => {
@@ -525,7 +527,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       .catch((err: unknown) => {
         if (ac.signal.aborted) return;
         if (isUnreachable(err)) return noAnswer("sources", err);
-        out.current.delete("sources");
+        // An answer, though a refusal: the give-up it followed is no longer true (R602 I2).
+        answered("sources");
         fail(err, "The sources could not be read.", setSourcesError);
       });
     return () => {
@@ -628,6 +631,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       projectIdRef.current = id;
       clearPendingFind();
       staleMore();
+      // R602 I2: what the project left got no answer for is not said of the next one.
+      setUnanswered(({ projects }) => (projects ? { projects } : {}));
       setProjectId(id);
       setCollections([]);
       setTags({ tags: [], workspaceTags: [] });
