@@ -1203,8 +1203,17 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const item = currentItem;
   /** The entries listed beside the panel, and the waiting files, shown in their own section (R303 b). */
   const listed = useMemo(() => (projectWide ? (items ?? []).filter((i) => !isFound(i)) : (items ?? [])), [items, projectWide]);
+  /**
+   * R641 C2 (iii): the queue as last read. While a re-read got no answer, the found files' cards stay in place with their
+   * own messages, as that read left them, beside the page's one alert ("one sentence per page" is about the service's
+   * silence, not a card's own message).
+   */
+  const lastRead = useRef<ReviewItem[] | null>(null);
+  if (items !== null) lastRead.current = items;
+  else if (locked) lastRead.current = null;
+  const heldShown = items ?? (unanswered ? lastRead.current : null);
   /** R319: the waiting files the service lists now (by id); those not laid out have arrived during the visit. */
-  const waitingIds = useMemo(() => new Set((items ?? []).filter(isFound).map((i) => i.id)), [items]);
+  const waitingIds = useMemo(() => new Set((heldShown ?? []).filter(isFound).map((i) => i.id)), [heldShown]);
   /**
    * R487 a (ii): the file looked at no longer waits — decided here, found decided, or no longer listed by the queue as
    * last read (while the queue is being read again, it is not known yet).
@@ -1400,7 +1409,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           )}
         </div>
       )}
-      {!locked && items !== null && projectWide && laid && (laid.items.length > 0 || arrivedCount > 0) && (
+      {!locked && heldShown !== null && projectWide && laid && (laid.items.length > 0 || arrivedCount > 0) && (
         <FoundFiles
           items={laid.items}
           waiting={waitingIds}

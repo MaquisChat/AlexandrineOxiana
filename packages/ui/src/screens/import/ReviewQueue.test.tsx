@@ -8,6 +8,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_WHY_TEXT } from "@ao/shared";
 import { FilePreview } from "./FilePreview";
 import { DECIDE_SETTLE_MS, HELD_DECISION_TIMEOUT_MS, HELD_NO_ANSWER_TEXT, ReviewQueue } from "./ReviewQueue";
+import { FIRST_READ_TIMEOUT_MS } from "../../api/firstRead";
 import { SCROLL_SETTLE_MS } from "./pressGuard";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -1217,6 +1218,49 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     passGuard();
     fireEvent.click(use(RECORD));
     await waitFor(() => expect(heldCalls).toHaveLength(2));
+  });
+
+  it("R641 C2 (iii): a decision given up, then the queue's re-read given up too: the cards stay with the card's own message, beside the page's one alert and one “Try again”", async () => {
+    const o = project();
+    const list = o.projectReview![P1]!;
+    let listReads = 0;
+    let hold = true;
+    o.extra = [
+      http.get(`${SERVICE}/projects/:id/review`, async ({ request }) => {
+        listReads++;
+        // The opening's read is answered; the re-read after the give-up is never answered (until "Try again").
+        if (listReads > 1 && hold) await new Promise<void>((r) => request.signal.addEventListener("abort", () => r(), { once: true }));
+        return HttpResponse.json({ items: list, total: list.length, offset: 0, limit: 500 });
+      }),
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        await new Promise<void>((r) => request.signal.addEventListener("abort", () => r(), { once: true }));
+        return HttpResponse.json({ decided: true });
+      }),
+    ];
+    open(o);
+    await ready(RECORD);
+    refake(["setTimeout", "clearTimeout", "Date"]);
+    try {
+      fireEvent.click(use(RECORD));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+      await vi.waitFor(() => expect(listReads).toBe(2));
+      await vi.advanceTimersByTimeAsync(FIRST_READ_TIMEOUT_MS + 100);
+    } finally {
+      refake(["Date"]);
+    }
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1));
+    const alerts = screen.getAllByRole("alert").map((a) => a.textContent);
+    expect(alerts.filter((t) => t === "The library service did not answer in time.")).toHaveLength(1);
+    expect(within(card(RECORD)).getByText(HELD_NO_ANSWER_TEXT)).toBeTruthy();
+    expect(within(card("A Second Record")).getByRole("heading", { level: 4 })).toBeTruthy();
+    expect(alerts).toEqual(expect.arrayContaining([HELD_NO_ANSWER_TEXT]));
+    expect(alerts).toHaveLength(2);
+    // "Try again" answered: the page's alert goes; the card keeps its message.
+    hold = false;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Try again" })).toBeNull());
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([HELD_NO_ANSWER_TEXT]);
   });
 
   it("FR-529: a decision given up at 60 seconds that the service records later shows as soon as the service answers, without waiting for the next read", async () => {
