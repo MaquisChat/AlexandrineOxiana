@@ -629,13 +629,17 @@ export class HttpClient {
     const signal = AbortSignal.any([...(opts.signal ? [opts.signal] : []), limit, halt]);
     const payload = JSON.stringify(body);
     let giveBack: (() => void) | undefined;
+    let slot: ((sent: boolean) => void) | undefined;
     let given = false;
     try {
       const waited = (async () => {
         const g = await this.hold(u.hostname);
         if (given) g(); // the call was given up while it waited: the place goes straight back
         else giveBack = g;
-        await this.throttle(u.hostname);
+        // FR-768: a call given up while it waits for its slot gives it back (not slept for, not moved on).
+        const s = await this.throttle(u.hostname, signal);
+        if (given) s(false);
+        else slot = s;
       })();
       await Promise.race([
         waited,
@@ -647,6 +651,7 @@ export class HttpClient {
       // FR-764: a stop or the limit that came in the turns since the wait ended keeps the request from the network
       // (undici hands a request whose signal is already aborted to the dispatcher all the same).
       if (signal.aborted) throw new Error("aborted");
+      slot?.(true);
       const res = await request(u, {
         method: "POST",
         headers: {
@@ -694,21 +699,46 @@ export class HttpClient {
       throw new LookupHttpError(signal.aborted ? "The service did not answer in time" : "The service could not be reached");
     } finally {
       given = true;
+      slot?.(false); // not sent: the slot is given back (once sent, this does nothing)
       giveBack?.();
     }
   }
 
-  /** Waits for the host's next free slot; slots are handed out in call order. */
-  private async throttle(host: string, caller?: AbortSignal): Promise<void> {
+  /**
+   * Waits for the host's next free slot; slots are handed out in call order. Resolves with the slot's settling, which the
+   * caller calls at once: `true` when its request leaves now (the host's next slot is then one gap away), `false` when
+   * it does not (FR-753 2: left out at the last check before sending; the client stopped, closing, or the caller
+   * stopped). The next caller's turn begins only once this one is settled. FR-768 (R641 A2): a slot not used is given
+   * back — the next slot is not moved, and a turn whose caller has already stopped does not sleep either. Pacing itself
+   * is never skipped: every request that leaves waits for the slot the last one that left set.
+   */
+  private async throttle(host: string, caller?: AbortSignal): Promise<(sent: boolean) => void> {
     const prev = this.hostQueue.get(host) ?? Promise.resolve();
+    let next!: () => void;
+    this.hostQueue.set(host, new Promise<void>((r) => (next = r)));
+    let settled = false;
+    const settle = (sent: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (sent) this.nextSlot.set(host, this.clock() + 1000 / (this.rates[host] ?? DEFAULT_RATE));
+      next();
+    };
     const turn = prev.then(async () => {
-      const gap = 1000 / (this.rates[host] ?? DEFAULT_RATE);
+      if (this.halt(caller).aborted) return settle(false); // stopped while queued: no sleep, the slot stays
       const wait = (this.nextSlot.get(host) ?? 0) - this.clock();
       if (wait > 0) await this.sleep(wait);
-      this.nextSlot.set(host, this.clock() + gap);
     });
-    this.hostQueue.set(host, turn.catch(() => {}));
-    await this.untilClosing(turn, caller);
+    try {
+      await this.untilClosing(turn, caller);
+    } catch (e) {
+      // The caller stopped (or the wait failed): its turn, once it has come and gone, gives the slot back.
+      void turn.then(
+        () => settle(false),
+        () => settle(false),
+      );
+      throw e;
+    }
+    return settle;
   }
 
   /**
@@ -871,13 +901,19 @@ export class HttpClient {
     for (let hop = 0; ; hop++) {
       const giveBack = await this.hold(current.hostname, caller);
       try {
-        await this.throttle(current.hostname, caller);
-        // R563 I1: a call with the choice looks at the hold immediately before it sends (another call may have set it
-        // while this one waited for its place or its slot).
-        if (leaveOut) this.leftOutIfHeld(current.hostname);
-        // FR-764, FR-765: nothing is handed to the network once the client is stopped, the session is closing or the
-        // caller has stopped — looked at right before every request, each redirect hop included.
-        this.assertOpen(caller);
+        const slot = await this.throttle(current.hostname, caller);
+        try {
+          // R563 I1: a call with the choice looks at the hold immediately before it sends (another call may have set it
+          // while this one waited for its place or its slot).
+          if (leaveOut) this.leftOutIfHeld(current.hostname);
+          // FR-764, FR-765: nothing is handed to the network once the client is stopped, the session is closing or the
+          // caller has stopped — looked at right before every request, each redirect hop included.
+          this.assertOpen(caller);
+        } catch (e) {
+          slot(false); // FR-753 (2): nothing is sent, so the slot is given back
+          throw e;
+        }
+        slot(true);
         if (!signal) {
           signal = AbortSignal.any([AbortSignal.timeout(this.attemptTimeoutMs), this.halt(caller)]);
         }
