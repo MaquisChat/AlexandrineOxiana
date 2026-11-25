@@ -207,3 +207,88 @@ NOT APPROVED.
 - **New Important (N2):** an audit log emptied or shortened at the new place passes the presence-only check. The finishing then hides it: no warning ever, "nothing was lost" said, and the old copy's full log is deletable later.
 - M1, M4 closed. M5 and M2 partly closed (M2: the deletion is allowed when the new drive is unplugged; API only).
 - Minor: a hand-deleted mark the journal records is finished over.
+
+---
+
+# Third look (R596)
+
+Branch `fr-755-move-failure` at 704506d: six commits on 6e33ae2. I changed no product code. Probes `*.probeFR755c.test.ts` were run alone and deleted; `git status --short` is empty.
+
+**Verdict: APPROVED WITH SMALL POINTS for this round.** N1–N5 are closed and R596 b holds.
+- Question (c) brings up an older fault, FR-068: it is now reachable in exactly the path the move dialog invites, and it is the one thing I would mend before calling the move safe (I-1).
+- Question (e) found a real stuck state the round made. It is narrow and safe (M-1).
+
+## N1–N5
+
+| finding | verdict | probe, file |
+|---|---|---|
+| N1 part-way split | **closed** | `fail={at:"split-mark",afterFolders:1}`. The old place opens read-only `moved`, `moveUnfinishedTo` = the new place; no byte under the old place changed after `idle()`, so no backup ran. Restart + `reopenLast()` reopens the OLD place read-only, still no byte changed. The new place then finishes, told once. The old place then opens read-write with "Kept" only. (`library.ts:283`, `old-copies.ts:377`) |
+| N2 audit logs | **closed** | Log emptied at the new place: read-only, `["empty","move-not-finished-files-differ"]`. Cut to its first line: `["truncated", …files-differ]`. Both folders unchanged by the refusal. (`move.ts:902`, `:982` `beginsWithVerified`, `:1013` `auditFaultsAt`) |
+| N3 mark removed | **closed** | The top mark of a whole library removed by hand (C2): `move-cannot-finish-mark-missing`, nothing written. The old place itself opens read-write, since its mark is gone; the finishing then refuses, so nothing is run over. The split variant (C) is covered by the builder's test. (`move.ts:893`) |
+| N4 unreachable new place | **closed** | Failure at unlink with the new drive renamed away: `deleteOldCopy` refused with the cannot-reach sentence. FINISHED move, drive away: refused the same way. Drive back: allowed (11 files). (`old-copies.ts:317`, `move.ts:1390`) |
+| N5 damaged journal at the old place; real path | **closed** | Damaged journal: the old place gives read-only `moved` with `moveUnfinishedTo` and `moveCannotFinish: true`, and the banner sentence does not promise a finishing. Real-path matching: the builder's engine test (symbolic link), by reading `recordFrom` (`old-copies.ts:299`). Letter case still cannot be probed here (ext4). |
+| R596 b | **holds** | The old place of a FINISHED move with its new drive away shows plain "moved" words (`moveUnfinishedTo` absent in the open route and in `libraryState`), and the deletion is refused with the cannot-reach sentence. After a failure at unlink with the drive away (complete + journal, "cannot tell"): also the plain words, as ruled. No reader turns "cannot tell" into "has not finished": all three go through `movedToOf` (`old-copies.ts:364`). |
+| (4) refusals write nothing | **holds** | Whole-folder snapshots of BOTH places around the opening, for: log emptied, log cut to its first line, a PDF deleted, mark removed, damaged journal. Changed files: `[]` and `[]` in every case. `auditFaultsAt` opens read-only (`move-incomplete`, no lock) with `noHeal`. |
+
+## The three questions
+
+### (c) A split that fails after the record and the journal, before the first mark
+- Probe: a directory planted where each moved project's `MOVED.json` must go, so the first mark write fails.
+- **Dialog:** `INTERNAL` "Something went wrong. Nothing was changed by this request unless it says otherwise." The page adds "The move stopped; nothing was deleted, and the library stays where it was."
+  - Broadly true: the old library carries on, read-write.
+  - But a full copy and a switching journal now sit at the new place, and nothing says so.
+- **Each place:**
+  - The old place opens read-write as the library (all three projects). N1's fourth condition is right: nothing is marked, so `finishMoveAt` returns undefined, and a read-only old library would leave both places read-only for good.
+  - The new place opens read-only `move-incomplete`, with `["truncated","truncated"]`: "The audit log of … is shorter than this computer's record of it: recent entries may have been removed outside the app." That is untrue: the old library simply went on writing (M-2).
+- **Can anything be written at the old place that a later finishing runs over? Through `finishMoveAt`: no** (it never acts on an unmarked old copy). **Through the move itself: YES (I-1):**
+  1. A change is made at the old library after the failure (attach: 200).
+  2. The obstacle is removed and the move is run again to the same folder, as the dialog's "stays where it was" invites.
+  3. `executeMove` → `finishesSwitch` → `completeMove` resumes the switch with NO copy, NO verification and NO re-check of the source.
+  4. The move answers `done`, the library opens at the new place, and Study has **2 sources, not 3**. The change is left behind in the marked old copy, silently.
+- This is FR-068 (listed since Task 13), not made by this round, and the same holds for a whole library. But it is now the natural next step after the very failure this item is about.
+
+### (e) Can the finishing's own writable opening append something other than `library.move`?
+**Yes: `audit.anchor-missing`.**
+- Engine probe: a whole-library switch stopped with mark-old done but not recorded. Before the finishing, this computer's `audit-anchors.json` is removed. The finishing is then interrupted after each step in turn (mark-old, register, close-source, audit-move, and a failure at mark-complete).
+- Its writable `openRepo` appends `audit.anchor-missing` to every moved project's log. The next opening **refuses for good** (`files-differ`, count 2) in all five cases.
+- With the anchors present, and with an outbox mark planted, all five finish at the second opening.
+- **How likely:** low. Anchors are kept per library id in this computer's config folder and carry over a move on the same computer. The state needs the anchors lost or set aside AND the finishing interrupted (killed, or a full disk at a later step).
+- **Effect:** stuck, read-only, nothing lost. The words ("N files here no longer match what was checked…") blame files the app itself wrote.
+- **Smallest true mend:** count `audit.anchor-missing` among the lines a finishing may have written after the verified beginning (`SWITCH_OWN_ACTIONS`, `move.ts`). It records a fact about this computer, not a change to the library; `anchor-mismatch` stays refused, as it is now. The library's own `audit/` log keeps the whole-hash rule, so the same applies there if this device ever wrote to it: let it take the same "begins" rule.
+
+### (f) `listUnfinishedMoves` versus `moveFinished`
+- Its only reader is `reconnect` (`reconnect.ts:760`), which sets `moveIncomplete` for a folder that opened normally or as a part-way split's old library.
+- The page only types `moveIncomplete` and shows nothing for it, and the service passes it as a bare flag.
+- Where the two judgements differ (record complete but journal still there), the folder is either the new place (opens `move-incomplete`, first branch) or the old place (top `MOVED.json` → `LibraryMovedError` with `movedToFor`, the one judgement).
+- **No disagreement a researcher meets.** Deletion offers go only through `deleteOldCopy` (one judgement) and the move's token; the retention screen's `offerOpen` is about opening an old copy, not deleting it.
+- Minor: `listUnfinishedMoves` still matches folders by text (`m.oldRoot === here`).
+
+## New findings
+
+### Important
+**I-1 (FR-068, older than FR-755; reached by (c)).** After a move that failed before the old copy was marked, the old library carries on and takes changes. Running the move again to the same folder then finishes the switch with no copy and no check, leaving those changes behind while it reports `done`.
+- Sequence: split or whole move; the first mark write fails; attach at the old library (200); the move again to the same folder → `done`; the new place lacks the change.
+- `move.ts` `executeMove` → `finishesSwitch` → `completeMove`.
+- Mend: when the journal does not record mark-old and the old copy shows no mark, do not resume the switch. Treat the journal as copying, so the copy and verification run again (the journal's `filesDone` keeps it quick), or re-hash the source against the verified record first.
+
+### Minor
+- **M-1 (from (e)).** `audit.anchor-missing` is not counted as the finishing's own, so an interrupted finishing on a computer whose anchors were lost refuses for good. One line in `SWITCH_OWN_ACTIONS`.
+- **M-2.** In state (c), the stale new place shows "recent entries may have been removed outside the app". Untrue: the old library went on.
+- **M-3.** `listUnfinishedMoves` matches the old place by text, not by real path (a flag no screen shows).
+
+## Tests run (each alone, `nice -n 10`, `NODE_OPTIONS=--use-openssl-ca`)
+- `@ao/library`: move 118, device-and-old-copies 18, reconnect 54, library 35, library-place 19, retention-old-copies 40.
+- `@ao/library-service`: move-finish 37, open-library 26, library-place-routes 8.
+- `@ao/ui`: StatusBanner 81, MoveLibrary 29.
+- All passed.
+- `tsc --noEmit`: shared, library, library-service, ui clean.
+- Existing tests: only the split sentence's expectations changed, as R590 ruled.
+
+## Message to the coordinator
+APPROVED WITH SMALL POINTS (round R590/R596).
+- **N1–N5:** closed (probes rerun).
+- **R596 b:** holds.
+- **Refusals:** every refusal writes nothing in either folder.
+- **(c):** the fourth condition is right. That state's dialog says "stays where it was", which is broadly true, but running the move again finishes it with no check and strands later changes (I-1, FR-068).
+- **(e):** yes, `audit.anchor-missing` with lost anchors; one-line mend (M-1).
+- **(f):** no visible disagreement.

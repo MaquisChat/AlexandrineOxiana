@@ -79,7 +79,7 @@ Closed (number only): D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13, D1
 - **FR-065** [code] bm25 merge approximate (Task 12, LEDGER:104)
 - **FR-066** [code] keyRing.clear without lockProject leaves TEMP content (Task 12, LEDGER:104)
 - **FR-067** [code] stale listUnfinishedMoves entry after crash between record write and switching-journal write (Task 13, LEDGER:111)
-- **FR-068** [code] source writable between 'switching' journal and mark-old → completeMove should re-hash source vs verified hashes (edits stranded in read-only old copy, not lost) — flag for final review (Task 13, LEDGER:111)
+- **FR-068** [code] source writable between 'switching' journal and mark-old → completeMove should re-hash source vs verified hashes (edits stranded in read-only old copy, not lost) — flag for final review (Task 13, LEDGER:111) — *25 November 2026 UTC, Ruling R599: PROVED by FR-755's third look (a move that failed before the mark, a change at the old library, the move run again to the same folder: it reports done and the new place lacks the change; the old copy, now marked, is offered for deletion a day later, so the change CAN be lost). Important. Being built as its own task: the switch is resumed only where the old copy cannot have changed (a mark recorded or seen); otherwise the copy and the verification are made again against the source as it is now.*
 - **FR-069** [code] orphaned moved-away folders after 24 h (Task 13, LEDGER:111)
 - **FR-070** [code] expired offers never pruned (Task 13, LEDGER:111)
 - **FR-071** [code] marker validity depends on mtimes (Task 13, LEDGER:111)
