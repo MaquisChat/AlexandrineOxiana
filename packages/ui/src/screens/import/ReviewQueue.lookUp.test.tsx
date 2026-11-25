@@ -405,3 +405,29 @@ describe("a lookup that failed outright is always said (R600 I3)", () => {
     expect(within(matches()).queryByText("No candidate matches were found.")).toBeNull();
   });
 });
+
+describe("the busy state covers the entry, not the screen (R600 m2)", () => {
+  it("while one entry's look-up runs, another entry's decisions stay usable; the entry looked up stays busy", async () => {
+    const one = entry({ reasons: [UNIDENTIFIED], lookUp: { state: "failed", tries: 0, canLookUpNow: true, failed: true } });
+    const two = entry({ id: "r2", sourceId: "s2", title: "Salt marsh survey", reasons: [UNIDENTIFIED] });
+    const record2 = { ...record, source: { ...record.source, id: "s2", title: { variants: [{ lang: "en", kind: "original", value: "Salt marsh survey" }] } } };
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    lookUpBodies = [];
+    const m = mockService({ batches: [], projectReview: { [P1]: [one, two] }, sources: { s1: record, s2: record2 }, extra: [lookUpRoute({ outcome: { kind: "nothing" }, entry: asEntry(one) }, held)] });
+    const user = userEvent.setup();
+    render(<ReviewQueue client={m.client} projectId={P1} />);
+    await openEntry(user);
+    await user.click(await screen.findByRole("button", { name: "Look up again" }));
+    await screen.findByRole("button", { name: LOOK_UP_AGAIN_TEXT.looking });
+    expect((screen.getByRole("button", { name: "Skip" }) as HTMLButtonElement).disabled).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Show Salt marsh survey" }));
+    const panel = await screen.findByRole("region", { name: "Imported record" });
+    await within(panel).findByRole("heading", { name: "Salt marsh survey" });
+    expect((screen.getByRole("button", { name: "Skip" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "Keep both" }) as HTMLButtonElement).disabled).toBe(false);
+    await act(async () => release());
+    await waitFor(() => expect(lookUpBodies).toHaveLength(1));
+  });
+});

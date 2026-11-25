@@ -910,4 +910,19 @@ describe("fix round (R600)", () => {
     expect((await lookUpAudit(lib.pid)).filter((a) => a.by === "researcher" && a.op === LOOK_SEND_OP)).toHaveLength(1);
   });
 
+  it("m2: a researcher's press goes before the pass's next entry (a pass of three; a press during the first)", { timeout: 30_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(3);
+    answer = () => NO_RESULTS;
+    const held = holdFirstRequest();
+    await reopen(lib, 16 * MIN);
+    await held.atGate;
+    const third = bySource(await queue(lib.pid), lib.sources[2]!).id as string;
+    const press = lookUpAgain(lib.pid, third);
+    await new Promise((r) => setTimeout(r, 50));
+    held.release();
+    expect((await press).json.outcome).toEqual({ kind: "nothing" });
+    await svc!.state.idle();
+    expect(sent).toEqual([1, 3, 2].map((i) => `api.openalex.org ${titleOf(i)} Souza`));
+  });
 });

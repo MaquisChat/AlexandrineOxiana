@@ -775,18 +775,23 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   };
 
   /**
-   * Decision 31 (c), "Look up again" (R577 i, iii): one request per press, while nothing else of the queue is under way
-   * (the usual busy state). Answered, the entry is shown as the service lists it now — its new matches after the earlier
-   * ones, its reasons with the state's sentence — and the result is said in the polite region. Locked meanwhile: the queue
-   * is forgotten (as for a decision); decided meanwhile (another window): it leaves the view.
+   * Decision 31 (c), "Look up again" (R577 i, iii): one request per press. R600 m2: the busy state covers the ENTRY
+   * looked up (its own decisions wait), not the screen — the other entries stay usable meanwhile. Answered, the entry is
+   * shown as the service lists it now — its new matches after the earlier ones, its reasons with the state's sentence —
+   * and the result is said in the polite region. Locked meanwhile: the queue is forgotten (as for a decision); decided
+   * meanwhile (another window): it leaves the view.
    */
-  const [lookingUp, setLookingUp] = useState<string | null>(null);
+  const [lookingUp, setLookingUp] = useState<ReadonlySet<string>>(() => new Set());
+  const lookingUpRef = useRef(new Set<string>());
+  const setLooking = (id: string, on: boolean) => {
+    if (on) lookingUpRef.current.add(id);
+    else lookingUpRef.current.delete(id);
+    setLookingUp(new Set(lookingUpRef.current));
+  };
   const lookUpAgain = async (item: ReviewItem): Promise<void> => {
-    if (busyRef.current) return;
-    busyRef.current = true;
+    if (lookingUpRef.current.has(item.id)) return;
     const g = gen.current;
-    setBusy(true);
-    setLookingUp(item.id);
+    setLooking(item.id, true);
     setError(null);
     try {
       const { outcome, entry } = await api.lookUpAgain(projectId, item.id);
@@ -804,11 +809,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       else if (e instanceof ApiClientError && e.code === "CONFLICT") leave([item.id], (n) => `This entry had already been reviewed, so it left the queue: ${titleFor(item, n)}`);
       else setError(errorText(e));
     } finally {
-      busyRef.current = false;
-      if (g === gen.current) {
-        setBusy(false);
-        setLookingUp(null);
-      }
+      if (g === gen.current) setLooking(item.id, false);
+      else lookingUpRef.current.delete(item.id);
     }
   };
 
@@ -1317,9 +1319,9 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               tags={tags}
               flagTitle={flagging && titleFromFileName(item, shownSource)}
               flagFolderNames={flagging ? (id: string) => madeByBatch(id, batchId ?? item.batchId, itemBatch(item), batchesKnown) : () => false as const}
-              busy={busy}
+              busy={busy || lookingUp.has(item.id)}
               onDecide={(d, done) => void decide(item, d, done)}
-              lookingUp={lookingUp === item.id}
+              lookingUp={lookingUp.has(item.id)}
               onLookUpAgain={() => lookUpAgain(item)}
               onConfirm={(field, value) => confirmField(item, field, value)}
               pointing={pointing}
