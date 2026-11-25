@@ -1350,6 +1350,24 @@ describe("FR-755 (R578): finishMoveAt finishes only this computer's own unfinish
     });
   }
 
+  it("R583 M2: after a failure at the journal's removal (the record already complete) the old copy says its move has not finished, and it cannot be deleted until the move is finished", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.fail = { at: "unlink" };
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toMatchObject({ code: "ENOSPC" });
+    await lib.close();
+    expect((await openLibrary(lib.root, mkDeps())).movedTo).toEqual({ newRoot: dest, unfinished: true });
+    const before = await hashes(lib.root);
+    await expect(deleteOldCopy(lib.root, { confirm: true }, { deps: mkDeps() })).rejects.toMatchObject({
+      code: "move-unfinished",
+      message: "The move of this library has not finished, so its old copy cannot be deleted yet. Open the library at its new place first; the move is finished then.",
+    });
+    expect(await hashes(lib.root)).toEqual(before);
+    expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+    expect((await openLibrary(lib.root, mkDeps())).movedTo).toEqual({ newRoot: dest, unfinished: false });
+    expect((await deleteOldCopy(lib.root, { confirm: true }, { deps: mkDeps() })).filesDeleted).toBeGreaterThan(0);
+  });
+
   it("nothing to finish (no journal): undefined, nothing written", async () => {
     const { lib } = await fixture();
     await lib.close();

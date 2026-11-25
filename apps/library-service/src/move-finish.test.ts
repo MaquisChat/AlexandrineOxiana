@@ -195,6 +195,17 @@ describe("FR-755: a move that fails once it has closed the old copy", () => {
     });
   }
 
+  it("R583 M2: after a failure at the journal's removal, the old place names the new place to open, like every unfinished state", async () => {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    moveSeams.fail = { at: "unlink" };
+    expect(lastLine(await move(dest)).error.reason).toBe(MOVE_NOT_FINISHED_REASON);
+    const old = await call({ method: "POST", url: "/libraries/open", body: { path } });
+    expect([old.json.mode, old.json.readOnlyReason, old.json.moveUnfinishedTo]).toEqual(["read-only", "moved", dest]);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: dest } })).json.mode).toBe("read-write");
+    await assertWholeAtNewPlace(path, pid, dest);
+  });
+
   it("a failure once the old copy is marked, before it is closed (the journal's write after mark-old): closed too, since the old copy may not be written any more; opening the new place finishes it", async () => {
     await start();
     const { path, pid, dest } = await libraryWithSources();

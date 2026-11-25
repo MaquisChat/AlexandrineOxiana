@@ -180,7 +180,20 @@ export async function movedToFor(deps: CfgDeps, oldRoot: string, libraryId: stri
   const r = (await load(deps))
     .filter((x) => x.oldRoot === oldRoot && x.libraryId === libraryId)
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-  return r ? { newRoot: r.newRoot, unfinished: !r.complete } : undefined;
+  return r ? { newRoot: r.newRoot, unfinished: !r.complete || (await journalStillAt(r)) } : undefined;
+}
+
+/**
+ * R583 M2: the move's journal is still at its new place (the record may already be marked complete when only the
+ * journal's removal failed): the move has not finished.
+ */
+export async function journalStillAt(rec: Pick<PendingOldCopy, "id" | "newRoot">): Promise<boolean> {
+  try {
+    const j = JSON.parse(await fsp.readFile(join(rec.newRoot, ".move-journal.json"), "utf8")) as { switch?: { pendingId?: unknown } };
+    return j.switch?.pendingId === rec.id;
+  } catch {
+    return false;
+  }
 }
 
 export async function getPendingOldCopy(deps: CfgDeps, id: string): Promise<PendingOldCopy | undefined> {

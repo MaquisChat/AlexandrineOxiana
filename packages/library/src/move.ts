@@ -34,6 +34,7 @@ import {
   addPendingOldCopy,
   getPendingOldCopy,
   isExpired,
+  journalStillAt,
   listPendingOldCopies,
   listUnfinishedMoves,
   markPendingComplete,
@@ -80,6 +81,8 @@ export type MoveRefusal =
   | "old-copy-in-use"
   /** finishMoveAt: the library's new place is open on another computer. */
   | "in-use"
+  /** deleteOldCopy: the move of this old copy has not finished (its journal is still at the new place, R583 M2). */
+  | "move-unfinished"
   | "nothing-to-complete";
 
 /** The move may not start (or the old copy may not be deleted now); nothing was changed. */
@@ -1206,6 +1209,9 @@ export async function deleteOldCopy(
   }
   if (!rec.complete) throw new InvalidConfirmTokenError("unknown");
   if (root !== rec.oldRoot) throw new InvalidConfirmTokenError("wrong-root");
+  if (await journalStillAt(rec)) {
+    throw new MoveNotAllowedError("move-unfinished", "The move of this library has not finished, so its old copy cannot be deleted yet. Open the library at its new place first; the move is finished then.");
+  }
   if (isExpired(rec, deps)) throw new InvalidConfirmTokenError("expired");
   if (!rec.split) {
     const meta = await fsp.readFile(join(root, "library.json"), "utf8").then((t) => JSON.parse(t) as Partial<LibraryJson>, () => null);
