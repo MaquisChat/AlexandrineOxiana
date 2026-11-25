@@ -42,3 +42,18 @@ How VoiceOver announces the moved alert (C2 i, iv). The e2e runs were Chromium o
 - 20× each: SourceDetail R641 20/20, FindAcquire R641 20/20, backup + chooser 20/20. The last ran two files in one command.
 - Typecheck: @ao/ui and e2e clean. lint:css clean; lint:colours ok.
 - UI build ok. Playwright Chromium: library.spec.ts 6 passed, find.spec.ts 6 passed.
+
+## Second round (coordinator's rulings)
+Head **52593d8**.
+- **C2 (iii), ruled (a)** — aff6478. `ReviewQueue.tsx`: while a re-read got no answer, the found files' cards are shown as the last read left them (`lastRead`, `heldShown`), with their own messages, beside the page's one alert and one "Try again". No new words. Test: `ReviewQueue.test.tsx` "R641 C2 (iii)…" (decision given up, re-read given up: the card and "The service did not answer. Look at the queue again before deciding." are there; exactly one "did not answer in time" alert, one "Try again"). Failed first (no card). The cards' controls stay usable in that state, as after any give-up; the card's own words say to look again first.
+- **"Back up now" off where changes are off** — fe8ff10. Disabled and described by the screen's existing reason through the same `whyId` that Retention and ProtocolDocuments use (read-only library, locked project). Two tests (one per state, the route's exact reasons): disabled, described by the reason, and a press sends nothing. Both failed first.
+- **Focus at a takeover (C2 i, iv)** — 52593d8. `TryAgain` gains `onGoneWithFocus` (a layout clean-up sees the button still focused). `usePageRead` passes on `handFocus`, and `usePageHost` returns `tryAgainRef`, whose button it focuses in the same commit. All of it is added only. Test: the C2 (i) test now focuses the panel's "Try again", types the search without moving focus, and asserts `document.activeElement` is the page's "Try again". Failed first (body). Find and acquire is wired the same way. In Find, the takeover order (the panel first, then the screen's read) cannot be reached in a test: the screen's reads are given up before a panel can be opened, apart from a re-read after an unlock. So it has no test of its own.
+- Runs:
+  - Single files: ReviewQueue 126, .look 18, .lookUp 31, .firstReads 19; ProjectReviewQueue 26.
+  - routes/import 19, routes/governance 20, routes/library 15.
+  - GovernanceSettings 65, .backup 6. governance.firstReads 37.
+  - SourceDetail.firstReads 10, SourceDetail 47. FindAcquire 234.
+  - Library 49, Library.firstReads 17. Capture.firstReads 14.
+  - 20× each, one file per command: ReviewQueue R641 20/20, backup 20/20, SourceDetail R641 20/20.
+  - Typecheck @ao/ui clean. lint:css and lint:colours ok. UI build ok.
+  - Chromium: library.spec 6, find.spec 6, review-queue.spec 11 passed.
