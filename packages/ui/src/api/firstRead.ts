@@ -72,3 +72,22 @@ export function oneNoAnswerSentence(sentences: Iterable<string | undefined>): st
   if (all.includes(SERVICE_UNREACHABLE)) return SERVICE_UNREACHABLE;
   return all.includes(SERVICE_NO_ANSWER) ? SERVICE_NO_ANSWER : all[0];
 }
+
+/**
+ * FR-756, R605 M6: several requests that make ONE limited read (inside one `readWithin`): the first to fail cancels the
+ * others at once, rather than leaving them out until they settle or the limit passes. `signal` (the read's own) still
+ * cancels them all.
+ */
+export function allOrCancel<const T extends readonly unknown[]>(signal: AbortSignal, reads: { [K in keyof T]: (signal: AbortSignal) => Promise<T[K]> }): Promise<T> {
+  const ac = new AbortController();
+  const stop = () => ac.abort();
+  if (signal.aborted) ac.abort();
+  else signal.addEventListener("abort", stop, { once: true });
+  const all = (reads as readonly ((s: AbortSignal) => Promise<unknown>)[]).map((read) =>
+    read(ac.signal).catch((err: unknown) => {
+      ac.abort();
+      throw err;
+    }),
+  );
+  return Promise.all(all).finally(() => signal.removeEventListener("abort", stop)) as Promise<unknown> as Promise<T>;
+}

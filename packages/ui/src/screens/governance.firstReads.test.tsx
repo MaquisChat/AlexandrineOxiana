@@ -496,3 +496,21 @@ describe("FR-756, R605 M5: a re-read after an act, given up, never replaces the 
     expect(h.count).toBe(3);
   });
 });
+
+describe("FR-756, R605 M6: fieldwork's three requests are one read: the failure of one cancels the others at once", () => {
+  it("a records request that fails cancels the two still out, long before the limit", async () => {
+    const signals: AbortSignal[] = [];
+    const gate = hang();
+    const held = async ({ request }: { request: Request }) => {
+      signals.push(request.signal);
+      await gate;
+      return HttpResponse.json({});
+    };
+    server.use(http.get(P("/participants"), () => HttpResponse.error()), http.get(P("/sessions"), held), http.get(P("/consents"), held));
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([UNREACHABLE]);
+    expect(signals).toHaveLength(2);
+    await waitFor(() => expect(signals.every((s) => s.aborted)).toBe(true), { timeout: 1000 });
+  });
+});

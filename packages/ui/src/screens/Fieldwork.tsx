@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { ConsentRecord, GovernanceApi, Participant, Session } from "../api/governance";
 import { ApiClientError } from "../api/client";
-import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { allOrCancel, FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { FileDrop } from "../components/FileDrop";
 import { useLatestRead } from "../components/leaveSignals";
 import { usePageRead } from "../components/PageReads";
@@ -163,8 +163,13 @@ export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = F
   const load = useCallback(async () => {
     const outer = reads.begin();
     try {
-      // FR-756: the three reads are given up together after `firstReadMs` when they have not all settled.
-      const [p, s, c] = await readWithin((signal) => Promise.all([api.participants(projectId, { signal }), api.sessions(projectId, { signal }), api.consents(projectId, { signal })]), firstReadMs, outer);
+      // FR-756: the three reads are given up together after `firstReadMs` when they have not all settled; the failure of
+      // one cancels the others at once (R605 M6).
+      const [p, s, c] = await readWithin(
+        (signal) => allOrCancel(signal, [(sg) => api.participants(projectId, { signal: sg }), (sg) => api.sessions(projectId, { signal: sg }), (sg) => api.consents(projectId, { signal: sg })]),
+        firstReadMs,
+        outer,
+      );
       if (!reads.settled(outer)) return;
       setParticipants(p.participants);
       setSessions(s.sessions);

@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { SERVICE_NO_ANSWER, SERVICE_UNREACHABLE } from "./client";
-import { answerWithin, isNoAnswerInTime, oneNoAnswerSentence } from "./firstRead";
+import { allOrCancel, answerWithin, isNoAnswerInTime, oneNoAnswerSentence } from "./firstRead";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -61,5 +61,38 @@ describe("oneNoAnswerSentence (R602 M1)", () => {
     expect(oneNoAnswerSentence([SERVICE_NO_ANSWER, SERVICE_UNREACHABLE, SERVICE_NO_ANSWER])).toBe(SERVICE_UNREACHABLE);
     expect(oneNoAnswerSentence([SERVICE_NO_ANSWER, undefined, SERVICE_NO_ANSWER])).toBe(SERVICE_NO_ANSWER);
     expect(oneNoAnswerSentence([])).toBeUndefined();
+  });
+});
+
+describe("allOrCancel (R605 M6)", () => {
+  it("the first request to fail cancels the others at once, and the whole read fails with its error", async () => {
+    const signals: AbortSignal[] = [];
+    const held = (signal: AbortSignal) =>
+      new Promise<string>((_, reject) => {
+        signals.push(signal);
+        signal.addEventListener("abort", () => reject(new DOMException("gone", "AbortError")));
+      });
+    const outer = new AbortController();
+    const err = await allOrCancel(outer.signal, [held, () => Promise.reject(new Error("refused")), held]).catch((e: unknown) => e);
+    expect((err as Error).message).toBe("refused");
+    expect(signals).toHaveLength(2);
+    expect(signals.every((s) => s.aborted)).toBe(true);
+    expect(outer.signal.aborted).toBe(false);
+  });
+
+  it("answers every request's answer, in order; the read's own signal cancels them all", async () => {
+    expect(await allOrCancel(new AbortController().signal, [async () => 1, async () => "two"] as const)).toEqual([1, "two"]);
+    const outer = new AbortController();
+    let seen: AbortSignal | undefined;
+    const p = allOrCancel(outer.signal, [
+      (signal: AbortSignal) =>
+        new Promise<never>((_, reject) => {
+          seen = signal;
+          signal.addEventListener("abort", () => reject(new DOMException("gone", "AbortError")));
+        }),
+    ]);
+    outer.abort();
+    expect(((await p.catch((e: unknown) => e)) as Error).name).toBe("AbortError");
+    expect(seen?.aborted).toBe(true);
   });
 });

@@ -30,7 +30,7 @@
 import { matchAnnotations } from "@ao/core/annotations/match";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
-import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
+import { allOrCancel, FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
 import { libraryApi, type Asset, type LibraryState, type ProjectSummary, type SourceAvailability } from "../api/library";
 import { readerApi, type AnnotationRecord } from "../api/reader";
 import { isReadablePdf } from "../components/ReaderLink";
@@ -197,8 +197,9 @@ export function ReaderRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, 
     const ac = new AbortController();
     setLoaded({ kind: "loading" });
     setEnded(undefined);
-    // FR-756: both reads are given up together if they have not both settled within the limit (the requests cancelled).
-    readWithin((signal) => Promise.all([library.sources.get(projectId, sourceId, { signal }), library.libraries.list({ signal })]), firstReadMs, ac.signal)
+    // FR-756: both reads are given up together if they have not both settled within the limit (the requests cancelled);
+    // the failure of one cancels the other at once (R605 M6).
+    readWithin((signal) => allOrCancel(signal, [(sg) => library.sources.get(projectId, sourceId, { signal: sg }), (sg) => library.libraries.list({ signal: sg })]), firstReadMs, ac.signal)
       .then(([file, libs]) => {
         if (!live) return;
         const files: ReaderFile[] = file.assets.filter((a) => isReadablePdf(a)).map((a) => ({ id: a.id, name: fileName(a), ...(missingNow(a) ? { missing: true as const } : {}) }));

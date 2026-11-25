@@ -114,3 +114,22 @@ describe("ReaderRoute: an event stream that does not open within the limit is tr
     expect(signals[0]!.aborted).toBe(false);
   });
 });
+
+describe("ReaderRoute: its two first reads are one read (FR-756, R605 M6)", () => {
+  it("a source read that fails cancels the read of the libraries still out, long before the limit", async () => {
+    const signals: AbortSignal[] = [];
+    const gate = hang();
+    serve({ source: () => HttpResponse.error() });
+    server.use(
+      http.get(url("/libraries"), async ({ request }) => {
+        signals.push(request.signal);
+        await gate;
+        return HttpResponse.json({ ...LIBRARIES, current: CURRENT_RW });
+      }),
+    );
+    show();
+    await screen.findByRole("button", { name: "Open again" });
+    await waitFor(() => expect(signals).toHaveLength(1));
+    await waitFor(() => expect(signals[0]!.aborted).toBe(true), { timeout: 1000 });
+  });
+});
