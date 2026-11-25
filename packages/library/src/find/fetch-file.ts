@@ -351,6 +351,9 @@ export async function fetchFile(
     let current = first;
     for (let hop = 0; ; hop++) {
       release ??= await place(current.hostname, ac.signal);
+      // FR-757: an abort during the waits above (the folder, a place) ends the call here: undici hands a request whose
+      // signal is already aborted to the dispatcher all the same, so nothing would otherwise stop it reaching the host.
+      if (ac.signal.aborted) throw ac.signal.reason;
       headersTimer = setTimeout(() => ac.abort(refuse("headers-timeout", SENTENCES.headers)), FETCH_FILE_HEADERS_MS);
       let res: Awaited<ReturnType<typeof request>>;
       try {
