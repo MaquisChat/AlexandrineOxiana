@@ -78,6 +78,9 @@ describe("Back up now (FR-754, R641 C3)", () => {
     const made = await screen.findByText(MADE);
     const shown = await screen.findByText(warning);
     expect(made.compareDocumentPosition(shown) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Review 2 (M1): announced with the success line, inside its status region.
+    expect(made.getAttribute("role")).toBe("status");
+    expect(shown.closest("[role=status]")).toBe(made);
     expect(shown.closest("[dir=auto]")).toBeTruthy();
     expect(document.querySelector("b")).toBeNull();
     warnings = [];

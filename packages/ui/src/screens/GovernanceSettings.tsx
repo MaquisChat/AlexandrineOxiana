@@ -568,27 +568,28 @@ function BackUpNow({ api, projectId, whyId }: { api: GovernanceApi; projectId: s
     }
   };
   return (
-    <>
-      <div className="ao-actions">
-        <button type="button" disabled={!!whyId} aria-describedby={whyId} aria-disabled={running || undefined} onClick={() => void backUp()}>
-          {running ? "Backing up…" : "Back up now"}
-        </button>
-        <span role="status">{outcome && "made" in outcome ? "A backup of this project was made." : null}</span>
-        {outcome && "error" in outcome ? (
-          <p role="alert" className="ao-warning">
-            <UserText>{outcome.error}</UserText>
-          </p>
-        ) : null}
+    <div className="ao-actions">
+      <button type="button" disabled={!!whyId} aria-describedby={whyId} aria-disabled={running || undefined} onClick={() => void backUp()}>
+        {running ? "Backing up…" : "Back up now"}
+      </button>
+      {/* Review I1, review 2 M1: what the backup itself warns of, below the success line and announced with it (inside its
+          status region), in the route's own words. */}
+      <div role="status">
+        {outcome && "made" in outcome ? "A backup of this project was made." : null}
+        {outcome && "made" in outcome
+          ? outcome.warnings.map((w, i) => (
+              <p key={i} className="ao-warning">
+                <UserText>{w}</UserText>
+              </p>
+            ))
+          : null}
       </div>
-      {/* Review I1: what the backup itself warns of, below the success line, in the route's own words. */}
-      {outcome && "made" in outcome
-        ? outcome.warnings.map((w, i) => (
-            <p key={i} className="ao-warning">
-              <UserText>{w}</UserText>
-            </p>
-          ))
-        : null}
-    </>
+      {outcome && "error" in outcome ? (
+        <p role="alert" className="ao-warning">
+          <UserText>{outcome.error}</UserText>
+        </p>
+      ) : null}
+    </div>
   );
 }
 
