@@ -394,3 +394,29 @@ describe("odd Retry-After values (decision 31 b, R563 M1)", () => {
     expect(count("api.crossref.org")).toBe(4);
   });
 });
+
+describe("a hold carried over a reopening: holdUntil (R600 I1)", () => {
+  it("holds the host until the time given: a call with the choice is left out and NOTHING is sent; after it, sent", async () => {
+    answering(CR, () => ({ statusCode: 200, data: fixture("crossref-work.json") }));
+    const http = client();
+    http.holdUntil("api.crossref.org", now + 30_000);
+    expect(http.heldUntil("api.crossref.org")).toBe(now + 30_000);
+    const err = await http.getJson(CR_URL, LEAVE).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(LookupLeftOutError);
+    expect((err as LookupLeftOutError).notBefore).toBe(now + 30_000);
+    expect(count("api.crossref.org")).toBe(0);
+    now += 30_000;
+    await expect(http.getJson(CR_URL, LEAVE)).resolves.toMatchObject({ message: { DOI } });
+    expect(count("api.crossref.org")).toBe(1);
+  });
+
+  it("capped at the client's longest hold (an hour); a later call never shortens a hold; a past time holds nothing", async () => {
+    const http = client();
+    http.holdUntil("api.crossref.org", now + 5 * 3_600_000);
+    expect(http.heldUntil("api.crossref.org")).toBe(now + 3_600_000);
+    http.holdUntil("api.crossref.org", now + 60_000);
+    expect(http.heldUntil("api.crossref.org")).toBe(now + 3_600_000);
+    http.holdUntil("api.openalex.org", now - 1);
+    expect(http.heldUntil("api.openalex.org")).toBeUndefined();
+  });
+});

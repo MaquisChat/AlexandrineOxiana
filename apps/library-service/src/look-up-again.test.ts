@@ -801,3 +801,49 @@ describe("joined to the fixed engine (R592)", () => {
     expect(sent).toHaveLength(2);
   });
 });
+
+describe("fix round (R600)", () => {
+  it("I1 (probe A1): a service's hold is carried over a reopening — 0 requests; the queue lists the held entry as not ready, with the hold's time; a press says \"not yet\" and sends nothing", async () => {
+    await start();
+    const lib = await libraryWithWaiting(3);
+    answer = () => WAIT_HOUR;
+    await reopen(lib, 16 * MIN);
+    await svc!.state.idle();
+    expect(sent).toEqual([`api.openalex.org ${titleOf(1)} Souza`]);
+    // A minute later, a fresh client: the time OpenAlex named (an hour) is kept on entry 1 only.
+    await reopen(lib, MIN);
+    await svc!.state.idle();
+    expect(sent).toHaveLength(1);
+    const items = await queue(lib.pid);
+    const held = bySource(items, lib.sources[0]!).lookUp.notBefore as string;
+    expect(Date.parse(held)).toBeGreaterThan(clock);
+    const third = bySource(items, lib.sources[2]!);
+    expect(third.lookUp).toEqual({ state: "waiting", tries: 0, canLookUpNow: false, notBefore: held });
+    const r = await lookUpAgain(lib.pid, third.id);
+    expect([r.status, r.json.outcome]).toEqual([200, { kind: "not-yet", notBefore: held }]);
+    expect(sent).toHaveLength(1);
+    // An attach of a new file now leaves OpenAlex out (decision 31 b): nothing is sent.
+    const att = await call({ method: "POST", url: `/projects/${lib.pid}/attach`, body: { paths: [await pdf("new.pdf", buildPdf({ title: "Salt marsh survey", author: "Ana Souza", lines: ["Salt marsh survey."] }))] } });
+    expect(att.status, att.body).toBe(200);
+    expect(att.json.items[0]).toMatchObject({ outcome: "needs-review", reason: LOOKUP_WAITING_TEXT });
+    expect(sent).toHaveLength(1);
+  });
+
+  it("I1: the same across a lock and an unlock of an encrypted project — the unlock carries the hold before its pass", async () => {
+    await start();
+    const lib = await libraryWithWaiting(3, { encrypted: true });
+    answer = () => WAIT_HOUR;
+    await reopen(lib, 16 * MIN);
+    expect((await call({ method: "POST", url: `/projects/${lib.pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    await svc!.state.idle();
+    expect(sent).toEqual([`api.openalex.org ${titleOf(1)} Souza`]);
+    // Reopened a minute later: the project is locked (nothing of it is read), then unlocked.
+    await reopen(lib, MIN);
+    await svc!.state.idle();
+    expect((await call({ method: "POST", url: `/projects/${lib.pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    await svc!.state.idle();
+    expect(sent).toHaveLength(1);
+    const third = bySource(await queue(lib.pid), lib.sources[2]!);
+    expect(third.lookUp).toMatchObject({ canLookUpNow: false, notBefore: expect.any(String) });
+  });
+});

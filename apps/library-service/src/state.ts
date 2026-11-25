@@ -15,7 +15,9 @@ import {
   backupFailure,
   backupIfDue,
   backupsAwaitingRemoval,
+  PROVIDER_HOSTS,
   dueLookUps,
+  keptNotBefore,
   lookUpAgain,
   type LookUpAgainResult,
   oldCopiesAwaitingDeletion,
@@ -167,6 +169,11 @@ export interface Session {
   find?: FindRunner;
   /** The index errors already seen when the index was last known good (Task F5): a new one means it cannot be trusted. */
   findIndexErrors?: number;
+  /**
+   * Decision 31 (c), R600 I1: the services' holds carried over this opening (from the times kept on the entries), set on
+   * `http` before anything of this session asks them. Never rejects.
+   */
+  holdsCarried?: Promise<void>;
 }
 
 /**
@@ -774,6 +781,7 @@ export class ServiceState {
     this.session = s;
     this.notFound = undefined;
     this.activate(s);
+    await s.holdsCarried;
     if (index && !opts.newLibrary) this.startIndexRebuild(s, needsRebuild);
     await rememberLastOpenLibrary(lib.id, this.deps).catch((err: unknown) => this.opts.log.warn({ err: this.describe(err) }, "remembering the open library"));
     return s;
@@ -992,8 +1000,10 @@ export class ServiceState {
       this.startWork("backup", async () => {
         await this.runScheduledBackups();
       });
-      // Decision 31 (c): the entries whose left-out lookups came due while the app was closed are looked up again now,
-      // in the background (the opening's answer does not wait for it).
+      // Decision 31 (c), R600 I1: the holds the services named are carried over the reopening first (the opening's answer
+      // waits for that, in `adopt`, so that an attach or a press after it respects them); then the entries whose left-out
+      // lookups came due while the app was closed are looked up again, in the background.
+      s.holdsCarried = this.carryLookUpHolds(s);
       this.startLookUpAgain();
     }
     s.http.setDiskCache(true); // in use again (after a move that was not made)
@@ -1980,6 +1990,7 @@ export class ServiceState {
     }
     this.lookUpPass = this.startWork("lookup-again", async (ctl) => {
       try {
+        await s.holdsCarried; // R600 I1: the holds carried over the opening first
         do {
           this.lookUpPassAgain = false;
           await this.runLookUpAgain(ctl);
@@ -1989,6 +2000,42 @@ export class ServiceState {
         this.lookUpPassAgain = false;
       }
     });
+  }
+
+  /**
+   * Decision 31 (c), R600 I1 (R411, choice 31c-3): the session's lookup client keeps a service's hold in memory only, so
+   * at an opening (and at an unlock, for that project) the hold is carried over from the entries: for each service, the
+   * latest time kept (the library's `keptNotBefore`: a wrong clock's time is not kept) among the readable projects'
+   * not-yet-answered asked-to-wait lookups that is still ahead; the client holds that service's host until then (capped
+   * at its longest hold; a hold it already has is never shortened). A project that cannot be read is skipped.
+   */
+  async carryLookUpHolds(s: Session, projectIds?: readonly string[]): Promise<void> {
+    if (s.lib.mode !== "read-write" || !s.bulk) return;
+    const now = this.opts.now().getTime();
+    const latest = new Map<string, number>();
+    for (const p of projectIds ?? s.repo.listProjects().map((x) => x.id)) {
+      if (!s.repo.isUnlocked(p)) continue;
+      let items: Awaited<ReturnType<BulkImport["listProjectReview"]>>["items"];
+      try {
+        items = (await s.bulk.listProjectReview(p)).items;
+      } catch (err) {
+        this.opts.log.warn({ err: this.describe(err) }, "looking up again: the review queue could not be read");
+        continue;
+      }
+      for (const e of items) {
+        for (const l of e.leftOut ?? []) {
+          // Asked to wait (not failed outright) and not answered ("found", "nothing").
+          if (l.why === "failed" || l.outcome === "found" || l.outcome === "nothing") continue;
+          const t = keptNotBefore(l, now);
+          if (t === undefined || t <= now) continue;
+          for (const svc of l.services) latest.set(svc, Math.max(latest.get(svc) ?? 0, t));
+        }
+      }
+    }
+    for (const [svc, t] of latest) {
+      const host = (PROVIDER_HOSTS as Record<string, string>)[svc];
+      if (host) s.http.holdUntil(host, t);
+    }
   }
 
   /**
@@ -2046,8 +2093,9 @@ export class ServiceState {
    * a look-up of the SAME entry runs (the pass's, or an earlier press), it does not wait for its turn: it answers at once
    * that one is under way — nothing audited, nothing sent, nothing written (the library's own refusal, by its name).
    */
-  lookUpAgainByHand(s: Session, projectId: string, entryId: string): Promise<LookUpAgainResult> {
-    if (this.lookUpRunning.has(lookUpKey(projectId, entryId))) return Promise.resolve({ done: false, why: "under-way" });
+  async lookUpAgainByHand(s: Session, projectId: string, entryId: string): Promise<LookUpAgainResult> {
+    await s.holdsCarried;
+    if (this.lookUpRunning.has(lookUpKey(projectId, entryId))) return { done: false, why: "under-way" };
     return this.lookUpInTurn(projectId, entryId, () => lookUpAgain(s.repo, s.http, projectId, entryId, { by: "researcher", closing: s.closing.signal, now: this.opts.now() }));
   }
 

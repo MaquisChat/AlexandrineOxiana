@@ -10,10 +10,12 @@ import {
   FindRunnerClosedError,
   HeldFileSourceGoneError,
   NotFoundError,
+  PROVIDER_HOSTS,
   ReviewEntryDecidedError,
   lookUpNow,
   lookUpStateOf,
   reviewCauseOf,
+  type HttpClient,
   type ListedReviewEntry,
   type LookUpAgainResult,
   type LookUpState,
@@ -55,17 +57,43 @@ import {
 import { ApiError, badRequest } from "../errors.js";
 import { bodyAs, intParam, optObj, paramsOf, projectParam, queryOf, str, strArray, type BodyOf, type Ctx, type Same } from "./util.js";
 
+/** Per service, until when (ms) the session's lookup client holds it, or undefined (R411). */
+type HeldUntil = (service: string) => number | undefined;
+const heldBy =
+  (http: HttpClient): HeldUntil =>
+  (service) => {
+    const host = (PROVIDER_HOSTS as Record<string, string>)[service];
+    return host ? http.heldUntil(host) : undefined;
+  };
+
 /**
  * Decision 31 (c) (R566 8, R577 iii): what the page needs to offer "Look up again", from the entry's left-out lookups —
- * the state (the library's `lookUpStateOf`, with every further state true of it), the tries, whether the researcher's act may send now and, when not yet, the
- * earliest time it may. R585 point 5, R592: "may it send now" and its time are the library's `lookUpNow` — the one rule
- * the act itself applies (a time only a wrong clock could have written counts as passed); the view's own `notBefore` is
- * never passed on. Never a title or an identifier. Absent when nothing was left out.
+ * the state (the library's `lookUpStateOf`, with every further state true of it), the tries, whether the researcher's
+ * act may send now and, when not yet, the earliest time it may. R585 point 5, R592: "may it send now" and its time are
+ * the library's `lookUpNow` — the one rule the act itself applies (a time only a wrong clock could have written counts as
+ * passed); the view's own `notBefore` is never passed on. R600 I1: `lookUpNow` knows only the entry, the service knows
+ * the lookup client's holds — as the act does, a lookup whose every service is held waits for the latest of their holds,
+ * and the entry may send now only while some lookup it would ask is not held. This is the ONE place the page's "now"
+ * and time are worked out. Never a title or an identifier. Absent when nothing was left out.
  */
-function lookUpOut(e: ListedReviewEntry, now: number): ReviewLookUp | undefined {
+function lookUpOut(e: ListedReviewEntry, now: number, held: HeldUntil): ReviewLookUp | undefined {
   const v = lookUpStateOf(e);
   if (!v) return undefined;
-  const { canLookUpNow, notBefore } = lookUpNow(e, new Date(now));
+  const at = new Date(now);
+  let { canLookUpNow, notBefore } = lookUpNow(e, at);
+  const left = e.leftOut ?? [];
+  if (canLookUpNow) {
+    const askable = left.filter((l) => lookUpNow({ leftOut: [l] }, at).canLookUpNow);
+    const holds = askable.map((l) => {
+      const hs = l.services.map(held);
+      return hs.length > 0 && hs.every((h) => h !== undefined) ? Math.max(...(hs as number[])) : undefined;
+    });
+    if (holds.every((h) => h !== undefined)) {
+      const rest = lookUpNow({ leftOut: left.filter((l) => !askable.includes(l)) }, at).notBefore;
+      canLookUpNow = false;
+      notBefore = new Date(Math.min(...(holds as number[]), ...(rest ? [Date.parse(rest)] : []))).toISOString();
+    }
+  }
   return {
     state: v.state,
     tries: v.tries,
@@ -78,8 +106,8 @@ function lookUpOut(e: ListedReviewEntry, now: number): ReviewLookUp | undefined 
 }
 
 /** What the queue sends of an entry (only pending entries are listed). */
-function entryOut(e: ListedReviewEntry, now: number): ProjectReviewEntry {
-  const lookUp = lookUpOut(e, now);
+function entryOut(e: ListedReviewEntry, now: number, held: HeldUntil): ProjectReviewEntry {
+  const lookUp = lookUpOut(e, now, held);
   // The cause as the library reads it (recorded, or inferred for an older entry: reviewCauseOf, R176 3).
   const read = reviewCauseOf(e);
   // A held file's cause is sent without the file's place in the project (F11): the screen needs only the entry.
@@ -158,7 +186,7 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
     if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
     const r = await s.bulk.listProjectReview(projectId, { offset, limit, ...(source ? { sourceId: source } : {}) });
     const now = state.now().getTime();
-    return { items: r.items.map((e) => entryOut(e, now)), total: r.total, offset, limit };
+    return { items: r.items.map((e) => entryOut(e, now, heldBy(s.http))), total: r.total, offset, limit };
   });
 
   app.post("/review/:itemId/decide", async (req): Promise<ReviewDecideResponse> => {
@@ -232,7 +260,7 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
     // The entry as the queue lists it now (decided or its source removed meanwhile: it is no longer waiting).
     const listed = (await s.bulk.listProjectReview(projectId, r.done ? { sourceId: r.sourceId } : {})).items.find((e) => e.id === itemId);
     if (!listed) throw new ApiError(409, "CONFLICT", ALREADY_REVIEWED);
-    const entry = entryOut(listed, state.now().getTime());
+    const entry = entryOut(listed, state.now().getTime(), heldBy(s.http));
     // Asked to wait again: the time the act may send from is `lookUpNow`'s (R592), never the view's own.
     if (outcome.kind === "asked-to-wait" && entry.lookUp?.notBefore) outcome.notBefore = entry.lookUp.notBefore;
     // Not yet: the time is the one the act met (the service's, or the lookup client's own hold of it).

@@ -440,6 +440,17 @@ export class HttpClient {
     return t !== undefined && this.clock() < t ? t : undefined;
   }
 
+  /**
+   * R600 I1: holds `host` until `t` (client clock, ms) — a hold carried over a reopening from the times the services
+   * named, kept on the entries. Capped at MAX_HOLD_MS from now, as every hold is; never shortens a hold already kept; a
+   * time already passed holds nothing.
+   */
+  holdUntil(host: string, t: number): void {
+    const until = Math.min(t, this.clock() + MAX_HOLD_MS);
+    if (until <= this.clock()) return;
+    this.notBefore.set(host, Math.max(this.notBefore.get(host) ?? 0, until));
+  }
+
   /** What ends this call's waits: the client's stop, and the closing of the session the current work runs for. */
   private halt(): AbortSignal {
     const scope = closingSignalAt(this.libraryRoot);
