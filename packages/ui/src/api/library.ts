@@ -419,7 +419,7 @@ export function libraryApi(client: ApiClient) {
           query: { text: q.text || undefined, type: q.type, collection: q.collection, tag: q.tag, limit: q.limit, offset: q.offset },
           ...(opts.signal ? { signal: opts.signal } : {}),
         }),
-      get: (pid: string, sid: string) => r<SourceFile>("GET", `${proj(pid)}/sources/${seg(sid)}`),
+      get: (pid: string, sid: string, opts: { signal?: AbortSignal } = {}) => r<SourceFile>("GET", `${proj(pid)}/sources/${seg(sid)}`, opts.signal ? { signal: opts.signal } : {}),
       update: (pid: string, sid: string, patch: SourcePatch) => r<SourceFile>("PATCH", `${proj(pid)}/sources/${seg(sid)}`, { body: patch }),
       attach: async (pid: string, paths: string[], toSourceId?: string) =>
         (await r<{ items: AttachOutcome[] }>("POST", `${proj(pid)}/attach`, { body: { paths, ...(toSourceId ? { toSourceId } : {}) } })).items,

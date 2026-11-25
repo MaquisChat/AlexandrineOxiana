@@ -584,10 +584,10 @@ const pid = (s: string): string => {
 export function captureApi(client: ApiClient) {
   const r = client.request;
   return {
-    projects: async () => (await r<{ projects: CaptureProject[] }>("GET", "/projects")).projects,
+    projects: async (o: { signal?: AbortSignal } = {}) => (await r<{ projects: CaptureProject[] }>("GET", "/projects", o)).projects,
     /** The rules as the screen reads them; the service's `readable: false` also counts as unreadable (R379 FR-A18). */
-    policy: async (projectId: string): Promise<CapturePolicy> => {
-      const g = await r<{ yaml: string } & Partial<GovernanceReadability>>("GET", `/projects/${pid(projectId)}/governance`);
+    policy: async (projectId: string, o: { signal?: AbortSignal } = {}): Promise<CapturePolicy> => {
+      const g = await r<{ yaml: string } & Partial<GovernanceReadability>>("GET", `/projects/${pid(projectId)}/governance`, o);
       return g.readable === false ? { ...UNREADABLE_POLICY } : capturePolicyFromYaml(g.yaml);
     },
     /** Queues links for the downloader; outcomes arrive as `capture.progress` events. */

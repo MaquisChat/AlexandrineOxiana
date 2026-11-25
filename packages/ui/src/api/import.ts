@@ -349,13 +349,13 @@ function readImportPolicy(yaml: string): ImportPolicyRead {
 export function importApi(client: ApiClient) {
   const r = client.request;
   return {
-    projects: async () => (await r<{ projects: ProjectInfo[] }>("GET", "/projects")).projects,
+    projects: async (o: { signal?: AbortSignal } = {}) => (await r<{ projects: ProjectInfo[] }>("GET", "/projects", o)).projects,
     /**
      * The service's `readable: false` reads the rules strictly and says so (R379 FR-A18); an answer
      * without the field (an older or partial one) is readable only if the rules read here (R397 f).
      */
-    policy: async (projectId: string): Promise<ImportPolicyRead> => {
-      const g = await r<{ yaml: string } & Partial<GovernanceReadability>>("GET", `/projects/${pid(projectId)}/governance`);
+    policy: async (projectId: string, o: { signal?: AbortSignal } = {}): Promise<ImportPolicyRead> => {
+      const g = await r<{ yaml: string } & Partial<GovernanceReadability>>("GET", `/projects/${pid(projectId)}/governance`, o);
       if (g.readable === false) return { pseudonymizeNames: true, encryptionRequired: true, readable: false };
       const read = readImportPolicy(g.yaml);
       return g.readable === undefined ? read : { ...read, readable: true };
@@ -367,7 +367,7 @@ export function importApi(client: ApiClient) {
       r<{ batchId: string }>("POST", `/projects/${pid(projectId)}/import`, { body: { adapter, options } }),
     deviceImport: (projectId: string, body: { dir: string; sessionId?: string; participantIds?: string[]; options: ImportOptions & { researcherName?: string } }) =>
       r<{ batchId: string }>("POST", `/projects/${pid(projectId)}/device-import`, { body }),
-    batches: async (projectId: string) => (await r<{ batches: BatchSummary[] }>("GET", `/projects/${pid(projectId)}/imports`)).batches,
+    batches: async (projectId: string, o: { signal?: AbortSignal } = {}) => (await r<{ batches: BatchSummary[] }>("GET", `/projects/${pid(projectId)}/imports`, o)).batches,
 
     pause: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${bid(batchId)}/pause`),
     resume: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${bid(batchId)}/resume`),

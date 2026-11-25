@@ -58,6 +58,7 @@ import { matchAnnotations } from "@ao/core/annotations/match";
 import { READER_PDF_MAX_BYTES } from "@ao/shared";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { ANSWER_CUT_OFF, ApiClientError } from "../api/client";
+import { answerWithin, FIRST_READ_TIMEOUT_MS, isNoAnswerInTime } from "../api/firstRead";
 import { isStreamCutOff } from "../api/governance";
 import type { SourceAvailability } from "../api/library";
 import type { AnnotationRecord, HighlightColourName, ReaderApi } from "../api/reader";
@@ -74,7 +75,7 @@ import { useHighlightMaking } from "../reader/useHighlightMaking";
 import { useKeyboardMaking } from "../reader/useKeyboardMaking";
 import "../reader/Reader.css";
 
-export type ReaderStateKind = "locked" | "missing" | "damaged" | "too-large" | "not-a-pdf" | "password-needed" | "password-wrong" | "unreachable" | "other";
+export type ReaderStateKind = "locked" | "missing" | "damaged" | "too-large" | "not-a-pdf" | "password-needed" | "password-wrong" | "unreachable" | "no-answer" | "other";
 
 /** Each state's heading and sentence (the sentences are the plan's, exactly). */
 export const READER_STATES: Record<ReaderStateKind, { heading: string; sentence: string }> = {
@@ -86,6 +87,8 @@ export const READER_STATES: Record<ReaderStateKind, { heading: string; sentence:
   "password-needed": { heading: "Password needed", sentence: "This PDF is protected by a password. Enter it to read it here." },
   "password-wrong": { heading: "Password needed", sentence: "That password did not open this PDF." },
   unreachable: { heading: "Library service not reachable", sentence: "The library service could not be reached, so this PDF cannot be shown. Try again in a moment." },
+  // FR-756 (R586 M5): a read given up at its time limit — the service may only have been slow, so not "not reachable".
+  "no-answer": { heading: "Library service did not answer", sentence: "The library service did not answer in time, so this PDF cannot be shown. Try again in a moment." },
   other: { heading: "PDF not shown", sentence: "This PDF could not be opened." },
 };
 
@@ -147,7 +150,8 @@ export function ReaderStateView({ heading, sentence, focus = false, children }: 
 
 /** R470 b: a file to LOOK at only — its bytes by ranges from a route of its own (a held file). */
 export interface LookOnly {
-  range(start: number, end: number, signal?: AbortSignal): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
+  /** `onAnswer` (FR-756): called once the answer has begun, before its bytes are read (the opening's limit stops there). */
+  range(start: number, end: number, signal?: AbortSignal, onAnswer?: () => void): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
   /**
    * Called once the file is no longer there ("not found", at the first range or in mid-look): the holder of the look
    * stops showing it and says so in its own words (R487 a).
@@ -186,6 +190,11 @@ export interface ReaderScreenProps {
    * gone. The route then asks, and ends the reader with "Project not found" if it is (A10).
    */
   onProjectInDoubt?(): void;
+  /**
+   * FR-756: while the PDF opens, how long each part of the file asked for may wait for its answer to BEGIN before the
+   * opening is given up ("did not answer in time"); an answer that has begun is never cut, however slowly it arrives.
+   */
+  firstReadMs?: number;
 }
 
 type Phase =
@@ -207,9 +216,11 @@ export const READER_CUT_OFF = `${ANSWER_CUT_OFF} Open the PDF again to read it.`
 
 /** The state a failure is shown as: its kind, and "out of reach" or "cut off" by what the last range met. */
 function stateOf(err: unknown, lastRangeError: unknown): { state: ReaderStateKind; sentence: string } {
+  if (isNoAnswerInTime(err)) return { state: "no-answer", sentence: READER_STATES["no-answer"].sentence };
   if (unreachable(err)) return { state: "unreachable", sentence: READER_STATES.unreachable.sentence };
   if (cutOff(err)) return { state: "other", sentence: READER_CUT_OFF };
   const e: PdfOpenError = toPdfOpenError(err);
+  if (e.kind === "other" && isNoAnswerInTime(lastRangeError)) return { state: "no-answer", sentence: READER_STATES["no-answer"].sentence };
   if (e.kind === "other" && unreachable(lastRangeError)) return { state: "unreachable", sentence: READER_STATES.unreachable.sentence };
   if (e.kind === "other" && cutOff(lastRangeError)) return { state: "other", sentence: READER_CUT_OFF };
   // "other" carries its own sentence (a file that changed while it was read, a worker that did not start…).
@@ -230,7 +241,7 @@ export const FIND_NOT_CARRIED = "Your search was not carried over, so all annota
 /** Said when the annotation the address names is not in the source (Task R12). */
 export const ANNOTATION_GONE = "That highlight or note is no longer there.";
 
-export function ReaderScreen({ api, projectId, sourceId, assetId: storedAssetId, annotationId, findWords, onFindDone, preloadedAnnotations, readOnly: libraryReadOnly, look, availability, onProjectInDoubt }: ReaderScreenProps) {
+export function ReaderScreen({ api, projectId, sourceId, assetId: storedAssetId, annotationId, findWords, onFindDone, preloadedAnnotations, readOnly: libraryReadOnly, look, availability, onProjectInDoubt, firstReadMs = FIRST_READ_TIMEOUT_MS }: ReaderScreenProps) {
   // R470 b: a look makes nothing — every making path sees a read-only reader with no file of the source.
   const assetId = look ? undefined : storedAssetId;
   const readOnly = libraryReadOnly || look !== undefined;
@@ -339,7 +350,13 @@ export function ReaderScreen({ api, projectId, sourceId, assetId: storedAssetId,
       const looking = lookRef.current;
       if (!assetId && !looking) return;
       const aid = assetId ?? "";
-      const range = looking ? (start: number, end: number, signal?: AbortSignal) => looking.range(start, end, signal) : (start: number, end: number, signal?: AbortSignal) => apiRef.current.documentRange(projectId, sourceId, aid, start, end, signal);
+      const ask = looking
+        ? (start: number, end: number, signal?: AbortSignal, onAnswer?: () => void) => looking.range(start, end, signal, onAnswer)
+        : (start: number, end: number, signal?: AbortSignal, onAnswer?: () => void) => apiRef.current.documentRange(projectId, sourceId, aid, start, end, signal, onAnswer);
+      // FR-756: while the document opens ("Opening the PDF…"), each part asked for is given up if its answer has not
+      // BEGUN within the limit; one whose answer has begun is never cut (a large file may arrive slowly). Once open, no limit.
+      let opening = true;
+      const range = (start: number, end: number, signal?: AbortSignal) => (opening ? answerWithin((s, answered) => ask(start, end, s, answered), firstReadMs, signal) : ask(start, end, signal));
       const g = ++gen.current;
       abort.current?.abort();
       close();
@@ -363,6 +380,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId: storedAssetId,
           void handle.destroy().catch(() => {});
           return;
         }
+        opening = false;
         current.current = handle;
         setPage(1);
         setDraft("1");
@@ -380,7 +398,7 @@ export function ReaderScreen({ api, projectId, sourceId, assetId: storedAssetId,
         fail(stateOf(err, lastRangeError));
       }
     },
-    [assetId, projectId, sourceId, close, fail],
+    [assetId, projectId, sourceId, close, fail, firstReadMs],
   );
 
   // Letting go of the document (the screen goes, the file changes) happens in a LAYOUT effect's

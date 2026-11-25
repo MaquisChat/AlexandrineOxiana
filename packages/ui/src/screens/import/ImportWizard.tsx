@@ -14,7 +14,8 @@
  * step lists the project's recent imports, each linking to its report.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ApiClient } from "../../api/client";
+import { STREAM_OPEN_TIMEOUT_MS, type ApiClient, type ApiClientError } from "../../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, oneNoAnswerSentence, readWithin } from "../../api/firstRead";
 import { IMPORT_RULES_UNREADABLE_TEXT } from "@ao/shared";
 import { importApi, isValidId, type BatchState, type BatchSummary, type ImportPolicy, type ProjectInfo, type ScanSummary } from "../../api/import";
 import { UserText } from "../../components/UserText";
@@ -61,7 +62,14 @@ export interface ImportWizardProps {
   projectId?: string;
   /** An import of `projectId` to open (from the address): its run, or its report and undo (D1). */
   batchId?: string;
+  /** FR-756: how long each first read (the import, the projects, the rules, the run's state on arrival) is waited for. */
+  firstReadMs?: number;
+  /** FR-756 (R597): how long the run step's event stream is waited for to open before it is closed and tried afresh. */
+  streamOpenMs?: number;
 }
+
+/** FR-756: a read that got no answer (none in time, or the service could not be reached) says only its own sentence. */
+const noAnswerText = (e: unknown) => (e as ApiClientError).message;
 
 /** Batch states the run screen follows; any other state is shown as the report. */
 const LIVE: ReadonlySet<BatchState> = new Set(["running", "paused", "interrupted"]);
@@ -76,7 +84,7 @@ interface Scanned {
   summary: ScanSummary;
 }
 
-export function ImportWizard({ client, projectId: initialProject, batchId: initialBatch }: ImportWizardProps) {
+export function ImportWizard({ client, projectId: initialProject, batchId: initialBatch, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: ImportWizardProps) {
   const api = useMemo(() => importApi(client), [client]);
   /** The import named by the address, when both ids are valid: it is read before anything is shown. */
   const [opening, setOpening] = useState(() => isValidId(initialProject) && isValidId(initialBatch));
@@ -102,6 +110,12 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
   const [runError, setRunError] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * FR-756: the reads that got no answer and that "Try again" makes again (the import in the address, the projects),
+   * each with the error's own sentence. Shown as ONE sentence (R602 M1: "could not be reached" wins).
+   */
+  const [unanswered, setUnanswered] = useState<{ open?: string; projects?: string }>({});
+  const [projectsTry, setProjectsTry] = useState(0);
 
   /** Any edit after a scan makes it stale: the scan and its approvals are dropped. */
   const invalidate = () => {
@@ -119,25 +133,35 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
 
   useEffect(() => {
     let live = true;
-    api
-      .projects()
+    const ac = new AbortController();
+    readWithin((signal) => api.projects({ signal }), firstReadMs, ac.signal)
       .then((list) => {
         if (!live) return;
+        // R602 (a): an answered read takes away its earlier give-up sentence.
+        setUnanswered(({ projects: _p, ...u }) => u);
         setProjects(list);
         setProjectIdState((cur) => (cur && list.some((p) => p.id === cur) ? cur : (list.find((p) => p.unlocked !== false && isValidId(p.id))?.id ?? "")));
       })
-      .catch((e: unknown) => live && setError(errorText(e)));
+      .catch((e: unknown) => {
+        if (!live) return;
+        if (isUnreachable(e)) setUnanswered((u) => ({ ...u, projects: noAnswerText(e) }));
+        else {
+          setUnanswered(({ projects: _p, ...u }) => u);
+          setError(errorText(e));
+        }
+      });
     return () => {
       live = false;
+      ac.abort();
     };
-  }, [api]);
+  }, [api, firstReadMs, projectsTry]);
 
   // The import named in the address (D1): its run while it runs, else its report.
   useEffect(() => {
     if (!opening || !isValidId(initialProject) || !isValidId(initialBatch)) return;
     let live = true;
-    api
-      .batches(initialProject)
+    const ac = new AbortController();
+    readWithin((signal) => api.batches(initialProject, { signal }), firstReadMs, ac.signal)
       .then((list) => {
         if (!live) return;
         const b = list.find((x) => x.batchId === initialBatch);
@@ -150,12 +174,26 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
           setStep(LIVE.has(b.state) ? "run" : "report");
         }
       })
-      .catch((e: unknown) => live && setError(`The import could not be read. ${errorText(e)}`))
+      .catch((e: unknown) => {
+        if (!live) return;
+        if (isUnreachable(e)) setUnanswered((u) => ({ ...u, open: noAnswerText(e) }));
+        else setError(`The import could not be read. ${errorText(e)}`);
+      })
       .finally(() => live && setOpening(false));
     return () => {
       live = false;
+      ac.abort();
     };
-  }, [api, opening, initialProject, initialBatch]);
+  }, [api, opening, initialProject, initialBatch, firstReadMs]);
+
+  /** FR-756: "Try again" makes again what got no answer: the import in the address ("Opening the import…"), the projects. */
+  const readAgain = () => {
+    // The button goes while the reads are made again: focus waits on the wizard's heading, never the page.
+    document.getElementById("ao-import-title")?.focus();
+    if (unanswered.open) setOpening(true);
+    if (unanswered.projects) setProjectsTry((n) => n + 1);
+    setUnanswered({});
+  };
 
   // The project's recent imports, listed on the Source step, each linking to its report (D1).
   useEffect(() => {
@@ -177,8 +215,9 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
     setPolicy(null);
     setRulesUnreadable(false);
     setOptions(null); // defaults follow the project's rules
-    api
-      .policy(projectId)
+    const ac = new AbortController();
+    // FR-756: given up after `firstReadMs` as a read that failed: the rules are then taken strictly, as before.
+    readWithin((signal) => api.policy(projectId, { signal }), firstReadMs, ac.signal)
       .then((p) => {
         if (!live) return;
         setPolicy(p);
@@ -187,8 +226,9 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
       .catch(() => live && setPolicy(STRICT));
     return () => {
       live = false;
+      ac.abort();
     };
-  }, [api, projectId]);
+  }, [api, projectId, firstReadMs]);
 
   const effectivePolicy = policy ?? STRICT;
   const opts = options ?? defaultOptions(effectivePolicy);
@@ -250,12 +290,16 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
     setStep("report");
   };
 
+  /** R602 M1: one sentence for the reads that got no answer. */
+  const noAnswer = oneNoAnswerSentence([unanswered.open, unanswered.projects]);
   const current = STEPS.findIndex((s) => s.step === step);
   const project = projects.find((p) => p.id === (runProject || projectId));
 
   return (
     <main ref={wizard} className="ao-import" aria-labelledby="ao-import-title">
-      <h1 id="ao-import-title">Bulk import</h1>
+      <h1 id="ao-import-title" tabIndex={-1}>
+        Bulk import
+      </h1>
       {project && step !== "source" && (
         <p className="ao-import__hint">
           Into <UserText>{project.name}</UserText>
@@ -274,6 +318,14 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
       </ol>
 
       {opening && <p role="status">Opening the import…</p>}
+      {!opening && noAnswer !== undefined && <ErrorNote error={unanswered.open ? `The import could not be read. ${noAnswer}` : noAnswer} />}
+      {!opening && noAnswer !== undefined && (
+        <p>
+          <button type="button" onClick={readAgain}>
+            Try again
+          </button>
+        </p>
+      )}
       {/* Rules the engine cannot read: every import is refused; say why on the first step (R379 FR-A18). */}
       {!opening && step === "source" && rulesUnreadable && isValidId(projectId) && <ErrorNote error={IMPORT_RULES_UNREADABLE_TEXT} />}
       {!opening && step === "source" && (
@@ -317,7 +369,7 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
           </div>
         </>
       )}
-      {step === "run" && batchId && runProject && <StepRun client={client} api={api} projectId={runProject} batchId={batchId} onEnded={ended} focusOnArrival={arrived} />}
+      {step === "run" && batchId && runProject && <StepRun client={client} api={api} projectId={runProject} batchId={batchId} onEnded={ended} focusOnArrival={arrived} firstReadMs={firstReadMs} streamOpenMs={streamOpenMs} />}
       {step === "report" && batchId && runProject && <StepReport api={api} projectId={runProject} batchId={batchId} focusOnArrival={reportFocus ?? arrived} {...(runError ? { error: runError } : {})} />}
     </main>
   );

@@ -29,7 +29,8 @@
  */
 import { matchAnnotations } from "@ao/core/annotations/match";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ApiClientError, type ApiClient } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
 import { libraryApi, type Asset, type LibraryState, type ProjectSummary, type SourceAvailability } from "../api/library";
 import { readerApi, type AnnotationRecord } from "../api/reader";
 import { isReadablePdf } from "../components/ReaderLink";
@@ -100,6 +101,8 @@ export function fileOfFind(list: readonly AnnotationRecord[], files: readonly { 
 const fileName = (a: Asset): string => a.path.split(/[\\/]/).pop() || a.path;
 
 function failureOf(err: unknown): ReaderStateKind | "no-source" {
+  // FR-756 (R586 M5): given up at the time limit — not said to be out of reach.
+  if (isNoAnswerInTime(err)) return "no-answer";
   if (err instanceof ApiClientError) {
     if (err.status === 423) return "locked";
     if (err.status === 0) return "unreachable";
@@ -108,7 +111,12 @@ function failureOf(err: unknown): ReaderStateKind | "no-source" {
   return "other";
 }
 
-export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocation }) {
+/**
+ * `firstReadMs` (FR-756): how long the source and the library's mode are waited for ("Opening the source…"), and, in the
+ * screen, each part of the PDF for its answer to begin. `streamOpenMs` (R597): how long the library's event stream is
+ * waited for to open before it is closed and tried afresh after the usual pause.
+ */
+export function ReaderRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number }) {
   const api = useMemo(() => readerApi(client), [client]);
   const library = useMemo(() => libraryApi(client), [client]);
   const q = new URLSearchParams(loc.search);
@@ -186,9 +194,11 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
   useEffect(() => {
     if (!projectId || !sourceId) return;
     let live = true;
+    const ac = new AbortController();
     setLoaded({ kind: "loading" });
     setEnded(undefined);
-    Promise.all([library.sources.get(projectId, sourceId), library.libraries.list()])
+    // FR-756: both reads are given up together if they have not both settled within the limit (the requests cancelled).
+    readWithin((signal) => Promise.all([library.sources.get(projectId, sourceId, { signal }), library.libraries.list({ signal })]), firstReadMs, ac.signal)
       .then(([file, libs]) => {
         if (!live) return;
         const files: ReaderFile[] = file.assets.filter((a) => isReadablePdf(a)).map((a) => ({ id: a.id, name: fileName(a), ...(missingNow(a) ? { missing: true as const } : {}) }));
@@ -221,8 +231,9 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
       });
     return () => {
       live = false;
+      ac.abort();
     };
-  }, [library, projectId, sourceId, attempt]);
+  }, [library, projectId, sourceId, attempt, firstReadMs]);
 
   // A9: the library's state, while the reader is shown.
   const watching = loaded.kind === "ready" && !ended ? (loaded.libraryId ?? "") : undefined;
@@ -297,7 +308,9 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
     const listen = async () => {
       while (!ac.signal.aborted) {
         try {
-          for await (const e of library.events({ signal: ac.signal })) {
+          // FR-756 (R597): a stream not opened within the limit is closed and, after the pause below, opened afresh; the
+          // service sends the library's state first on every opening, which asks the project question again.
+          for await (const e of library.events({ signal: ac.signal, openWithinMs: streamOpenMs })) {
             if (e.type !== "library.state" || !e.data || typeof e.data !== "object") continue;
             const d = e.data as LibraryState;
             if (d.open === false || (d.libraryId !== undefined && d.libraryId !== watching)) return end("closed");
@@ -323,7 +336,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
       askNow.current = undefined;
       ac.abort();
     };
-  }, [client, library, projectId, watching]);
+  }, [client, library, projectId, watching, streamOpenMs]);
 
   if (!projectId || !sourceId) {
     return (
@@ -426,6 +439,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
           readOnly={readOnly}
           {...(availability ? { availability } : {})}
           onProjectInDoubt={() => askNow.current?.()}
+          firstReadMs={firstReadMs}
         />
       ) : (
         <ReaderStateView heading="No PDF" sentence="This source has no PDF that can be shown here." />
