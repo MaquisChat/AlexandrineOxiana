@@ -6,7 +6,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient, type ApiClientError } from "../../api/client";
-import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../../api/firstRead";
+import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../../api/firstRead";
 import { isProgressFor, type BatchState, type ImportApi } from "../../api/import";
 import { ErrorNote, errorText, fmt, Section } from "./shared";
 import { useLeaveSignal } from "../../components/leaveSignals";
@@ -84,12 +84,22 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
     (async () => {
       // On arrival: the batch may already be paused or over (R115 minor).
       if (await recheck()) return;
-      for (let tries = 0; !stop && !over.current; tries++) {
+      // R658: the tries in a row that did not prove themselves. A connection proves itself by delivering an event (any
+      // event), or by staying open and silent to its quiet limit; one that closes at once, or never opens, does not.
+      let tries = 0;
+      while (!stop && !over.current) {
         let failure: unknown;
+        let opened = false;
+        let proved = false;
         try {
           // A batch that ended before the stream opened would never send its last event: check once open. FR-756 (R597):
           // a stream not opened within `streamOpenMs` is closed and tried afresh below.
-          for await (const e of client.events({ signal: ctl.signal, onOpen: () => void recheck(), openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
+          const onOpen = () => {
+            opened = true;
+            void recheck();
+          };
+          for await (const e of client.events({ signal: ctl.signal, onOpen, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
+            proved = true;
             if (!isProgressFor(batchId, e)) continue;
             const d = e.data;
             if (typeof d.done === "number") setDone(d.done);
@@ -104,11 +114,14 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
           }
         } catch (err) {
           failure = err;
+          // Once open, the client's "did not answer in time" is only its quiet limit: the stream was open and silent to it.
+          if (opened && isNoAnswerInTime(err)) proved = true;
         }
         if (stop || ctl.signal.aborted || over.current) return;
         // The stream ended while the batch had not: check, then follow it again.
         if (await recheck()) return;
-        if (tries >= RECONNECTS) {
+        if (proved) tries = 0;
+        else if (tries++ >= RECONNECTS) {
           setLost(true);
           // A stream that got no answer says only its own sentence ("did not answer in time" or "could not be reached").
           if (failure) setError(isUnreachable(failure) ? (failure as ApiClientError).message : errorText(failure));

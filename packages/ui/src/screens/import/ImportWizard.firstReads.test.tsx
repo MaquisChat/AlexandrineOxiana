@@ -8,7 +8,7 @@
  */
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { http } from "msw";
+import { http, HttpResponse } from "msw";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { B1, BASE, mockService, P1, server, type ServiceSetup } from "../../test/importService";
 import { hang } from "../../test/service";
@@ -227,6 +227,41 @@ describe("Import wizard, run step: its first read and its event stream (FR-756, 
     await waitFor(() => expect(events.count()).toBe(2), { timeout: 10_000 });
     expect(events.signals[0]!.aborted).toBe(true);
     expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
+  });
+
+  // R658 (review M5): a connection that proved itself starts the step's count of tries again. The step's own limit is
+  // three tries in a row (two reconnects); five proven connections in a row are more than that. The sixth try is held,
+  // never opening (its opening limit is the default 20 s): the step rests there, still following.
+  it("R658: more silences in a row than the step's tries, each after the stream opened, do not end in the notice: the step keeps following", async () => {
+    const events = holding("/events", (n) => n === 6);
+    open({ batches: [running], extra: [events.handler] }, { streamQuietMs: 300 });
+    await screen.findByRole("heading", { name: "Run" });
+    await waitFor(() => expect(events.count()).toBe(6), { timeout: 20_000 });
+    for (let i = 0; i < 5; i++) expect(events.signals[i]!.aborted).toBe(true);
+    expect(events.signals[5]!.aborted).toBe(false);
+    expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+  });
+
+  it("R658: a stream that delivered an event and then dropped, more times than the step's tries, does not end in the notice: the step keeps following", async () => {
+    // Each of the first five streams delivers one event (another batch's: any event proves the connection) and ends.
+    let n = 0;
+    const requests: Request[] = [];
+    const gate = hang();
+    const other = `event: import.progress\ndata: ${JSON.stringify({ batchId: "another-batch", projectId: P1, state: "running", done: 1, total: 2 })}\n\n`;
+    const dropping = http.get(url("/events"), async ({ request }) => {
+      requests.push(request);
+      if (++n <= 5) return new HttpResponse(`: connected\n\n${other}`, { headers: { "Content-Type": "text/event-stream" } });
+      await gate;
+      return undefined;
+    });
+    open({ batches: [running], extra: [dropping] });
+    await screen.findByRole("heading", { name: "Run" });
+    await waitFor(() => expect(n).toBe(6), { timeout: 20_000 });
+    expect(requests[5]!.signal.aborted).toBe(false);
+    expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+    expect(screen.getByText("Starting…")).toBeTruthy();
   });
 });
 
