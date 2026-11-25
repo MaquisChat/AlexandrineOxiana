@@ -44,6 +44,12 @@ residency:
 `;
 const HIPAA_GOV = `profiles: [hipaa]
 `;
+/** Encryption at rest required: an unencrypted project is refused (recorded in the library's own audit log). */
+const NEEDS_ENCRYPTION = `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: required
+`;
 
 let tmp: string;
 let now: Date;
@@ -1752,5 +1758,64 @@ describe("FR-755 (R583): split moves, the check before finishing, and what canno
     const { lib, dest } = await stopped();
     await symlink(lib.root, join(tmp, "OldLink"));
     expect((await openLibrary(join(tmp, "OldLink"), mkDeps())).movedTo).toEqual({ newRoot: dest, unfinished: true });
+  });
+});
+
+describe("FR-755 (R599 M-1): on a computer whose audit anchors were lost, an interrupted finishing still finishes", () => {
+  /** A whole-library switch stopped with mark-old done but not recorded; this computer's audit anchors then removed. */
+  async function markedNotRecordedAnchorsLost() {
+    const f = await fixture();
+    // A refused project creation: the library's own audit log then holds an entry written by this computer.
+    await expect(f.repo.createProject({ name: "Refused", governanceYaml: NEEDS_ENCRYPTION, encryption: { enabled: false } })).rejects.toThrow();
+    const dest = join(tmp, "Dest");
+    moveSeams.crashAfter = "mark-old";
+    await expect(executeMove(f.lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    await f.lib.close();
+    const jp = join(dest, ".move-journal.json");
+    const j = JSON.parse(await readFile(jp, "utf8"));
+    j.switch.done = [];
+    await writeFile(jp, JSON.stringify(j));
+    await rm(join(tmp, "config", "audit-anchors.json"));
+    return { ...f, dest };
+  }
+
+  for (const step of ["mark-old", "register", "close-source", "audit-move", "mark-complete"] as const) {
+    it(`the finishing interrupted ${step === "mark-complete" ? "by a failure at mark-complete" : `after "${step}"`}: the next opening finishes it`, async () => {
+      const { lib, a, b, dest } = await markedNotRecordedAnchorsLost();
+      if (step === "mark-complete") {
+        moveSeams.fail = { at: "mark-complete" };
+        await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ code: "ENOSPC" });
+      } else {
+        moveSeams.crashAfter = step;
+        await expect(finishMoveAt(dest, mkDeps())).rejects.toBeInstanceOf(SimulatedMoveCrash);
+      }
+      // The finishing's own writable opening recorded that this computer's anchor was missing.
+      expect((await auditOf(dest, a.folder)).some((e) => e.action === "audit.anchor-missing")).toBe(true);
+      expect((await auditOf(dest, ".")).some((e) => e.action === "audit.anchor-missing")).toBe(true);
+      expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+      expect(await readdir(dest)).not.toContain(".move-journal.json");
+      for (const fo of [a.folder, b.folder]) expect((await auditOf(dest, fo)).filter((e) => e.action === "library.move")).toHaveLength(1);
+      expect((await openLibrary(lib.root, mkDeps())).readOnlyReason).toBe("moved");
+    });
+  }
+
+  it("audit.anchor-mismatch after the verified beginning of a project's log is still refused", async () => {
+    const { a, dest } = await markedNotRecordedAnchorsLost();
+    const dir = join(dest, a.folder, "audit");
+    const log = join(dir, (await readdir(dir)).filter((n) => n.endsWith(".jsonl")).sort()[0]!);
+    await writeFile(log, `${await readFile(log, "utf8")}${JSON.stringify({ action: "audit.anchor-mismatch" })}\n`);
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "files-differ", detail: { count: 1 } });
+  });
+
+  it("the library's own audit log takes the same rule: a line of another action after its verified beginning is refused", async () => {
+    const { dest } = await markedNotRecordedAnchorsLost();
+    const dir = join(dest, "audit");
+    const log = join(dir, (await readdir(dir)).filter((n) => n.endsWith(".jsonl")).sort()[0]!);
+    const text = await readFile(log, "utf8");
+    const last = JSON.parse(text.split("\n").filter(Boolean).pop()!);
+    await writeFile(log, `${text}${JSON.stringify({ ...last, seq: last.seq + 1, action: "store" })}\n`);
+    const destAt = await hashes(dest);
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "files-differ", detail: { count: 1 } });
+    expect(await hashes(dest)).toEqual(destAt);
   });
 });

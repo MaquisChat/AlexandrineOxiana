@@ -899,9 +899,10 @@ export async function finishMoveAt(destRoot: string, deps: Deps, opts: { tz?: st
     }
   }
 
-  // R583 M5: the new place checked again against the move's own record of every file it verified. R590 N2: each project's
-  // audit log must begin with exactly what was verified, followed only by the switch's own lines; and the new place's
-  // audit logs must show no fault to a check that writes nothing (empty, shortened, chain broken, head not anchored).
+  // R583 M5: the new place checked again against the move's own record of every file it verified. R590 N2: each audit
+  // log (a project's, and the library's own, R599 M-1) must begin with exactly what was verified, followed only by the
+  // finishing's own lines; and the new place's audit logs must show no fault to a check that writes nothing (empty,
+  // shortened, chain broken, head not anchored).
   const verified = (await readVerifiedHashes(rec)).files;
   const differ = await notMatching(dest, verified, (rel) => (rel === "library.json" ? "present" : AUDIT_LOG.test(rel) ? "begins" : "same"));
   for (const where of await auditFaultsAt(dest, deps)) if (!differ.some((rel) => rel.startsWith(where))) differ.push(where);
@@ -949,8 +950,8 @@ export async function finishMoveAt(destRoot: string, deps: Deps, opts: { tz?: st
   }
 }
 
-/** A project's audit log (appended by the switch's own audit steps). */
-const AUDIT_LOG = /^Projects\/[^/]+\/audit\/[^/]+\.jsonl$/u;
+/** An audit log: a project's (appended by the switch's own audit steps) or the library's own (R599 M-1: the same rule). */
+const AUDIT_LOG = /^(?:Projects\/[^/]+\/)?audit\/[^/]+\.jsonl$/u;
 
 /**
  * The files of `expected` (library-relative path → SHA-256, the move's own verification record) that are missing under
@@ -969,8 +970,12 @@ async function notMatching(root: string, expected: Record<string, string>, rule:
   return bad;
 }
 
-/** What the finishing's switch appends to a moved project's audit log at the new place (audit-move). */
-const SWITCH_OWN_ACTIONS = new Set(["library.move"]);
+/**
+ * What the finishing itself may append to an audit log at the new place: the switch's own event (audit-move), and the
+ * record its own writable opening makes when this computer's anchor of the log was lost (R599 M-1: a fact about this
+ * computer, not a change of the library). `audit.anchor-mismatch` is not among them: it is refused.
+ */
+const SWITCH_OWN_ACTIONS = new Set(["library.move", "audit.anchor-missing"]);
 
 /**
  * R590 N2: the audit log at `p` begins with exactly what the move verified, and goes on only with the switch's own lines.
