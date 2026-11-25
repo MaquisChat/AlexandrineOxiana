@@ -46,7 +46,7 @@ import { basename, delimiter, extname, isAbsolute, join, resolve, sep } from "no
 import { createInterface } from "node:readline";
 import { test as base, expect, type Page, type Request } from "@playwright/test";
 import { FAKE_SPEECH, FAKE_TOOLS, LIBRARY_DIR, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
-import { QUIET_WAIT_MS, stillOutMessage } from "./quiet.js";
+import { QUIET_SETTLE_MS, QUIET_WAIT_MS, stillOutMessage } from "./quiet.js";
 
 /** The desktop shell's origin (apps/library-service/src/auth.ts SHELL_ORIGINS): the page is served here. */
 export const APP_ORIGIN = "http://tauri.localhost";
@@ -610,20 +610,25 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl
     // FR-750 (R579): the page's requests to the service still in the air (the event stream, which never ends, aside),
     // so that a screen is not opened by its address while the page before is still reading (`gotoWhenQuiet`).
     const out = new Set<Request>();
-    /** The requests out when a new document was asked for: once it is in the page they are gone (Chromium may not report their end). */
-    let beforeLoad: Request[] | undefined;
+    /**
+     * A new document was asked for: once it is in the page, every request the page before still had out is gone
+     * (Chromium may not report their end). That holds also for requests the page before sent AFTER the new document was
+     * asked for and before it was in the page (R614: a screen between two of its reads) — the new document has sent
+     * nothing of its own yet at that moment, so all that is out then is the old page's.
+     */
+    let loading = false;
     const settled = (r: Request) => void out.delete(r);
     page.on("request", (r) => {
-      if (r.isNavigationRequest() && r.frame() === page.mainFrame()) beforeLoad = [...out];
+      if (r.isNavigationRequest() && r.frame() === page.mainFrame()) loading = true;
       const u = new URL(r.url());
       if (u.host === service() && u.pathname !== "/events") out.add(r);
     });
     page.on("requestfinished", settled);
     page.on("requestfailed", settled);
     page.on("framenavigated", (f) => {
-      if (f !== page.mainFrame() || !beforeLoad) return;
-      for (const r of beforeLoad) out.delete(r);
-      beforeLoad = undefined;
+      if (f !== page.mainFrame() || !loading) return;
+      out.clear();
+      loading = false;
     });
     inFlight.set(page, out);
     await page.goto(`${APP_ORIGIN}/`);
@@ -643,7 +648,18 @@ export async function gotoWhenQuiet(page: Page, url: string): Promise<void> {
   const out = inFlight.get(page);
   if (out) {
     try {
-      await expect.poll(() => out.size, { timeout: QUIET_WAIT_MS }).toBe(0);
+      // R614: quiet means nothing out now AND nothing out a moment later — a screen between two of its reads (the list
+      // answered, the reads that depend on it not yet sent) has nothing out for a few milliseconds and is not quiet.
+      await expect
+        .poll(
+          async () => {
+            if (out.size > 0) return out.size;
+            await page.waitForTimeout(QUIET_SETTLE_MS);
+            return out.size;
+          },
+          { timeout: QUIET_WAIT_MS },
+        )
+        .toBe(0);
     } catch {
       // R586 M4: which requests were still out, by method and path (never a query).
       throw new Error(stillOutMessage([...out].map((r) => ({ method: r.method(), url: r.url() }))));
