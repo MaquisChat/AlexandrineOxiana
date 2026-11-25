@@ -1,5 +1,7 @@
 # The final review — what I need from you
 
+*Updated 24 November 2026, 7 pm Central: MAC BUILD 12 EXISTS — GitHub gave the build a Mac this time and every check passed, the test of Quit among them. Part 12 says where to download it. It replaces build 10.*
+
 *Updated 24 November 2026, evening: part 12, at the end, is new — closing the library safely (FR-749) and your decision 31 (b) are built, reviewed, tested together and pushed as build request 12; it has four small choices for "Look up again" and asks whether I may merge. Start there.*
 
 *Updated 24 November 2026, mid-afternoon: the known-gaps round is merged to `main` on your word, and decision 31 is decided ((b) now, (c) next); part 11 says so.*
@@ -179,7 +181,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 
 ## 4. Things only you can check
 
-*Use Mac build 10 for these (part 10 says where to download it). Note your findings beside each box.*
+*Use Mac build 12 for these (part 12 says where to download it). Note your findings beside each box.*
 
 ### Installing and opening the app on your Mac
 
@@ -349,7 +351,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 **It is merged.** You asked me to check and merge. `main` now holds everything built so far, and its files are identical to the branch that was verified.
 
-**Your Mac build was build 9 (24 November 2026) when this part was written; **build 10 (part 10) now replaces it.** Build 9 replaced build 8.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. It passed every start-up check on GitHub's Mac, in both the debug app and the release app from the disk image.
+**Your Mac build was build 9 (24 November 2026) when this part was written; **build 12 (part 12) now replaces it** (builds 9 and 10 came in between; there was no build 11). Build 9 replaced build 8.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. It passed every start-up check on GitHub's Mac, in both the debug app and the release app from the disk image.
 
 - **Why build 9.** In build 8 you found that nothing on the Optional tools screen would install ("The download did not finish…"). The fault was the app's: the helper that downloads the tools looked for its list of trusted certificate authorities in a place that exists on the machine that built the app and not on your Mac, so it trusted nobody and refused every connection. Build 9 carries that list inside the app, and its build proves it from inside the finished app ("118 authorities from the app's own list"). If an install fails now, the message says whether it is the connection or a certificate that could not be verified (a VPN, a security program or a network that inspects secure connections can cause that).
 - **Where (build 9):** GitHub → Actions → "Desktop (macOS)" → run 12 → Artifacts → `alexandrine-oxiana-macos-apple-silicon`. Direct link to the run: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45291457721 — the disk image's checksum (SHA-256) is `1415478b68f59901b1b15a2938b490ca4623e981cb1cb798606fe9c22526852f`. Quit the app, then replace it with the one in this disk image.
@@ -379,7 +381,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 Everything built up to 23 November is on `main`, checked by GitHub and on a Mac. The rough-edge fixes of 24 November are in Mac build 10 and, by your word, on `main` too (part 10). What is left is yours. In the order I would do it:
 
-- [ ] **1. Install Mac build 10** (part 10 says where: run 13's download). It replaces builds 8 and 9: build 8 could not install any optional tool, build 9 mended that, and build 10 adds the rough-edge fixes.
+- [ ] **1. Install Mac build 12** (part 12 says where: run 18's download). It replaces builds 8, 9 and 10: build 9 mended the optional tools' downloads, build 10 added the rough-edge fixes, and build 12 adds the known gaps, the safe closing of the library and attaching without the wait.
 - [ ] **2. Undo the import that stopped when the disk filled, then import again** with enough free space, or with "leave the files where they are".
 - [ ] **3. Work through the hands-on checklist in part 4** (51 boxes, about ten areas). Tell me what you find, in any form; a sentence per problem is enough. Three areas matter most because nothing but your Mac can test them: "Get through my library" (the sign-in window), watched cloud folders, and the macOS prompts.
 - [ ] **4. Answer the decisions.** There are 30 (28, 29 and 30 are new, in part 10); two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26), part 8 (27) and part 10 (28–30).
@@ -507,7 +509,7 @@ You said "keep building". The 23 known gaps of part 10 are built; the other two 
 
 - **Where it stands:** built, tested together on my side, and green in GitHub's own check: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45464905103
 - **There is no Mac build of it yet.** I asked for Mac build 11 twice. GitHub cancelled the Mac job four times, each time about fifteen minutes after it was queued, without ever giving it a Mac; nothing of the build ran, so this says nothing about the app. The last time a Mac was given was for build 10, the night before. I cannot see GitHub's reason from here; the cancelled job's page may show it: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45464905098 (the job "apple-silicon (macos-15)"). I will ask again with the next change (FR-749, below) and put the download here when it exists. *(Asked again as build request 12: part 12.)*
-- **Until then, build 10 is the build to use** (part 10 says where). What follows describes the next build.
+- **Until then, build 10 is the build to use** (part 10 says where). What follows describes the next build. *(That build now exists: Mac build 12, part 12.)*
 - **It is in `main`** (the approved version) since 24 November, about 3 pm Central: you said "merge". The app's code in `main` is, file for file, the code that was tested and that passed GitHub's check. GitHub's check of `main` itself passed on that merge (4:13 pm Central): https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45487722814
 
 ### What you will notice (in the next Mac build)
@@ -615,7 +617,7 @@ After the merge you asked for, two more pieces are built. The first mends an old
 
 - **Tested together on my side:** every step passes. The first full run caught two faults of the close work, and both were mended before anything was pushed (they are in the list of what was caught, below); the second full run passed everything except one of 224 browser scenarios, which failed once in one browser for a cause that is older than this work and is now understood (FR-750, under "Still open").
 - **GitHub's own check** runs on the push: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45520284119 — I will say here and in the chat when it is in.
-- **A Mac build** is asked for again: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45520284023 — GitHub has cancelled the Mac job five times so far without giving it a machine; if it builds this time, the download goes here. Until then build 10 stays the build to use.
+- **Mac build 12 exists, and it is the build to use now** (it replaces build 10; there never was a build 11). Run 18 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45520284023 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon`, unzip it and open the `.dmg` inside. Its SHA-256 is `5c418d3874c28ccc6edaa28cb36d5bca7e6883769b35aeee4a5308274b9e7b44`. GitHub gave the job a Mac this time, after five refusals during the day. Every check of the build passed: the app starts from the disk image and its helpers start, answer and stop; every ready-made library inside the media helper is the pinned version (56 of 56); and, for the first time on a Mac, **the test of Quit ran and passed**: a quit sent as a system request closed the app the orderly way twice, and when closing was slowed the window "Closing Alexandrine Oxiana" appeared after two seconds.
 - **It is not in `main`** until you say so. **May I merge it?** A yes in the chat is enough. (I would wait for GitHub's check to be green before merging.)
 
 ### What you will notice
@@ -656,12 +658,14 @@ And the full test run, after all the reviews, caught two more, both mended befor
 - "Move library" left the old copy's search index open, so the old copy was not the exact copy the move checks for (the index can be rebuilt; nothing of yours was touched);
 - an integrity check that was waiting when the library was moved said the library was "closed" where it should say it was moved.
 
-### Things only you can check in the next Mac build
+### Things only you can check in Mac build 12
 
 - [ ] Attach several PDFs at once. They should be in within seconds. A line ending "Waiting for lookup service response." is this case, not an error.
 - [ ] Start a Bulk Import of a folder, close the library while it runs, then open it again. The import should be shown as paused (or "interrupted"), "Resume" should carry it on, and no file should be marked failed.
 - [ ] Attach a large file and close the library at once. The file is either there, complete, or its line says nothing was changed; never half.
-- [ ] As in part 11: quit with **Cmd-Q** while something long runs, and install "Speech model: tiny" in Optional tools.
+- [ ] Quit with **Cmd-Q** while something long runs (a transcription), and once with the Dock's Quit: the app should end completely, with "Closing Alexandrine Oxiana" shown if closing takes more than two seconds. GitHub's Mac passed its own test of this (above); your own Cmd-Q is the last word.
+- [ ] In Optional tools, install "Speech model: tiny" (still unconfirmed since build 9).
+- [ ] The checks of part 11's list that are not repeated here still apply to this build: a linked file replaced by a folder, and "Move library" to a folder that is not empty while a transcription runs.
 
 ### Decision 31 (c): four choices
 
