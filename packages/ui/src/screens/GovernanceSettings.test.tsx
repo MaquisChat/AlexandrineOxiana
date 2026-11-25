@@ -351,8 +351,8 @@ describe("Governance settings", () => {
   for (const [status, sentence] of [
     ["none", "Backups holding them: none held these files."],
     ["pending", "Backups holding them: at least one listed backup is still to be removed; the app will try again."],
-    ["unknown-pending", "Backups holding them: a backup that could not be read, and may hold them, is still there."],
-    ["deleted", "Backups holding them: every listed backup was removed by the app."],
+    ["unknown-pending", "Backups holding them: at least one listed backup that may still hold them is still there."],
+    ["deleted", "Backups holding them: none is left that holds them; the app removed each one that did."],
     ["no-longer-present", "Backups holding them: none is left. At least one listed backup is no longer there, and the app has no record of removing it."],
     ["something-new", "Backups holding them: the app cannot tell how they stand."],
   ] as const) {
