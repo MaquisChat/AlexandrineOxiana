@@ -241,16 +241,17 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /**
    * FR-756's remainder: the source's detail, opened beside the list, is part of this page. While the screen says its
    * one sentence, the panel says none of its own, the sentence covers the panel's read too (R602 M1), and the one
-   * "Try again" reads it again as well (R605 I2).
+   * "Try again" reads it again as well (R605 I2). The panel is a side panel: once the screen's own read is unanswered the
+   * screen says the page's sentence in its own place, even where the panel said it first (R641 C2 i).
    */
-  const { page, sentence: pageSentence, retryAll } = usePageHost({
+  const { page, sentence: pageSentence, retryAll, tryAgainRef } = usePageHost({
     sentence: unansweredText,
     out: () => out.current.size > 0 || !projectsRef.current,
     retry: () => {
       triedAgain.current = true;
       readAgain();
     },
-  });
+  }, { panelsOnly: true });
   useEffect(() => {
     if (showTryAgain || !triedAgain.current) return;
     triedAgain.current = false;
@@ -445,12 +446,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     };
   }, [api, showProjects, firstReadMs, tries.projects, answered, noAnswer]);
   const mounted = useRef(true);
-  useEffect(
-    () => () => {
+  // Set again at mount: under strict mode (mount, clean-up, mount) the screen otherwise reads nothing after (FR-762).
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
       mounted.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
   /** Reads the project list again (after the new-project dialog closes, whatever the reason). */
   const reloadProjects = useCallback(async (keep?: ProjectSummary) => {
     const { projects: read } = await api.projects.list();
@@ -1066,7 +1068,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         )}
         {pageSentence !== undefined && (
           <p>
-            <button type="button" onClick={retryAll}>
+            <button type="button" ref={tryAgainRef} onClick={retryAll}>
               Try again
             </button>
           </p>

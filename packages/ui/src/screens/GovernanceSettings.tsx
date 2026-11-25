@@ -18,6 +18,7 @@ import { isMap, isScalar, isSeq, parseDocument, type Document } from "yaml";
 import { GOVERNANCE_UNREADABLE_TEXT, backupsStatusText, GOVERNANCE_WARNINGS_TEXT, type GovernanceReadability } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { errorText } from "../api/library";
 import type { DestructionCertificate, GovernanceApi, Profile, ProtocolDocument, ProtocolDocumentResult, RetentionDue, Violation } from "../api/governance";
 import { FileDrop } from "../components/FileDrop";
 import { useLatestRead } from "../components/leaveSignals";
@@ -491,6 +492,8 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
         </ControlCard>
       </div>
 
+      <BackUpNow api={api} projectId={projectId} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} />
+
       <div className="ao-actions">
         <button type="button" onClick={() => void save()} disabled={busy || text === saved.yaml || off}>
           Save changes
@@ -529,6 +532,64 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
         />
       ) : null}
     </main>
+  );
+}
+
+/**
+ * FR-754 (R641 C3): "Back up now" asks the service for a backup of the project (the route is governed and audited, R125).
+ * While it runs the button reads "Backing up…" and a press sends nothing (aria-disabled, so focus stays on it); a
+ * success says so; a failure shows the route's own sentence (a backup cut by the library's closing included, R551).
+ * `whyId`: as for ProtocolDocuments (a locked project, a read-only library): the button is then off, as the screen's
+ * other changing controls are; the route's refusal still answers anything that slips through.
+ */
+function BackUpNow({ api, projectId, whyId }: { api: GovernanceApi; projectId: string; whyId?: string }) {
+  const [running, setRunning] = useState(false);
+  const [outcome, setOutcome] = useState<{ made: true; warnings: string[] } | { error: string } | null>(null);
+  // A ref, not state: a double click fires before the button re-renders (N8, R113).
+  const sending = useRef(false);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => void (alive.current = false);
+  }, []);
+  const backUp = async () => {
+    if (sending.current || whyId) return;
+    sending.current = true;
+    setRunning(true);
+    setOutcome(null);
+    try {
+      const { backup } = await api.backUpNow(projectId);
+      if (alive.current) setOutcome({ made: true, warnings: backup.warnings ?? [] });
+    } catch (err) {
+      if (alive.current) setOutcome({ error: errorText(err, "That could not be done. Try again.") });
+    } finally {
+      sending.current = false;
+      if (alive.current) setRunning(false);
+    }
+  };
+  return (
+    <div className="ao-actions">
+      <button type="button" disabled={!!whyId} aria-describedby={whyId} aria-disabled={running || undefined} onClick={() => void backUp()}>
+        {running ? "Backing up…" : "Back up now"}
+      </button>
+      {/* Review I1, review 2 M1: what the backup itself warns of, below the success line and announced with it (inside its
+          status region), in the route's own words. */}
+      <div role="status">
+        {outcome && "made" in outcome ? "A backup of this project was made." : null}
+        {outcome && "made" in outcome
+          ? outcome.warnings.map((w, i) => (
+              <p key={i} className="ao-warning">
+                <UserText>{w}</UserText>
+              </p>
+            ))
+          : null}
+      </div>
+      {outcome && "error" in outcome ? (
+        <p role="alert" className="ao-warning">
+          <UserText>{outcome.error}</UserText>
+        </p>
+      ) : null}
+    </div>
   );
 }
 

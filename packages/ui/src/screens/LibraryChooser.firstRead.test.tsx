@@ -84,6 +84,37 @@ describe("LibraryChooser: “No libraries yet” only for a list that was read (
     expect(screen.queryByText("Loading libraries…")).toBeNull();
   });
 
+  it("R641 C2 (ii): the refused list's sentence stays, once, after an act fails and after the act's own words are cleared", async () => {
+    let created = 0;
+    server.use(
+      http.get(url("/libraries"), () => serviceError(500, "INTERNAL", "The list could not be read.")),
+      http.post(url("/libraries"), () => {
+        created++;
+        return serviceError(500, "INTERNAL", "The list could not be read.");
+      }),
+    );
+    show();
+    const user = userEvent.setup();
+    await screen.findByText("The list could not be read.");
+    // An act that fails with its own words: both are said, each once.
+    await user.type(screen.getByRole("textbox", { name: "Library folder" }), "relative");
+    await user.click(screen.getByRole("button", { name: "Open library" }));
+    await waitFor(() => expect(alerts()).toContain("Give the library folder's full path, for example /Users/you/Research library or D:\\Research library."));
+    expect(alerts()).toEqual(["The list could not be read.", "Give the library folder's full path, for example /Users/you/Research library or D:\\Research library."]);
+    // The act's words are cleared by a change of the path: the list's sentence is still there.
+    await user.clear(screen.getByRole("textbox", { name: "Library folder" }));
+    await user.type(screen.getByRole("textbox", { name: "Library folder" }), "/Users/ana/Lib");
+    expect(alerts()).toEqual(["The list could not be read."]);
+    expect(screen.queryByText(/No libraries yet/)).toBeNull();
+    // An act refused with the very same words: the sentence is said once.
+    await user.type(screen.getByRole("textbox", { name: "New library name" }), "Field");
+    await user.click(screen.getByRole("button", { name: "Create a new library in that folder" }));
+    await waitFor(() => expect(created).toBe(1));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open library" })).toHaveProperty("disabled", false));
+    expect(alerts()).toEqual(["The list could not be read."]);
+    expect(tryAgain()).toBeNull();
+  });
+
   it("a list read and empty says “No libraries yet”", async () => {
     server.use(http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })));
     show();

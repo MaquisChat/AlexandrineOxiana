@@ -107,6 +107,7 @@ import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, 
 import { ApiClientError, SERVICE_NO_ANSWER, SERVICE_UNREACHABLE, STREAM_OPEN_TIMEOUT_MS, type ApiClient, type ServiceEvent } from "../api/client";
 import { findApi, findHref, findProgressOf, type FindApi } from "../api/find";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
+import { PageReads, usePageHost } from "../components/PageReads";
 import { isValidId } from "../api/import";
 import { isProjectLocked, libraryApi, type Collection, type LibraryApi, type LibraryState, type ProjectSummary } from "../api/library";
 import { ChoosePersonDialog } from "../components/ChoosePersonDialog";
@@ -894,10 +895,7 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, 
    * was given up. Each such read's sentence is shown as this one (said once: equal sentences are not repeated).
    */
   const noAnswers = [projectsUnreachable && projectsError, screenUnreachable && screenError, collectionsUnreachable && collectionsError, showTryAgain && queueNoAnswer].filter((t): t is string => !!t);
-  const noAnswerSaid = noAnswers.find((t) => t !== SERVICE_NO_ANSWER) ?? SERVICE_NO_ANSWER;
-  const shownScreenError = screenUnreachable && screenError ? noAnswerSaid : screenError;
-  const shownProjectsError = projectsUnreachable && projectsError ? noAnswerSaid : projectsError;
-  const shownCollectionsError = collectionsUnreachable && collectionsError ? noAnswerSaid : collectionsError;
+  const ownNoAnswer = noAnswers.find((t) => t !== SERVICE_NO_ANSWER) ?? SERVICE_NO_ANSWER;
   const triedAgain = useRef(false);
   const tryAgain = () => {
     triedAgain.current = true;
@@ -907,6 +905,16 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, 
     // The queue's own read, when it got no answer either (its sentence may be said here only, FR-576).
     emit({ kind: "retry" });
   };
+  /**
+   * R641 C2 (iv): a source's record, opened beside the queue, is a side panel of this page (as on the library screen).
+   * While the screen says its one sentence, the panel says none of its own, the sentence covers the panel's read too,
+   * and the screen's one "Try again" reads it again as well (R602 M1, R605 I2).
+   */
+  const { page, sentence: pageSentence, retryAll, tryAgainRef } = usePageHost({ sentence: showTryAgain ? ownNoAnswer : undefined, out: () => false, retry: tryAgain }, { panelsOnly: true });
+  const noAnswerSaid = pageSentence ?? ownNoAnswer;
+  const shownScreenError = screenUnreachable && screenError ? noAnswerSaid : screenError;
+  const shownProjectsError = projectsUnreachable && projectsError ? noAnswerSaid : projectsError;
+  const shownCollectionsError = collectionsUnreachable && collectionsError ? noAnswerSaid : collectionsError;
   // The button pressed has gone (everything was read): focus goes to the heading, never the page.
   useEffect(() => {
     if (showTryAgain || !triedAgain.current) return;
@@ -1004,33 +1012,35 @@ export function FindAcquire({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, 
       {/* FR-750 (R579): a read that got no answer (or none in time) is offered again; an answer the screen handles is not. */}
       {showTryAgain && (
         <p>
-          <button type="button" onClick={tryAgain}>
+          <button type="button" ref={tryAgainRef} onClick={retryAll}>
             Try again
           </button>
         </p>
       )}
       {projects && remembered && !projectId && !projectsError && <p>{FIND_SCREEN_TEXT.noProject}</p>}
       {projectId && project && (
-        <ProjectQueue
-          key={`${epoch}\u0000${projectId}`}
-          bus={bus}
-          api={api}
-          libApi={libApi}
-          lib={lib}
-          project={project}
-          collectionId={collectionId}
-          text={text}
-          setText={setText}
-          checkEverything={confirmedCheck}
-          switchVersion={switchVersion}
-          onStoredCheck={onStoredCheck}
-          onUnlocked={readProjects}
-          waitForSwitch={waitForSwitch}
-          saidAbove={showTryAgain && queueNoAnswer ? queueNoAnswer : screenError}
-          screenSays={showTryAgain}
-          onNoAnswer={setQueueNoAnswer}
-          firstReadMs={firstReadMs}
-        />
+        <PageReads value={page}>
+          <ProjectQueue
+            key={`${epoch}\u0000${projectId}`}
+            bus={bus}
+            api={api}
+            libApi={libApi}
+            lib={lib}
+            project={project}
+            collectionId={collectionId}
+            text={text}
+            setText={setText}
+            checkEverything={confirmedCheck}
+            switchVersion={switchVersion}
+            onStoredCheck={onStoredCheck}
+            onUnlocked={readProjects}
+            waitForSwitch={waitForSwitch}
+            saidAbove={showTryAgain && queueNoAnswer ? queueNoAnswer : screenError}
+            screenSays={showTryAgain}
+            onNoAnswer={setQueueNoAnswer}
+            firstReadMs={firstReadMs}
+          />
+        </PageReads>
       )}
     </main>
   );
@@ -2473,6 +2483,7 @@ function ProjectQueue(props: {
             projectId={openSource.projectId}
             sourceId={openSource.sourceId}
             readOnly={readOnly || openSource.projectId !== projectId}
+            firstReadMs={firstReadMs}
             onLocked={() => (openSource.projectId === projectId ? markLocked() : setOpenSource(null))}
             onClose={() => {
               const from = openSource.from;

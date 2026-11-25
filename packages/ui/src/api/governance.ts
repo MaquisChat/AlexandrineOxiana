@@ -248,6 +248,9 @@ export function governanceApi(client: ApiClient) {
     addProtocolDocuments: (projectId: string, paths: string[]) =>
       r<{ results: ProtocolDocumentResult[]; documents: ProtocolDocument[] }>("POST", `${p(projectId)}/protocol/documents`, { body: { paths } }),
 
+    /** FR-754 (R641 C3): a backup of the project now (governed and audited by the service; R125, R551). `warnings`: the backup's own sentences (review I1). */
+    backUpNow: (projectId: string) => r<{ backup: { file: string; sha256: string; bytes: number; warnings?: string[] } }>("POST", `${p(projectId)}/backups`),
+
     retention: (projectId: string) => r<RetentionDue>("GET", `${p(projectId)}/retention`),
     /** Sets (an IANA zone name) or clears (null: UTC) the time zone the project's dates are read in (R93). */
     setTimeZone: (projectId: string, timeZone: string | null) => r<{ timeZone: string | null }>("PUT", `${p(projectId)}/time-zone`, { body: { timeZone } }),

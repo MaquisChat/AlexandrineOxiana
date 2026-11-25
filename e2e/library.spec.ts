@@ -527,3 +527,40 @@ test("FR-756 A: opened while its look at the libraries is never answered, the op
   await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
+
+// FR-754 (R641 C3): the project's settings offer "Back up now". Pressed, the real service makes the backup through its
+// governed route: the button reads "Backing up…" meanwhile, the screen says "A backup of this project was made.", the
+// file is in the library's Backups folder, and the project's audit log records it (its `backup.create` event).
+test("FR-754: “Back up now” in the project's settings makes a backup, says so, and the backup is in the Backups folder and the audit log", async ({ page, app }) => {
+  const { libraryPath, projectId } = await libraryWithProject(app, page, { library: "Backup library", project: "Harbour ledgers", governanceYaml: LOOKUP_RULES });
+  await gotoWhenQuiet(page, `${APP_ORIGIN}/governance?project=${encodeURIComponent(projectId)}`);
+  await expect(page.getByRole("heading", { level: 1, name: "Governance" })).toBeVisible();
+  const button = page.getByRole("button", { name: "Back up now" });
+  // The request is held in the browser until "Backing up…" has been seen, then sent on to the real service.
+  const backupsUrl = `${app.baseUrl}/projects/${projectId}/backups`;
+  let release!: () => void;
+  const released = new Promise<void>((r) => (release = r));
+  await page.route(backupsUrl, async (route) => {
+    await released;
+    await route.continue();
+  });
+  const answered = page.waitForResponse((r) => r.url() === backupsUrl && r.request().method() === "POST");
+  try {
+    await button.click();
+    const working = page.getByRole("button", { name: "Backing up…" });
+    await expect(working).toBeVisible();
+    await expect(working).toHaveAttribute("aria-disabled", "true");
+  } finally {
+    release();
+  }
+  const response = await answered;
+  await page.unroute(backupsUrl);
+  expect(response.status()).toBe(200);
+  const made = ((await response.json()) as { backup: { file: string } }).backup.file;
+  await expect(page.getByRole("status").filter({ hasText: "A backup of this project was made." })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Back up now" })).not.toHaveAttribute("aria-disabled", "true");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(readdirSync(join(libraryPath, "Backups"))).toContain(made);
+  const audit = (await app.api<{ events: Array<{ action: string; details?: { file?: string } }> }>("GET", `/projects/${projectId}/audit?limit=100`)).body;
+  expect(audit.events.filter((e) => e.action === "backup.create").map((e) => e.details?.file)).toEqual([made]);
+});
