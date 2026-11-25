@@ -23,7 +23,7 @@ import { openLibraryIsbn } from "./openlibrary.js";
 
 export { DEFAULT_ATTEMPT_TIMEOUT_MS, DEFAULT_RATE_LIMITS, HttpClient, LookupCancelledError, LookupHttpError, LookupLeftOutError, USER_AGENT } from "./http.js";
 export type { GetOptions, HttpClientOptions } from "./http.js";
-export { isSensitive, lookupContextFor, providerAllowed } from "./context.js";
+export { forgetSensitiveIfLocked, isSensitive, lookupContextFor, providerAllowed } from "./context.js";
 export type { LookupContext, LookupResult, Provider } from "./context.js";
 export { LOC_SRU_BASE } from "./loc.js";
 

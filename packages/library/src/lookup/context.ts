@@ -94,6 +94,24 @@ export function providerAllowed(ctx: LookupContext, provider: Provider): boolean
   return true;
 }
 
+/**
+ * FR-759, FR-767 (as R600 I2; R30, R50): called when work that looked things up for `projectId` ends, whether it
+ * succeeded, failed or was cancelled. The lock route drops the client's sensitive answers at the lock, but an answer
+ * that was in the air then lands after it. So when the project is encrypted and no longer unlocked (or can no longer
+ * be read: removed meanwhile), every sensitive answer is dropped again, and nothing looked up for a locked project
+ * stays in memory. Coarse, as the lock route's purge is: another unlocked project's sensitive answers go too, and are
+ * simply looked up again.
+ */
+export function forgetSensitiveIfLocked(repo: Repo, http: HttpClient, projectId: string): void {
+  let locked: boolean;
+  try {
+    locked = repo.getProject(projectId).encryption.enabled && !repo.isUnlocked(projectId);
+  } catch {
+    locked = true; // the project cannot be read: nothing of it is kept either
+  }
+  if (locked) http.purgeSensitive();
+}
+
 /** The lookup context for one of the repository's projects. Throws NotFoundError for an unknown project. */
 export async function lookupContextFor(
   repo: Repo,

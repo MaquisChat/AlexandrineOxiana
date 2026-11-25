@@ -53,7 +53,7 @@ import { libraryVersion } from "../resources.js";
 import { fileTypeFromFile } from "file-type";
 import { findDuplicate, type DupKey, type FileNamePattern, type SourceFile } from "@ao/core";
 import { UnsafeFileError, extractMetadata } from "../extract/index.js";
-import { lookupContextFor, type HttpClient, type LookupContext } from "../lookup/index.js";
+import { forgetSensitiveIfLocked, lookupContextFor, type HttpClient, type LookupContext } from "../lookup/index.js";
 import { LibraryClosedError, NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import { whileOpen } from "../library.js";
 import { LookupCancelledError } from "../lookup/http.js";
@@ -449,6 +449,16 @@ export function createAttach(deps: AttachDeps): Attach {
   }
 
   async function attachFiles(projectId: string, paths: string[], opts: AttachOpts = {}): Promise<AttachOutcome[]> {
+    try {
+      return await attachEach(projectId, paths, opts);
+    } finally {
+      // FR-759, FR-767: the attach route and a watched folder's bring-in alike: locked while a lookup was in the air,
+      // its late answer is not kept in memory.
+      forgetSensitiveIfLocked(repo, http, projectId);
+    }
+  }
+
+  async function attachEach(projectId: string, paths: string[], opts: AttachOpts): Promise<AttachOutcome[]> {
     repo.getProject(projectId); // NotFoundError for an unknown project
     const s = session(projectId, opts.toSourceId);
     const out: AttachOutcome[] = [];
