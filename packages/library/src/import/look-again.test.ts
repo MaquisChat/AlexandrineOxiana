@@ -7,7 +7,7 @@
  * once the library begins to close (R247 c, R546). Requests are counted with a MockAgent that refuses the network.
  */
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -540,11 +540,12 @@ describe("closing, audit and sealing (R247 c, R546, R566 6, R55)", () => {
     expect(bytes).not.toContain("Rivers and Memory");
     const send = events.filter((x) => x.details?.op === LOOK_SEND_OP);
     const write = events.filter((x) => x.details?.op === LOOK_UP_AGAIN_OP);
-    expect(send).toHaveLength(1);
+    // R585 M8: one send line PER SERVICE asked (Crossref for the DOI, OpenAlex for the title search), each with its name.
+    expect(send).toHaveLength(2);
     expect(write).toHaveLength(1);
-    expect(send[0]!.seq).toBeLessThan(write[0]!.seq);
-    expect(Object.keys(send[0]!.details!).sort()).toEqual(["by", "lookups", "op", "reviewEntry", "services"]);
-    expect(send[0]!.details!.services).toEqual(expect.arrayContaining(["crossref"]));
+    for (const x of send) expect(x.seq).toBeLessThan(write[0]!.seq);
+    for (const x of send) expect(Object.keys(x.details!).sort()).toEqual(["by", "lookups", "op", "reviewEntry", "services"]);
+    expect(send.map((x) => x.details!.services)).toEqual([["crossref"], ["openalex"]]);
     const { txn: _t, changes: _c, ...rest } = write[0]!.details as Record<string, unknown>;
     expect(Object.keys(rest).sort()).toEqual(["by", "candidatesAdded", "lookups", "op", "reviewEntry", "state"]);
     expect(write[0]!.entity).toEqual({ type: "source", id: e!.sourceId });
@@ -693,5 +694,76 @@ describe("decision 31 (c), R585 I1: two look-ups of one entry", () => {
     expect(end.reasons[0]).toBe(LOOK_UP_AGAIN_TEXT.found);
     expect(end.reasons).not.toContain(LOOKUP_WAITING_TEXT);
     expect(end.candidates).toHaveLength(2);
+  });
+});
+
+describe("decision 31 (c), R585 M8: the send is audited per service, through the unchanged authorizeOnly", () => {
+  /** The send lines on disk now, read synchronously — called from the stand-in's reply, as the request arrives. */
+  const sendLinesNow = (p: { folder: string }) => {
+    const dir = join(lib.root, p.folder, "audit");
+    const lines = readdirSync(dir)
+      .sort()
+      .flatMap((f) => readFileSync(join(dir, f), "utf8").split("\n").filter(Boolean))
+      .map((l) => JSON.parse(l) as AuditEvent);
+    return lines.filter((x) => x.details?.op === LOOK_SEND_OP);
+  };
+
+  it("two services asked: two send lines, each on disk BEFORE its own service's request leaves, each with that service's own decision", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.crossref.org"] = () => WAIT_60;
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [buildDoiPdf()]);
+    now += 16 * MIN;
+    sent = [];
+    const seen: Record<string, string[][]> = { crossref: [], openalex: [] };
+    answers["api.crossref.org"] = () => {
+      seen.crossref!.push(sendLinesNow(p).map((x) => (x.details!.services as string[]).join()));
+      return { statusCode: 404, data: "{}" };
+    };
+    answers["api.openalex.org"] = (path) => {
+      seen.openalex!.push(sendLinesNow(p).map((x) => (x.details!.services as string[]).join()));
+      return path.includes("search") ? NO_RESULTS : { statusCode: 404, data: "{}" };
+    };
+    const r = await lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) });
+    expect(r).toMatchObject({ done: true, services: ["crossref", "openalex"] });
+    expect([to("api.crossref.org"), to("api.openalex.org")]).toEqual([1, 2]);
+    expect(seen.crossref).toEqual([["crossref"]]); // its own line was there before its request
+    expect(seen.openalex![0]).toEqual(["crossref", "openalex"]); // and OpenAlex's before OpenAlex's first
+    const lines = (await auditOf(p)).events.filter((x) => x.details?.op === LOOK_SEND_OP);
+    expect(lines.map((x) => x.details)).toEqual([
+      { op: LOOK_SEND_OP, reviewEntry: e!.id, by: "automatic", services: ["crossref"], lookups: 1 },
+      { op: LOOK_SEND_OP, reviewEntry: e!.id, by: "automatic", services: ["openalex"], lookups: 2 },
+    ]);
+    for (const x of lines) expect(x).toMatchObject({ action: "process", entity: { type: "source", id: e!.sourceId }, decision: { result: "allow" } });
+  });
+
+  it("a service the rules deny when its send is authorised: it is not asked and its lookups get \"not-allowed\"; one allowed send line, one request", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.crossref.org"] = () => WAIT_60;
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [buildDoiPdf()]);
+    now += 16 * MIN;
+    sent = [];
+    answers["api.crossref.org"] = () => ({ statusCode: 404, data: "{}" });
+    answers["api.openalex.org"] = () => SEARCH;
+    const hold = holdRequests(http, "after");
+    const run = lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) });
+    await hold.atGate; // Crossref has answered; the project's rules now allow Crossref only
+    const g = await repo.getGovernance(p.id);
+    await repo.setGovernance(p.id, `${GOV}processing:\n  metadata_lookup: [crossref]\n`, { baseSha256: g.sha256 });
+    hold.release();
+    const r = await run;
+    expect(r).toMatchObject({ done: true, services: ["crossref"], notAllowed: 2, state: { state: "not-allowed" } });
+    expect(sent).toHaveLength(1);
+    expect(to("api.crossref.org")).toBe(1);
+    const lines = (await auditOf(p)).events.filter((x) => x.details?.op === LOOK_SEND_OP);
+    expect(lines.filter((x) => x.decision?.result === "allow").map((x) => x.details!.services)).toEqual([["crossref"]]);
+    // the deny is audited as any denied act is (once: the service is not asked again in this look-up)
+    expect(lines.filter((x) => x.decision?.result === "deny")).toHaveLength(1);
+    const end = await entry(p, e!.id);
+    expect(end.leftOut!.map((l) => l.outcome)).toEqual(["not-allowed", "not-allowed"]);
+    expect(end.leftOut![0]!.services).toEqual(["openalex"]); // the service still to be asked; Crossref answered
   });
 });
