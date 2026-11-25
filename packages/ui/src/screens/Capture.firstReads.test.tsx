@@ -242,6 +242,20 @@ describe("Capture: an event stream that does not open within the limit is tried 
     expect(screen.getByRole("button", { name: "Reconnect" })).toBeTruthy();
   });
 
+  it("“Reconnect” also makes again the first reads still out (R605 M7)", async () => {
+    const events = holding("/events", () => true);
+    const rules = holding(`/projects/${P1}/governance`, (n) => n === 1);
+    const m = mockCapture({ extra: [events.handler, rules.handler] });
+    show(m, { streamOpenMs: 200 }); // the reads keep the default limit (twenty seconds): the first rules read is still out
+    await screen.findByText(/Progress updates are not available right now/, {}, { timeout: 5000 });
+    expect(rules.count()).toBe(1);
+    expect(screen.getByText(LOADING)).toBeTruthy();
+    await userEvent.setup().click(screen.getByRole("button", { name: "Reconnect" }));
+    await waitFor(() => expect(rules.count()).toBe(2));
+    await waitFor(() => expect(screen.queryByText(LOADING)).toBeNull());
+    expect(rules.signals[0]!.aborted).toBe(true);
+  });
+
   it("a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
     const events = holding("/events", () => false);
     const m = mockCapture({ extra: [events.handler] });

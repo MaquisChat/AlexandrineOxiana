@@ -901,6 +901,9 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
             onClick={() => {
               setLost(false);
               setAttempt((n) => n + 1);
+              // R605 M7: the first reads still out (or unanswered) are made again too, not only at the stream's opening;
+              // on the route, its list of projects too (the page's reads, R605 I2).
+              retryAll();
             }}
           >
             Reconnect
