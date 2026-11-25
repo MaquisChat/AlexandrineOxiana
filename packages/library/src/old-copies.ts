@@ -201,7 +201,8 @@ async function recordFrom(deps: CfgDeps, oldRoot: string, libraryId: string): Pr
  * complete, or its journal is still at the new place; "damaged": a journal is at the new place but cannot be read, so the
  * app cannot finish the move; "cannot-tell": the record is complete but the new place cannot be read (its drive is not
  * connected), so whether its journal is still there is not known; "finished" otherwise. Everything but "finished" counts
- * as unfinished (it fails closed): the old copy is not deletable, and an old library of a split stays read-only.
+ * as unfinished where it decides (it fails closed): the old copy is not deletable, and an old library of a split stays
+ * read-only. The words (movedToOf) claim "has not finished" only for "unfinished" and "damaged" (R596 b).
  */
 export type MoveFinished = "finished" | "unfinished" | "damaged" | "cannot-tell";
 export async function moveFinished(rec: Pick<PendingOldCopy, "id" | "newRoot" | "complete">): Promise<MoveFinished> {
@@ -243,7 +244,16 @@ export interface MovedTo {
   /** R590 N5: the move's journal at the new place is damaged: the app cannot finish this move. */
   journalDamaged?: true;
 }
-const movedToOf = (r: PendingOldCopy, state: MoveFinished): MovedTo => ({ newRoot: r.newRoot, unfinished: state !== "finished", ...(state === "damaged" ? { journalDamaged: true as const } : {}) });
+/**
+ * The words say only what this computer knows (R596 b): "has not finished" only when it is seen to be unfinished (or its
+ * journal is damaged); "cannot-tell" (a complete record, the new place unreadable) gives the plain moved words. The
+ * deletion of the old copy still fails closed on it (deleteOldCopy).
+ */
+const movedToOf = (r: PendingOldCopy, state: MoveFinished): MovedTo => ({
+  newRoot: r.newRoot,
+  unfinished: state === "unfinished" || state === "damaged",
+  ...(state === "damaged" ? { journalDamaged: true as const } : {}),
+});
 
 /**
  * R590 N1: this device's record shows an unfinished SPLIT out of the folder `root` (real path) for the library

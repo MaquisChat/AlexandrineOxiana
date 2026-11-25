@@ -422,6 +422,24 @@ describe("FR-755 (R578 (1)): opening the new place of an unfinished move finishe
     expect([r.json.mode, r.json.readOnlyReason, r.json.moveUnfinishedTo, r.json.moveCannotFinish]).toEqual(["read-only", "moved", dest, true]);
     expect(stateOf()).toMatchObject({ moveUnfinishedTo: dest, moveCannotFinish: true });
   });
+
+  it("R596 b: the old place of a FINISHED move whose new place cannot be read shows the plain moved words; of an unfinished one, the new place to open", async () => {
+    await start();
+    const { path, dest } = await libraryWithSources();
+    expect(lastLine(await move(dest)).done).toBe(true);
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    await rename(dest, join(tmp, "Unplugged"));
+    const old = await call({ method: "POST", url: "/libraries/open", body: { path } });
+    expect([old.json.mode, old.json.readOnlyReason, old.json.moveUnfinishedTo, old.json.moveCannotFinish]).toEqual(["read-only", "moved", undefined, undefined]);
+    expect(stateOf().moveUnfinishedTo).toBeUndefined();
+  });
+
+  it("R596 b: the record not complete and the new place unreadable: the old place says the move has not finished", async () => {
+    const { path, dest } = await stoppedAfter("close-source");
+    await rename(dest, join(tmp, "Unplugged"));
+    const old = await call({ method: "POST", url: "/libraries/open", body: { path } });
+    expect([old.json.readOnlyReason, old.json.moveUnfinishedTo]).toEqual(["moved", dest]);
+  });
 });
 
 describe("R573 Minor 2: during a successful move, between the close of the old copy and the switch", () => {

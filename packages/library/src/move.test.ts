@@ -1722,6 +1722,25 @@ describe("FR-755 (R583): split moves, the check before finishing, and what canno
     expect(await hashes(lib.root)).toEqual(before);
   });
 
+  // R596 b: the words say only what this computer knows; the deletion stays fail-closed.
+  it("R596 b: the old copy of a FINISHED move whose new place cannot be read: not called unfinished, and still not deletable", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await executeMove(lib, dest, { deps: mkDeps(), env });
+    await rename(dest, join(tmp, "Unplugged"));
+    expect((await openLibrary(lib.root, mkDeps())).movedTo).toEqual({ newRoot: dest, unfinished: false });
+    await expect(deleteOldCopy(lib.root, { confirm: true }, { deps: mkDeps() })).rejects.toMatchObject({
+      code: "move-unfinished",
+      message: "The old copy cannot be deleted now: the library's new place cannot be reached, so the app cannot tell whether its move has finished. Connect the drive the new place is on and try again.",
+    });
+  });
+
+  it("R596 b: the old copy of a move whose record is not complete, its new place unreadable: has not finished", async () => {
+    const { lib, dest } = await stopped();
+    await rename(dest, join(tmp, "Unplugged"));
+    expect((await openLibrary(lib.root, mkDeps())).movedTo).toEqual({ newRoot: dest, unfinished: true });
+  });
+
   // R590 N5: the old place's words, and how the old place is found.
   it("R590 N5: the old place of a move whose journal is damaged says so: it does not promise that opening the new place finishes the move", async () => {
     const { lib, dest } = await stopped();
