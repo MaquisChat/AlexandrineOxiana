@@ -124,9 +124,12 @@ export interface LeftOutLookup {
   notBefore?: string;
   /** Why it was left out: absent means "asked-to-wait" (every entry written by decision 31 b). R577 iv: "failed" is a lookup that failed outright (no network, a 500), looked up again only by the researcher's act. */
   why?: "asked-to-wait" | "failed";
-  /** How many times "Look up again" asked it (automatic and by hand). */
+  /**
+   * How many times the app's own AUTOMATIC pass asked it with a request that left (R585 M2, M3): toward giving up. A
+   * researcher's press is not counted.
+   */
   tries?: number;
-  /** ISO 8601: when it was last asked by "Look up again". */
+  /** ISO 8601: when "Look up again" (automatic or by hand) last sent a request for it. */
   lastTriedAt?: string;
   /** What the last look-up gave; absent while it is still to be asked. */
   outcome?: "found" | "nothing" | "not-allowed" | "gave-up";

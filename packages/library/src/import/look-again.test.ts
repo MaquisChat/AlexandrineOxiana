@@ -7,7 +7,7 @@
  * once the library begins to close (R247 c, R546). Requests are counted with a MockAgent that refuses the network.
  */
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,14 +21,14 @@ import type { Deps } from "../deps.js";
 import { shutdownExtractors } from "../extract/index.js";
 import { createLibrary, type Library } from "../library.js";
 import { HttpClient, lookupDoi, lookupContextFor } from "../lookup/index.js";
-import { REVIEW_FILE, parseReviewFile, type ReviewEntry } from "../repo/review.js";
+import { REVIEW_FILE, parseReviewFile, type LeftOutLookup, type ReviewEntry } from "../repo/review.js";
 import { storeRequest } from "../repo/sources.js";
 import { importChange, projectDataKey, type Repo } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
 import { createAttach } from "./attach.js";
 import { decideReview } from "./bulk/review.js";
 import { LOOK_SEND_OP, LOOK_UP_AGAIN_OP, dueLookUps, lookUpAgain } from "./look-again.js";
-import { LOOK_UP_AGAIN_BOUNDS } from "./look-up-state.js";
+import { LOOK_UP_AGAIN_BOUNDS, lookUpNow } from "./look-up-state.js";
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/lookup");
 const fixture = (n: string) => readFileSync(join(FIX, n), "utf8");
@@ -151,6 +151,15 @@ async function auditOf(p: { folder: string }): Promise<{ events: AuditEvent[]; b
   for (const f of (await readdir(dir)).sort()) bytes += await readFile(join(dir, f), "utf8");
   return { events: bytes.split("\n").filter(Boolean).map((l) => JSON.parse(l) as AuditEvent), bytes };
 }
+/** The send lines on disk now, read synchronously — called from the stand-in's reply, as the request arrives. */
+function sendLinesNow(p: { folder: string }): AuditEvent[] {
+  const dir = join(lib.root, p.folder, "audit");
+  return readdirSync(dir)
+    .sort()
+    .flatMap((f) => readFileSync(join(dir, f), "utf8").split("\n").filter(Boolean))
+    .map((l) => JSON.parse(l) as AuditEvent)
+    .filter((x) => x.details?.op === LOOK_SEND_OP);
+}
 async function sourceJson(p: { id: string }, sourceId: string): Promise<Buffer> {
   const sf = await repo.getSource(p.id, sourceId);
   const dir = join(lib.root, ...sf.source.folder.split("/"));
@@ -182,10 +191,15 @@ function holdRequests(http: HttpClient, when: "before" | "after") {
       await gate;
       return orig(...a);
     }
-    const r = await orig(...a);
+    // An answer that throws (a service asking to wait, with "leave-out") is held as well, then thrown.
+    const r = await orig(...a).then(
+      (v) => ({ v }),
+      (err: unknown) => ({ err }),
+    );
     reached();
     await gate;
-    return r;
+    if ("err" in r) throw r.err;
+    return r.v;
   };
   onTestFinished(() => release());
   return { atGate, release: () => release() };
@@ -470,19 +484,23 @@ describe("the automatic pass: due, bounded, growing waits; the hold (R411, R566 
     expect(r).toMatchObject({ done: true, asked: 1, found: 2, state: { state: "found" } });
     expect(sent).toHaveLength(1);
     const after = await entry(p, e!.id);
-    expect(after.leftOut![0]).toMatchObject({ why: "failed", tries: 1, outcome: "found" });
+    // R585 M3: a researcher's press is not counted in tries; it moves the last try's time
+    expect(after.leftOut![0]).toMatchObject({ why: "failed", lastTriedAt: new Date(now).toISOString(), outcome: "found" });
+    expect(after.leftOut![0]!.tries).toBeUndefined();
     expect(after.reasons[0]).toBe(LOOK_UP_AGAIN_TEXT.found);
   });
 
-  it("a failed lookup that fails again stays failed (tries counted); the entry never reads \"Waiting…\"", async () => {
+  it("a failed lookup that fails again stays failed (the researcher's press moves its last try, not its tries, R585 M3); the entry never reads \"Waiting…\"", async () => {
     const p = await project();
     const http = client();
     answers["api.openalex.org"] = () => ({ statusCode: 500, data: "broken" });
     const [e] = await attached(p, http, [notesPdf()]);
-    const r = await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) });
-    expect(r).toMatchObject({ done: true, asked: 1, found: 0, state: { state: "failed", tries: 1 } });
+    const pressed = new Date(now); // the client's back-off waits move the test's clock after this
+    const r = await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: pressed });
+    expect(r).toMatchObject({ done: true, asked: 1, found: 0, state: { state: "failed", tries: 0 } });
     const after = await entry(p, e!.id);
-    expect(after.leftOut![0]).toMatchObject({ why: "failed", tries: 1 });
+    expect(after.leftOut![0]).toMatchObject({ why: "failed", lastTriedAt: pressed.toISOString() });
+    expect(after.leftOut![0]!.tries).toBeUndefined();
     expect(after.leftOut![0]!.outcome).toBeUndefined();
     expect(after.reasons).not.toContain(LOOKUP_WAITING_TEXT);
     expect(after.reasons).toEqual(e!.reasons);
@@ -524,10 +542,19 @@ describe("closing, audit and sealing (R247 c, R546, R566 6, R55)", () => {
     const [e] = await attached(p, http, [buildDoiPdf()]);
     const titles = e!.leftOut!.map((l) => l.title).filter((t): t is string => !!t);
     now += 16 * MIN;
-    answers["api.crossref.org"] = () => ({ statusCode: 200, data: fixture("crossref-work.json") });
-    answers["api.openalex.org"] = () => SEARCH;
+    // R585 M6: each request, as it arrives, finds its service's send line already on disk.
+    const onDisk: string[][] = [];
+    answers["api.crossref.org"] = () => {
+      onDisk.push(sendLinesNow(p).map((x) => (x.details!.services as string[]).join()));
+      return { statusCode: 200, data: fixture("crossref-work.json") };
+    };
+    answers["api.openalex.org"] = () => {
+      onDisk.push(sendLinesNow(p).map((x) => (x.details!.services as string[]).join()));
+      return SEARCH;
+    };
     const r = await lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) });
     expect(r).toMatchObject({ done: true });
+    expect(onDisk).toEqual([["crossref"], ["crossref", "openalex"]]);
     const { events, bytes } = await auditOf(p);
     expect(bytes).not.toContain(FIXTURE_DOI);
     expect(bytes.toLowerCase()).not.toContain(FIXTURE_DOI.toLowerCase());
@@ -535,13 +562,15 @@ describe("closing, audit and sealing (R247 c, R546, R566 6, R55)", () => {
     expect(bytes).not.toContain("Rivers and Memory");
     const send = events.filter((x) => x.details?.op === LOOK_SEND_OP);
     const write = events.filter((x) => x.details?.op === LOOK_UP_AGAIN_OP);
-    expect(send).toHaveLength(1);
+    // R585 M8: one send line PER SERVICE asked (Crossref for the DOI, OpenAlex for the title search), each with its name.
+    expect(send).toHaveLength(2);
     expect(write).toHaveLength(1);
-    expect(send[0]!.seq).toBeLessThan(write[0]!.seq);
-    expect(Object.keys(send[0]!.details!).sort()).toEqual(["by", "lookups", "op", "reviewEntry", "services"]);
-    expect(send[0]!.details!.services).toEqual(expect.arrayContaining(["crossref"]));
+    for (const x of send) expect(x.seq).toBeLessThan(write[0]!.seq);
+    for (const x of send) expect(Object.keys(x.details!).sort()).toEqual(["by", "lookups", "op", "reviewEntry", "services"]);
+    expect(send.map((x) => x.details!.services)).toEqual([["crossref"], ["openalex"]]);
     const { txn: _t, changes: _c, ...rest } = write[0]!.details as Record<string, unknown>;
-    expect(Object.keys(rest).sort()).toEqual(["by", "candidatesAdded", "lookups", "op", "reviewEntry", "state"]);
+    expect(Object.keys(rest).sort()).toEqual(["by", "candidatesAdded", "lookups", "op", "reviewEntry", "sent", "state"]); // R585 M2: `sent`
+    expect(rest.sent).toBe(2);
     expect(write[0]!.entity).toEqual({ type: "source", id: e!.sourceId });
   });
 
@@ -557,7 +586,7 @@ describe("closing, audit and sealing (R247 c, R546, R566 6, R55)", () => {
     const raw = await readFile(reviewPath(p), "utf8");
     for (const word of [TITLE, "Rivers and Memory", "lastTriedAt", "outcome", "openalex", "found", LOOK_UP_AGAIN_TEXT.found]) expect(raw).not.toContain(word);
     const after = await entry(p, e!.id); // opened with the project's key
-    expect(after.leftOut![0]).toMatchObject({ tries: 1, outcome: "found" });
+    expect(after.leftOut![0]).toMatchObject({ lastTriedAt: new Date(now).toISOString(), outcome: "found" });
     expect(after.candidates).toHaveLength(2);
   });
 });
@@ -575,5 +604,359 @@ describe("the provider filter is the call's own (R566 5)", () => {
     const b = await lookupDoi("10.5555/another", ctx);
     expect(b?.provider).toBe("crossref");
     expect(to("api.crossref.org")).toBe(1);
+  });
+});
+
+describe("decision 31 (c), R585: each left-out lookup is known by its PLACE in leftOut (I2)", () => {
+  it("P-N: Crossref asked to wait and OpenAlex failed for the file's DOI; OpenAlex then asks to wait; Crossref then finds the DOI — its \"found\" stands, the OpenAlex lookup appears once, the entry does not read \"Waiting…\"", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.crossref.org"] = () => WAIT_60;
+    answers["api.openalex.org"] = () => ({ statusCode: 500, data: "broken" });
+    const [e] = await attached(p, http, [buildDoiPdf()]);
+    const doi = `doi:${FIXTURE_DOI}`;
+    expect(e!.leftOut!.map((l) => [l.services, l.identifier ?? "title", l.why ?? "asked-to-wait"])).toEqual([
+      [["crossref"], doi, "asked-to-wait"],
+      [["openalex"], doi, "failed"],
+      [["openalex"], "title", "failed"],
+    ]);
+    // First look-up, by hand: both services ask to wait. The failed DOI lookup becomes one that waits — beside, not over,
+    // the Crossref one with the same identifier.
+    now += 2 * MIN;
+    answers["api.openalex.org"] = () => WAIT_60;
+    expect(await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true });
+    const mid = await entry(p, e!.id);
+    expect(mid.leftOut).toHaveLength(3);
+    expect(mid.leftOut!.map((l) => [l.services, l.identifier ?? "title"])).toEqual([
+      [["crossref"], doi],
+      [["openalex"], doi],
+      [["openalex"], "title"],
+    ]);
+    // Second look-up, by hand: Crossref finds the DOI; OpenAlex knows nothing of either.
+    now += 2 * MIN;
+    answers["api.crossref.org"] = () => ({ statusCode: 200, data: fixture("crossref-work.json") });
+    answers["api.openalex.org"] = (path) => (path.includes("search") ? NO_RESULTS : { statusCode: 404, data: "{}" });
+    const r = await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) });
+    expect(r).toMatchObject({ done: true, found: 1, state: { state: "found", fromFile: true } });
+    const end = await entry(p, e!.id);
+    expect(end.leftOut).toHaveLength(3);
+    expect(end.leftOut![0]).toMatchObject({ services: ["crossref"], identifier: doi, outcome: "found" });
+    expect(end.leftOut![1]).toMatchObject({ services: ["openalex"], identifier: doi, outcome: "nothing" });
+    expect(end.leftOut![2]).toMatchObject({ services: ["openalex"], title: "Rivers and Memory in Upland Villages", outcome: "nothing" });
+    expect(end.reasons.slice(0, 2)).toEqual([LOOK_UP_AGAIN_TEXT.found, LOOK_UP_AGAIN_TEXT.fromFile]);
+    expect(end.reasons).not.toContain(LOOKUP_WAITING_TEXT);
+  });
+});
+
+describe("decision 31 (c), R585 I1: two look-ups of one entry", () => {
+  it("P-B, with the in-process guard: while the automatic look-up of an entry is under way, the researcher's act answers \"under-way\" at once — nothing audited, sent or written; the first then writes its own result", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    now += 16 * MIN;
+    const hold = holdRequests(http, "after");
+    const runB = lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) });
+    await hold.atGate; // B was answered "wait"; its write is held
+    const sentBefore = sent.length;
+    const auditBefore = (await auditOf(p)).bytes;
+    const reviewBefore = await readFile(reviewPath(p));
+    answers["api.openalex.org"] = () => SEARCH;
+    expect(await lookUpAgain(repo, client(), p.id, e!.id, { by: "researcher", now: new Date(now + 2 * MIN) })).toEqual({ done: false, why: "under-way" });
+    expect(sent.length).toBe(sentBefore);
+    expect((await auditOf(p)).bytes).toBe(auditBefore);
+    expect(await readFile(reviewPath(p))).toEqual(reviewBefore);
+    hold.release();
+    expect(await runB).toMatchObject({ done: true, state: { state: "waiting" } });
+    // Once it is over, the entry can be looked up again.
+    now += 30 * MIN;
+    expect(await lookUpAgain(repo, client(), p.id, e!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true, state: { state: "found" } });
+  });
+
+  it("P-A: two look-ups of one entry at once — ONE send audit line, ONE request", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    now += 16 * MIN;
+    answers["api.openalex.org"] = () => SEARCH;
+    sent = [];
+    const [r1, r2] = await Promise.all([
+      lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) }),
+      lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) }),
+    ]);
+    expect([r1, r2].filter((r) => r.done)).toHaveLength(1);
+    expect([r1, r2].filter((r) => !r.done)).toEqual([{ done: false, why: "under-way" }]);
+    expect(sent).toHaveLength(1);
+    const { events } = await auditOf(p);
+    expect(events.filter((x) => x.details?.op === LOOK_SEND_OP)).toHaveLength(1);
+    expect(events.filter((x) => x.details?.op === LOOK_UP_AGAIN_OP)).toHaveLength(1);
+  });
+
+  it("(a) without the guard (two handles of the library): the slower look-up's result is worked out against the entry as re-read — a \"found\" written meanwhile stands, no time moves back, matches are appended once", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    const repo2 = await openTestRepo(lib, ring, { scryptN: 2 ** 10, actor: "tester", clock: () => new Date(now), tz: "UTC" });
+    now += 16 * MIN;
+    const tB = new Date(now);
+    const hold = holdRequests(http, "after");
+    const runB = lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: tB });
+    await hold.atGate; // B was answered "wait"; its write is held
+    answers["api.openalex.org"] = () => SEARCH;
+    now += 2 * MIN;
+    const tA = new Date(now);
+    const ra = await lookUpAgain(repo2, client(), p.id, e!.id, { by: "researcher", now: tA });
+    expect(ra).toMatchObject({ done: true, found: 2, state: { state: "found" } });
+    hold.release();
+    expect(await runB).toMatchObject({ done: true, state: { state: "found" } });
+    const end = await entry(p, e!.id);
+    expect(end.leftOut).toHaveLength(1);
+    expect(end.leftOut![0]).toMatchObject({ outcome: "found", lastTriedAt: tA.toISOString() });
+    expect(end.reasons[0]).toBe(LOOK_UP_AGAIN_TEXT.found);
+    expect(end.reasons).not.toContain(LOOKUP_WAITING_TEXT);
+    expect(end.candidates).toHaveLength(2);
+  });
+});
+
+describe("decision 31 (c), R585 M8: the send is audited per service, through the unchanged authorizeOnly", () => {
+  it("two services asked: two send lines, each on disk BEFORE its own service's request leaves, each with that service's own decision", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.crossref.org"] = () => WAIT_60;
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [buildDoiPdf()]);
+    now += 16 * MIN;
+    sent = [];
+    const seen: Record<string, string[][]> = { crossref: [], openalex: [] };
+    answers["api.crossref.org"] = () => {
+      seen.crossref!.push(sendLinesNow(p).map((x) => (x.details!.services as string[]).join()));
+      return { statusCode: 404, data: "{}" };
+    };
+    answers["api.openalex.org"] = (path) => {
+      seen.openalex!.push(sendLinesNow(p).map((x) => (x.details!.services as string[]).join()));
+      return path.includes("search") ? NO_RESULTS : { statusCode: 404, data: "{}" };
+    };
+    const r = await lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) });
+    expect(r).toMatchObject({ done: true, services: ["crossref", "openalex"] });
+    expect([to("api.crossref.org"), to("api.openalex.org")]).toEqual([1, 2]);
+    expect(seen.crossref).toEqual([["crossref"]]); // its own line was there before its request
+    expect(seen.openalex![0]).toEqual(["crossref", "openalex"]); // and OpenAlex's before OpenAlex's first
+    const lines = (await auditOf(p)).events.filter((x) => x.details?.op === LOOK_SEND_OP);
+    expect(lines.map((x) => x.details)).toEqual([
+      { op: LOOK_SEND_OP, reviewEntry: e!.id, by: "automatic", services: ["crossref"], lookups: 1 },
+      { op: LOOK_SEND_OP, reviewEntry: e!.id, by: "automatic", services: ["openalex"], lookups: 2 },
+    ]);
+    for (const x of lines) expect(x).toMatchObject({ action: "process", entity: { type: "source", id: e!.sourceId }, decision: { result: "allow" } });
+  });
+
+  it("a service the rules deny when its send is authorised: it is not asked and its lookups get \"not-allowed\"; one allowed send line, one request", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.crossref.org"] = () => WAIT_60;
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [buildDoiPdf()]);
+    now += 16 * MIN;
+    sent = [];
+    answers["api.crossref.org"] = () => ({ statusCode: 404, data: "{}" });
+    answers["api.openalex.org"] = () => SEARCH;
+    const hold = holdRequests(http, "after");
+    const run = lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) });
+    await hold.atGate; // Crossref has answered; the project's rules now allow Crossref only
+    const g = await repo.getGovernance(p.id);
+    await repo.setGovernance(p.id, `${GOV}processing:\n  metadata_lookup: [crossref]\n`, { baseSha256: g.sha256 });
+    hold.release();
+    const r = await run;
+    expect(r).toMatchObject({ done: true, services: ["crossref"], notAllowed: 2, state: { state: "not-allowed" } });
+    expect(sent).toHaveLength(1);
+    expect(to("api.crossref.org")).toBe(1);
+    const lines = (await auditOf(p)).events.filter((x) => x.details?.op === LOOK_SEND_OP);
+    expect(lines.filter((x) => x.decision?.result === "allow").map((x) => x.details!.services)).toEqual([["crossref"]]);
+    // the deny is audited as any denied act is (once: the service is not asked again in this look-up)
+    expect(lines.filter((x) => x.decision?.result === "deny")).toHaveLength(1);
+    const end = await entry(p, e!.id);
+    expect(end.leftOut!.map((l) => l.outcome)).toEqual(["not-allowed", "not-allowed"]);
+    expect(end.leftOut![0]!.services).toEqual(["openalex"]); // the service still to be asked; Crossref answered
+  });
+});
+
+describe("decision 31 (c), R585 M2: what was really sent", () => {
+  it("P-H: five automatic look-ups whose request the client's hold left out (another call was told to wait between the send's audit and the request): no try is counted, never \"gave-up\"; each outcome line says sent: 0", async () => {
+    const p = await project();
+    const http = client();
+    const raw = http.getJson.bind(http);
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    now += 16 * MIN;
+    for (let k = 0; k < 6; k++) {
+      sent = [];
+      const hold = holdRequests(http, "before");
+      const run = lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) });
+      await hold.atGate; // the send is audited; before the request goes another call is told to wait
+      await expect(raw(`https://api.openalex.org/works?search=other${k}`, { cacheKey: `other${k}`, sensitive: false, askedToWait: "leave-out" })).rejects.toThrow();
+      expect(sent).toHaveLength(1); // that other call's request
+      hold.release();
+      expect(await run).toMatchObject({ done: true, sent: 0, state: { state: "waiting" } });
+      expect(sent).toHaveLength(1); // the look-up's own request never left
+      now += 2 * MIN;
+    }
+    const end = await entry(p, e!.id);
+    expect(end.leftOut![0]!.tries).toBeUndefined();
+    expect(end.leftOut![0]!.lastTriedAt).toBeUndefined();
+    expect(end.leftOut![0]!.outcome).toBeUndefined();
+    expect(end.reasons[0]).toBe(LOOKUP_WAITING_TEXT);
+    const outcomes = (await auditOf(p)).events.filter((x) => x.details?.op === LOOK_UP_AGAIN_OP);
+    expect(outcomes).toHaveLength(6);
+    for (const x of outcomes) expect(x.details).toMatchObject({ sent: 0, state: "waiting" });
+  });
+
+  it("a request that left is counted: the outcome line says how many left (sent), and the try is counted", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    now += 16 * MIN;
+    answers["api.openalex.org"] = () => NO_RESULTS;
+    expect(await lookUpAgain(repo, http, p.id, e!.id, { by: "automatic", now: new Date(now) })).toMatchObject({ done: true, sent: 1, state: { state: "nothing" } });
+    expect((await entry(p, e!.id)).leftOut![0]).toMatchObject({ tries: 1, lastTriedAt: new Date(now).toISOString(), outcome: "nothing" });
+    const [line] = (await auditOf(p)).events.filter((x) => x.details?.op === LOOK_UP_AGAIN_OP);
+    expect(line!.details).toMatchObject({ sent: 1 });
+  });
+});
+
+describe("decision 31 (c), R585 M1: a kept time only a wrong clock could have written counts as passed", () => {
+  const FAR = "2031-01-01T00:00:00.000Z";
+  it("P-D: notBefore and lastTriedAt in 2031 — the researcher's act sends; the automatic pass takes it; with notBefore mended and lastTriedAt still in 2031, the automatic pass still takes it", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [a, b, c] = await attached(p, http, [notesPdf(), notesPdf("Market days in the northern valleys"), notesPdf("Harvest songs of the delta")]);
+    for (const e of [a!, b!]) await patch(p, e, { leftOut: [{ ...e.leftOut![0]!, notBefore: FAR, lastTriedAt: FAR, tries: 1 }] });
+    await patch(p, c!, { leftOut: [{ ...c!.leftOut![0]!, notBefore: new Date(now).toISOString(), lastTriedAt: FAR, tries: 1 }] });
+    now += 61 * MIN; // past the wait after one try (an hour, counted from the attach: the 2031 try is not kept)
+    answers["api.openalex.org"] = () => NO_RESULTS;
+    // 1. by hand
+    expect(await lookUpAgain(repo, client(), p.id, a!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true, sent: 1, state: { state: "nothing" } });
+    // 2. automatic (and listed as due)
+    expect((await dueLookUps(repo, p.id, new Date(now))).map((d) => d.entryId)).toEqual([b!.id, c!.id]);
+    expect(await lookUpAgain(repo, client(), p.id, b!.id, { by: "automatic", now: new Date(now) })).toMatchObject({ done: true, sent: 1 });
+    // 3. notBefore mended, lastTriedAt still in 2031: due all the same
+    expect(await lookUpAgain(repo, client(), p.id, c!.id, { by: "automatic", now: new Date(now) })).toMatchObject({ done: true, sent: 1 });
+    // the times written are today's, not 2031's (a time never moves back — but a wrong one is not kept)
+    expect((await entry(p, c!.id)).leftOut![0]!.lastTriedAt).toBe(new Date(now).toISOString());
+  });
+
+  it("every real wait is unchanged (R411): a notBefore less than an hour ahead holds, by hand and automatically", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    now += 16 * MIN;
+    const nb = new Date(now + 59 * MIN).toISOString();
+    await patch(p, e!, { leftOut: [{ ...e!.leftOut![0]!, notBefore: nb }] });
+    sent = [];
+    expect(await lookUpAgain(repo, client(), p.id, e!.id, { by: "researcher", now: new Date(now) })).toEqual({ done: false, why: "not-yet", notBefore: nb });
+    expect(await lookUpAgain(repo, client(), p.id, e!.id, { by: "automatic", now: new Date(now) })).toEqual({ done: false, why: "not-due" });
+    expect(sent).toEqual([]);
+  });
+
+  it("lookUpNow (for the service and the page) agrees with lookUpAgain's own answer for the researcher, over a table of entries", async () => {
+    const p = await project();
+    const T = now + 16 * MIN;
+    const iso = (d: number) => new Date(T + d).toISOString();
+    const w = (title: string, extra: Partial<LeftOutLookup> = {}): LeftOutLookup => ({ services: ["openalex"], title, creator: "Souza", notBefore: iso(30_000), ...extra });
+    const rows: Array<[string, (t: string) => LeftOutLookup[], { canLookUpNow: boolean; notBefore?: string }]> = [
+      ["waiting", (t) => [w(t)], { canLookUpNow: false, notBefore: iso(30_000) }],
+      ["due", (t) => [w(t, { notBefore: iso(-MIN) })], { canLookUpNow: true }],
+      ["wrong clock ahead", (t) => [w(t, { notBefore: FAR, lastTriedAt: FAR })], { canLookUpNow: true }],
+      ["less than an hour ahead", (t) => [w(t, { notBefore: iso(59 * MIN) })], { canLookUpNow: false, notBefore: iso(59 * MIN) }],
+      ["failed", (t) => [{ services: ["openalex"], title: t, why: "failed" }], { canLookUpNow: true }],
+      ["mixed: waiting and found", (t) => [w(t), w(`${t} b`, { outcome: "found" })], { canLookUpNow: false, notBefore: iso(30_000) }],
+      ["mixed: failed and waiting", (t) => [{ services: ["openalex"], title: t, why: "failed" }, w(`${t} b`)], { canLookUpNow: true }],
+      ["two waiting: the earliest", (t) => [w(t, { notBefore: iso(10 * MIN) }), w(`${t} b`)], { canLookUpNow: false, notBefore: iso(30_000) }],
+      ["gave up, its time passed", (t) => [w(t, { notBefore: iso(-MIN), tries: 5, outcome: "gave-up" })], { canLookUpNow: true }],
+      ["nothing left", (t) => [w(t, { outcome: "found" }), w(`${t} b`, { outcome: "nothing" })], { canLookUpNow: false }],
+    ];
+    answers["api.openalex.org"] = () => WAIT_60;
+    const made = await attached(p, client(), rows.map((_, i) => notesPdf(`Field notes number ${i}`)));
+    for (const [i, [, left]] of rows.entries()) await patch(p, made[i]!, { leftOut: left(`Field notes number ${i}`) });
+    now = T;
+    answers["api.openalex.org"] = () => NO_RESULTS;
+    for (const [i, [name, , expected]] of rows.entries()) {
+      const e = await entry(p, made[i]!.id);
+      const said = lookUpNow(e, new Date(now));
+      expect(said, name).toEqual(expected);
+      const r = await lookUpAgain(repo, client(), p.id, e.id, { by: "researcher", now: new Date(now) });
+      if (said.canLookUpNow) expect(r.done, name).toBe(true);
+      else expect(r, name).toEqual(said.notBefore ? { done: false, why: "not-yet", notBefore: said.notBefore } : { done: false, why: "nothing-to-look-up" });
+    }
+  });
+});
+
+describe("decision 31 (c), R585 M3: the sentences in mixes; only the app's own automatic tries count toward giving up", () => {
+  it("P-K: Crossref finds the file's DOI while the title search is told to wait: found, the warning about the file's identifier, and waiting — each once", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.crossref.org"] = () => WAIT_60;
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [buildDoiPdf()]);
+    now += 16 * MIN;
+    answers["api.crossref.org"] = () => ({ statusCode: 200, data: fixture("crossref-work.json") });
+    const r = await lookUpAgain(repo, client(), p.id, e!.id, { by: "automatic", now: new Date(now) });
+    expect(r).toMatchObject({ done: true, found: 1, state: { state: "waiting", fromFile: true } });
+    const end = await entry(p, e!.id);
+    expect(end.reasons.slice(0, 3)).toEqual([LOOK_UP_AGAIN_TEXT.found, LOOK_UP_AGAIN_TEXT.fromFile, LOOKUP_WAITING_TEXT]);
+    for (const s of [LOOK_UP_AGAIN_TEXT.found, LOOK_UP_AGAIN_TEXT.fromFile, LOOKUP_WAITING_TEXT]) expect(end.reasons.filter((x) => x === s)).toHaveLength(1);
+  });
+
+  it("P-M: five presses of the researcher, each told to wait, never end \"gave-up\" and are not counted in tries; they move lastTriedAt and notBefore", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    for (let k = 0; k < 6; k++) {
+      now += 2 * MIN;
+      expect(await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true, sent: 1, state: { state: "waiting" } });
+      const l = (await entry(p, e!.id)).leftOut![0]!;
+      expect(l.tries).toBeUndefined();
+      expect(l.outcome).toBeUndefined();
+      expect(l).toMatchObject({ lastTriedAt: new Date(now).toISOString(), notBefore: new Date(now + MIN).toISOString() });
+    }
+    expect((await entry(p, e!.id)).reasons[0]).toBe(LOOKUP_WAITING_TEXT);
+  });
+
+  it("after the app gave up, a researcher's press told to wait leaves it \"gave-up\" (the automatic pass does not take it again) with the app's own tries", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [notesPdf()]);
+    await patch(p, e!, { leftOut: [{ ...e!.leftOut![0]!, tries: 5, outcome: "gave-up" }] });
+    now += 2 * MIN;
+    expect(await lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) })).toMatchObject({ done: true, state: { state: "gave-up", tries: 5 } });
+    expect((await entry(p, e!.id)).reasons[0]).toBe(lookUpGaveUpText(5));
+  });
+});
+
+describe("decision 31 (c), R585 M6: only the part of a chain that was left out is asked", () => {
+  it("a DOI lookup of which only OpenAlex was left out (Crossref had answered): the look-up asks OpenAlex alone; Crossref receives 0 requests", async () => {
+    const p = await project();
+    const http = client();
+    answers["api.crossref.org"] = () => WAIT_60;
+    answers["api.openalex.org"] = () => WAIT_60;
+    const [e] = await attached(p, http, [buildDoiPdf()]);
+    // Only part of the chain left out, as an attach writes it when Crossref answered and OpenAlex asked to wait. (Set by
+    // hand: a Crossref answer at the attach would sit in the lookup cache and hide a request made in error.)
+    const at = e!.leftOut!.findIndex((l) => l.identifier);
+    await patch(p, e!, { leftOut: e!.leftOut!.map((l, i) => (i === at ? { ...l, services: ["openalex"] } : l)) });
+    now += 16 * MIN;
+    sent = [];
+    answers["api.crossref.org"] = () => ({ statusCode: 200, data: fixture("crossref-work.json") });
+    answers["api.openalex.org"] = (path) => (path.includes("search") ? NO_RESULTS : { statusCode: 200, data: fixture("openalex-work.json") });
+    // a fresh client (as after reopening): Crossref's earlier answer is not in its memory, so a request would show
+    const r = await lookUpAgain(repo, client(), p.id, e!.id, { by: "automatic", now: new Date(now) });
+    expect(r).toMatchObject({ done: true, services: ["openalex"] });
+    expect(to("api.crossref.org")).toBe(0);
+    expect(sent.filter((s) => s.startsWith("api.openalex.org/works/doi"))).toHaveLength(1);
   });
 });

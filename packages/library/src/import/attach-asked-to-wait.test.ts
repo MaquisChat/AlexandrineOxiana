@@ -12,7 +12,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { newId } from "@ao/core";
-import { LOOKUP_WAITING_TEXT } from "@ao/shared";
+import { LOOKUP_WAITING_TEXT, lookUpGaveUpText } from "@ao/shared";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FIXTURE_DOI, buildDoiPdf, buildPdf } from "../../../../tests/fixtures/generate.mjs";
@@ -22,8 +22,11 @@ import { shutdownExtractors } from "../extract/index.js";
 import { createLibrary, type Library } from "../library.js";
 import { HttpClient } from "../lookup/index.js";
 import { REVIEW_FILE, parseReviewFile, type LeftOutLookup, type ReviewEntry } from "../repo/review.js";
-import { appendCandidates, reasonsWithLookUpState } from "./look-up-state.js";
-import type { Repo } from "../repo/repo.js";
+import { appendCandidates, lookUpStateOf, reasonsWithLookUpState } from "./look-up-state.js";
+import { importChange, projectDataKey, type Repo } from "../repo/repo.js";
+import { openLine } from "../repo/io.js";
+import { storeRequest } from "../repo/sources.js";
+import { KeyNotAvailableError } from "../crypto/format.js";
 import { openTestRepo } from "../repo/testing.js";
 import { ATTACH_REASONS, createAttach } from "./attach.js";
 import { watchFolder, type WatchEvent } from "./watch.js";
@@ -119,6 +122,34 @@ async function put(name: string, data: Buffer): Promise<string> {
   return p;
 }
 const notesPdf = (title = "Notes from the tide-line interviews") => buildPdf({ title, author: "Ana Souza", lines: [`${title}.`] });
+/**
+ * The older build's reader of a review file, copied line for line from commit 2d12ab1,
+ * `packages/library/src/repo/review.ts` lines 463-479 (`parseReviewFile`; `git show 2d12ab1:packages/library/src/repo/review.ts
+ * | sed -n '455,485p'`): each line opened with the project's key when there is one (`openLine(key, projectId, line,
+ * PURPOSE)`, PURPOSE = "ao-review" at its line 23), JSON.parse, then the one check `typeof e.id === "string" &&
+ * e.projectId === projectId`; a wiped key is rethrown, any other failure skips the line; the newest line per id wins.
+ * Nothing else is checked and no field is removed. `openLine` is this build's own: `packages/library/src/repo/io.ts` and
+ * `src/crypto` are unchanged since 2d12ab1 (`git diff 2d12ab1 HEAD -- packages/library/src/repo/io.ts
+ * packages/library/src/crypto` is empty). Only the types differ (the entry is kept as a plain record).
+ */
+function olderParse(text: string, projectId: string, key: Uint8Array | null = null): { entries: Array<Record<string, unknown>>; skipped: number } {
+  const byId = new Map<string, Record<string, unknown>>();
+  let skipped = 0;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const json = key ? openLine(key, projectId, line, "ao-review") : line;
+      const e = JSON.parse(json) as Record<string, unknown>;
+      if (typeof e?.id !== "string" || e.projectId !== projectId) throw new Error("not a review entry of this project");
+      byId.set(e.id as string, e);
+    } catch (err) {
+      if (err instanceof KeyNotAvailableError) throw err; // a wiped key: locked, not a skipped line (R386 a)
+      skipped++;
+    }
+  }
+  return { entries: [...byId.values()], skipped };
+}
+
 async function reviewEntries(p: { id: string; folder: string }): Promise<ReviewEntry[]> {
   const text = await readFile(join(lib.root, p.folder, ...REVIEW_FILE.split("/")), "utf8").catch(() => "");
   return parseReviewFile(text, p.id, null).entries;
@@ -287,23 +318,6 @@ describe("an attach does not wait for a service that asks to wait (decision 31 b
     const [o] = await createAttach({ repo, http: client() }).attachFiles(p.id, [await put("tide-line-notes.pdf", await notesPdf())]);
     const raw = (await readFile(join(lib.root, p.folder, ...REVIEW_FILE.split("/")), "utf8")).split("\n").filter(Boolean);
     expect(raw).toHaveLength(1);
-    // 2d12ab1:packages/library/src/repo/review.ts, parseReviewFile (lines 463-479): JSON.parse of the line, then the one
-    // check `typeof e.id === "string" && e.projectId === projectId`; nothing else is checked, no field is removed.
-    const olderParse = (text: string, projectId: string) => {
-      const byId = new Map<string, Record<string, unknown>>();
-      let skipped = 0;
-      for (const line of text.split("\n")) {
-        if (!line.trim()) continue;
-        try {
-          const e = JSON.parse(line) as Record<string, unknown>;
-          if (typeof e?.id !== "string" || e.projectId !== projectId) throw new Error("not a review entry of this project");
-          byId.set(e.id, e);
-        } catch {
-          skipped++;
-        }
-      }
-      return { entries: [...byId.values()], skipped };
-    };
     const { entries, skipped } = olderParse(raw.join("\n"), p.id);
     expect(skipped).toBe(0);
     const e = entries[0]!;
@@ -351,5 +365,40 @@ describe("an attach does not wait for a service that asks to wait (decision 31 b
     const decided = JSON.parse(JSON.stringify({ ...l, status: "resolved", resolvedAt: "2026-11-25T09:00:00.000Z", decision: "accept-candidate" }));
     expect(olderParse([...raw, JSON.stringify(later), JSON.stringify(decided)].join("\n"), p.id).entries).toEqual([decided]);
     expect(decided.leftOut).toEqual(JSON.parse(JSON.stringify(later.leftOut)));
+  });
+
+  it("R585 M7: an entry the app GAVE UP on, in an encrypted project — its SEALED lines are read by 2d12ab1's reader with the project's key; the values it branches on are ones it knows; a decision keeps every new field", async () => {
+    const p = (await repo.createProject({ name: `E${Math.random().toString(36).slice(2, 7)}`, governanceYaml: GOV, encryption: { enabled: true, passphrase: "correct horse battery staple" } })).project;
+    answering("https://api.openalex.org", () => WAIT_60);
+    const [o] = await createAttach({ repo, http: client() }).attachFiles(p.id, [await put("sealed-notes.pdf", await notesPdf("Harvest songs of the delta"))]);
+    const k = projectDataKey(repo, p.id)!.key;
+    const file = join(lib.root, p.folder, ...REVIEW_FILE.split("/"));
+    const [e] = parseReviewFile(await readFile(file, "utf8"), p.id, k).entries;
+    expect(e!.sourceId).toBe(o!.sourceId);
+    // A later line as "Look up again" writes it once the app has given up (five automatic tries told to wait), through
+    // the same governed, sealing write.
+    const leftOut: LeftOutLookup[] = e!.leftOut!.map((l) => ({ ...l, tries: 5, lastTriedAt: "2026-11-26T10:00:00.000Z", notBefore: "2026-11-26T10:01:00.000Z", outcome: "gave-up" }));
+    const later: ReviewEntry = { ...e!, leftOut, reasons: reasonsWithLookUpState(e!.reasons, lookUpStateOf({ leftOut })!) };
+    expect(later.reasons[0]).toBe(lookUpGaveUpText(5));
+    const sf = await repo.getSource(p.id, e!.sourceId!);
+    await importChange(repo, p.id, storeRequest(sf.source.provenance), async (ops) => ops.updateReview(later), { op: "test.later-line" });
+    const raw = (await readFile(file, "utf8")).split("\n").filter(Boolean);
+    expect(raw).toHaveLength(2);
+    for (const line of raw) {
+      expect(Object.keys(JSON.parse(line) as object).sort()).toEqual(["alg", "ct", "keyId", "nonce", "v"]); // sealed
+      for (const word of ["Harvest songs", "gave-up", "lastTriedAt", "openalex", lookUpGaveUpText(5)]) expect(line).not.toContain(word);
+    }
+    // Without the key the older build reads nothing of it (a locked project: as for any sealed line).
+    expect(olderParse(raw.join("\n"), p.id, null)).toEqual({ entries: [], skipped: 2 });
+    const read = olderParse(raw.join("\n"), p.id, k);
+    expect(read.skipped).toBe(0);
+    const l = read.entries[0]!;
+    expect(l).toEqual(JSON.parse(JSON.stringify(later)));
+    expect([l.kind, l.status, l.batchId, l.cause, l.method]).toEqual(["import", "pending", undefined, undefined, "embedded"]);
+    expect((l.reasons as unknown[]).every((x) => typeof x === "string")).toBe(true);
+    expect((l.reasons as string[])[0]).toBe(lookUpGaveUpText(5));
+    // Its decision spreads the entry (2d12ab1 import/bulk/review.ts:214): the given-up lookups are kept.
+    const decided = JSON.parse(JSON.stringify({ ...l, status: "resolved", resolvedAt: "2026-11-27T09:00:00.000Z", decision: "keep-both" }));
+    expect(decided.leftOut).toEqual(JSON.parse(JSON.stringify(leftOut)));
   });
 });
