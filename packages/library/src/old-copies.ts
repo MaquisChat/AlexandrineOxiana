@@ -170,13 +170,20 @@ export async function addPendingOldCopy(
 /**
  * Moves whose switch has started but not finished (e.g. the app crashed): the
  * old copy may already be read-only. Finish each with `completeMove(newRoot, …)`.
+ * With `at`, only the moves of the library `at.libraryId` out of or into the folder `at.folder`, matched by real path
+ * (R599 M-3).
  */
 export async function listUnfinishedMoves(
   deps: CfgDeps,
+  at?: { libraryId: string; folder: string },
 ): Promise<Array<{ libraryId: string; oldRoot: string; newRoot: string; moveId: string; startedAt: string }>> {
-  return (await load(deps))
-    .filter((r) => !r.complete)
-    .map((r) => ({ libraryId: r.libraryId, oldRoot: r.oldRoot, newRoot: r.newRoot, moveId: r.moveId, startedAt: r.createdAt }));
+  const out: Array<{ libraryId: string; oldRoot: string; newRoot: string; moveId: string; startedAt: string }> = [];
+  for (const r of await load(deps)) {
+    if (r.complete) continue;
+    if (at && (r.libraryId !== at.libraryId || !((await sameFolder(r.oldRoot, at.folder)) || (await sameFolder(r.newRoot, at.folder))))) continue;
+    out.push({ libraryId: r.libraryId, oldRoot: r.oldRoot, newRoot: r.newRoot, moveId: r.moveId, startedAt: r.createdAt });
+  }
+  return out;
 }
 
 /**
