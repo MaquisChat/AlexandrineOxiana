@@ -8,6 +8,7 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { isUsableFontFamily, isUserFontId } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, readWithin } from "../api/firstRead";
 import { canLoadFaces, fontsApi, loadUserFace, type FontsApi, type FontsClient } from "../api/fonts";
 import { DEFAULT_APPEARANCE, FONT_SLOTS, applyPatch, checkAccent, type AppearancePatch, type AppearanceSettings, type FontSlot } from "./appearance";
 import { fontStack, type FontChoice } from "./fonts";
@@ -78,10 +79,15 @@ export interface AppearanceProviderProps {
   client?: Pick<ApiClient, "appearance"> & Partial<Pick<ApiClient, "request" | "bytes">>;
   /** Settings to start with (before the service answers). */
   initial?: AppearanceSettings;
+  /**
+   * FR-756: how long the read of the saved settings is waited for (smaller in tests). Given up, it is a failed load:
+   * the same alert and "Try loading again", with "The library service did not answer in time.".
+   */
+  firstReadMs?: number;
   children?: ReactNode;
 }
 
-export function AppearanceProvider({ client, initial, children }: AppearanceProviderProps) {
+export function AppearanceProvider({ client, initial, children, firstReadMs = FIRST_READ_TIMEOUT_MS }: AppearanceProviderProps) {
   const [settings, setSettings] = useState<AppearanceSettings>(initial ?? DEFAULT_APPEARANCE);
   const [saveError, setSaveError] = useState<string | undefined>();
   const [saveErrorReason, setSaveErrorReason] = useState<string | undefined>();
@@ -102,7 +108,9 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
   useEffect(() => {
     if (!client) return;
     let live = true;
-    client.appearance.get().then(
+    // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled; a late answer changes nothing).
+    const ac = new AbortController();
+    readWithin((signal) => client.appearance.get({ signal }), firstReadMs, ac.signal).then(
       (s) => {
         if (!live) return;
         setLoadError(undefined);
@@ -114,8 +122,9 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
     );
     return () => {
       live = false;
+      ac.abort();
     };
-  }, [client, loadTry]);
+  }, [client, loadTry, firstReadMs]);
   const retryLoad = useCallback(() => setLoadTry((n) => n + 1), []);
 
   const theme = resolveTheme(settings.theme, settings.highContrast, systemDark);
