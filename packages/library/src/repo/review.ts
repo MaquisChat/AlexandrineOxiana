@@ -106,14 +106,30 @@ export interface ReviewEntry {
   leftOut?: LeftOutLookup[];
 }
 
-/** A lookup left out (decision 31 b): see `ReviewEntry.leftOut`. */
+/**
+ * A lookup left out (decision 31 b): see `ReviewEntry.leftOut`. Decision 31 (c), "Look up again" (R566 7, R577 4): its
+ * state lives in OPTIONAL fields only, so an entry written by (b) — which has none — reads as before and the build at
+ * 2d12ab1 keeps them when it rewrites the entry (it spreads the entry; it does not know `leftOut` at all).
+ */
 export interface LeftOutLookup {
+  /** The services still to be asked for this lookup (one that answered is taken out). */
   services: string[];
   identifier?: string;
   title?: string;
   creator?: string;
-  /** ISO 8601: those services are not to be asked again before it (R411). */
-  notBefore: string;
+  /**
+   * ISO 8601: those services are not to be asked again before it (R411). Always set for a lookup whose service asked to
+   * wait; absent for one that failed outright (there is no time to wait for).
+   */
+  notBefore?: string;
+  /** Why it was left out: absent means "asked-to-wait" (every entry written by decision 31 b). R577 iv: "failed" is a lookup that failed outright (no network, a 500), looked up again only by the researcher's act. */
+  why?: "asked-to-wait" | "failed";
+  /** How many times "Look up again" asked it (automatic and by hand). */
+  tries?: number;
+  /** ISO 8601: when it was last asked by "Look up again". */
+  lastTriedAt?: string;
+  /** What the last look-up gave; absent while it is still to be asked. */
+  outcome?: "found" | "nothing" | "not-allowed" | "gave-up";
 }
 
 /**
