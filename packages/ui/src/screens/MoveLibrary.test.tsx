@@ -127,6 +127,21 @@ describe("Move library", () => {
     expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it("R583 I1: a split move that did not finish says so for the projects, and that the library they came from opens again", async () => {
+    const user = userEvent.setup();
+    const body = { code: "UNAVAILABLE", message: "x", reason: "move-not-finished-split" };
+    server.use(
+      http.post(url("/libraries/move"), () => new HttpResponse(`${JSON.stringify({ error: body })}\n`, { headers: { "content-type": "application/x-ndjson" } })),
+    );
+    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+    await user.click(within(plan).getByRole("button", { name: "Move library" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      `The move of the projects did not finish, so the library has been closed. Open the new library at its new place, ${DEST}, and the move will be finished then. The library they came from can be opened again for the projects that stayed; nothing is lost.`,
+    );
+    expect(alert.querySelector("[dir='auto']")?.textContent).toBe(DEST);
+  });
+
   it("FR-755: the same sentence when the move's answer is read again from move/status after the stream was cut off", async () => {
     const user = userEvent.setup();
     let attempt = "";

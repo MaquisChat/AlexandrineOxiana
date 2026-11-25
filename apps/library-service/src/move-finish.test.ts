@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireLock, deviceDeps, openLibrary, type Deps } from "@ao/library";
-import { MOVE_NOT_FINISHED_REASON, moveNotFinishedText } from "@ao/shared";
+import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedSplitText, moveNotFinishedText } from "@ao/shared";
 import { moveSeams } from "../../../packages/library/src/move.js";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
@@ -92,8 +92,8 @@ async function libraryWithSources(): Promise<{ path: string; pid: string; dest: 
 }
 
 /** The move's NDJSON lines. */
-async function move(dest: string): Promise<any[]> {
-  const r = await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a1" } });
+async function move(dest: string, excludeProjectIds?: string[]): Promise<any[]> {
+  const r = await call({ method: "POST", url: "/libraries/move", body: { dest, attempt: "a1", ...(excludeProjectIds ? { excludeProjectIds } : {}) } });
   return r.body
     .split("\n")
     .filter((l) => l.trim())
@@ -350,5 +350,69 @@ describe("R573 Minor 2: during a successful move, between the close of the old c
     }
     expect(lastLine(await moving).done).toBe(true);
     expect((await call({ url: `/projects/${f.pid}/sources?text=harbour` })).json.total).toBe(1);
+  });
+});
+
+describe("FR-755 (R583 I1): a split move (some projects stay behind) that fails late", () => {
+  /** Projects Study and Field (moved, a source each) and Kept (stays, one source). */
+  async function splitLibrary() {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    const mk = async (name: string, file: string) => {
+      const p = await call({ method: "POST", url: "/projects", body: { name, governanceYaml: OPEN_GOV, encryption: { enabled: false } } });
+      const id = p.json.project.id as string;
+      expect((await call({ method: "POST", url: `/projects/${id}/attach`, body: { paths: [await pdf(file, `${name} notebook`)] } })).status).toBe(200);
+      return id;
+    };
+    const field = await mk("Field", "f.pdf");
+    const kept = await mk("Kept", "k.pdf");
+    return { path, dest, study: pid, field, kept };
+  }
+  const names = async () => ((await call({ url: "/projects" })).json.projects as Array<{ name: string }>).map((p) => p.name).sort();
+
+  const cases: Array<[string, () => void]> = [
+    ["after the first project's mark", () => void (moveSeams.fail = { at: "split-mark", afterFolders: 1 })],
+    ["after the last project's mark", () => void (moveSeams.fail = { at: "split-mark", afterFolders: 2 })],
+    ["at the journal's write after the marking", () => void (moveSeams.fail = { at: "journal", after: "mark-old" })],
+    ["after register", () => void (moveSeams.crashAfter = "register")],
+    ["after close-source", () => void (moveSeams.crashAfter = "close-source")],
+    ["at the record's marking as complete", () => void (moveSeams.fail = { at: "mark-complete" })],
+    ["at the journal's removal", () => void (moveSeams.fail = { at: "unlink" })],
+  ];
+  for (const [when, arm] of cases) {
+    it(`${when}: closed in the service, the split's sentence; the new place's opening finishes it; both libraries whole`, async () => {
+      const f = await splitLibrary();
+      arm();
+      const lines = await move(f.dest, [f.kept]);
+      expect(lastLine(lines)).toEqual({ error: { code: "UNAVAILABLE", message: moveNotFinishedSplitText(), reason: MOVE_NOT_FINISHED_SPLIT_REASON } });
+      expect((await call({ url: "/libraries" })).json.current).toBeUndefined();
+      // No change is taken into a marked project (the reviewer's probe).
+      const late = await call({ method: "POST", url: `/projects/${f.study}/attach`, body: { paths: [await pdf("late.pdf", "Late")] } });
+      expect([late.status, late.json.error?.code]).toEqual([503, "LIBRARY_OFFLINE"]);
+      // The new place: finished, the moved projects whole.
+      const opened = await call({ method: "POST", url: "/libraries/open", body: { path: f.dest } });
+      expect([opened.status, opened.json.mode]).toEqual([200, "read-write"]);
+      expect(kindsNow()).toEqual(["move-finished-at-opening"]);
+      expect(existsSync(join(f.dest, ".move-journal.json"))).toBe(false);
+      expect(await names()).toEqual(["Field", "Study"]);
+      await svc!.state.idle();
+      expect((await call({ url: `/projects/${f.study}/sources` })).json.total).toBe(2);
+      expect((await call({ url: `/projects/${f.field}/sources` })).json.total).toBe(1);
+      // The library they came from: the projects that stayed, read-write.
+      const rest = await call({ method: "POST", url: "/libraries/open", body: { path: f.path } });
+      expect([rest.status, rest.json.mode]).toEqual([200, "read-write"]);
+      expect(await names()).toEqual(["Kept"]);
+      await svc!.state.idle();
+      expect((await call({ url: `/projects/${f.kept}/sources` })).json.total).toBe(1);
+    });
+  }
+
+  it("the sentence for a split, word for word", () => {
+    expect(moveNotFinishedSplitText()).toBe(
+      "The move of the projects did not finish, so the library has been closed. Open the new library at its new place, and the move will be finished then. The library they came from can be opened again for the projects that stayed; nothing is lost.",
+    );
+    expect(moveNotFinishedSplitText("/Volumes/Drive/Lib")).toBe(
+      "The move of the projects did not finish, so the library has been closed. Open the new library at its new place, /Volumes/Drive/Lib, and the move will be finished then. The library they came from can be opened again for the projects that stayed; nothing is lost.",
+    );
   });
 });

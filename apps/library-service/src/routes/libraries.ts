@@ -4,8 +4,7 @@
  * Paths the researcher chose come back as given (R96: their own chosen path); everything else is
  * library-relative.
  */
-import { access } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
   checkIntegrity,
@@ -26,13 +25,13 @@ import {
   ReadOnlyLibraryError,
   acceptMovePlan,
   isClosed,
-  MOVED_MARKER,
+  oldCopyMarkedFor,
   scrubPaths,
   type IntegritySample,
   type Library,
 } from "@ao/library";
 import type { LibraryFolderRoomRequest, LibraryFolderRoomResponse, LibrarySuggestedFolderResponse } from "@ao/shared";
-import { MOVE_NOT_FINISHED_REASON, moveNotFinishedText } from "@ao/shared";
+import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedSplitText, moveNotFinishedText } from "@ao/shared";
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
 import { cheapLocationEnv } from "./watched-folders.js";
@@ -351,12 +350,18 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         // journal's write at the destination, the record's marking, the journal's removal). The old library cannot carry
         // on: it is closed in the service, as by "Close library", and opening the library at its new place finishes the
         // move. What the move paused waits there, as after a move whose new place could not be opened.
-        if (state.session === s && (isClosed(s.lib) || (await access(join(oldRoot, MOVED_MARKER)).then(() => true, () => false)))) {
+        // Marked: from the journal's record of the steps done, or what the old copy shows — its top's mark, or for a split
+        // any moved project's mark (R583 I1).
+        if (state.session === s && (isClosed(s.lib) || (await oldCopyMarkedFor(dest, oldRoot, state.deps)))) {
           state.resumeWhenOpened(dest, paused, oldRoot);
           await state.closeLibrary();
           state.moving = false;
           state.opts.log.warn({ err: state.describe(err) }, "the move did not finish after the old copy was closed");
-          const body = errorBody(new ApiError(503, "UNAVAILABLE", moveNotFinishedText(), MOVE_NOT_FINISHED_REASON), state.roots);
+          const split = (excludeProjectIds?.length ?? 0) > 0;
+          const body = errorBody(
+            split ? new ApiError(503, "UNAVAILABLE", moveNotFinishedSplitText(), MOVE_NOT_FINISHED_SPLIT_REASON) : new ApiError(503, "UNAVAILABLE", moveNotFinishedText(), MOVE_NOT_FINISHED_REASON),
+            state.roots,
+          );
           state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
           await write(body);
           reply.raw.end();
