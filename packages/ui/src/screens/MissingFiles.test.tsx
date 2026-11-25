@@ -1,6 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
+import { StrictMode } from "react";
 import { describe, expect, it } from "vitest";
 import { makeApi, server, url, useMsw } from "../test/msw-governance";
 import { MissingFiles } from "./MissingFiles";
@@ -98,5 +99,24 @@ describe("Missing files", () => {
     const section = await screen.findByRole("region", { name: "Search index" });
     await userEvent.setup().click(within(section).getByRole("button", { name: "Rebuild library from folder" }));
     expect((await within(section).findByRole("alert")).textContent).toMatch(/read-only/);
+  });
+});
+
+describe("FR-762 (review M1): under strict mode (mounted, cleaned up, mounted again) the rebuild still says what it did", () => {
+  it("“Rebuild library from folder” shows its result and is usable again", async () => {
+    server.use(
+      http.get(url("/libraries/integrity"), () => HttpResponse.json(report([]))),
+      http.post(url("/libraries/rebuild-index"), () => HttpResponse.json({ indexed: 1284, lockedProjects: 0, errors: 0 })),
+    );
+    render(
+      <StrictMode>
+        <MissingFiles api={makeApi()} isWindows={false} />
+      </StrictMode>,
+    );
+    const section = await screen.findByRole("region", { name: "Search index" });
+    const button = within(section).getByRole("button", { name: "Rebuild library from folder" }) as HTMLButtonElement;
+    await userEvent.setup().click(button);
+    await waitFor(() => expect(section.textContent).toMatch(/1,284 sources indexed/));
+    expect(button.disabled).toBe(false);
   });
 });
