@@ -577,3 +577,4 @@ R651 (2026-11-25 UTC): batch C reviewed, Ready with fixes — a backup's own war
 R652 (2026-11-25 UTC): batch A's fix commits read and accepted ("Look up again" carries the lock stop; lockStopOf aborted while a lock is pending); b16-a-lookups 9dcf6f4 merged on kg-join
 R653 (2026-11-25 UTC): CI run 292 green (17:34 UTC); build request 15 merged to main on the owner's word — merge commit 8372a1f, code identical to a11beeb; the owner's page has part 15; still no Mac build (the evening try)
 R654 (2026-11-25 UTC): batch C's second look, Ready with fixes — "Show them" lays out from the last read (it emptied the list and said something untrue); the backup's warnings inside the status region; a test that proved nothing deleted; M5 rightly left (a ruled focus sequence)
+R655 (2026-11-25 UTC): batch C's last commits read and accepted; b16-c-screens ab8f4a2 merged on kg-join (now build 15 + batches B, A, C)
