@@ -251,3 +251,149 @@ All probes were deleted. `git status --short` is empty, and no process was left 
 ## Verdict
 
 **NOT APPROVED.** The fix round is I1 to I3. m1 and m3 are worth taking with it, and the rest can be listed.
+
+---
+
+# Second look (R606)
+
+Head 5a53b73: ten commits after 8ce0311. I read the builder's section "Fix round (R600)", rulings R600 and R606, and the diff `8ce0311..HEAD`.
+
+My probes ran again in throwaway copies of `look-up-again.test.ts`, with the same harness and no public host. The copies are deleted. The timing mutant was made by copying the file aside, editing it, running, and restoring it. `git status --short` is empty, and no process of mine is left running.
+
+**Verdict: APPROVED WITH SMALL POINTS.** Every finding of the first review is closed. Three new Minor points, none Critical or Important.
+
+## The first review's findings
+
+| Finding | Closed? | Evidence |
+|---|---|---|
+| I1 the hold over a reopening | **closed** | Probe A1, again: a 429 for one hour, then three reopenings a minute apart. Requests: 1, 0, 0, 0 (before the fix: 1, 1, 1). After them, the queue lists all three entries `canLookUpNow:false` with one time. A press answers `not-yet` with that same time and sends 0. An attach after the reopening goes to review with "Waiting for lookup service response." and sends 0. Code: `state.ts:2019` `carryLookUpHolds`, `:1009`, awaited in `adopt` at `:787`, in the pass at `:1998`, in a press at `:2104`; unlock at `routes/projects.ts:166`. |
+| I2 a lock during a look-up | **closed** | Probe A3, again: 1 request in the air during the lock. Sensitive answers left in memory: **0** (before: 1). Code: `state.ts:2138`. |
+| I3 a failed lookup always said | **closed** (one stale case is a new point: n1) | Probe R595, again: after the press (one lookup nothing, one failed again) the entry carries `lookUp:{state:"nothing", canLookUpNow:true, failed:true}`. Page `ReviewQueue.tsx:2389-2390`: the failed sentence is shown and "No candidate matches were found." is not. Before the press: `{state:"waiting", failed:true}`. |
+| m1 double press | **closed** | Probe B1, again: the first press answers `failed`, the second `under-way`. Entry 2 got **4** requests (before: 8). Code: `state.ts:2107`. |
+| m2 busy | **closed** as ruled | The page's busy state is per entry (`ReviewQueue.tsx:1331`). A press goes before the pass's next entry. The wait behind the pass's current entry is accepted and listed. |
+| m3 re-reads | **closed** | Only `reasons`, `candidates` and `lookUp.state` are compared. After the 30th re-read the entry as last read is shown, and nothing is said. Page tests cover both. |
+| m4 | **closed** | The optional `sourceId`, then that source only. |
+| m5 | **closed** | `ReviewQueue.tsx:258` uses "en". |
+| m6 | **closed** | Only `sent > 0` is counted (`state.ts:2086`). A tick during a pass is dropped. An unlock during a pass gets a pass of its own project only. Side effect: n3 below. |
+| m7 | **closed** | The tests asked for are present: service 37 tests, page 31 tests. |
+
+## I1 in depth
+
+**(a) What feeds the carried hold.** Only lookups that are asked to wait and not answered feed it. Failed lookups, "found" and "nothing" are skipped. The kept time goes through the engine's `keptNotBefore`, so:
+- a wrong clock's time (more than an hour ahead) is ignored;
+- a time already passed is skipped.
+
+The rest, by case:
+- **Several projects naming different times for one service:** the latest is kept. Probe I1b: the plain project's 40 minutes was carried at opening, past the encrypted project's 20.
+- **A locked project at opening:** it is not read. At its unlock its times are added (`carryLookUpHolds(s, [id])`).
+- **Can an unlock shorten or lose a hold?** No. `holdUntil` takes the larger of the two times (`http.ts:451`), and probe I1b gave the same hold before and after the unlock.
+- **Inherent limit:** while a project is locked, its own times are not known. An attach into *another* project can therefore ask that service before the locked project's time. The queue is sealed, so nothing better is possible. Noted only.
+
+**(b) `holdUntil`** (`packages/library/src/lookup/http.ts:448`):
+- It is capped at the client's `MAX_HOLD_MS` from now.
+- It never shortens a hold.
+- A time already passed holds nothing.
+- It writes the same `notBefore` map as an ordinary hold, so a 2xx from the host clears it (`:794`).
+
+**Does a 2xx from an attach clear it?** An attach cannot get one while the host is held, because it uses `leave-out` and sends nothing. Only a caller *without* that option (Bulk Import, Find, Zotero) can get a 2xx then, and it clears the carried hold exactly as it clears an ordinary hold (R563 I2: the service is answering again). After that:
+- Entries the hold had skipped become askable and due.
+- Entries that were themselves tried keep their own kept time.
+
+That is right.
+
+**Unchanged for Bulk Import, Zotero and Find.** They never look at or wait for a hold. A call without `leave-out` does not read the map (`http.ts:765,776`). `holdUntil` changes nothing for them.
+
+**(c) R606: what the opening's wait costs.** Each figure is three openings, warm.
+
+| Waiting entries | `POST /libraries/open` (ms) | `carryLookUpHolds` alone (ms) |
+|---|---|---|
+| 0 | 26 / 14 / 13 | 0 |
+| 50 | 45 / 33 / 43 | 10 / 8 / 8 |
+| 500 | 227 / 178 / 200 | 80 / 76 / 78 |
+
+**An encrypted project.** It is locked at opening, so the opening does not read it. The cost moves to its unlock, which waits for the carrying.
+
+| Unlock of an encrypted project with … | Unlock (ms) | Carrying alone (ms) |
+|---|---|---|
+| 1 waiting entry | 360 / 357 | 1 |
+| 300 waiting entries | 793 / 768 | 83 / 72 |
+| 300 waiting entries, with the carrying's `await` removed in a copy | 678 / 670 | — |
+
+So the carrying costs about 100 ms at 300 encrypted entries. The rest of the unlock's growth comes from other unlock work.
+
+**Verdict on R606: not felt.** It is under about 100 ms at 500 plain entries and about 100 ms at 300 encrypted ones. Exporting the plain reader is not needed. If it is ever wanted, the smallest mend is to export `projectReviewEntries` and use it in `carryLookUpHolds`; it needs no titles.
+
+**The opening should keep waiting.** An attach (or a watched folder's bring-in, see n2) or a press in the gap would send to a held service before its time, which is exactly I1. Waiting only in the pass, a press and an attach would need the attach to await `s.holdsCarried` too. The cost does not justify that.
+
+**(d) One place for "now" and its time.** Yes: `lookUpOut` (`routes/review.ts:79`), which reads `lookUpNow` and the client's holds. The page compares only to turn ready when the time comes.
+
+A press can disagree with it in two cases, both harmless:
+1. A lookup whose allowed services are all held, while a service the rules deny is not held. The field says "now", and the press answers `not-yet` with the hold's time, which the page shows (builder's Uncertain 2).
+2. Every askable lookup held, plus a lookup the rules now refuse. The field says "not now", while a press would write "not allowed" and send nothing.
+
+Nothing is sent early in either case.
+
+## I3: what the page says with `failed: true`, word for word against R577
+
+Under the matches, whatever the main state, with or without matches: "Not looked up: a lookup service could not be reached. You can use Look up again." It is never beside "No candidate matches were found.".
+
+What else is shown, by main state:
+- **waiting, no matches:** "Not looked up yet: the lookup service asked to wait." is shown as well. Both are true, and they are different sentences.
+- **nothing:** the reasons say "The lookup service has now answered, but it found no match for this item." That is true of the lookup that answered, and the failed sentence stands beside it, so the earlier untrue pair is gone.
+- **found:** the reasons carry the found sentence, and the matches are listed with the failed sentence below them.
+- **failed:** that sentence only. In the announcement, "failed" plus `failed:true` is deduplicated by the `Set` (`ReviewQueue.tsx:274`), so it is said once.
+
+The announcement is the state's sentence or sentences, then the failed sentence, each once. Every word matches `packages/shared/src/api/sources.ts`, which is R577.
+
+## New points (all Minor)
+
+**n1. "Could not be reached" stays after the rules refuse that lookup.**
+- Sequence (probe R595, continued):
+  1. One lookup answered nothing; the other failed again.
+  2. The project's rules are changed to allow no lookup.
+  3. A press answers `{kind:"not-allowed"}`.
+- The engine keeps the lookup's `why:"failed"` and adds `outcome:"not-allowed"`. The field stays `failed:true` (`routes/review.ts:106` excludes only found and nothing), so the page says, for that same lookup:
+  - "This project's rules no longer allow this lookup, so it was not looked up again." (true);
+  - "Not looked up: a lookup service could not be reached. You can use Look up again." (stale: its last attempt was refused by the rules, not unreachable).
+- Mend: `failed` only when `l.why === "failed" && !l.outcome` (one condition).
+
+**n2. A watched folder's bring-in at opening can start before the holds are carried.**
+- `activate` starts the watches (`state.ts:998`) before `s.holdsCarried` (`:1009`). A bring-in uses `leave-out` and does not await it.
+- A file waiting in a watched folder at opening could therefore ask a held service within its time. In practice the watch's stability wait likely makes it lose the race, but nothing guarantees that. Not probed: a timing race.
+- Mend: the bring-in, or `startProjectsWatches`, awaits `s.holdsCarried` (one line), or `holdsCarried` is set before the watches start and awaited by them.
+
+**n3. A pass against a held service walks every due entry, each reading the whole queue.**
+- m6 counts only entries for which something was sent. While a service holds, every due entry is tried, and each `lookUpAgain` re-reads the project's whole queue before answering `not-due`.
+- Probe P, 500 entries, OpenAlex held for an hour:
+  - opening pass: 1 760 ms, 1 request;
+  - next timer pass: **959 ms of work, 0 requests, 0 taken**.
+- Quadratic in the queue's size, every ten minutes while a hold lasts. A press waits behind at most one entry.
+- Mend: before taking an entry, skip it in the pass when every service of every due lookup is held. That is the same `heldBy` check `lookUpOut` makes, with no queue read. Alternatively, keep a bound on entries tried as well as on entries sent (for example 100).
+
+## Runs (each alone, `nice -n 10`)
+
+**library:**
+- http-leave-out 33/33
+- http-closing 7/7
+- look-again 34/34
+- look-up-state 20/20
+- attach-asked-to-wait 12/12
+
+**service:**
+- look-up-again 37/37
+- review-queue 23/23
+- open-library 26/26
+- close-during-attach 13/13
+- lock-during-change 3/3
+- server (includes lock and unlock) 160 passed, 1 skipped
+
+**page:**
+- ReviewQueue.lookUp 31/31
+- ReviewQueue.look 18/18
+- ReviewQueue 125/125
+
+**typecheck:** `pnpm -r typecheck`: 9/9 Done.
+
+## Verdict (second look)
+
+**APPROVED WITH SMALL POINTS.** I1, I2, I3 and m1 to m7 are closed. n1 is a one-condition mend worth making now. n2 and n3 can be made now or listed.
