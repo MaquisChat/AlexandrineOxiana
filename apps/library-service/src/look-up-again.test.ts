@@ -309,7 +309,7 @@ describe("the automatic pass (R566 3, R577 i)", () => {
     await svc!.state.idle();
     await svc!.state.runLookUpAgain();
     expect(sent).toEqual([]);
-    expect(bySource(await queue(lib.pid), lib.sources[0]!).lookUp).toEqual({ state: "failed", tries: 0, canLookUpNow: true });
+    expect(bySource(await queue(lib.pid), lib.sources[0]!).lookUp).toEqual({ state: "failed", tries: 0, canLookUpNow: true, failed: true });
   });
 
   it("runs when a locked project is unlocked; nothing is asked while it is locked (R566 4)", async () => {
@@ -589,7 +589,7 @@ describe("POST /review/:itemId/look-up-again (R577 iii)", () => {
     await reopen(lib, 0);
     await svc!.state.idle();
     const e = bySource(await queue(lib.pid), lib.sources[0]!);
-    expect(e.lookUp).toEqual({ state: "failed", tries: 0, canLookUpNow: true });
+    expect(e.lookUp).toEqual({ state: "failed", tries: 0, canLookUpNow: true, failed: true });
     answer = () => FOUND;
     const r = await lookUpAgain(lib.pid, e.id);
     expect([r.status, r.json.outcome]).toEqual([200, { kind: "found", found: 2 }]);
@@ -861,5 +861,23 @@ describe("fix round (R600)", () => {
     expect(sent).toEqual([`api.openalex.org ${titleOf(1)} Souza`]);
     const memory = (svc!.state.session!.http as unknown as { memory: Map<string, { sensitive: boolean }> }).memory;
     expect([...memory.values()].filter((e) => e.sensitive)).toHaveLength(0);
+  });
+
+  it("I3 (R595): a lookup that failed outright is always said — `failed: true` before and after a look-up in which the other lookup found nothing and it failed again", { timeout: 60_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(1);
+    // A: asked to wait (the title search); B: failed outright (another title).
+    await patchEntry(lib.pid, lib.sources[0]!, (e) => {
+      const { notBefore: _n, ...a } = e.leftOut![0]!;
+      return { leftOut: [e.leftOut![0]!, { ...a, title: "Second harbour ledger", why: "failed" as const }] };
+    });
+    await reopen(lib, 2 * MIN);
+    await svc!.state.idle();
+    const e = bySource(await queue(lib.pid), lib.sources[0]!);
+    expect(e.lookUp).toEqual({ state: "waiting", tries: 0, canLookUpNow: true, failed: true });
+    answer = (_h, path) => (path.includes("Second") ? { statusCode: 500, data: "down" } : NO_RESULTS);
+    const r = await lookUpAgain(lib.pid, e.id);
+    expect([r.status, r.json.outcome]).toEqual([200, { kind: "nothing" }]);
+    expect(r.json.entry.lookUp).toEqual({ state: "nothing", tries: 0, canLookUpNow: true, failed: true });
   });
 });

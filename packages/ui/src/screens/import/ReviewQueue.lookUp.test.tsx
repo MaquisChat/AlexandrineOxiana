@@ -372,3 +372,36 @@ describe("every true sentence in a mix (R585 M3, R592 point 4)", () => {
     expect(lookUpBodies).toEqual([]);
   });
 });
+
+describe("a lookup that failed outright is always said (R600 I3)", () => {
+  const FAILED = "Not looked up: a lookup service could not be reached. You can use Look up again.";
+  it('{ state: "nothing", failed: true } with no matches: the failed sentence, never "No candidate matches were found."', async () => {
+    const { user } = setup(entry({ reasons: [LOOK_UP_AGAIN_TEXT.nothing, UNIDENTIFIED], lookUp: { state: "nothing", tries: 0, canLookUpNow: true, failed: true } }));
+    await openEntry(user);
+    expect(within(matches()).getByText(FAILED)).toBeTruthy();
+    expect(within(matches()).queryByText("No candidate matches were found.")).toBeNull();
+  });
+
+  it('{ state: "nothing", failed: true } with matches listed: the failed sentence is still said', async () => {
+    const { user } = setup(entry({ reasons: [LOOK_UP_AGAIN_TEXT.nothing, UNIDENTIFIED], candidates: [match("Rivers and memory")], lookUp: { state: "nothing", tries: 0, canLookUpNow: true, failed: true } }));
+    await openEntry(user);
+    expect(within(matches()).getByText(FAILED)).toBeTruthy();
+    expect(within(matches()).getAllByRole("listitem")).toHaveLength(1);
+  });
+
+  it('a pure "failed" state WITH matches listed: the failed sentence is said', async () => {
+    const { user } = setup(entry({ reasons: [UNIDENTIFIED], candidates: [match("Rivers and memory")], lookUp: { state: "failed", tries: 0, canLookUpNow: true, failed: true } }));
+    await openEntry(user);
+    expect(within(matches()).getByText(FAILED)).toBeTruthy();
+  });
+
+  it("after a look-up, the failed sentence is announced after the state's sentence", async () => {
+    const before = entry({ reasons: [LOOKUP_WAITING_TEXT, UNIDENTIFIED], lookUp: { state: "waiting", tries: 0, canLookUpNow: true, failed: true } });
+    const after = entry({ reasons: [LOOK_UP_AGAIN_TEXT.nothing, UNIDENTIFIED], lookUp: { state: "nothing", tries: 0, canLookUpNow: true, failed: true } });
+    const { user } = setup(before, [lookUpRoute({ outcome: { kind: "nothing" }, entry: asEntry(after) })]);
+    await openEntry(user);
+    await user.click(await screen.findByRole("button", { name: "Look up again" }));
+    await waitFor(() => expect(screen.getAllByRole("status").map((r) => r.textContent)).toContain(`${LOOK_UP_AGAIN_TEXT.nothing} ${FAILED}`));
+    expect(within(matches()).queryByText("No candidate matches were found.")).toBeNull();
+  });
+});

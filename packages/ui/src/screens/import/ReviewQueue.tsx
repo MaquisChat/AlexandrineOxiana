@@ -267,6 +267,8 @@ function lookUpSaid(outcome: ReviewLookUpOutcome, lookUp: ReviewLookUp | undefin
   if (outcome.kind === "not-yet") return lookUpAgainAfter(lookUpTime(outcome.notBefore));
   if (!lookUp) return "";
   const states = [lookUp.state, ...(lookUp.also ?? []).filter((st) => st !== lookUp.state)];
+  // R600 I3: a lookup that failed outright is still unanswered: its sentence follows the state's sentence(s).
+  if (lookUp.failed) states.push("failed");
   return [...new Set(states.map((st) => lookUpStateSentence(st, lookUp)))].join(" ");
 }
 
@@ -2176,6 +2178,7 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
   };
   const empty = !item.candidates?.length;
   const lookUpState = item.lookUp?.state;
+  const lookUpFailed = lookUpState === "failed" || item.lookUp?.failed === true;
   const guard = usePressGuard<string>(pointing, epoch);
   const noticeId = `${useId()}-not-taken`;
   const guarded: Guarded = (key, act) => ({
@@ -2371,8 +2374,9 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
         <Section title="Candidate matches" level={2} className="ao-review__candidates" headingRef={matchesHead}>
           {/* R566 (8): "No candidate matches were found." only where a look-up was made and found nothing. */}
           {empty && (lookUpState === "waiting" || lookUpState === "gave-up") && <p className="ao-import__hint">{LOOK_UP_AGAIN_TEXT.notLookedUpYet}</p>}
-          {empty && lookUpState === "failed" && <p className="ao-import__hint">{LOOK_UP_AGAIN_TEXT.notLookedUpFailed}</p>}
-          {empty && (lookUpState === undefined || lookUpState === "nothing" || lookUpState === "found") && <p className="ao-import__hint">No candidate matches were found.</p>}
+          {/* R600 I3: a lookup that failed outright is said whatever the state, matches listed or not. */}
+          {lookUpFailed && <p className="ao-import__hint">{LOOK_UP_AGAIN_TEXT.notLookedUpFailed}</p>}
+          {empty && !lookUpFailed && (lookUpState === undefined || lookUpState === "nothing" || lookUpState === "found") && <p className="ao-import__hint">No candidate matches were found.</p>}
           {item.candidates && item.candidates.length > 0 && (
             <ol className="ao-review__candidate-list">
               {item.candidates.map((c, i) => (

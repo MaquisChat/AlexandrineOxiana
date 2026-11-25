@@ -100,6 +100,11 @@ export interface ReviewLookUp {
   also?: Array<Exclude<ReviewLookUpState, "failed">>;
   /** With "gave-up" in `also`: the tries of the lookups the app gave up on (the given-up sentence's {n}). */
   gaveUpTries?: number;
+  /**
+   * R600 I3: a lookup that failed outright is still unanswered, whatever `state` says: the page says R577's "Not looked
+   * up: a lookup service could not be reached. You can use Look up again." Absent otherwise.
+   */
+  failed?: true;
 }
 
 /**
