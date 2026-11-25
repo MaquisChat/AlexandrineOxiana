@@ -76,6 +76,7 @@
  * (`project.backups.automatic`, default on), the project is unlocked, and the last backup is a day
  * old (or there is none).
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -95,7 +96,9 @@ import { scrubPaths } from "../app-settings.js";
 import { defaultLocationEnv, type LocationEnv } from "../location.js";
 import { candidates, locate } from "../move.js";
 import { AuditStore } from "../repo/audit-store.js";
-import { PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { LibraryClosedError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { isClosed, onClose, type Library } from "../library.js";
+import { backupClosedSentence } from "@ao/shared";
 import { SimulatedCrash } from "../repo/seams.js";
 import { foldName, namesIn, readMaybe } from "../repo/io.js";
 import type { ProjectKeyFile } from "../repo/projects.js";
@@ -168,6 +171,10 @@ export const backupSeams: {
   beforePruneAudit?: () => Promise<void>;
   /** Runs once the archive is complete and recorded, before it is named and committed (R138 probes). */
   beforeCommit?: (hold: MaintenanceHold) => Promise<void>;
+  /** Runs before each piece of the zip is written to its temp file (R551 I2 probes: a close in the middle of the zip). */
+  zipChunk?: () => Promise<void>;
+  /** Runs inside each write of the state file, before it is written (R555 4 probes: a close while one is being made). */
+  stateWrite?: () => Promise<void>;
 } = {};
 
 function crashPoint(point: BackupCrashPoint): void {
@@ -179,6 +186,72 @@ function crashPoint(point: BackupCrashPoint): void {
 
 /** Package-internal (retention): the same test seam, for the steps of a destruction's backups. */
 export const backupCrashPoint = crashPoint;
+
+/**
+ * R551 I2 (R247 c): the library was closed (or its session began to close: the close, the close inside opening or
+ * creating another library or a reconnect, the service's stop) while the backup was being made. It stopped at its next
+ * step, before its commit point; its temporary file is removed; neither a success nor a failure is recorded. The
+ * message is the one sentence for whoever asked (`backupClosedSentence`).
+ */
+export class BackupCancelledError extends Error {
+  override name = "BackupCancelledError";
+  constructor(projectName: string) {
+    super(backupClosedSentence(projectName));
+  }
+}
+
+/**
+ * R551 I2: the backups in flight on each library. Its `close()` waits for them (registered once, as a repository's
+ * write queue is) before the lock is released: a backup cut by the close removes its temporary file and its pending
+ * record first, so nothing under Backups/ changes after the close.
+ */
+const backupsInFlight = new WeakMap<Library, Set<Promise<unknown>>>();
+
+/**
+ * Package-internal (retention, R554): runs `run` as work under Backups/ that the library's `close()` waits for — a
+ * backup, or a destruction's backups step (its fresh backup, its removals, its record).
+ */
+export function inFlight<T>(lib: Library, run: () => Promise<T>): Promise<T> {
+  let set = backupsInFlight.get(lib);
+  if (!set) {
+    const mine = new Set<Promise<unknown>>();
+    set = mine;
+    backupsInFlight.set(lib, mine);
+    onClose(lib, { drain: async () => void (await Promise.allSettled([...mine])), holdsTurn: () => false });
+  }
+  const work: InFlightWork = { lib, beganOpen: !isClosed(lib), live: true };
+  const p = inFlightWork.run(work, run);
+  const held = set;
+  const forget = () => {
+    work.live = false;
+    held.delete(p);
+  };
+  held.add(p);
+  p.then(forget, forget);
+  return p;
+}
+
+/**
+ * R555 4: the work in flight the current code runs for. Work that began while its library was open is what the close
+ * is waiting for: its own last writes of the state file (a cut backup taking back its pending record; a destruction's
+ * step) land before `close()` resolves. A callback that outlives the work carries this context, so `live` says whether
+ * the work is still running.
+ */
+interface InFlightWork {
+  lib: Library;
+  beganOpen: boolean;
+  live: boolean;
+}
+const inFlightWork = new AsyncLocalStorage<InFlightWork>();
+
+/** True while the current code runs for work of `lib` that the close waits for (begun while the library was open). */
+function waitedForByClose(lib: Library): boolean {
+  const w = inFlightWork.getStore();
+  return w !== undefined && w.lib === lib && w.beganOpen && w.live;
+}
+
+/** A close (or the session's closing) cut the backup: the library refused a step, or the backup saw it between steps. Package-internal (retention, R554). */
+export const cutByClose = (err: unknown): boolean => err instanceof BackupCancelledError || err instanceof LibraryClosedError;
 
 /** The `backup.create` event (the commit point) could not be written: the backup was not kept. */
 export class BackupNotRecordedError extends Error {
@@ -249,8 +322,9 @@ function withManifest<T>(repo: Repo, fn: (m: BackupManifest) => Promise<T>): Pro
     const m = await loadManifest(repo);
     const before = JSON.stringify(m);
     const out = await fn(m);
-    // (Never into a library this computer does not hold for writing: its readers change nothing.)
-    if (JSON.stringify(m) !== before && repoLibrary(repo).mode === "read-write") await writeManifest(dir, m);
+    // (Never into a library this computer does not hold for writing: its readers change nothing. Nor into a closed one,
+    // R560 M1: kept in memory only.)
+    if (JSON.stringify(m) !== before && repoLibrary(repo).mode === "read-write") await whileOpenOrWaited(repoLibrary(repo), () => writeManifest(dir, m));
     return out;
   });
   manifestLocks.set(
@@ -258,6 +332,18 @@ function withManifest<T>(repo: Repo, fn: (m: BackupManifest) => Promise<T>): Pro
     run.catch(() => {}),
   );
   return run;
+}
+
+/**
+ * R560 M1 (R247 c; as the state file's one writer, R555 4, R558 a): runs `write` — a write under Backups/ — only while the
+ * library is open, counted in the close's wait (`inFlight`, checked and registered in the same tick), or for work the close
+ * was already waiting for when it began. Once the library is closed it writes nothing and resolves (the caller's reading
+ * stands in memory; whatever it would have tidied is left for the next opening).
+ */
+function whileOpenOrWaited(lib: Library, write: () => Promise<unknown>): Promise<void> {
+  if (waitedForByClose(lib)) return write().then(() => undefined);
+  if (isClosed(lib)) return Promise.resolve();
+  return inFlight(lib, write).then(() => undefined);
 }
 
 const writeManifest = async (dir: string, m: BackupManifest) => {
@@ -282,7 +368,7 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
     const rebuilt = await rebuildManifest(repo);
     // Nothing to list: nothing is written (a library that never made a backup keeps no manifest).
     if (!rebuilt.backups.length && !rebuilt.unresolved?.length) return { formatVersion: 1, backups: [] };
-    if (mayWrite) await writeManifest(dir, rebuilt);
+    if (mayWrite) await whileOpenOrWaited(repoLibrary(repo), () => writeManifest(dir, rebuilt));
     return rebuilt;
   }
   let m: BackupManifest;
@@ -295,9 +381,9 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
       ...(Array.isArray(parsed.unresolved) ? { unresolved: parsed.unresolved.filter((x) => typeof x === "string") } : {}),
     };
   } catch {
-    if (mayWrite) await fsp.rename(join(dir, BACKUPS_MANIFEST), join(dir, `${BACKUPS_MANIFEST}.unreadable-${Date.now()}`)).catch(() => {});
+    if (mayWrite) await whileOpenOrWaited(repoLibrary(repo), () => fsp.rename(join(dir, BACKUPS_MANIFEST), join(dir, `${BACKUPS_MANIFEST}.unreadable-${Date.now()}`)).catch(() => {}));
     const rebuilt = await rebuildManifest(repo);
-    if (mayWrite) await writeManifest(dir, rebuilt);
+    if (mayWrite) await whileOpenOrWaited(repoLibrary(repo), () => writeManifest(dir, rebuilt));
     return rebuilt;
   }
   // Files a rebuild could not read are tried again every time (R94): e.g. a sealed backup whose
@@ -327,7 +413,7 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
     if (moved) {
       if (still.length) m.unresolved = still;
       else delete m.unresolved;
-      if (mayWrite) await writeManifest(dir, m);
+      if (mayWrite) await whileOpenOrWaited(repoLibrary(repo), () => writeManifest(dir, m));
     }
   }
   return m;
@@ -473,15 +559,43 @@ async function readState(dir: string): Promise<BackupState> {
   }
 }
 
-/** Reads, edits and writes the state; the caller holds the manifest's queue. */
-async function editStateNow(dir: string, fn: (s: BackupState) => void): Promise<void> {
+/**
+ * Reads, edits and writes the state; the caller holds the manifest's queue. The one writer of the state file (R555 4):
+ * refused once the library is closed (LibraryClosedError, "cannot run now" for every caller) — except by work the close is
+ * already waiting for — and counted in the close's wait while it is being made (`inFlight`), so the file never changes
+ * after `close()` resolved.
+ */
+function editStateNow(repo: Repo, dir: string, fn: (s: BackupState) => void, dropIfEmpty = false): Promise<void> {
+  const lib = repoLibrary(repo);
+  // Checked and registered in the same tick: no gap between the check and the close's wait. Work the close already waits
+  // for (a backup or a destruction's step begun while the library was open) still finishes its own writes in that wait.
+  if (isClosed(lib) && !waitedForByClose(lib)) return Promise.reject(new LibraryClosedError());
+  return inFlight(lib, () => writeState(dir, fn, dropIfEmpty));
+}
+
+async function writeState(dir: string, fn: (s: BackupState) => void, dropIfEmpty = false): Promise<void> {
   const s = await readState(dir);
+  await backupSeams.stateWrite?.();
   fn(s);
+  // R560 M4: a record put back where there was no state file before leaves none, when nothing else is kept in it.
+  if (dropIfEmpty && isEmptyState(s)) {
+    await fsp.rm(join(dir, BACKUPS_STATE), { force: true });
+    return;
+  }
   // Written only when it holds something (R379): a library with no such note keeps the file as before.
   const { oldCopiesUndestroyed, ...rest } = s;
   const out = Object.keys(oldCopiesUndestroyed).length ? s : rest;
   await fsp.mkdir(dir, { recursive: true });
   await writeFileAtomic(join(dir, BACKUPS_STATE), `${JSON.stringify(out, null, 2)}\n`, { mode: 0o600 });
+}
+
+/** Nothing is kept in the state: as a library with no state file reads. */
+const isEmptyState = (s: BackupState): boolean =>
+  [s.owners, s.failures, s.pending, s.undestroyed, s.destructionProblems, s.retries, s.oldCopiesUndestroyed].every((x) => Object.keys(x).length === 0);
+
+/** Package-internal (retention, R560 M4): whether the state file is there now. */
+export async function backupStateExists(repo: Repo): Promise<boolean> {
+  return exists(join(backupsDir(repo), BACKUPS_STATE));
 }
 
 /** The recorded failure of the project's last backup (the warning `backup-failed`), if any. */
@@ -491,10 +605,10 @@ export async function backupFailure(repo: Repo, projectId: string): Promise<Back
 }
 
 /** Edits the state (in the manifest's queue, so writes never interleave). */
-function withState(repo: Repo, fn: (s: BackupState) => void): Promise<void> {
+function withState(repo: Repo, fn: (s: BackupState) => void, opts: { dropIfEmpty?: boolean } = {}): Promise<void> {
   const dir = backupsDir(repo);
   const prev = manifestLocks.get(dir) ?? Promise.resolve();
-  const run = prev.then(() => editStateNow(dir, fn));
+  const run = prev.then(() => editStateNow(repo, dir, fn, opts.dropIfEmpty === true));
   manifestLocks.set(
     dir,
     run.catch(() => {}),
@@ -750,7 +864,7 @@ async function snapshot(repo: Repo, projectId: string): Promise<Snapshot> {
 const DOS_EPOCH = new Date("1980-01-02T00:00:00Z");
 
 /** Streams the zip of the snapshot (backup.json first) through the encryption (if any) into `tmp`. */
-async function writeZip(tmp: string, snap: Snapshot, header: Record<string, unknown>): Promise<{ sha256: string; bytes: number }> {
+async function writeZip(tmp: string, snap: Snapshot, header: Record<string, unknown>, step: () => void = () => {}): Promise<{ sha256: string; bytes: number }> {
   // R454: the zip starts reading its files as soon as they are added, so nothing is awaited from here on until its
   // errors are listened to and its output consumed: the temp file is opened first.
   const hash = createHash("sha256");
@@ -776,6 +890,10 @@ async function writeZip(tmp: string, snap: Snapshot, header: Record<string, unkn
     const sink = new Writable({
       async write(chunk: Buffer, _enc, cb) {
         try {
+          // R551 I2: a close cuts the zip between two of its pieces (the stream ends with the error; the caller shreds
+          // the temp file).
+          await backupSeams.zipChunk?.();
+          step();
           hash.update(chunk);
           bytes += chunk.length;
           for (let off = 0; off < chunk.length; ) off += (await fh.write(chunk, off)).bytesWritten;
@@ -890,8 +1008,8 @@ export function backupFailureReason(repo: Repo, err: unknown): string {
 }
 
 async function recordFailure(repo: Repo, projectId: string, err: unknown): Promise<void> {
-  // A locked project or a read-only library: nothing failed, it cannot run now (M3).
-  if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError) return;
+  // A locked project or a read-only library: nothing failed, it cannot run now (M3). Nor a closed one (R551 I2).
+  if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError || cutByClose(err)) return;
   const at = repoClock(repo)().toISOString();
   const f: BackupFailure = { at, reason: backupFailureReason(repo, err), ...(err instanceof PolicyDeniedError ? { refused: true as const } : {}) };
   await withState(repo, (s) => {
@@ -931,7 +1049,7 @@ function reserveName(repo: Repo, backupId: string, wanted: string, tmp?: string)
   return underManifestLock(repo, async () => {
     const taken = await namesIn(dir);
     let out = wanted;
-    await editStateNow(dir, (s) => {
+    await editStateNow(repo, dir, (s) => {
       const reserved = new Set(
         Object.entries(s.pending).flatMap(([id, op]) => (id !== backupId && op.kind === "create" && op.file ? [foldName(op.file)] : [])),
       );
@@ -994,6 +1112,12 @@ async function discardArchive(dir: string, op: { tmp?: string; file?: string; en
  */
 async function settlePending(repo: Repo): Promise<void> {
   if (repoLibrary(repo).mode !== "read-write") return;
+  // R560 M1: not in a closed library (the interrupted record and its files are left for the next opening), unless the
+  // close already waits for the caller; otherwise counted in the close's wait while it settles.
+  await whileOpenOrWaited(repoLibrary(repo), () => settlePendingNow(repo));
+}
+
+async function settlePendingNow(repo: Repo): Promise<void> {
   const state = await readState(backupsDir(repo));
   for (const [id, op] of Object.entries(state.pending)) {
     if (activeOps.has(id)) continue;
@@ -1095,6 +1219,11 @@ export interface BackupOptions {
   prune?: boolean;
   /** Where things are on this machine, to classify the library's folder (default: probed). */
   locationEnv?: LocationEnv;
+  /**
+   * R551 I2: the closing signal of the library's session (the service's). Once it is aborted the backup stops at its
+   * next step, as when the library itself is closed: BackupCancelledError, nothing kept, nothing recorded.
+   */
+  signal?: AbortSignal;
 }
 
 /** The commit could not be appended (as opposed to a refusal or a discard at the commit point). */
@@ -1111,7 +1240,20 @@ export function backupProject(repo: Repo, projectId: string, opts: BackupOptions
   return withProjectMaintenance(repo, projectId, (hold) => backupLocked(repo, projectId, opts, hold));
 }
 
-async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, hold: MaintenanceHold): Promise<BackupResult> {
+function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, hold: MaintenanceHold): Promise<BackupResult> {
+  const lib = repoLibrary(repo);
+  return inFlight(lib, () => backupRun(repo, projectId, opts, hold, lib));
+}
+
+async function backupRun(repo: Repo, projectId: string, opts: BackupOptions, hold: MaintenanceHold, lib: Library): Promise<BackupResult> {
+  // R551 I2: between its steps, up to its commit point, the backup stops once its library is closed or its session
+  // closing (nothing is written by this check itself; what was written is taken back below).
+  const projectName = repo.getProject(projectId).name;
+  const cut = () => isClosed(lib) || opts.signal?.aborted === true;
+  const step = () => {
+    if (cut()) throw new BackupCancelledError(projectName);
+  };
+  step();
   const dir = backupsDir(repo);
   await fsp.mkdir(dir, { recursive: true });
   await settlePending(repo);
@@ -1122,16 +1264,20 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
   let made: { entry: BackupEntry; project: Project };
   /** The pending record exists. */
   let recorded = false;
+  /** There was no state file before this backup's pending record (R560 M4). */
+  let stateWasAbsent = false;
   /** The commit could not be confirmed either way: the pending record stays for the audit log to decide. */
   let undecided = false;
   const temps: string[] = [];
   try {
+    step();
     if (backupSeams.failBackup) throw new Error("simulated backup failure");
     const destinations = await backupDestinations(dir, opts.locationEnv ?? (await defaultLocationEnv()));
     const request = { action: "backup" as const, backup: { destinations } };
     const entity = { type: "project" as const, id: projectId };
     // Recorded first, so an interruption from here on is settled (and shown) later.
     activeOps.add(backupId);
+    stateWasAbsent = !(await exists(join(dir, BACKUPS_STATE)));
     await withState(repo, (s) => {
       s.pending[backupId] = { kind: "create", projectId, at: repoClock(repo)().toISOString() };
     });
@@ -1140,6 +1286,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
     const decision = await authorizeProcessing(repo, projectId, request, { op: "backup.create", entity, auditAllow: { details: { backupId } } });
     const mustSeal = decision.result === "allow_with_conditions" && decision.conditions.some((c) => c.type === "encrypt");
     crashPoint("after-decision");
+    step();
 
     // 2. The zip, complete and fsynced under its temp name; the backup name reserved.
     let result: { snap: Snapshot; tmp: string; sha256: string; bytes: number; name: string; wanted: string } | undefined;
@@ -1149,6 +1296,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
         // Never an unsealed backup of a project whose rules require encryption (the engine's condition).
         if (mustSeal && !snap.key) throw new PolicyDeniedError("Governance requires encryption at rest, but this project is not encrypted", "backup");
         await backupSeams.afterSnapshot?.();
+        step();
         let wanted = datedFileName(`${snap.project.name} - backup`, new Date(snap.at), "zip", tz);
         if (snap.key) wanted = `${wanted}.enc`;
         const tmp = join(dir, `${wanted}.tmp-${randomBytes(6).toString("hex")}`);
@@ -1157,7 +1305,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
         const name = await reserveName(repo, backupId, wanted, basename(tmp));
         try {
           const header = { formatVersion: 1, projectId, projectName: snap.project.name, createdAt: snap.at, encrypted: !!snap.key, auditHead: snap.head, files: snap.files.length, assets: snap.assets };
-          const r = await writeZip(tmp, snap, header);
+          const r = await writeZip(tmp, snap, header, step);
           if (await changedSince(snap.files)) {
             if (attempt === 0) {
               await shredPath(tmp);
@@ -1171,6 +1319,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
           if (err instanceof SimulatedCrash) throw err;
           await shredPath(tmp).catch(() => {});
           activeTemps.delete(tmp);
+          if (cutByClose(err)) throw err;
           // A file that changed size or went away while it was read: start again once.
           if (attempt === 0 && (await changedSince(snap.files))) continue;
           throw err;
@@ -1199,6 +1348,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
       if (p?.kind === "create") Object.assign(p, { tmp: basename(result.tmp), file: result.name, entry: entryOf(result.name) });
     });
     await backupSeams.beforeCommit?.(hold);
+    step();
 
     // 3. Its name, never over an existing file (a taken name gets the next counter), then the
     // bytes under that name checked against what was recorded (R138 b).
@@ -1219,6 +1369,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
       throw new BackupDiscardedError(CHANGED_ON_DISK);
     }
     crashPoint("before-commit");
+    step();
 
     // 4. The commit point, in one write-queue turn (R138 c, d): the decision again, against the
     // governance in force now (a deny is audited, with this attempt's id and name, and thrown); no
@@ -1270,10 +1421,17 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
       // Nothing was committed (a committed backup does not get here): anything left of it goes.
       const p = (await readState(dir)).pending[backupId];
       if (p?.kind === "create") await discardArchive(dir, p).catch(() => {});
-      await withState(repo, (s) => {
-        delete s.pending[backupId];
-      }).catch(() => {});
+      // R560 M4: cut by the close where there was no state file before: none is left.
+      await withState(
+        repo,
+        (s) => {
+          delete s.pending[backupId];
+        },
+        { dropIfEmpty: stateWasAbsent && cutByClose(err) },
+      ).catch(() => {});
     }
+    // R551 I2: cut by a close: neither a success nor a failure is recorded; whoever asked reads the one sentence.
+    if (cutByClose(err)) throw err instanceof BackupCancelledError ? err : new BackupCancelledError(projectName);
     await recordFailure(repo, projectId, err);
     throw err;
   } finally {
@@ -1281,7 +1439,8 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
     for (const t of temps) activeTemps.delete(t);
   }
   let pruned: string[] = [];
-  if (opts.prune !== false) {
+  // R551 I2: the backup is made and recorded; with the library closing, its older backups are left for the next one.
+  if (opts.prune !== false && !cut()) {
     try {
       pruned = await pruneLocked(repo, projectId, opts.keep ?? made.project.backups?.keep ?? DEFAULT_KEEP);
     } catch (err) {
@@ -1331,6 +1490,7 @@ async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise
   // Never in a library this computer does not hold for writing (R154 e): nothing is removed or noted.
   const lib = repoLibrary(repo);
   if (lib.mode !== "read-write") throw new ReadOnlyLibraryError(lib.readOnlyReason);
+  if (isClosed(lib)) throw new LibraryClosedError(); // R551 I2: nothing removed from a closed library
   await settlePending(repo);
   const pruneId = newId();
   activeOps.add(pruneId);
@@ -1342,7 +1502,7 @@ async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise
       const out: string[] = [];
       if (!doomed.length) return out;
       // Recorded before the first removal, so a crash cannot lose the record of it.
-      await editStateNow(dir, (s) => {
+      await editStateNow(repo, dir, (s) => {
         s.pending[pruneId] = { kind: "prune", projectId, at: repoClock(repo)().toISOString(), files: doomed, keep };
       });
       try {
@@ -1384,12 +1544,14 @@ async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise
  * not remove it. Either way the manifest lists it no longer. A failure does not stop the others.
  * Only plain names of the backup pattern, inside Backups/, are ever touched. With `expect` (name →
  * sha256, for a list inherited through a restore, R175) a file is removed only when its bytes are
- * those: one of another content is `other` and is left alone, with its manifest entry.
+ * those: one of another content is `other` and is left alone, with its manifest entry. With `step`, it is called
+ * before each file; what it throws ends the removals there (R554: the library's close), the ones made standing.
  */
 export async function removeHoldingBackups(
   repo: Repo,
   files: string[],
   expect?: ReadonlyMap<string, string>,
+  step?: () => void,
 ): Promise<{ removed: string[]; gone: string[]; other: string[]; failed: Array<{ file: string; error: unknown }> }> {
   const dir = backupsDir(repo);
   const removed: string[] = [];
@@ -1397,6 +1559,8 @@ export async function removeHoldingBackups(
   const other: string[] = [];
   const failed: Array<{ file: string; error: unknown }> = [];
   for (const f of files) {
+    // R554: before each removal (never in the middle of one), the caller's step may stop the rest by throwing.
+    step?.();
     if (!isBackupFileName(f) || (expect && !expect.has(f))) {
       failed.push({ file: f, error: new Error(isBackupFileName(f) ? "the making of this backup is not on record" : "this is not the name of a backup") });
       continue;
@@ -1601,11 +1765,15 @@ export async function retentionRetry(repo: Repo, key: string): Promise<Retention
   return Object.hasOwn(r, key) ? r[key] : undefined;
 }
 
-export function setRetentionRetry(repo: Repo, key: string, rec: RetentionRetry | undefined): Promise<void> {
-  return withState(repo, (s) => {
-    if (rec) s.retries[key] = rec;
-    else delete s.retries[key];
-  });
+export function setRetentionRetry(repo: Repo, key: string, rec: RetentionRetry | undefined, opts: { dropIfEmpty?: boolean } = {}): Promise<void> {
+  return withState(
+    repo,
+    (s) => {
+      if (rec) s.retries[key] = rec;
+      else delete s.retries[key];
+    },
+    opts,
+  );
 }
 
 /** Package-internal: an error's message in plain words, paths in the library scrubbed (its class name when it has none). */
@@ -1626,13 +1794,13 @@ export function setBackupSettings(repo: Repo, projectId: string, settings: { aut
  * as the project's warning `backup-failed`, with its reason. A refused one is asked again a day
  * later, not at every pass of the scheduler (one denial in the audit log a day, not one an hour).
  */
-export function backupIfDue(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv"> = {}): Promise<BackupResult | null> {
+export function backupIfDue(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv" | "signal"> = {}): Promise<BackupResult | null> {
   // Whether one is due is decided while holding the project (R138 a): a manual backup running at
   // the same time makes this one not due, instead of a second backup.
   return withProjectMaintenance(repo, projectId, (hold) => backupIfDueLocked(repo, projectId, now, opts, hold));
 }
 
-async function backupIfDueLocked(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv">, hold: MaintenanceHold): Promise<BackupResult | null> {
+async function backupIfDueLocked(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv" | "signal">, hold: MaintenanceHold): Promise<BackupResult | null> {
   const p = repo.getProject(projectId);
   if (p.backups?.automatic === false) return null;
   if (!repo.isUnlocked(projectId)) return null;
@@ -1643,7 +1811,8 @@ async function backupIfDueLocked(repo: Repo, projectId: string, now: Date, opts:
   try {
     return await backupLocked(repo, projectId, opts, hold);
   } catch (err) {
-    if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError) return null;
+    // Cannot run now: locked, read-only, or the library closed under it (R551 I2: nothing kept, nothing recorded).
+    if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError || cutByClose(err)) return null;
     throw err;
   }
 }

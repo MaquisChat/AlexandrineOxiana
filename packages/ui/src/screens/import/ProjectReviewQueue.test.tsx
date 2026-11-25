@@ -7,6 +7,7 @@ import userEvent from "@testing-library/user-event";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewItem } from "../../api/import";
 import { http, HttpResponse } from "msw";
+import { LOOKUP_WAITING_TEXT } from "@ao/shared";
 import { BASE as SERVICE, B1, mockService, P1, P2, server, type ServiceSetup } from "../../test/importService";
 import { DECIDE_SETTLE_MS, ReviewQueue } from "./ReviewQueue";
 
@@ -240,6 +241,16 @@ describe("the project's whole review queue (Task 67)", () => {
     expect(m.bodies(`PATCH /projects/${P1}/sources/s6/fields`)).toHaveLength(1);
     await pressPanel(user, within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
     await waitFor(() => expect(m.bodies("POST /review/r6/decide")).toHaveLength(1));
+  });
+
+  it("decision 31 (b), R556 (2) iii: an attached file whose lookup service asked to wait shows the owner's sentence among why it waits", async () => {
+    const waiting = entry(2, "attach", { reasons: [LOOKUP_WAITING_TEXT, "The item could not be identified with enough confidence."], hints: ["doi:10.5555/ao.fixture.2021.001"] });
+    const { user } = setup({ ...BASE, projectReview: { [P1]: [waiting] } });
+    await user.click(await screen.findByRole("button", { name: "Show Entry 2" }));
+    const why = await screen.findByRole("region", { name: "Why it needs review" });
+    const first = within(why).getAllByRole("listitem")[0]!;
+    expect(first.textContent).toBe("Waiting for lookup service response.");
+    expect(within(first).getByText(LOOKUP_WAITING_TEXT).getAttribute("dir")).toBe("auto");
   });
 
   it("an entry after a consent withdrawal shows why it waits, in the participant's words of the record", async () => {

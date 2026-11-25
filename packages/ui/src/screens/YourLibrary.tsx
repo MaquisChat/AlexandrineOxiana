@@ -434,7 +434,8 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       else if (o.kind === "not-put-back") note = T.stayNotPutBack;
       else {
         note = o.error === undefined ? T.saveFailed : sentenceOf(o.error, T.saveFailed);
-        if (o.error instanceof ApiClientError && o.error.status === 409) {
+        // R555 3: not for the closed library's refusal: nothing changed, the draft is kept.
+        if (o.error instanceof ApiClientError && o.error.status === 409 && o.error.code !== "LIBRARY_CLOSED") {
           setDraft(null);
           void read();
         }
@@ -516,8 +517,9 @@ export function YourLibrary({ client }: { client: ApiClient }) {
       setFieldErrors({ [field]: msg });
       setFocusField((f) => ({ field, n: (f?.n ?? 0) + 1 }));
     } else setSaveError(msg);
-    // A newer file meanwhile: the draft is dropped and what the service holds now is read and shown (R336 b).
-    if (err instanceof ApiClientError && err.status === 409) {
+    // A newer file meanwhile: the draft is dropped and what the service holds now is read and shown (R336 b). Not for the
+    // closed library's refusal (R555 3): nothing changed, the draft is kept and the answer's sentence shown.
+    if (err instanceof ApiClientError && err.status === 409 && err.code !== "LIBRARY_CLOSED") {
       setDraft(null);
       void read();
     }

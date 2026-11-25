@@ -5,9 +5,9 @@
  */
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { IndexHandle, KeyRing, createIndexSink, deviceDeps, getMeta, openLibrary, openRepo, rebuildIndexIfNeeded, type Library, rememberLastOpenLibrary, setMeta, type Deps } from "@ao/library";
@@ -471,6 +471,40 @@ describe("C1: a rebuild stopped half-way is never taken as complete", () => {
     await svc!.state.idle();
     expect(svc!.state.libraryState().index).toBeUndefined();
     expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(3);
+  });
+
+  it("R570 b: a move leaves the old copy's index closed (no working files); every file of the old copy is at the new place, byte for byte", async () => {
+    /** Every file under `root`, relative, `/`-separated. */
+    const filesUnder = async (root: string) =>
+      (await readdir(root, { recursive: true, withFileTypes: true }))
+        .filter((e) => e.isFile())
+        .map((e) => relative(root, join(e.parentPath, e.name)).split(sep).join("/"))
+        .sort();
+    let atCopy: string[] = [];
+    await start({ beforeExecuteMove: async () => void (atCopy = await filesUnder(join(tmp, "Lib"))) });
+    const { path } = await libraryWithSources();
+    const oldIndex = svc!.state.session!.index!;
+    const dest = join(tmp, "Moved", "Lib");
+    await mkdir(dirname(dest), { recursive: true });
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    expect(moved.body).toContain('"done":true');
+    await svc!.state.idle();
+    // The index was open while the move began (its working files are never copied) ...
+    expect(atCopy).toContain("library.sqlite");
+    // ... and it is closed in the old copy by the end of the move: checkpointed, its working files gone.
+    expect(oldIndex.isOpen).toBe(false);
+    const old = (await filesUnder(path)).filter((f) => f !== "MOVED.json");
+    expect(old.filter((f) => f.startsWith("library.sqlite-"))).toEqual([]);
+    const different: string[] = [];
+    for (const f of old) {
+      if (!existsSync(join(dest, f))) {
+        different.push(f);
+        continue;
+      }
+      const [was, now] = [await readFile(join(path, f)), await readFile(join(dest, f))];
+      if (/\/audit\/[^/]+\.jsonl$/u.test(f) ? !now.subarray(0, was.length).equals(was) : !now.equals(was)) different.push(f);
+    }
+    expect(different).toEqual([]);
   });
 
   it("M6: a write made before the staleness check has run does not hide a change made outside the app", async () => {

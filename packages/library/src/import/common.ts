@@ -6,6 +6,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { nonBlank, primary, type DupKey, type PolicyDecision, type PolicyRequest, type Provenance, type SourceFile } from "@ao/core";
+import { LOOKUP_WAITING_TEXT } from "@ao/shared";
 import type { ReviewInput } from "../repo/review.js";
 import { projectPolicy, type Repo } from "../repo/repo.js";
 import { AUTO_ACCEPT_THRESHOLD, type Resolution } from "./resolve.js";
@@ -46,6 +47,8 @@ export const ITEM_REASONS = {
   review: "Some details could not be confirmed, so the source is in the review queue.",
   likelyDuplicate: "This may be a duplicate of a source already in the project, so it is in the review queue.",
   lowConfidence: "The item could not be identified with enough confidence.",
+  /** Decision 31 (b), R556 (2) iii: in review while a service it would have asked had asked to wait (the owner's words). */
+  waiting: LOOKUP_WAITING_TEXT,
 };
 
 export async function sha256File(path: string): Promise<string> {
@@ -116,7 +119,10 @@ export function candidateKey(r: Resolution, sha256s: string[]): DupKey {
 
 /**
  * Whether a resolved item goes to review (a likely duplicate, below the threshold, or its
- * verification needs review) and, if so, its review entry.
+ * verification needs review) and, if so, its review entry. Decision 31 (b), R556 (2) iii, iv: an item in review whose
+ * resolution left lookups out (their services asked to wait) says so first after a likely duplicate (ITEM_REASONS.waiting)
+ * and keeps what was left out (`leftOut`). An item not in review shows nothing of it. Only the attach and watched folders
+ * leave lookups out; Bulk Import's resolutions never have any.
  */
 export function reviewFor(
   r: Resolution,
@@ -128,8 +134,10 @@ export function reviewFor(
   const fields = Object.fromEntries(
     Object.entries(r.verification.fields).filter(([, v]) => v.status === "conflict" || v.status === "unverified").map(([k, v]) => [k, v.status]),
   );
+  const waiting = r.leftOut.length > 0;
   const reasons = [
     ...(dup ? [ITEM_REASONS.likelyDuplicate] : []),
+    ...(waiting ? [ITEM_REASONS.waiting] : []),
     ...r.verification.reasons,
     ...(r.confidence < threshold && r.verification.reasons.length === 0 ? [ITEM_REASONS.lowConfidence] : []),
   ];
@@ -142,6 +150,7 @@ export function reviewFor(
     candidates: r.candidates,
     ...(dup ? { duplicateOf: { sourceId: dup.sourceId, reason: dup.reason } } : {}),
     ...(r.identifierHints.length ? { hints: r.identifierHints } : {}),
+    ...(waiting ? { leftOut: r.leftOut } : {}),
   };
 }
 

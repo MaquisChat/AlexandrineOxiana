@@ -388,6 +388,11 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
       // So do the folder choices not yet used (R207): their paths are forgotten.
       folderGrants.clear();
       closing ??= (async () => {
+        // FR-749 (R546 3): first, the library session begins to close: an attach waiting on a lookup is cancelled at
+        // once (it no longer holds the stop for a minute) and the lookup client sends nothing more; a change in its store
+        // turn is still waited for below, as every request in flight.
+        const open = state.session;
+        if (open) await state.beginClosing(open);
         // Requests are refused from here on; those already in progress finish (a library being
         // opened is then refused and released); then running work is paused and the library closed.
         if (inFlight > 0) await new Promise<void>((r) => {

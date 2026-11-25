@@ -25,6 +25,11 @@
  *      below AUTO_ACCEPT_THRESHOLD or whose verification needs review → created and queued
  *      (`review/pending.jsonl`, sealed in encrypted projects, R31); else `created`.
  *
+ * Decision 31 (b), R556 (2): the lookups never wait for a metadata service that asks to wait (a 429, or a 503 with a
+ * wait asked): that service is left out for the file (and, until the time it named, for every file of the session),
+ * and the file is stored at once. A file in review while a lookup was left out has the reason ITEM_REASONS.waiting
+ * (the owner's "Waiting for lookup service response.") and its review entry keeps what was left out (`leftOut`).
+ *
  * Identifiers found in a file but not confirmed by a lookup are never recorded or used to find
  * duplicates (R55): they go on the review entry as `hints`. Media (images, video, audio) with GPS,
  * or whose metadata could not be read, are stored with `hasLocation: true`, so location governance
@@ -49,11 +54,13 @@ import { fileTypeFromFile } from "file-type";
 import { findDuplicate, type DupKey, type FileNamePattern, type SourceFile } from "@ao/core";
 import { UnsafeFileError, extractMetadata } from "../extract/index.js";
 import { lookupContextFor, type HttpClient, type LookupContext } from "../lookup/index.js";
-import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
+import { LibraryClosedError, NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
+import { whileOpen } from "../library.js";
+import { LookupCancelledError } from "../lookup/http.js";
 import { kindFor, mimeFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
 import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, projectCollectionsAndTags, repoLibrary, type Repo } from "../repo/repo.js";
-import { IN_LIBRARY_TEXT } from "@ao/shared";
+import { IN_LIBRARY_TEXT, attachClosedSentence } from "@ao/shared";
 import { realInsideLibrary, realOrNearest } from "../fs/inside-library.js";
 import type { CreateInTx } from "../repo/sources.js";
 import { ITEM_REASONS, LOCATION_REASON, candidateKey, dupKey, itemProvenance, locationRule, reviewFor, sha256File, storeInputs as sharedStoreInputs } from "./common.js";
@@ -66,7 +73,12 @@ export { LOCATION_REASON };
 
 const VERSION: string = libraryVersion();
 
-export type AttachStatus = "created" | "attached" | "duplicate" | "needs-review" | "failed";
+/**
+ * `cancelled` (FR-749, R546 2): the library began to close before anything of the file was written (it was still being
+ * looked up, or waiting for its turn); nothing was changed and the file is untouched. Its reason is the one sentence
+ * `attachClosedSentence`.
+ */
+export type AttachStatus = "created" | "attached" | "duplicate" | "needs-review" | "failed" | "cancelled";
 
 export interface AttachOutcome {
   /** The path as given. */
@@ -113,6 +125,13 @@ export interface AttachDeps {
    * and drop, Bulk Import): every file is read as before.
    */
   readable?: (path: string) => Promise<boolean>;
+  /**
+   * FR-749 (R546 2): the library session's closing signal, aborted when the library begins to close (the close, the
+   * close inside opening or creating another library, the service's stop). From then on a file not yet in its store
+   * turn is `cancelled`: its lookup's waits are cut short, and nothing of it is written. A file already in its store
+   * turn finishes. Absent: attach behaves as before (the closed library itself still refuses every write).
+   */
+  closing?: AbortSignal;
 }
 
 export interface Attach {
@@ -160,6 +179,8 @@ export function acceptedType(type: { ext: string; mime: string }): { ext: string
 }
 
 const failed = (path: string, reason: string): AttachOutcome => ({ path, outcome: "failed", reason });
+/** FR-749 (R546 2): nothing of the file was written because the library began to close; the file's name is the last part of its path. */
+const cancelled = (path: string): AttachOutcome => ({ path, outcome: "cancelled", reason: attachClosedSentence(basename(path)) });
 
 /** Thrown inside the creating change when the collection was deleted meanwhile: that change is taken back. */
 class CollectionGone extends Error {}
@@ -171,6 +192,8 @@ function addedLabel(kind: string, at: Date): string {
 
 export function createAttach(deps: AttachDeps): Attach {
   const { repo, http } = deps;
+  /** The library has begun to close (R546 2): nothing more of a file is begun. */
+  const closingNow = () => deps.closing?.aborted === true;
   const patterns = deps.patterns ?? [];
 
   /** Per call: the target source, the policy decision, the lookup context and the duplicate keys, each made once. */
@@ -217,7 +240,10 @@ export function createAttach(deps: AttachDeps): Attach {
             throw err;
           }
         })()),
-      lookup: () => (lookup ??= lookupContextFor(repo, projectId, http, deps.debug ? { debug: deps.debug } : {})),
+      // Decision 31 (b), R556 (2) i: an attach (and so a watched folder's bringing-in) never waits for a service that asks
+      // to wait: that service is left out for the file, which comes in at once.
+      lookup: () =>
+        (lookup ??= lookupContextFor(repo, projectId, http, deps.debug ? { debug: deps.debug } : {}).then((c): LookupContext => ({ ...c, askedToWait: "leave-out" }))),
       /** Inside a queue turn: forget the cached duplicate keys if anyone else stored since this call's last turn. */
       refreshKeys: () => {
         const t = storeTurn(repo, projectId);
@@ -308,6 +334,9 @@ export function createAttach(deps: AttachDeps): Attach {
       { path: real, fileName: basename(path), mime, sidecarPaths, ...(deps.readable ? { sidecarReadable: deps.readable } : {}) },
       { projectId, patterns, lookup: await s.lookup() },
     );
+    // Closed during the lookups (their waits cut short, R546 2): the record would rest on lookups that were let go, and
+    // nothing of it is written.
+    if (closingNow()) return cancelled(path);
     const dup = findDuplicate(candidateKey(r, [sha256]), keys);
     if (dup?.certainty === "certain") return { path, outcome: "duplicate", sourceId: dup.sourceId };
     const reviewItem = reviewFor(r, dup);
@@ -367,7 +396,9 @@ export function createAttach(deps: AttachDeps): Attach {
     keys.push(dupKey(sf));
     const note = { ...proxyNote(projectId, sf.source.id, plan, rule.mode()), ...(noCollection ? { noCollection: true as const } : {}) };
     if (!needsReview) return { path, outcome: "created", sourceId: sf.source.id, ...note };
-    return { path, outcome: "needs-review", sourceId: sf.source.id, reason: dup ? REASONS.likelyDuplicate : REASONS.review, ...note };
+    // R556 (2) iii: a record in review while a service it would have asked had asked to wait says so, in the owner's words.
+    const reason = dup ? REASONS.likelyDuplicate : reviewItem?.leftOut?.length ? REASONS.waiting : REASONS.review;
+    return { path, outcome: "needs-review", sourceId: sf.source.id, reason, ...note };
   }
 
   async function collectionExists(projectId: string, id: string): Promise<boolean> {
@@ -376,6 +407,7 @@ export function createAttach(deps: AttachDeps): Attach {
 
   async function attachOne(projectId: string, path: string, opts: AttachOpts, s: Session, freshKeys = false): Promise<AttachOutcome> {
     const toSourceId = opts.toSourceId;
+    if (closingNow()) return cancelled(path); // R546 2: its turn came after the library began to close
     if (freshKeys) s.refreshKeys();
     // R362 c (defect D27): nothing inside the library's own folder (by real path) is attached — not a project's file,
     // not a found file held for the researcher's check (it comes in only through "Use this file"). Before anything is
@@ -418,13 +450,38 @@ export function createAttach(deps: AttachDeps): Attach {
     repo.getProject(projectId); // NotFoundError for an unknown project
     const s = session(projectId, opts.toSourceId);
     const out: AttachOutcome[] = [];
+    /**
+     * One file in its project's store turn. A file still waiting for that turn (behind another file, a watched folder's
+     * or an import's) is answered `cancelled` as soon as the library begins to close (R546 2); when its turn comes it
+     * finds the library closing and writes nothing. Once its turn has begun it is awaited: what is in its store turn
+     * finishes (its lookups' waits are cut short, and a change already being written completes).
+     */
+    const one = (path: string): Promise<AttachOutcome> => {
+      let started = false;
+      const run = serialStore(repo, projectId, () => {
+        started = true;
+        return attachOne(projectId, path, opts, s, true);
+      });
+      const sig = deps.closing;
+      if (!sig) return run;
+      return new Promise<AttachOutcome>((resolve, reject) => {
+        const stop = () => {
+          if (!started) resolve(cancelled(path));
+        };
+        sig.addEventListener("abort", stop, { once: true });
+        if (sig.aborted) stop();
+        run.then(resolve, reject).finally(() => sig.removeEventListener("abort", stop));
+      });
+    };
     for (const path of paths) {
       try {
         // One file at a time per project, across attach, watched folders and Bulk Import (R81 I4);
         // the duplicate keys are read afresh inside the turn.
-        out.push(await serialStore(repo, projectId, () => attachOne(projectId, path, opts, s, true)));
+        out.push(await whileOpen(repoLibrary(repo), deps.closing, () => one(path)));
       } catch (err) {
-        if (err instanceof PolicyDeniedError) out.push(failed(path, err.reason));
+        // The library closed (or began to close) before the file's change began: nothing of it was written (R546).
+        if (err instanceof LibraryClosedError || err instanceof LookupCancelledError) out.push(cancelled(path));
+        else if (err instanceof PolicyDeniedError) out.push(failed(path, err.reason));
         else if (err instanceof ProjectLockedError) out.push(failed(path, REASONS.locked));
         else if (err instanceof UnsafeFileError) out.push(failed(path, REASONS.unsafe));
         else {

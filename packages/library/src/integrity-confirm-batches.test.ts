@@ -4,14 +4,19 @@
  * meanwhile waits for one batch, not for every finding), honours the request's cancel signal between batches, and
  * ends with the error a closed or moved library gives when the library is closed or moved meanwhile: it never drops
  * the findings and answers "nothing missing". Source reads are counted through a wrapped `readSource`; nothing sleeps.
+ * FR-749 (R546 1, R570 a): a closed library's write queue grants no further turn, and its `close()` resolves only once
+ * the turn in progress has ended and the queue is empty; so after a close the queue is shown drained by `close()`
+ * having resolved (and a turn asked then is refused without running), never by asking the closed library for a turn.
  */
 import { cp, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Project, SourceFile } from "@ao/core";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
 import { CONFIRM_BATCH_SOURCES, checkIntegrity } from "./reconnect.js";
-import { ReadOnlyLibraryError } from "./repo/errors.js";
+import { isClosed } from "./library.js";
+import { LibraryClosedError, ReadOnlyLibraryError } from "./repo/errors.js";
 import { writeQueueTurn } from "./repo/repo.js";
 
 const reads = vi.hoisted(() => ({ n: 0 }));
@@ -64,16 +69,33 @@ function confirmRecording(order: string[], after: (turn: number) => void | Promi
   };
 }
 
-/** A turn of the queue held by the test until `release`. */
-function holdQueue() {
+/** A turn of the queue held by the test until `release` (released too when the test ends, whatever its end). */
+function holdQueue(events: string[] = []) {
   let release!: () => void;
   const open = new Promise<void>((r) => (release = r));
-  const held = writeQueueTurn(kit.repo)(() => open);
+  onTestFinished(() => release());
+  const held = writeQueueTurn(kit.repo)(async () => {
+    await open;
+    events.push("held turn ended");
+  });
   return { release, held };
 }
 
 /** The queue is free: a turn asked now runs at once. */
 const queueFree = () => expect(writeQueueTurn(kit.repo)(async () => "free")).resolves.toBe("free");
+
+/**
+ * The closed library's queue is drained and takes no further turn (FR-749, R546 1): its `close()` has resolved — which
+ * it does only once no turn runs or waits — the lock is gone, and a turn asked now is refused without running.
+ */
+async function queueDrainedAndClosed(): Promise<void> {
+  await kit.lib.close();
+  expect(isClosed(kit.lib)).toBe(true);
+  expect(existsSync(join(kit.lib.root, ".lock"))).toBe(false);
+  let ran = false;
+  await expect(writeQueueTurn(kit.repo)(async () => void (ran = true))).rejects.toBeInstanceOf(LibraryClosedError);
+  expect(ran).toBe(false);
+}
 
 describe("R484 e: the integrity check's confirmation", () => {
   it("reads a source with several findings once", async () => {
@@ -142,24 +164,57 @@ describe("R484 e: the integrity check's confirmation", () => {
     const c = confirmRecording(order, async (k) => {
       if (k === 1) await kit.lib.close();
     });
-    await expect(checkIntegrity(kit.lib, "full", { keyRing: kit.ring, confirm: c.confirm })).rejects.toBeInstanceOf(ReadOnlyLibraryError);
+    const err = await checkIntegrity(kit.lib, "full", { keyRing: kit.ring, confirm: c.confirm }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ReadOnlyLibraryError);
+    expect((err as ReadOnlyLibraryError).reason).not.toBe("moved");
     expect(order).toEqual(["batch 1"]);
-    await queueFree();
+    expect(c.asks()).toBe(1);
+    await queueDrainedAndClosed();
   }, 60_000);
 
-  it("a close while the check waits for its first turn ends it the same way", async () => {
+  /**
+   * The test holds the turn in progress; the check waits behind it; the library is closed. The close waits for the
+   * held turn (FR-749, R247 d), so the test releases it WHILE the close waits: the close resolves only after that turn
+   * ended, the check's own turn never runs (refused as it comes up), and the check ends as a close mid-way does.
+   */
+  async function closeWhileWaiting(moved: boolean): Promise<unknown> {
     const p = await makeProject(kit);
     await missingSources(p, 3);
-    const hold = holdQueue();
+    const events: string[] = [];
+    const hold = holdQueue(events);
     const order: string[] = [];
     const c = confirmRecording(order);
-    const check = checkIntegrity(kit.lib, "full", { keyRing: kit.ring, confirm: c.confirm });
-    check.catch(() => {});
+    const check = checkIntegrity(kit.lib, "full", { keyRing: kit.ring, confirm: c.confirm }).then(
+      () => null,
+      (e: unknown) => e,
+    );
     await c.askedOnce;
-    await kit.lib.close();
+    if (moved) await writeFile(join(kit.lib.root, "MOVED.json"), JSON.stringify({ libraryId: kit.lib.id, movedAt: "2026-11-10T09:31:00.000Z" }));
+    const closing = kit.lib.close().then(() => void events.push("close resolved"));
     hold.release();
-    await expect(check).rejects.toBeInstanceOf(ReadOnlyLibraryError);
-    await queueFree();
+    await hold.held;
+    await closing;
+    expect(events).toEqual(["held turn ended", "close resolved"]);
+    const err = await check;
+    expect(order).toEqual([]);
+    expect(c.asks()).toBe(1);
+    await queueDrainedAndClosed();
+    return err;
+  }
+
+  it("a close while the check waits for its first turn ends it the same way", async () => {
+    const err = await closeWhileWaiting(false);
+    expect(err).toBeInstanceOf(ReadOnlyLibraryError);
+    expect((err as ReadOnlyLibraryError).reason).not.toBe("moved");
+  });
+
+  it("a move while the check waits for its first turn ends it with the moved library's error", async () => {
+    const err = await closeWhileWaiting(true);
+    expect(err).toBeInstanceOf(ReadOnlyLibraryError);
+    expect((err as ReadOnlyLibraryError).reason).toBe("moved");
   });
 
   it("a move in mid-confirmation (the old copy marked as moved, its handle closed) ends the check with the moved library's error", async () => {
@@ -182,7 +237,8 @@ describe("R484 e: the integrity check's confirmation", () => {
     expect(err).toBeInstanceOf(ReadOnlyLibraryError);
     expect((err as ReadOnlyLibraryError).reason).toBe("moved");
     expect(order).toEqual(["batch 1"]);
+    expect(c.asks()).toBe(1);
     expect(await readdir(join(kit.tmp, "elsewhere", "Sources"))).toHaveLength(250);
-    await queueFree();
+    await queueDrainedAndClosed();
   }, 60_000);
 });

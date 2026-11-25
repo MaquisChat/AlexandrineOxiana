@@ -237,7 +237,8 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
       setReasons([]);
       setStatus({ kind: "saved" });
     } catch (err) {
-      if (err instanceof ApiClientError && err.status === 409) {
+      // R555 3: a 409 is "changed elsewhere" only when it says so; the closed library's refusal says its own sentence.
+      if (err instanceof ApiClientError && err.status === 409 && err.code !== "LIBRARY_CLOSED") {
         setStatus({ kind: "conflict", message: "These rules were changed elsewhere — reload to see them. Your edits are still here." });
       } else if (err instanceof ApiClientError && err.code === "VALIDATION" && /needs a reason/i.test(err.message)) {
         setReasons(all);

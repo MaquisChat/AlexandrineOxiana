@@ -12,7 +12,7 @@ import { randomUUID } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import { newId, type PendingOcr, type SourceFile } from "@ao/core";
-import type { Library } from "../library.js";
+import { isClosed, type Library } from "../library.js";
 import { DestroyedParentError, MissingParentError, PolicyDeniedError, ProjectLockedError, ProxyRecordRefusedError } from "../repo/errors.js";
 import { addOcrAsset, editPendingOcr, editPendingOcrMany, repoLibrary, type Repo } from "../repo/repo.js";
 import { activeTemp } from "../tmp-registry.js";
@@ -110,7 +110,8 @@ export class OcrQueue {
       }
       return list;
     });
-    if (this.worker) for (const id of sourceIds) this.then(() => this.runSource(projectId, id)).catch(() => {});
+    // R562: none once the library is closed (a queue a caller did not dispose of).
+    if (this.worker && !isClosed(repoLibrary(this.repo))) for (const id of sourceIds) this.then(() => this.runSource(projectId, id)).catch(() => {});
     return added;
   }
 
@@ -228,6 +229,9 @@ export class OcrQueue {
   private async runJob(worker: WorkerClient, projectId: string, sf: SourceFile, job: PendingOcr): Promise<OcrResult> {
     const sourceId = sf.source.id;
     const base = { projectId, sourceId, jobId: job.id };
+    // R562 (R546 1, R247 c): no job starts once the library is closed — nothing is made under it, nothing recorded; the job
+    // stays pending ("PENDING" is never recorded as a failure).
+    if (isClosed(repoLibrary(this.repo))) return { ...base, ok: false, code: "PENDING" };
     const asset = sf.assets.find((a) => a.id === job.assetId && a.role === "original" && a.status !== "destroyed");
     if (!asset) return { ...base, ok: false, code: "ORIGINAL_GONE" };
     const root = repoLibrary(this.repo).root;

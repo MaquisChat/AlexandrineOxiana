@@ -134,6 +134,35 @@ export interface JobsRetryResponse {
  * refusal of an import whose OWN file (a ZIP, a BibTeX, RIS, CSL-JSON or Zotero RDF export) lies inside the library —
  * a backup above all, which holds the held files too (a backup is brought back by the restore, not by an import).
  */
+/**
+ * FR-749 (R546 2; R551 M5, word for word): an attach (or a watched folder's bringing-in) that a close of the library,
+ * the opening of another library or the library going offline cancelled before anything of the file was written — it
+ * was still looking the file's record up. The attach route answers the file with outcome `cancelled` and this
+ * sentence; the page says it with the file's name shown as the researcher's own text.
+ */
+export const ATTACH_CLOSED_TEXT = {
+  before: "The library was closed or went offline before ",
+  after: " was attached, so nothing was changed. Attach it again when the library is open.",
+} as const;
+
+/**
+ * R551 M5 (word for word): a watched folder's act ("Bring in the new version…", "Keep the library's copy as it is")
+ * cut by a close, another library's opening or the library going offline; nothing was changed.
+ */
+export const WATCH_ACT_CLOSED_TEXT = "The library was closed or went offline before this could be done, so nothing was changed. Try again when the library is open.";
+
+/**
+ * Decision 31 (b), R556 (2) iii — the owner's words: the reason of a file an attach or a watched folder brought in at once,
+ * as "needs review", because a metadata service it would have asked had asked to wait (it was left out, not waited for).
+ * The attach route's outcome reason ("Stored; it needs review: …") and the first reason of its entry in the review queue.
+ */
+export const LOOKUP_WAITING_TEXT = "Waiting for lookup service response.";
+
+/** The one sentence for a file whose attach the library's closing cancelled (ATTACH_CLOSED_TEXT around its name). */
+export function attachClosedSentence(fileName: string): string {
+  return `${ATTACH_CLOSED_TEXT.before}${fileName}${ATTACH_CLOSED_TEXT.after}`;
+}
+
 export const IN_LIBRARY_TEXT = {
   file: "That file is inside this library's own folder. Files already in the library cannot be attached again.",
   folder: "That folder is inside this library's own folder, or holds it. Choose a folder outside the library.",

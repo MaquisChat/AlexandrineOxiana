@@ -15,9 +15,9 @@ import {
   type AuditEvent,
 } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
-import { projectMovedAway, type Library } from "../library.js";
+import { closingSignal, isClosed, onClose, projectMovedAway, type Library } from "../library.js";
 import { AnchorStore, AuditStore, type AuditInput, type IntegrityWarning } from "./audit-store.js";
-import { NotFoundError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
+import { LibraryClosedError, NotFoundError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
 import { absPath, readMaybe } from "./io.js";
 import type { InternalOptions } from "./seams.js";
 import type { UndoCause } from "./txn.js";
@@ -197,6 +197,8 @@ export class RepoCore {
   private readonly urgent: Array<() => void> = [];
   /** A turn is running or about to start. */
   private writing = false;
+  /** Called once the queue is empty (no turn running or waiting): the handle's `close()` waits for this (R546 1). */
+  private idleWaiters: Array<() => void> = [];
   /** The turn running now, if any. */
   private running: Turn | undefined;
   /** Locks asked and not yet done (the key is wiped when the turn in progress ends), by project id (R386 b). */
@@ -220,6 +222,24 @@ export class RepoCore {
     this.device = opts.device ?? library.deviceId;
     this.scryptN = opts.scryptN;
     this.auditSegmentSize = opts.auditSegmentSize;
+    // FR-749 (R546 1, R247 d): the handle's close() waits for the change in its store turn before the lock goes; the
+    // turns still waiting are refused as they come up (`enqueue`), so the queue empties without writing.
+    onClose(library, { drain: () => this.whenIdle(), holdsTurn: () => this.inRunningTurn() });
+  }
+
+  /** Resolves when no turn is running or waiting. */
+  private whenIdle(): Promise<void> {
+    if (!this.writing) return Promise.resolve();
+    return new Promise<void>((r) => this.idleWaiters.push(r));
+  }
+
+  /**
+   * FR-749 (R546 1, 2): true when a change may not begin now — the library's handle has been closed, or the session the
+   * asking work runs for has begun to close it (`whileOpen`). Only a change already in its turn (begun before) goes on;
+   * every other is refused with LibraryClosedError.
+   */
+  private refusesNewChanges(): boolean {
+    return isClosed(this.library) || closingSignal(this.library)?.aborted === true;
   }
 
   get root(): string {
@@ -242,6 +262,8 @@ export class RepoCore {
   readonly noHeal: boolean;
 
   assertWritable(): void {
+    // A closed library refuses every write (R546 1); the change in its store turn when it was closed finishes (R247 d).
+    if (this.refusesNewChanges() && !this.holdsTurn()) throw new LibraryClosedError();
     if (this.library.mode !== "read-write" || this.noHeal) throw new ReadOnlyLibraryError(this.noHeal ? "not-writable" : this.library.readOnlyReason);
   }
 
@@ -279,6 +301,12 @@ export class RepoCore {
     return new Promise<T>((resolve, reject) => {
       // Bound to the caller's async context, as a promise reaction would be.
       const start = AsyncResource.bind(() => {
+        // A turn that had not begun when the library was closed never begins (R546 1): refused, nothing run.
+        if (this.refusesNewChanges()) {
+          reject(new LibraryClosedError());
+          this.startNext();
+          return;
+        }
         const turn: Turn = { core: this };
         this.running = turn;
         let run: Promise<T>;
@@ -303,12 +331,22 @@ export class RepoCore {
   private startNext(): void {
     const start = this.urgent.shift() ?? this.waiting.shift();
     this.writing = start !== undefined;
+    if (!start) for (const w of this.idleWaiters.splice(0)) w();
     start?.();
   }
 
   /** True while running in a turn of this repo's write queue (`serial`): no other write is in progress. */
   holdsTurn(): boolean {
     return inTurn.getStore()?.core === this;
+  }
+
+  /**
+   * R555 2: true only inside the turn that is RUNNING now. A callback set up inside a turn carries that turn's context
+   * after it ended (see `inTurn`); it is not inside a change, so it may close the library.
+   */
+  inRunningTurn(): boolean {
+    const t = inTurn.getStore();
+    return t !== undefined && t.core === this && t === this.running;
   }
 
   state(projectId: string): ProjectState {
