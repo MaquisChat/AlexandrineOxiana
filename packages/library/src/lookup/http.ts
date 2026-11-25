@@ -424,6 +424,16 @@ export class HttpClient {
     this.stopped.abort();
   }
 
+  /**
+   * Decision 31 (c), R411: the time (client clock, ms) before which `host` is not to be asked — the hold a 429 or a 503
+   * with a wait asked set — or undefined when it may be asked now. Only reads: "Look up again" leaves a held service out
+   * without sending, and without counting a try.
+   */
+  heldUntil(host: string): number | undefined {
+    const t = this.notBefore.get(host);
+    return t !== undefined && this.clock() < t ? t : undefined;
+  }
+
   /** What ends this call's waits: the client's stop, and the closing of the session the current work runs for. */
   private halt(): AbortSignal {
     const scope = closingSignalAt(this.libraryRoot);

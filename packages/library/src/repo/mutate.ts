@@ -445,7 +445,12 @@ export async function decide(
 export async function authorizeOnly(
   core: RepoCore,
   projectId: string,
-  req: MutateRequest,
+  /**
+   * One request, or several of one action (decision 31 c: one `process/metadata_lookup` per service about to be asked):
+   * each is evaluated, a deny of any is audited and thrown, and an allow is audited as ONE event (the first request's
+   * action and decision; the caller's details say what it covers). The first decision is returned.
+   */
+  req: MutateRequest | MutateRequest[],
   opts: InternalMutateOptions & {
     /** Also audit an allow, as this one event (the caller then skips re-evaluating the request when storing). */
     auditAllow?: { details: Record<string, unknown> };
@@ -463,7 +468,7 @@ export async function authorizeOnly(
     if (opts.auditAllow) {
       await core.auditNow(st, {
         ...core.auditBase(st, at),
-        action: req.action,
+        action: first!.req.action,
         entity: opts.entity ?? { type: "project", id: projectId },
         decision: auditDecision(first!.d),
         details: { op, ...opts.auditAllow.details, ...(first!.d.warnings.length ? { warnings: first!.d.warnings } : {}) },

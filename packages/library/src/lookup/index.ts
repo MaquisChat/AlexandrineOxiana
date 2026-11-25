@@ -17,7 +17,7 @@ import { toIsbn13 } from "@ao/core";
 import { isSensitive, providerAllowed, type LookupContext, type LookupResult, type Provider } from "./context.js";
 import { crossrefWork } from "./crossref.js";
 import { LookupHttpError, LookupLeftOutError } from "./http.js";
-import { locIsbn } from "./loc.js";
+import { LOC_SRU_BASE, locIsbn } from "./loc.js";
 import { openAlexSearch, openAlexWork } from "./openalex.js";
 import { openLibraryIsbn } from "./openlibrary.js";
 
@@ -35,6 +35,15 @@ export { LOC_SRU_BASE } from "./loc.js";
 export interface LookupOnly {
   only?: readonly string[];
 }
+
+/** Decision 31 (c): the host each provider's lookups go to (where the client keeps a service's hold, R411). */
+export const PROVIDER_HOSTS: Readonly<Record<Provider, string>> = {
+  crossref: "api.crossref.org",
+  openalex: "api.openalex.org",
+  openlibrary: "openlibrary.org",
+  loc: new URL(LOC_SRU_BASE).hostname,
+  elicit: "elicit.com",
+};
 
 async function firstAnswer(
   ctx: LookupContext,

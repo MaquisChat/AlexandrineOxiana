@@ -993,7 +993,7 @@ export function relinkLinkedAsset(repo: Repo, projectId: string, sourceId: strin
  * such as local processing; a deny is audited and thrown as PolicyDeniedError. With `auditAllow`, an
  * allow is audited too (link capture: the one audited capture decision).
  */
-export function authorizeProcessing(repo: Repo, projectId: string, req: MutateRequest, opts: Parameters<typeof authorizeOnly>[3] = {}): ReturnType<typeof authorizeOnly> {
+export function authorizeProcessing(repo: Repo, projectId: string, req: MutateRequest | MutateRequest[], opts: Parameters<typeof authorizeOnly>[3] = {}): ReturnType<typeof authorizeOnly> {
   return authorizeOnly(cores.get(repo)!, projectId, req, opts);
 }
 
