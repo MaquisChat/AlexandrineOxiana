@@ -150,3 +150,130 @@ Checks:
 - `pnpm --filter @ao/ui run typecheck`: clean.
 - `lint:css`: clean.
 - `lint:colours`: "ok: no hard-coded colours in src/**/*.ts(x)".
+
+---
+
+# Second look (R613): fix round `fr-756-screens` de02a65 (diff b8a320d..HEAD, eleven commits)
+
+## Verdict: APPROVED WITH SMALL POINTS (no Critical, no Important; two new Minor)
+
+Every finding R605 ruled on is closed. Each was checked with my own probes (written, run and removed). The two planted faults (I1, I2) each made their tests fail. 39 test files, 981 tests, all green. The new Minor findings do not hold up approval.
+
+## Per finding
+
+- **I1: closed.** `screens/Capture.tsx:1194`. The route's failure branch no longer empties the list. Probe at `/capture?project=P1`, holding only the route's ask (the second `/projects` ask), after typing a link:
+  - list held: the field is the same element and keeps "https://example.org/a". One alert, "did not answer in time", with 1 "Try again".
+  - list failed with no answer: the same, with "could not be reached".
+  - list refused with the service's own words: the same field, the refusal shown, no "Try again" (as for any refusal).
+  - Nothing says "not one of this library's projects".
+- **I2: closed.** `components/PageReads.tsx`; host in `routes/governance.tsx`; screens `GovernanceSettings.tsx`, `AuditLog.tsx`, `Fieldwork.tsx`; capture host and screen in `Capture.tsx`. Results are in the next section.
+- **I3: closed.** `TranscriptViewer.tsx:294` and `:779`. The Version box after each kind of versions read:
+
+  | versions read | box | alert | "Try again" |
+  |---|---|---|---|
+  | held | `[""]` | "did not answer in time" | 1 |
+  | failed with no answer | `[""]` | "could not be reached" | 1 |
+  | refused by the service | `[""]` | the service's words | none, as before |
+  | answered with an empty list | "No transcript yet" | none | none |
+
+- **M1: closed.** `routes/governance.tsx:105-113`. The builder's two tests, plus my matrix (no "not in this library" in any case where the list was not read).
+- **M2: closed.** The sentence is on the Options step only (`ImportWizard.tsx:371-383`), `role="note"`.
+  - Probe, rules read and strict (encryption required): no note, no "Try again", "Link in place" off. True.
+  - Probe, rules refused by the service: the note and one "Try again". "Could not be read" is true there.
+  - The builder's tests cover the give-up and the failure: "Try again" reads the rules, the note goes, and "Link in place" becomes available.
+- **M3: closed for production, with a flaw in one helper (N1 below).**
+  - `useLatestRead` (rules, audit log, fieldwork) and the per-project controller in Search sources are sound, including under StrictMode.
+  - `useLeaveSignal` (Your library, the run step) cancels the request, but its after-the-fact check cannot see that the screen was left.
+- **M4: closed.** `SearchSources.tsx:286-296`. A project change aborts the reads of the project left and clears its alert. The builder's two tests failed first.
+- **M5: closed.** `Fieldwork.tsx:113-117, 184-189, 296-304` and `AuditLog.tsx:463-488, 532-542`. The no-answer sentence is kept apart from `error`, and each screen has a "Try again" in its records view. The builder's tests failed first and pass now.
+- **M6: closed.** `api/firstRead.ts:76-93`, used at `Fieldwork.tsx:166` and `routes/reader.tsx:200`. A failure cancels the others (the builder's tests). My probe: three reads that all succeed at 0, 50 and 100 ms all resolve to `[1,2,3]`, with no signal aborted. A success cancels nothing.
+- **M7: closed.** `Capture.tsx:900-906`. Probe: a stream that never opens leads to "Reconnect"; the press asks for the rules (which were still out) a second time (1 → 2).
+- **M11: closed.** The tests are written: a late answer after "Try again", and an answered failure after a give-up, on each b screen. The builder planted faults (the request's signal dropped) and the late-answer tests failed.
+- **The builder's claim that the reader and import routes cannot double: holds** (checked in the code):
+  - The reader route renders `ReaderScreen` only when `loaded.kind === "ready"`. "Open again" and a failure replace the screen.
+  - `importRoute` makes no read on the wizard path (`routes/import.tsx:24-35`).
+
+## I2 in depth: the matrix (probed, limit 200 ms)
+
+Every combination of the route's list and the screen's read was probed: held, failed with no answer, refused with the service's words, answered. That is 16 cases on each of `/governance?project=p1`, `/audit?project=p1` and `/fieldwork?project=p1` (participants held; sessions and consents answered), and 16 on `/capture?project=P1` (route list × rules). All four screens gave the same results:
+
+| list \ screen | held | failed | refused | answered |
+|---|---|---|---|---|
+| **held** | "did not answer in time", 1 button; press re-asks list and screen (1,1 → 2,2) | "could not be reached" alone, 1 button; (1,1 → 2,2) | "did not answer in time" + the refusal, 1 button; press re-asks the list only (→ 2,1), the refusal stays | "did not answer in time", 1 button; list only (→ 2,1) |
+| **failed** | "could not be reached" alone; (→ 2,2) | "could not be reached", 1 button; (→ 2,2) | "could not be reached" + the refusal; list only (→ 2,1) | "could not be reached"; list only (→ 2,1) |
+| **refused** | the refusal + "did not answer in time", 1 button; screen only (→ 1,2) | the refusal + "could not be reached"; screen only (→ 1,2) | the two refusals, no button | the refusal, no button |
+| **answered** | "did not answer in time", 1 button; screen only (→ 1,2) | "could not be reached"; screen only (→ 1,2) | the refusal, no button | none |
+
+- **Request counts:** the press never re-asks a read that was answered or refused. On capture the counts include the screen's own `/projects`, which was answered and not asked again (2 → 3 is the route's ask only).
+- **After the press**, with everything then answering: no stale sentence remains. Only a refusal stays, as before.
+- **The service's own words** are never replaced or doubled by the page's sentence.
+- **Focus:** on the project picker when the host's button was pressed; on the screen's h1 when the screen's button was pressed.
+- **Project switch:** with the list given up and the audit read failed ("could not be reached"), going to `?project=p2` takes the left screen's sentence away at once. What remains is the list's own "did not answer in time" with one button, which is true: the list is still unread.
+- **Announced once:** within a settled state there is one `role="alert"` for the no-answer sentence. One exception, by reading the code: see N2.
+
+## The decisions accepted in R613
+
+- **Capture with a FAILED list and a project in the address.** Nothing the researcher needs is lost, and nothing false can be done:
+  - Probe, route list failed, address naming a project that is not in the library, the screen's own list answering: the screen says "This project was not found in the library." and "Capture links" is off.
+  - Probe, both lists failed: one "could not be reached" with one "Try again", and "Capture links" off. `ready` needs the project (`Capture.tsx:815`).
+  - Whatever the screen shows, the service refuses a capture into a project it does not have.
+- **A REFUSED versions read.** The box is empty and disabled, under the service's own sentence (`loadError`). That is true: nothing is claimed about the versions. As before, the refusal has no "Try again". The locked view's "Try again" bumps `attempt` without resetting `versionsUnread`, so during that re-read the box shows "" rather than "Loading…". It is cosmetic and not worth a finding.
+
+## New findings
+
+**N1 (Minor): `useLeaveSignal`'s check after the await never sees that the screen was left.**
+- Where: `components/leaveSignals.ts:22`, used at `YourLibrary.tsx:310`.
+- Cause: `leaving()` makes a NEW controller when the old one was aborted and cleared, so `if (leaving().aborted) return;` is never true.
+- Probed in `<StrictMode>`, which is how `main.tsx` mounts the app; its double effects run in development builds and in any browser scenario served by the dev server. React's simulated unmount aborts the first read. Its AbortError then lands as "The Your library settings could not be read." while the real (second) read is still out: 2 asks, that alert shown, the loading words gone. It goes when the second read answers.
+- Production is not affected (no double effects). After a real leave, the catch still runs and sets state on the unmounted screen, which is harmless.
+- `StepRun.tsx:66` uses the same helper but swallows every failure, so nothing shows there.
+- Smallest mend: take the signal before the await (`const s = leaving(); … readWithin(…, s) … catch { if (s.aborted) return; … }`). Or have `leaving()` never re-create a controller after the effect's clean-up.
+
+**N2 (Minor, by reading the code): a screen's failed read can be announced twice.**
+- Sequence: the screen's read fails at once while the route's list is still out. The screen's own alert says "could not be reached". When the list is given up, the host takes over: the screen's alert node goes and the host's new `role="alert"` node says the same sentence again.
+- Smallest mend, if wanted: the host's alert node is always rendered (empty until needed), so a takeover with the same words is not announced again. Acceptable as it is.
+
+Not a finding: when the list and the screen's read are both refused, the page shows two refusal sentences. They are the service's own words for two different reads, and the one-sentence rule is about the no-answer sentences. In my probe the two read the same only because the mock gave them the same words.
+
+## Planted faults (each in a copy, run, restored byte for byte)
+
+| fault | result |
+|---|---|
+| I1: `setProjects([])` put back in the capture route's failure branch | `Capture.firstReads`: 4 failed (both I1 tests and both capture I2 tests) |
+| I2: `usePageRead` never yields (`yields: false`) | `governance.firstReads`: 5 failed (the probe on all three screens, the mirror, both given up); `Capture.firstReads`: 2 failed |
+
+## Tests run (each file alone, `nice -n 10`, `NODE_OPTIONS=--use-openssl-ca`)
+
+39 files, 981 tests, all passed:
+- api: firstRead 6, client 43
+- routes: reader.firstReads 5, reader 13, reader.find 22, governance 20, tools 9, transcript 4, import 18
+- Capture: firstReads 14, plain 65
+- MissingToolNotice: capture 4, hookups 8
+- ExtensionPairing 71
+- Fieldwork 31
+- AuditLog 18
+- GovernanceSettings 65
+- governance.firstReads 32
+- ResearcherName 8
+- AppearanceSettings: plain 24, reset 10
+- SearchSources 42
+- ToolsSetup 34
+- TranscriptViewer: firstReads 11, plain 66
+- YourLibrary 59
+- import: ImportWizard.firstReads 13, ImportWizard 56, StepReport 25, ReviewQueue.look 18
+- Library.reader 9
+- Reader: firstReads 4, plain 59
+- ReaderHandover 3
+- MissingFiles 5
+- MoveLibrary 26
+- App 16
+- dialogs.r145 42
+- reachability 3
+
+No flake or time-out.
+
+Checks:
+- `@ao/ui` typecheck: 0 errors.
+- `lint:css`: clean.
+- `lint:colours`: "ok: no hard-coded colours in src/**/*.ts(x)".
+- `git status --short`: empty. No process of mine is left.
