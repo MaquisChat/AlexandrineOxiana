@@ -3305,6 +3305,10 @@ describe("F11: the free copy of a record the queue completed", () => {
     mockCopies();
   });
   afterEach(async () => {
+    // FR-757: the runners are stopped while the file mock is still the network, so no run still live can hand a
+    // request to the guard. A held file needs no answer for this: the stop aborts its download (the interceptor's
+    // abort). The file-wide afterEach's second stopAll() then finds nothing to wait for.
+    for (const r of runners) await r.stopAll();
     for (const h of heldFiles) h.respond(500, null);
     setGlobalDispatcher(saved);
     await fileAgent.close();

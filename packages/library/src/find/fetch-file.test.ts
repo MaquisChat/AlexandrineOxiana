@@ -415,9 +415,9 @@ describe("fetchFile: time and abort", () => {
     expect(requests).toEqual([]);
   });
 
-  // FR-757: the place is given at once and the call then waits on the disk (the folder); an abort in that wait (a
-  // stop, a lock, a close) must end the call there — no request is handed to the network after the caller stopped.
-  it("FR-757: an abort after the start, while the folder is made, sends nothing and leaves nothing", async () => {
+  // FR-757: the place is given at once, before the call goes on; an abort right then (a stop, a lock, a close) must
+  // end the call before its request — nothing is handed to the network after the caller stopped.
+  it("FR-757: an abort right after the start, once the place is given, sends nothing and leaves nothing", async () => {
     pdfAt("https://arxiv.org", "/pdf/late-abort");
     const ac = new AbortController();
     const p = get("https://arxiv.org/pdf/late-abort", { signal: ac.signal });
