@@ -214,6 +214,11 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
   const [tries, setTries] = useState<Record<FirstRead, number>>({ source: 0, versions: 0, transcript: 0 });
   /** The versions have been read once: until then a failed read's empty list is not shown while it is read again. */
   const versionsRead = useRef(false);
+  /**
+   * R605 I3: the versions' read was given up or failed before they were ever read: the Version box then says nothing
+   * that claims they were read (never "No transcript yet").
+   */
+  const [versionsUnread, setVersionsUnread] = useState(false);
   const headingRef = useRef<HTMLHeadingElement | null>(null);
 
   const listSeq = useRef(0);
@@ -286,7 +291,8 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
           setUnanswered(({ versions: _v, ...u }) => u);
           if (!sawLocked(err)) setLoadError(errorText(err, "The transcript versions could not be read."));
         }
-        setVersions((v) => v ?? []);
+        // Never read: the list is unknown, not empty (R605 I3).
+        if (!versionsRead.current) setVersionsUnread(true);
       }
     },
     [projectId, sourceId, sawLocked, firstReadMs],
@@ -366,7 +372,10 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
   const readAgain = useCallback((stillOut: boolean) => {
     const again = new Set<FirstRead>([...(Object.keys(unansweredRef.current) as FirstRead[]), ...(stillOut ? out.current : [])]);
     if (!again.size) return;
-    if (again.has("versions") && !versionsRead.current) setVersions(undefined);
+    if (again.has("versions") && !versionsRead.current) {
+      setVersions(undefined);
+      setVersionsUnread(false);
+    }
     setUnanswered((u) => Object.fromEntries(Object.entries(u).filter(([r]) => !again.has(r as FirstRead))));
     setTries((t) => ({ source: t.source + (again.has("source") ? 1 : 0), versions: t.versions + (again.has("versions") ? 1 : 0), transcript: t.transcript + (again.has("transcript") ? 1 : 0) }));
   }, []);
@@ -767,7 +776,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
         <div className="ao-tx__toolbar">
           <label htmlFor={`${id}-version`}>Version</label>
           <select id={`${id}-version`} ref={versionPicker} value={selected ?? ""} disabled={!versions?.length} onChange={(e) => chooseVersion(e.target.value)} aria-describedby={dirty ? `${id}-dirty` : undefined}>
-            {!versions?.length && <option value="">{versions ? "No transcript yet" : "Loading…"}</option>}
+            {!versions?.length && <option value="">{versions ? "No transcript yet" : versionsUnread ? "" : "Loading…"}</option>}
             {versions?.map((v) => (
               <option key={v.id} value={v.id}>
                 {versionLabel(v)}

@@ -23,6 +23,8 @@ const TITLE = "Interview with a baker";
 const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
 const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
 const heading = () => screen.getByRole("heading", { level: 1 });
+/** The Version box's options, as shown. */
+const versionBox = () => [...(screen.getByLabelText("Version") as HTMLSelectElement).options].map((o) => o.textContent);
 
 beforeEach(() => {
   window.history.replaceState(null, "", "/transcript?project=p1&source=s1");
@@ -95,6 +97,8 @@ describe("TranscriptViewer: first reads that never settle or fail (FR-756)", () 
     expect((screen.getByLabelText("Version") as HTMLSelectElement).options[0]!.textContent).toBe("Loading…");
     await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
     expect(alerts()).toEqual([NO_ANSWER]);
+    // R605 I3: the versions were never read: the box says nothing that claims they were ("No transcript yet").
+    expect(versionBox()).toEqual([""]);
     await userEvent.setup().click(tryAgain()!);
     expect((screen.getByLabelText("Version") as HTMLSelectElement).options[0]!.textContent).toBe("Loading…");
     expect(alerts()).toEqual([]);
@@ -104,6 +108,19 @@ describe("TranscriptViewer: first reads that never settle or fail (FR-756)", () 
     expect(tryAgain()).toBeNull();
     expect(alerts()).toEqual([]);
     expect(document.activeElement).toBe(heading());
+  });
+
+  it.each([
+    ["failed with no answer", () => HttpResponse.error()],
+    ["refused with the service's own words", () => HttpResponse.json({ error: { code: "INTERNAL", message: "The versions could not be listed." } }, { status: 500 })],
+  ])("a versions read that %s never shows “No transcript yet” in the Version box (R605 I3)", async (_what, answer) => {
+    const svc = transcriptService({ media: "none" });
+    server.use(...svc.handlers);
+    server.use(http.get(url("/projects/:id/sources/:sid/transcripts"), answer));
+    show({ firstReadMs: 300 });
+    await waitFor(() => expect(alerts().length).toBeGreaterThan(0));
+    expect(versionBox()).toEqual([""]);
+    expect(screen.queryByText("No transcript yet")).toBeNull();
   });
 
   it("a transcript read that hangs is given up at the limit: “Loading the transcript…” gives way to the alert and “Try again”; pressing it shows the loading words, then the segments", async () => {
