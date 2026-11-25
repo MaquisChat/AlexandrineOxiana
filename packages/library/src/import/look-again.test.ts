@@ -960,3 +960,57 @@ describe("decision 31 (c), R585 M6: only the part of a chain that was left out i
     expect(sent.filter((s) => s.startsWith("api.openalex.org/works/doi"))).toHaveLength(1);
   });
 });
+
+describe("decision 31 (c), R593 m2: a service the rules deny at send time is KEPT in a lookup that met a wait or a failure", () => {
+  for (const [name, first] of [
+    ["asks to wait (429)", WAIT_60],
+    ["fails outright (500)", { statusCode: 500, data: "broken" } as Answer],
+  ] as const) {
+    it(`Crossref ${name}, then the rules deny OpenAlex before its send: the DOI lookup still names both services; once the rules allow OpenAlex again, a later look-up asks it`, async () => {
+      const p = await project();
+      const http = client();
+      answers["api.crossref.org"] = () => WAIT_60;
+      answers["api.openalex.org"] = () => WAIT_60;
+      const [e] = await attached(p, http, [buildDoiPdf()]);
+      const at = e!.leftOut!.findIndex((l) => l.identifier);
+      expect(e!.leftOut![at]!.services).toEqual(["crossref", "openalex"]);
+      now += 16 * MIN;
+      answers["api.crossref.org"] = () => first;
+      answers["api.openalex.org"] = () => SEARCH;
+      const hold = holdRequests(http, "after");
+      const run = lookUpAgain(repo, http, p.id, e!.id, { by: "researcher", now: new Date(now) });
+      await hold.atGate; // Crossref has answered; before OpenAlex's send is authorised the rules deny OpenAlex
+      const g = await repo.getGovernance(p.id);
+      await repo.setGovernance(p.id, `${GOV}processing:\n  metadata_lookup: [crossref]\n`, { baseSha256: g.sha256 });
+      hold.release();
+      const r = await run;
+      expect(r).toMatchObject({ done: true, services: ["crossref"] });
+      const mid = await entry(p, e!.id);
+      const doi = mid.leftOut![at]!;
+      expect(doi.services).toEqual(["crossref", "openalex"]);
+      expect(doi.outcome).toBeUndefined();
+      if (first === WAIT_60) expect(doi.notBefore).toBeDefined();
+      else expect(doi.why).toBe("failed");
+      // The state and sentences: the title search (OpenAlex only) is "not-allowed"; the DOI lookup waits (429) or has failed.
+      const view = (r as { state: unknown }).state;
+      if (first === WAIT_60) {
+        expect(view).toMatchObject({ state: "waiting", also: ["not-allowed"] });
+        expect(mid.reasons.slice(0, 2)).toEqual([LOOKUP_WAITING_TEXT, LOOK_UP_AGAIN_TEXT.notAllowed]);
+      } else {
+        expect(view).toMatchObject({ state: "not-allowed" });
+        expect(mid.reasons[0]).toBe(LOOK_UP_AGAIN_TEXT.notAllowed);
+      }
+      // The rules allow OpenAlex again: a later look-up asks it for the DOI.
+      const g2 = await repo.getGovernance(p.id);
+      await repo.setGovernance(p.id, GOV, { baseSha256: g2.sha256, reason: "test: OpenAlex allowed again" });
+      now += 30 * MIN;
+      sent = [];
+      answers["api.crossref.org"] = () => ({ statusCode: 404, data: "{}" });
+      answers["api.openalex.org"] = (path) => (path.includes("search") ? NO_RESULTS : { statusCode: 200, data: fixture("openalex-work.json") });
+      const r2 = await lookUpAgain(repo, client(), p.id, e!.id, { by: "researcher", now: new Date(now) });
+      expect(r2).toMatchObject({ done: true });
+      expect(sent.filter((s) => s.startsWith("api.openalex.org/works/doi"))).toHaveLength(1);
+      expect((await entry(p, e!.id)).leftOut![at]!.outcome).toBe("found");
+    });
+  }
+});

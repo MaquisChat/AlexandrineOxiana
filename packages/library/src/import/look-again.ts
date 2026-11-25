@@ -210,7 +210,7 @@ function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string, b
   if (p.notAllowed || (a?.kind === "denied" && !p.held.length)) return { ...l, outcome: "not-allowed" };
   if (!a || a.kind === "denied") {
     // Every allowed service held: not asked now; it waits for the hold (no try counted).
-    return { ...l, services: p.held, notBefore: new Date(Math.max(keptNotBefore(l, ms(at)) ?? 0, p.heldUntil ?? 0)).toISOString() };
+    return { ...l, services: [...new Set([...p.held, ...(a?.denied ?? [])])], notBefore: new Date(Math.max(keptNotBefore(l, ms(at)) ?? 0, p.heldUntil ?? 0)).toISOString() };
   }
   // R585 M2: a try is counted only when a request of it left (not one the client's hold left out, nor an answer from
   // the cache). A time never moves backwards (R585 2): a later try written meanwhile keeps its time.
@@ -230,10 +230,11 @@ function after(p: Plan, l: LeftOutLookup, a: Answered | undefined, at: string, b
   if (a.kind === "failed") {
     // Every service asked failed outright: it is now a lookup that failed (looked up again by hand only, R577 iv).
     const { notBefore: _n, ...rest } = tried;
-    return { ...rest, services: [...new Set([...a.services, ...p.held])], why: "failed" };
+    // R593 m2: a service the rules denied at send time stays to be asked (when they allow it again).
+    return { ...rest, services: [...new Set([...a.services, ...p.held, ...a.denied])], why: "failed" };
   }
-  // Still to be asked: those that asked to wait again, and those held.
-  const services = a.kind === "waiting" ? [...new Set([...a.services, ...p.held])] : p.held;
+  // Still to be asked: those that asked to wait again, those held, and those the rules denied at send time (R593 m2).
+  const services = [...new Set([...(a.kind === "waiting" ? a.services : []), ...p.held, ...a.denied])];
   const notBefore = Math.max(a.kind === "waiting" ? a.notBefore : 0, p.heldUntil ?? 0, keptNotBefore(l, ms(at)) ?? 0);
   const waiting: LeftOutLookup = { ...tried, services, notBefore: new Date(notBefore).toISOString(), ...(isAskedToWait(l) ? {} : { why: "asked-to-wait" as const }) };
   if (counted && tries >= LOOK_UP_AGAIN_BOUNDS.maxAutomaticTries) return { ...waiting, outcome: "gave-up" };
