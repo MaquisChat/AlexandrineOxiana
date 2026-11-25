@@ -517,3 +517,4 @@ R591 (2026-11-25 UTC): FR-756's first piece begun beside the next build (the ope
 R592 (2026-11-25 UTC): "Look up again" — the engine's fix round built (e62d244); six uncertain points ruled; to its second look; the service and the page are joined to it meanwhile by a fresh implementer
 R593 (2026-11-25 UTC): "Look up again" engine approved with small points at its second look; m1 (wording) and m2 (a denied service kept in a lookup that met a wait or a failure) mended now; m3 listed as FR-758
 R594 (2026-11-25 UTC): main 88a6bed — CI run 287 green (71 min); with the Mac job (run 19) both checks of main are green
+R595 (2026-11-25 UTC): "Look up again" engine ready at 89a97d2 (m1, m2 in, read by the coordinator); one question on the "failed" sentence in a mix goes to the review of the service and the page
