@@ -45,6 +45,8 @@ export type BannerVariant =
       state?: IncompleteRollback;
       /** FR-729: kept with the library until dismissed ("Dismiss"). */
       keptId?: string;
+      /** R583: a place the sentence names (the researcher's own path, shown through UserText). */
+      place?: string;
     }
   /** This computer's own notice (Task 68, R154, R178): fixed words by kind; goes by "Got it". */
   | { kind: "notice"; notice: DeviceNoticeKind };
@@ -178,25 +180,42 @@ const CLOSED_UNCONFIRMED = (p: string) =>
 const ROLLBACK_KINDS: ReadonlySet<string> = new Set(["rolled-back-incomplete-write", "incomplete-write-pending"]);
 
 /** The sentence for a warning kind; an unknown kind gets a generic sentence (never the detail). */
-export function warningText(kind: string, project: string, count = 1, state?: IncompleteRollback): string {
+export function warningText(kind: string, project: string, count = 1, state?: IncompleteRollback, place?: string): string {
   // FR-736: an undo that is not complete says its state, in the library's shared sentence.
   if (state && ROLLBACK_KINDS.has(kind) && Object.hasOwn(INCOMPLETE_ROLLBACK_BANNER, state)) return INCOMPLETE_ROLLBACK_BANNER[state](project);
   // R527: a change closed where something stood at the place: never "that file is lost".
   if (kind === "interrupted-change-closed" && state === "unconfirmed") return CLOSED_UNCONFIRMED(project);
+  if (Object.hasOwn(PLACE_WARNINGS, kind)) return PLACE_WARNINGS[kind]!(count, place ?? "its old place");
   const known = Object.hasOwn(WARNINGS, kind) ? WARNINGS[kind] : undefined;
   return known ? known(project, count) : `Something in ${project} needs attention. Open the verification report for details.`;
 }
+
+const files = (n: number) => (n === 1 ? "1 file here no longer matches" : `${n} files here no longer match`);
+/**
+ * R583 (FR-755): the opening's words that name a place — the old copy's, as the researcher chose it — and how many files
+ * no longer match. `n`: the count; `place`: the path (shown through UserText by warningSentence).
+ */
+const PLACE_WARNINGS: Record<string, (n: number, place: string) => string> = {
+  "move-not-finished-files-differ": (n, place) =>
+    `The move of this library to this folder has not finished, and the app did not finish it: ${files(n)} what was checked when the library was copied. The old copy at ${place} still holds every file as it was checked. Both copies are kept as they are, and this library is open read-only.`,
+  "move-not-finished-files-differ-old-unconfirmed": (n, place) =>
+    `The move of this library to this folder has not finished, and the app did not finish it: ${files(n)} what was checked when the library was copied, and the old copy at ${place} could not be confirmed to hold every file either. Both copies are kept as they are, and this library is open read-only. Ask for help before changing or deleting either copy.`,
+};
 
 /**
  * A warning's sentence with only the project's name laid out by its own direction (FR-158): a right-to-left name at the
  * start of the sentence no longer turns the whole English sentence round. Each place the name stands is isolated.
  * `count`: how many warnings of this kind in this project the sentence stands for (R484 f).
  */
-function warningSentence(kind: string, project: string, count = 1, state?: IncompleteRollback): ReactNode {
+function warningSentence(kind: string, project: string, count = 1, state?: IncompleteRollback, place?: string): ReactNode {
   const mark = "\u0000";
-  return warningText(kind, mark, count, state)
+  const placeMark = "\u0001";
+  return warningText(kind, mark, count, state, place === undefined ? undefined : placeMark)
     .split(mark)
-    .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={i}>{project}</UserText>, part]));
+    .flatMap((part, i) => (i === 0 ? [part] : [<UserText key={`p${i}`}>{project}</UserText>, part]))
+    .flatMap((part, i) =>
+      typeof part === "string" && place !== undefined ? part.split(placeMark).flatMap((bit, k) => (k === 0 ? [bit] : [<UserText key={`l${i}-${k}`}>{place}</UserText>, bit])) : [part],
+    );
 }
 
 /** Kinds the library records once per source folder, shown once per project with their number (R484 f). */
@@ -301,7 +320,7 @@ export function StatusBanner({
   // Project names and service details are user text, shown with dir=auto; in a warning only the project's name (FR-158).
   return (
     <div role="status" className={`ao-banner ao-banner--${TONE[variant.kind]}`}>
-      {variant.kind === "warning" && !variant.oldCopies ? <span>{warningSentence(variant.warning, variant.project, variant.count, variant.state)}</span> : <UserText>{text(variant)}</UserText>}
+      {variant.kind === "warning" && !variant.oldCopies ? <span>{warningSentence(variant.warning, variant.project, variant.count, variant.state, variant.place)}</span> : <UserText>{text(variant)}</UserText>}
       {variant.kind === "warning" && !!variant.oldCopies?.places.length && (
         <ul>
           {variant.oldCopies.places.map((p) => (
@@ -392,7 +411,16 @@ export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyR
   const grouped = new Map<string, { count: number }>();
   for (const w of state.integrityWarnings ?? ([] as IntegrityWarning[])) {
     if (!PER_PROJECT.has(w.kind)) {
-      out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail, ...(w.state ? { state: w.state } : {}), ...(w.keptId ? { keptId: w.keptId } : {}) });
+      out.push({
+        kind: "warning",
+        warning: w.kind,
+        project: w.project,
+        detail: w.detail,
+        ...(w.state ? { state: w.state } : {}),
+        ...(w.keptId ? { keptId: w.keptId } : {}),
+        ...(w.count !== undefined ? { count: w.count } : {}),
+        ...(w.place !== undefined ? { place: w.place } : {}),
+      });
       continue;
     }
     const key = JSON.stringify([w.projectId, w.kind]);

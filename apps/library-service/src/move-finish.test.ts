@@ -100,7 +100,7 @@ async function move(dest: string, excludeProjectIds?: string[]): Promise<any[]> 
     .map((l) => JSON.parse(l));
 }
 const lastLine = (lines: any[]) => lines[lines.length - 1];
-const stateOf = () => svc!.state.libraryState() as { open: boolean; mode?: string; readOnlyReason?: string; moveUnfinishedTo?: string; integrityWarnings?: Array<{ kind: string }> };
+const stateOf = () => svc!.state.libraryState() as { open: boolean; mode?: string; readOnlyReason?: string; moveUnfinishedTo?: string; integrityWarnings?: Array<{ kind: string; detail?: string }> };
 const kindsNow = () => (stateOf().integrityWarnings ?? []).map((w) => w.kind);
 const libraryMoveEvents = async (root: string) => {
   let n = 0;
@@ -289,6 +289,31 @@ describe("FR-755 (R578 (1)): opening the new place of an unfinished move finishe
     // location history when it is not the last one recorded; here the new place has the old one's name, so nothing.)
     expect(changedFiles(destAt, await hashes(dest))).toEqual([]);
     // Again: finished.
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: dest } })).json.mode).toBe("read-write");
+    expect(kindsNow()).toEqual(["move-finished-at-opening"]);
+    await assertWholeAtNewPlace(path, pid, dest);
+  });
+
+  it("R583 M5: a PDF removed by hand at the new place, or a file changed: not finished, read-only, the count and the old copy's place said; nothing written; a clean library still finishes", async () => {
+    const { path, pid, dest } = await stoppedAfter("close-source");
+    const pdfs = Object.keys(await hashes(dest)).filter((f) => f.endsWith(".pdf"));
+    const gone = join(dest, pdfs[0]!);
+    const kept = await readFile(gone);
+    await rm(gone);
+    const [oldAt, destAt] = [await hashes(path), await hashes(dest)];
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect([r.json.mode, r.json.readOnlyReason]).toEqual(["read-only", "move-incomplete"]);
+    expect(stateOf().integrityWarnings).toEqual([{ projectId: "*", project: "library", kind: "move-not-finished-files-differ", detail: expect.any(String), count: 1, place: path }]);
+    expect(stateOf().integrityWarnings![0]!.detail).not.toContain(tmp);
+    expect(await hashes(path)).toEqual(oldAt);
+    expect(await hashes(dest)).toEqual(destAt);
+    // A file changed instead.
+    await writeFile(gone, kept);
+    await writeFile(join(dest, pdfs[1]!), "changed by hand");
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: dest } })).json.mode).toBe("read-only");
+    expect(kindsNow()).toEqual(["move-not-finished-files-differ"]);
+    // Put right: it finishes.
+    await writeFile(join(dest, pdfs[1]!), await readFile(join(path, pdfs[1]!)));
     expect((await call({ method: "POST", url: "/libraries/open", body: { path: dest } })).json.mode).toBe("read-write");
     expect(kindsNow()).toEqual(["move-finished-at-opening"]);
     await assertWholeAtNewPlace(path, pid, dest);

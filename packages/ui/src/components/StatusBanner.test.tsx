@@ -500,3 +500,25 @@ describe("FR-755 (R578): a move that had not finished", () => {
     expect(screen.getByRole("status").textContent).toBe("Read-only — this is the old copy of a library that was moved. Changes are off.");
   });
 });
+
+describe("R583 M5: files at the new place that no longer match", () => {
+  const place = "/Volumes/Old Drive/Library ‮gpj";
+  const shown = (kind: string, count: number) => {
+    const [b] = bannersFor({ integrityWarnings: [{ projectId: "*", project: "library", kind, detail: "x", count, place }] });
+    render(<StatusBanner variant={b!} />);
+    const st = screen.getByRole("status");
+    const out = { text: st.textContent, isolated: [...st.querySelectorAll("[dir='auto']")].map((e) => e.textContent) };
+    cleanup();
+    return out;
+  };
+  it("says how many, and that the old copy at its place is whole; the place shown as the researcher's own text", () => {
+    expect(shown("move-not-finished-files-differ", 1)).toEqual({
+      text: `The move of this library to this folder has not finished, and the app did not finish it: 1 file here no longer matches what was checked when the library was copied. The old copy at ${place} still holds every file as it was checked. Both copies are kept as they are, and this library is open read-only.`,
+      isolated: [place],
+    });
+    expect(shown("move-not-finished-files-differ", 3).text).toMatch(/: 3 files here no longer match what was checked/u);
+    expect(shown("move-not-finished-files-differ-old-unconfirmed", 2).text).toBe(
+      `The move of this library to this folder has not finished, and the app did not finish it: 2 files here no longer match what was checked when the library was copied, and the old copy at ${place} could not be confirmed to hold every file either. Both copies are kept as they are, and this library is open read-only. Ask for help before changing or deleting either copy.`,
+    );
+  });
+});

@@ -76,6 +76,7 @@ import {
   MOVE_JOURNAL,
   MOVED_MARKER,
   MoveNotAllowedError,
+  MoveFinishRefusedError,
 } from "@ao/library";
 import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent, IncompleteRollback } from "@ao/shared";
 import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, oldCopiesPendingText } from "@ao/shared";
@@ -136,6 +137,25 @@ export const WATCHED_FOLDERS_UNREADABLE = "watched-folders-unreadable";
 export const MOVE_FINISHED_AT_OPENING = "move-finished-at-opening";
 export type MoveNotFinishedKind = "move-not-finished-disk-full" | "move-not-finished-not-writable" | "move-not-finished-in-use" | "move-not-finished";
 
+/**
+ * What an opening tells once (a session warning). `count` and `place` are for the screen only (R583 M5: how many files no
+ * longer match, and the old copy's place, which the researcher chose): never logged or recorded.
+ */
+export interface OpeningNote {
+  kind: string;
+  detail: string;
+  count?: number;
+  place?: string;
+}
+
+/** The note of a failed finishing: its kind by the plain cause, with what its words need. */
+function notFinishedNote(err: unknown, detail: string): OpeningNote {
+  if (err instanceof MoveFinishRefusedError && err.kind === "files-differ") {
+    return { kind: err.detail.oldWhole ? "move-not-finished-files-differ" : "move-not-finished-files-differ-old-unconfirmed", detail, count: err.detail.count ?? 0, place: err.detail.oldRoot ?? "" };
+  }
+  return { kind: notFinishedKind(err), detail };
+}
+
 /** The plain cause of a failed finishing, as the kind of its session warning. */
 function notFinishedKind(err: unknown): MoveNotFinishedKind {
   const code = (err as { code?: unknown } | null)?.code;
@@ -178,7 +198,7 @@ export interface Session {
    * Warnings for this session only, shown with the library's integrity warnings (Task 68 fix round 2,
    * Rm4): e.g. this computer's watched folders could not be read at open, so none run now.
    */
-  sessionWarnings?: Array<{ kind: string; detail: string }>;
+  sessionWarnings?: OpeningNote[];
   /** FR-720: the start of the watches that did not start at open, under way after the list could be read again. */
   watchRestart?: Promise<void>;
   /** R508 M3: each project's start of its watches under way (the opening's or a restart's): one per project at a time. */
@@ -353,12 +373,12 @@ export class ServiceState {
   }
 
   /** What an opening of a library found to tell once, by the handle it opened (taken up by `adopt`). */
-  private readonly openingNotes = new WeakMap<Library, { kind: string; detail: string }>();
+  private readonly openingNotes = new WeakMap<Library, OpeningNote>();
   /** The finishing of an unfinished move under way, by folder: a second opening of the same folder waits for it. */
-  private readonly finishing = new Map<string, Promise<{ kind: string; detail: string } | undefined>>();
+  private readonly finishing = new Map<string, Promise<OpeningNote | undefined>>();
 
   /** `note` is shown with the library opened as `lib`, for that session only (FR-755). */
-  noteOpening(lib: Library, note: { kind: string; detail: string }): void {
+  noteOpening(lib: Library, note: OpeningNote): void {
     this.openingNotes.set(lib, note);
   }
 
@@ -369,7 +389,7 @@ export class ServiceState {
    * why; nothing when there was no such move. Never throws: a failed finishing leaves the folder to open read-only as
    * before. Two openings of one folder at once share one finishing; the second has nothing more to tell.
    */
-  async finishUnfinishedMove(root: string): Promise<{ kind: string; detail: string } | undefined> {
+  async finishUnfinishedMove(root: string): Promise<OpeningNote | undefined> {
     // By what the folder is (R583 M1): an opening through a link and one by the real path share the finishing.
     const key = await realpath(root).catch(() => resolvePath(root));
     const running = this.finishing.get(key);
@@ -386,7 +406,7 @@ export class ServiceState {
         return { kind: MOVE_FINISHED_AT_OPENING, detail: "" };
       } catch (err) {
         this.opts.log.warn({ err: this.describe(err) }, "an unfinished move could not be finished at the library's new place");
-        return { kind: notFinishedKind(err), detail: this.describe(err) };
+        return notFinishedNote(err, this.describe(err));
       }
     })();
     this.finishing.set(key, run);
@@ -1889,7 +1909,7 @@ export class ServiceState {
   integrityWarnings(
     s: Session,
     names = new Map(s.repo.listProjects().map((p) => [p.id, p.name])),
-  ): Array<{ projectId: string; project: string; kind: string; detail: string; state?: IncompleteRollback; keptId?: string }> {
+  ): Array<{ projectId: string; project: string; kind: string; detail: string; state?: IncompleteRollback; keptId?: string; count?: number; place?: string }> {
     return [
       ...s.repo.integrityWarnings.map((w) => ({
         projectId: w.projectId,
@@ -1901,7 +1921,15 @@ export class ServiceState {
         // FR-729: kept with the library until dismissed (POST /libraries/recovery-warnings/:id/dismiss).
         ...(w.keptId ? { keptId: w.keptId } : {}),
       })),
-      ...(s.sessionWarnings ?? []).map((w) => ({ projectId: "*", project: "library", kind: w.kind, detail: scrubPaths(w.detail, this.roots) })),
+      ...(s.sessionWarnings ?? []).map((w) => ({
+        projectId: "*",
+        project: "library",
+        kind: w.kind,
+        detail: scrubPaths(w.detail, this.roots),
+        ...(w.count !== undefined ? { count: w.count } : {}),
+        // The old copy's place, for its sentence on the screen (R583 M5): the researcher's own path, shown as theirs.
+        ...(w.place !== undefined ? { place: w.place } : {}),
+      })),
     ];
   }
 

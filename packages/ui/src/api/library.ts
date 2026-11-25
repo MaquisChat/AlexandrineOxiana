@@ -119,6 +119,10 @@ export interface IntegrityWarning {
   state?: IncompleteRollback;
   /** FR-729: kept with the library until dismissed: its id there. */
   keptId?: string;
+  /** R583 M5: for the opening's words about an unfinished move: how many files no longer match. */
+  count?: number;
+  /** R583: the old copy's place (the researcher's own path), for those words. */
+  place?: string;
 }
 
 /** The `library.state` event (LibraryState.libraryState in the service). */
