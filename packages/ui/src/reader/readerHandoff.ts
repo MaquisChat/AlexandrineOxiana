@@ -12,6 +12,7 @@
  * is lost (it fails closed: words are never kept unwatched). A search in an encrypted project
  * therefore leaves nothing behind.
  */
+import { STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type EventsOptions } from "../api/client";
 
 /** How long handed-over words wait for the reader. */
 export const FIND_TTL_MS = 60_000;
@@ -94,9 +95,10 @@ export function takePendingFind(projectId: string, sourceId: string): string | u
 /**
  * Watches the service's events for as long as words wait; `events` is the client's stream. Any
  * `library.state` after the first, and the loss of the stream, drop the words. Does nothing when no
- * words wait.
+ * words wait. R641 D1 (ruled (a)): a watch not open within STREAM_OPEN_TIMEOUT_MS, or silent (not even the service's
+ * keep-alive) for STREAM_QUIET_TIMEOUT_MS, is lost like any other: the words are dropped and nothing is opened again.
  */
-export function guardPendingFind(events: (opts: { signal?: AbortSignal }) => AsyncIterable<{ type: string }>): void {
+export function guardPendingFind(events: (opts: EventsOptions) => AsyncIterable<{ type: string }>): void {
   if (!pending) return;
   stopWatching();
   const mine = pending;
@@ -105,7 +107,7 @@ export function guardPendingFind(events: (opts: { signal?: AbortSignal }) => Asy
   void (async () => {
     let first = true;
     try {
-      for await (const e of events({ signal: ac.signal })) {
+      for await (const e of events({ signal: ac.signal, openWithinMs: STREAM_OPEN_TIMEOUT_MS, quietWithinMs: STREAM_QUIET_TIMEOUT_MS })) {
         if (ac.signal.aborted) return;
         if (e.type !== "library.state") continue;
         if (first) {
