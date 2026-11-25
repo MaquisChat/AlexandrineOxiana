@@ -939,7 +939,7 @@ A short part. Build request 15 holds two safety mends that the review of the sto
 - **Tested together on my side:** every step passed at the first run (11,864 tests, 228 of 228 browser scenarios, the desktop scenarios, the app started and quit).
 - **Pushed as build request 15** at 10:21 am Central on 25 November.
 - **GitHub's own check is green** on exactly this code: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45652933197 (green at 11:34 am Central).
-- **It is in `main`.** At 10:17 am Central you wrote "merge build 15 to main when the check is green"; I merged exactly build request 15 at 11:37 am Central.
+- **It is in `main`.** At 10:17 am Central you wrote "merge build 15 to main when the check is green"; I merged exactly build request 15 at 11:37 am Central. `main`'s own check passed too, at 12:49 pm: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45666793004
 - **No Mac build yet, of build 14 or of build 15.** GitHub gives this project no Mac during the US working day and gives one at once in the evening; I ask again at 6:30 pm Central. The build made then will be build 15, which contains all of build 14. Until then Mac build 13 is the build to use.
 
 ### What it mends
