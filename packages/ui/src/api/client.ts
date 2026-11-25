@@ -99,9 +99,10 @@ export interface ApiClient {
    * (status 502, INTERNAL) and never handed on. The service's own refusals (404, 413, 423…) are
    * thrown as they are; a 416 (no body) as VALIDATION with the file's length as `reason`. An answer
    * whose signal was aborted meanwhile is never returned (AbortError). Same path rules as
-   * request(); bad arguments throw before anything is sent.
+   * request(); bad arguments throw before anything is sent. `onAnswer` (FR-756) is called once the service's answer has
+   * begun (its headers arrived), before its body is read.
    */
-  byteRange(path: string, start: number, end: number, opts?: { signal?: AbortSignal }): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
+  byteRange(path: string, start: number, end: number, opts?: { signal?: AbortSignal; onAnswer?: () => void }): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }>;
 }
 
 /** The options of `events()`. */
@@ -523,7 +524,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     })();
   }
 
-  async function byteRange(path: string, start: number, end: number, o: { signal?: AbortSignal } = {}): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }> {
+  async function byteRange(path: string, start: number, end: number, o: { signal?: AbortSignal; onAnswer?: () => void } = {}): Promise<{ bytes: Uint8Array; start: number; end: number; total: number }> {
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
       throw new Error("A byte range needs whole numbers with 0 ≤ start ≤ end.");
     }
@@ -538,6 +539,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       if (o.signal?.aborted) throw err;
       throw unreachable();
     }
+    o.onAnswer?.();
     if (res.status === 416) {
       // No error body: said in plain words, with the file's length (`bytes */<total>`) as the reason.
       res.body?.cancel().catch(() => {});

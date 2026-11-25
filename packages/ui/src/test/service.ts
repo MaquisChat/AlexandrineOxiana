@@ -109,6 +109,36 @@ export function hang(): Promise<void> {
 
 export const serviceError = (status: number, code: string, message: string) => HttpResponse.json({ error: { code, message } }, { status });
 
+/** FR-756 (R605 M11): the sentence `asksInTurn`'s "refuse" answers with (a failure with the service's own words). */
+export const REFUSED_READ = "The service refused this read.";
+
+/**
+ * FR-756 (R605 M11): a GET handler whose asks, in turn, are: "late" (held until `release()`, then answered), "hold"
+ * (never settled), "refuse" (a failure with the service's own words, `REFUSED_READ`) or "answer". An answer is
+ * `answer()`, or, when that gives undefined, whatever the next handler for the path answers. The last step repeats.
+ * Each ask's request signal is kept (a request given up or replaced is cancelled).
+ */
+export function asksInTurn(path: string, steps: Array<"late" | "hold" | "refuse" | "answer">, answer: () => Response | undefined = () => undefined) {
+  let n = 0;
+  const signals: AbortSignal[] = [];
+  const gate = hang();
+  let release!: () => void;
+  const released = new Promise<void>((r) => (release = r));
+  return {
+    handler: http.get(path, async ({ request }) => {
+      signals.push(request.signal);
+      const step = steps[Math.min(n++, steps.length - 1)];
+      if (step === "hold") await gate;
+      if (step === "late") await Promise.race([gate, released]);
+      if (step === "refuse") return serviceError(500, "INTERNAL", REFUSED_READ);
+      return answer();
+    }),
+    signals,
+    count: () => n,
+    release: () => release(),
+  };
+}
+
 // ---- fixtures -------------------------------------------------------------------------------
 
 export const LIBRARIES = {

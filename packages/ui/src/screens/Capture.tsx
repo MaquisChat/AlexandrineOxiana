@@ -21,7 +21,8 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { CAPTURE_RULES_UNREADABLE_TEXT, CAPTURE_RUNNING, CAPTURE_STOPPING } from "@ao/shared";
-import { ApiClientError, type ApiClient } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, oneNoAnswerSentence, readWithin } from "../api/firstRead";
 import {
   applyProgress,
   BROWSERS,
@@ -54,6 +55,7 @@ import {
 import { isValidId } from "../api/import";
 import { errorText } from "../api/library";
 import { CaptureQueue } from "../components/CaptureQueue";
+import { PageReads, usePageHost, usePageRead } from "../components/PageReads";
 import { modelOptionLabel, SpeechModelNotice, ToolsLink, useSpeechModels } from "../components/MissingToolNotice";
 import { DEFAULT_SPEECH_MODEL, toolsApi } from "../api/tools";
 import { useTrap } from "../components/ReasonDialog";
@@ -310,9 +312,16 @@ function FieldError({ id, error }: { id: string; error: string | null }) {
 export interface CaptureProps {
   client: ApiClient;
   projectId: string;
+  /** FR-756: how long each first read (the project, its rules) is waited for. */
+  firstReadMs?: number;
+  /** FR-756 (R597): how long the event stream is waited for to open before it is closed and tried afresh. */
+  streamOpenMs?: number;
 }
 
-export function Capture({ client, projectId }: CaptureProps) {
+/** FR-756: the first reads that "Try again" (and a new opening of the event stream) can make again. */
+type FirstRead = "project" | "policy";
+
+export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: CaptureProps) {
   const api = useMemo(() => captureApi(client), [client]);
   const installedModels = useSpeechModels(useMemo(() => toolsApi(client), [client]));
   const id = useId();
@@ -323,6 +332,18 @@ export function Capture({ client, projectId }: CaptureProps) {
   const [policy, setPolicy] = useState<CapturePolicy | undefined>();
   const [loadError, setLoadError] = useState<string | null>(null);
   const [acknowledged, setAcknowledged] = useState(false);
+  /**
+   * FR-756: the first reads that got no answer (none in time, or the service could not be reached), each with the
+   * error's own sentence — "did not answer in time" or "could not be reached", never both run together (R586 M5).
+   */
+  const [unanswered, setUnanswered] = useState<Partial<Record<FirstRead, string>>>({});
+  const unansweredRef = useRef(unanswered);
+  unansweredRef.current = unanswered;
+  /** The first reads now in the air (one may never settle). */
+  const out = useRef(new Set<FirstRead>());
+  /** Bumped to make one first read again ("Try again", or a new opening of the stream). */
+  const [tries, setTries] = useState<Record<FirstRead, number>>({ project: 0, policy: 0 });
+  const headingRef = useRef<HTMLHeadingElement>(null);
 
   // Links.
   const [text, setText] = useState("");
@@ -399,26 +420,84 @@ export function Capture({ client, projectId }: CaptureProps) {
     };
   }, []);
 
+  // The project; given up after `firstReadMs` as a read that got no answer (FR-756).
   useEffect(() => {
-    api.projects().then(
+    const ac = new AbortController();
+    out.current.add("project");
+    readWithin((signal) => api.projects({ signal }), firstReadMs, ac.signal).then(
       (list) => {
+        if (ac.signal.aborted) return;
+        out.current.delete("project");
         if (!live.current) return;
+        // R602 (a): an answered read takes away its earlier give-up sentence.
+        setUnanswered(({ project: _p, ...u }) => u);
         const p = list.find((x) => x.id === projectId) ?? null;
         setProject(p);
         setAcknowledged(!!p?.acknowledgements?.includes("cookies"));
       },
-      (err: unknown) => live.current && setLoadError(plainError(err, "The project could not be read.")),
-    );
-    api.policy(projectId).then(
-      (p) => live.current && setPolicy(p),
       (err: unknown) => {
+        if (ac.signal.aborted) return;
+        out.current.delete("project");
+        if (!live.current) return;
+        if (isUnreachable(err)) setUnanswered((u) => ({ ...u, project: (err as ApiClientError).message }));
+        else {
+          setUnanswered(({ project: _p, ...u }) => u);
+          setLoadError(plainError(err, "The project could not be read."));
+        }
+      },
+    );
+    return () => {
+      ac.abort();
+      out.current.delete("project");
+    };
+  }, [api, projectId, firstReadMs, tries.project]);
+  // Its rules, likewise.
+  useEffect(() => {
+    const ac = new AbortController();
+    out.current.add("policy");
+    readWithin((signal) => api.policy(projectId, { signal }), firstReadMs, ac.signal).then(
+      (p) => {
+        if (ac.signal.aborted) return;
+        out.current.delete("policy");
+        if (!live.current) return;
+        setUnanswered(({ policy: _p, ...u }) => u);
+        setPolicy(p);
+      },
+      (err: unknown) => {
+        if (ac.signal.aborted) return;
+        out.current.delete("policy");
         if (!live.current) return;
         // Unreadable rules are read strictly (the service then refuses everything anyway).
         setPolicy({ legalBasisRequired: true, defaultLegalBasis: undefined, downloaderAllowed: false, readable: false });
-        setLoadError(plainError(err, "This project's rules could not be read."));
+        if (isUnreachable(err)) setUnanswered((u) => ({ ...u, policy: (err as ApiClientError).message }));
+        else {
+          setUnanswered(({ policy: _p, ...u }) => u);
+          setLoadError(plainError(err, "This project's rules could not be read."));
+        }
       },
     );
-  }, [api, projectId]);
+    return () => {
+      ac.abort();
+      out.current.delete("policy");
+    };
+  }, [api, projectId, firstReadMs, tries.policy]);
+
+  /**
+   * FR-756: makes again each first read that got no answer, and (`stillOut`) each still in the air — after the event
+   * stream was lost, one may never settle. Meanwhile its words go and the rules are unknown again (the loading words).
+   */
+  const readAgain = useCallback((stillOut: boolean) => {
+    const again = new Set<FirstRead>([...(Object.keys(unansweredRef.current) as FirstRead[]), ...(stillOut ? out.current : [])]);
+    if (!again.size) return;
+    if (again.has("policy") && unansweredRef.current.policy !== undefined) setPolicy(undefined);
+    setUnanswered((u) => Object.fromEntries(Object.entries(u).filter(([r]) => !again.has(r as FirstRead))));
+    setTries((t) => ({ project: t.project + (again.has("project") ? 1 : 0), policy: t.policy + (again.has("policy") ? 1 : 0) }));
+  }, []);
+  /** FR-756, R602 M1: one sentence for the first reads that got no answer ("could not be reached" wins). */
+  const noAnswer = oneNoAnswerSentence(Object.values(unanswered));
+  // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects); "Try again" makes
+  // again every first read unanswered or still out.
+  const { yields, retryAll } = usePageRead("capture", { sentence: noAnswer, out: () => out.current.size > 0, retry: () => readAgain(true) });
 
   /** A LEGAL_BASIS_REQUIRED refusal of a queue this screen started opens the legal-basis field (review M7). */
   const noteRefusal = (e: CaptureProgress) => {
@@ -526,7 +605,11 @@ export function Capture({ client, projectId }: CaptureProps) {
     let stop = false;
     (async () => {
       let tries = 0;
+      let attempts = 0;
       while (!stop) {
+        // FR-756: at an opening after a try that failed, dropped or did not open in time, the first reads still out or
+        // unanswered are made again, without waiting for an event.
+        const again = attempts++ > 0;
         try {
           const onOpen = () => {
             connected.current = true;
@@ -535,14 +618,16 @@ export function Capture({ client, projectId }: CaptureProps) {
             if (live.current) setLost(false);
             // Read the queues now: with the stream open, nothing published from here on is missed.
             void readQueues();
+            if (again && live.current) readAgain(true);
           };
-          for await (const ev of client.events({ signal: ctl.signal, onOpen })) {
+          // FR-756 (R597): a stream not opened within `streamOpenMs` is closed and tried afresh below.
+          for await (const ev of client.events({ signal: ctl.signal, onOpen, openWithinMs: streamOpenMs })) {
             if (stop) return;
             const e = captureProgress(ev, projectId);
             if (e) onProgress(e);
           }
         } catch {
-          // ended or failed: try again below
+          // ended, failed, or did not open in time (FR-756): try again below
         }
         if (stop || ctl.signal.aborted) return;
         // The stream ended: whatever is published until it is back is missed by every running queue.
@@ -563,7 +648,7 @@ export function Capture({ client, projectId }: CaptureProps) {
       conn.current++;
       ctl.abort();
     };
-  }, [client, projectId, onProgress, readQueues, attempt]);
+  }, [client, projectId, onProgress, readQueues, attempt, streamOpenMs, readAgain]);
 
   /** A queue the service has started: its early events are applied now. */
   const addQueue = (q: CaptureQueueState) => {
@@ -748,7 +833,9 @@ export function Capture({ client, projectId }: CaptureProps) {
 
   return (
     <main className="ao-page ao-capture" aria-labelledby={`${id}-title`}>
-      <h1 id={`${id}-title`}>Capture</h1>
+      <h1 id={`${id}-title`} ref={headingRef} tabIndex={-1}>
+        Capture
+      </h1>
       {project && (
         <p>
           Project: <UserText>{project.name}</UserText>
@@ -758,6 +845,25 @@ export function Capture({ client, projectId }: CaptureProps) {
       {loadError && (
         <p className="ao-capture__error" role="alert">
           {loadError}
+        </p>
+      )}
+      {noAnswer !== undefined && !yields && (
+        <p className="ao-capture__error" role="alert">
+          {noAnswer}
+        </p>
+      )}
+      {noAnswer !== undefined && !yields && (
+        <p>
+          <button
+            type="button"
+            onClick={() => {
+              // The button goes while the reads are made again: focus waits on the heading, never the page.
+              headingRef.current?.focus();
+              retryAll();
+            }}
+          >
+            Try again
+          </button>
         </p>
       )}
       {project === null && (
@@ -781,7 +887,7 @@ export function Capture({ client, projectId }: CaptureProps) {
         {cutByLock > 0 && cutAckError && <p role="alert">{cutAckError}</p>}
       </div>
       {/* Rules the engine cannot read: every capture is refused; say why (R379 FR-A18). A failed read is said above. */}
-      {policy && !policy.readable && !loadError && <p className="ao-capture__note">{CAPTURE_RULES_UNREADABLE_TEXT}</p>}
+      {policy && !policy.readable && !loadError && !unanswered.policy && <p className="ao-capture__note">{CAPTURE_RULES_UNREADABLE_TEXT}</p>}
       {policy?.readable && !policy.downloaderAllowed && (
         <p className="ao-capture__note">
           This project&apos;s rules do not allow capture with the downloader, so links will be refused. Whoever manages the project&apos;s rules can allow it under Governance.
@@ -795,6 +901,9 @@ export function Capture({ client, projectId }: CaptureProps) {
             onClick={() => {
               setLost(false);
               setAttempt((n) => n + 1);
+              // R605 M7: the first reads still out (or unanswered) are made again too, not only at the stream's opening;
+              // on the route, its list of projects too (the page's reads, R605 I2).
+              retryAll();
             }}
           >
             Reconnect
@@ -1056,27 +1165,58 @@ export function Capture({ client, projectId }: CaptureProps) {
 // ---------------------------------------------------------------------------------------------
 // The route: the project named in the address (`?project=<id>`), else the first one
 
-export function CaptureRoute({ client, loc }: { client: ApiClient; loc: AppLocation }) {
+/** `firstReadMs` (FR-756): how long the list of projects, and the screen's own first reads, are waited for. */
+export function CaptureRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number }) {
   const api = useMemo(() => captureApi(client), [client]);
   const id = useId();
   const path = normalisePath(loc.pathname);
   const asked = new URLSearchParams(loc.search).get("project") ?? "";
   const [projects, setProjects] = useState<CaptureProject[] | undefined>();
   const [error, setError] = useState<string | null>(null);
+  /** FR-756: the list got no answer (none in time, or the service could not be reached): "Try again" is offered. */
+  const [unanswered, setUnanswered] = useState(false);
+  const [tries, setTries] = useState(0);
+  const pickerRef = useRef<HTMLSelectElement>(null);
+  /** The list's read is in the air (it may never settle). */
+  const listOut = useRef(false);
   useEffect(() => {
     let live = true;
-    api.projects().then(
-      (list) => live && setProjects(list),
+    const ac = new AbortController();
+    listOut.current = true;
+    readWithin((signal) => api.projects({ signal }), firstReadMs, ac.signal).then(
+      (list) => {
+        if (!live) return;
+        listOut.current = false;
+        setProjects(list);
+      },
       (err: unknown) => {
         if (!live) return;
-        setProjects([]);
-        setError(plainError(err, "The projects could not be read."));
+        listOut.current = false;
+        // R605 I1: a list not read (given up at the limit, or failed) is never taken for an empty one: the project named
+        // in the address stays shown (its working Capture screen, links being typed are not lost), and nothing says it
+        // is not one of the library's projects.
+        // A read with no answer says only its own sentence (never "could not be reached" and "did not answer" together).
+        setUnanswered(isUnreachable(err));
+        setError(isUnreachable(err) ? (err as ApiClientError).message : plainError(err, "The projects could not be read."));
       },
     );
     return () => {
       live = false;
+      listOut.current = false;
+      ac.abort();
     };
-  }, [api]);
+  }, [api, firstReadMs, tries]);
+  // R605 I2: the list and the Capture screen's own first reads are one page: one sentence and one "Try again".
+  const { page, sentence: pageSentence, retryAll } = usePageHost({
+    sentence: error !== null && unanswered ? error : undefined,
+    out: () => listOut.current,
+    retry: () => {
+      setError(null);
+      setUnanswered(false);
+      setProjects(undefined);
+      setTries((n) => n + 1);
+    },
+  });
   const list = projects ?? [];
   // A name that is not one of the library's selects none (never another project's screen).
   const unknown = !!asked && (!isValidId(asked) || (!!projects && !list.some((p) => p.id === asked)));
@@ -1085,7 +1225,7 @@ export function CaptureRoute({ client, loc }: { client: ApiClient; loc: AppLocat
     <>
       <nav className="ao-capture__picker" aria-label="Capture project">
         <label htmlFor={`${id}-project`}>Project</label>
-        <select id={`${id}-project`} value={projectId} onChange={(e) => e.target.value && navigate(`${path}?project=${encodeURIComponent(e.target.value)}`)}>
+        <select id={`${id}-project`} ref={pickerRef} value={projectId} onChange={(e) => e.target.value && navigate(`${path}?project=${encodeURIComponent(e.target.value)}`)}>
           {!projectId && <option value="">Choose a project</option>}
           {list.map((p) => (
             <option key={p.id} value={p.id} dir="auto">
@@ -1094,9 +1234,23 @@ export function CaptureRoute({ client, loc }: { client: ApiClient; loc: AppLocat
           ))}
         </select>
       </nav>
-      {error && (
+      {(pageSentence ?? error) && (
         <p className="ao-capture__error" role="alert">
-          {error}
+          {pageSentence ?? error}
+        </p>
+      )}
+      {pageSentence !== undefined && (
+        <p>
+          <button
+            type="button"
+            onClick={() => {
+              // The button goes while the reads are made again: focus waits on the project choice, never the page.
+              pickerRef.current?.focus();
+              retryAll();
+            }}
+          >
+            Try again
+          </button>
         </p>
       )}
       {unknown && (
@@ -1104,7 +1258,7 @@ export function CaptureRoute({ client, loc }: { client: ApiClient; loc: AppLocat
           The project in this address is not one of this library&apos;s projects. Choose a project.
         </p>
       )}
-      {projectId && isValidId(projectId) && <Capture key={projectId} client={client} projectId={projectId} />}
+      <PageReads value={page}>{projectId && isValidId(projectId) && <Capture key={projectId} client={client} projectId={projectId} firstReadMs={firstReadMs} />}</PageReads>
     </>
   );
 }

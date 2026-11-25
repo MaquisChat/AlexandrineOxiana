@@ -2,7 +2,9 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS } from "@ao/shared";
-import { catalogue, catalogueWithoutHosts, makeApi, onComputer, server, toolsService, useMsw, withoutHostsFor } from "../test/msw-tools";
+import { http, HttpResponse } from "msw";
+import { catalogue, catalogueWithoutHosts, makeApi, onComputer, server, toolsService, url, useMsw, withoutHostsFor } from "../test/msw-tools";
+import { asksInTurn, hang, REFUSED_READ } from "../test/service";
 import { ToolsSetup } from "./ToolsSetup";
 
 useMsw();
@@ -383,5 +385,77 @@ describe("the optional tools screen", () => {
   it("brings the named tool into view and focus when the address names one", async () => {
     await shown(toolsService(), { focusTool: "ffmpeg" });
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: FFMPEG })));
+  });
+});
+
+describe("the optional tools screen: a first read that never settles (FR-756, R584, R586)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const UNREACHABLE = "The library service could not be reached.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
+
+  it("is given up at the limit: the alert (its sentence alone) and “Try again”; pressed, it reads again, the loading words meanwhile, and the tools are shown with focus kept", async () => {
+    const svc = toolsService();
+    svc.state.gates.push({ wait: hang() }, { wait: hang() });
+    server.use(...svc.handlers);
+    render(<ToolsSetup api={makeApi()} pollMs={20} firstReadMs={300} />);
+    expect(screen.getByText("Reading the list of tools…")).toBeTruthy();
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([`${NO_ANSWER}Try again`]);
+    expect(screen.queryByText("Reading the list of tools…")).toBeNull();
+    await userEvent.setup().click(tryAgain()!);
+    expect(screen.getByText("Reading the list of tools…")).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Optional tools" }));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("region", { name: "Video downloader" });
+    expect(tryAgain()).toBeNull();
+    expect(alerts()).toEqual([]);
+    expect(svc.state.requests.filter((r) => r === "GET /tools")).toHaveLength(3);
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Optional tools" }));
+  });
+
+  it("a read that FAILS says what it said before, with “Try again”", async () => {
+    server.use(http.get(url("/tools"), () => HttpResponse.error()));
+    render(<ToolsSetup api={makeApi()} pollMs={20} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([`${UNREACHABLE}Try again`]);
+  });
+});
+
+describe("the optional tools screen: a late answer after “Try again”, and an answered failure after a give-up (FR-756, R605 M11)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent ?? "");
+
+  it("a late answer of the read given up, after “Try again”, changes nothing (its request was cancelled)", async () => {
+    server.use(...toolsService().handlers);
+    const asks = asksInTurn(url("/tools"), ["late", "hold"], () => undefined);
+    server.use(asks.handler);
+    render(<ToolsSetup api={makeApi()} pollMs={20} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(asks.signals[0]!.aborted).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    asks.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(screen.queryByRole("region", { name: "Video downloader" })).toBeNull();
+    expect(screen.queryByText("Reading the list of tools…")).toBeTruthy();
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
+  });
+
+  it("an answered failure after a give-up takes the give-up's sentence away (rule ii)", async () => {
+    server.use(...toolsService().handlers);
+    const asks = asksInTurn(url("/tools"), ["hold", "refuse"]);
+    server.use(asks.handler);
+    render(<ToolsSetup api={makeApi()} pollMs={20} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(asks.count()).toBe(2));
+    await waitFor(() => expect(alerts().length).toBeGreaterThan(0));
+    // The tools screen offers "Try again" on any failed read (as before FR-756).
+    expect(alerts().some((a) => a.includes(REFUSED_READ))).toBe(true);
+    expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
   });
 });

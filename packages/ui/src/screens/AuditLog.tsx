@@ -11,7 +11,11 @@
  */
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import type { AttentionMarkView, AuditCheck, AuditEvent, AuditPage, GovernanceApi, LibraryAuditPage } from "../api/governance";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { DialogShell } from "../components/ReasonDialog";
+import { useLatestRead } from "../components/leaveSignals";
+import { usePageRead } from "../components/PageReads";
+import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import "./GovernanceScreens.css";
 
@@ -449,26 +453,54 @@ function LibraryAudit({ api }: { api: GovernanceApi }) {
   );
 }
 
-export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceApi; projectId: string; pageSize?: number }) {
+/** `firstReadMs` (FR-756, R579): how long a page of the log is waited for before the read is given up (smaller in tests). */
+export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_READ_TIMEOUT_MS }: { api: GovernanceApi; projectId: string; pageSize?: number; firstReadMs?: number }) {
   const [cursors, setCursors] = useState<Array<number | undefined>>([undefined]);
   const [page, setPage] = useState<AuditPage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [check, setCheck] = useState<AuditCheck | null>(null);
   const [checking, setChecking] = useState(false);
+  /**
+   * FR-756: the log's last read got no answer (none in time, or the service could not be reached): its sentence, with
+   * "Try again". Kept apart from `error` (R605 M5): a re-read after an act, given up, never replaces the screen's message.
+   */
+  const [unanswered, setUnanswered] = useState<string | null>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const before = cursors[cursors.length - 1];
   const ids = useId();
 
+  /** R605 M3: one read at a time (a newer one replaces it), cancelled when the screen is left. */
+  const reads = useLatestRead();
   const load = useCallback(async () => {
+    const outer = reads.begin();
     try {
-      setPage(await api.audit(projectId, { limit: pageSize, ...(before !== undefined ? { before } : {}) }));
+      // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
+      const p = await readWithin((signal) => api.audit(projectId, { limit: pageSize, ...(before !== undefined ? { before } : {}), signal }), firstReadMs, outer);
+      if (!reads.settled(outer)) return;
+      setPage(p);
       setError(null);
+      setUnanswered(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "The audit log could not be read.");
+      if (!reads.settled(outer)) return;
+      if (isUnreachable(err)) setUnanswered((err as Error).message);
+      else {
+        setUnanswered(null);
+        setError(err instanceof Error ? err.message : "The audit log could not be read.");
+      }
     }
-  }, [api, projectId, pageSize, before]);
+  }, [api, projectId, pageSize, before, firstReadMs, reads]);
   useEffect(() => {
     void load();
   }, [load]);
+  // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects).
+  const { yields, retryAll } = usePageRead("audit", {
+    sentence: unanswered ?? undefined,
+    out: reads.out,
+    retry: () => {
+      setUnanswered(null);
+      void load();
+    },
+  });
 
   const verify = async () => {
     setChecking(true);
@@ -486,7 +518,9 @@ export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceAp
   const oldest = events[events.length - 1]?.seq;
   return (
     <main className="ao-screen">
-      <h1>Audit log</h1>
+      <h1 ref={headingRef} tabIndex={-1}>
+        Audit log
+      </h1>
       <div className="ao-actions">
         <button type="button" onClick={() => void verify()} disabled={checking}>
           Verify integrity
@@ -504,6 +538,12 @@ export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceAp
           {error}
         </p>
       ) : null}
+      {unanswered && !yields ? (
+        <p role="alert" className="ao-warning">
+          {unanswered}
+        </p>
+      ) : null}
+      {unanswered && !yields && <TryAgain focusTo={headingRef} onPress={retryAll} />}
       <NeedsAttention api={api} projectId={projectId} onChanged={() => void load()} />
       {page ? (
         <>

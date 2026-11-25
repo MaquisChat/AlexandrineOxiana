@@ -22,8 +22,10 @@
 import type { ToolAction, ToolId, ToolInfo, ToolJob } from "@ao/shared";
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
 import { DEFAULT_SPEECH_MODEL, describeHosts, formatSize, hostsOf, PUBLISHER_SERVERS, remainingOf, speechSize, toolsApi, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
 import { recordToolsScreenSeen, type FirstUseMemory } from "../components/FirstUseTools";
+import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import type { AppLocation } from "../navigation";
 import "./GovernanceScreens.css";
@@ -83,10 +85,12 @@ export function ToolsSetupRoute({ client, loc, memory }: { client: ApiClient; lo
   return <ToolsSetup api={api} {...(focusTool ? { focusTool } : {})} />;
 }
 
-export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; pollMs?: number; focusTool?: string }) {
+/** `firstReadMs` (FR-756, R579): how long a reading of the catalogue is waited for before it is given up (smaller in tests). */
+export function ToolsSetup({ api, pollMs = 1000, focusTool, firstReadMs = FIRST_READ_TIMEOUT_MS }: { api: ToolsApi; pollMs?: number; focusTool?: string; firstReadMs?: number }) {
   const ids = useId();
   const [tools, setTools] = useState<ToolInfo[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const [reqErrors, setReqErrors] = useState<Partial<Record<ToolId, RequestError>>>({});
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
   /** Tools whose job was just stopped, while the catalogue is read again. */
@@ -126,17 +130,19 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
     const my = ++loadSeq.current;
     const ac = controller();
     try {
-      const r = await api.catalogue(ac.signal);
+      // FR-756: a reading that never settles is given up after `firstReadMs` (its request cancelled).
+      const r = await readWithin((signal) => api.catalogue(signal), firstReadMs, ac.signal);
       if (!alive.current || my !== loadSeq.current) return;
       setTools(Array.isArray(r.tools) ? r.tools : []);
       setLoadError(null);
     } catch (err) {
       if (!alive.current || my !== loadSeq.current) return;
-      setLoadError(toolsErrorText(err, "The list of optional tools could not be read."));
+      // Given up at the limit: its own sentence alone, not run together with "could not be reached" (R586 M5).
+      setLoadError(isNoAnswerInTime(err) ? (err as Error).message : toolsErrorText(err, "The list of optional tools could not be read."));
     } finally {
       release(ac);
     }
-  }, [api]);
+  }, [api, firstReadMs]);
 
   useEffect(() => {
     void load();
@@ -505,7 +511,9 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
 
   return (
     <main className="ao-screen ao-tools">
-      <h1>Optional tools</h1>
+      <h1 ref={headingRef} tabIndex={-1}>
+        Optional tools
+      </h1>
       <p>The app does not include these tools, so that its own download stays small. Install only the ones you need; you can remove them again here.</p>
       <p>
         {/* The servers that host a tool are not always its publisher's (a speech model is hosted by a third party) (FR-291). */}
@@ -528,9 +536,14 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
       {loadError ? (
         <div role="alert" className="ao-warning">
           <UserText as="p">{loadError}</UserText>
-          <button type="button" onClick={() => void load()}>
-            Try again
-          </button>
+          {/* FR-756: pressed, the list is read again with the loading words meanwhile; focus goes to the heading. */}
+          <TryAgain
+            focusTo={headingRef}
+            onPress={() => {
+              setLoadError(null);
+              void load();
+            }}
+          />
         </div>
       ) : null}
       {tools === null && !loadError ? <p className="ao-hint">Reading the list of tools…</p> : null}

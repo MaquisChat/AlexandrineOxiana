@@ -3,33 +3,47 @@
  * the person named on certificates of destroyed raw data. Stored in this device's app settings by
  * the service (GET/PUT /settings/researcher); empty means "use this computer's user name".
  */
-import { useEffect, useId, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
+import { TryAgain } from "../components/TryAgain";
 import "../components/library.css";
 
-export function ResearcherNameSetting({ client }: { client: ApiClient }) {
+/** `firstReadMs` (FR-756, R579): how long the stored name is waited for before the read is given up (smaller in tests). */
+export function ResearcherNameSetting({ client, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; firstReadMs?: number }) {
   const id = useId();
   const [name, setName] = useState("");
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** FR-756: the name's read was given up or failed: "Try again" reads it again (`readTry` moves on with it). */
+  const [readFailed, setReadFailed] = useState(false);
+  const [readTry, setReadTry] = useState(0);
+  const headingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
     let live = true;
-    client.request<{ name: string | null }>("GET", "/settings/researcher").then(
+    const ac = new AbortController();
+    // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
+    readWithin((signal) => client.request<{ name: string | null }>("GET", "/settings/researcher", { signal }), firstReadMs, ac.signal).then(
       (r) => {
         if (!live) return;
         setName(r.name ?? "");
         setLoaded(true);
       },
       // Not read: the form stays off, or saving would clear a name that was never shown (41b2 M9).
-      () => live && setError("Your name as researcher could not be read, so it cannot be changed here now. Nothing was changed."),
+      (err: unknown) => {
+        if (!live) return;
+        setReadFailed(true);
+        setError(isNoAnswerInTime(err) ? (err as Error).message : "Your name as researcher could not be read, so it cannot be changed here now. Nothing was changed.");
+      },
     );
     return () => {
       live = false;
+      ac.abort();
     };
-  }, [client]);
+  }, [client, firstReadMs, readTry]);
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
@@ -49,7 +63,9 @@ export function ResearcherNameSetting({ client }: { client: ApiClient }) {
 
   return (
     <section aria-labelledby={`${id}-h`} className="ao-page">
-      <h2 id={`${id}-h`}>Researcher name</h2>
+      <h2 id={`${id}-h`} ref={headingRef} tabIndex={-1}>
+        Researcher name
+      </h2>
       <form onSubmit={(e) => void save(e)} className="ao-inline-form">
         <label htmlFor={`${id}-name`}>Your name as researcher</label>
         <input id={`${id}-name`} type="text" dir="auto" maxLength={200} disabled={!loaded} value={name} aria-describedby={`${id}-hint`} onChange={(e) => setName(e.target.value)} />
@@ -65,6 +81,16 @@ export function ResearcherNameSetting({ client }: { client: ApiClient }) {
         <p role="alert" className="ao-error">
           {error}
         </p>
+      )}
+      {error && readFailed && !loaded && (
+        <TryAgain
+          focusTo={headingRef}
+          onPress={() => {
+            setError(null);
+            setReadFailed(false);
+            setReadTry((n) => n + 1);
+          }}
+        />
       )}
     </section>
   );

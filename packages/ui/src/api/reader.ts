@@ -27,7 +27,8 @@ export interface DocumentRange {
 }
 
 export interface ReaderApi {
-  documentRange(projectId: string, sourceId: string, assetId: string, start: number, end: number, signal?: AbortSignal): Promise<DocumentRange>;
+  /** `onAnswer` (FR-756): called once the service's answer has begun, before its bytes are read. */
+  documentRange(projectId: string, sourceId: string, assetId: string, start: number, end: number, signal?: AbortSignal, onAnswer?: () => void): Promise<DocumentRange>;
   /** The source's annotations; `signal` aborts the request (R8: when the document ends). */
   listAnnotations(projectId: string, sourceId: string, signal?: AbortSignal): Promise<AnnotationListResponse>;
   createAnnotation(projectId: string, sourceId: string, req: AnnotationCreateRequest): Promise<AnnotationRecord>;
@@ -41,7 +42,7 @@ const src = (pid: string, sid: string) => `/projects/${seg(pid)}/sources/${seg(s
 export function readerApi(client: ApiClient): ReaderApi {
   const r = client.request;
   return {
-    documentRange: (pid, sid, aid, start, end, signal) => client.byteRange(`${src(pid, sid)}/assets/${seg(aid)}/document`, start, end, signal ? { signal } : {}),
+    documentRange: (pid, sid, aid, start, end, signal, onAnswer) => client.byteRange(`${src(pid, sid)}/assets/${seg(aid)}/document`, start, end, { ...(signal ? { signal } : {}), ...(onAnswer ? { onAnswer } : {}) }),
     listAnnotations: (pid, sid, signal) => r<AnnotationListResponse>("GET", `${src(pid, sid)}/annotations`, signal ? { signal } : {}),
     createAnnotation: (pid, sid, body) => r<AnnotationRecord>("POST", `${src(pid, sid)}/annotations`, { body }),
     updateAnnotation: (pid, sid, id, body) => r<AnnotationRecord>("PATCH", `${src(pid, sid)}/annotations/${seg(id)}`, { body }),
@@ -54,6 +55,6 @@ export function readerApi(client: ApiClient): ReaderApi {
  * `GET /projects/:id/review/:itemId/held-file/document` — what the reader reads when the researcher LOOKS at a held file
  * before deciding. Read-only: the route records nothing.
  */
-export function heldFileRanges(client: ApiClient, projectId: string, reviewId: string): (start: number, end: number, signal?: AbortSignal) => Promise<DocumentRange> {
-  return (start, end, signal) => client.byteRange(`/projects/${seg(projectId)}/review/${seg(reviewId)}/held-file/document`, start, end, signal ? { signal } : {});
+export function heldFileRanges(client: ApiClient, projectId: string, reviewId: string): (start: number, end: number, signal?: AbortSignal, onAnswer?: () => void) => Promise<DocumentRange> {
+  return (start, end, signal, onAnswer) => client.byteRange(`/projects/${seg(projectId)}/review/${seg(reviewId)}/held-file/document`, start, end, { ...(signal ? { signal } : {}), ...(onAnswer ? { onAnswer } : {}) });
 }

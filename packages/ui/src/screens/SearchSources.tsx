@@ -44,8 +44,10 @@ import {
 } from "@ao/shared";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../api/firstRead";
 import { importApi } from "../api/import";
 import { KeyField, type KeyFieldWords } from "../components/KeyField";
+import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import { inAppLink, PATHS, projectInQuery, type AppLocation } from "../navigation";
 import { governanceHref } from "../routes/governance";
@@ -117,7 +119,7 @@ type KeyId = keyof typeof SEARCH_KEY_SECRETS;
 export function searchSourcesApi(client: ApiClient) {
   const key = (k: KeyId) => `/secrets/${SEARCH_KEY_SECRETS[k]}`;
   return {
-    read: (project?: string) => client.request<SearchSourcesResponse>("GET", "/settings/search-sources", project !== undefined ? { query: { project } } : {}),
+    read: (project?: string, o: { signal?: AbortSignal } = {}) => client.request<SearchSourcesResponse>("GET", "/settings/search-sources", { ...(project !== undefined ? { query: { project } } : {}), ...o }),
     save: (body: SearchSourcesRequest) => client.request<SearchSourcesResponse>("PUT", "/settings/search-sources", { body }),
     /** No body: the service asks its own fixed question. */
     test: (group: SearchSourceGroup, id: string) => client.request<SearchSourceTestResponse>("POST", `/settings/search-sources/${group}/${encodeURIComponent(id)}/test`),
@@ -190,7 +192,8 @@ const KEY_WORDS: Record<KeyId, Partial<KeyFieldWords>> = {
 /** A key's shape as the service accepts it; the refusal is the service's own sentence. */
 const keyShape = (v: string): string | null => (isSearchApiKeyShape(v) ? null : SEARCH_SETTINGS_TEXT.keyShape);
 
-export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLocation }) {
+/** `firstReadMs` (FR-756, R579): how long a read of the settings is waited for before it is given up (smaller in tests). */
+export function SearchSources({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number }) {
   const api = useMemo(() => searchSourcesApi(client), [client]);
   const imp = useMemo(() => importApi(client), [client]);
   const projectId = projectInQuery(loc.search);
@@ -199,6 +202,9 @@ export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLoca
   const [confirmed, setConfirmed] = useState<SearchSourcesResponse | undefined>();
   const [draft, setDraftState] = useState<Draft | null>(null);
   const [loadError, setLoadError] = useState<string | undefined>();
+  /** FR-756: the settings' last read got no answer (or none in time): "Try again" is offered. */
+  const [loadUnreachable, setLoadUnreachable] = useState(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const [projectError, setProjectError] = useState<string | undefined>();
   const [projectName, setProjectName] = useState<string | undefined>();
   const [saving, setSaving] = useState(false);
@@ -244,32 +250,49 @@ export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLoca
     return true;
   }, []);
 
+  /**
+   * The project's reads: cancelled when another project is chosen (R605 M4: a give-up of the project left never shows on
+   * the one chosen) and when the screen is left (R605 M3).
+   */
+  const projectReads = useRef(new AbortController());
   /** The settings, read again; with the project's rules when the screen is opened for one. */
   const read = useCallback(
     async (withProject = true): Promise<void> => {
       const project = withProject ? projectRef.current : undefined;
       const seq = ++readSeq.current;
+      const outer = projectReads.current.signal;
       try {
-        const r = await api.read(project);
-        if (!alive.current) return;
+        // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
+        const r = await readWithin((signal) => api.read(project, { signal }), firstReadMs, outer);
+        if (!alive.current || outer.aborted) return;
         if (apply(r, seq) && project !== undefined) setProjectError(undefined);
       } catch (err) {
-        if (!alive.current) return;
-        if (project !== undefined && project === projectRef.current) {
+        if (!alive.current || outer.aborted) return;
+        // Given up at the limit (R586 M5): the service did not answer, which says nothing of the project.
+        if (project !== undefined && project === projectRef.current && !isNoAnswerInTime(err)) {
           // The project could not be read (not found, not an id, no library open): its sentence, and the settings anyway.
           setProjectError(sentenceOf(err, SEARCH_SOURCES_TEXT.loadFailed));
           void read(false);
           return;
         }
-        if (!confirmedRef.current && seq >= applied.current) setLoadError(sentenceOf(err, SEARCH_SOURCES_TEXT.loadFailed));
+        if (!confirmedRef.current && seq >= applied.current) {
+          setLoadError(sentenceOf(err, SEARCH_SOURCES_TEXT.loadFailed));
+          setLoadUnreachable(isUnreachable(err));
+        }
       }
     },
-    [api, apply],
+    [api, apply, firstReadMs],
   );
 
   useEffect(() => {
+    const ac = new AbortController();
+    projectReads.current = ac;
     setProjectError(undefined);
+    // The alert of the project left goes with it (R605 M4): the loading words while the one chosen is read.
+    setLoadError(undefined);
+    setLoadUnreachable(false);
     void read();
+    return () => ac.abort();
   }, [read, projectId]);
 
   // The project's name, for the rules' note (the settings are shown whatever happens here).
@@ -610,7 +633,7 @@ export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLoca
 
   return (
     <main ref={mainRef} className="ao-page ao-search" aria-labelledby={titleId}>
-      <h1 id={titleId} tabIndex={-1}>
+      <h1 id={titleId} ref={headingRef} tabIndex={-1}>
         Search sources
       </h1>
       <p>{SEARCH_SOURCES_TEXT.intro}</p>
@@ -622,6 +645,16 @@ export function SearchSources({ client, loc }: { client: ApiClient; loc: AppLoca
         <p role="alert" className="ao-error">
           <UserText>{loadError}</UserText>
         </p>
+      )}
+      {!confirmed && loadError && loadUnreachable && (
+        <TryAgain
+          focusTo={headingRef}
+          onPress={() => {
+            setLoadError(undefined);
+            setProjectError(undefined);
+            void read();
+          }}
+        />
       )}
       {projectError && (
         <p className="ao-error" data-testid="search-project-error">

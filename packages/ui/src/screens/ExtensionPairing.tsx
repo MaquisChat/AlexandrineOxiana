@@ -21,8 +21,10 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import { PAIRING_CODE_ID, type PairingCodeStatus } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "../api/client";
 import { extensionApi, type ExtensionApi, type PairedBrowser } from "../api/extension";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { errorText } from "../api/library";
 import { ChoiceDialog } from "../components/ReasonDialog";
+import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import "./ExtensionPairing.css";
 
@@ -99,8 +101,9 @@ const LIST_POLLS_MAX = 120;
 /**
  * `port` is the service's port (not a secret; the extension's popup asks for it). The token never reaches this screen.
  * `listPollMs` and `listPollMax` set the quiet re-reading of the list while the "port changed" notice is shown (tests shorten them).
+ * `firstReadMs` (FR-756, R579): how long a reading of the list is waited for before it is given up (smaller in tests).
  */
-export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_POLL_MS, listPollMax = LIST_POLLS_MAX }: { api: ExtensionApi; pollMs?: number; port?: number; listPollMs?: number; listPollMax?: number }) {
+export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_POLL_MS, listPollMax = LIST_POLLS_MAX, firstReadMs = FIRST_READ_TIMEOUT_MS }: { api: ExtensionApi; pollMs?: number; port?: number; listPollMs?: number; listPollMax?: number; firstReadMs?: number }) {
   const ids = useId();
   const [code, setCode] = useState<ShownCode | null>(null);
   const [remaining, setRemaining] = useState(0);
@@ -112,6 +115,8 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
   /** The service's port now, as its list answer says it (R171). */
   const [servicePort, setServicePort] = useState<number | undefined>(undefined);
   const [listError, setListError] = useState<string | null>(null);
+  /** FR-756: the list's last read got no answer (or none in time): "Try again" is offered. */
+  const [listUnreachable, setListUnreachable] = useState(false);
   const [revoking, setRevoking] = useState<PairedBrowser | null>(null);
   const [revokeBusy, setRevokeBusy] = useState(false);
   const [revokeError, setRevokeError] = useState<string | null>(null);
@@ -176,7 +181,8 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
       const my = ++listSeq.current;
       const ac = signal();
       try {
-        const answer = await api.list(ac.signal);
+        // FR-756: a reading that never settles is given up after `firstReadMs` (its request cancelled).
+        const answer = await readWithin((signal) => api.list(signal), firstReadMs, ac.signal);
         if (!alive.current || my !== listSeq.current) return undefined;
         const list = answer.extensions;
         browsersRef.current = list;
@@ -184,19 +190,24 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
         setServicePort(answer.port);
         setListUnreadable(answer.unreadable === true);
         setListError(null);
+        setListUnreachable(false);
         lastReadFailed.current = false;
         // The list was read after all: "could not be read" is no longer true; whether the browser is in it now says (R466 M3).
         setPairedMissing((m) => (m === "unread" ? "missing" : m));
         return list;
       } catch (err) {
         if (my === listSeq.current) lastReadFailed.current = true;
-        if (alive.current && my === listSeq.current && !quiet) setListError(errorText(err, "The list of paired browsers could not be read."));
+        if (alive.current && my === listSeq.current && !quiet) {
+          // No answer (or none in time): its own sentence alone, never two run together (R586 M5).
+          setListError(isUnreachable(err) ? (err as Error).message : errorText(err, "The list of paired browsers could not be read."));
+          setListUnreachable(isUnreachable(err));
+        }
         return undefined;
       } finally {
         done(ac);
       }
     },
-    [api],
+    [api, firstReadMs],
   );
 
   useEffect(() => {
@@ -629,6 +640,15 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
           <p role="alert" className="ao-warning">
             {listError}
           </p>
+        ) : null}
+        {listError && listUnreachable ? (
+          <TryAgain
+            focusTo={heading}
+            onPress={() => {
+              setListError(null);
+              void refresh();
+            }}
+          />
         ) : null}
         {listUnreadable ? (
           <div role="alert" className="ao-warning">
