@@ -545,3 +545,4 @@ R619 (2026-11-25 UTC): FR-068 strict ready (4b1496c: I-A's two sentences from on
 R620 (2026-11-25 UTC): CI run 288 green on build 13's code (403f0f8); run 289 on 2f4a00c due ~08:05 UTC; main waits for the owner's word and then receives 2f4a00c exactly
 R621 (2026-11-25 UTC): FR-756's remainder built (277b1ed; step 0: the two lines agree, 2588 tests); two of the builder's choices accepted; to a fresh adversarial review
 R622 (2026-11-25 UTC): CI run 289 on build request 13's commit failed on one test — FR-757, intermittent (the net guard: a real request to arxiv.org); the same code green in run 288; the failed job run again once; FR-757 being debugged by proof on fr-757-find-two-offers
+R623 (2026-11-25 UTC): FR-756's remainder approved with small points; five mends now (the route's one-sentence test; the panel's stale alert; the queue's side reads; the picker's old import at a switch; Zotero lines under strict mode); four leftovers listed
