@@ -349,7 +349,7 @@ const proj = (id: string) => `/projects/${seg(id)}`;
 export function libraryApi(client: ApiClient) {
   const r = client.request;
   return {
-    events: (opts: { signal?: AbortSignal } = {}): AsyncGenerator<ServiceEvent, void, undefined> => client.events(opts),
+    events: (opts: { signal?: AbortSignal; onOpen?: () => void } = {}): AsyncGenerator<ServiceEvent, void, undefined> => client.events(opts),
     /** Interrupted changes recovery could not settle, resolved by the researcher's choice (R27). */
     pendingWrites: {
       list: async () => (await r<{ pendingWrites: PendingWrite[] }>("GET", "/libraries/pending-writes")).pendingWrites,
@@ -403,7 +403,7 @@ export function libraryApi(client: ApiClient) {
       remove: (pid: string, cid: string) => r<{ deleted: true }>("DELETE", `${proj(pid)}/collections/${seg(cid)}`),
     },
     tags: {
-      list: (pid: string) => r<{ tags: Tag[]; workspaceTags: Tag[] }>("GET", `${proj(pid)}/tags`),
+      list: (pid: string, opts: { signal?: AbortSignal } = {}) => r<{ tags: Tag[]; workspaceTags: Tag[] }>("GET", `${proj(pid)}/tags`, opts.signal ? { signal: opts.signal } : {}),
       create: (pid: string, name: string, scope: "project" | "workspace" = "project") => r<Tag>("POST", `${proj(pid)}/tags`, { body: { name, scope } }),
       /** Project tags; workspace tags use renameWorkspace / removeWorkspace. */
       rename: (pid: string, tid: string, name: string) => r<Tag>("PATCH", `${proj(pid)}/tags/${seg(tid)}`, { body: { name } }),

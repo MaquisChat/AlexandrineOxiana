@@ -186,6 +186,7 @@ function LibraryFlow({ client, loc, firstReadMs }: { client: ApiClient; loc: App
           key={view.current.libraryId}
           api={api}
           current={view.current}
+          firstReadMs={firstReadMs}
           {...(view.path ? { libraryPath: view.path } : {})}
           navigate={navigate}
           firstUse={(hidden) => <FirstUseTools api={tools} hidden={hidden} />}
