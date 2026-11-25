@@ -4,7 +4,7 @@
  */
 import { http, HttpResponse, type JsonBodyType } from "msw";
 import { setupServer } from "msw/node";
-import { afterAll, afterEach, beforeAll } from "vitest";
+import { afterAll, afterEach, beforeAll, onTestFinished } from "vitest";
 import { createClient } from "../api/client";
 import { libraryApi, type LibraryApi } from "../api/library";
 
@@ -61,6 +61,41 @@ export function sse(events: Array<{ type: string; data: unknown }>): HttpRespons
     },
   });
   return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
+}
+
+/**
+ * FR-750: GET /events whose every attempt answers by `attempt(n)` (n counts from 1) — "fail" (a network error), or a
+ * stream holding those events, left open. `drop()` ends the open stream (the screen connects again by itself).
+ */
+export function sseAttempts(attempt: (n: number) => "fail" | Array<{ type: string; data: unknown }>) {
+  let n = 0;
+  let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
+  return {
+    handler: http.get(url("/events"), () => {
+      const a = attempt(++n);
+      if (a === "fail") return HttpResponse.error();
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          ctl = c;
+          for (const e of a) c.enqueue(enc.encode(`event: ${e.type}\ndata: ${JSON.stringify(e.data)}\n\n`));
+        },
+      });
+      return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
+    }),
+    attempts: () => n,
+    drop: () => {
+      ctl?.close();
+      ctl = undefined;
+    },
+  };
+}
+
+/** FR-750: a request held unanswered until the test ends (whatever its end), standing for one the browser never settles. */
+export function hang(): Promise<void> {
+  let release!: () => void;
+  const p = new Promise<void>((r) => (release = r));
+  onTestFinished(() => release());
+  return p;
 }
 
 export const serviceError = (status: number, code: string, message: string) => HttpResponse.json({ error: { code, message } }, { status });

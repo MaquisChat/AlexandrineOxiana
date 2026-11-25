@@ -32,7 +32,7 @@ import { routeFor } from "../App";
 import { PATHS } from "../navigation";
 import type { LibraryWindowEvent } from "../desktopShell";
 import { fakeShell, type FakeShell } from "../test/desktopShell";
-import { SOURCE_FILE, server, testClient, url, useMockService } from "../test/service";
+import { hang, SOURCE_FILE, server, sseAttempts, testClient, url, useMockService } from "../test/service";
 import { ACT_SAID_MS, FindAcquire, LIBRARY_CLOSE_WAIT_MS, LIBRARY_SHELL_TIMEOUT_MS, QUEUE_READ_WAIT_MS, SWITCH_TIMEOUT_MS } from "./FindAcquire";
 
 useMockService();
@@ -5393,37 +5393,6 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
   const count = (path: string) => calls.filter((c) => c.method === "GET" && c.path === path).length;
   const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
   const projectBox = () => screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement;
-  /** The event stream: each attempt answers by `attempt(n)` — "fail" (a network error), or a stream holding `events`. */
-  function streams(attempt: (n: number) => "fail" | Array<{ type: string; data: unknown }>) {
-    const enc = new TextEncoder();
-    let n = 0;
-    let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
-    return {
-      handler: http.get(url("/events"), () => {
-        const a = attempt(++n);
-        if (a === "fail") return HttpResponse.error();
-        const body = new ReadableStream<Uint8Array>({
-          start(c) {
-            ctl = c;
-            for (const e of a) c.enqueue(enc.encode(`event: ${e.type}\ndata: ${JSON.stringify(e.data)}\n\n`));
-          },
-        });
-        return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
-      }),
-      attempts: () => n,
-      /** Ends the open stream (the screen connects again by itself). */
-      drop: () => {
-        ctl?.close();
-        ctl = undefined;
-      },
-    };
-  }
-  /** A request that never answers, until released (released at the test's end whatever happens). */
-  function hang() {
-    const h = held<void>();
-    onTestFinished(() => h.release());
-    return h;
-  }
   const showWithin = (ms: number, search = "") => render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search }} firstReadMs={ms} />);
 
   it("reads that hang are given up after the limit: the usual alert with “Try again”; pressing it reads again and the screen fills, focus not lost", async () => {
@@ -5432,11 +5401,11 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     const gate = hang();
     server.use(
       http.get(url("/projects"), async () => {
-        if (!answer) await gate.p;
+        if (!answer) await gate;
         return HttpResponse.json(PROJECTS);
       }),
       http.get(url("/find/screen"), async () => {
-        if (!answer) await gate.p;
+        if (!answer) await gate;
         return HttpResponse.json(screenSettings);
       }),
     );
@@ -5466,11 +5435,13 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
 
   it("an abandoned read answering late changes nothing (it was cancelled)", async () => {
     useService();
-    const gate = hang();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
     let aborted: boolean | undefined;
     server.use(
       http.get(url("/projects"), async ({ request }) => {
-        await gate.p;
+        await gate;
         aborted = request.signal.aborted;
         return HttpResponse.json(PROJECTS);
       }),
@@ -5478,7 +5449,7 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     );
     showWithin(300);
     await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
-    gate.release();
+    release();
     await waitFor(() => expect(aborted).toBe(true));
     expect(projectBox().textContent).toBe("No project");
     expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
@@ -5487,18 +5458,18 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
 
   it("when the event stream opens anew, the reads that have not settled are made again, without a press and without an event on it", async () => {
     useService();
-    const ev = streams((n) => (n === 1 ? "fail" : []));
+    const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
     const gate = hang();
     let projectsN = 0;
     let screenN = 0;
     server.use(
       ev.handler,
       http.get(url("/projects"), async () => {
-        if (++projectsN === 1) await gate.p;
+        if (++projectsN === 1) await gate;
         return HttpResponse.json(PROJECTS);
       }),
       http.get(url("/find/screen"), async () => {
-        if (++screenN === 1) await gate.p;
+        if (++screenN === 1) await gate;
         return HttpResponse.json(screenSettings);
       }),
     );
@@ -5515,7 +5486,7 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
 
   it("reads that failed are made again once when the stream opens anew and delivers the library's state — not twice (R281 e and the opening fit)", async () => {
     useService();
-    const ev = streams((n) => (n === 1 ? "fail" : [{ type: "library.state", data: { open: true, libraryId: "lib-1", name: "Thesis library", mode: "read-write" } }]));
+    const ev = sseAttempts((n) => (n === 1 ? "fail" : [{ type: "library.state", data: { open: true, libraryId: "lib-1", name: "Thesis library", mode: "read-write" } }]));
     let failing = true;
     server.use(
       ev.handler,
@@ -5535,7 +5506,7 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
 
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
     useService();
-    const ev = streams((n) => (n === 1 ? "fail" : []));
+    const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
     server.use(
       ev.handler,
       http.get(url("/projects"), () => HttpResponse.error()),
@@ -5584,7 +5555,7 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     useService({
       queues: {
         [PID]: async () => {
-          if (!answer) await gate.p;
+          if (!answer) await gate;
           return HttpResponse.json(queue([]));
         },
       },
