@@ -334,3 +334,145 @@ It was a few lines (`old-copies.ts`, `completedAt` set in `markPendingComplete`;
 - End to end: `@ao/ui` built, `maintenance.spec.ts` in Chromium: 3 passed.
 
 Not done, as ruled: M3, M6.
+
+---
+
+# Third round (R590)
+
+Branch `fr-755-move-failure`, five commits on 6e33ae2 (not pushed), one per finding, in dependency order. `git status --short` is empty. Nothing of mine is left running.
+
+| commit | finding |
+|---|---|
+| 0258e1a | N4: an old copy cannot be deleted while its new place cannot be read |
+| 7389076 | N5: the damaged-journal words at the old place; the old place found by its real path |
+| c52226b | N1: the old library of an unfinished split opens read-only |
+| 6eebe87 | N2: each audit log at the new place is proved against what the move verified |
+| 87181b8 | N3: every mark the journal records must still be there |
+
+I wrote every new test first and saw it fail before the mend:
+- the engine and page tests against the code before the change;
+- the service tests by putting back the 6e33ae2 versions of the product files (tests kept) for one run, which gave 7 failed out of 7 R590 tests, then restoring.
+
+The commits were cut from the tested final tree. The intermediate states were rebuilt backwards and checked to equal HEAD exactly, and the last state to equal the tested final exactly. Each intermediate stage was typechecked, and its R590 engine tests were run.
+
+## N1 — the old library of an unfinished split opens read-only
+- **Failing tests:**
+  - `packages/library/src/move.test.ts`:
+    - "R590 N1: the old library of a split whose marking stopped after the first / the last moved project opens read-only as moved…" (2 tests). Before the mend: `['read-write', undefined, undefined]`.
+    - "…matched by its real path: opened through a symbolic link…".
+    - A guard that passes before and after: "a split stopped before any project was marked: … opens for changes".
+  - `apps/library-service/src/move-finish.test.ts` "R590 N1: after a split whose marking failed after the first moved project…". This is the reviewer's probe: Study and Field moving, Kept staying, `fail = {at:"split-mark", afterFolders:1}`. The test checks:
+    - the old place opens read-only `moved` with `moveUnfinishedTo` = the new place;
+    - after `idle()`, no file under the old place changed (byte snapshot), so no backup ran;
+    - an attach into Study answers 409;
+    - `restart()` + `reopenLast()` opens the OLD place, read-only, and still nothing under it changes;
+    - opening the new place finishes it (read-write, told once, Field and Study);
+    - the old place then opens read-write with no `moveUnfinishedTo` and "Kept" only.
+  - The whole-library and finished-split tests are unchanged and pass.
+- **Mend:**
+  - `packages/library/src/library.ts:283`: in `openLibraryInternal`, after the `MOVED_MARKER` check, `unfinishedSplitFrom(deps, root, meta.libraryId)`. When it matches: `readOnly("moved", movedTo)`.
+  - `packages/library/src/old-copies.ts:255` `unfinishedSplitFrom`.
+- **How "unfinished split" is judged at the old place.** All of these must hold:
+  1. This computer's newest record for this library id whose `oldRoot` is this folder by real path (`recordFrom`, `old-copies.ts:193`, using `sameFolder`, `:187`).
+  2. The record has `split: true`.
+  3. `moveFinished(rec) !== "finished"` (`:207`). This is the one judgement of "unfinished": `!complete`, or the journal at the new place names this record, or it is damaged, or (failing closed) the new place cannot be read.
+  4. At least one of the record's `movedFolders` in this folder carries a MOVED.json naming the library.
+
+  How this tells the cases apart:
+  - **Unfinished split.** The old `library.json` still carries the ORIGINAL id until every moved project is marked. Once the marking is complete it carries the remaining library's id, so a finished split's remaining library never matches (nor does a fully marked one). No STOP was needed.
+  - **Why condition 4.** With no project marked yet (the record is written before the journal and before the first mark), the finishing at the new place returns undefined: the old library is still the library. Making it read-only there would leave both places read-only for good. So that state opens as before.
+- **Sentence** (`packages/shared/src/api/library-move.ts:30`). With the path in the dialog, inside UserText; without it in the service's answer:
+  - "The move of the projects did not finish, so the library has been closed. Open the new library first, at its new place, {newRoot}: the move will be finished then. Until then the library they came from opens only read-only; after that it opens again for the projects that stayed. Nothing is lost."
+  - Without the path: "… Open the new library first, at its new place: the move will be finished then. …"
+- **Tests changed on purpose** (they asserted the old words): `move-finish.test.ts` "the sentence for a split, word for word" and `MoveLibrary.test.tsx` "R583 I1: …".
+- **The old place's banner** is the existing one: "Read-only — this is the old copy of a library whose move has not finished. Open the library at its new place, {newRoot}, and the move will be finished then; nothing is lost."
+
+## N2 — the audit logs at the new place
+- **Failing tests:**
+  - `move.test.ts`:
+    - "R590 N2: an audit log at the new place cut to nothing by hand" and "… cut to its first line by hand" (D5, D5d). Each gives `files-differ`, count 1, nothing written at either place; before the mend the promise resolved.
+    - "a line that is not the switch's own, appended by hand…: … the log counted once".
+    - "the switch's own line changed by hand after the verified beginning (the chain broken): the finishing's own opening reports it…". This proves (i) on its own, because the verified beginning is intact.
+    - A guard: "an audit log that begins with what was verified and goes on with the switch's own lines is finished over" (a finishing that failed at mark-complete after audit-move, then finished).
+  - `move-finish.test.ts` "R590 N2: an audit log at the new place cut to nothing / to its first line by hand (the reviewer's D5)": read-only `move-incomplete`, `move-not-finished-files-differ` with count 1 and the old place. The read-only opening's own check also shows the log's fault (`empty` / `truncated`), which is true. Nothing is written.
+- **Mend** (`packages/library/src/move.ts`):
+  - `:902` before anything is written: `notMatching` with a third rule, `"begins"`, for `Projects/*/audit/*.jsonl`. `library.json` stays `"present"` (R588 a).
+  - `:982` `beginsWithVerified`.
+  - `:1013` `auditFaultsAt`. It opens the new place with `openLibraryInternal` as usual. Its journal makes that opening read-only `move-incomplete`, with no lock and nothing written. It then calls `openRepo(…, { noHeal: true })` and collects every `empty`, `truncated`, `chain-broken` or `head-mismatch` warning, mapped to `Projects/<n>/audit/`, or `audit/` for the library's own log.
+  - A log that fails either check counts once.
+  - Why not use the finishing's own writable `openRepo` warnings: that opening appends `audit.anchor-mismatch` to the log and anchors it anew. The refusal would then have already written into the new place, and the next opening would see no fault.
+- **How an audit log's beginning is proved:**
+  - The record (`old-copies/<id>.json`) holds, per file, only the SHA-256 of the whole file at verification. It holds no size.
+  - The beginning is found by its hash. The log is read once, an incremental SHA-256 runs over it, and at the empty beginning, at every line end and at the end of the file, a copy of the running hash is compared with the recorded value. A match fixes the verified length. A collision would be needed to fake it.
+  - Every complete line after that point must parse as an audit event with `action: "library.move"`, the only thing the finishing's switch appends there (audit-move). A late-recorded one keeps its action.
+  - A last fragment with no line end is ignored. It is a line cut off by a crash, which the opening's own repair (R28) trims.
+  - The old copy's log was not needed.
+
+## N3 — the marks the journal records
+- **Failing tests:**
+  - `move.test.ts` "R590 N3: a moved project's mark the journal records, removed by hand: not finished, nothing written (C)" (a split with `crashAfter = "register"`).
+  - `move.test.ts` "… a whole library's top mark …: (C2)".
+  - `move-finish.test.ts` "R590 N3: the old copy's mark … (the reviewer's C2)" and "… a moved project's mark … (the reviewer's C)".
+  - `StatusBanner.test.tsx` "N3: …".
+- **Mend:**
+  - `move.ts:893`: when the journal records `mark-old` and the old folder can be reached, every recorded mark must still name the library: a split's `movedFolders/*/MOVED.json`, or the top MOVED.json for a whole library. Otherwise `MoveFinishRefusedError("mark-missing")`, before anything is written.
+  - `apps/library-service/src/state.ts:161` maps it to the warning `move-cannot-finish-mark-missing`.
+  - `StatusBanner.tsx:116` holds the words.
+- **Sentence:** "The move of this library to this folder has not finished, and the app cannot finish it: a mark the move left in the old copy, which keeps that copy from being changed, was removed outside the app. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy."
+
+  This is a NEW sentence in the existing cannot-finish family. Neither existing one is true here: "journal damaged" is not the case, and "projects changed" does not fit a whole library. Please confirm.
+
+## N4 — fail closed
+- **Failing test:** `move.test.ts` "R590 N4: the new place's drive not connected: the old copy cannot be deleted, and the refusal says why". It covers a failure at unlink with the new place renamed away. Before the mend the deletion went ahead: `filesDeleted: 18`.
+- **Mend:**
+  - `old-copies.ts:207` `moveFinished`, with `journalAt` at `:215`. `journalStillAt` is gone. `journalAt` gives `"unreachable"` when the journal cannot be read for a reason other than "missing", or when it is missing and the new place's folder cannot be read either.
+  - `move.ts:1390`: `deleteOldCopy` refuses on anything but `"finished"`.
+- **Sentence** (code `move-unfinished`, 409 in the service): "The old copy cannot be deleted now: the library's new place cannot be reached, so the app cannot tell whether its move has finished. Connect the drive the new place is on and try again."
+
+## N5 — words, and the old place by its real path
+- **Failing tests:**
+  - `move.test.ts`:
+    - "R590 N5: the old place of a move whose journal is damaged says so…": `movedTo` = `{ newRoot, unfinished: true, journalDamaged: true }`.
+    - "… the old place is matched by its real path: opened through a symbolic link…" (was `undefined`).
+  - `move-finish.test.ts` "R590 N5: …": `moveCannotFinish: true` in the open route's answer and in `library.state`.
+  - `StatusBanner.test.tsx` "N5: …".
+- **Mend:**
+  - `old-copies.ts:235` `movedToFor`, matched through `recordFrom` by real path, with `journalDamaged` from `moveFinished`.
+  - `sameFolder` moved from `move.ts` to `old-copies.ts:187`; both use it.
+  - `Library.movedTo` is the type `MovedTo`.
+  - `state.ts:1847` and `routes/libraries.ts:53` carry `moveCannotFinish`.
+  - The page: `api/library.ts`, and `StatusBanner.tsx:244` and `:416`.
+- **Sentence:** "Read-only — this is the old copy of a library whose move has not finished, and the app cannot finish it: the record of the move kept at its new place, {newRoot}, is damaged. Both copies are kept as they are. Tell the developer before changing or deleting either copy." The whole sentence is inside UserText, as for the existing banner.
+
+## Runs (each file alone, `nice -n 10`, `NODE_OPTIONS=--use-openssl-ca`)
+- **`@ao/library`:** move.test 116 (14 new); reconnect 54; library 35; library-place 19; device-and-old-copies 18; retention-old-copies 40; retention-closing 10; retention-confirm 3; retention 23; export/backup 23. All passed.
+- **`@ao/library-service`:** move-finish 35 (7 new, one changed); open-library 26; close-during-attach 13; lock-during-change 3; library-place-routes 8; device-notices 17; library-audit 11; your-library-routes 35; server 160 + 1 skipped; fieldwork-governance 23. All passed.
+- **`@ao/ui`:** StatusBanner 81 (2 new); MoveLibrary 29 (1 changed); Library 48; LibraryChooser 24. All passed.
+- **Typecheck:** shared, library, library-service, ui and cli clean. `lint:css` and `lint:colours` clean.
+- **End to end:** `@ao/ui` built; `maintenance.spec.ts` in Chromium, 3 passed.
+
+## Uncertain / for the reviewer
+- **N1:**
+  - If this computer's list of old copies cannot be read, the opening treats it as "no record" and opens normally, as `movedToFor` already did. Failing closed would make every library read-only while the list is unreadable.
+  - The rule needs a moved project to be marked (see above).
+- **N4 / one judgement:** `"cannot-tell"` counts as unfinished everywhere. So the old copy of a FINISHED move whose new drive is unplugged now says "…whose move has not finished. Open the library at its new place…". That is fail-closed and harmless (opening the new place opens it normally), but not exact. `listUnfinishedMoves` (used by reconnect) still judges by `!complete` alone; I did not change it.
+- **N2:**
+  - Only `library.move` counts as the switch's own. A finishing interrupted after a writable opening at the new place recorded another event in a moved project's log would refuse from then on, safely, with the files-differ words. An example is `audit.anchor-missing`, which appears only when this computer's anchor was lost.
+  - `anchor-missing` and `anchors-unreadable` are not refused over. They are not among the ruled faults, and the beginning check still holds.
+  - The library's own log (`audit/`) keeps the whole-hash rule.
+- **N3:** with the old copy unreachable, a recorded mark is not looked at and the move still finishes without it (R583 M4, kept).
+- **N3 words** are new (see N3).
+
+## After R596
+- **Commit and mend.**
+  - In `704506d`, `movedToOf` in `old-copies.ts` sets `unfinished` only for "unfinished" and "damaged". For "cannot-tell" it gives the plain moved words, and `moveUnfinishedTo` is not sent.
+  - `deleteOldCopy` still refuses with the cannot-reach sentence.
+  - Every other reader goes through `movedToOf`: the service's state, the open route and the page.
+- **Tests, each seen to fail first:**
+  - `move.test.ts` "R596 b: the old copy of a FINISHED move whose new place cannot be read…"
+  - `move-finish.test.ts` "R596 b: the old place of a FINISHED move…"
+  - Two guards with the record not complete: "has not finished".
+- **`unfinishedSplitFrom` (N1)** still opens read-only on anything but "finished".
+  - In "cannot-tell" its banner would read the plain moved words.
+  - That case cannot arise with a marked project. The record becomes complete only in "finalize", after "mark-old" has rewritten the old `library.json` to the remaining library's id, so the record (keyed by the original id) no longer matches. Only a hand-reverted `library.json` could reach it.
+- **Runs:** move 118, device-and-old-copies 18, move-finish 37, StatusBanner 81; library and library-service typecheck clean.
