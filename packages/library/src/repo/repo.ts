@@ -629,7 +629,8 @@ export async function openRepoInternal(
   // FR-068 (R607 c): the stale copy of a move that stopped before its old copy was marked (read-only; the library still
   // at its old place) is not compared with this computer's record of the audit logs' heads: its logs are only older than
   // the living library's. Their chains are still checked.
-  const compareAnchors = library.staleMoveOf === undefined;
+  // R612 m-B: also for any copy of this computer's move whose own mark is neither recorded nor seen (anchorsNotCompared).
+  const compareAnchors = library.staleMoveOf === undefined && library.anchorsNotCompared !== true;
   const anchors = compareAnchors ? await readAnchors(core, writable) : {};
   // Projects with a marker that is still unresolved: no writes, no audit appends and no trimming
   // until it is resolved. An invalid marker may name one project and point into another's folder,

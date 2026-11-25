@@ -667,6 +667,41 @@ describe("FR-068 (R607 c): the stale folder, opened, says what it is and accuses
   });
 });
 
+describe("R612 m-B: a stopped move's folder whose own mark is neither recorded nor seen shows no 'changed outside the app' warning", () => {
+  async function stoppedCopy() {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    await mkdir(join(path, "MOVED.json"));
+    expect(lastLine(await move(dest)).error).toBeDefined();
+    await rm(join(path, "MOVED.json"), { recursive: true });
+    expect((await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await pdf("c.pdf", "Lighthouse keeper diary")] } })).status).toBe(200);
+    await svc!.state.idle();
+    return { path, pid, dest };
+  }
+
+  it("G6: the library then moved on to another folder: opened, the stopped folder is read-only, not said to be a copy of a library still at its old place, and shows no warning", async () => {
+    const { dest } = await stoppedCopy();
+    const c = join(tmp, "Moved", "C");
+    expect(lastLine(await move(c)).done).toBe(true);
+    await svc!.state.idle();
+    const before = await hashes(dest);
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect([r.status, r.json.mode, r.json.readOnlyReason, r.json.staleMoveOf]).toEqual([200, "read-only", "move-incomplete", undefined]);
+    expect(kindsNow()).toEqual([]);
+    await svc!.state.idle();
+    expect(changedFiles(before, await hashes(dest))).toEqual([]);
+  });
+
+  it("G6b: the old place out of reach: the same, no audit-log warning (only the finishing's own note that the old copy cannot be reached, as before)", async () => {
+    const { path, dest } = await stoppedCopy();
+    await call({ method: "POST", url: "/libraries/close" });
+    await rename(path, join(tmp, "Away"));
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect([r.status, r.json.mode, r.json.readOnlyReason, r.json.staleMoveOf]).toEqual([200, "read-only", "move-incomplete", undefined]);
+    expect(kindsNow()).toEqual(["move-not-finished-old-copy-unreachable"]);
+  });
+});
+
 describe("FR-068 (R607 d): the move's answer after it stopped before the library was switched", () => {
   const stopped = () => ({ error: { code: "CONFLICT", message: moveStoppedBeforeSwitchText(), reason: MOVE_STOPPED_BEFORE_SWITCH_REASON } });
 

@@ -2119,20 +2119,47 @@ describe("FR-068 (R607 c): the stale folder of a move that stopped before its ol
     expect(await hashes(dest)).toEqual(before);
   });
 
-  it("the old place out of reach: not said to be the library; today's words and checks stay", async () => {
+  // R612 m-B: no anchor can be newer than this copy unless the library went on elsewhere: wherever this move's own mark is
+  // neither recorded nor seen, no audit log is compared with this computer's record (no untrue "changed outside the app").
+  it("the old place out of reach (G6b): not said to be the library (today's words), and no audit log compared with this computer's record; nothing written", async () => {
     const { lib, dest } = await staleCopy();
     await lib.close();
     await rename(lib.root, join(tmp, "Away"));
+    const before = await hashes(dest);
     const { lib: opened, repo } = await openedAt(dest);
     expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
-    expect(repo.integrityWarnings.map((w) => w.kind)).not.toEqual([]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toEqual([]);
+    expect(await hashes(dest)).toEqual(before);
   });
 
-  it("the old place marked by a later move to another folder (it is no longer the library): not said to be the library", async () => {
+  it("the old place deleted: not said to be the library, and no audit log compared with this computer's record", async () => {
+    const { lib, dest } = await staleCopy();
+    await lib.close();
+    await rm(lib.root, { recursive: true });
+    const { lib: opened, repo } = await openedAt(dest);
+    expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toEqual([]);
+  });
+
+  it("the old place marked by a later move to another folder (G6: it is no longer the library): not said to be the library, and no audit log compared with this computer's record", async () => {
     const { lib, dest } = await staleCopy();
     await executeMove(lib, join(tmp, "C"), { deps: mkDeps(), env });
-    const { lib: opened } = await openedAt(dest);
+    const { lib: opened, repo } = await openedAt(dest);
     expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toEqual([]);
+  });
+
+  it("this move's mark seen at the old place (not recorded): the logs are still compared: a log emptied by hand gives its warning", async () => {
+    const f = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    await expect(executeMove(f.lib, dest, { deps: mkDeps(), env })).rejects.toMatchObject({ code: "ENOSPC" });
+    expect((await readFile(join(f.lib.root, "MOVED.json"), "utf8")).length).toBeGreaterThan(0);
+    const log = join(dest, f.a.folder, "audit", (await readdir(join(dest, f.a.folder, "audit"))).filter((n) => n.endsWith(".jsonl")).sort()[0]!);
+    await writeFile(log, "");
+    const { lib: opened, repo } = await openedAt(dest);
+    expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toContain("empty");
   });
 
   it("once the old copy is marked by the move, the new place is not a stale copy: a log emptied by hand there still gives its warning", async () => {
