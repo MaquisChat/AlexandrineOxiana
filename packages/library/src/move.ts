@@ -16,7 +16,8 @@
  * old copy is marked with MOVED.json and opens read-only (`moved`).
  */
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, realpath as realpathCb } from "node:fs";
+import { promisify } from "node:util";
 import * as fsp from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { dateRuleZone, evaluate, newId, parseGovernance, type PolicyDecision, type ResidencyKind } from "@ao/core";
@@ -828,7 +829,7 @@ export async function completeMove(destRoot: string, deps: Deps, _env?: Location
   }
   // Only at the place this computer's record names, for the library it names (R578): a copy of the destination made by
   // hand, journal and all, is not that move's destination.
-  if (resolve(rec.newRoot) !== dest || rec.libraryId !== j.libraryId) {
+  if (!(await sameFolder(rec.newRoot, dest)) || rec.libraryId !== j.libraryId) {
     throw new MoveNotAllowedError("nothing-to-complete", "This folder is not the destination this computer recorded for that move");
   }
   return runSwitch(dest, j, rec, deps, ctx);
@@ -850,7 +851,7 @@ export async function finishMoveAt(destRoot: string, deps: Deps, opts: { tz?: st
   const j = await readJournal(dest);
   if (j?.phase !== "switching" || !j.switch) return undefined;
   const rec = await getPendingOldCopy(deps, j.switch.pendingId).catch(() => undefined);
-  if (!rec || resolve(rec.newRoot) !== dest || rec.libraryId !== j.libraryId) return undefined;
+  if (!rec || !(await sameFolder(rec.newRoot, dest)) || rec.libraryId !== j.libraryId) return undefined;
   const markAgain = !j.switch.done.includes("mark-old");
   if (markAgain && !(await oldCopyMarked(rec, j.libraryId))) return undefined;
   // The old copy's lock first, when it is to be marked again: refused before anything is written anywhere.
@@ -884,6 +885,16 @@ async function takeOldCopyLock(oldRoot: string, deps: Deps): Promise<void> {
   }
   const got = await acquireLock(oldRoot, deps);
   if (!got.acquired) throw new MoveNotAllowedError("old-copy-in-use", "The old copy of the library is open on another computer, so the move cannot be finished now");
+}
+
+/**
+ * R583 M1: the two paths name the same folder — compared by what the folder is (its real path: links resolved, the
+ * disk's own letter case), not by their text. A path that cannot be resolved is compared as written.
+ */
+const realpathNative = promisify(realpathCb.native);
+async function sameFolder(a: string, b: string): Promise<boolean> {
+  const real = (p: string) => realpathNative(p).catch(() => resolve(p));
+  return (await real(a)) === (await real(b));
 }
 
 /** The whole-library old copy carries this library's moved marker (a split's marking is judged by the journal alone). */

@@ -1335,6 +1335,21 @@ describe("FR-755 (R578): finishMoveAt finishes only this computer's own unfinish
     });
   }
 
+  for (const by of ["real path", "link"] as const) {
+    it(`R583 M1: a move to a place reached through a symbolic link is recognised by what the folder is: opened by its ${by}, it finishes`, async () => {
+      const f = await fixture();
+      await mkdir(join(tmp, "Real"));
+      await symlink(join(tmp, "Real"), join(tmp, "Link"));
+      const linked = join(tmp, "Link", "Lib");
+      moveSeams.crashAfter = "close-source";
+      await expect(executeMove(f.lib, linked, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+      await f.lib.close();
+      const opened = by === "link" ? linked : join(await realpath(join(tmp, "Real")), "Lib");
+      expect((await finishMoveAt(opened, mkDeps()))?.verified).toBe(true);
+      expect(await readdir(join(tmp, "Real", "Lib"))).not.toContain(".move-journal.json");
+    });
+  }
+
   it("nothing to finish (no journal): undefined, nothing written", async () => {
     const { lib } = await fixture();
     await lib.close();

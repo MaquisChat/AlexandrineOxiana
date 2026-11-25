@@ -4,7 +4,7 @@
  * batches), the media worker, the event bus and the daily backup scheduler (R96 carry-overs).
  * Everything that changes the library goes through `@ao/library`.
  */
-import { access } from "node:fs/promises";
+import { access, realpath } from "node:fs/promises";
 import { join as joinPath, resolve as resolvePath } from "node:path";
 import { userInfo } from "node:os";
 import { isDeepStrictEqual } from "node:util";
@@ -370,7 +370,8 @@ export class ServiceState {
    * before. Two openings of one folder at once share one finishing; the second has nothing more to tell.
    */
   async finishUnfinishedMove(root: string): Promise<{ kind: string; detail: string } | undefined> {
-    const key = resolvePath(root);
+    // By what the folder is (R583 M1): an opening through a link and one by the real path share the finishing.
+    const key = await realpath(root).catch(() => resolvePath(root));
     const running = this.finishing.get(key);
     if (running) {
       await running;
