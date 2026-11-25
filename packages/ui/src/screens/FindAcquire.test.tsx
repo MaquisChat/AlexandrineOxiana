@@ -4320,11 +4320,14 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       let hang = false;
       let open = 0;
       let most = 0;
+      // Each held request is kept, so its signal's abort reaches the listener (a request no longer held can miss it).
+      const held: Request[] = [];
       server.use(
         http.get(url(`/projects/${PID}/find`), ({ request }) => {
           if (!hang) return HttpResponse.json(queue(current));
           open++;
           most = Math.max(most, open);
+          held.push(request);
           request.signal.addEventListener("abort", () => open--, { once: true });
           return new Promise<Response>(() => {});
         }),

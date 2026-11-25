@@ -97,55 +97,55 @@ describe("ReaderRoute: an event stream that does not open within the limit is tr
   });
 
   it("a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     serve();
     server.use(
       http.get(url("/events"), ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         return new HttpResponse(new ReadableStream(), { headers: { "content-type": "text/event-stream" } });
       }),
     );
     show({ streamOpenMs: 200 });
     await screen.findByTestId("reader-screen");
-    await waitFor(() => expect(signals).toHaveLength(1));
+    await waitFor(() => expect(requests).toHaveLength(1));
     await new Promise((r) => setTimeout(r, 3_000));
     // Still the first stream, and its request not cancelled (R602).
-    expect(signals).toHaveLength(1);
-    expect(signals[0]!.aborted).toBe(false);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.signal.aborted).toBe(false);
   });
 
   it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh; the reader stays", async () => {
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     serve();
     server.use(
       http.get(url("/events"), ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         return new HttpResponse(new ReadableStream(), { headers: { "content-type": "text/event-stream" } });
       }),
     );
     show({ streamQuietMs: 300 });
     await screen.findByTestId("reader-screen");
-    await waitFor(() => expect(signals.length).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
-    expect(signals[0]!.aborted).toBe(true);
+    await waitFor(() => expect(requests.length).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(requests[0]!.signal.aborted).toBe(true);
     expect(screen.getByTestId("reader-screen")).toBeTruthy();
   });
 });
 
 describe("ReaderRoute: its two first reads are one read (FR-756, R605 M6)", () => {
   it("a source read that fails cancels the read of the libraries still out, long before the limit", async () => {
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     const gate = hang();
     serve({ source: () => HttpResponse.error() });
     server.use(
       http.get(url("/libraries"), async ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         await gate;
         return HttpResponse.json({ ...LIBRARIES, current: CURRENT_RW });
       }),
     );
     show();
     await screen.findByRole("button", { name: "Open again" });
-    await waitFor(() => expect(signals).toHaveLength(1));
-    await waitFor(() => expect(signals[0]!.aborted).toBe(true), { timeout: 1000 });
+    await waitFor(() => expect(requests).toHaveLength(1));
+    await waitFor(() => expect(requests[0]!.signal.aborted).toBe(true), { timeout: 1000 });
   });
 });

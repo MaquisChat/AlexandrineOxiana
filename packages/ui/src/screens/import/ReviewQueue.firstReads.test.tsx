@@ -30,11 +30,17 @@ const RECORD = { source: { id: "s1", type: "webpage", title: { variants: [{ lang
 
 /** GET of the project's queue, step by step: "hold" never settles, "fail" gets no answer, "answer" answers. */
 function queueAsks(steps: Array<"hold" | "fail" | "answer" | "refuse">) {
-  const h = { count: 0, signals: [] as AbortSignal[] };
+  const requests: Request[] = [];
+  const h = {
+    count: 0,
+    get signals(): AbortSignal[] {
+      return requests.map((r) => r.signal);
+    },
+  };
   return {
     h,
     handler: http.get(url("/projects/:id/review"), async ({ request }) => {
-      h.signals.push(request.signal);
+      requests.push(request);
       const step = steps[Math.min(h.count++, steps.length - 1)];
       if (step === "hold") await hang();
       if (step === "fail") return HttpResponse.error();
@@ -130,13 +136,18 @@ describe("the review queue's own first read (FR-756 remainder)", () => {
 describe("the review queue's side reads of collections and tags (the bulk bar's lists): the limit, silently (FR-756 remainder, R623 Minor 3)", () => {
   /** The collections and tags, each held (never settling); their requests' signals. */
   function heldLists() {
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     const held = async ({ request }: { request: Request }) => {
-      signals.push(request.signal);
+      requests.push(request);
       await hang();
       return undefined;
     };
-    return { signals, handlers: [http.get(url("/projects/:id/collections"), held), http.get(url("/projects/:id/tags"), held)] };
+    return {
+      get signals(): AbortSignal[] {
+        return requests.map((r) => r.signal);
+      },
+      handlers: [http.get(url("/projects/:id/collections"), held), http.get(url("/projects/:id/tags"), held)],
+    };
   }
   const options = (name: string) => within(screen.getByRole("combobox", { name })).getAllByRole("option").map((o) => o.textContent);
 
@@ -220,7 +231,7 @@ describe("the review queue's route naming an import and no project: the picker a
     for (const queue of STEPS)
       it(`the list of imports ${imports === "hold" ? "held" : imports === "fail" ? "failed with no answer" : "answered"}, the import's queue ${queue === "hold" ? "held" : queue === "fail" ? "failed with no answer" : "answered"}`, async () => {
         const asks = { imports: 0, queue: 0 };
-        const held: { imports: AbortSignal[] } = { imports: [] };
+        const held: { imports: Request[] } = { imports: [] };
         let answerAll = false;
         const m = mockService({
           extra: [
@@ -228,7 +239,7 @@ describe("the review queue's route naming an import and no project: the picker a
             http.get(url("/projects/:id/imports"), async ({ request }) => {
               asks.imports++;
               if (!answerAll && imports === "hold") {
-                held.imports.push(request.signal);
+                held.imports.push(request);
                 await hang();
               }
               if (!answerAll && imports === "fail") return HttpResponse.error();
@@ -250,7 +261,7 @@ describe("the review queue's route naming an import and no project: the picker a
           () => {
             expect(queueLoading()).toBe(false);
             if (imports === "answer") expect(screen.queryByRole("option", { name: /Import 1/ })).not.toBeNull();
-            if (imports === "hold") expect(held.imports.every((s) => s.aborted)).toBe(true);
+            if (imports === "hold") expect(held.imports.every((r) => r.signal.aborted)).toBe(true);
             if (sentence !== undefined) expect(alerts()).toContain(sentence);
           },
           { timeout: 5000 },

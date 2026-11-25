@@ -124,6 +124,7 @@ export const server = setupServer();
 export function mockService(o: ServiceSetup = {}): ServiceMock {
   const calls: Recorded[] = [];
   const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
+  const held: Request[] = [];
   const enc = new TextEncoder();
 
   const rec = async (request: Request, path: string) => {
@@ -355,6 +356,9 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
           streams.delete(ctl);
         },
       });
+      // The request is kept: Node's Request passes the caller's abort on through a weak reference, so a listener on the
+      // signal of a request no longer held can miss it.
+      held.push(request);
       request.signal.addEventListener("abort", () => streams.delete(ctl));
       return new HttpResponse(stream, { headers: { "Content-Type": "text/event-stream" } });
     }),

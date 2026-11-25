@@ -33,19 +33,21 @@ const heading = () => screen.getByRole("heading", { level: 1, name: "Capture" })
  */
 function holding(path: string, hold: (n: number) => boolean) {
   let n = 0;
-  const signals: AbortSignal[] = [];
+  const requests: Request[] = [];
   const gate = hang();
   let release!: () => void;
   const released = new Promise<void>((r) => (release = r));
   return {
     handler: http.get(url(path), async ({ request }) => {
-      signals.push(request.signal);
+      requests.push(request);
       if (hold(++n)) await Promise.race([gate, released]);
       return undefined;
     }),
     count: () => n,
     /** Each ask's request signal (an open stream's must not be aborted). */
-    signals,
+    get signals(): AbortSignal[] {
+      return requests.map((r) => r.signal);
+    },
     release: () => release(),
   };
 }

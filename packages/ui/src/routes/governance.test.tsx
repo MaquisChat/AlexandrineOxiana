@@ -304,10 +304,10 @@ describe("R641 D1: the Governance form's event stream reconnects by itself, with
   function attempts(answer: (n: number) => "hang" | Record<string, unknown>) {
     let n = 0;
     let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     return {
       handler: http.get(url("/events"), async ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         const a = answer(++n);
         if (a === "hang") {
           await new Promise<void>((r) => request.signal.addEventListener("abort", () => r(), { once: true }));
@@ -322,7 +322,7 @@ describe("R641 D1: the Governance form's event stream reconnects by itself, with
         return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
       }),
       attempts: () => n,
-      signals: () => signals,
+      signals: () => requests.map((r) => r.signal),
       drop: () => {
         ctl?.close();
         ctl = undefined;
@@ -378,10 +378,10 @@ describe("R641 D1: the Governance form's event stream reconnects by itself, with
   });
   it("a stream that opens and then delivers nothing for `streamQuietMs` is given up (its request cancelled) and opened afresh (R641 D2)", async () => {
     let n = 0;
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     serve({
       handler: http.get(url("/events"), ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         // The first opens and sends nothing at all, not even a keep-alive; the second sends the state as it now is.
         const first = ++n === 1;
         const body = new ReadableStream<Uint8Array>({
@@ -396,7 +396,7 @@ describe("R641 D1: the Governance form's event stream reconnects by itself, with
     render(<GovernanceRoutes client={createClient(BASE, TOKEN)} loc={window.location} streamQuietMs={300} />);
     expect(await screen.findByText(readOnly, undefined, { timeout: 10_000 })).toBeTruthy();
     expect(n).toBe(2);
-    expect(signals[0]!.aborted).toBe(true);
-    expect(signals[1]!.aborted).toBe(false);
+    expect(requests[0]!.signal.aborted).toBe(true);
+    expect(requests[1]!.signal.aborted).toBe(false);
   });
 });

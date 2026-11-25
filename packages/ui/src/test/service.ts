@@ -67,15 +67,17 @@ export function sse(events: Array<{ type: string; data: unknown }>): HttpRespons
  * FR-750: GET /events whose every attempt answers by `attempt(n)` (n counts from 1) — "fail" (a network error), or a
  * stream holding those events, left open. `drop()` ends the open stream (the screen connects again by itself).
  * FR-756 C: "hang" — the attempt is never answered (it never opens) until the test ends. `signals()`: each attempt's
- * request signal, so a test can see whether the page cancelled a stream (R602 M2).
+ * request signal, so a test can see whether the page cancelled a stream (R602 M2). The REQUESTS are kept and their
+ * signals read when asked for: Node's Request follows the caller's abort through a weak reference, so a signal kept
+ * without its request can stay un-aborted once the request is collected.
  */
 export function sseAttempts(attempt: (n: number) => "fail" | "hang" | Array<{ type: string; data: unknown }>) {
   let n = 0;
   let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
-  const signals: AbortSignal[] = [];
+  const requests: Request[] = [];
   return {
     handler: http.get(url("/events"), async ({ request }) => {
-      signals.push(request.signal);
+      requests.push(request);
       const a = attempt(++n);
       if (a === "hang") {
         await hang();
@@ -91,7 +93,7 @@ export function sseAttempts(attempt: (n: number) => "fail" | "hang" | Array<{ ty
       return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
     }),
     attempts: () => n,
-    signals: () => signals,
+    signals: () => requests.map((r) => r.signal),
     drop: () => {
       ctl?.close();
       ctl = undefined;
@@ -116,24 +118,27 @@ export const REFUSED_READ = "The service refused this read.";
  * FR-756 (R605 M11): a GET handler whose asks, in turn, are: "late" (held until `release()`, then answered), "hold"
  * (never settled), "refuse" (a failure with the service's own words, `REFUSED_READ`) or "answer". An answer is
  * `answer()`, or, when that gives undefined, whatever the next handler for the path answers. The last step repeats.
- * Each ask's request signal is kept (a request given up or replaced is cancelled).
+ * Each ask's request is kept, and `signals` reads their signals when asked for (a request given up or replaced is
+ * cancelled; a signal kept without its request can miss its abort, see `sseAttempts`).
  */
 export function asksInTurn(path: string, steps: Array<"late" | "hold" | "refuse" | "answer">, answer: () => Response | undefined = () => undefined) {
   let n = 0;
-  const signals: AbortSignal[] = [];
+  const requests: Request[] = [];
   const gate = hang();
   let release!: () => void;
   const released = new Promise<void>((r) => (release = r));
   return {
     handler: http.get(path, async ({ request }) => {
-      signals.push(request.signal);
+      requests.push(request);
       const step = steps[Math.min(n++, steps.length - 1)];
       if (step === "hold") await gate;
       if (step === "late") await Promise.race([gate, released]);
       if (step === "refuse") return serviceError(500, "INTERNAL", REFUSED_READ);
       return answer();
     }),
-    signals,
+    get signals(): AbortSignal[] {
+      return requests.map((r) => r.signal);
+    },
     count: () => n,
     release: () => release(),
   };

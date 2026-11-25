@@ -113,7 +113,15 @@ describe("Missing files: the check says how far it is, and can be stopped (R641 
       handler: http.get(url("/libraries/integrity"), ({ request }) => {
         let ctl!: ReadableStreamDefaultController<Uint8Array>;
         const body = new ReadableStream<Uint8Array>({ start: (c) => void (ctl = c) });
-        asks.push({ signal: request.signal, accept: request.headers.get("accept"), send: (l) => ctl.enqueue(enc.encode(`${JSON.stringify(l)}\n`)), end: () => ctl.close() });
+        asks.push({
+          // The request is kept and its signal read when asserted (a signal kept alone can miss its abort).
+          get signal() {
+            return request.signal;
+          },
+          accept: request.headers.get("accept"),
+          send: (l) => ctl.enqueue(enc.encode(`${JSON.stringify(l)}\n`)),
+          end: () => ctl.close(),
+        });
         return new HttpResponse(body, { headers: { "content-type": "application/x-ndjson" } });
       }),
       asks,
