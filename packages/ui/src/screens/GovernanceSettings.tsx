@@ -17,8 +17,10 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNod
 import { isMap, isScalar, isSeq, parseDocument, type Document } from "yaml";
 import { GOVERNANCE_UNREADABLE_TEXT, GOVERNANCE_WARNINGS_TEXT, type GovernanceReadability } from "@ao/shared";
 import { ApiClientError } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import type { DestructionCertificate, GovernanceApi, Profile, ProtocolDocument, ProtocolDocumentResult, RetentionDue, Violation } from "../api/governance";
 import { FileDrop } from "../components/FileDrop";
+import { TryAgain } from "../components/TryAgain";
 import { ConfirmDialog, ReasonDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import {
@@ -81,6 +83,8 @@ export interface GovernanceSettingsProps {
   readOnlyReason?: string | undefined;
   /** The project is encrypted (from the project list): its governance.yaml is still readable without the passphrase. */
   encrypted?: boolean | undefined;
+  /** FR-756 (R579): how long the rules are waited for before the read is given up (smaller in tests). */
+  firstReadMs?: number;
 }
 
 /**
@@ -96,7 +100,7 @@ const localToday = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
-export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }: GovernanceSettingsProps) {
+export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, firstReadMs = FIRST_READ_TIMEOUT_MS }: GovernanceSettingsProps) {
   const [saved, setSaved] = useState<{ yaml: string; sha256: string } | null>(null);
   const [text, setTextNow] = useState("");
   // What the cards show is parsed from `parseText`: at once for form edits, 300 ms after the last
@@ -123,6 +127,9 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
   const [pending, setPending] = useState<Pending | null>(null);
   const [status, setStatus] = useState<Status>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  /** FR-756: the rules' last read got no answer (or none in time): "Try again" is offered. */
+  const [loadUnreachable, setLoadUnreachable] = useState(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const [rawOpen, setRawOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   /** Counts cancelled reason dialogs: a field holding the cancelled value is reset from the rules. */
@@ -131,7 +138,8 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
 
   const load = useCallback(async () => {
     try {
-      const g = await api.getGovernance(projectId);
+      // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
+      const g = await readWithin((signal) => api.getGovernance(projectId, { signal }), firstReadMs);
       setSaved({ yaml: g.yaml, sha256: g.sha256 });
       setText(g.yaml);
       setViolations(g.violations);
@@ -141,8 +149,9 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
       setLoadError(null);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "The rules could not be loaded.");
+      setLoadUnreachable(isUnreachable(err));
     }
-  }, [api, projectId, setText]);
+  }, [api, projectId, setText, firstReadMs]);
 
   useEffect(() => {
     void load();
@@ -267,17 +276,30 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
   if (loadError) {
     return (
       <main className="ao-screen">
-        <h1>Governance</h1>
+        <h1 ref={headingRef} tabIndex={-1}>
+          Governance
+        </h1>
         <p role="alert" className="ao-warning">
           {loadError}
         </p>
+        {loadUnreachable && (
+          <TryAgain
+            focusTo={headingRef}
+            onPress={() => {
+              setLoadError(null);
+              void load();
+            }}
+          />
+        )}
       </main>
     );
   }
   if (!saved) {
     return (
       <main className="ao-screen">
-        <h1>Governance</h1>
+        <h1 ref={headingRef} tabIndex={-1}>
+          Governance
+        </h1>
         <p role="status">Loading the project's rules…</p>
       </main>
     );
@@ -287,7 +309,9 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted }
 
   return (
     <main className="ao-screen">
-      <h1>Governance</h1>
+      <h1 ref={headingRef} tabIndex={-1}>
+        Governance
+      </h1>
       <RulesReadability readability={readability} />
       <p className="ao-hint">These rules are checked on every capture, import, change and export in this project. You may make any rule stricter; making one looser asks for a reason, which is kept in the audit log.</p>
       {readOnlyReason ? (

@@ -9,7 +9,9 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { ConsentRecord, GovernanceApi, Participant, Session } from "../api/governance";
 import { ApiClientError } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { FileDrop } from "../components/FileDrop";
+import { TryAgain } from "../components/TryAgain";
 import { READABLE_SCOPE_TEXT, useReadableNote } from "../components/ReadableNameNote";
 import { ChoiceDialog, ReasonOptionalDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
@@ -95,14 +97,20 @@ const fileName = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1) ??
 /** R463 M4: why a signed form cannot be detached here. */
 export const DETACH_READ_ONLY = "This library is open read-only here, so a signed form cannot be detached.";
 
-/** `readOnly`: the library is open read-only here; the detach is then not offered (R463 M4). */
-export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: GovernanceApi; projectId: string; encrypted?: boolean | undefined; readOnly?: boolean }) {
+/**
+ * `readOnly`: the library is open read-only here; the detach is then not offered (R463 M4). `firstReadMs` (FR-756,
+ * R579): how long the records are waited for before the read is given up (smaller in tests).
+ */
+export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = FIRST_READ_TIMEOUT_MS }: { api: GovernanceApi; projectId: string; encrypted?: boolean | undefined; readOnly?: boolean; firstReadMs?: number }) {
   const readableScope = useReadableNote(encrypted, READABLE_SCOPE_TEXT);
   const [participants, setParticipants] = useState<Participant[] | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [consents, setConsents] = useState<ConsentRecord[]>([]);
   const [complete, setComplete] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /** FR-756: the records' last read got no answer (or none in time): "Try again" is offered while they are unread. */
+  const [loadUnreachable, setLoadUnreachable] = useState(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const [result, setResult] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Participant | null>(null);
@@ -147,7 +155,8 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
   const [flagged, setFlagged] = useState(false);
   const load = useCallback(async () => {
     try {
-      const [p, s, c] = await Promise.all([api.participants(projectId), api.sessions(projectId), api.consents(projectId)]);
+      // FR-756: the three reads are given up together after `firstReadMs` when they have not all settled.
+      const [p, s, c] = await readWithin((signal) => Promise.all([api.participants(projectId, { signal }), api.sessions(projectId, { signal }), api.consents(projectId, { signal })]), firstReadMs);
       setParticipants(p.participants);
       setSessions(s.sessions);
       setConsents(c.consents);
@@ -156,8 +165,9 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
       // A pending focus target must never fire later, by surprise (n2).
       setDetachedFrom(null);
       setError(err instanceof Error ? err.message : "The fieldwork records could not be loaded.");
+      setLoadUnreachable(isUnreachable(err));
     }
-  }, [api, projectId]);
+  }, [api, projectId, firstReadMs]);
   useEffect(() => {
     void load();
   }, [load]);
@@ -223,7 +233,9 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
   if (!participants) {
     return (
       <main className="ao-screen">
-        <h1>Fieldwork</h1>
+        <h1 ref={headingRef} tabIndex={-1}>
+          Fieldwork
+        </h1>
         {error ? (
           <p role="alert" className="ao-warning">
             {error}
@@ -231,13 +243,24 @@ export function Fieldwork({ api, projectId, encrypted, readOnly }: { api: Govern
         ) : (
           <p role="status">Loading…</p>
         )}
+        {error && loadUnreachable && (
+          <TryAgain
+            focusTo={headingRef}
+            onPress={() => {
+              setError(null);
+              void load();
+            }}
+          />
+        )}
       </main>
     );
   }
 
   return (
     <main className="ao-screen">
-      <h1>Fieldwork</h1>
+      <h1 ref={headingRef} tabIndex={-1}>
+        Fieldwork
+      </h1>
       {!complete ? <p className="ao-hint">This project is locked: identifying details, places and notes are hidden until it is unlocked.</p> : null}
       {error ? (
         <p role="alert" className="ao-warning">

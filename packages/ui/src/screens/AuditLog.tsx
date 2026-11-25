@@ -11,7 +11,9 @@
  */
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import type { AttentionMarkView, AuditCheck, AuditEvent, AuditPage, GovernanceApi, LibraryAuditPage } from "../api/governance";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { DialogShell } from "../components/ReasonDialog";
+import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import "./GovernanceScreens.css";
 
@@ -449,23 +451,30 @@ function LibraryAudit({ api }: { api: GovernanceApi }) {
   );
 }
 
-export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceApi; projectId: string; pageSize?: number }) {
+/** `firstReadMs` (FR-756, R579): how long a page of the log is waited for before the read is given up (smaller in tests). */
+export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_READ_TIMEOUT_MS }: { api: GovernanceApi; projectId: string; pageSize?: number; firstReadMs?: number }) {
   const [cursors, setCursors] = useState<Array<number | undefined>>([undefined]);
   const [page, setPage] = useState<AuditPage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [check, setCheck] = useState<AuditCheck | null>(null);
   const [checking, setChecking] = useState(false);
+  /** FR-756: the log's last read got no answer (or none in time): "Try again" is offered. */
+  const [loadUnreachable, setLoadUnreachable] = useState(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const before = cursors[cursors.length - 1];
   const ids = useId();
 
   const load = useCallback(async () => {
     try {
-      setPage(await api.audit(projectId, { limit: pageSize, ...(before !== undefined ? { before } : {}) }));
+      // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
+      setPage(await readWithin((signal) => api.audit(projectId, { limit: pageSize, ...(before !== undefined ? { before } : {}), signal }), firstReadMs));
       setError(null);
+      setLoadUnreachable(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "The audit log could not be read.");
+      setLoadUnreachable(isUnreachable(err));
     }
-  }, [api, projectId, pageSize, before]);
+  }, [api, projectId, pageSize, before, firstReadMs]);
   useEffect(() => {
     void load();
   }, [load]);
@@ -486,7 +495,9 @@ export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceAp
   const oldest = events[events.length - 1]?.seq;
   return (
     <main className="ao-screen">
-      <h1>Audit log</h1>
+      <h1 ref={headingRef} tabIndex={-1}>
+        Audit log
+      </h1>
       <div className="ao-actions">
         <button type="button" onClick={() => void verify()} disabled={checking}>
           Verify integrity
@@ -504,6 +515,16 @@ export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceAp
           {error}
         </p>
       ) : null}
+      {loadUnreachable && (
+        <TryAgain
+          focusTo={headingRef}
+          onPress={() => {
+            setError(null);
+            setLoadUnreachable(false);
+            void load();
+          }}
+        />
+      )}
       <NeedsAttention api={api} projectId={projectId} onChanged={() => void load()} />
       {page ? (
         <>

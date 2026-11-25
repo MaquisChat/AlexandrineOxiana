@@ -5,8 +5,10 @@
  */
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import type { ApiClient } from "../api/client";
+import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../api/firstRead";
 import { governanceApi, type GovernanceApi, type ProjectSummary } from "../api/governance";
 import { errorText, type LibraryState } from "../api/library";
+import { TryAgain } from "../components/TryAgain";
 import { isolated } from "../components/UserText";
 import { inAppLink, libraryHref, navigate, normalisePath, PATHS, type AppLocation } from "../navigation";
 import { AuditLog } from "../screens/AuditLog";
@@ -36,13 +38,18 @@ export const isGovernancePath = (path: string): boolean => governanceRoutes.some
 /** A link to one of these screens, for a project (when it needs one). */
 export const governanceHref = (path: string, projectId?: string): string => (projectId ? `${path}?project=${encodeURIComponent(projectId)}` : path);
 
-export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppLocation }) {
+/** `firstReadMs` (FR-756, R579): how long the list of projects is waited for before the read is given up (smaller in tests). */
+export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number }) {
   const api = useMemo(() => governanceApi(client), [client]);
   const path = normalisePath(loc.pathname);
   const asked = new URLSearchParams(loc.search).get("project") ?? "";
   const id = useId();
   const [projects, setProjects] = useState<ProjectSummary[] | undefined>();
   const [listError, setListError] = useState<string | undefined>();
+  /** FR-756: the list's last read got no answer (or none in time): "Try again" is offered; `listTry` moves on with it. */
+  const [listUnreachable, setListUnreachable] = useState(false);
+  const [listTry, setListTry] = useState(0);
+  const pickerRef = useRef<HTMLSelectElement>(null);
   // R463 M4: Fieldwork asks too, so that it does not offer a detach the library would refuse.
   const onGovernance = path === PATHS.governance || path === PATHS.fieldwork;
   // On the Governance form, each change of the library's state (a project locked or unlocked in
@@ -78,22 +85,33 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
   }, [client, onGovernance]);
   useEffect(() => {
     let live = true;
-    api.projects().then(
+    const ac = new AbortController();
+    // FR-756: a read that never settles is given up after `firstReadMs` (its request cancelled).
+    readWithin((signal) => api.projects({ signal }), firstReadMs, ac.signal).then(
       (r) => {
         if (!live) return;
         setProjects(r.projects);
         setListError(undefined);
+        setListUnreachable(false);
       },
       (err: unknown) => {
         if (!live) return;
+        setListUnreachable(isUnreachable(err));
+        // Given up at the limit: nothing is known of the projects, so the one named in the address is still shown
+        // (never "not in this library"); its sentence alone, not run together with "could not be reached" (R586 M5).
+        if (isNoAnswerInTime(err)) {
+          setListError((err as Error).message);
+          return;
+        }
         setProjects((cur) => cur ?? []);
         setListError(errorText(err, "The projects could not be read."));
       },
     );
     return () => {
       live = false;
+      ac.abort();
     };
-  }, [api, stateSeq]);
+  }, [api, stateSeq, firstReadMs, listTry]);
   // Whether the library may be changed here, read for the Governance form only: it then says why its
   // rules cannot be changed instead of letting a change be refused on save. Unknown: not said (the
   // service refuses a change it may not make either way).
@@ -137,7 +155,7 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
           );
         })}
         <label htmlFor={`${id}-project`}>Project</label>
-        <select id={`${id}-project`} value={projectId} onChange={(e) => e.target.value && navigate(governanceHref(path, e.target.value))}>
+        <select ref={pickerRef} id={`${id}-project`} value={projectId} onChange={(e) => e.target.value && navigate(governanceHref(path, e.target.value))}>
           {!projectId && <option value="">Choose a project</option>}
           {list.map((p) => (
             <option key={p.id} value={p.id}>
@@ -150,6 +168,17 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
         <p role="alert" className="ao-screen ao-error">
           {listError}
         </p>
+      )}
+      {listError && listUnreachable && (
+        <div className="ao-screen">
+          <TryAgain
+            focusTo={pickerRef}
+            onPress={() => {
+              setListError(undefined);
+              setListTry((n) => n + 1);
+            }}
+          />
+        </div>
       )}
       {unknown && (
         <p role="alert" className="ao-screen ao-error">
