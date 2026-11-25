@@ -2047,3 +2047,58 @@ describe("FR-068 (R607 b): a resumed copy never writes through a link", () => {
     expect(lib.mode).toBe("read-write");
   });
 });
+
+describe("FR-068 (R607 c): the stale folder of a move that stopped before its old copy was marked says what it is and accuses nothing", () => {
+  async function staleCopy() {
+    const f = await fixture();
+    const dest = join(tmp, "Dest");
+    await mkdir(join(f.lib.root, "MOVED.json"));
+    await expect(executeMove(f.lib, dest, { deps: mkDeps(), env })).rejects.toThrow();
+    await rm(join(f.lib.root, "MOVED.json"), { recursive: true });
+    // The living library goes on: its audit logs, and this computer's record of their heads, move on past the copy's.
+    await f.repo.createSource(f.a.id, draft("Four"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() });
+    return { ...f, dest };
+  }
+  const openedAt = async (root: string) => {
+    const lib = await openLibrary(root, mkDeps());
+    open.push(lib);
+    return { lib, repo: await openTestRepo(lib, ring, { clock: () => now, tz: "UTC", scryptN: FAST }) };
+  };
+
+  it("opened, it is read-only, names the old place where the library still is, and no audit log is compared with this computer's record of it; nothing is written", async () => {
+    const { lib, dest } = await staleCopy();
+    const before = await hashes(dest);
+    const { lib: stale, repo } = await openedAt(dest);
+    expect([stale.mode, stale.readOnlyReason, stale.staleMoveOf]).toEqual(["read-only", "move-incomplete", lib.root]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toEqual([]);
+    expect(await hashes(dest)).toEqual(before);
+  });
+
+  it("the old place out of reach: not said to be the library; today's words and checks stay", async () => {
+    const { lib, dest } = await staleCopy();
+    await lib.close();
+    await rename(lib.root, join(tmp, "Away"));
+    const { lib: opened, repo } = await openedAt(dest);
+    expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).not.toEqual([]);
+  });
+
+  it("the old place marked by a later move to another folder (it is no longer the library): not said to be the library", async () => {
+    const { lib, dest } = await staleCopy();
+    await executeMove(lib, join(tmp, "C"), { deps: mkDeps(), env });
+    const { lib: opened } = await openedAt(dest);
+    expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+  });
+
+  it("once the old copy is marked by the move, the new place is not a stale copy: a log emptied by hand there still gives its warning", async () => {
+    const f = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.crashAfter = "close-source";
+    await expect(executeMove(f.lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    const log = join(dest, f.a.folder, "audit", (await readdir(join(dest, f.a.folder, "audit"))).filter((n) => n.endsWith(".jsonl")).sort()[0]!);
+    await writeFile(log, "");
+    const { lib: opened, repo } = await openedAt(dest);
+    expect([opened.readOnlyReason, opened.staleMoveOf]).toEqual(["move-incomplete", undefined]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).toContain("empty");
+  });
+});

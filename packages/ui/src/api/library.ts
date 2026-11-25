@@ -57,6 +57,11 @@ export interface CurrentLibrary {
   moveUnfinishedTo?: string;
   /** With `moveUnfinishedTo`: the record of that move at the new place is damaged, so the app cannot finish it (R590 N5). */
   moveCannotFinish?: true;
+  /**
+   * With "move-incomplete": this folder holds the copy of a move that stopped before its old copy was marked; the library
+   * is still at this old place (FR-068, R607 c).
+   */
+  staleMoveOf?: string;
   /** With "locked-by-other-device": the name of the device holding the library (R118; never a user name). */
   lockedBy?: string;
   /** The index when it is not ready (D8). */
@@ -136,6 +141,7 @@ export interface LibraryState {
   readOnlyReason?: CurrentLibrary["readOnlyReason"];
   moveUnfinishedTo?: CurrentLibrary["moveUnfinishedTo"];
   moveCannotFinish?: CurrentLibrary["moveCannotFinish"];
+  staleMoveOf?: CurrentLibrary["staleMoveOf"];
   lockedBy?: CurrentLibrary["lockedBy"];
   index?: IndexStatus;
   integrityWarnings?: IntegrityWarning[];

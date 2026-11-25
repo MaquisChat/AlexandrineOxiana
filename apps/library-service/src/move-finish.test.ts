@@ -396,6 +396,8 @@ describe("FR-755 (R578 (1)): opening the new place of an unfinished move finishe
       const [oldAt, destAt] = [await hashes(path), await hashes(dest)];
       const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
       expect([r.json.mode, r.json.readOnlyReason]).toEqual(["read-only", "move-incomplete"]);
+      // FR-068 (R607 c): the old copy is marked, so this is not the stale copy of a move: its faults are still said, as today.
+      expect([r.json.staleMoveOf, stateOf()]).toEqual([undefined, expect.not.objectContaining({ staleMoveOf: expect.anything() })]);
       // The read-only opening's own check reports the log's fault too (empty, or shortened).
       expect(stateOf().integrityWarnings).toContainEqual({ projectId: "*", project: "library", kind: "move-not-finished-files-differ", detail: expect.any(String), count: 1, place: path });
       expect(kindsNow().filter((k) => k !== "move-not-finished-files-differ")).toEqual([how === "cut to nothing" ? "empty" : "truncated"]);
@@ -629,5 +631,24 @@ describe("FR-068 (R607 a): a folder holding the copy of a move that stopped befo
     expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
     expect(svc!.state.session!.lib.root).toBe(c);
     expect(await total(pid)).toBe(3);
+  });
+});
+
+describe("FR-068 (R607 c): the stale folder, opened, says what it is and accuses nothing", () => {
+  it("the folder of a move that stopped before its old copy was marked, the library changed since at its old place: read-only, the old place named, no warning, nothing written", async () => {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    await mkdir(join(path, "MOVED.json"));
+    expect(lastLine(await move(dest)).error).toBeDefined();
+    await rm(join(path, "MOVED.json"), { recursive: true });
+    expect((await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await pdf("c.pdf", "Lighthouse keeper diary")] } })).status).toBe(200);
+    await svc!.state.idle();
+    const before = await hashes(dest);
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect([r.status, r.json.mode, r.json.readOnlyReason, r.json.staleMoveOf]).toEqual([200, "read-only", "move-incomplete", path]);
+    expect(stateOf()).toMatchObject({ readOnlyReason: "move-incomplete", staleMoveOf: path });
+    expect(kindsNow()).toEqual([]);
+    await svc!.state.idle();
+    expect(changedFiles(before, await hashes(dest))).toEqual([]);
   });
 });

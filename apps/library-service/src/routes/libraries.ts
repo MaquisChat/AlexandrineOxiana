@@ -51,6 +51,8 @@ function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
     ...(s.lib.movedTo?.unfinished ? { moveUnfinishedTo: s.lib.movedTo.newRoot } : {}),
     // R590 N5: and where the move's journal at the new place is damaged, that the app cannot finish it.
     ...(s.lib.movedTo?.unfinished && s.lib.movedTo.journalDamaged ? { moveCannotFinish: true } : {}),
+    // FR-068 (R607 c): the copy of a move that stopped before its old copy was marked: where the library still is.
+    ...(s.lib.staleMoveOf ? { staleMoveOf: s.lib.staleMoveOf } : {}),
     // Only the holding device's name (R118): never its id, process or a user name.
     ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
     // Being rebuilt, failed, or not writable (read-only): absent when the index is ready (D8).

@@ -15,7 +15,7 @@ import {
   startHeartbeat,
   type LockInfo,
 } from "./lock.js";
-import { movedToFor, unfinishedSplitFrom, type MovedTo } from "./old-copies.js";
+import { movedToFor, staleMoveCopyAt, unfinishedSplitFrom, type MovedTo } from "./old-copies.js";
 import { registerLibrary } from "./registry.js";
 
 export const FORMAT_VERSION = 1;
@@ -47,6 +47,12 @@ export interface Library {
    * move's switch did not finish; complete it with `completeMove(newRoot, …)`.
    */
   movedTo?: MovedTo;
+  /**
+   * FR-068 (R607 c): with `move-incomplete`, this folder holds the copy of this computer's move that stopped before its
+   * old copy was marked, and the library is seen to be still at this old place: nothing here is the library. Its audit
+   * logs are then not compared with this computer's record of them (they are only older than the living library's).
+   */
+  staleMoveOf?: string;
   /**
    * With `locked-by-other-device`: the name of the device holding the lock (its hostname from the
    * lock file), when known and plausible. Only the device's name: the lock records no user name.
@@ -285,7 +291,11 @@ export async function openLibraryInternal(
   // into a moving project the finishing would have to leave behind.
   const split = await unfinishedSplitFrom(deps, root, meta.libraryId).catch(() => undefined);
   if (split) return readOnly("moved", split);
-  if (!internal.ignoreMoveJournal && (await exists(join(root, MOVE_JOURNAL)))) return readOnly("move-incomplete");
+  if (!internal.ignoreMoveJournal && (await exists(join(root, MOVE_JOURNAL)))) {
+    const staleMoveOf = await staleMoveCopyAt(deps, root, meta.libraryId).catch(() => undefined);
+    const lib = readOnly("move-incomplete");
+    return staleMoveOf ? Object.assign(lib, { staleMoveOf }) : lib;
+  }
   // Same-process double open: the lock on disk is ours, so the lock rules
   // alone would let a second handle through.
   const onDisk = await readLock(root);

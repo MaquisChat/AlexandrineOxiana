@@ -22,8 +22,12 @@ import "./library.css";
 export type BannerVariant =
   | { kind: "read-only-locked"; hostname?: string }
   | { kind: "read-only-newer-format" }
-  /** `newRoot`: with "moved", the new place of a move that has not finished (FR-755); `cannotFinish`: the app cannot finish it (R590 N5). */
-  | { kind: "read-only"; reason?: string; newRoot?: string; cannotFinish?: true }
+  /**
+   * `newRoot`: with "moved", the new place of a move that has not finished (FR-755); `cannotFinish`: the app cannot finish
+   * it (R590 N5). `oldRoot`: with "move-incomplete", the old place where the library still is: this folder holds the copy
+   * of a move that stopped before its old copy was marked (FR-068, R607 c).
+   */
+  | { kind: "read-only"; reason?: string; newRoot?: string; cannotFinish?: true; oldRoot?: string }
   | { kind: "offline"; volume: string }
   /** `total` 0: the rebuild has started but not counted the sources yet. */
   | { kind: "index-rebuilding"; done: number; total: number }
@@ -244,6 +248,9 @@ function text(v: BannerVariant): string {
       if (v.reason === "moved" && v.newRoot && v.cannotFinish) {
         return `Read-only — this is the old copy of a library whose move has not finished, and the app cannot finish it: the record of the move kept at its new place, ${v.newRoot}, is damaged. Both copies are kept as they are. Tell the developer before changing or deleting either copy.`;
       }
+      if (v.reason === "move-incomplete" && v.oldRoot) {
+        return `Read-only — this folder holds the copy of a move that did not finish. The library is still at ${v.oldRoot}, and nothing here is the library. This folder can be deleted.`;
+      }
       if (v.reason === "moved" && v.newRoot) {
         return `Read-only — this is the old copy of a library whose move has not finished. Open the library at its new place, ${v.newRoot}, and the move will be finished then; nothing is lost.`;
       }
@@ -406,7 +413,7 @@ export interface BannerContext {
 }
 
 /** Banners for the library's state, in order: access, index progress, integrity warnings, project warnings. */
-export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyReason" | "moveUnfinishedTo" | "moveCannotFinish" | "integrityWarnings" | "projectWarnings" | "index" | "notices" | "destructionOldCopiesPending">>, ctx: BannerContext = {}): BannerVariant[] {
+export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyReason" | "moveUnfinishedTo" | "moveCannotFinish" | "staleMoveOf" | "integrityWarnings" | "projectWarnings" | "index" | "notices" | "destructionOldCopiesPending">>, ctx: BannerContext = {}): BannerVariant[] {
   const out: BannerVariant[] = [];
   if (state.mode === "read-only") {
     const r = state.readOnlyReason;
@@ -414,6 +421,7 @@ export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyR
     else if (r === "newer-format") out.push({ kind: "read-only-newer-format" });
     else if (r === "offline") out.push({ kind: "offline", volume: ctx.volume ?? "the library's drive" });
     else if (r === "moved" && state.moveUnfinishedTo) out.push({ kind: "read-only", reason: r, newRoot: state.moveUnfinishedTo, ...(state.moveCannotFinish ? { cannotFinish: true as const } : {}) });
+    else if (r === "move-incomplete" && state.staleMoveOf) out.push({ kind: "read-only", reason: r, oldRoot: state.staleMoveOf });
     else out.push(r ? { kind: "read-only", reason: r } : { kind: "read-only" });
   }
   // The library's state says a rebuild runs (D8) even before progress arrives; progress events say how far.

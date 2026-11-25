@@ -1845,6 +1845,8 @@ export class ServiceState {
       ...(s.lib.movedTo?.unfinished ? { moveUnfinishedTo: s.lib.movedTo.newRoot } : {}),
       // R590 N5: the move's journal at the new place is damaged: the app cannot finish that move.
       ...(s.lib.movedTo?.unfinished && s.lib.movedTo.journalDamaged ? { moveCannotFinish: true } : {}),
+      // FR-068 (R607 c): the copy of a move that stopped before its old copy was marked: where the library still is.
+      ...(s.lib.staleMoveOf ? { staleMoveOf: s.lib.staleMoveOf } : {}),
       ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
       ...(s.indexStatus ? { index: s.indexStatus } : {}),
       integrityWarnings: this.integrityWarnings(s, names),
