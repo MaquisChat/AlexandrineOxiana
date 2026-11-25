@@ -41,6 +41,7 @@ export {
   NotALibraryError,
   WrongLibraryError,
   createLibrary,
+  isClosed,
   openLibrary,
 } from "./library.js";
 export type { Library, LibraryJson, OpenOptions } from "./library.js";

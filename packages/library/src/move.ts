@@ -77,6 +77,8 @@ export type MoveRefusal =
   | "unreadable-project"
   | "name-collision"
   | "old-copy-in-use"
+  /** finishMoveAt: the library's new place is open on another computer. */
+  | "in-use"
   | "nothing-to-complete";
 
 /** The move may not start (or the old copy may not be deleted now); nothing was changed. */
@@ -856,12 +858,11 @@ export async function finishMoveAt(destRoot: string, deps: Deps, opts: { tz?: st
   let lib: Library | undefined;
   try {
     lib = await openLibraryInternal(dest, deps, {}, { ignoreMoveJournal: true });
+    if (lib.readOnlyReason === "locked-by-other-device") throw new MoveNotAllowedError("in-use", "The library's new place is open on another computer");
     if (lib.mode !== "read-write" || lib.id !== j.libraryId) {
       throw new MoveNotAllowedError(
         "read-only",
-        lib.readOnlyReason === "locked-by-other-device"
-          ? "The library's new place is open on another computer"
-          : `The library's new place could not be opened for writing (${lib.readOnlyReason ?? "another library"})`,
+        `The library's new place could not be opened for writing (${lib.readOnlyReason ?? "another library"})`,
       );
     }
     const repo = await openRepo(lib, new KeyRing(), { clock: deps.clock, ...(opts.tz ? { tz: opts.tz } : {}), ...(opts.actor ? { actor: opts.actor } : {}) });

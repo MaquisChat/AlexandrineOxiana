@@ -4,7 +4,8 @@
  * batches), the media worker, the event bus and the daily backup scheduler (R96 carry-overs).
  * Everything that changes the library goes through `@ao/library`.
  */
-import { resolve as resolvePath } from "node:path";
+import { access } from "node:fs/promises";
+import { join as joinPath, resolve as resolvePath } from "node:path";
 import { userInfo } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -70,6 +71,11 @@ import {
   type SearchSettings,
   type SearchSettingsRead,
   writeQueueTurn,
+  finishMoveAt,
+  isClosed,
+  MOVE_JOURNAL,
+  MOVED_MARKER,
+  MoveNotAllowedError,
 } from "@ao/library";
 import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent, IncompleteRollback } from "@ao/shared";
 import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, oldCopiesPendingText } from "@ao/shared";
@@ -122,6 +128,23 @@ export const defaultWorkerProvider = (onLog?: (line: string) => void): WorkerPro
 
 /** The session warning when this computer's watched folders could not be read at open (Rm4). */
 export const WATCHED_FOLDERS_UNREADABLE = "watched-folders-unreadable";
+
+/**
+ * FR-755 (R578): the session warnings of an opening that met this computer's own unfinished move at the library's new
+ * place: finished there, or not finished yet, by the plain cause (the page says each in words; the detail is never shown).
+ */
+export const MOVE_FINISHED_AT_OPENING = "move-finished-at-opening";
+export type MoveNotFinishedKind = "move-not-finished-disk-full" | "move-not-finished-not-writable" | "move-not-finished-in-use" | "move-not-finished";
+
+/** The plain cause of a failed finishing, as the kind of its session warning. */
+function notFinishedKind(err: unknown): MoveNotFinishedKind {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code === "ENOSPC" || code === "EDQUOT") return "move-not-finished-disk-full";
+  if (code === "EACCES" || code === "EPERM" || code === "EROFS" || (err instanceof MoveNotAllowedError && err.code === "read-only")) return "move-not-finished-not-writable";
+  if (err instanceof MoveNotAllowedError && (err.code === "old-copy-in-use" || err.code === "in-use")) return "move-not-finished-in-use";
+  return "move-not-finished";
+}
+const exists = (p: string) => access(p).then(() => true, () => false);
 
 export interface Session {
   lib: Library;
@@ -322,8 +345,55 @@ export class ServiceState {
   /** Opens a library folder (honours the shutdown gate before and after the lock is taken). */
   async openLibrary(root: string): Promise<Library> {
     if (this.shuttingDown) throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
+    const note = await this.finishUnfinishedMove(root);
     const open = this.opts.openLibrary ?? openLibrary;
-    return open(root, this.deps, { onLockLost: () => this.publishState() });
+    const lib = await open(root, this.deps, { onLockLost: () => this.publishState() });
+    if (note) this.noteOpening(lib, note);
+    return lib;
+  }
+
+  /** What an opening of a library found to tell once, by the handle it opened (taken up by `adopt`). */
+  private readonly openingNotes = new WeakMap<Library, { kind: string; detail: string }>();
+  /** The finishing of an unfinished move under way, by folder: a second opening of the same folder waits for it. */
+  private readonly finishing = new Map<string, Promise<{ kind: string; detail: string } | undefined>>();
+
+  /** `note` is shown with the library opened as `lib`, for that session only (FR-755). */
+  noteOpening(lib: Library, note: { kind: string; detail: string }): void {
+    this.openingNotes.set(lib, note);
+  }
+
+  /**
+   * FR-755 (R578): before a folder is opened (the open route, reconnect, the reopening at start), finishes this computer's
+   * own move into it whose switch did not finish (the engine's finishMoveAt: only at the place its record names, once the
+   * old copy is marked; otherwise it writes nothing). Says what to tell the researcher: finished, or not finished yet and
+   * why; nothing when there was no such move. Never throws: a failed finishing leaves the folder to open read-only as
+   * before. Two openings of one folder at once share one finishing; the second has nothing more to tell.
+   */
+  async finishUnfinishedMove(root: string): Promise<{ kind: string; detail: string } | undefined> {
+    const key = resolvePath(root);
+    const running = this.finishing.get(key);
+    if (running) {
+      await running;
+      return undefined;
+    }
+    const run = (async () => {
+      if (!(await exists(joinPath(key, MOVE_JOURNAL))) || (await exists(joinPath(key, MOVED_MARKER)))) return undefined;
+      try {
+        const done = await finishMoveAt(key, this.deps, { tz: this.tz, actor: actor() });
+        if (!done) return undefined;
+        this.opts.log.info({}, "an unfinished move was finished at the library's new place");
+        return { kind: MOVE_FINISHED_AT_OPENING, detail: "" };
+      } catch (err) {
+        this.opts.log.warn({ err: this.describe(err) }, "an unfinished move could not be finished at the library's new place");
+        return { kind: notFinishedKind(err), detail: this.describe(err) };
+      }
+    })();
+    this.finishing.set(key, run);
+    try {
+      return await run;
+    } finally {
+      this.finishing.delete(key);
+    }
   }
 
   // ---- the work registry (R106 C1) -----------------------------------------------------
@@ -657,6 +727,9 @@ export class ServiceState {
   requireSession(): Session {
     const s = this.session;
     if (!s) throw new ApiError(503, "LIBRARY_OFFLINE", "No library is open.");
+    // R573 Minor 2: once a move has closed the old copy (its library and its index), until the service has switched to
+    // the new place, a read is refused as every change is, rather than meeting the closed index.
+    if (this.moving && (isClosed(s.lib) || s.index?.isOpen === false)) this.assertNotMoving();
     if (s.lib.mode === "read-only" && s.lib.readOnlyReason === "offline") throw new ApiError(503, "LIBRARY_OFFLINE", "The library's folder is not reachable.", "offline");
     return s;
   }
@@ -745,6 +818,11 @@ export class ServiceState {
     if (opts.stillWanted && !opts.stillWanted()) {
       index?.close();
       return unwanted();
+    }
+    const note = this.openingNotes.get(lib);
+    if (note) {
+      this.openingNotes.delete(lib);
+      s.sessionWarnings = [...(s.sessionWarnings ?? []), note];
     }
     this.session = s;
     this.notFound = undefined;
@@ -1736,6 +1814,7 @@ export class ServiceState {
       name: s.lib.name,
       mode: s.lib.mode,
       ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
+      ...(s.lib.movedTo?.unfinished ? { moveUnfinishedTo: s.lib.movedTo.newRoot } : {}),
       ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
       ...(s.indexStatus ? { index: s.indexStatus } : {}),
       integrityWarnings: this.integrityWarnings(s, names),
