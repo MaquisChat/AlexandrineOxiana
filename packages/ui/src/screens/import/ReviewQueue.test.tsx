@@ -1263,6 +1263,66 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([HELD_NO_ANSWER_TEXT]);
   });
 
+  /**
+   * Review I2: while the cards are drawn from the last read (the queue's re-read given up), their deciding controls are
+   * aria-disabled (as when busy; no new words) and a press sends nothing; once a read is answered they decide again.
+   */
+  it("R641 C2 (iii), review I2: after the queue's re-read is given up, the cards' deciding controls are aria-disabled and send nothing; answered, they work again", async () => {
+    const o = project();
+    const list = o.projectReview![P1]!;
+    let listReads = 0;
+    let hold = true;
+    let holdDecision = true;
+    o.extra = [
+      http.get(`${SERVICE}/projects/:id/review`, async ({ request }) => {
+        listReads++;
+        if (listReads > 1 && hold) await new Promise<void>((r) => request.signal.addEventListener("abort", () => r(), { once: true }));
+        return HttpResponse.json({ items: list, total: list.length, offset: 0, limit: 500 });
+      }),
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        if (holdDecision) await new Promise<void>((r) => request.signal.addEventListener("abort", () => r(), { once: true }));
+        return HttpResponse.json({ decided: true });
+      }),
+    ];
+    open(o);
+    await ready(RECORD);
+    const off = (title: string) => {
+      for (const b of [use(title), not(title)]) expect(b.getAttribute("aria-disabled")).toBe("true");
+      // No new words: the controls still say what they do.
+      expect(use(title).textContent).toBe("Use this file");
+      expect(not(title).textContent).toBe("Not this file");
+    };
+    refake(["setTimeout", "clearTimeout", "Date"]);
+    try {
+      fireEvent.click(use(RECORD));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+      await vi.waitFor(() => expect(listReads).toBe(2));
+      await vi.advanceTimersByTimeAsync(FIRST_READ_TIMEOUT_MS + 100);
+    } finally {
+      refake(["Date"]);
+    }
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1));
+    // Given up: the cards as last read, deciding nothing.
+    off(RECORD);
+    off("A Second Record");
+    passGuard();
+    fireEvent.click(use("A Second Record"));
+    fireEvent.click(not(RECORD));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(heldCalls.map((c) => c.id)).toEqual(["r7"]);
+    // Answered: the controls decide again.
+    hold = false;
+    holdDecision = false;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Try again" })).toBeNull());
+    await waitFor(() => expect(use("A Second Record").getAttribute("aria-disabled")).toBeNull());
+    expect(not(RECORD).getAttribute("aria-disabled")).toBeNull();
+    passGuard();
+    fireEvent.click(use("A Second Record"));
+    await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r7", "r8"]));
+  });
+
   it("FR-529: a decision given up at 60 seconds that the service records later shows as soon as the service answers, without waiting for the next read", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
