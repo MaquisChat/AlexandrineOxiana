@@ -482,6 +482,9 @@ function skipper(excludedFolders: string[], split: boolean): (rel: string) => bo
   };
 }
 
+/** The verification's words, before the paths it names. */
+const VERIFICATION_FAILED = "Verification failed; nothing was switched or deleted";
+
 function abortOnOdd(w: Walked): void {
   if (w.odd.length > 0) {
     throw new MoveVerificationError(w.odd.slice(0, MAX_LISTED), w.odd.length, "The library contains symbolic links or special files, which are not moved");
@@ -678,6 +681,12 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   const excludedFolders = plan.perProject.filter((p) => exclude.includes(p.projectId)).map((p) => p.folder);
   const { movedAway } = await readProjects(lib.root);
   const journal = await preflight(lib, dest, opts.sourceRepo);
+  // FR-068 (R607 b): a resumed copy writes nothing before the destination is walked: a symbolic link or special file
+  // there (one in place of a folder would take the copy outside the folder) refuses, in the verification's words.
+  if (journal) {
+    const odd = (await walk(dest, () => false)).odd;
+    if (odd.length > 0) throw new MoveVerificationError(odd.slice(0, MAX_LISTED), odd.length, VERIFICATION_FAILED);
+  }
 
   if (opts.index?.isOpen) checkpointTruncate(opts.index.db);
   const split = excludedFolders.length > 0;
@@ -780,7 +789,7 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   bad.push(...atDest.odd);
   if (bad.length > 0) {
     const uniq = [...new Set(bad)];
-    throw new MoveVerificationError(uniq.slice(0, MAX_LISTED), uniq.length, "Verification failed; nothing was switched or deleted");
+    throw new MoveVerificationError(uniq.slice(0, MAX_LISTED), uniq.length, VERIFICATION_FAILED);
   }
 
   // Switch: plan every step, record it, then run the steps.

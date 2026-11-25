@@ -2017,3 +2017,33 @@ describe("FR-068 (R607 a): a move into a folder holding a stopped move's switch 
     });
   }
 });
+
+describe("FR-068 (R607 b): a resumed copy never writes through a link", () => {
+  it("the review's probe P2: the stopped copy's Exports replaced by a link to a folder outside holding a file; the move run again refuses before writing anything, naming it; the file outside is unchanged", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await executeMove(lib, dest, {
+      deps: mkDeps(),
+      env,
+      onProgress: (p) => {
+        if (p.phase === "copy" && p.filesDone >= 3) throw new Error("stop");
+      },
+    }).catch(() => {});
+    expect(JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8")).phase).toBe("copying");
+    const outside = join(tmp, "Outside");
+    await mkdir(outside);
+    await writeFile(join(outside, "private.txt"), "PRECIOUS OUTSIDE FILE");
+    await rm(join(dest, "Exports"), { recursive: true });
+    await symlink(outside, join(dest, "Exports"));
+    const notTheLink = (rel: string) => rel === "Exports";
+    const [destAt, srcAt] = [await hashes(dest, notTheLink), await hashes(lib.root)];
+    const err = await executeMove(lib, dest, { deps: mkDeps(), env }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MoveVerificationError);
+    expect((err as MoveVerificationError).paths).toEqual(["Exports"]);
+    expect((err as Error).message).toBe("Verification failed; nothing was switched or deleted: Exports");
+    expect(await readFile(join(outside, "private.txt"), "utf8")).toBe("PRECIOUS OUTSIDE FILE");
+    expect(await readdir(outside)).toEqual(["private.txt"]);
+    expect([await hashes(dest, notTheLink), await hashes(lib.root)]).toEqual([destAt, srcAt]);
+    expect(lib.mode).toBe("read-write");
+  });
+});
