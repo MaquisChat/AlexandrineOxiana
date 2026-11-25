@@ -44,7 +44,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
-import { test as base, expect, type Page } from "@playwright/test";
+import { test as base, expect, type Page, type Request } from "@playwright/test";
 import { FAKE_SPEECH, FAKE_TOOLS, LIBRARY_DIR, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
 
 /** The desktop shell's origin (apps/library-service/src/auth.ts SHELL_ORIGINS): the page is served here. */
@@ -606,10 +606,43 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl
       },
       { origin: APP_ORIGIN },
     );
+    // FR-750 (R579): the page's requests to the service still in the air (the event stream, which never ends, aside),
+    // so that a screen is not opened by its address while the page before is still reading (`gotoWhenQuiet`).
+    const out = new Set<Request>();
+    /** The requests out when a new document was asked for: once it is in the page they are gone (Chromium may not report their end). */
+    let beforeLoad: Request[] | undefined;
+    const settled = (r: Request) => void out.delete(r);
+    page.on("request", (r) => {
+      if (r.isNavigationRequest() && r.frame() === page.mainFrame()) beforeLoad = [...out];
+      const u = new URL(r.url());
+      if (u.host === service() && u.pathname !== "/events") out.add(r);
+    });
+    page.on("requestfinished", settled);
+    page.on("requestfailed", settled);
+    page.on("framenavigated", (f) => {
+      if (f !== page.mainFrame() || !beforeLoad) return;
+      for (const r of beforeLoad) out.delete(r);
+      beforeLoad = undefined;
+    });
+    inFlight.set(page, out);
     await page.goto(`${APP_ORIGIN}/`);
     await use(page);
   },
 });
+
+/** Per page, its requests to the service still in the air (the event stream aside); filled by the `page` fixture. */
+const inFlight = new WeakMap<Page, Set<Request>>();
+
+/**
+ * FR-750 (R579): opens `url` once the page before has no request to the service in the air — the true state of a page
+ * that has finished reading. Loading a new page while the one before still had requests out made WebKit fail the new
+ * page's first requests at once ("WebKit encountered an internal error"); no scenario is about that.
+ */
+export async function gotoWhenQuiet(page: Page, url: string): Promise<void> {
+  const out = inFlight.get(page);
+  if (out) await expect.poll(() => out.size, { message: "the page before has finished its requests to the service", timeout: 30_000 }).toBe(0);
+  await page.goto(url);
+}
 
 /**
  * Rules of a project without identifiable data and without online lookups: the default rules
@@ -635,7 +668,7 @@ export async function libraryWithProject(
   const encryption = o.passphrase ? { enabled: true, passphrase: o.passphrase } : { enabled: false };
   const created = await app.api<{ project: { id: string; folder: string } }>("POST", "/projects", { name: o.project, governanceYaml: o.governanceYaml ?? OPEN_RULES, encryption });
   expect(created.status, JSON.stringify(created.body)).toBe(200);
-  await page.goto(`${APP_ORIGIN}/?project=${encodeURIComponent(created.body.project.id)}`);
+  await gotoWhenQuiet(page, `${APP_ORIGIN}/?project=${encodeURIComponent(created.body.project.id)}`);
   await expect(page.getByRole("heading", { level: 1, name: o.library })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Projects" }).getByRole("button", { name: o.project })).toHaveAttribute("aria-current", "true");
   return { libraryPath, projectId: created.body.project.id, projectFolder: created.body.project.folder };

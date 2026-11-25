@@ -82,7 +82,7 @@ import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "
 import { join, relative, sep } from "node:path";
 import { parseGovernance } from "../packages/core/src/governance/schema.js";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
-import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
+import { APP_ORIGIN, expect, gotoWhenQuiet, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LOOKUP_FIXTURES } from "./paths.js";
 import { pressByMouse } from "./press.js";
 
@@ -206,7 +206,7 @@ const stateOfRow = (page: Page, w: Work) => rowOf(page, w).locator(".ao-find__st
 const reasonOfRow = (page: Page, w: Work) => rowOf(page, w).locator(".ao-find__reason");
 
 async function openFind(page: Page, projectId: string): Promise<void> {
-  await page.goto(`${APP_ORIGIN}/find?project=${encodeURIComponent(projectId)}`);
+  await gotoWhenQuiet(page, `${APP_ORIGIN}/find?project=${encodeURIComponent(projectId)}`);
   await expect(page.getByRole("heading", { level: 1, name: "Find and acquire" })).toBeVisible();
   await expect(page.getByRole("textbox", { name: "References" })).toBeEnabled({ timeout: STATE_TIMEOUT });
 }
@@ -241,7 +241,7 @@ const useButton = (page: Page, w: Work) => page.getByRole("button", { name: `${W
 const notThisButton = (page: Page, w: Work) => page.getByRole("button", { name: `${WORDS.notThis} for ${named(w)}`, exact: true });
 
 async function openReviewQueue(page: Page, projectId: string): Promise<void> {
-  await page.goto(`${APP_ORIGIN}/import/review?project=${encodeURIComponent(projectId)}`);
+  await gotoWhenQuiet(page, `${APP_ORIGIN}/import/review?project=${encodeURIComponent(projectId)}`);
   await expect(page.getByRole("heading", { level: 1, name: "Review queue" })).toBeVisible();
   await expect(page.getByRole("heading", { level: 2, name: WORDS.section })).toBeVisible({ timeout: STATE_TIMEOUT });
 }
@@ -842,7 +842,7 @@ test("a copy service switched off in Search sources is not asked; switched on ag
 
   /** On the Search sources screen (opened for the project), exactly the copy services named ticked, then saved. */
   async function copiesOn(on: string[]): Promise<void> {
-    await page.goto(`${APP_ORIGIN}/settings/search-sources?project=${encodeURIComponent(projectId)}`);
+    await gotoWhenQuiet(page, `${APP_ORIGIN}/settings/search-sources?project=${encodeURIComponent(projectId)}`);
     await expect(page.getByRole("heading", { level: 1, name: "Search sources" })).toBeVisible();
     await expect(group().getByRole("checkbox", { name: "Europe PMC", exact: true })).toBeEnabled({ timeout: STATE_TIMEOUT });
     for (const name of WORDS.copyServices) {

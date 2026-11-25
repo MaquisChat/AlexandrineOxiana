@@ -44,7 +44,7 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
+import { APP_ORIGIN, expect, gotoWhenQuiet, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR } from "./paths.js";
 
 // ---------- what is typed, and what the recorded answers say ----------
@@ -153,7 +153,7 @@ async function expectNoOpenCopy(app: AppHarness, projectId: string, row: Row, do
 
 /** The Find and acquire screen for a project (by its address, as the Library screen's link leads there). */
 async function openFind(page: Page, projectId: string): Promise<void> {
-  await page.goto(`${APP_ORIGIN}/find?project=${encodeURIComponent(projectId)}`);
+  await gotoWhenQuiet(page, `${APP_ORIGIN}/find?project=${encodeURIComponent(projectId)}`);
   await expect(page.getByRole("heading", { level: 1, name: "Find and acquire" })).toBeVisible();
   await expect(page.getByRole("textbox", { name: "References" })).toBeEnabled({ timeout: STATE_TIMEOUT });
 }
