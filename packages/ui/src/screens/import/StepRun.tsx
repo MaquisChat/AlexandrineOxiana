@@ -84,8 +84,9 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
     (async () => {
       // On arrival: the batch may already be paused or over (R115 minor).
       if (await recheck()) return;
-      // R658: the tries in a row that did not prove themselves. A connection proves itself by delivering an event (any
-      // event), or by staying open and silent to its quiet limit; one that closes at once, or never opens, does not.
+      // R658, R659: the tries in a row that did not prove themselves. A connection proves itself by delivering a progress
+      // event of this batch, or by staying open and silent to its quiet limit. Any other event (the service's opening
+      // `library.state`, another batch's) proves nothing; nor does a stream that closes at once, or never opens.
       let tries = 0;
       while (!stop && !over.current) {
         let failure: unknown;
@@ -99,8 +100,8 @@ export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArriv
             void recheck();
           };
           for await (const e of client.events({ signal: ctl.signal, onOpen, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
-            proved = true;
             if (!isProgressFor(batchId, e)) continue;
+            proved = true;
             const d = e.data;
             if (typeof d.done === "number") setDone(d.done);
             if (typeof d.total === "number") setTotal(d.total);

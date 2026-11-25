@@ -243,24 +243,53 @@ describe("Import wizard, run step: its first read and its event stream (FR-756, 
     expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
   });
 
-  it("R658: a stream that delivered an event and then dropped, more times than the step's tries, does not end in the notice: the step keeps following", async () => {
-    // Each of the first five streams delivers one event (another batch's: any event proves the connection) and ends.
+  /** R659: `/events` answered as the real service does: the opening `library.state` event, then `then`, then the stream
+   *  ends. Connections after `upTo` are held, never opening (the step rests there); `n()` counts the connections. */
+  function dropping(then: string, upTo = Infinity) {
     let n = 0;
     const requests: Request[] = [];
     const gate = hang();
-    const other = `event: import.progress\ndata: ${JSON.stringify({ batchId: "another-batch", projectId: P1, state: "running", done: 1, total: 2 })}\n\n`;
-    const dropping = http.get(url("/events"), async ({ request }) => {
-      requests.push(request);
-      if (++n <= 5) return new HttpResponse(`: connected\n\n${other}`, { headers: { "Content-Type": "text/event-stream" } });
-      await gate;
-      return undefined;
-    });
-    open({ batches: [running], extra: [dropping] });
+    const opening = `event: library.state\ndata: ${JSON.stringify({ open: true, libraryId: "lib-1", mode: "read-write" })}\n\n`;
+    return {
+      handler: http.get(url("/events"), async ({ request }) => {
+        requests.push(request);
+        if (++n <= upTo) return new HttpResponse(`${opening}${then}`, { headers: { "Content-Type": "text/event-stream" } });
+        await gate;
+        return undefined;
+      }),
+      n: () => n,
+      requests,
+    };
+  }
+  const progress = (batchId: string) => `event: import.progress\ndata: ${JSON.stringify({ batchId, projectId: P1, state: "running", done: 1, total: 3 })}\n\n`;
+
+  it("R659: a stream that sends only the service's opening state and ends, every time, ends after the step's tries in the notice with “Check again”; the step then rests", async () => {
+    const events = dropping("");
+    open({ batches: [running], extra: [events.handler] });
+    await screen.findByText(/Progress updates are not available right now/, {}, { timeout: 20_000 });
+    expect(screen.getByRole("button", { name: "Check again" })).toBeTruthy();
+    // The step's loop has ended with the notice: no further connection is made.
+    expect(events.n()).toBe(3);
+  });
+
+  it("R658, R659: a stream that delivered a progress event of this batch and then dropped, more times than the step's tries, does not end in the notice: the step keeps following", async () => {
+    // Each of the first five streams sends the opening state, then this batch's progress, and ends; the sixth is held.
+    const events = dropping(progress(B1), 5);
+    open({ batches: [running], extra: [events.handler] });
     await screen.findByRole("heading", { name: "Run" });
-    await waitFor(() => expect(n).toBe(6), { timeout: 20_000 });
-    expect(requests[5]!.signal.aborted).toBe(false);
+    await waitFor(() => expect(events.n()).toBe(6), { timeout: 20_000 });
+    expect(events.requests[5]!.signal.aborted).toBe(false);
     expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
     expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+    expect(screen.getByText("1 of 3 items")).toBeTruthy();
+  });
+
+  it("R659: a stream that delivered the opening state and another batch's event and then dropped, every time, ends after the step's tries in the notice", async () => {
+    const events = dropping(progress("another-batch"));
+    open({ batches: [running], extra: [events.handler] });
+    await screen.findByText(/Progress updates are not available right now/, {}, { timeout: 20_000 });
+    expect(screen.getByRole("button", { name: "Check again" })).toBeTruthy();
+    expect(events.n()).toBe(3);
     expect(screen.getByText("Starting…")).toBeTruthy();
   });
 });

@@ -481,6 +481,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
         } finally {
           clearTimeout(quiet);
         }
+        // R659: StepRun reads "opened, then this error" as "open and silent to the quiet limit": change the two together.
         if (gaveUp && !o.signal?.aborted) throw noAnswerInTime();
         if (chunk.done) break;
         for (const e of parser.push(decoder.decode(chunk.value, { stream: true }))) {
