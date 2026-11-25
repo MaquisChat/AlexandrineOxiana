@@ -1023,7 +1023,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
    * holds (the cards have moved, as the researcher asked).
    */
   const layOutAgain = () => {
-    const list = itemsRef.current ?? [];
+    // Review 2 (I1): while the queue's re-read got no answer, the queue as last read (the cards shown from it).
+    const list = itemsRef.current ?? lastRead.current ?? [];
     putLayout({ items: list.filter(isFound) as HeldItem[], ended: {} });
     holdQuiet(Date.now());
     setStatus(FOUND_FILES_TEXT.laidOut);

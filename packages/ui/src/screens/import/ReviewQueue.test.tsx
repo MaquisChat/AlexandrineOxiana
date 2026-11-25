@@ -7,7 +7,7 @@ import { BASE as SERVICE, mockService, PSEUDONYMISING_GOVERNANCE, server, type S
 import { renderToStaticMarkup } from "react-dom/server";
 import { HELD_FILE_LOOKS_RIGHT_TEXT, HELD_FILE_WHY_TEXT } from "@ao/shared";
 import { FilePreview } from "./FilePreview";
-import { DECIDE_SETTLE_MS, HELD_DECISION_TIMEOUT_MS, HELD_NO_ANSWER_TEXT, ReviewQueue } from "./ReviewQueue";
+import { DECIDE_SETTLE_MS, FOUND_FILES_TEXT, HELD_DECISION_TIMEOUT_MS, HELD_NO_ANSWER_TEXT, ReviewQueue } from "./ReviewQueue";
 import { FIRST_READ_TIMEOUT_MS } from "../../api/firstRead";
 import { SCROLL_SETTLE_MS } from "./pressGuard";
 
@@ -1321,6 +1321,68 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
     passGuard();
     fireEvent.click(use("A Second Record"));
     await waitFor(() => expect(heldCalls.map((c) => c.id)).toEqual(["r7", "r8"]));
+  });
+
+  // Review 2, I1: "Show them" while the cards come from the last read lays the section out from that read.
+  it("R641 C2 (iii), review 2 I1: “Show them” pressed while the queue's re-read is given up lays the cards out as last read, with their messages; nothing untrue is said; answered, the list is right", async () => {
+    const o = project();
+    const THIRD = "A Third Record";
+    o.sources = { ...o.sources, s9: source(9, THIRD) };
+    let list = o.projectReview![P1]!;
+    let listReads = 0;
+    let hold = false;
+    o.extra = [
+      http.get(`${SERVICE}/projects/:id/review`, async ({ request }) => {
+        listReads++;
+        if (hold) await new Promise<void>((r) => request.signal.addEventListener("abort", () => r(), { once: true }));
+        return HttpResponse.json({ items: list, total: list.length, offset: 0, limit: 500 });
+      }),
+      http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+        heldCalls.push({ id: params.itemId as string, body: await request.json() });
+        await new Promise<void>((r) => request.signal.addEventListener("abort", () => r(), { once: true }));
+        return HttpResponse.json({ decided: true });
+      }),
+    ];
+    open(o);
+    await ready(RECORD);
+    const titles = () => [...document.querySelectorAll(".ao-review__file h4")].map((h) => h.textContent);
+    /** The line that counts files that arrived (not its never-seen stand-in). */
+    const arrivedLine = () => document.querySelector(".ao-review__arrivals > p:not(.ao-review__ghost)");
+    refake(["setTimeout", "clearTimeout", "Date"]);
+    try {
+      // A decision given up; the next read brings a new file in (only counted, R319 c).
+      list = [...list, heldItem(9, { sourceId: "s9", title: THIRD })];
+      fireEvent.click(use(RECORD));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+      await vi.waitFor(() => expect(listReads).toBe(2));
+      await vi.waitFor(() => expect(screen.getByText(FOUND_FILES_TEXT.arrived(1))).toBeTruthy());
+      // A second decision given up; its re-read given up too.
+      vi.setSystemTime(Date.now() + DECIDE_SETTLE_MS + 1);
+      hold = true;
+      fireEvent.click(use("A Second Record"));
+      await vi.advanceTimersByTimeAsync(HELD_DECISION_TIMEOUT_MS + 100);
+      await vi.waitFor(() => expect(listReads).toBe(3));
+      await vi.advanceTimersByTimeAsync(FIRST_READ_TIMEOUT_MS + 100);
+    } finally {
+      refake(["Date"]);
+    }
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1));
+    expect(heldCalls.map((c) => c.id)).toEqual(["r7", "r8"]);
+    fireEvent.click(screen.getByRole("button", { name: FOUND_FILES_TEXT.showThem }));
+    // Laid out as last read: the two cards keep their messages, the new file comes in, nothing says files arrived.
+    await waitFor(() => expect(titles()).toEqual(expect.arrayContaining([RECORD, "A Second Record", THIRD])));
+    expect(titles()).toHaveLength(3);
+    expect(within(card(RECORD)).getByText(HELD_NO_ANSWER_TEXT)).toBeTruthy();
+    expect(within(card("A Second Record")).getByText(HELD_NO_ANSWER_TEXT)).toBeTruthy();
+    expect(arrivedLine()).toBeNull();
+    // Answered: the list is right.
+    hold = false;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Try again" })).toBeNull());
+    await waitFor(() => expect(use(THIRD).getAttribute("aria-disabled")).toBeNull());
+    expect(titles()).toHaveLength(3);
+    expect(titles()).toEqual(expect.arrayContaining([RECORD, "A Second Record", THIRD]));
+    expect(arrivedLine()).toBeNull();
   });
 
   it("FR-529: a decision given up at 60 seconds that the service records later shows as soon as the service answers, without waiting for the next read", async () => {
