@@ -220,6 +220,45 @@ describe("Missing files: the check says how far it is, and can be stopped (R641 
     expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
   });
 
+  // R658: "Check again" goes away when the check starts; focus is handed on to the screen's heading, never dropped.
+  it("R658: “Check again” after a stop, pressed, hands focus to the screen's heading as the check starts", async () => {
+    const check = ndjsonCheck();
+    server.use(check.handler);
+    render(<MissingFiles api={makeApi()} isWindows={false} />);
+    await waitFor(() => expect(check.asks).toHaveLength(1));
+    check.asks[0]!.send({ progress: { checked: 3, total: 10 } });
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Stop" }));
+    const again = await screen.findByRole("button", { name: "Check again" });
+    await waitFor(() => expect(document.activeElement).toBe(again));
+    await user.click(again);
+    await waitFor(() => expect(check.asks).toHaveLength(2));
+    expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Missing files" }));
+  });
+
+  it("R658: “Check again” under a failed check, pressed, hands focus to the screen's heading as the check starts", async () => {
+    const check = ndjsonCheck();
+    server.use(check.handler);
+    render(<MissingFiles api={makeApi()} isWindows={false} />);
+    await waitFor(() => expect(check.asks).toHaveLength(1));
+    check.asks[0]!.send({ progress: { checked: 3, total: 10 } });
+    check.asks[0]!.cut();
+    await screen.findByRole("alert");
+    await userEvent.setup().click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(check.asks).toHaveLength(2));
+    expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Missing files" }));
+  });
+
+  it("R658: the screen's first check, at its opening, does not take focus to the heading", async () => {
+    const check = ndjsonCheck();
+    server.use(check.handler);
+    render(<MissingFiles api={makeApi()} isWindows={false} />);
+    await waitFor(() => expect(check.asks).toHaveLength(1));
+    expect(document.activeElement).toBe(document.body);
+  });
+
   it("the progress is shown as it comes, but told to a screen reader at most every five seconds; the stopped sentence at once (review M3)", async () => {
     const check = ndjsonCheck();
     server.use(check.handler);

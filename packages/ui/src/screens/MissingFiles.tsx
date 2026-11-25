@@ -43,6 +43,7 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
   const [stopped, setStopped] = useState(false);
   const running = useRef<AbortController | null>(null);
   const checkAgainRef = useRef<HTMLButtonElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   /** Review M3: the progress line as last told to a screen reader, and when. */
   const [said, setSaid] = useState("");
   const saidAt = useRef(Number.NEGATIVE_INFINITY);
@@ -96,6 +97,11 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
   useEffect(() => {
     if (stopped) checkAgainRef.current?.focus();
   }, [stopped]);
+  /** R658: "Check again" goes away as the check starts; focus, which was on it, is handed to the heading. */
+  const checkAgain = () => {
+    headingRef.current?.focus();
+    void load();
+  };
 
   const search = async () => {
     setBusy(true);
@@ -113,7 +119,9 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
   const missing = integrity?.report.missing ?? [];
   return (
     <main className="ao-screen">
-      <h1>Missing files</h1>
+      <h1 ref={headingRef} tabIndex={-1}>
+        Missing files
+      </h1>
       {error ? (
         <p role="alert" className="ao-warning">
           {error}
@@ -122,7 +130,7 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
       {stopped ? (
         <div className="ao-actions">
           <p role="status">The check was stopped. Nothing was changed.</p>
-          <button type="button" ref={checkAgainRef} onClick={() => void load()}>
+          <button type="button" ref={checkAgainRef} onClick={checkAgain}>
             Check again
           </button>
         </div>
@@ -130,7 +138,7 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
         error ? (
           // A check that failed (partway or at once) has a way on (review I2).
           <div className="ao-actions">
-            <button type="button" onClick={() => void load()}>
+            <button type="button" onClick={checkAgain}>
               Check again
             </button>
           </div>
