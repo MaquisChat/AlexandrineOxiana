@@ -147,3 +147,15 @@ The coordinator's rulings after the whole-branch review and the owner's first tr
 | A refusal never advises deleting a folder that may be the library (R610, R612) | One sentence for every refused case | Where that move's mark exists or the old place cannot be seen, the folder may hold the library itself |
 | After a container restart the join was pushed to the reader branch before the last test step's re-run was in, without a build request (R615) | Waiting for the re-run | Four approved pieces existed only on one machine; a push without a build request starts GitHub's check and no Mac build |
 | A failing scenario is read before it is believed, and a fault of the test harness is mended in the harness (R614) | Re-running until green | The two failures were the harness opening a page while the page before was between two of its reads; the app was not at fault |
+
+## Decisions of build request 14 (25 November 2026)
+
+| Decision | Alternative rejected | Why; cost if wrong |
+|---|---|---|
+| A hypothesis is not written into the ledger, or told to the owner, as a finding before a probe has tested it (R626 c) | Recording the likeliest reading at once (R622: "intermittent, an entry tried early"; R625: "the real clock, every time") | Two wrong readings in a row reached the owner; the debugger's runs disproved both within the hour. Cost: a slower first message |
+| A failing check is not run again before its cause is read (R625, R626) | Re-running until green | The second run of CI run 289 failed again and told nothing new; the cause was a fault of the app that a green re-run would have hidden |
+| A download checks its signal right before every request (R626, R627) | Trusting the network library to drop a request whose signal is already aborted | Probed against a local server: it dispatches the request and opens a connection before it notices the abort, so "nothing is asked after a stop" did not hold |
+| A test that ends while its run is still live stops its runners BEFORE its network mock is taken away (R627 c, R628) | Relying on the product's check alone | A run that is still live is not stopped yet; only the order of the test's clean-up closes that window |
+| The same fault elsewhere (FR-764) and the lookups that go on after a project's lock or a move (FR-765) are the NEXT piece, not part of build 14 (R627 d) | Holding build 14 for them | They are older than this work and need their own tests and review; build 14 already mends what the check caught |
+| A stopped run's lookups are to be ended by a signal the run owns, carried through the lookup context — never by halting the shared lookup client (R627 d; the brief `task-FR765-brief.md`) | Halting the client at a lock, as a close does | Other projects' lookups share the client; a lock of one project must not cut theirs |
+| `main` is asked for build 14, not for build 13 alone (R625, R626 h) | Merging build 13 while GitHub's check on it was red | The check failed twice on build 13's commit, and the mend is a fix of the app. Cost: `main` stays at build 12's state some hours longer |
