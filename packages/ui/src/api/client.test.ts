@@ -506,6 +506,8 @@ describe("events() — SSE over fetch streaming (not EventSource)", () => {
     });
 
     it("anything that arrives, the service's keep-alive comment included, starts the silence again", async () => {
+      // On a fake clock: the beats and the silence limit keep their order whatever the machine's load.
+      vi.useFakeTimers();
       const timers: ReturnType<typeof setInterval>[] = [];
       const { f, signals } = quietStream("event: library.state\ndata: {}\n\n", (send) => {
         let beats = 0;
@@ -522,12 +524,15 @@ describe("events() — SSE over fetch streaming (not EventSource)", () => {
       try {
         const it = createClient(BASE, TOKEN, { fetch: f.fetch }).events({ signal: ac.signal, openWithinMs: 5_000, quietWithinMs: 150 });
         await it.next();
-        // About 360 ms with no event, but a beat every 40 ms: still open, and the next event is delivered.
-        expect((await it.next()).value).toEqual({ type: "job.progress", data: { done: 1 } });
+        // 360 ms with no event, but a beat every 40 ms: still open, and the next event is delivered.
+        const next = it.next();
+        await vi.advanceTimersByTimeAsync(400);
+        expect((await next).value).toEqual({ type: "job.progress", data: { done: 1 } });
         expect(signals[0]!.aborted).toBe(false);
       } finally {
         timers.forEach(clearInterval);
         ac.abort();
+        vi.useRealTimers();
       }
     });
 

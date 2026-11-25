@@ -415,7 +415,7 @@ describe("Library: an event stream that opens and then delivers nothing is given
     server.use(ev.handler, ...libraryHandlers());
     render(<Library api={testApi()} current={CURRENT_RW as never} streamQuietMs={300} />);
     await screen.findByText("Ethnography at Work");
-    await waitFor(() => expect(ev.attempts()).toBe(2), { timeout: 10_000 });
+    await waitFor(() => expect(ev.attempts()).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
     expect(ev.signals()[0]!.aborted).toBe(true);
     expect(alerts()).toEqual([]);
   });

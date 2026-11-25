@@ -219,7 +219,8 @@ describe("Import wizard, run step: its first read and its event stream (FR-756, 
   });
 
   it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled, the batch's state checked, and the stream opened afresh", async () => {
-    const events = holding("/events", () => false);
+    // The second try is held, never opening: the step rests there (its opening limit is the default 20 s).
+    const events = holding("/events", (n) => n === 2);
     const batches = holding(`/projects/${P1}/imports`, () => false);
     open({ batches: [running], extra: [events.handler, batches.handler] }, { streamQuietMs: 300 });
     await screen.findByRole("heading", { name: "Run" });

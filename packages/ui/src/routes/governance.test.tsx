@@ -392,12 +392,25 @@ describe("R641 D1: the Governance form's event stream reconnects by itself, with
         return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
       }),
     });
-    window.history.replaceState(null, "", "/governance?project=p1");
-    render(<GovernanceRoutes client={createClient(BASE, TOKEN)} loc={window.location} streamQuietMs={300} />);
-    expect(await screen.findByText(readOnly, undefined, { timeout: 10_000 })).toBeTruthy();
-    expect(n).toBe(2);
-    expect(requests[0]!.signal.aborted).toBe(true);
-    expect(requests[1]!.signal.aborted).toBe(false);
+    // On a fake clock: the silence limit, the pause and the second stream's own silence act only as the test moves time.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      window.history.replaceState(null, "", "/governance?project=p1");
+      render(<GovernanceRoutes client={createClient(BASE, TOKEN)} loc={window.location} streamQuietMs={300} />);
+      await vi.waitFor(() => expect(n).toBe(1));
+      // The clock moves on in steps of 100 ms until the silence limit has given the first stream up …
+      await vi.waitFor(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+        expect(requests[0]!.signal.aborted).toBe(true);
+      });
+      // … then by the pause (2 s), after which it is opened afresh and its first state is shown.
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(screen.getByText(readOnly)).toBeTruthy());
+      expect(n).toBe(2);
+      expect(requests[1]!.signal.aborted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("each pause before the stream is opened again leaves no abort listener behind once it is over (review M4)", async () => {
