@@ -13,6 +13,7 @@ import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 
 import type { AttentionMarkView, AuditCheck, AuditEvent, AuditPage, GovernanceApi, LibraryAuditPage } from "../api/governance";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { DialogShell } from "../components/ReasonDialog";
+import { usePageRead } from "../components/PageReads";
 import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import "./GovernanceScreens.css";
@@ -478,6 +479,16 @@ export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_R
   useEffect(() => {
     void load();
   }, [load]);
+  // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects).
+  const { yields, retryAll } = usePageRead("audit", {
+    sentence: loadUnreachable && error !== null ? error : undefined,
+    out: () => !page && error === null,
+    retry: () => {
+      setError(null);
+      setLoadUnreachable(false);
+      void load();
+    },
+  });
 
   const verify = async () => {
     setChecking(true);
@@ -510,21 +521,12 @@ export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_R
           <Verdict check={check} />
         </section>
       ) : null}
-      {error ? (
+      {error && !(loadUnreachable && yields) ? (
         <p role="alert" className="ao-warning">
           {error}
         </p>
       ) : null}
-      {loadUnreachable && (
-        <TryAgain
-          focusTo={headingRef}
-          onPress={() => {
-            setError(null);
-            setLoadUnreachable(false);
-            void load();
-          }}
-        />
-      )}
+      {loadUnreachable && !yields && <TryAgain focusTo={headingRef} onPress={retryAll} />}
       <NeedsAttention api={api} projectId={projectId} onChanged={() => void load()} />
       {page ? (
         <>

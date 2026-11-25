@@ -20,6 +20,7 @@ import { ApiClientError } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import type { DestructionCertificate, GovernanceApi, Profile, ProtocolDocument, ProtocolDocumentResult, RetentionDue, Violation } from "../api/governance";
 import { FileDrop } from "../components/FileDrop";
+import { usePageRead } from "../components/PageReads";
 import { TryAgain } from "../components/TryAgain";
 import { ConfirmDialog, ReasonDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
@@ -156,6 +157,16 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
   useEffect(() => {
     void load();
   }, [load]);
+  // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects).
+  const { yields, retryAll } = usePageRead("rules", {
+    sentence: loadError !== null && loadUnreachable ? loadError : undefined,
+    out: () => !saved && loadError === null,
+    retry: () => {
+      setLoadError(null);
+      setLoadUnreachable(false);
+      void load();
+    },
+  });
 
   const parsed = useMemo((): { cfg: Config | null; error: string | null } => {
     try {
@@ -279,18 +290,12 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
         <h1 ref={headingRef} tabIndex={-1}>
           Governance
         </h1>
-        <p role="alert" className="ao-warning">
-          {loadError}
-        </p>
-        {loadUnreachable && (
-          <TryAgain
-            focusTo={headingRef}
-            onPress={() => {
-              setLoadError(null);
-              void load();
-            }}
-          />
+        {!(loadUnreachable && yields) && (
+          <p role="alert" className="ao-warning">
+            {loadError}
+          </p>
         )}
+        {loadUnreachable && !yields && <TryAgain focusTo={headingRef} onPress={retryAll} />}
       </main>
     );
   }

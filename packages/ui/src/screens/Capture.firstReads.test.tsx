@@ -171,6 +171,52 @@ describe("Capture route: the list of projects with a project in the address (FR-
   });
 });
 
+describe("Capture route and screen: one sentence and one “Try again” for the page (FR-756, R605 I2)", () => {
+  const route = (m: ReturnType<typeof mockCapture>) => render(<CaptureRoute client={m.client} loc={{ pathname: "/capture", search: `?project=${P1}` }} firstReadMs={300} />);
+
+  it("the route's list given up and the screen's rules failed with no answer say “could not be reached” alone, with one “Try again”, which reads both again", async () => {
+    let answer = false;
+    const projects = holding("/projects", (n) => n === 2);
+    let rulesAsks = 0;
+    const m = mockCapture({
+      extra: [
+        projects.handler,
+        http.get(url(`/projects/${P1}/governance`), () => {
+          rulesAsks++;
+          return answer ? undefined : HttpResponse.error();
+        }),
+      ],
+    });
+    route(m);
+    await waitFor(() => expect(projects.count()).toBe(2));
+    await new Promise((r) => setTimeout(r, 600));
+    expect(alerts()).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("option", { name: "Thesis" });
+    await waitFor(() => expect((screen.getByRole("button", { name: "Capture links" }) as HTMLButtonElement).disabled).toBe(false));
+    expect(projects.count()).toBe(3);
+    expect(rulesAsks).toBe(2);
+    await waitFor(() => expect(alerts()).toEqual([]));
+  });
+
+  it("the mirror: the route's list failed with no answer and the screen's rules given up say “could not be reached” alone, with one “Try again”", async () => {
+    let n = 0;
+    const rules = holding(`/projects/${P1}/governance`, (k) => k === 1);
+    const m = mockCapture({ extra: [http.get(url("/projects"), () => (++n === 2 ? HttpResponse.error() : undefined)), rules.handler] });
+    route(m);
+    await waitFor(() => expect(rules.count()).toBe(1));
+    await new Promise((r) => setTimeout(r, 600));
+    expect(alerts()).toEqual([UNREACHABLE]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("option", { name: "Thesis" });
+    await waitFor(() => expect(rules.count()).toBe(2));
+    await waitFor(() => expect(alerts()).toEqual([]));
+  });
+});
+
 describe("Capture: an event stream that does not open within the limit is tried afresh (FR-756, R597)", () => {
   it("a stream that never opens is closed at the limit and opened afresh after the pause; at that opening the first reads still out are made again", async () => {
     const events = holding("/events", (n) => n === 1);

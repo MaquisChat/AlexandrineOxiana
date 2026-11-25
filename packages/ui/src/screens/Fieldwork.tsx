@@ -11,6 +11,7 @@ import type { ConsentRecord, GovernanceApi, Participant, Session } from "../api/
 import { ApiClientError } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { FileDrop } from "../components/FileDrop";
+import { usePageRead } from "../components/PageReads";
 import { TryAgain } from "../components/TryAgain";
 import { READABLE_SCOPE_TEXT, useReadableNote } from "../components/ReadableNameNote";
 import { ChoiceDialog, ReasonOptionalDialog } from "../components/ReasonDialog";
@@ -171,6 +172,15 @@ export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = F
   useEffect(() => {
     void load();
   }, [load]);
+  // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects).
+  const { yields, retryAll } = usePageRead("fieldwork", {
+    sentence: !participants && loadUnreachable && error !== null ? error : undefined,
+    out: () => !participants && error === null,
+    retry: () => {
+      setError(null);
+      void load();
+    },
+  });
 
   /** A request of this screen is running (R379, I3): a second press, a doubled submit or a held key is not taken. */
   const busyRef = useRef(false);
@@ -237,21 +247,15 @@ export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = F
           Fieldwork
         </h1>
         {error ? (
-          <p role="alert" className="ao-warning">
-            {error}
-          </p>
+          !(loadUnreachable && yields) && (
+            <p role="alert" className="ao-warning">
+              {error}
+            </p>
+          )
         ) : (
           <p role="status">Loading…</p>
         )}
-        {error && loadUnreachable && (
-          <TryAgain
-            focusTo={headingRef}
-            onPress={() => {
-              setError(null);
-              void load();
-            }}
-          />
-        )}
+        {error && loadUnreachable && !yields && <TryAgain focusTo={headingRef} onPress={retryAll} />}
       </main>
     );
   }

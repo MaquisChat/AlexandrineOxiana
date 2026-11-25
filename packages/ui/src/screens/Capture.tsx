@@ -55,6 +55,7 @@ import {
 import { isValidId } from "../api/import";
 import { errorText } from "../api/library";
 import { CaptureQueue } from "../components/CaptureQueue";
+import { PageReads, usePageHost, usePageRead } from "../components/PageReads";
 import { modelOptionLabel, SpeechModelNotice, ToolsLink, useSpeechModels } from "../components/MissingToolNotice";
 import { DEFAULT_SPEECH_MODEL, toolsApi } from "../api/tools";
 import { useTrap } from "../components/ReasonDialog";
@@ -494,6 +495,9 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   }, []);
   /** FR-756, R602 M1: one sentence for the first reads that got no answer ("could not be reached" wins). */
   const noAnswer = oneNoAnswerSentence(Object.values(unanswered));
+  // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects); "Try again" makes
+  // again every first read unanswered or still out.
+  const { yields, retryAll } = usePageRead("capture", { sentence: noAnswer, out: () => out.current.size > 0, retry: () => readAgain(true) });
 
   /** A LEGAL_BASIS_REQUIRED refusal of a queue this screen started opens the legal-basis field (review M7). */
   const noteRefusal = (e: CaptureProgress) => {
@@ -843,19 +847,19 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
           {loadError}
         </p>
       )}
-      {noAnswer !== undefined && (
+      {noAnswer !== undefined && !yields && (
         <p className="ao-capture__error" role="alert">
           {noAnswer}
         </p>
       )}
-      {noAnswer !== undefined && (
+      {noAnswer !== undefined && !yields && (
         <p>
           <button
             type="button"
             onClick={() => {
               // The button goes while the reads are made again: focus waits on the heading, never the page.
               headingRef.current?.focus();
-              readAgain(false);
+              retryAll();
             }}
           >
             Try again
@@ -1170,13 +1174,21 @@ export function CaptureRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS 
   const [unanswered, setUnanswered] = useState(false);
   const [tries, setTries] = useState(0);
   const pickerRef = useRef<HTMLSelectElement>(null);
+  /** The list's read is in the air (it may never settle). */
+  const listOut = useRef(false);
   useEffect(() => {
     let live = true;
     const ac = new AbortController();
+    listOut.current = true;
     readWithin((signal) => api.projects({ signal }), firstReadMs, ac.signal).then(
-      (list) => live && setProjects(list),
+      (list) => {
+        if (!live) return;
+        listOut.current = false;
+        setProjects(list);
+      },
       (err: unknown) => {
         if (!live) return;
+        listOut.current = false;
         // R605 I1: a list not read (given up at the limit, or failed) is never taken for an empty one: the project named
         // in the address stays shown (its working Capture screen, links being typed are not lost), and nothing says it
         // is not one of the library's projects.
@@ -1187,9 +1199,21 @@ export function CaptureRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS 
     );
     return () => {
       live = false;
+      listOut.current = false;
       ac.abort();
     };
   }, [api, firstReadMs, tries]);
+  // R605 I2: the list and the Capture screen's own first reads are one page: one sentence and one "Try again".
+  const { page, sentence: pageSentence, retryAll } = usePageHost({
+    sentence: error !== null && unanswered ? error : undefined,
+    out: () => listOut.current,
+    retry: () => {
+      setError(null);
+      setUnanswered(false);
+      setProjects(undefined);
+      setTries((n) => n + 1);
+    },
+  });
   const list = projects ?? [];
   // A name that is not one of the library's selects none (never another project's screen).
   const unknown = !!asked && (!isValidId(asked) || (!!projects && !list.some((p) => p.id === asked)));
@@ -1207,22 +1231,19 @@ export function CaptureRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS 
           ))}
         </select>
       </nav>
-      {error && (
+      {(pageSentence ?? error) && (
         <p className="ao-capture__error" role="alert">
-          {error}
+          {pageSentence ?? error}
         </p>
       )}
-      {error && unanswered && (
+      {pageSentence !== undefined && (
         <p>
           <button
             type="button"
             onClick={() => {
-              // The button goes while the list is read again: focus waits on the project choice, never the page.
+              // The button goes while the reads are made again: focus waits on the project choice, never the page.
               pickerRef.current?.focus();
-              setError(null);
-              setUnanswered(false);
-              setProjects(undefined);
-              setTries((n) => n + 1);
+              retryAll();
             }}
           >
             Try again
@@ -1234,7 +1255,7 @@ export function CaptureRoute({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS 
           The project in this address is not one of this library&apos;s projects. Choose a project.
         </p>
       )}
-      {projectId && isValidId(projectId) && <Capture key={projectId} client={client} projectId={projectId} firstReadMs={firstReadMs} />}
+      <PageReads value={page}>{projectId && isValidId(projectId) && <Capture key={projectId} client={client} projectId={projectId} firstReadMs={firstReadMs} />}</PageReads>
     </>
   );
 }
