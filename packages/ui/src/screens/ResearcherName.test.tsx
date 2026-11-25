@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
-import { server, testClient, url, useMockService } from "../test/service";
+import { hang, server, testClient, url, useMockService } from "../test/service";
 import { ResearcherNameSetting } from "./ResearcherName";
 
 useMockService();
@@ -61,5 +61,71 @@ describe("researcher name setting (R84/R117)", () => {
     await user.type(await screen.findByRole("textbox", { name: "Your name as researcher" }), "x");
     await user.click(screen.getByRole("button", { name: "Save name" }));
     expect((await screen.findByRole("alert")).textContent).toMatch(/200 characters/);
+  });
+});
+
+describe("researcher name: a first read that never settles (FR-756, R584, R586)", () => {
+  const NO_ANSWER = "The library service did not answer in time.";
+  const READ_FAILED = "Your name as researcher could not be read, so it cannot be changed here now. Nothing was changed.";
+  const field = () => screen.getByRole("textbox", { name: "Your name as researcher" }) as HTMLInputElement;
+  const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
+
+  it("is given up at the limit: the alert and “Try again”, the field still off; pressed, it reads again and the field is on with the name, focus kept", async () => {
+    let answer = false;
+    let n = 0;
+    const gate = hang();
+    server.use(
+      http.get(url("/settings/researcher"), async () => {
+        n++;
+        if (!answer) await gate;
+        return HttpResponse.json({ name: "Ana Souza" });
+      }),
+    );
+    render(<ResearcherNameSetting client={testClient()} firstReadMs={300} />);
+    expect(field().disabled).toBe(true);
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    expect(field().disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Save name" }) as HTMLButtonElement).disabled).toBe(true);
+    await userEvent.setup().click(tryAgain()!);
+    expect(alerts()).toEqual([]);
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 2, name: "Researcher name" }));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(field().disabled).toBe(false));
+    expect(field().value).toBe("Ana Souza");
+    expect(tryAgain()).toBeNull();
+    expect(alerts()).toEqual([]);
+    expect(n).toBe(3);
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 2, name: "Researcher name" }));
+  });
+
+  it("a read that FAILS says what it said before, now with “Try again”; pressed, the field is on", async () => {
+    let fail = true;
+    server.use(http.get(url("/settings/researcher"), () => (fail ? HttpResponse.error() : HttpResponse.json({ name: "Ana Souza" }))));
+    render(<ResearcherNameSetting client={testClient()} firstReadMs={300} />);
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([READ_FAILED]);
+    expect(field().disabled).toBe(true);
+    fail = false;
+    await userEvent.setup().click(tryAgain()!);
+    await waitFor(() => expect(field().disabled).toBe(false));
+    expect(field().value).toBe("Ana Souza");
+  });
+
+  it("a refused save is not offered as “Try again” for the read", async () => {
+    server.use(
+      http.get(url("/settings/researcher"), () => HttpResponse.json({ name: null })),
+      http.put(url("/settings/researcher"), () => HttpResponse.error()),
+    );
+    const user = userEvent.setup();
+    render(<ResearcherNameSetting client={testClient()} firstReadMs={300} />);
+    await waitFor(() => expect(field().disabled).toBe(false));
+    await user.type(field(), "x");
+    await user.click(screen.getByRole("button", { name: "Save name" }));
+    await screen.findByRole("alert");
+    expect(tryAgain()).toBeNull();
   });
 });
