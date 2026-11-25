@@ -122,3 +122,10 @@ The coordinator's rulings after the whole-branch review and the owner's first tr
 |---|---|---|
 | The known-gaps round goes to `main` | The owner: "merge." `main` receives `claude/pdf-reader-highlights` at facf73d and the documents up to R556. FR-749 and decision 31's build follow as their own merges, each on the owner's word. | Verified here and green on GitHub (CI run 284); it also carries the fix that makes `main`'s own check green again. No Mac build of it exists yet (GitHub assigned no Mac). |
 | Decision 31: attaching a file when a metadata service says "too many requests" | The owner: "b now and c next, but have the error read "waiting for lookup service response"". (b): the file is brought in at once, marked "needs review", the reason shown reading "Waiting for lookup service response."; (c), next: a "look up again" that completes such a record later. | Measured: the app waited one to nine minutes per file with only "Attaching…" on the screen (R546). A file the researcher chose should be in the library at once; what the services know can follow. |
+
+### The owner's decision of 24 November 2026, about 7:05 pm Central (Ruling R577)
+
+| Decision | What was decided | Why |
+|---|---|---|
+| Build request 12's state goes to `main` | The owner: "merge when ready". `main` receives `claude/pdf-reader-highlights` at 7d8d861 (the known-gaps round, FR-749, decision 31 (b)) once GitHub's check of that commit is green. | Verified in full twice over (R570–R574); Mac build 12 exists and passed every check, the test of Quit among them (R576). |
+| Decision 31 (c), "Look up again": its four choices | Not answered by the owner; built with the recommendation for each, as the owner was told: automatic and by hand; a later answer never fills a record by itself; the button waits for the service's named time; failed lookups kept and offered by hand only. The owner can change any of them. | Each recommendation is the choice that changes nothing in a record without the researcher's own act (R566). |

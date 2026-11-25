@@ -1,5 +1,11 @@
 # The final review — what I need from you
 
+*Updated 24 November 2026, 7 pm Central: MAC BUILD 12 EXISTS — GitHub gave the build a Mac this time and every check passed, the test of Quit among them. Part 12 says where to download it. It replaces build 10.*
+
+*Updated 24 November 2026, evening: part 12, at the end, is new — closing the library safely (FR-749) and your decision 31 (b) are built, reviewed, tested together and pushed as build request 12; it has four small choices for "Look up again" and asks whether I may merge. Start there.*
+
+*Updated 24 November 2026, mid-afternoon: the known-gaps round is merged to `main` on your word, and decision 31 is decided ((b) now, (c) next); part 11 says so.*
+
 *Updated 24 November 2026, later: part 11, at the end, is new — the known gaps of part 10 are built and pass GitHub's check, but there is no Mac build of them yet: GitHub has not given the build a Mac. Build 10 stays the build to use. Start at part 11; it also has a new decision (31).*
 
 *Updated 24 November 2026: part 10, at the end, is new — the 94 rough edges are fixed and come to you as Mac build 10. Start there.*
@@ -175,7 +181,7 @@ These are small flaws a researcher could meet but that lose nothing important: w
 
 ## 4. Things only you can check
 
-*Use Mac build 10 for these (part 10 says where to download it). Note your findings beside each box.*
+*Use Mac build 12 for these (part 12 says where to download it). Note your findings beside each box.*
 
 ### Installing and opening the app on your Mac
 
@@ -345,7 +351,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 **It is merged.** You asked me to check and merge. `main` now holds everything built so far, and its files are identical to the branch that was verified.
 
-**Your Mac build was build 9 (24 November 2026) when this part was written; **build 10 (part 10) now replaces it.** Build 9 replaced build 8.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. It passed every start-up check on GitHub's Mac, in both the debug app and the release app from the disk image.
+**Your Mac build was build 9 (24 November 2026) when this part was written; **build 12 (part 12) now replaces it** (builds 9 and 10 came in between; there was no build 11). Build 9 replaced build 8.** It is the first Mac build with the PDF reader, Zotero account sync, cloud folders, Find and acquire, and every fix since your build 4. It passed every start-up check on GitHub's Mac, in both the debug app and the release app from the disk image.
 
 - **Why build 9.** In build 8 you found that nothing on the Optional tools screen would install ("The download did not finish…"). The fault was the app's: the helper that downloads the tools looked for its list of trusted certificate authorities in a place that exists on the machine that built the app and not on your Mac, so it trusted nobody and refused every connection. Build 9 carries that list inside the app, and its build proves it from inside the finished app ("118 authorities from the app's own list"). If an install fails now, the message says whether it is the connection or a certificate that could not be verified (a VPN, a security program or a network that inspects secure connections can cause that).
 - **Where (build 9):** GitHub → Actions → "Desktop (macOS)" → run 12 → Artifacts → `alexandrine-oxiana-macos-apple-silicon`. Direct link to the run: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45291457721 — the disk image's checksum (SHA-256) is `1415478b68f59901b1b15a2938b490ca4623e981cb1cb798606fe9c22526852f`. Quit the app, then replace it with the one in this disk image.
@@ -375,7 +381,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 Everything built up to 23 November is on `main`, checked by GitHub and on a Mac. The rough-edge fixes of 24 November are in Mac build 10 and, by your word, on `main` too (part 10). What is left is yours. In the order I would do it:
 
-- [ ] **1. Install Mac build 10** (part 10 says where: run 13's download). It replaces builds 8 and 9: build 8 could not install any optional tool, build 9 mended that, and build 10 adds the rough-edge fixes.
+- [ ] **1. Install Mac build 12** (part 12 says where: run 18's download). It replaces builds 8, 9 and 10: build 9 mended the optional tools' downloads, build 10 added the rough-edge fixes, and build 12 adds the known gaps, the safe closing of the library and attaching without the wait.
 - [ ] **2. Undo the import that stopped when the disk filled, then import again** with enough free space, or with "leave the files where they are".
 - [ ] **3. Work through the hands-on checklist in part 4** (51 boxes, about ten areas). Tell me what you find, in any form; a sentence per problem is enough. Three areas matter most because nothing but your Mac can test them: "Get through my library" (the sign-in window), watched cloud folders, and the macOS prompts.
 - [ ] **4. Answer the decisions.** There are 30 (28, 29 and 30 are new, in part 10); two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26), part 8 (27) and part 10 (28–30).
@@ -502,9 +508,9 @@ The 94 rough edges of part 3 are fixed. They were built in seven batches, and a 
 You said "keep building". The 23 known gaps of part 10 are built; the other two of the 25 are your decisions 28 and 29 and stay so. A second reviewer checked each batch and tried to break it; several were sent back and mended, and then everything was tested together. Nothing in it needs a decision from you before you use it.
 
 - **Where it stands:** built, tested together on my side, and green in GitHub's own check: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45464905103
-- **There is no Mac build of it yet.** I asked for Mac build 11 twice. GitHub cancelled the Mac job four times, each time about fifteen minutes after it was queued, without ever giving it a Mac; nothing of the build ran, so this says nothing about the app. The last time a Mac was given was for build 10, the night before. I cannot see GitHub's reason from here; the cancelled job's page may show it: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45464905098 (the job "apple-silicon (macos-15)"). I will ask again with the next change (FR-749, below) and put the download here when it exists.
-- **Until then, build 10 is the build to use** (part 10 says where). What follows describes the next build.
-- **It is not in `main`** (the approved version). `main` has the rough-edges round (build 10) and lacks this round and the small fix to GitHub's check. **May I merge it?** A yes in the chat is enough.
+- **There is no Mac build of it yet.** I asked for Mac build 11 twice. GitHub cancelled the Mac job four times, each time about fifteen minutes after it was queued, without ever giving it a Mac; nothing of the build ran, so this says nothing about the app. The last time a Mac was given was for build 10, the night before. I cannot see GitHub's reason from here; the cancelled job's page may show it: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45464905098 (the job "apple-silicon (macos-15)"). I will ask again with the next change (FR-749, below) and put the download here when it exists. *(Asked again as build request 12: part 12.)*
+- **Until then, build 10 is the build to use** (part 10 says where). What follows describes the next build. *(That build now exists: Mac build 12, part 12.)*
+- **It is in `main`** (the approved version) since 24 November, about 3 pm Central: you said "merge". The app's code in `main` is, file for file, the code that was tested and that passed GitHub's check. GitHub's check of `main` itself passed on that merge (4:13 pm Central): https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45487722814
 
 ### What you will notice (in the next Mac build)
 
@@ -560,7 +566,7 @@ This is the largest part of the round, and I hope you never meet it: the app was
 
 The reviews caught, on the way: watches restarted in the middle of a move; a ruling of mine that would have moved a hand-placed file into a folder the app empties; and a guard that, in one contrived sequence, would have let a close delete the only copy of a file.
 
-### Things only you can check in the next Mac build (build 11)
+### Things only you can check in the next Mac build (no build 11 was ever made; part 12's list is the one to use)
 
 - [ ] Start a transcription, then quit with **Cmd-Q**. You should see "Closing Alexandrine Oxiana" if closing takes more than two seconds, and the app should end completely. GitHub's Mac has not yet run its test of a quit sent as a system request, because no Mac build has run. Your own Cmd-Q is the last word.
 - [ ] The same with the Dock's Quit.
@@ -574,10 +580,10 @@ The reviews caught, on the way: watches restarted in the middle of a move; a rul
 - 28, links waiting when a project is locked: I recommend (a), leave it so.
 - 29, tool downloads on a network that inspects secure connections: I recommend (a), unless you meet the problem.
 - 30, logging out or shutting down: I recommend (a) now; (c) later if you ever see a "the last change was not finished" notice after a shutdown.
-- **31 (new, below), attaching a file when a metadata service says "too many requests": I recommend (b) now and (c) next.**
+- **31 (new, below), attaching a file when a metadata service says "too many requests": DECIDED on 24 November — you said "b now and c next", and that the message reads "Waiting for lookup service response." (b) is being built now; (c), "look up again", is the piece after it.**
 
 **Listed in this round, not built (most serious first):**
-- **FR-749:** a library closed while a file is still "Attaching…" is written into after its lock is released. Being fixed and reviewed now; it comes with the next build (see "What GitHub's own check found", below).
+- **FR-749:** a library closed while a file is still "Attaching…" is written into after its lock is released. Being fixed and reviewed now; it comes with the next build (see "What GitHub's own check found", below). *(Built since: part 12.)*
 - **FR-738:** a library already holding a change stuck by an older build stays blocked; a backup is the way. Very unlikely (a crash at that one step under build 10 or earlier). In two rare shapes the app also refuses a close that would be safe.
 - **FR-746:** the "never touch what is not its own" rule does not yet cover a hand-put file where the app only adds to its own logs, or inside a folder the change made. Far-fetched.
 - **FR-745:** with a shortcut or folder at a linked file's place, Find and acquire still suggests a disconnected drive; whether to follow such a shortcut is a choice with a safety side.
@@ -602,4 +608,99 @@ The round passed every test on my side, and then GitHub's check of the same code
    **What it is:** When you attach a file, the app first asks public services (Crossref, OpenAlex, Open Library, the Library of Congress) for its details. If one answers "too many requests", the app waits as long as that service asks, up to a minute per try, and then asks again. Measured with a stand-in: one minute for a plain PDF with one such answer; three minutes if every service keeps answering so; nine minutes for a PDF with a DOI. Several files wait one after another. All you see meanwhile is "Attaching…" with the buttons off: no progress and no Cancel. One of these services appears to have changed its limits for requests without a key (its answers now carry a shared allowance), so this may happen more often than it used to. When a lookup fails outright (no network), the file comes in within seconds marked "needs review", and nothing looks that record up again later.
    **Your options:** (a) Wait, as now. (b) Bring the file in at once, marked "needs review", whenever a service asks to wait: small to build; the record then holds only what the file itself says, and you fill in the rest by hand. (c) As (b), and add "look up again", which completes such a record later: a medium piece of work. (d) Keep waiting, but for about ten seconds at most, with "Looking up the details…" and a Cancel.
    **My recommendation:** (b) now and (c) next. A file you chose should be in your library at once; what the services know can follow.
+   **Decided, 24 November:** (b) now and (c) next, with your words: the file comes in at once, marked "needs review", and the line reads "Waiting for lookup service response." One thing to know until (c) is built: nothing looks such a record up again by itself yet, so "waiting" becomes literally true with (c); until then you complete the record by hand in the review queue, or it stays as it is.
    <sub>(FR-748)</sub>
+
+## 12. Added on 24 November, evening: closing the library safely, and attaching without the wait
+
+After the merge you asked for, two more pieces are built. The first mends an older fault: a library closed while a file was still "Attaching…" was written into after its lock was released. The mend covers everything that can still be running when a library closes. The second is your decision 31 (b): attaching a file no longer waits for a metadata service that says "too many requests". Each was checked by reviewers who had not built it and tried to break it: the first through four reviews, the second through two, and both were sent back before they were approved. They were tested together and are pushed as build request 12.
+
+- **Tested together on my side:** every step passes. The first full run caught two faults of the close work, and both were mended before anything was pushed (they are in the list of what was caught, below); the second full run passed everything except one of 224 browser scenarios, which failed once in one browser for a cause that is older than this work and is now understood (FR-750, under "Still open").
+- **GitHub's own check passed** (24 November, 7:40 pm Central): https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45520284119
+- **Mac build 12 exists, and it is the build to use now** (it replaces build 10; there never was a build 11). Run 18 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45520284023 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon`, unzip it and open the `.dmg` inside. Its SHA-256 is `5c418d3874c28ccc6edaa28cb36d5bca7e6883769b35aeee4a5308274b9e7b44`. GitHub gave the job a Mac this time, after five refusals during the day. Every check of the build passed: the app starts from the disk image and its helpers start, answer and stop; every ready-made library inside the media helper is the pinned version (56 of 56); and, for the first time on a Mac, **the test of Quit ran and passed**: a quit sent as a system request closed the app the orderly way twice, and when closing was slowed the window "Closing Alexandrine Oxiana" appeared after two seconds.
+- **It is in `main`** (the approved version) since 24 November, about 7:50 pm Central: you said "merge when ready", and I merged once GitHub's check was green. The app's code in `main` is, file for file, the code Mac build 12 was made from.
+
+### What you will notice
+
+**Attaching a file**
+- When a lookup service answers "too many requests", the file is in your library at once, marked "needs review". Its line in "Attached files" reads: "{file} — Stored; it needs review: Waiting for lookup service response."
+- In the review queue the same sentence stands first under "Why it needs review".
+- The other services are still asked; if one confirms the file, it comes in as usual.
+- A service that asked to wait is left out for every file until the time it named (an hour at most).
+- Bulk Import and Zotero still wait, as before, with their own progress.
+
+**Closing the library, or opening another, while something is running**
+- A file still "Attaching…" is not added, and its line says: "The library was closed or went offline before {file} was attached, so nothing was changed. Attach it again when the library is open."
+- "Bring in the new version…" or "Keep the library's copy as it is", cut the same way, says: "The library was closed or went offline before this could be done, so nothing was changed. Try again when the library is open."
+- A file a watched folder was bringing in stays in its folder and is brought in next time.
+- A Bulk Import is left paused, with no file marked failed, and can be resumed after you open the library again.
+- A backup is cancelled: no backup is made, nothing is recorded, and no "backup failed" warning appears when you open the library again.
+- Quit no longer waits a minute for a file whose lookup was waiting.
+- If the library was closed under a save, Governance and "Your library" say "That library has been closed, so nothing was changed.", not "changed elsewhere", and "Your library" keeps what you typed.
+
+### What became safer underneath
+
+- Once a library is closed, nothing is written into it: the app's own rule, now enforced in one place for every kind of change.
+- A close lets a change that is already being written finish first.
+- In an encrypted project, the keys are wiped only after that.
+- A data destruction caught by a close stops cleanly and is finished the next time the library is opened. A destruction that did happen is never answered with "nothing was changed".
+- Nothing more is sent to a lookup service once the library begins to close.
+- A lookup service that asked to wait is not asked again before its time, also when several files are attached at once.
+
+The reviews caught these on the way:
+- a Bulk Import cut by a close had its remaining files marked failed;
+- a backup cut by a close was recorded as failed;
+- a destruction that had happened could be answered "nothing was changed";
+- a change of mine to the retry record would have let an attempt that crashes the app be made again at every opening;
+- the first build of the "do not wait" rule still asked a service again when files overlapped, and slowed Bulk Import down.
+
+And the full test run, after all the reviews, caught two more, both mended before the push:
+- "Move library" left the old copy's search index open, so the old copy was not the exact copy the move checks for (the index can be rebuilt; nothing of yours was touched);
+- an integrity check that was waiting when the library was moved said the library was "closed" where it should say it was moved.
+
+### Things only you can check in Mac build 12
+
+- [ ] Attach several PDFs at once. They should be in within seconds. A line ending "Waiting for lookup service response." is this case, not an error.
+- [ ] Start a Bulk Import of a folder, close the library while it runs, then open it again. The import should be shown as paused (or "interrupted"), "Resume" should carry it on, and no file should be marked failed.
+- [ ] Attach a large file and close the library at once. The file is either there, complete, or its line says nothing was changed; never half.
+- [ ] Quit with **Cmd-Q** while something long runs (a transcription), and once with the Dock's Quit: the app should end completely, with "Closing Alexandrine Oxiana" shown if closing takes more than two seconds. GitHub's Mac passed its own test of this (above); your own Cmd-Q is the last word.
+- [ ] In Optional tools, install "Speech model: tiny" (still unconfirmed since build 9).
+- [ ] The checks of part 11's list that are not repeated here still apply to this build: a linked file replaced by a folder, and "Move library" to a folder that is not empty while a transcription runs.
+
+### Decision 31 (c): four choices
+
+With (c), an entry that is waiting is looked up again later, and what the service says appears on the entry as suggested matches. Nothing in the record changes until you accept one.
+
+31c-1. **Automatic, or by hand only**
+   **What it is:** Waiting entries can be looked up by themselves while the library is open, and with a "Look up again" button.
+   **Your options:** (a) both; (b) by hand only.
+   **My recommendation:** (a). The automatic tries are limited in number and only add suggested matches.
+
+31c-2. **May a later answer fill a record by itself?**
+   **Your options:** (a) never: it stays a suggestion; (b) allow it for a perfect match.
+   **My recommendation:** (a), never.
+
+31c-3. **"Look up again" before the service's named time**
+   **Your options:** (a) the button waits: it is off and says when it can be used; (b) it sends one request at once, as your own act.
+   **My recommendation:** (a).
+
+31c-4. **Lookups that failed outright** (for example, no network)
+   **Your options:** (a) not covered; (b) kept from now on and offered by hand only; (c) also tried again automatically.
+   **My recommendation:** (b).
+
+I build my recommendation for each unless you say otherwise before the build starts.
+
+### Still open
+
+- **FR-755 (the first thing I build next) — corrected at 7:30 pm Central; what I wrote here before was wrong on one point:** if "Move library" fails at its very last steps — or if the app is killed or the Mac goes down in those last moments of a move — the library is left half-switched. **Nothing is lost:** the new place holds the whole copy, checked file by file before the switch began, and the old copy is untouched. But I wrote that the move "then finishes when the library is opened". It does not: today the app has no way to finish such a move, and the library opens only read-only, at the old place and at the new one, from then on. That is older than this work (it has been so since the move was built) and no review had caught it; the worker building this fix found it by trying it. The fix, being built now: opening the library at its new place finishes the move and tells you so; and a move that fails late closes the library and says where to open it. Until that build: if a move ever ends with the library read-only and the words "a move into this folder has not finished", stop and tell me — do not delete either copy.
+- **FR-750 (built with it):** the Find and acquire screen can sit at "Reading the projects…" with no error and no "Try again" when its very first requests fail. Seen three times in the test browser, never on a Mac so far; the cause is found.
+- **FR-749:** a close waits without a time limit for a change being written, so a change stuck on a vanished network drive holds the close (Quit still gives up after a minute and a half). Unlikely.
+- **FR-749:** a picture or text-recognition job already running at a close can make and remove a scratch folder after it. The app stops these queues first, so you should not meet it.
+- **FR-749:** a Bulk Import that does not pause in time may remove its own scratch folder late. Rare.
+- **FR-749:** a forced exit during a very large cancelled backup can leave a partial file until the next backup. Very unlikely.
+- **Decision 31 (b):** the hold on a service is kept in memory, so after the library is closed and reopened one request can go early. Until (c) is built, nothing looks a waiting record up again by itself.
+- **FR-753:** two small corners of that hold: one request can go early when answers arrive out of order, and a file can wait a moment longer than needed. Nothing is lost.
+- **FR-751:** a destruction certificate's status can say a backup "was not removed by the app" when it was. A wording to correct.
+- **FR-752:** in an encrypted project, a source's folder name and one of its files hold its title in the clear. Whether this is as designed or a gap is being checked; it is not yet judged.
+- **FR-754:** the "automatic backup failed" warning says "make one now from the project's settings", but no screen offers a backup by hand. A sentence to correct, or a button to add.
+- **FR-747:** a test only.
