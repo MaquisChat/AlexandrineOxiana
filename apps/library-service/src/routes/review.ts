@@ -17,6 +17,7 @@ import {
   type ListedReviewEntry,
   type LookUpAgainResult,
   type LookUpState,
+  type LookUpView,
   type ReviewDecision,
   type ReviewPatch,
 } from "@ao/library";
@@ -56,7 +57,7 @@ import { bodyAs, intParam, optObj, paramsOf, projectParam, queryOf, str, strArra
 
 /**
  * Decision 31 (c) (R566 8, R577 iii): what the page needs to offer "Look up again", from the entry's left-out lookups —
- * the state (the library's `lookUpStateOf`), the tries, whether the researcher's act may send now and, when not yet, the
+ * the state (the library's `lookUpStateOf`, with every further state true of it), the tries, whether the researcher's act may send now and, when not yet, the
  * earliest time it may. R585 point 5, R592: "may it send now" and its time are the library's `lookUpNow` — the one rule
  * the act itself applies (a time only a wrong clock could have written counts as passed); the view's own `notBefore` is
  * never passed on. Never a title or an identifier. Absent when nothing was left out.
@@ -65,7 +66,15 @@ function lookUpOut(e: ListedReviewEntry, now: number): ReviewLookUp | undefined 
   const v = lookUpStateOf(e);
   if (!v) return undefined;
   const { canLookUpNow, notBefore } = lookUpNow(e, new Date(now));
-  return { state: v.state, tries: v.tries, canLookUpNow, ...(notBefore ? { notBefore } : {}) };
+  return {
+    state: v.state,
+    tries: v.tries,
+    canLookUpNow,
+    ...(notBefore ? { notBefore } : {}),
+    // R585 M3, R592: every further state true of the entry, in the library's order, and the given-up lookups' tries.
+    ...(v.also?.length ? { also: [...v.also] } : {}),
+    ...(v.gaveUpTries !== undefined ? { gaveUpTries: v.gaveUpTries } : {}),
+  };
 }
 
 /** What the queue sends of an entry (only pending entries are listed). */
@@ -119,6 +128,7 @@ true satisfies Same<Omit<ReviewPatch, "type">, Omit<ReviewEntryPatch, "type">>;
 true satisfies Same<keyof ReviewPatch, keyof ReviewEntryPatch>;
 // Decision 31 (c): the look-up states the page is told are the library's.
 true satisfies Same<LookUpState, ReviewLookUpState>;
+true satisfies Same<NonNullable<LookUpView["also"]>, NonNullable<ReviewLookUp["also"]>>;
 // Every key of the accept decision's draft is one the library's SourceDraft reads: the library skips
 // a key it does not know, so a renamed key would drop the researcher's correction silently (I2).
 true satisfies ([keyof ReviewDraft] extends [keyof SourceDraft] ? true : false);

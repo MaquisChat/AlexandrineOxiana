@@ -708,4 +708,33 @@ describe("joined to the fixed engine (R592)", () => {
     // `sent` is not passed on: the page has no use for the number.
     expect(JSON.stringify(r.json)).not.toContain('"sent"');
   });
+
+  it("point 4 (R585 M3): every true state reaches the page — one lookup answered with matches and another still waiting: `also`, and both sentences in the reasons", async () => {
+    await start();
+    const lib = await libraryWithWaiting(1);
+    // Two lookups of the entry, both waiting (as an attach that left out two lookups writes them); two searches, so
+    // the lookup client's cache cannot answer the second from the first.
+    await patchEntry(lib.pid, lib.sources[0]!, (e) => ({ leftOut: [e.leftOut![0]!, { ...e.leftOut![0]!, title: "Second harbour ledger" }] }));
+    await reopen(lib, 2 * MIN);
+    await svc!.state.idle();
+    const id = bySource(await queue(lib.pid), lib.sources[0]!).id as string;
+    answer = (_h, path) => (path.includes("Second") ? WAIT_HOUR : FOUND);
+    const r = await lookUpAgain(lib.pid, id);
+    expect(r.status, r.body).toBe(200);
+    expect(sent).toHaveLength(2);
+    expect(r.json.entry.lookUp).toEqual({ state: "waiting", tries: 0, canLookUpNow: false, notBefore: expect.any(String), also: ["found"] });
+    expect(r.json.entry.reasons.slice(0, 2)).toEqual([LOOK_UP_AGAIN_TEXT.found, LOOKUP_WAITING_TEXT]);
+    expect(bySource(await queue(lib.pid), lib.sources[0]!)).toEqual(r.json.entry);
+  });
+
+  it("point 4: a mix with \"gave up\" carries the given-up lookups' own tries (`gaveUpTries`); one \"gave up\" and one \"not allowed\" carries both states", async () => {
+    await start();
+    const lib = await libraryWithWaiting(2);
+    const [a, b] = lib.sources;
+    await patchEntry(lib.pid, a!, (e) => ({ leftOut: [e.leftOut![0]!, { ...e.leftOut![0]!, tries: 5, outcome: "gave-up" as const }] }));
+    await patchEntry(lib.pid, b!, (e) => ({ leftOut: [{ ...e.leftOut![0]!, tries: 5, outcome: "gave-up" as const }, { ...e.leftOut![0]!, outcome: "not-allowed" as const }] }));
+    const items = await queue(lib.pid);
+    expect(bySource(items, a!).lookUp).toEqual({ state: "waiting", tries: 0, canLookUpNow: false, notBefore: expect.any(String), also: ["gave-up"], gaveUpTries: 5 });
+    expect(bySource(items, b!).lookUp).toEqual({ state: "gave-up", tries: 5, canLookUpNow: false, notBefore: expect.any(String), also: ["not-allowed"] });
+  });
 });

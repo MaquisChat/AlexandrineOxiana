@@ -12,7 +12,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
-import { LOOKUP_WAITING_TEXT, LOOK_UP_AGAIN_TEXT, lookUpAgainAfter, type ReviewLookUpAgainResponse } from "@ao/shared";
+import { LOOKUP_WAITING_TEXT, LOOK_UP_AGAIN_TEXT, lookUpAgainAfter, lookUpGaveUpText, type ReviewLookUpAgainResponse } from "@ao/shared";
 import type { Candidate, ReviewItem } from "../../api/import";
 import { BASE as SERVICE, mockService, P1, server, type ServiceSetup } from "../../test/importService";
 import { DECIDE_SETTLE_MS, ReviewQueue } from "./ReviewQueue";
@@ -316,5 +316,47 @@ describe("joined to the fixed engine (R592)", () => {
     expect(screen.queryByRole("button", { name: /\(after / })).toBeNull();
     await user.click(b);
     await waitFor(() => expect(lookUpBodies).toEqual([{ itemId: "r1", body: { projectId: P1 } }]));
+  });
+});
+
+describe("every true sentence in a mix (R585 M3, R592 point 4)", () => {
+  const said = () => screen.getAllByRole("status").map((r) => r.textContent ?? "");
+  const reasonsShown = () => within(screen.getByRole("region", { name: "Why it needs review" })).getAllByRole("listitem").map((li) => li.textContent);
+
+  it("one lookup answered with matches and another still waiting: both sentences, each once, and the button; the answer says both", async () => {
+    const later = new Date(Date.now() + 60 * 60_000).toISOString();
+    const reasons = [LOOK_UP_AGAIN_TEXT.found, LOOKUP_WAITING_TEXT, UNIDENTIFIED];
+    const item = entry({ reasons, candidates: [match("Rivers and memory")], lookUp: { state: "waiting", tries: 0, canLookUpNow: true, also: ["found"] } });
+    const after = entry({ reasons, candidates: [match("Rivers and memory")], lookUp: { state: "waiting", tries: 0, canLookUpNow: false, notBefore: later, also: ["found"] } });
+    const { user } = setup(item, [lookUpRoute({ outcome: { kind: "asked-to-wait", notBefore: later }, entry: asEntry(after) })]);
+    await openEntry(user);
+    expect(reasonsShown()).toEqual(reasons);
+    await user.click(await screen.findByRole("button", { name: "Look up again" }));
+    await screen.findByRole("button", { name: lookUpAgainAfter(when(later)) });
+    expect(reasonsShown()).toEqual(reasons);
+    // The main state's sentence, then each further state's, each once.
+    await waitFor(() => expect(said()).toContain(`${LOOKUP_WAITING_TEXT} ${LOOK_UP_AGAIN_TEXT.found}`));
+  });
+
+  it('one "gave up" and one "not allowed": both sentences, and the answer says both, the given-up sentence with its own tries', async () => {
+    const reasons = [LOOK_UP_AGAIN_TEXT.notAllowed, lookUpGaveUpText(5), UNIDENTIFIED];
+    const item = entry({ reasons, lookUp: { state: "gave-up", tries: 5, canLookUpNow: true, also: ["not-allowed"] } });
+    const { user } = setup(item, [lookUpRoute({ outcome: { kind: "asked-to-wait" }, entry: asEntry(item) })]);
+    await openEntry(user);
+    expect(reasonsShown()).toEqual(reasons);
+    expect(screen.getByRole("button", { name: "Look up again" })).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Look up again" }));
+    await waitFor(() => expect(said()).toContain(`${lookUpGaveUpText(5)} ${LOOK_UP_AGAIN_TEXT.notAllowed}`));
+  });
+
+  it("in a mix, the given-up sentence's {n} is the given-up lookups' own tries (gaveUpTries), not the main state's", async () => {
+    const later = new Date(Date.now() + 60 * 60_000).toISOString();
+    const reasons = [LOOKUP_WAITING_TEXT, lookUpGaveUpText(5), UNIDENTIFIED];
+    const item = entry({ reasons, lookUp: { state: "waiting", tries: 1, canLookUpNow: true, also: ["gave-up"], gaveUpTries: 5 } });
+    const after = entry({ reasons, lookUp: { state: "waiting", tries: 1, canLookUpNow: false, notBefore: later, also: ["gave-up"], gaveUpTries: 5 } });
+    const { user } = setup(item, [lookUpRoute({ outcome: { kind: "asked-to-wait", notBefore: later }, entry: asEntry(after) })]);
+    await openEntry(user);
+    await user.click(await screen.findByRole("button", { name: "Look up again" }));
+    await waitFor(() => expect(said()).toContain(`${LOOKUP_WAITING_TEXT} ${lookUpGaveUpText(5)}`));
   });
 });

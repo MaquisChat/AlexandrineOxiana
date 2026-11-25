@@ -258,10 +258,21 @@ const lookUpTime = (iso: string): string => {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 };
 
-/** What the polite region says after a look-up: the state's own sentence (R577 4), or the button's "after {time}". */
+/**
+ * What the polite region says after a look-up: the state's own sentence (R577 4), then (R585 M3, R592) the sentence of
+ * each further state true of the entry, each once, in the library's order — or the button's "after {time}". The
+ * given-up sentence's {n} is the given-up lookups' own tries: `tries` when "gave-up" is the main state, else `gaveUpTries`.
+ */
 function lookUpSaid(outcome: ReviewLookUpOutcome, lookUp: ReviewLookUp | undefined): string {
   if (outcome.kind === "not-yet") return lookUpAgainAfter(lookUpTime(outcome.notBefore));
-  switch (lookUp?.state) {
+  if (!lookUp) return "";
+  const states = [lookUp.state, ...(lookUp.also ?? []).filter((st) => st !== lookUp.state)];
+  return [...new Set(states.map((st) => lookUpStateSentence(st, lookUp)))].join(" ");
+}
+
+/** One look-up state's ruled sentence (R577 4). */
+function lookUpStateSentence(state: ReviewLookUp["state"], lookUp: ReviewLookUp): string {
+  switch (state) {
     case "waiting":
       return LOOKUP_WAITING_TEXT;
     case "found":
@@ -271,11 +282,9 @@ function lookUpSaid(outcome: ReviewLookUpOutcome, lookUp: ReviewLookUp | undefin
     case "not-allowed":
       return LOOK_UP_AGAIN_TEXT.notAllowed;
     case "gave-up":
-      return lookUpGaveUpText(lookUp.tries);
+      return lookUpGaveUpText(lookUp.state === "gave-up" ? lookUp.tries : (lookUp.gaveUpTries ?? lookUp.tries));
     case "failed":
       return LOOK_UP_AGAIN_TEXT.notLookedUpFailed;
-    default:
-      return "";
   }
 }
 

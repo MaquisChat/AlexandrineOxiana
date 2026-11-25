@@ -93,6 +93,13 @@ export interface ReviewLookUp {
   tries: number;
   canLookUpNow: boolean;
   notBefore?: string;
+  /**
+   * R585 M3, R592: every OTHER state true of the entry besides `state` (never "failed"), in the order of the entry's
+   * sentences (found, waiting, nothing, not-allowed, gave-up). Present only in a mix.
+   */
+  also?: Array<Exclude<ReviewLookUpState, "failed">>;
+  /** With "gave-up" in `also`: the tries of the lookups the app gave up on (the given-up sentence's {n}). */
+  gaveUpTries?: number;
 }
 
 /**
