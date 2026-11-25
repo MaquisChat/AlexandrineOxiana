@@ -1596,4 +1596,20 @@ describe("FR-755 (R583): split moves, the check before finishing, and what canno
     await writeFile(join(dest, "library.json"), JSON.stringify({ ...meta, formatVersion: 99 }));
     await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ code: "newer-format" });
   });
+
+  // R590 N4: where the new place cannot be read, whether the move finished cannot be told: the old copy is kept.
+  it("R590 N4: the new place's drive not connected: the old copy cannot be deleted, and the refusal says why", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.fail = { at: "unlink" };
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toMatchObject({ code: "ENOSPC" });
+    await lib.close();
+    await rename(dest, join(tmp, "Unplugged"));
+    const before = await hashes(lib.root);
+    await expect(deleteOldCopy(lib.root, { confirm: true }, { deps: mkDeps() })).rejects.toMatchObject({
+      code: "move-unfinished",
+      message: "The old copy cannot be deleted now: the library's new place cannot be reached, so the app cannot tell whether its move has finished. Connect the drive the new place is on and try again.",
+    });
+    expect(await hashes(lib.root)).toEqual(before);
+  });
 });

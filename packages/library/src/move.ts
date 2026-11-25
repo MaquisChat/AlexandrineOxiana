@@ -34,7 +34,7 @@ import {
   addPendingOldCopy,
   getPendingOldCopy,
   isExpired,
-  journalStillAt,
+  moveFinished,
   listPendingOldCopies,
   listUnfinishedMoves,
   markPendingComplete,
@@ -1324,7 +1324,15 @@ export async function deleteOldCopy(
   }
   if (!rec.complete) throw new InvalidConfirmTokenError("unknown");
   if (root !== rec.oldRoot) throw new InvalidConfirmTokenError("wrong-root");
-  if (await journalStillAt(rec)) {
+  // R583 M2, R590 N4: not while the move is unfinished, nor while that cannot be told (the new place cannot be read).
+  const finished = await moveFinished(rec);
+  if (finished === "cannot-tell") {
+    throw new MoveNotAllowedError(
+      "move-unfinished",
+      "The old copy cannot be deleted now: the library's new place cannot be reached, so the app cannot tell whether its move has finished. Connect the drive the new place is on and try again.",
+    );
+  }
+  if (finished !== "finished") {
     throw new MoveNotAllowedError("move-unfinished", "The move of this library has not finished, so its old copy cannot be deleted yet. Open the library at its new place first; the move is finished then.");
   }
   if (isExpired(rec, deps)) throw new InvalidConfirmTokenError("expired");

@@ -177,25 +177,47 @@ export async function listUnfinishedMoves(
     .map((r) => ({ libraryId: r.libraryId, oldRoot: r.oldRoot, newRoot: r.newRoot, moveId: r.moveId, startedAt: r.createdAt }));
 }
 
+/**
+ * R583 M2, R590 N4: the one judgement of whether a recorded move has finished. "unfinished": the record is not
+ * complete, or its journal is still at the new place; "damaged": a journal is at the new place but cannot be read;
+ * "cannot-tell": the record is complete but the new place cannot be read (its drive is not
+ * connected), so whether its journal is still there is not known; "finished" otherwise. Everything but "finished" counts
+ * as unfinished (it fails closed): the old copy is not deletable, and an old library of a split stays read-only.
+ */
+export type MoveFinished = "finished" | "unfinished" | "damaged" | "cannot-tell";
+export async function moveFinished(rec: Pick<PendingOldCopy, "id" | "newRoot" | "complete">): Promise<MoveFinished> {
+  const at = await journalAt(rec);
+  if (at === "damaged") return "damaged";
+  if (!rec.complete || at === "here") return "unfinished";
+  return at === "unreachable" ? "cannot-tell" : "finished";
+}
+
+/** The move's journal at the record's new place: this record's ("here"), none or another move's ("absent"), unreadable as a journal ("damaged"), or the new place itself cannot be read ("unreachable"). */
+async function journalAt(rec: Pick<PendingOldCopy, "id" | "newRoot">): Promise<"here" | "absent" | "damaged" | "unreachable"> {
+  let raw: string;
+  try {
+    raw = await fsp.readFile(join(rec.newRoot, ".move-journal.json"), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return "unreachable";
+    return (await fsp.stat(rec.newRoot).then((st) => st.isDirectory(), () => false)) ? "absent" : "unreachable";
+  }
+  let j: { libraryId?: unknown; filesDone?: unknown; switch?: { pendingId?: unknown } } | null;
+  try {
+    j = JSON.parse(raw) as typeof j;
+  } catch {
+    return "damaged";
+  }
+  // As the move reads its journal (move.ts readJournal): without these it is not a journal it can use.
+  if (typeof j?.libraryId !== "string" || !Array.isArray(j.filesDone)) return "damaged";
+  return j.switch?.pendingId === rec.id ? "here" : "absent";
+}
+
 /** Where the library at `oldRoot` was moved, from this device's records (newest first). */
 export async function movedToFor(deps: CfgDeps, oldRoot: string, libraryId: string): Promise<{ newRoot: string; unfinished: boolean } | undefined> {
   const r = (await load(deps))
     .filter((x) => x.oldRoot === oldRoot && x.libraryId === libraryId)
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-  return r ? { newRoot: r.newRoot, unfinished: !r.complete || (await journalStillAt(r)) } : undefined;
-}
-
-/**
- * R583 M2: the move's journal is still at its new place (the record may already be marked complete when only the
- * journal's removal failed): the move has not finished.
- */
-export async function journalStillAt(rec: Pick<PendingOldCopy, "id" | "newRoot">): Promise<boolean> {
-  try {
-    const j = JSON.parse(await fsp.readFile(join(rec.newRoot, ".move-journal.json"), "utf8")) as { switch?: { pendingId?: unknown } };
-    return j.switch?.pendingId === rec.id;
-  } catch {
-    return false;
-  }
+  return r ? { newRoot: r.newRoot, unfinished: (await moveFinished(r)) !== "finished" } : undefined;
 }
 
 export async function getPendingOldCopy(deps: CfgDeps, id: string): Promise<PendingOldCopy | undefined> {
