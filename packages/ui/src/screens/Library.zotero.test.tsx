@@ -5,6 +5,7 @@
  * is open, and never an error when the state cannot be read. Against a mocked service shaped like Z8's handler.
  */
 import { ZOTERO_SYNC_REASON_TEXT, zoteroSyncStatusLine, type ZoteroSyncCounts, type ZoteroSyncRun, type ZoteroSyncStateResponse } from "@ao/shared";
+import { StrictMode } from "react";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
@@ -120,6 +121,30 @@ describe("Library: the Zotero lines", () => {
     // Ordinary text in reading order: not an announcement.
     expect(box.closest("[role=status], [role=alert], [aria-live]")).toBeNull();
     expect(box.querySelector("[role=status], [role=alert], [aria-live]")).toBeNull();
+  });
+
+  it("under strict mode (mounted, cleaned up, mounted again) the lines are read once and shown (R623 Minor 5)", async () => {
+    const a = run({ ref: "user:42" });
+    const ev = liveEvents();
+    const signals: AbortSignal[] = [];
+    server.use(
+      ev.handler,
+      ...libraryHandlers(),
+      http.get(url("/zotero/sync"), ({ request }) => {
+        signals.push(request.signal);
+        return HttpResponse.json(stateOf([{ ref: "user:42", projectId: "p1", lastRun: a }]));
+      }),
+    );
+    ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+    render(
+      <StrictMode>
+        <Library api={testApi()} current={CURRENT_RW as never} />
+      </StrictMode>,
+    );
+    const box = await screen.findByTestId("zotero-lines");
+    expect([...box.querySelectorAll("p")].map((p) => p.textContent)).toEqual([`Zotero library user:42: ${zoteroSyncStatusLine(a, new Date())}`]);
+    // The read of the first mount is cancelled by its clean-up; the second mount's is the one answered.
+    expect(signals.filter((s) => !s.aborted)).toHaveLength(1);
   });
 
   it("the other project's links show when it is chosen, and the ones of the project left are gone", async () => {

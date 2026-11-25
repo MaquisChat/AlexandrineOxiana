@@ -107,13 +107,14 @@ export function LibraryZotero({ api, projectId, open, events, firstReadMs }: Pro
       .finally(done);
   };
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // R623 (Minor 5): set again at each mount, as strict mode mounts, cleans up and mounts again.
+    alive.current = true;
+    return () => {
       alive.current = false;
       gen.current++;
-    },
-    [],
-  );
+    };
+  }, []);
 
   // A project shown (or left, or the library closed): the reads of the one before are dropped, and one is made for this.
   useEffect(() => {
