@@ -66,6 +66,8 @@ export {
   acceptMovePlan,
   executeMove,
   finishMoveAt,
+  MoveFinishRefusedError,
+  oldCopyMarkedFor,
   listPendingOldCopies,
   listUnfinishedMoves,
   planMove,

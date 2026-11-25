@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditEvent, Provenance, SourceDraft } from "@ao/core";
@@ -20,6 +20,7 @@ import {
   executeMove,
   finishMoveAt,
   listPendingOldCopies,
+  oldCopyMarkedFor,
   listUnfinishedMoves,
   moveSeams,
   planMove,
@@ -1437,7 +1438,7 @@ describe("FR-755 (R578): finishMoveAt finishes only this computer's own unfinish
     const other = { ...mkDeps(), deviceId: "dev-B", hostname: "host-B", pid: 4242 };
     expect((await acquireLock(dest, other)).acquired).toBe(true);
     const [destBefore, oldBefore] = [await hashes(dest), await hashes(lib.root)];
-    await expect(finishMoveAt(dest, mkDeps())).rejects.toThrow(/another computer|read-only/i);
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ code: "in-use" });
     expect(await hashes(dest)).toEqual(destBefore);
     expect(await hashes(lib.root)).toEqual(oldBefore);
   });
@@ -1457,5 +1458,133 @@ describe("FR-755 (R578): finishMoveAt finishes only this computer's own unfinish
     expect(changed.filter((k) => !(k === ".move-journal.json" || k === "library.json" || /\/audit\//u.test(k)))).toEqual([]);
     expect(await readdir(dest)).not.toContain(".lock");
     expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+  });
+});
+
+describe("FR-755 (R583): split moves, the check before finishing, and what cannot be finished", () => {
+  /** A library with projects A and B (moved) and C (kept); `dest` is where A and B go. */
+  async function splitFixture() {
+    const f = await fixture();
+    const c = (await f.repo.createProject({ name: "C", governanceYaml: CLOUD_OK_GOV, encryption: { enabled: false } })).project;
+    await f.repo.createSource(c.id, draft("Sea"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() });
+    return { ...f, c: { id: c.id, folder: c.folder }, dest: join(tmp, "Dest") };
+  }
+  const moveSplit = (f: Awaited<ReturnType<typeof splitFixture>>) => executeMove(f.lib, f.dest, { deps: mkDeps(), env, excludeProjectIds: [f.c.id] });
+  const marked = async (root: string, folder: string) => (await readdir(join(root, folder))).includes("MOVED.json");
+
+  async function assertSplitFinished(f: Awaited<ReturnType<typeof splitFixture>>) {
+    expect(await readdir(f.dest)).not.toContain(".move-journal.json");
+    const d = await openLibrary(f.dest, mkDeps());
+    expect([d.mode, d.id]).toEqual(["read-write", f.lib.id]);
+    await d.close();
+    const rest = await openLibrary(f.lib.root, mkDeps());
+    expect(rest.mode).toBe("read-write");
+    expect(rest.id).not.toBe(f.lib.id);
+    await rest.close();
+    expect(await marked(f.lib.root, f.a.folder)).toBe(true);
+    expect(await marked(f.lib.root, f.b.folder)).toBe(true);
+    expect(await marked(f.lib.root, f.c.folder)).toBe(false);
+    expect(await readdir(f.lib.root)).not.toContain(".lock");
+  }
+
+  for (const n of [1, 2]) {
+    it(`I1: a split whose marking stopped after ${n === 1 ? "the first" : "the last"} moved project is recognised and finished at the new place; the kept project is untouched`, async () => {
+      const f = await splitFixture();
+      moveSeams.fail = { at: "split-mark", afterFolders: n };
+      await expect(moveSplit(f)).rejects.toMatchObject({ code: "ENOSPC" });
+      await f.lib.close();
+      expect(await oldCopyMarkedFor(f.dest, f.lib.root, mkDeps())).toBe(true);
+      const keptBefore = await hashes(join(f.lib.root, f.c.folder), (rel) => /^audit\//u.test(rel));
+      expect((await finishMoveAt(f.dest, mkDeps()))?.verified).toBe(true);
+      await assertSplitFinished(f);
+      expect(await hashes(join(f.lib.root, f.c.folder), (rel) => /^audit\//u.test(rel))).toEqual(keptBefore);
+    });
+  }
+
+  it("I1: a split whose journal's write failed after the marking is finished at the new place", async () => {
+    const f = await splitFixture();
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    await expect(moveSplit(f)).rejects.toMatchObject({ code: "ENOSPC" });
+    await f.lib.close();
+    expect(await oldCopyMarkedFor(f.dest, f.lib.root, mkDeps())).toBe(true);
+    expect((await finishMoveAt(f.dest, mkDeps()))?.verified).toBe(true);
+    await assertSplitFinished(f);
+  });
+
+  it("I1: nothing marked yet: not marked, and not finished", async () => {
+    const f = await splitFixture();
+    moveSeams.fail = { at: "split-mark", afterFolders: 1 };
+    await expect(moveSplit(f)).rejects.toMatchObject({ code: "ENOSPC" });
+    await f.lib.close();
+    await rm(join(f.lib.root, f.a.folder, "MOVED.json"));
+    expect(await oldCopyMarkedFor(f.dest, f.lib.root, mkDeps())).toBe(false);
+    expect(await finishMoveAt(f.dest, mkDeps())).toBeUndefined();
+  });
+
+  it("I1: a split marked part-way whose not-yet-marked project was changed in the library it came from is not finished; nothing is written", async () => {
+    const f = await splitFixture();
+    moveSeams.fail = { at: "split-mark", afterFolders: 1 };
+    await expect(moveSplit(f)).rejects.toMatchObject({ code: "ENOSPC" });
+    await f.lib.close();
+    const late = (await readdir(join(f.lib.root, f.b.folder, "audit")))[0]!;
+    await writeFile(join(f.lib.root, f.b.folder, "audit", late), (await readFile(join(f.lib.root, f.b.folder, "audit", late), "utf8")) + "{}\n");
+    const [oldAt, destAt] = [await hashes(f.lib.root), await hashes(f.dest)];
+    await expect(finishMoveAt(f.dest, mkDeps())).rejects.toMatchObject({ kind: "source-changed" });
+    expect(await hashes(f.lib.root)).toEqual(oldAt);
+    expect(await hashes(f.dest)).toEqual(destAt);
+  });
+
+  async function stopped() {
+    const f = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.crashAfter = "close-source";
+    await expect(executeMove(f.lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    await f.lib.close();
+    return { ...f, dest };
+  }
+  const aPdf = async (root: string, folder: string) => (await walkFiles(join(root, folder))).find((r) => r.endsWith(".pdf"))!;
+
+  it("M5: a file removed by hand at the new place: not finished, the count said, the old copy whole; nothing written", async () => {
+    const { lib, a, dest } = await stopped();
+    await rm(join(dest, a.folder, await aPdf(dest, a.folder)));
+    const [oldAt, destAt] = [await hashes(lib.root), await hashes(dest)];
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "files-differ", detail: { count: 1, oldRoot: lib.root, oldWhole: true } });
+    expect(await hashes(lib.root)).toEqual(oldAt);
+    expect(await hashes(dest)).toEqual(destAt);
+  });
+
+  it("M5: a file changed at the new place, and one at the old copy too: not finished, the old copy not called whole", async () => {
+    const { lib, a, dest } = await stopped();
+    const rel = await aPdf(dest, a.folder);
+    await writeFile(join(dest, a.folder, rel), "changed");
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "files-differ", detail: { count: 1, oldWhole: true } });
+    await writeFile(join(lib.root, a.folder, rel), "changed too");
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "files-differ", detail: { count: 1, oldWhole: false } });
+  });
+
+  it("M4: a damaged journal cannot be finished, and says so", async () => {
+    const { dest } = await stopped();
+    await writeFile(join(dest, ".move-journal.json"), "{ not json");
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "journal-damaged" });
+  });
+
+  it("M4: the old copy cannot be reached when its mark must be looked at: says so; with the mark recorded, the move still finishes without it", async () => {
+    const { lib, dest } = await stopped();
+    const jp = join(dest, ".move-journal.json");
+    const recorded = await readFile(jp, "utf8");
+    const j = JSON.parse(recorded);
+    j.switch.done = [];
+    await writeFile(jp, JSON.stringify(j));
+    await rename(lib.root, join(tmp, "Unplugged"));
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "old-copy-unreachable", detail: { oldRoot: lib.root } });
+    await writeFile(jp, recorded);
+    expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+  });
+
+  it("M4: a library of a newer format at the new place is refused as such", async () => {
+    const { dest } = await stopped();
+    const meta = JSON.parse(await readFile(join(dest, "library.json"), "utf8"));
+    await writeFile(join(dest, "library.json"), JSON.stringify({ ...meta, formatVersion: 99 }));
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ code: "newer-format" });
   });
 });
