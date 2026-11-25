@@ -1823,8 +1823,10 @@ describe("FR-755 (R599 M-1): on a computer whose audit anchors were lost, an int
 });
 
 describe("FR-068 (R607 a): a move into a folder holding a stopped move's switch resumes only that very move, once its old copy is marked; otherwise it is refused and nothing is written", () => {
+  // R612 I-A: the delete-words only where the folder is provably a stale copy; otherwise the words that never advise deleting it.
   const STALE = "That folder holds the copy of an earlier move that did not finish. Choose another, empty folder, or delete that folder first.";
-  const refused = { name: "MoveNotAllowedError", code: "destination-not-empty", message: STALE };
+  const UNFINISHED = "That folder holds a library whose move there has not finished. Choose another, empty folder. To finish that move, open the library at that folder.";
+  const refusedWith = (message: string) => ({ name: "MoveNotAllowedError", code: "destination-not-empty", message });
   const journalOf = async (dest: string) => JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8"));
   const config = () => hashes(join(tmp, "config"));
   const sourcesOf = (r: Repo, pid: string) => r.listSourceIds(pid).length;
@@ -1844,7 +1846,8 @@ describe("FR-068 (R607 a): a move into a folder holding a stopped move's switch 
   }
 
   /** The move asked again from `lib` into `dest`, by the plan, the early plan and the move itself: each refused, nothing written anywhere. */
-  async function refusedEverywhere(lib: Library, dest: string, places: string[], exclude: string[] = []) {
+  async function refusedEverywhere(lib: Library, dest: string, places: string[], exclude: string[] = [], words: string = STALE) {
+    const refused = refusedWith(words);
     const before = [await config(), ...(await Promise.all(places.map((p) => hashes(p))))];
     await expect(planMove(lib, dest, env)).rejects.toMatchObject(refused);
     await expect(acceptMovePlan(lib, dest, { deps: mkDeps(), env, excludeProjectIds: exclude })).rejects.toMatchObject(refused);
@@ -1911,9 +1914,10 @@ describe("FR-068 (R607 a): a move into a folder holding a stopped move's switch 
     expect(moveId).toBeDefined();
     expect(moveId).not.toBe((await journalOf(c)).switch.moveId);
     const { moveId: _drop, ...noId } = JSON.parse(markOfFirst) as Record<string, unknown>;
-    for (const stale of [markOfFirst, markOfSecond, JSON.stringify(noId)]) {
+    // R612 I-A: a mark carrying another move's id: provably stale (STALE); a mark without an id: it may be this move's (UNFINISHED).
+    for (const [stale, words] of [[markOfFirst, STALE], [markOfSecond, STALE], [JSON.stringify(noId), UNFINISHED]] as const) {
       await writeFile(join(lib.root, "MOVED.json"), stale);
-      await refusedEverywhere(back, c, [lib.root, c]);
+      await refusedEverywhere(back, c, [lib.root, c], [], words);
     }
   });
 
@@ -1940,7 +1944,7 @@ describe("FR-068 (R607 a): a move into a folder holding a stopped move's switch 
     await failedBeforeMark(lib, dest);
     await rename(lib.root, join(tmp, "Away"));
     try {
-      await refusedEverywhere(lib, dest, [dest]);
+      await refusedEverywhere(lib, dest, [dest], [], UNFINISHED);
     } finally {
       await rename(join(tmp, "Away"), lib.root);
     }
@@ -1986,10 +1990,51 @@ describe("FR-068 (R607 a): a move into a folder holding a stopped move's switch 
     expect(mark.moveId).toBe((await journalOf(dest)).switch.moveId);
     const { moveId: _drop, ...older } = mark;
     await writeFile(join(lib.root, "MOVED.json"), JSON.stringify(older, null, 2));
-    await refusedEverywhere(lib, dest, [lib.root, dest]);
+    await refusedEverywhere(lib, dest, [lib.root, dest], [], UNFINISHED);
     await lib.close();
     expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
     expect((await openLibrary(lib.root, mkDeps())).readOnlyReason).toBe("moved");
+  });
+
+  it("R612 I-A: this move's mark seen at the old place, the move asked by a copy of the library made by hand: refused in the words that never advise deleting the folder (it is the library's new place)", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    const hand = join(tmp, "Hand");
+    await cp(lib.root, hand, { recursive: true });
+    await rm(join(hand, ".lock"));
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toMatchObject({ code: "ENOSPC" });
+    expect((await journalOf(dest)).switch.done).toEqual([]);
+    expect(JSON.parse(await readFile(join(lib.root, "MOVED.json"), "utf8")).moveId).toBe((await journalOf(dest)).switch.moveId);
+    const copy = await openLibrary(hand, mkDeps());
+    open.push(copy);
+    expect([copy.mode, copy.id]).toEqual(["read-write", lib.id]);
+    await refusedEverywhere(copy, dest, [hand, dest, lib.root], [], UNFINISHED);
+  });
+
+  it("R612 I-A: this move's mark recorded in the journal, the move asked by a copy of the library made by hand: refused in the words that never advise deleting the folder", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    const hand = join(tmp, "Hand");
+    await cp(lib.root, hand, { recursive: true });
+    await rm(join(hand, ".lock"));
+    moveSeams.crashAfter = "mark-old";
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    expect((await journalOf(dest)).switch.done).toEqual(["mark-old"]);
+    const copy = await openLibrary(hand, mkDeps());
+    open.push(copy);
+    await refusedEverywhere(copy, dest, [hand, dest, lib.root], [], UNFINISHED);
+  });
+
+  it("R612 I-A: this computer's record of the move is missing: refused in the words that never advise deleting the folder", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await failedBeforeMark(lib, dest);
+    const list = join(tmp, "config", "pending-old-copies.json");
+    const v = JSON.parse(await readFile(list, "utf8")) as { records: Array<{ id: string }> };
+    const { pendingId } = (await journalOf(dest)).switch;
+    await writeFile(list, JSON.stringify({ ...v, records: v.records.filter((r) => r.id !== pendingId) }));
+    await refusedEverywhere(lib, dest, [lib.root, dest], [], UNFINISHED);
   });
 
   // What does not change: the mark of THIS move recorded in the journal, or seen at the old copy: the switch is resumed,

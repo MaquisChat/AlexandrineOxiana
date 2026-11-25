@@ -55,3 +55,18 @@ export function moveStoppedBeforeSwitchParts(newRoot?: string): [string, string,
 export function moveStoppedBeforeSwitchText(newRoot?: string): string {
   return moveStoppedBeforeSwitchParts(newRoot).join("");
 }
+
+/**
+ * FR-068 (R607 a, R612 I-A): the refusal of a move into a folder that holds an earlier move's switch which this move may
+ * not resume (the engine's own reason; the service answers it as the reason of "The library cannot be moved there.").
+ * Which one is said is decided by the engine's one judgement of that folder:
+ * - STALE: only where the folder is provably a stale copy: the earlier move's old place is seen to be the living,
+ *   unmarked library of the same id, or marked by a mark naming another library or carrying another move's id;
+ * - UNFINISHED: in every other case (that move's mark recorded or seen, a mark without a move's id, the old place out of
+ *   reach, this computer's record of the move missing): the folder may hold the library itself, so it never advises
+ *   deleting it.
+ */
+export const MOVE_FOLDER_STALE_COPY_TEXT =
+  "That folder holds the copy of an earlier move that did not finish. Choose another, empty folder, or delete that folder first.";
+export const MOVE_FOLDER_UNFINISHED_TEXT =
+  "That folder holds a library whose move there has not finished. Choose another, empty folder. To finish that move, open the library at that folder.";

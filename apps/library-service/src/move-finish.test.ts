@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireLock, deviceDeps, openLibrary, type Deps } from "@ao/library";
-import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, MOVE_STOPPED_BEFORE_SWITCH_REASON, moveNotFinishedSplitText, moveNotFinishedText, moveStoppedBeforeSwitchText } from "@ao/shared";
+import { MOVE_FOLDER_STALE_COPY_TEXT, MOVE_FOLDER_UNFINISHED_TEXT, MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, MOVE_STOPPED_BEFORE_SWITCH_REASON, moveNotFinishedSplitText, moveNotFinishedText, moveStoppedBeforeSwitchText } from "@ao/shared";
 import { moveSeams } from "../../../packages/library/src/move.js";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
@@ -583,7 +583,9 @@ describe("FR-755 (R583 I1): a split move (some projects stay behind) that fails 
 
 describe("FR-068 (R607 a): a folder holding the copy of a move that stopped before its old copy was marked is refused, by the plan and by the move asked without it; nothing is written", () => {
   const STALE = "That folder holds the copy of an earlier move that did not finish. Choose another, empty folder, or delete that folder first.";
-  const refusal = { code: "POLICY_DENIED", message: "The library cannot be moved there.", reason: STALE };
+  const refusalStale = { code: "POLICY_DENIED", message: "The library cannot be moved there.", reason: STALE };
+  // R612 I-A: where the folder may hold the library itself, the words never advise deleting it.
+  const refusalUnfinished = { ...refusalStale, reason: MOVE_FOLDER_UNFINISHED_TEXT };
   const total = async (pid: string) => (await call({ url: `/projects/${pid}/sources` })).json.total as number;
 
   /** A whole-library move that fails before the old copy is marked (a folder stands where the mark must go); the obstacle then removed. */
@@ -597,7 +599,7 @@ describe("FR-068 (R607 a): a folder holding the copy of a move that stopped befo
   }
 
   /** The dialog's plan, then the move without it: both refused in those words, nothing written at `places` or this computer's records. */
-  async function refusedTwice(dest: string, places: string[]) {
+  async function refusedTwice(dest: string, places: string[], refusal = refusalStale) {
     await svc!.state.idle();
     const before = await Promise.all([join(tmp, "config"), ...places].map((p) => hashes(p)));
     const plan = await call({ method: "POST", url: "/libraries/move/plan", body: { dest } });
@@ -631,6 +633,18 @@ describe("FR-068 (R607 a): a folder holding the copy of a move that stopped befo
     expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
     expect(svc!.state.session!.lib.root).toBe(c);
     expect(await total(pid)).toBe(3);
+  });
+
+  it("R612 I-A: this computer's record of that move missing: the plan and the move are refused in the words that never advise deleting the folder", async () => {
+    await start();
+    const { path, dest } = await libraryWithSources();
+    await failedBeforeMark(path, dest);
+    const list = join(tmp, "config", "pending-old-copies.json");
+    const v = JSON.parse(await readFile(list, "utf8")) as { records: Array<{ id: string }> };
+    const { pendingId } = JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8")).switch;
+    await writeFile(list, JSON.stringify({ ...v, records: v.records.filter((r) => r.id !== pendingId) }));
+    await refusedTwice(dest, [path, dest], refusalUnfinished);
+    expect(STALE).toBe(MOVE_FOLDER_STALE_COPY_TEXT);
   });
 });
 
