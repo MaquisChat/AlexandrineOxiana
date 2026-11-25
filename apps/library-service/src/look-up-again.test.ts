@@ -9,7 +9,7 @@
  *    identifier in it.
  * Every request is answered by a MockAgent that refuses the network; the service's clock is the test's.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -23,6 +23,7 @@ import { importChange, projectReviewEntries } from "../../../packages/library/sr
 import { storeRequest } from "../../../packages/library/src/repo/sources.js";
 import type { ReviewEntry } from "../../../packages/library/src/repo/review.js";
 import { FIXTURE_DOI, buildDoiPdf, buildPdf } from "../../../tests/fixtures/generate.mjs";
+import { FolderGrants } from "./folder-grants.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 import { LOOK_UP_AGAIN_PASS_MAX } from "./state.js";
 
@@ -1031,5 +1032,65 @@ describe("second look (R608)", () => {
     expect(sent).toHaveLength(before);
     expect(r.json.entry.lookUp).not.toHaveProperty("failed");
     expect(bySource(await queue(lib.pid), lib.sources[0]!).lookUp).not.toHaveProperty("failed");
+  });
+
+  it("n2: a watched folder's bring-in at an opening waits until the holds are carried — a file waiting there sends nothing to the held service and comes in waiting", { timeout: 60_000 }, async () => {
+    const grants = new FolderGrants();
+    await start({ watchStabilityMs: 50, folderGrants: grants });
+    const lib = await libraryWithWaiting(1);
+    // OpenAlex asks to wait for an hour: the time is kept on the entry (as in I1).
+    answer = () => WAIT_HOUR;
+    await reopen(lib, 16 * MIN);
+    await svc!.state.idle();
+    expect(sent).toEqual([`api.openalex.org ${titleOf(1)} Souza`]);
+    const dir = join(tmp, "drive", "Inbox");
+    await mkdir(dir, { recursive: true });
+    const grantId = randomBytes(16).toString("hex");
+    grants.add(grantId, dir);
+    expect((await call({ method: "POST", url: `/projects/${lib.pid}/watched-folders`, body: { grantId } })).status).toBe(201);
+    // Closed; a file is put in the watched folder; opened again a minute later (within the hour), with the carrying of
+    // the holds held back by the test. A request now would be answered (and counted).
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    await writeFile(join(dir, "waiting.pdf"), await buildPdf({ title: "Salt marsh survey", author: "Ana Souza", lines: ["Salt marsh survey."] }));
+    answer = () => NO_RESULTS;
+    sent = [];
+    const state = svc!.state;
+    let carried = false;
+    /** Whether the holds had been carried each time a watch was about to start (its bring-in can ask from then on). */
+    const carriedAtWatchStart: boolean[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    // The verdict is read from `carriedAtWatchStart`, not from timing: a watch that starts while the carrying is held back
+    // records false and releases it (so the run goes on). The fallback below only lets a correct start proceed.
+    const fallback = setTimeout(() => release(), 500);
+    onTestFinished(() => {
+      clearTimeout(fallback);
+      release();
+    });
+    const carry = state.carryLookUpHolds.bind(state);
+    state.carryLookUpHolds = async (s, p) => {
+      await gate;
+      await carry(s, p);
+      carried = true;
+    };
+    const deps = state.watchDeps.bind(state);
+    state.watchDeps = (s, pid) => {
+      carriedAtWatchStart.push(carried);
+      release();
+      return deps(s, pid);
+    };
+    clock += MIN;
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: lib.path } });
+    expect(r.status, r.body).toBe(200);
+    const repo = state.session!.repo;
+    for (let i = 0; repo.listSourceIds(lib.pid).length < 2; i++) {
+      if (i > 400) throw new Error("the waiting file did not come in");
+      await new Promise((res) => setTimeout(res, 50));
+    }
+    await state.idle();
+    expect(carriedAtWatchStart).toEqual([true]);
+    expect(sent).toEqual([]);
+    const sid = repo.listSourceIds(lib.pid).find((x) => !lib.sources.includes(x))!;
+    expect(bySource(await queue(lib.pid), sid).reasons[0]).toBe(LOOKUP_WAITING_TEXT);
   });
 });

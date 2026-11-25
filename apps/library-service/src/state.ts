@@ -995,6 +995,10 @@ export class ServiceState {
     s.unsubscribe.push(proxies.onResult((r) => this.events.publish("job.progress", { kind: "proxy", ...r })));
     s.unsubscribe.push(ocr.onResult((r) => this.events.publish("job.progress", { kind: "ocr", ...r })));
     if (s.lib.mode === "read-write") {
+      // Decision 31 (c), R600 I1: the holds the services named are carried over the reopening first (the opening's answer
+      // waits for that, in `adopt`, so that an attach or a press after it respects them). R608 n2: set before the watches
+      // start, which wait for it (`startWatches`), so that no bring-in asks a held service before its hold is carried.
+      s.holdsCarried = this.carryLookUpHolds(s);
       void this.startProjectsWatches(
         s,
         s.repo.listProjects().map((p) => p.id),
@@ -1003,10 +1007,7 @@ export class ServiceState {
       this.startWork("backup", async () => {
         await this.runScheduledBackups();
       });
-      // Decision 31 (c), R600 I1: the holds the services named are carried over the reopening first (the opening's answer
-      // waits for that, in `adopt`, so that an attach or a press after it respects them); then the entries whose left-out
-      // lookups came due while the app was closed are looked up again, in the background.
-      s.holdsCarried = this.carryLookUpHolds(s);
+      // Then the entries whose left-out lookups came due while the app was closed are looked up again, in the background.
       this.startLookUpAgain();
     }
     s.http.setDiskCache(true); // in use again (after a move that was not made)
@@ -1095,6 +1096,10 @@ export class ServiceState {
 
   /** Starts the project's watched folders (all of them; replaces any running). */
   async startWatches(s: Session, projectId: string): Promise<void> {
+    // R608 n2: a bring-in attaches leaving a held service out, so nothing starts before the holds are carried (never
+    // rejects). A close that began meanwhile (the session gone, its closing signal set) starts nothing.
+    await s.holdsCarried;
+    if (this.session !== s || s.closing.signal.aborted) return;
     await this.stopWatches(s, projectId);
     let watches: FolderWatch[];
     try {
