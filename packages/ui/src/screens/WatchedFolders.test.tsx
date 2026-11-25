@@ -1442,6 +1442,8 @@ describe("Watched folders: first reads that never settle (FR-750, R579)", () => 
     await waitFor(() => expect(ev.attempts()).toBe(1));
     await new Promise((r) => setTimeout(r, 3_000));
     expect(ev.attempts()).toBe(1);
+    // R602 M2: the page has not cancelled it (a drop after the answer began would not end a mocked body).
+    expect(ev.signals()[0]!.aborted).toBe(false);
   });
 
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {

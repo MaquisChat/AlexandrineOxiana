@@ -354,5 +354,7 @@ describe("Library: an event stream that does not open within the limit is tried 
     // Five times the limit, and more than the screen's pause before a new try (two seconds): still the first stream.
     await new Promise((r) => setTimeout(r, 3_000));
     expect(ev.attempts()).toBe(1);
+    // R602 M2: the page has not cancelled it (a drop after the answer began would not end a mocked body).
+    expect(ev.signals()[0]!.aborted).toBe(false);
   });
 });
