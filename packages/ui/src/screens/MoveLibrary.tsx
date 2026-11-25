@@ -14,7 +14,7 @@
  * screen stops reading the stream (the move itself carries on in the service).
  */
 import { useEffect, useId, useRef, useState } from "react";
-import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedParts, moveNotFinishedSplitParts } from "@ao/shared";
+import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, MOVE_STOPPED_BEFORE_SWITCH_REASON, moveNotFinishedParts, moveNotFinishedSplitParts, moveStoppedBeforeSwitchParts } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { isStreamCutOff, normaliseRoot, type GovernanceApi, type MovePlan, type MoveProgress, type MoveStatus } from "../api/governance";
 import { ConfirmDialog } from "../components/ReasonDialog";
@@ -55,15 +55,24 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
    * place finishes the move. Its sentence names the place (the researcher's own text, through UserText).
    */
   const [notFinished, setNotFinished] = useState<{ newRoot: string; split: boolean } | null>(null);
+  /**
+   * FR-068 (R607 d): the move stopped before the library was switched; the copy made at this new place is not used. Its
+   * sentence names the place (through UserText), in place of the generic words.
+   */
+  const [stoppedAt, setStoppedAt] = useState<string | null>(null);
   const setError = (e: string | null) => {
     setErrorText(e);
     setNotFinished(null);
+    setStoppedAt(null);
   };
   /** A failed move's answer: the sentence of a move that did not finish, or the error with today's ending. */
   const failedWith = (e: { message: string; reason?: string }, newRoot: string) => {
     if (e.reason === MOVE_NOT_FINISHED_REASON || e.reason === MOVE_NOT_FINISHED_SPLIT_REASON) {
       setErrorText(null);
       setNotFinished({ newRoot, split: e.reason === MOVE_NOT_FINISHED_SPLIT_REASON });
+    } else if (e.reason === MOVE_STOPPED_BEFORE_SWITCH_REASON) {
+      setError(null);
+      setStoppedAt(newRoot);
     } else setError(`${e.message} The move stopped; nothing was deleted, and the library stays where it was.`);
     setStage("failed");
   };
@@ -281,6 +290,18 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
       {notFinished !== null
         ? (() => {
             const [before, place, after] = notFinished.split ? moveNotFinishedSplitParts(notFinished.newRoot) : moveNotFinishedParts(notFinished.newRoot);
+            return (
+              <p role="alert" className="ao-warning">
+                {before}
+                <UserText>{place}</UserText>
+                {after}
+              </p>
+            );
+          })()
+        : null}
+      {stoppedAt !== null
+        ? (() => {
+            const [before, place, after] = moveStoppedBeforeSwitchParts(stoppedAt);
             return (
               <p role="alert" className="ao-warning">
                 {before}

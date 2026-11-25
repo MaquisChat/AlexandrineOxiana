@@ -26,12 +26,13 @@ import {
   acceptMovePlan,
   isClosed,
   oldCopyMarkedFor,
+  staleMoveCopyAt,
   scrubPaths,
   type IntegritySample,
   type Library,
 } from "@ao/library";
 import type { LibraryFolderRoomRequest, LibraryFolderRoomResponse, LibrarySuggestedFolderResponse } from "@ao/shared";
-import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedSplitText, moveNotFinishedText } from "@ao/shared";
+import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, MOVE_STOPPED_BEFORE_SWITCH_REASON, moveNotFinishedSplitText, moveNotFinishedText, moveStoppedBeforeSwitchText } from "@ao/shared";
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
 import { cheapLocationEnv } from "./watched-folders.js";
@@ -378,7 +379,14 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
           state.resumeBatches(paused);
           state.restartStoppedWork();
         }
-        const body = ndjsonError(ctx, err);
+        // FR-068 (R607 d): stopped after its switch began and before any mark of it (the switching journal at the new
+        // place, this computer's record of it, the old place unmarked and still this library): the library was not
+        // switched, and the copy there is not used; a move into that folder is refused from now on. Said in its own
+        // sentence (no path: it is recorded), in place of the failure's own words.
+        const stopped = await staleMoveCopyAt(state.deps, dest, s.lib.id).catch(() => undefined);
+        const body = stopped
+          ? errorBody(new ApiError(409, "CONFLICT", moveStoppedBeforeSwitchText(), MOVE_STOPPED_BEFORE_SWITCH_REASON), state.roots)
+          : ndjsonError(ctx, err);
         state.recordMoveFailure({ newRoot: dest, attempt, error: body.error });
         await write(body);
         reply.raw.end();

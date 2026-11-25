@@ -72,6 +72,7 @@ export {
   listUnfinishedMoves,
   planMove,
 } from "./move.js";
+export { staleMoveCopyAt } from "./old-copies.js";
 export type {
   DeleteOldCopyResult,
   MoveOptions,

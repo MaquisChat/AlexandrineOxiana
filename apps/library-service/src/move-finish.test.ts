@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireLock, deviceDeps, openLibrary, type Deps } from "@ao/library";
-import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, moveNotFinishedSplitText, moveNotFinishedText } from "@ao/shared";
+import { MOVE_NOT_FINISHED_REASON, MOVE_NOT_FINISHED_SPLIT_REASON, MOVE_STOPPED_BEFORE_SWITCH_REASON, moveNotFinishedSplitText, moveNotFinishedText, moveStoppedBeforeSwitchText } from "@ao/shared";
 import { moveSeams } from "../../../packages/library/src/move.js";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
@@ -650,5 +650,51 @@ describe("FR-068 (R607 c): the stale folder, opened, says what it is and accuses
     expect(kindsNow()).toEqual([]);
     await svc!.state.idle();
     expect(changedFiles(before, await hashes(dest))).toEqual([]);
+  });
+});
+
+describe("FR-068 (R607 d): the move's answer after it stopped before the library was switched", () => {
+  const stopped = () => ({ error: { code: "CONFLICT", message: moveStoppedBeforeSwitchText(), reason: MOVE_STOPPED_BEFORE_SWITCH_REASON } });
+
+  it("a whole library: the move fails after its switch began and before any mark: its own sentence, kept as the last failed move; the library goes on where it was", async () => {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    await mkdir(join(path, "MOVED.json"));
+    const lines = await move(dest);
+    expect(lastLine(lines)).toEqual(stopped());
+    expect(JSON.stringify(lines)).not.toContain(tmp);
+    expect(moveStoppedBeforeSwitchText()).toBe(
+      "The move stopped before the library was switched. Nothing of the library was deleted, and it stays where it was. The copy made at the new place is not used and can be deleted. To move the library, choose another, empty folder.",
+    );
+    expect(moveStoppedBeforeSwitchText("/Volumes/Drive/Lib")).toBe(
+      "The move stopped before the library was switched. Nothing of the library was deleted, and it stays where it was. The copy made at /Volumes/Drive/Lib is not used and can be deleted. To move the library, choose another, empty folder.",
+    );
+    expect((await call({ url: "/libraries/move/status" })).json.failed).toEqual({ newRoot: dest, attempt: "a1", ...stopped() });
+    expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
+    expect(svc!.state.session!.lib.root).toBe(path);
+    await svc!.state.idle();
+    expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(2);
+  });
+
+  it("a split that fails before its first mark: the same sentence", async () => {
+    await start();
+    const { path, dest } = await libraryWithSources();
+    const k = await call({ method: "POST", url: "/projects", body: { name: "Kept", governanceYaml: OPEN_GOV, encryption: { enabled: false } } });
+    const kept = k.json.project.id as string;
+    const keptFolder = k.json.project.folder as string;
+    const moving = (await readdir(join(path, "Projects"))).filter((n) => !n.startsWith(".") && `Projects/${n}` !== keptFolder);
+    for (const n of moving) await mkdir(join(path, "Projects", n, "MOVED.json"));
+    expect(lastLine(await move(dest, [kept]))).toEqual(stopped());
+  });
+
+  it("every other failure keeps its words: a folder that is not empty; a failure once the old copy is marked", async () => {
+    await start();
+    const { dest } = await libraryWithSources();
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, "notes.txt"), "mine");
+    expect(lastLine(await move(dest)).error).toEqual({ code: "POLICY_DENIED", message: "The library cannot be moved there.", reason: "The destination folder is not empty; choose an empty folder" });
+    await rm(join(dest, "notes.txt"));
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    expect(lastLine(await move(dest)).error).toEqual({ code: "UNAVAILABLE", message: moveNotFinishedText(), reason: MOVE_NOT_FINISHED_REASON });
   });
 });

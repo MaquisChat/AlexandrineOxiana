@@ -142,6 +142,30 @@ describe("Move library", () => {
     expect(alert.querySelector("[dir='auto']")?.textContent).toBe(DEST);
   });
 
+  it("FR-068 (R607 d): a move that stopped before the library was switched says so in its own sentence naming the copy's place, in place of the generic words, with nothing appended", async () => {
+    const user = userEvent.setup();
+    const body = {
+      code: "CONFLICT",
+      message: "The move stopped before the library was switched. Nothing of the library was deleted, and it stays where it was. The copy made at the new place is not used and can be deleted. To move the library, choose another, empty folder.",
+      reason: "move-stopped-before-switch",
+    };
+    server.use(
+      http.post(url("/libraries/move"), () =>
+        new HttpResponse(`${JSON.stringify({ progress: { phase: "switch", filesDone: 120, fileCount: 120, bytesDone: 5, totalBytes: 5 } })}\n${JSON.stringify({ error: body })}\n`, { headers: { "content-type": "application/x-ndjson" } }),
+      ),
+    );
+    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+    await user.click(within(plan).getByRole("button", { name: "Move library" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      `The move stopped before the library was switched. Nothing of the library was deleted, and it stays where it was. The copy made at ${DEST} is not used and can be deleted. To move the library, choose another, empty folder.`,
+    );
+    expect(alert.querySelector("bdi, [dir='auto']")?.textContent).toBe(DEST);
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(screen.queryByText(/The move stopped; nothing was deleted/u)).toBeNull();
+    expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("FR-755: the same sentence when the move's answer is read again from move/status after the stream was cut off", async () => {
     const user = userEvent.setup();
     let attempt = "";

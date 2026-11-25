@@ -36,3 +36,22 @@ export function moveNotFinishedSplitParts(newRoot?: string): [string, string, st
 export function moveNotFinishedSplitText(newRoot?: string): string {
   return moveNotFinishedSplitParts(newRoot).join("");
 }
+
+/**
+ * FR-068 (R607 d): a move that stopped after its switch began and before the old copy was marked by it. The library was
+ * not switched and stays where it was; the copy at the new place is not used. A move into that folder is refused from
+ * then on, so the way on is another, empty folder. The answer's `reason` for this case:
+ */
+export const MOVE_STOPPED_BEFORE_SWITCH_REASON = "move-stopped-before-switch";
+
+/** The sentence, in three parts: before the new place, the new place (the researcher's own text), after it. */
+export function moveStoppedBeforeSwitchParts(newRoot?: string): [string, string, string] {
+  const before = "The move stopped before the library was switched. Nothing of the library was deleted, and it stays where it was. The copy made at ";
+  const after = " is not used and can be deleted. To move the library, choose another, empty folder.";
+  return newRoot ? [before, newRoot, after] : [`${before}the new place${after}`, "", ""];
+}
+
+/** The sentence whole: with the new place when it is given (never in anything recorded), without it otherwise. */
+export function moveStoppedBeforeSwitchText(newRoot?: string): string {
+  return moveStoppedBeforeSwitchParts(newRoot).join("");
+}
