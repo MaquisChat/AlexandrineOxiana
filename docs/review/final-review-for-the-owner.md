@@ -2,6 +2,8 @@
 
 *Updated 24 November 2026, 7 pm Central: MAC BUILD 12 EXISTS — GitHub gave the build a Mac this time and every check passed, the test of Quit among them. Part 12 says where to download it. It replaces build 10.*
 
+*Updated 25 November 2026, 11:37 am Central: part 15, at the end, is new and short — build request 15 (after a stop nothing more is asked; after a lock nothing about the project stays in memory) passed GitHub's check and **is merged to `main` on your word**. It also tells you two things that are yours to decide. **There is still no Mac build of build 14 or 15** (GitHub gives no Mac during the day; I ask again this evening) — Mac build 13 remains the build to use.*
+
 *Updated 25 November 2026, 8:45 am Central: part 14, at the end, is new — nearly every screen now gives up politely when the app's service does not answer, "Move library" refuses a leftover folder and says why, and a stopped download asks nothing more. Build request 14 passed GitHub's check and **is merged to `main` on your word**. **Mac build 14 does not exist yet** (GitHub has not provided a Mac; I keep trying) — Mac build 13 remains the build to use. Start at part 14.*
 
 *Updated 25 November 2026, just after midnight Central: part 13, at the end, is new — the move fix, the screens that no longer wait for ever (the first five), and "Look up again" are built, reviewed, tested together and pushed as build request 13. **Mac build 13 exists and replaces build 12** (part 13 says where). It asks whether I may merge. Start there.*
@@ -845,7 +847,7 @@ After build request 13, three more pieces were built for the next Mac build (bui
 - **Pushed as build request 14** at 7:28 am Central on 25 November.
 - **GitHub's own check is green** on exactly this code: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45623952522 (green at 8:38 am Central, after 70 minutes). The test that failed on build request 13 passed.
 - **It is in `main`.** At 8:28 am Central you wrote "merge build 14 to main when the check is green"; I merged exactly build request 14 at 8:43 am. `main`'s own check passed too, at 9:45 am Central: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45637345358
-- **Mac build 14 does not exist yet.** GitHub has not given the build a Mac: three attempts (7:28, 7:46 and 8:05 am Central) each waited fifteen minutes and were cancelled by GitHub with nothing run. Nothing on our side changed since Mac build 13, which got a Mac within seconds; GitHub's status page reports no incident, and its documentation says queued jobs can be dropped when its machines are busy. I try again at intervals and will put the download and its SHA-256 here. *(Added at 9:02 am: the build started from `main` was dropped the same way. Yesterday GitHub also gave no Mac during the day, and gave one at once in the evening and at night; so Mac build 14 will most likely exist this evening, about 7 pm Central.)* **Until then Mac build 13 is the build to use** (part 13 says where); it lacks only what this part describes.
+- **Mac build 14 does not exist yet.** GitHub has not given the build a Mac: three attempts (7:28, 7:46 and 8:05 am Central) each waited fifteen minutes and were cancelled by GitHub with nothing run. Nothing on our side changed since Mac build 13, which got a Mac within seconds; GitHub's status page reports no incident, and its documentation says queued jobs can be dropped when its machines are busy. I try again at intervals and will put the download and its SHA-256 here. *(Added at 9:02 am: the build started from `main` was dropped the same way. Yesterday GitHub also gave no Mac during the day, and gave one at once in the evening and at night; so Mac build 14 will most likely exist this evening, about 7 pm Central.)* *(Added at midday: the Mac build made this evening will be of build 15, which contains all of build 14: part 15.)* **Until then Mac build 13 is the build to use** (part 13 says where); it lacks only what this part describes.
 
 ### What you will notice
 
@@ -929,3 +931,48 @@ This list replaces part 13's "Still open".
 - **FR-753, FR-758, FR-762:** small corners you would not see. **FR-761:** whether the audit log can show events out of order; to be checked.
 - **FR-751, FR-754:** two sentences to correct (a destruction certificate after a crash; a backup warning that points to a missing button).
 - **FR-752:** in an encrypted project, a source's title is readable in its folder name. Still being checked.
+
+## 15. Added on 25 November, midday: after a stop nothing more is asked, and after a lock nothing is kept
+
+A short part. Build request 15 holds two safety mends that the review of the stopped download (part 14) led to, and one mended test. **Nothing on any screen changes.**
+
+- **Tested together on my side:** every step passed at the first run (11,864 tests, 228 of 228 browser scenarios, the desktop scenarios, the app started and quit).
+- **Pushed as build request 15** at 10:21 am Central on 25 November.
+- **GitHub's own check is green** on exactly this code: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45652933197 (green at 11:34 am Central).
+- **It is in `main`.** At 10:17 am Central you wrote "merge build 15 to main when the check is green"; I merged exactly build request 15 at 11:37 am Central.
+- **No Mac build yet, of build 14 or of build 15.** GitHub gives this project no Mac during the US working day and gives one at once in the evening; I ask again at 6:30 pm Central. The build made then will be build 15, which contains all of build 14. Until then Mac build 13 is the build to use.
+
+### What it mends
+
+**A. After a stop, nothing more is asked (FR-765, FR-764).** When "Find and acquire" is stopped — by you, by locking a project, by moving or closing the library — the lookups it had under way end at once: no retry, no following of a redirect, no new request. A stopped Zotero sync ends its wait and asks nothing more. Before, a lookup already under way could still send its retries after the stop. Lookups of your other projects go on undisturbed.
+
+**B. After a lock, nothing about the project stays in memory (FR-759, FR-767).** If an encrypted project was locked while the app was still waiting for an answer about one of its sources, that answer arrived after the lock and stayed in the app's memory. Nothing was written to disk or sent anywhere. This was real when attaching a file, in a bulk import, for watched folders, in the Zotero import and in Zotero sync; each was first proved by a test, then closed by one shared fix.
+
+**C. A test that would have begun to fail by itself on 11 December** (it compared a fixed date with the day's date) is mended. A fault of the test, not of the app; every test was then run with the clock a year ahead and nothing else turned up.
+
+A builder did the work; a reviewer who had not built it went through it twice and tried to break it (among other things: two projects asking the same service at the same moment, one of them locked — the other still got its answer).
+
+### Things only you can check
+
+Nothing new to see. Part 14's list holds, with the Mac build of build 15 once it exists.
+
+### Two things I want you to know
+
+1. **In an encrypted project, some words stay readable on the disk.** Each source's files and details are encrypted. Its year, first author and a short title stay readable in the names of its folder and files. The specification designed it so, to keep the library readable by a person, and an earlier ruling accepted the cost. Where participants' names are replaced by codes, the code appears there, not the name. A project that must hide its titles cannot do so today. **Your decision:** leave it as designed (nothing to do), or have coded folder names added for projects that need them (a new piece of work, not a small one).
+2. **A new button is coming with build 16: "Back up now"**, on a project's Governance screen. An existing warning already told you to make a backup "from the project's settings", and no such place existed. The warning will name the button. If you would rather have no button and a shorter warning, say so.
+
+### Still open
+
+Being built now for build 16, each reviewed by someone who did not build it:
+
+- **Nothing is asked for a locked project during imports either (FR-769)** — bulk import, the Zotero import and sync, attaching, and "Look up again". Built and reviewed.
+- **The move:** two rare corners, and a truer sentence for a leftover folder whose library drive is unplugged (FR-760, FR-766). Built and reviewed.
+- **The Governance screen says the state of backups in sentences**, where it showed a code (FR-751). Built and reviewed.
+- **Live connections that went silent — after the Mac slept, for example — are opened again** on every screen that has one; the missing-files check shows its progress and has a "Stop". Being built.
+- **Small tidying of the "did not answer in time" sentence** on four screens, and the button above. At its review.
+
+Listed, not built:
+
+- **FR-770:** a destruction certificate, which an ethics board may read, gives the state of the backups as a code, not a sentence.
+- **FR-771:** whether a Zotero import's own requests to Zotero stop when its project is locked; to be checked.
+- **FR-752** is answered above (point 1). **FR-761** was checked and is not a fault: the audit log is newest-first on purpose.
