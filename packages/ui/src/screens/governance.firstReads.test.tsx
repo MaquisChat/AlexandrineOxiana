@@ -111,6 +111,24 @@ describe("FR-756: the audit log", () => {
     expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: "Audit log" }));
   });
 
+  // FR-756's remainder (R601 b): the log had no loading words; "Reading the audit log…" is ruled, polite as the others'.
+  it("says “Reading the audit log…” (polite) while its page is read and after “Try again”, never beside the alert or the log", async () => {
+    server.use(http.get(P("/attention"), () => HttpResponse.json({ marks: [] })));
+    const h = held(P("/audit"), PAGE);
+    render(<AuditLog api={makeApi()} projectId={PID} firstReadMs={LIMIT} />);
+    const words = () => screen.queryByText("Reading the audit log…");
+    expect(words()?.getAttribute("role")).toBe("status");
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(words()).toBeNull();
+    await userEvent.setup().click(tryAgain()!);
+    expect(words()?.getAttribute("role")).toBe("status");
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    h.answer = true;
+    await userEvent.setup().click(tryAgain()!);
+    await screen.findByRole("table", { name: "Audit events" });
+    expect(words()).toBeNull();
+  });
+
   it("a read of the log that FAILS says what it said before, now with “Try again”", async () => {
     server.use(
       http.get(P("/attention"), () => HttpResponse.json({ marks: [] })),
@@ -344,6 +362,66 @@ describe("FR-756, R605 I2: one sentence and one “Try again” for the page —
     expect(list.count).toBe(2);
     expect(own.count).toBe(2);
     expect(document.activeElement?.isConnected && document.activeElement !== document.body).toBe(true);
+  });
+
+  // R617 N2: the screen said "could not be reached"; the list then given up leaves the page's sentence the same, so the
+  // screen's alert stays the one that says it (the same element), never taken away and put again by the route.
+  it.each(SCREENS)("on $path: the screen's read failed, then the list given up: the sentence is announced once — the same alert element, one alert put on the page", async (s) => {
+    routeSide();
+    s.side();
+    asked(url("/projects"), LIST, () => "hold");
+    const own = asked(url(s.read), s.body, () => "fail");
+    // Each element that became an alert: put on the page as one, or an element already there turned into one.
+    const put: Element[] = [];
+    const watch = new MutationObserver((records) => {
+      for (const r of records) {
+        if (r.type === "attributes" && r.target instanceof Element && r.target.getAttribute("role") === "alert") put.push(r.target);
+        for (const n of r.addedNodes) if (n instanceof Element) put.push(...[n, ...n.querySelectorAll("*")].filter((e) => e.getAttribute("role") === "alert"));
+      }
+    });
+    watch.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["role"] });
+    try {
+      window.history.replaceState(null, "", `${s.path}?project=p1`);
+      render(<Host />);
+      await waitFor(() => expect(alerts()).toEqual([UNREACHABLE]));
+      expect(own.count).toBe(1);
+      const first = screen.getByRole("alert");
+      await new Promise((r) => setTimeout(r, LIMIT + 300));
+      expect(alerts()).toEqual([UNREACHABLE]);
+      expect(screen.getByRole("alert")).toBe(first);
+      expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+      expect(put).toHaveLength(1);
+      expect(put[0]).toBe(first);
+    } finally {
+      watch.disconnect();
+    }
+  });
+
+  it("the list failed, then the screen's read failed with the same words: the route's alert stays the one that says it", async () => {
+    routeSide();
+    SCREENS[1]!.side();
+    let screenAsks = 0;
+    const gate = hang();
+    let letScreenFail!: () => void;
+    const screenMayFail = new Promise<void>((r) => (letScreenFail = r));
+    asked(url("/projects"), LIST, () => "fail");
+    server.use(
+      http.get(url("/projects/p1/audit"), async () => {
+        screenAsks++;
+        await Promise.race([screenMayFail, gate]);
+        return HttpResponse.error();
+      }),
+    );
+    window.history.replaceState(null, "", "/audit?project=p1");
+    render(<Host />);
+    await waitFor(() => expect(alerts()).toEqual([UNREACHABLE]));
+    const first = screen.getByRole("alert");
+    letScreenFail();
+    await waitFor(() => expect(screenAsks).toBe(1));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(alerts()).toEqual([UNREACHABLE]);
+    expect(screen.getByRole("alert")).toBe(first);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
   });
 
   it("the mirror: the list failed with no answer and the screen's read given up at the limit say “could not be reached” alone, with one “Try again”, which reads both again", async () => {

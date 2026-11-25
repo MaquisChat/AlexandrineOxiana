@@ -22,6 +22,7 @@
  */
 import { HELD_FILE_WHY_TEXT } from "@ao/shared";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { errorText, isProjectLocked, type Asset, type Creator, type LibraryApi, type SourcePatch } from "../api/library";
 import { isShowablePicture, type FieldReview, type PendingJob, type VerifiedSource } from "../api/verification";
 import { AvailabilityMark, availabilityText } from "../components/AvailabilityMark";
@@ -31,6 +32,8 @@ import { typeLabel } from "../components/SourceTable";
 import { ReaderLink } from "../components/ReaderLink";
 import { WatchOrigin } from "../components/WatchOrigin";
 import { TranscriptLink } from "../components/TranscriptLink";
+import { usePageRead } from "../components/PageReads";
+import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import { FieldCheck } from "../components/VerificationBadge";
 import { valueText } from "../components/FieldEvidencePopover";
@@ -51,6 +54,8 @@ export interface SourceDetailProps {
   refreshKey?: number;
   /** How long to wait between reads of the record after "Try again" (tests shorten it). */
   retryPollMs?: number;
+  /** FR-756: how long a read of the record is waited for before it is given up (smaller in tests). */
+  firstReadMs?: number;
 }
 
 const IDENTIFIER_LABELS: Record<string, string> = { doi: "DOI", isbn: "ISBN", issn: "ISSN", pmid: "PubMed ID", pmcid: "PubMed Central ID", arxiv: "arXiv", url: "Web address" };
@@ -203,9 +208,15 @@ type RetryState = { state: "idle"; error?: string } | { state: "running" } | { s
 /** Reads of the record after "Try again" before the screen stops following the work. */
 const RETRY_READS = 60;
 
-export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onChanged, onLocked, refreshKey = 0, retryPollMs = 2000 }: SourceDetailProps) {
+export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onChanged, onLocked, refreshKey = 0, retryPollMs = 2000, firstReadMs = FIRST_READ_TIMEOUT_MS }: SourceDetailProps) {
   const [file, setFile] = useState<VerifiedSource | undefined>();
   const [error, setError] = useState<string | undefined>();
+  /** FR-756: the record's last read got no answer (none in time, or none at all): its sentence, with "Try again". */
+  const [unanswered, setUnanswered] = useState<string | undefined>();
+  /** "Try again" moves it on; `recordOut`: a read of the record is in the air (it may never settle). */
+  const [tries, setTries] = useState(0);
+  const recordOut = useRef(false);
+  const closeRef = useRef<HTMLButtonElement>(null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState({ title: "", issued: "", publisher: "" });
   const [saving, setSaving] = useState(false);
@@ -255,6 +266,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
       gen.current++;
       setFile(undefined);
       setError(undefined);
+      setUnanswered(undefined);
       setEditing(false);
       setRechecking(false);
       setRecheckNote(undefined);
@@ -262,19 +274,44 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     }
     const g = gen.current;
     let live = true;
-    api.sources
-      .get(projectId, sourceId)
+    // FR-756: given up after `firstReadMs` (its request cancelled), and cancelled when the panel is closed.
+    const ac = new AbortController();
+    recordOut.current = true;
+    readWithin((signal) => api.sources.get(projectId, sourceId, { signal }), firstReadMs, ac.signal)
       .then((f) => {
-        if (live && g === gen.current) showFile(f as VerifiedSource);
+        if (!live || g !== gen.current) return;
+        recordOut.current = false;
+        setUnanswered(undefined);
+        showFile(f as VerifiedSource);
       })
       .catch((err: unknown) => {
         if (!live || g !== gen.current) return;
+        recordOut.current = false;
+        // No answer: its own sentence alone, with "Try again"; an answer the panel handles as before. R623 (Minor 1): the
+        // alert of the read before (a refusal) is replaced when this read settles, as a failure replaced it before.
+        if (isUnreachable(err)) {
+          setError(undefined);
+          setUnanswered((err as Error).message);
+          return;
+        }
+        setUnanswered(undefined);
         setError(failed(err, "This source could not be read."));
       });
     return () => {
       live = false;
+      recordOut.current = false;
+      ac.abort();
     };
-  }, [projectId, sourceId, refreshKey, reloads, failed]);
+  }, [projectId, sourceId, refreshKey, reloads, failed, firstReadMs, tries]);
+  // R605 I2: inside a page that says one sentence (the library screen), the panel yields its own.
+  const { yields, retryAll } = usePageRead("source", {
+    sentence: unanswered,
+    out: () => recordOut.current,
+    retry: () => {
+      setUnanswered(undefined);
+      setTries((n) => n + 1);
+    },
+  });
 
   const src = file?.source;
   const variants = src?.title?.variants ?? [];
@@ -484,7 +521,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
   return (
     <section aria-label="Source details" className="ao-detail">
       <div className="ao-row">
-        <button type="button" onClick={onClose}>
+        <button type="button" ref={closeRef} onClick={onClose}>
           Close
         </button>
         <button type="button" disabled={readOnly || !src} onClick={startEdit} aria-expanded={editing}>
@@ -505,7 +542,15 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
       <p role="status" className="ao-muted">
         {recheckNote}
       </p>
-      {!src && !error && <p aria-live="polite">Loading…</p>}
+      {unanswered && !yields && (
+        <>
+          <p role="alert" className="ao-error">
+            {unanswered}
+          </p>
+          <TryAgain focusTo={closeRef} onPress={retryAll} />
+        </>
+      )}
+      {!src && !error && !unanswered && <p aria-live="polite">Loading…</p>}
       {src && (
         <>
           <div className="ao-row">

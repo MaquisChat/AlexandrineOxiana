@@ -17,6 +17,7 @@ import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRe
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
 import { JobsIndicator, type Job } from "../components/JobsIndicator";
+import { PageReads, usePageHost } from "../components/PageReads";
 import { ProjectNav } from "../components/ProjectNav";
 import { RecheckProjectButton, useProjectRecheck } from "../components/RecheckProject";
 import { SearchBox } from "../components/SearchBox";
@@ -237,6 +238,19 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
    * "could not be reached" is said alone where any read failed so; "did not answer in time" where every one was given up.
    */
   const unansweredText = showTryAgain ? (Object.values(unanswered).find((t) => t !== SERVICE_NO_ANSWER) ?? SERVICE_NO_ANSWER) : undefined;
+  /**
+   * FR-756's remainder: the source's detail, opened beside the list, is part of this page. While the screen says its
+   * one sentence, the panel says none of its own, the sentence covers the panel's read too (R602 M1), and the one
+   * "Try again" reads it again as well (R605 I2).
+   */
+  const { page, sentence: pageSentence, retryAll } = usePageHost({
+    sentence: unansweredText,
+    out: () => out.current.size > 0 || !projectsRef.current,
+    retry: () => {
+      triedAgain.current = true;
+      readAgain();
+    },
+  });
   useEffect(() => {
     if (showTryAgain || !triedAgain.current) return;
     triedAgain.current = false;
@@ -726,6 +740,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const readOnlyReason = state.readOnlyReason === "offline" ? "The library is offline; attaching waits until it is back." : "This library is read-only.";
 
   return (
+    <PageReads value={page}>
     <div className="ao-library">
       <header className="ao-library__header">
         <UserText as="h1">{state.name ?? current.name}</UserText>
@@ -878,6 +893,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         {creating && (
           <NewProject
             api={api}
+            firstReadMs={firstReadMs}
             returnFocusTo={() => {
               // The opener, unless it was disabled meanwhile (the library turned read-only): then the project list.
               const b = newProjectButton.current;
@@ -1043,20 +1059,14 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           </p>
         )}
         {/* FR-756 B: a read that got no answer says so (each sentence once) and is offered again. */}
-        {unansweredText && (
+        {pageSentence && (
           <p role="alert" className="ao-error">
-            {unansweredText}
+            {pageSentence}
           </p>
         )}
-        {showTryAgain && (
+        {pageSentence !== undefined && (
           <p>
-            <button
-              type="button"
-              onClick={() => {
-                triedAgain.current = true;
-                readAgain();
-              }}
-            >
+            <button type="button" onClick={retryAll}>
               Try again
             </button>
           </p>
@@ -1166,12 +1176,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             )}
             {openSource && (
               <div className="ao-library__detail">
-                <SourceDetail api={api} projectId={project.id} sourceId={openSource} readOnly={readOnly} onClose={() => setOpenSource(undefined)} onChanged={refresh} onLocked={() => markLocked(project.id)} refreshKey={badgesVersion} />
+                <SourceDetail api={api} projectId={project.id} sourceId={openSource} readOnly={readOnly} onClose={() => setOpenSource(undefined)} onChanged={refresh} onLocked={() => markLocked(project.id)} refreshKey={badgesVersion} firstReadMs={firstReadMs} />
               </div>
             )}
           </>
         )}
       </main>
     </div>
+    </PageReads>
   );
 }

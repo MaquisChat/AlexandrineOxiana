@@ -1469,3 +1469,45 @@ describe("Watched folders: first reads that never settle (FR-750, R579)", () => 
     expect(tryAgain()).toBeNull();
   });
 });
+
+// FR-756's remainder (R609 N4): the screen's silent side reads — the projects (its name), the libraries (the mode), the
+// collections — are given up at the limit silently (cancelled; nothing new is shown), and cancelled when it is left.
+describe("Watched folders: the side reads are given up silently at the limit (FR-756 remainder)", () => {
+  function heldSide() {
+    const gate = hang();
+    const seen = new Map<string, AbortSignal>();
+    const held = (name: string, body: unknown) => async ({ request }: { request: Request }) => {
+      seen.set(name, request.signal);
+      await gate;
+      return HttpResponse.json(body as never);
+    };
+    server.use(
+      http.get(url("/projects"), held("projects", PROJECTS)),
+      http.get(url("/libraries"), held("libraries", { libraries: [], current: CURRENT_RW })),
+      http.get(url("/projects/p1/collections"), held("collections", { collections: [] })),
+    );
+    return seen;
+  }
+
+  it("held, they are cancelled at the limit with no alert, and the folders are shown", async () => {
+    useService([folder()]);
+    const seen = heldSide();
+    render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} firstReadMs={300} />);
+    await screen.findByRole("region", { name: "Fieldwork scans" });
+    await waitFor(() => expect([...seen.keys()].sort()).toEqual(["collections", "libraries", "projects"]));
+    await waitFor(() => expect([...seen.values()].every((s) => s.aborted)).toBe(true), { timeout: 3000 });
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("held, they are cancelled when the screen is left", async () => {
+    useService([folder()]);
+    const seen = heldSide();
+    const view = render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} firstReadMs={60_000} />);
+    await screen.findByRole("region", { name: "Fieldwork scans" });
+    await waitFor(() => expect([...seen.keys()].sort()).toEqual(["collections", "libraries", "projects"]));
+    expect([...seen.values()].some((s) => s.aborted)).toBe(false);
+    view.unmount();
+    await waitFor(() => expect([...seen.values()].every((s) => s.aborted)).toBe(true), { timeout: 1000 });
+  });
+});

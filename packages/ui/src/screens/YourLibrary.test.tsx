@@ -7,6 +7,7 @@
  * page's own ticket, the window's events) and "Sign out of my library", in the desktop app and outside it.
  */
 import { FIND_LIBRARY_TEXT, YOUR_LIBRARY_CATALOGUE_MAX, YOUR_LIBRARY_DERIVE_TEXT, YOUR_LIBRARY_TEXT, type LibraryAccess, type YourLibraryResponse } from "@ao/shared";
+import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
@@ -1494,6 +1495,27 @@ describe("Your library: leaving the screen cancels its held read (FR-756, R605 M
     expect(signals[0]!.aborted).toBe(false);
     unmount();
     await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+  });
+});
+
+describe("Your library under React's strict mode (FR-756, R617 N1)", () => {
+  it("the read cancelled by strict mode's simulated leave says nothing while the real read is still out", async () => {
+    const svc = useSvc(SET);
+    const gate = hang();
+    svc.onGet = async () => {
+      await gate;
+      return undefined;
+    };
+    render(
+      <StrictMode>
+        <YourLibrary client={testClient()} firstReadMs={60_000} />
+      </StrictMode>,
+    );
+    await waitFor(() => expect(svc.count("GET", "/settings/your-library")).toBe(2));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(screen.queryAllByRole("alert").map((a) => a.textContent)).toEqual([]);
+    expect(screen.queryByText(T.loadFailed)).toBeNull();
+    expect(screen.getByText(T.loading)).toBeTruthy();
   });
 });
 

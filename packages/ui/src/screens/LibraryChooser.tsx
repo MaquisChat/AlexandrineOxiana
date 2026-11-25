@@ -7,7 +7,7 @@
  */
 import { useEffect, useId, useRef, useState, type FormEvent, type RefObject } from "react";
 import { ApiClientError } from "../api/client";
-import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../api/firstRead";
+import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry, type LibraryState } from "../api/library";
 import { PathField } from "../components/PathField";
 import { DeviceNoticeBanners, useNoticeDismiss } from "../components/StatusBanner";
@@ -191,6 +191,8 @@ export function LibraryChooser({ api, onOpened, onNotFound, firstReadMs = FIRST_
   // FR-756 I3 (R602): the list has the time limit. A read that got no answer (none at all, or none in time) says its own
   // sentence with "Try again" (`listTry` moves it on); one refused with an answer says so as before.
   const [listNoAnswer, setListNoAnswer] = useState<string | undefined>();
+  /** FR-756's remainder (R609 N2): the list's last read was refused with an answer (it says so; the list is not known). */
+  const [listRefused, setListRefused] = useState(false);
   const [listTry, setListTry] = useState(0);
   const triedList = useRef(false);
   useEffect(() => {
@@ -199,19 +201,20 @@ export function LibraryChooser({ api, onOpened, onNotFound, firstReadMs = FIRST_
       .then((r) => {
         if (ac.signal.aborted) return;
         setListNoAnswer(undefined);
+        setListRefused(false);
         setLibraries(r.libraries);
         setNotices(r.notices ?? []);
       })
       .catch((err: unknown) => {
         if (ac.signal.aborted) return;
+        // R609 N2: a list not read (given up, failed or refused) is never shown as an empty one ("No libraries yet"): the
+        // list stays as it was (unread, or as last read).
         if (isUnreachable(err)) {
           setListNoAnswer((err as ApiClientError).message);
-          // Given up, nothing is known of the list; failed, it is shown empty as before.
-          if (!isNoAnswerInTime(err)) setLibraries((l) => l ?? []);
           return;
         }
         setListNoAnswer(undefined);
-        setLibraries([]);
+        setListRefused(true);
         setError(message(err, "The list of libraries could not be read."));
       });
     return () => ac.abort();
@@ -263,7 +266,7 @@ export function LibraryChooser({ api, onOpened, onNotFound, firstReadMs = FIRST_
       <DeviceNoticeBanners notices={notices} onDismiss={notice.onDismiss} error={notice.error} />
       <LostCreateNotices heading={heading} />
       {libraries === undefined ? (
-        !listNoAnswer && <p aria-live="polite">Loading libraries…</p>
+        !listNoAnswer && !listRefused && <p aria-live="polite">Loading libraries…</p>
       ) : libraries.length === 0 ? (
         <p>No libraries yet. Open a library folder, or create a new library below.</p>
       ) : (

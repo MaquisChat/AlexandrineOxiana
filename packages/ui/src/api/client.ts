@@ -60,7 +60,8 @@ export interface ApiClient {
   /** Any route; `path` starts with "/". Prefer the typed methods. */
   request<T>(method: Method, path: string, opts?: RequestOptions): Promise<T>;
   appearance: {
-    get(): Promise<AppearanceSettings>;
+    /** `opts.signal` (FR-756): cancels the read (the appearance settings' read is given up at its time limit). */
+    get(opts?: { signal?: AbortSignal }): Promise<AppearanceSettings>;
     put(patch: AppearancePatch): Promise<AppearanceSettings>;
   };
   /**
@@ -594,7 +595,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     bytes,
     byteRange,
     appearance: {
-      get: () => request<AppearanceSettings>("GET", "/settings/appearance"),
+      get: (opts = {}) => request<AppearanceSettings>("GET", "/settings/appearance", opts.signal ? { signal: opts.signal } : {}),
       put: (patch) => request<AppearanceSettings>("PUT", "/settings/appearance", { body: patch }),
     },
     ndjson,

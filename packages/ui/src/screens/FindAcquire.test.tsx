@@ -5612,6 +5612,36 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
   });
 
+  it("R609 N1: the queue given up while the screen already says its sentence: the queue's own alert and “Try again” are never put on the page, not even for a moment", async () => {
+    useService();
+    const gate = hang();
+    server.use(
+      http.get(url("/find/screen"), () => HttpResponse.error()),
+      http.get(url("/projects/:id/find"), async () => {
+        await gate;
+        return HttpResponse.json({ entries: [] });
+      }),
+    );
+    // Every element put on the page while it settles (a node put and taken away at once is seen too).
+    const added: Element[] = [];
+    const watch = new MutationObserver((records) => {
+      for (const r of records) for (const n of r.addedNodes) if (n instanceof Element) added.push(n, ...n.querySelectorAll("*"));
+    });
+    watch.observe(document.body, { childList: true, subtree: true });
+    try {
+      showWithin(300, `?project=${PID}`);
+      await waitFor(() => expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]), { timeout: 5000 });
+      // Past the queue's limit.
+      await new Promise((r) => setTimeout(r, 900));
+      expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([UNREACHABLE]);
+      expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+      expect(added.filter((e) => e.getAttribute("role") === "alert" && e.textContent?.includes(NO_ANSWER))).toEqual([]);
+      expect(added.filter((e) => e.tagName === "BUTTON" && e.textContent === "Try again")).toHaveLength(1);
+    } finally {
+      watch.disconnect();
+    }
+  });
+
   it("R602 M1: every unanswered read given up: “did not answer in time”, once", async () => {
     useService();
     const gate = hang();

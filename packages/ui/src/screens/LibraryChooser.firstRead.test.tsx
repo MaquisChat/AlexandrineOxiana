@@ -64,3 +64,30 @@ describe("LibraryChooser: its own read of the list has the time limit (FR-756 I3
     expect(tryAgain()).toBeNull();
   });
 });
+
+// FR-756's remainder (R609 N2): "No libraries yet" is said only of a list that was read and is empty.
+describe("LibraryChooser: “No libraries yet” only for a list that was read (FR-756 remainder)", () => {
+  it("a list that failed with no answer: “could not be reached” and “Try again”, never “No libraries yet”", async () => {
+    server.use(http.get(url("/libraries"), () => HttpResponse.error()));
+    show();
+    await screen.findByRole("button", { name: "Try again" });
+    expect(alerts()).toEqual([UNREACHABLE]);
+    expect(screen.queryByText(/No libraries yet/)).toBeNull();
+    expect(screen.queryByText("Loading libraries…")).toBeNull();
+  });
+
+  it("a list refused with an answer: its sentence, never “No libraries yet” nor the loading words", async () => {
+    server.use(http.get(url("/libraries"), () => serviceError(500, "INTERNAL", "The list could not be read.")));
+    show();
+    await screen.findByText("The list could not be read.");
+    expect(screen.queryByText(/No libraries yet/)).toBeNull();
+    expect(screen.queryByText("Loading libraries…")).toBeNull();
+  });
+
+  it("a list read and empty says “No libraries yet”", async () => {
+    server.use(http.get(url("/libraries"), () => HttpResponse.json({ libraries: [] })));
+    show();
+    expect(await screen.findByText(/No libraries yet/)).toBeTruthy();
+    expect(alerts()).toEqual([]);
+  });
+});
