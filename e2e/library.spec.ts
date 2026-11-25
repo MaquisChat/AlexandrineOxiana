@@ -24,7 +24,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { buildDoiPdf, buildPdf } from "../tests/fixtures/generate.mjs";
-import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
+import { APP_ORIGIN, expect, gotoWhenQuiet, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 
 // ---------- shared ----------
 
@@ -492,3 +492,36 @@ test("scenario 7: delete library.sqlite while the service is stopped, start it a
   });
 });
 
+
+// FR-756 A: the opening screen does not wait for ever on a look at the libraries the browser never settles. The look is
+// held unanswered here (it stands for the request the test browser left unsettled at a reload, FR-750); the page gives
+// it up at its twenty-second limit. No seam shortens the limit: the scenario waits for it, with room for a busy machine.
+test("FR-756 A: opened while its look at the libraries is never answered, the opening screen says so within the limit and “Try again” opens the chooser", async ({ page, app }) => {
+  await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
+  const isList = (url: URL) => url.origin === app.baseUrl && url.pathname === "/libraries";
+  let held = 0;
+  let release!: () => void;
+  const released = new Promise<void>((r) => (release = r));
+  await page.route(isList, async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    held++;
+    await released;
+    await route.abort().catch(() => {});
+  });
+  try {
+    await gotoWhenQuiet(page, `${APP_ORIGIN}/`);
+    await expect(page.getByText("Connecting to the library…")).toBeVisible();
+    const alert = page.getByRole("alert");
+    await expect(alert).toHaveText("The library service did not answer in time.", { timeout: 40_000 });
+    await expect(page.getByText("Connecting to the library…")).toHaveCount(0);
+    await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toHaveCount(0);
+    expect(held).toBe(1);
+  } finally {
+    await page.unroute(isList);
+    release();
+  }
+  // Answered again: the press looks again and the screen goes on (here, to the chooser: no library yet).
+  await page.getByRole("button", { name: "Try again" }).click();
+  await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
