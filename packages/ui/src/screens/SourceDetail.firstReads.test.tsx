@@ -83,6 +83,33 @@ describe("the source's detail alone: its read has the limit (FR-756 remainder)",
     expect(tryAgains()).toHaveLength(0);
   });
 
+  for (const reRead of ["given up", "failed with no answer"] as const)
+    it(`a refused read, then a re-read (the badges refreshed) ${reRead}: the refusal stands while the re-read is out, then one alert, the re-read's (R623 Minor 1)`, async () => {
+      styles();
+      const signals: AbortSignal[] = [];
+      server.use(
+        http.get(url("/projects/:id/sources/:sid"), async ({ request }) => {
+          signals.push(request.signal);
+          if (signals.length === 1) return HttpResponse.json({ error: { code: "INTERNAL", message: REFUSED_READ } }, { status: 500 });
+          if (reRead === "failed with no answer") return HttpResponse.error();
+          await hang();
+          return undefined;
+        }),
+      );
+      const props = { api: testApi(), projectId: "p1", sourceId: "s1", readOnly: false, onClose: vi.fn(), firstReadMs: LIMIT };
+      const { rerender } = render(<SourceDetail {...props} refreshKey={0} />);
+      await waitFor(() => expect(alerts().join(" ")).toContain(REFUSED_READ));
+      rerender(<SourceDetail {...props} refreshKey={1} />);
+      await waitFor(() => expect(signals).toHaveLength(2));
+      if (reRead === "given up") {
+        expect(alerts()).toHaveLength(1);
+        expect(alerts().join(" ")).toContain(REFUSED_READ);
+      }
+      await within(panel()).findByRole("button", { name: "Try again" }, { timeout: 5000 });
+      expect(alerts()).toEqual([reRead === "given up" ? NO_ANSWER : UNREACHABLE]);
+      expect(tryAgains()).toHaveLength(1);
+    });
+
   it("closing the panel cancels its held read", async () => {
     styles();
     const asks = asksInTurn(url("/projects/:id/sources/:sid"), ["hold"]);

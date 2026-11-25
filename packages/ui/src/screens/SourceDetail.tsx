@@ -287,8 +287,10 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
       .catch((err: unknown) => {
         if (!live || g !== gen.current) return;
         recordOut.current = false;
-        // No answer: its own sentence alone, with "Try again"; an answer the panel handles as before.
+        // No answer: its own sentence alone, with "Try again"; an answer the panel handles as before. R623 (Minor 1): the
+        // alert of the read before (a refusal) is replaced when this read settles, as a failure replaced it before.
         if (isUnreachable(err)) {
+          setError(undefined);
           setUnanswered((err as Error).message);
           return;
         }
