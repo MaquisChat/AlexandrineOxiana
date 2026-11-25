@@ -123,3 +123,87 @@ NOT APPROVED. 1 Important, 6 Minor.
 - To mend before a join: decide "marked" from the journal or the steps completed, not from the root marker; recognise a split's markers when finishing; add a service test for a split.
 
 Minor, can follow: the path is matched only by exact string (symbolic link or case); after a failure at "unlink" the old place does not name the new one, and the old copy can be deleted through the API before finishing; the note is lost when its opening is refused; "another computer" also covers the same computer; finishing does not re-check the new place against the recorded hashes before saying "nothing was lost".
+
+---
+
+# Second look (R583)
+
+Branch `fr-755-move-failure` at 6e33ae2: seven commits on 9b1a1fa. I changed no product code. Probes `*.probeFR755b.test.ts` were written, run alone at `nice -n 10`, and deleted; `git status --short` is empty.
+
+**Verdict on the whole change now: NOT APPROVED.**
+- Most of the fix round holds: I1 for every probed state, M1 and M4, and M2 in the service.
+- Two Important points remain:
+  - **N1:** the stuck state R588 (b) names is confirmed, and it is reached without any change by the researcher.
+  - **N2:** the M5 check lets an audit log that was emptied or shortened by hand through, and finishing then hides it.
+
+## The findings, each ruled again
+
+| finding | verdict | probe |
+|---|---|---|
+| I1 split moves | **partly** | Nine late states of a split, each probed (first mark, last mark, journal write after the marking, crash after mark-old, register, close-source, audit-split, mark-complete, unlink). In each: the split's answer `move-not-finished-split`; my old probe (attach into a marked project) now answers 503; opening the new place finishes, read-write, told once; the old library opens read-write with "Kept" only; in "Kept" only `audit/0001.jsonl` changed (audit-split's `library.split`, by design); a change to Kept is accepted. Still open: the part-way state (N1) and a recorded step whose mark is missing (N3). |
+| M1 real paths | closed, for the new place | The engine test covers the link. In the service, a move to a destination reached through a link is refused before it starts ("That path is not allowed."). Letter case could NOT be probed: this machine's disk (ext4) keeps case; `realpath.native` is right by reading. A hand-made copy is still refused (builder's tests). The old place is still matched by text in `movedToFor` (`old-copies.ts:182`), by reading only (N5). |
+| M2 deleting the old copy while unfinished | partly | After a failure at "unlink", `deleteOldCopy({confirm})` is refused with `move-unfinished`. **But** with the new place's drive unplugged, `journalStillAt` reads nothing and returns false, so the deletion is ALLOWED: 11 files deleted. With the drive back, the new place opens read-only `move-incomplete`, with no words and no finishing, for good. Only an engine/API caller can do this (the service deletes only by the move's token), so Minor (N4). The day-long offer now runs from `completedAt`, which is never earlier than `createdAt`. No deletion can come earlier than before, or before the check passed: `complete` is set only by `runSwitch`'s finalize, which `finishMoveAt` reaches only after its check. |
+| M4 words | closed (Minor N5) | The builder's tests cover in-use by another program, newer format, damaged journal, and the old drive unreachable; the sentences are true by reading. Left over: the old place's words in the damaged-journal state still promise that opening the new place finishes it (`movedToFor` gives `!complete`, and the journal cannot be parsed). |
+| M5 check before finishing | **partly** | One file deleted and one changed at the new place, with the old copy changed too: read-only, `move-not-finished-files-differ-old-unconfirmed`, count 2, place = the old root. Deleted only: `…files-differ`, count 1. A file added by hand at the new place: finished (nothing is lost; R588 does not ask for it). `library.json` emptied or garbage: the opening answers 409 and nothing is finished. `library.json` rewritten with valid content (renamed, history emptied): finished, which is harmless. **An audit log emptied, or cut to its first line, by hand: finished, "nothing was lost", no warning at all (N2).** Timing: 300 MB extra took 0.56 s from the page cache. The opening's request waits for the whole check; I could not measure a cold external disk (the builder estimates 1–2 min per 10 GB); I found no service time limit on `/libraries/open`. The count and place reach the page only (`integrityWarnings[].place`, through `UserText`); the log carries `describe(err)`, with no path. |
+
+## The stuck state (R588 b): CONFIRMED, and worse than the builder says
+- Probe: a split with Study and Field moving and Kept staying; `fail = {at:"split-mark", afterFolders:1}`.
+  - Field is marked; Study is not.
+  - The move answers the split sentence; the library is closed.
+  - Opening the OLD place gives read-write, projects ["Kept","Study"]: the moving Study is shown as the old library's own.
+- **With no change by the researcher at all**, merely opening the old library changes Study's `audit/0001.jsonl`: the daily backup runs at the opening and records `backup.create` in every project.
+  - Opening the new place then refuses with `move-cannot-finish-source-changed`, read-only, both folders byte for byte unchanged by the refusal. Nothing is lost.
+  - The move is stuck for good, and the words tell the researcher to "Tell the developer".
+- The same happens with a change made in Study (attach answers 200).
+- **And it is reached without any act**: after a part-way failure, quit and start the app. The reopening at start opens the OLD place, because register had not run, so `lastKnownPaths[0]` is still the old one. That reopening runs the backup and is stuck the same way (probe B3).
+- The split's dialog sentence ("The library they came from can be opened again for the projects that stayed") leads the researcher straight into this state.
+- **The cure R588 rules is right, and small.**
+  - The old library CAN know the moving projects: this computer's record (`PendingOldCopy`, in the app's config folder) holds `split`, `movedFolders` and `movedProjectIds`. The old folder itself holds nothing until it is marked; the journal is only at the new place.
+  - Smallest safe place: `openLibraryInternal` (`library.ts`, beside the `MOVED_MARKER` check at :279). When a record for this root and `meta.libraryId` is an unfinished split (`!complete || journalStillAt`), open READ-ONLY `moved` with `movedTo`. The banner naming the new place already exists (`moveUnfinishedTo`). That is about 5–10 lines plus a test.
+  - It matches only the part-way state: once fully marked, `library.json` carries the remaining id, so the record no longer matches and the remaining library opens normally.
+  - Because the opening is read-only, the backup and every other write are off. A per-project variant (R588's literal wording) would have to reach all six callers of `projectMovedAway` (repo state, attention, index changes, restore record, move) and must also HIDE the projects, not only refuse changes, or the backup would still write. That is larger. I recommend the whole-library read-only opening; the projects that stayed are then read-only only until the new place is opened.
+  - The lookup must use the real path (as M1 does). The split sentence should then say to open the new library FIRST.
+  - Nothing can be done on another computer, which has no record; there the finishing still refuses safely.
+
+## New findings
+
+### Important
+**N1. The part-way split state is stuck, reached by the reopening at start or by any opening of the old library** (above). Files: `move.ts` (the source-changed check in `finishMoveAt`); `library.ts:279` is where the cure goes.
+
+**N2. An audit log emptied or shortened by hand at the new place passes the check, and finishing hides it.**
+- `finishMoveAt` checks audit logs for presence only (`move.ts`, `AUDIT_LOG` rule).
+- Probe D5/D5d: the log cut to 0 bytes, or to its first of 5 lines, before the opening. The move is finished, "nothing was lost" is shown, and `GET /libraries/integrity` and every later opening show **no warning**.
+- The same cut made AFTER a finished move is caught at the next opening ("empty", D5c).
+- So the finishing launders it. The anchor check runs inside the finishing's own `openRepo`, whose warnings are dropped; audit-move then appends and re-anchors.
+- The old copy still holds the full log, but a later confirmed `deleteOldCopy` deletes it there (its hash matches the record), and the project's audit history is then gone.
+- R588 (a) rested on "the integrity check at opening verifies the audit chains", which is not true across a finishing.
+- Direction:
+  - Refuse when the finishing's `openRepo` reports any audit-anchor problem (truncated, empty, chain-broken, head-mismatch).
+  - And/or require each audit log at the new place to begin with the verified bytes: record each file's size with its hash; the prefix of that size must hash to the recorded value.
+
+### Minor
+- **N3.** A recorded step whose mark is missing: the journal records mark-old, and a mark is deleted by hand (a moved project's `MOVED.json`, or for a whole library the top's).
+  - The old place then opens read-write and takes a change (attach 200).
+  - Opening the new place finishes without that change and says "nothing was lost" (probes C and C2).
+  - It needs a hand deletion. Direction: finishing could check that the marks the journal records are still present, and refuse otherwise.
+- **N4.** `journalStillAt` returns false when the new place cannot be read, so `deleteOldCopy({confirm})` deletes the old copy of an unfinished move whose new drive is unplugged, and the new place is then stuck. API only. Direction: fail closed (an unreadable `newRoot` means "cannot tell": refuse).
+- **N5.** Words:
+  - The old place in the damaged-journal state still promises that opening the new place finishes the move.
+  - `movedToFor` matches the old root by text, not by real path.
+  - In a split, the old library hides the moved projects rather than "showing them as moved" (R583 (2)'s wording). No words there say where they went.
+
+## The existing tests
+`git diff 9b1a1fa..HEAD --stat -- '*.test.ts' '*.test.tsx'`: the only lines removed are:
+- import and helper lines that were refactored;
+- three expectations of FR-755's OWN first-round tests, for words this round changed on purpose (the in-use regex, the disk-full sentence, the engine's in-use matcher, now `code: "in-use"`).
+
+No test from before FR-755 was changed.
+
+## Message to the coordinator
+NOT APPROVED.
+- **I1:** holds in all nine late split states (the attach into a marked project is refused; the new place finishes; Kept unchanged apart from its `library.split` audit line), except the part-way state.
+- **R588 (b) is confirmed, and worse:** no change by the researcher is needed. The daily backup at the old library's opening writes into the unmarked moving project's audit log, and the reopening at start opens the OLD place after a part-way failure, so quitting and restarting is enough to make the move stuck for good.
+- **The cure is small:** in `openLibraryInternal`, open read-only `moved` while this computer's record shows an unfinished split for that root and library id (the record holds `movedFolders`). About 10 lines.
+- **New Important (N2):** an audit log emptied or shortened at the new place passes the presence-only check. The finishing then hides it: no warning ever, "nothing was lost" said, and the old copy's full log is deletable later.
+- M1, M4 closed. M5 and M2 partly closed (M2: the deletion is allowed when the new drive is unplugged; API only).
+- Minor: a hand-deleted mark the journal records is finished over.
