@@ -1636,6 +1636,54 @@ describe("FR-755 (R583): split moves, the check before finishing, and what canno
     await old.close();
   });
 
+  // R590 N2: each audit log at the new place begins with exactly what the move verified, and has no fault.
+  const auditLogOf = async (root: string, folder: string) => join(root, folder, "audit", (await readdir(join(root, folder, "audit"))).filter((n) => n.endsWith(".jsonl")).sort()[0]!);
+  for (const [how, cut] of [
+    ["cut to nothing", () => ""],
+    ["cut to its first line", (t: string) => `${t.split("\n")[0]}\n`],
+  ] as const) {
+    it(`R590 N2: an audit log at the new place ${how} by hand: not finished, counted among the files that differ; nothing written`, async () => {
+      const { lib, a, dest } = await stopped();
+      const log = await auditLogOf(dest, a.folder);
+      const text = await readFile(log, "utf8");
+      expect(text.split("\n").filter(Boolean).length).toBeGreaterThan(1);
+      await writeFile(log, cut(text));
+      const [oldAt, destAt] = [await hashes(lib.root), await hashes(dest)];
+      await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "files-differ", detail: { count: 1, oldRoot: lib.root, oldWhole: true } });
+      expect(await hashes(lib.root)).toEqual(oldAt);
+      expect(await hashes(dest)).toEqual(destAt);
+    });
+  }
+
+  it("R590 N2: a line that is not the switch's own, appended by hand to an audit log at the new place: not finished, the log counted once", async () => {
+    const { a, dest } = await stopped();
+    const log = await auditLogOf(dest, a.folder);
+    await writeFile(log, `${await readFile(log, "utf8")}${JSON.stringify({ action: "source.delete" })}\n`);
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "files-differ", detail: { count: 1 } });
+  });
+
+  it("R590 N2: an audit log that begins with what was verified and goes on with the switch's own lines is finished over", async () => {
+    const { a, dest } = await stopped();
+    moveSeams.fail = { at: "mark-complete" };
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ code: "ENOSPC" });
+    expect((await auditOf(dest, a.folder)).filter((e) => e.action === "library.move")).toHaveLength(1);
+    expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+  });
+
+  it("R590 N2: the switch's own line changed by hand after the verified beginning (the chain broken): the finishing's own opening reports it, and the move is not finished", async () => {
+    const { a, dest } = await stopped();
+    moveSeams.fail = { at: "mark-complete" };
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ code: "ENOSPC" });
+    const log = await auditLogOf(dest, a.folder);
+    const lines = (await readFile(log, "utf8")).split("\n").filter(Boolean);
+    const last = JSON.parse(lines.pop()!);
+    last.details = { ...last.details, fileCount: 999 };
+    await writeFile(log, `${[...lines, JSON.stringify(last)].join("\n")}\n`);
+    const destAt = await hashes(dest);
+    await expect(finishMoveAt(dest, mkDeps())).rejects.toMatchObject({ kind: "files-differ", detail: { count: 1 } });
+    expect(await hashes(dest)).toEqual(destAt);
+  });
+
   // R590 N4: where the new place cannot be read, whether the move finished cannot be told: the old copy is kept.
   it("R590 N4: the new place's drive not connected: the old copy cannot be deleted, and the refusal says why", async () => {
     const { lib } = await fixture();

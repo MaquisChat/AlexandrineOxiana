@@ -385,6 +385,25 @@ describe("FR-755 (R578 (1)): opening the new place of an unfinished move finishe
     expect(await hashes(path)).toEqual(oldAt);
   });
 
+  for (const [how, cut] of [
+    ["cut to nothing", () => ""],
+    ["cut to its first line", (t: string) => `${t.split("\n")[0]}\n`],
+  ] as const) {
+    it(`R590 N2: an audit log at the new place ${how} by hand (the reviewer's D5): not finished, read-only, counted among the files that differ; nothing written`, async () => {
+      const { path, dest } = await stoppedAfter("close-source");
+      const log = Object.keys(await hashes(dest)).find((f) => /^Projects\/[^/]+\/audit\/[^/]+\.jsonl$/u.test(f))!;
+      await writeFile(join(dest, log), cut(await readFile(join(dest, log), "utf8")));
+      const [oldAt, destAt] = [await hashes(path), await hashes(dest)];
+      const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+      expect([r.json.mode, r.json.readOnlyReason]).toEqual(["read-only", "move-incomplete"]);
+      // The read-only opening's own check reports the log's fault too (empty, or shortened).
+      expect(stateOf().integrityWarnings).toContainEqual({ projectId: "*", project: "library", kind: "move-not-finished-files-differ", detail: expect.any(String), count: 1, place: path });
+      expect(kindsNow().filter((k) => k !== "move-not-finished-files-differ")).toEqual([how === "cut to nothing" ? "empty" : "truncated"]);
+      expect(await hashes(path)).toEqual(oldAt);
+      expect(await hashes(dest)).toEqual(destAt);
+    });
+  }
+
   it("R590 N5: the old place of a move whose journal at the new place is damaged: read-only, naming the new place and that the app cannot finish the move", async () => {
     const { path, dest } = await stoppedAfter("close-source");
     await writeFile(join(dest, ".move-journal.json"), "{ damaged");

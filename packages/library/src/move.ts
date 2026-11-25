@@ -890,9 +890,12 @@ export async function finishMoveAt(destRoot: string, deps: Deps, opts: { tz?: st
   const markAgain = !sw.done.includes("mark-old");
   if (markAgain && !(await oldCopyMarked(rec, j))) return undefined;
 
-  // R583 M5: the new place checked again against the move's own record of every file it verified.
+  // R583 M5: the new place checked again against the move's own record of every file it verified. R590 N2: each project's
+  // audit log must begin with exactly what was verified, followed only by the switch's own lines; and the new place's
+  // audit logs must show no fault to a check that writes nothing (empty, shortened, chain broken, head not anchored).
   const verified = (await readVerifiedHashes(rec)).files;
-  const differ = await notMatching(dest, verified, (rel) => (rel === "library.json" || AUDIT_LOG.test(rel) ? "present" : "same"));
+  const differ = await notMatching(dest, verified, (rel) => (rel === "library.json" ? "present" : AUDIT_LOG.test(rel) ? "begins" : "same"));
+  for (const where of await auditFaultsAt(dest, deps)) if (!differ.some((rel) => rel.startsWith(where))) differ.push(where);
   if (differ.length > 0) {
     const oldWhole =
       (await fsp.stat(rec.oldRoot).then(() => true, () => false)) &&
@@ -944,15 +947,76 @@ const AUDIT_LOG = /^Projects\/[^/]+\/audit\/[^/]+\.jsonl$/u;
  * The files of `expected` (library-relative path → SHA-256, the move's own verification record) that are missing under
  * `root` or, where `rule` says "same", differ from what was verified. Read as the move's verification reads (sha256File).
  */
-async function notMatching(root: string, expected: Record<string, string>, rule: (rel: string) => "same" | "present"): Promise<string[]> {
+async function notMatching(root: string, expected: Record<string, string>, rule: (rel: string) => "same" | "present" | "begins"): Promise<string[]> {
   const bad: string[] = [];
   for (const [rel, hash] of Object.entries(expected)) {
     const p = abs(root, rel);
     const st = await fsp.lstat(p).catch(() => null);
+    const r = rule(rel);
     if (!st?.isFile()) bad.push(rel);
-    else if (rule(rel) === "same" && (await sha256File(p).catch(() => "")) !== hash) bad.push(rel);
+    else if (r === "same" && (await sha256File(p).catch(() => "")) !== hash) bad.push(rel);
+    else if (r === "begins" && !(await beginsWithVerified(p, hash).catch(() => false))) bad.push(rel);
   }
   return bad;
+}
+
+/** What the finishing's switch appends to a moved project's audit log at the new place (audit-move). */
+const SWITCH_OWN_ACTIONS = new Set(["library.move"]);
+
+/**
+ * R590 N2: the audit log at `p` begins with exactly what the move verified, and goes on only with the switch's own lines.
+ * The move's record holds each file's SHA-256 and no size, so the verified beginning is found by its hash: the log is
+ * read once, and the hash of every beginning that ends a line (or is empty, or is the whole file) is compared with the
+ * recorded one. Every complete line after it must be an audit event the switch writes; a last line cut off by a crash
+ * (no line end) is not a record and is left to the opening's own repair.
+ */
+async function beginsWithVerified(p: string, hash: string): Promise<boolean> {
+  const buf = await fsp.readFile(p);
+  const h = createHash("sha256");
+  let end = h.copy().digest("hex") === hash ? 0 : -1;
+  for (let from = 0; end < 0 && from < buf.length; ) {
+    const nl = buf.indexOf(0x0a, from);
+    const to = nl < 0 ? buf.length : nl + 1;
+    h.update(buf.subarray(from, to));
+    from = to;
+    if (h.copy().digest("hex") === hash) end = to;
+  }
+  if (end < 0) return false;
+  const rest = buf.subarray(end).toString("utf8").split("\n");
+  rest.pop(); // what follows the last line end: nothing, or a line cut off by a crash
+  return rest.every((line) => {
+    try {
+      return SWITCH_OWN_ACTIONS.has((JSON.parse(line) as { action?: unknown }).action as string);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** R590 N2: the faults of the new place's audit logs that the finishing refuses over. */
+const AUDIT_FAULTS = new Set(["empty", "truncated", "chain-broken", "head-mismatch"]);
+
+/**
+ * R590 N2: the new place's audit logs with a fault (`Projects/<n>/audit/`, or `audit/` for the library's own log), found
+ * by the library's own check, opened read-only so that nothing is written and no fault is recorded over (a writable
+ * opening records a fault in the log and anchors it anew, after which no later opening reports it).
+ */
+async function auditFaultsAt(dest: string, deps: Deps): Promise<string[]> {
+  const lib = await openLibraryInternal(dest, deps, {}, {});
+  try {
+    // With its journal, the new place opens read-only (no lock, nothing written); any other state is refused later.
+    if (lib.readOnlyReason !== "move-incomplete") return [];
+    const repo = await openRepo(lib, new KeyRing(), { clock: deps.clock, noHeal: true });
+    const out: string[] = [];
+    for (const w of repo.integrityWarnings) {
+      if (!AUDIT_FAULTS.has(w.kind)) continue;
+      const where = w.projectId === "*" ? "audit/" : `${(await projectFolderOf(dest, w.projectId)) ?? `Projects/${w.projectId}`}/audit/`;
+      if (!out.includes(where)) out.push(where);
+    }
+    return out;
+  } finally {
+    await lib.close();
+  }
 }
 
 /**
