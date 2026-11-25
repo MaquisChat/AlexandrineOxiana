@@ -578,3 +578,56 @@ describe("FR-755 (R583 I1): a split move (some projects stay behind) that fails 
     expect(kindsNow()).toEqual(["move-cannot-finish-mark-missing"]);
   });
 });
+
+describe("FR-068 (R607 a): a folder holding the copy of a move that stopped before its old copy was marked is refused, by the plan and by the move asked without it; nothing is written", () => {
+  const STALE = "That folder holds the copy of an earlier move that did not finish. Choose another, empty folder, or delete that folder first.";
+  const refusal = { code: "POLICY_DENIED", message: "The library cannot be moved there.", reason: STALE };
+  const total = async (pid: string) => (await call({ url: `/projects/${pid}/sources` })).json.total as number;
+
+  /** A whole-library move that fails before the old copy is marked (a folder stands where the mark must go); the obstacle then removed. */
+  async function failedBeforeMark(path: string, dest: string) {
+    await mkdir(join(path, "MOVED.json"));
+    expect(lastLine(await move(dest)).error).toBeDefined();
+    await rm(join(path, "MOVED.json"), { recursive: true });
+    expect(JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8")).phase).toBe("switching");
+    expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
+    expect(svc!.state.session!.lib.root).toBe(path);
+  }
+
+  /** The dialog's plan, then the move without it: both refused in those words, nothing written at `places` or this computer's records. */
+  async function refusedTwice(dest: string, places: string[]) {
+    await svc!.state.idle();
+    const before = await Promise.all([join(tmp, "config"), ...places].map((p) => hashes(p)));
+    const plan = await call({ method: "POST", url: "/libraries/move/plan", body: { dest } });
+    expect([plan.status, plan.json.error]).toEqual([403, refusal]);
+    expect(lastLine(await move(dest))).toEqual({ error: refusal });
+    await svc!.state.idle();
+    expect(await Promise.all([join(tmp, "config"), ...places].map((p) => hashes(p)))).toEqual(before);
+  }
+
+  it("the FR-068 sequence: the move fails before the mark; the old library takes a change; the move asked again to that folder is refused; nothing changed; the old library is still the library, with its change", async () => {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    await failedBeforeMark(path, dest);
+    expect((await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await pdf("c.pdf", "Lighthouse keeper diary")] } })).status).toBe(200);
+    await refusedTwice(dest, [path, dest]);
+    expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
+    expect(svc!.state.session!.lib.root).toBe(path);
+    expect(await total(pid)).toBe(3);
+  });
+
+  it("C-1 (the review's sequence): A→B fails before the mark; A→C succeeds; a change at C; the plan to B and the move to B without it are both refused; B and C byte for byte unchanged; C is still the library", async () => {
+    await start();
+    const { path, pid, dest: b } = await libraryWithSources();
+    await failedBeforeMark(path, b);
+    const c = join(tmp, "Moved", "C");
+    expect((await call({ method: "POST", url: "/libraries/move/plan", body: { dest: c } })).status).toBe(200);
+    expect(lastLine(await move(c)).done).toBe(true);
+    expect(svc!.state.session!.lib.root).toBe(c);
+    expect((await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await pdf("c.pdf", "Lighthouse keeper diary")] } })).status).toBe(200);
+    await refusedTwice(b, [b, c, path]);
+    expect(stateOf()).toMatchObject({ open: true, mode: "read-write" });
+    expect(svc!.state.session!.lib.root).toBe(c);
+    expect(await total(pid)).toBe(3);
+  });
+});
