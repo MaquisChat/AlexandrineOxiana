@@ -218,3 +218,54 @@ describe("FR-765: a caller's stop ends its lookup, and nothing more is sent for 
     expect(net.sent.map((x) => x.path).sort()).toEqual(["/works?query=theirs", "/works?search=mine"]);
   });
 });
+
+/** Runs `fn` after `n` turns of the microtask queue (to land a stop at every point of a call's waits in turn). */
+async function afterTurns(n: number, fn: () => void): Promise<void> {
+  for (let i = 0; i < n; i++) await null;
+  fn();
+}
+
+// FR-764: the stop is looked at right before the request itself. undici hands a request whose signal is already aborted
+// to the dispatcher all the same (and the dispatcher then opens a connection to the host), so a stop that lands in the
+// last turns before the request — after the waits were looked at — must still keep it from the network. Each case lands
+// the stop at every turn from the call's start, one call each, and no request may reach the dispatcher once stopped.
+describe("FR-764: a stop that lands just before the request keeps it from the network", () => {
+  const TURNS = 80;
+
+  it("a GET: the client's stop (a close)", async () => {
+    agent.get(OA).intercept({ path: (p) => p.startsWith("/works"), method: "GET" }).reply(() => json({ results: [] })).persist();
+    for (let n = 0; n < TURNS; n++) {
+      const http = client({ sleep: async () => {} });
+      const call = http.getJson(`${OA}/works?search=t${n}`, { cacheKey: `t${n}` }).catch(() => undefined);
+      await afterTurns(n, () => http.stop());
+      await call;
+    }
+    expect(net.sent.filter((x) => x.aborted)).toEqual([]);
+  });
+
+  it("a GET: the caller's stop", async () => {
+    agent.get(OA).intercept({ path: (p) => p.startsWith("/works"), method: "GET" }).reply(() => json({ results: [] })).persist();
+    for (let n = 0; n < TURNS; n++) {
+      const http = client({ sleep: async () => {} });
+      const ac = new AbortController();
+      const call = http.getJson(`${OA}/works?search=c${n}`, { cacheKey: `c${n}`, signal: ac.signal }).catch(() => undefined);
+      await afterTurns(n, () => ac.abort(new Error("stopped")));
+      await call;
+    }
+    expect(net.sent.filter((x) => x.aborted)).toEqual([]);
+  });
+
+  for (const how of ["the client's stop", "the caller's stop"] as const) {
+    it(`a POST (Find's search through Elicit): ${how}`, async () => {
+      agent.get("https://elicit.com").intercept({ path: "/api/v1/search", method: "POST" }).reply(() => json({ papers: [] })).persist();
+      for (let n = 0; n < TURNS; n++) {
+        const http = client({ sleep: async () => {} });
+        const ac = new AbortController();
+        const call = http.postJson("https://elicit.com/api/v1/search", { q: "tide" }, { signal: ac.signal }).catch(() => undefined);
+        await afterTurns(n, () => (how === "the client's stop" ? http.stop() : ac.abort(new Error("stopped"))));
+        await call;
+      }
+      expect(net.sent.filter((x) => x.aborted)).toEqual([]);
+    });
+  }
+});

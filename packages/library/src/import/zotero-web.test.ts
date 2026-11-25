@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MockAgent } from "undici";
+import { Dispatcher, MockAgent } from "undici";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCATION_NEEDS_ENCRYPTION, type Project, type SourceFile } from "@ao/core";
 import { buildCameraTiff, buildPdf, buildZip } from "../../../../tests/fixtures/generate.mjs";
@@ -2273,5 +2273,101 @@ processing:
     expect(z.requests.length).toBeGreaterThan(0);
     expect(z.requests.every((r) => r.method === "GET")).toBe(true);
     expect(checked.requests >= checked.tests).toBe(true);
+  });
+});
+
+// FR-764: a Zotero sync that is stopped hands nothing more to the network: the wait before a storage retry ends at once,
+// and a stop that lands while the storage redirect is read keeps its request from the storage host.
+describe("FR-764: a stopped sync asks the storage host nothing more", () => {
+  /** Counts the requests handed to the network for the storage host; `abortAfter` aborts as one answer has ended. */
+  class Watched extends Dispatcher {
+    storage = 0;
+    abortAfter?: { path: string; abort: () => void };
+    constructor(private readonly inner: Dispatcher) {
+      super();
+    }
+    override dispatch(opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
+      if (String(opts.origin) === STORAGE) this.storage++;
+      const after = this.abortAfter;
+      if (!after || String(opts.path) !== after.path) return this.inner.dispatch(opts, handler);
+      // The answer ends first (its signal is let go), and the stop lands right after it.
+      const wrapped = new Proxy(handler, {
+        get(t, k) {
+          if (k === "onResponseEnd" || k === "onComplete") {
+            const f = Reflect.get(t, k) as ((...a: unknown[]) => unknown) | undefined;
+            if (!f) return undefined;
+            return (...a: unknown[]) => {
+              const out = f.apply(t, a);
+              after.abort();
+              return out;
+            };
+          }
+          const v = Reflect.get(t, k) as unknown;
+          return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+        },
+      });
+      return this.inner.dispatch(opts, wrapped);
+    }
+    override close(): Promise<void> {
+      return this.inner.close();
+    }
+    override destroy(): Promise<void> {
+      return this.inner.destroy();
+    }
+  }
+
+  async function serveOneFile(key: string): Promise<string> {
+    const pdf = await buildPdf({ extra: `fr764 ${key}` });
+    const md5 = createHash("md5").update(pdf).digest("hex");
+    serveItems(
+      [
+        article(`P${key}`, "Stopped while its file came"),
+        { key: `A${key}`, version: 9, data: { key: `A${key}`, version: 9, itemType: "attachment", parentItem: `P${key}`, linkMode: "imported_file", contentType: "application/pdf", filename: "f.pdf", md5, tags: [] } },
+      ],
+      9,
+    );
+    serveCollections([]);
+    serveTagColors();
+    agent.get(API).intercept({ path: `/users/42/items/A${key}/file`, method: "GET" }).reply(302, "", { headers: { location: `${STORAGE}/signed/${key}?sig=1` } }).persist();
+    return `/users/42/items/A${key}/file`;
+  }
+
+  async function scanWith(net: Dispatcher, signal: AbortSignal, sleep: (ms: number) => Promise<void>): Promise<void> {
+    const work = join(tmp, "work");
+    await mkdir(work, { recursive: true, mode: 0o700 });
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: net, sleep });
+    for await (const _ of a.scan(signal, { workDir: async () => work })) void _;
+  }
+
+  it("a sync stopped during the wait before a storage retry ends there, and the storage host is not asked again", async () => {
+    await serveOneFile("WAIT64");
+    agent.get(STORAGE).intercept({ path: "/signed/WAIT64?sig=1", method: "GET" }).reply(503, "busy").persist();
+    const net = new Watched(agent);
+    const ac = new AbortController();
+    const reason = new Error("the sync was stopped");
+    const waits: number[] = [];
+    // Every other wait passes at once; the storage retry's wait never ends by itself: only the stop can end it.
+    const sleep = (ms: number) => {
+      if (net.storage === 0) return Promise.resolve();
+      waits.push(ms);
+      ac.abort(reason);
+      return new Promise<void>(() => {});
+    };
+    await expect(scanWith(net, ac.signal, sleep)).rejects.toBe(reason);
+    expect(waits).toHaveLength(1);
+    expect(net.storage).toBe(1);
+  });
+
+  it("a sync stopped while the storage redirect is read asks the storage host nothing", async () => {
+    const filePath = await serveOneFile("GAP64");
+    const storageAnswers = vi.fn(() => ({ statusCode: 200, data: "x" }));
+    agent.get(STORAGE).intercept({ path: "/signed/GAP64?sig=1", method: "GET" }).reply(storageAnswers).persist();
+    const net = new Watched(agent);
+    const ac = new AbortController();
+    const reason = new Error("the sync was stopped");
+    net.abortAfter = { path: filePath, abort: () => ac.abort(reason) };
+    await expect(scanWith(net, ac.signal, async () => {})).rejects.toBe(reason);
+    expect(net.storage).toBe(0);
+    expect(storageAnswers).not.toHaveBeenCalled();
   });
 });

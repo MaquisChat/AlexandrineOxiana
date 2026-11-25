@@ -642,6 +642,9 @@ export class HttpClient {
           signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
         }),
       ]);
+      // FR-764: a stop or the limit that came in the turns since the wait ended keeps the request from the network
+      // (undici hands a request whose signal is already aborted to the dispatcher all the same).
+      if (signal.aborted) throw new Error("aborted");
       const res = await request(u, {
         method: "POST",
         headers: {

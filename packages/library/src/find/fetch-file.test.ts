@@ -429,6 +429,20 @@ describe("fetchFile: time and abort", () => {
     await empty();
   });
 
+  // FR-764: an abort while the folder is made, when making it fails, ends the call with the abort's reason, not with a
+  // write failure (the caller stopped; nothing about the folder is to be told).
+  it("FR-764: an abort while a folder that cannot be made is tried gives the abort's reason and sends nothing", async () => {
+    pdfAt("https://arxiv.org", "/pdf/no-folder");
+    await writeFile(dir, "a file where the folder should be");
+    const ac = new AbortController();
+    const p = get("https://arxiv.org/pdf/no-folder", { signal: ac.signal });
+    p.catch(() => {});
+    const reason = new Error("stopped by the runner");
+    ac.abort(reason);
+    await expect(p).rejects.toBe(reason);
+    expect(requests).toEqual([]);
+  });
+
   it("a write that fails at the end (the final name taken meanwhile) leaves no part file", async () => {
     holdKeys.add("https://arxiv.org/late");
     const p = get("https://arxiv.org/late");
