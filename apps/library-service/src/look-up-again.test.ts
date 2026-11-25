@@ -943,4 +943,42 @@ describe("fix round (R600)", () => {
     const wrong = await call({ method: "POST", url: `/review/${e.id}/look-up-again`, body: { projectId: lib.pid, sourceId: lib.sources[1] } });
     expect([wrong.status, wrong.json.entry.id]).toEqual([200, e.id]);
   });
+
+  it(`m6: the pass's bound of ${LOOK_UP_AGAIN_PASS_MAX} counts only entries for which a request left`, { timeout: 120_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(LOOK_UP_AGAIN_PASS_MAX + 2);
+    // The 20 oldest look a DOI up at Crossref only; the client holds Crossref (nothing can leave for them).
+    for (const [i, sid] of lib.sources.slice(0, LOOK_UP_AGAIN_PASS_MAX).entries()) {
+      await patchEntry(lib.pid, sid, (e) => ({ leftOut: [{ ...e.leftOut![0]!, identifier: `doi:10.5555/held.${i}`, services: ["crossref"] }] }));
+    }
+    answer = () => NO_RESULTS;
+    await reopen(lib, MIN);
+    await svc!.state.idle();
+    svc!.state.session!.http.holdUntil("api.crossref.org", Date.now() + 30 * MIN);
+    clock += 16 * MIN;
+    expect(await svc!.state.runLookUpAgain()).toBe(2);
+    expect(sent).toEqual([LOOK_UP_AGAIN_PASS_MAX + 1, LOOK_UP_AGAIN_PASS_MAX + 2].map((i) => `api.openalex.org ${titleOf(i)} Souza`));
+  });
+
+  it("m6, m7: a timer tick during a pass is dropped; an unlock during a pass is followed by a pass of that project only", { timeout: 30_000 }, async () => {
+    await start();
+    const lib = await libraryWithWaiting(2);
+    const enc = await call({ method: "POST", url: "/projects", body: { name: "Sealed", governanceYaml: LOOKUP_GOV, encryption: { enabled: true, passphrase: PASS } } });
+    expect(enc.status, enc.body).toBe(200);
+    const sealed = enc.json.project.id as string;
+    answer = () => NO_RESULTS;
+    const passes: Array<readonly string[] | undefined> = [];
+    const orig = svc!.state.runLookUpAgain.bind(svc!.state);
+    svc!.state.runLookUpAgain = (ctl, projects) => (passes.push(projects), orig(ctl, projects));
+    const held = holdFirstRequest();
+    await reopen(lib, 16 * MIN);
+    await held.atGate;
+    // The timer ticks, and the sealed project is unlocked, while the pass's first request is held.
+    svc!.state.startLookUpAgain();
+    expect((await call({ method: "POST", url: `/projects/${sealed}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    held.release();
+    await svc!.state.idle();
+    expect(passes).toEqual([undefined, [sealed]]);
+    expect(sent).toEqual([1, 2].map((i) => `api.openalex.org ${titleOf(i)} Souza`));
+  });
 });

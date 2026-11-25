@@ -319,7 +319,8 @@ export class ServiceState {
   private lookUpTimer: ReturnType<typeof setInterval> | undefined;
   /** The pass running now (one at a time), and whether another was asked for while it ran (an unlock, the timer). */
   private lookUpPass: Promise<void> | undefined;
-  private lookUpPassAgain = false;
+  /** R600 m6: the projects unlocked while a pass ran: the next pass takes only their entries. */
+  private readonly lookUpPassFor = new Set<string>();
   /** Look-ups take turns: the automatic pass's entries and the researcher's act, one at a time per service. */
   private lookUpTurn: Promise<unknown> = Promise.resolve();
   /** The entry (project and id) whose look-up runs in its turn now (R592: a press for it answers "under way"). */
@@ -1983,23 +1984,27 @@ export class ServiceState {
    * the opening, at an unlock, and on the quiet timer. One pass at a time: asked for while one runs, another runs once
    * that one has ended (so an unlock during a pass is not missed). Read-write libraries only.
    */
-  startLookUpAgain(): void {
+  startLookUpAgain(projectIds?: readonly string[]): void {
     const s = this.session;
     if (!s || s.lib.mode !== "read-write" || this.startsHeld || this.shuttingDown || s.closing.signal.aborted) return;
     if (this.lookUpPass) {
-      this.lookUpPassAgain = true;
+      // R600 m6: asked for while a pass runs — a timer tick is dropped (that pass is taking what is due); an unlock's
+      // project is taken by a pass of its own entries only, once this pass has ended.
+      for (const p of projectIds ?? []) this.lookUpPassFor.add(p);
       return;
     }
     this.lookUpPass = this.startWork("lookup-again", async (ctl) => {
       try {
         await s.holdsCarried; // R600 I1: the holds carried over the opening first
-        do {
-          this.lookUpPassAgain = false;
-          await this.runLookUpAgain(ctl);
-        } while (this.lookUpPassAgain && !ctl.stopping);
+        await this.runLookUpAgain(ctl, projectIds);
+        while (this.lookUpPassFor.size && !ctl.stopping) {
+          const next = [...this.lookUpPassFor];
+          this.lookUpPassFor.clear();
+          await this.runLookUpAgain(ctl, next);
+        }
       } finally {
         this.lookUpPass = undefined;
-        this.lookUpPassAgain = false;
+        this.lookUpPassFor.clear();
       }
     });
   }
@@ -2049,12 +2054,12 @@ export class ServiceState {
    * sends it nothing. A lookup that failed outright is never due (R577 iv): only the researcher's act asks it. Returns
    * how many entries it took.
    */
-  async runLookUpAgain(ctl: WorkControl = { stopping: false }): Promise<number> {
+  async runLookUpAgain(ctl: WorkControl = { stopping: false }, projectIds?: readonly string[]): Promise<number> {
     const s = this.session;
     let taken = 0;
     const stop = () => ctl.stopping || this.startsHeld || this.shuttingDown || s?.closing.signal.aborted === true || this.session !== s;
     if (!s || s.lib.mode !== "read-write" || stop()) return taken;
-    for (const p of s.repo.listProjects()) {
+    for (const p of s.repo.listProjects().filter((x) => !projectIds || projectIds.includes(x.id))) {
       if (stop()) return taken;
       // A locked project waits for its unlock (R566 4): nothing of it is read or asked.
       if (!s.repo.isUnlocked(p.id)) continue;
@@ -2071,16 +2076,16 @@ export class ServiceState {
         try {
           r = await this.lookUpInTurn(p.id, d.entryId, () => lookUpAgain(s.repo, s.http, p.id, d.entryId, { by: "automatic", closing: s.closing.signal, now: this.opts.now() }));
         } catch (err) {
-          taken++;
           // A refusal by the project's rules (audited by the library) or a failure of this one entry: the next goes on.
           this.opts.log.warn({ err: this.describe(err) }, "looking up again: an entry was not looked up");
           continue;
         }
-        // R585 (3), R592: a look-up of this entry is already under way (nothing sent, nothing written): skipped, and
-        // not counted toward the pass's bound.
-        if (!r.done && r.why === "under-way") continue;
-        taken++;
-        if (r.done) continue;
+        // R600 m6: the bound counts only the entries for which a request LEFT — not one every service of which is held,
+        // nor one the rules no longer allow, nor one under way (R585 3: nothing sent, nothing written).
+        if (r.done) {
+          if (r.sent > 0) taken++;
+          continue;
+        }
         // The library began to close (or another opened): nothing more is sent or written.
         if (r.why === "closing" || r.why === "cancelled" || r.why === "read-only") return taken;
         // Locked meanwhile: the rest of this project waits for its unlock.
