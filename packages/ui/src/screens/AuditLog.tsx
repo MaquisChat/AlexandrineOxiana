@@ -460,8 +460,11 @@ export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_R
   const [error, setError] = useState<string | null>(null);
   const [check, setCheck] = useState<AuditCheck | null>(null);
   const [checking, setChecking] = useState(false);
-  /** FR-756: the log's last read got no answer (or none in time): "Try again" is offered. */
-  const [loadUnreachable, setLoadUnreachable] = useState(false);
+  /**
+   * FR-756: the log's last read got no answer (none in time, or the service could not be reached): its sentence, with
+   * "Try again". Kept apart from `error` (R605 M5): a re-read after an act, given up, never replaces the screen's message.
+   */
+  const [unanswered, setUnanswered] = useState<string | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const before = cursors[cursors.length - 1];
   const ids = useId();
@@ -476,11 +479,14 @@ export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_R
       if (!reads.settled(outer)) return;
       setPage(p);
       setError(null);
-      setLoadUnreachable(false);
+      setUnanswered(null);
     } catch (err) {
       if (!reads.settled(outer)) return;
-      setError(err instanceof Error ? err.message : "The audit log could not be read.");
-      setLoadUnreachable(isUnreachable(err));
+      if (isUnreachable(err)) setUnanswered((err as Error).message);
+      else {
+        setUnanswered(null);
+        setError(err instanceof Error ? err.message : "The audit log could not be read.");
+      }
     }
   }, [api, projectId, pageSize, before, firstReadMs, reads]);
   useEffect(() => {
@@ -488,11 +494,10 @@ export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_R
   }, [load]);
   // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects).
   const { yields, retryAll } = usePageRead("audit", {
-    sentence: loadUnreachable && error !== null ? error : undefined,
-    out: () => !page && reads.out(),
+    sentence: unanswered ?? undefined,
+    out: reads.out,
     retry: () => {
-      setError(null);
-      setLoadUnreachable(false);
+      setUnanswered(null);
       void load();
     },
   });
@@ -528,12 +533,17 @@ export function AuditLog({ api, projectId, pageSize = 100, firstReadMs = FIRST_R
           <Verdict check={check} />
         </section>
       ) : null}
-      {error && !(loadUnreachable && yields) ? (
+      {error ? (
         <p role="alert" className="ao-warning">
           {error}
         </p>
       ) : null}
-      {loadUnreachable && !yields && <TryAgain focusTo={headingRef} onPress={retryAll} />}
+      {unanswered && !yields ? (
+        <p role="alert" className="ao-warning">
+          {unanswered}
+        </p>
+      ) : null}
+      {unanswered && !yields && <TryAgain focusTo={headingRef} onPress={retryAll} />}
       <NeedsAttention api={api} projectId={projectId} onChanged={() => void load()} />
       {page ? (
         <>

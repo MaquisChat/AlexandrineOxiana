@@ -110,8 +110,11 @@ export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = F
   const [consents, setConsents] = useState<ConsentRecord[]>([]);
   const [complete, setComplete] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  /** FR-756: the records' last read got no answer (or none in time): "Try again" is offered while they are unread. */
-  const [loadUnreachable, setLoadUnreachable] = useState(false);
+  /**
+   * FR-756: the records' last read got no answer (none in time, or the service could not be reached): its sentence, with
+   * "Try again". Kept apart from `error` (R605 M5): a re-read after an act, given up, never replaces the act's message.
+   */
+  const [unanswered, setUnanswered] = useState<string | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const [result, setResult] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
@@ -167,12 +170,16 @@ export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = F
       setSessions(s.sessions);
       setConsents(c.consents);
       setComplete(p.complete && s.complete && c.complete);
+      setUnanswered(null);
     } catch (err) {
       if (!reads.settled(outer)) return;
       // A pending focus target must never fire later, by surprise (n2).
       setDetachedFrom(null);
-      setError(err instanceof Error ? err.message : "The fieldwork records could not be loaded.");
-      setLoadUnreachable(isUnreachable(err));
+      if (isUnreachable(err)) setUnanswered((err as Error).message);
+      else {
+        setUnanswered(null);
+        setError(err instanceof Error ? err.message : "The fieldwork records could not be loaded.");
+      }
     }
   }, [api, projectId, firstReadMs, reads]);
   useEffect(() => {
@@ -180,10 +187,10 @@ export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = F
   }, [load]);
   // R605 I2: one sentence and one "Try again" for the page (with the route's list of projects).
   const { yields, retryAll } = usePageRead("fieldwork", {
-    sentence: !participants && loadUnreachable && error !== null ? error : undefined,
-    out: () => !participants && reads.out(),
+    sentence: unanswered ?? undefined,
+    out: reads.out,
     retry: () => {
-      setError(null);
+      setUnanswered(null);
       void load();
     },
   });
@@ -203,6 +210,7 @@ export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = F
     busyRef.current = true;
     focusBack.current = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
     setError(null);
+    setUnanswered(null);
     setResult(null);
     setFlagged(false);
     setBusy(true);
@@ -253,15 +261,17 @@ export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = F
           Fieldwork
         </h1>
         {error ? (
-          !(loadUnreachable && yields) && (
-            <p role="alert" className="ao-warning">
-              {error}
-            </p>
-          )
-        ) : (
-          <p role="status">Loading…</p>
-        )}
-        {error && loadUnreachable && !yields && <TryAgain focusTo={headingRef} onPress={retryAll} />}
+          <p role="alert" className="ao-warning">
+            {error}
+          </p>
+        ) : null}
+        {unanswered && !yields ? (
+          <p role="alert" className="ao-warning">
+            {unanswered}
+          </p>
+        ) : null}
+        {!error && !unanswered && <p role="status">Loading…</p>}
+        {unanswered && !yields && <TryAgain focusTo={headingRef} onPress={retryAll} />}
       </main>
     );
   }
@@ -277,6 +287,12 @@ export function Fieldwork({ api, projectId, encrypted, readOnly, firstReadMs = F
           {error}
         </p>
       ) : null}
+      {unanswered && !yields ? (
+        <p role="alert" className="ao-warning">
+          {unanswered}
+        </p>
+      ) : null}
+      {unanswered && !yields && <TryAgain focusTo={headingRef} onPress={retryAll} />}
       {result ? (
         <p role="status" aria-label="Fieldwork result" className="ao-ok">
           {result}

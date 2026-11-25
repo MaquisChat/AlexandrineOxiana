@@ -4,7 +4,7 @@
  * "Try again", which reads again (the loading words meanwhile) and focus is not lost; a read that FAILS shows what it
  * showed before. The limit is passed small (`firstReadMs`), as FR-750's screens' tests do.
  */
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it } from "vitest";
@@ -27,6 +27,7 @@ const UNREACHABLE = "The library service could not be reached.";
 const LIMIT = 300;
 const tryAgain = () => screen.queryByRole("button", { name: "Try again" });
 const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
+const PAGE_ONE = { events: [{ seq: 1, at: "2026-10-01T08:00:00.000Z", actor: "Ana", action: "source.add", decision: { result: "allow" } }], total: 1 };
 
 /** A GET that hangs (never settles) until `answer` is set; then answers with `body`. Counts its requests. */
 function held(path: string, body: unknown) {
@@ -429,5 +430,69 @@ describe("FR-756, R605 M3: leaving a governance screen cancels its held read", (
     expect(signals[0]!.aborted).toBe(false);
     unmount();
     await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+  });
+});
+
+describe("FR-756, R605 M5: a re-read after an act, given up, never replaces the act's own message", () => {
+  /** A GET answered with `body` on its first ask, then held (never settles) until `h.answer` is set. */
+  function thenHeld(path: string, body: unknown) {
+    const h = { answer: false, count: 0 };
+    const gate = hang();
+    server.use(
+      http.get(path, async () => {
+        if (++h.count > 1 && !h.answer) await gate;
+        return HttpResponse.json(body as never);
+      }),
+    );
+    return h;
+  }
+
+  it("fieldwork: a refused act keeps its message when the re-read after it is given up; the give-up is the screen's alert with “Try again”, which reads again", async () => {
+    const h = thenHeld(P("/participants"), { participants: [], complete: true });
+    server.use(
+      http.get(P("/sessions"), () => HttpResponse.json({ sessions: [], complete: true })),
+      http.get(P("/consents"), () => HttpResponse.json({ consents: [], complete: true })),
+      http.post(P("/participants"), () => HttpResponse.json({ error: { code: "REFUSED", message: "The participant could not be added." } }, { status: 409 })),
+    );
+    render(<Fieldwork api={makeApi()} projectId={PID} firstReadMs={LIMIT} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Add participant" }));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual(["The participant could not be added.", NO_ANSWER]);
+    h.answer = true;
+    await user.click(tryAgain()!);
+    await waitFor(() => expect(alerts()).toEqual(["The participant could not be added."]));
+    expect(tryAgain()).toBeNull();
+    expect(h.count).toBe(3);
+  });
+
+  it("the audit log: after a set-aside, a re-read of the log given up keeps the screen's earlier message and says the give-up with “Try again”", async () => {
+    const h = thenHeld(P("/audit"), PAGE_ONE);
+    let list = [{ id: "m1", kind: "permissions-not-set", action: "library.relink", occurredAt: "2026-11-03T08:00:00.000Z", actor: "ana", canSetAside: true }];
+    server.use(
+      http.get(P("/attention"), () => HttpResponse.json({ marks: list })),
+      http.get(P("/audit/verify"), () => HttpResponse.json({ error: { code: "INTERNAL", message: "The audit log could not be checked." } }, { status: 500 })),
+      http.post(P("/attention/m1/set-aside"), () => {
+        list = [];
+        return HttpResponse.json({ recordedIn: "project" });
+      }),
+    );
+    render(<AuditLog api={makeApi()} projectId={PID} firstReadMs={LIMIT} />);
+    const user = userEvent.setup();
+    await screen.findByRole("table", { name: "Audit events" });
+    await user.click(screen.getByRole("button", { name: "Verify integrity" }));
+    await screen.findByText("The audit log could not be checked.");
+    await user.click(screen.getByRole("button", { name: /Set aside/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Set this aside" });
+    await user.type(within(dialog).getByRole("textbox", { name: /Reason/ }), "Recorded on paper");
+    await user.click(within(dialog).getByRole("button", { name: "Set aside" }));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual(["The audit log could not be checked.", NO_ANSWER]);
+    h.answer = true;
+    await user.click(tryAgain()!);
+    // A log read that is answered clears the screen's alerts, as it did before.
+    await waitFor(() => expect(alerts()).toEqual([]));
+    expect(tryAgain()).toBeNull();
+    expect(h.count).toBe(3);
   });
 });
