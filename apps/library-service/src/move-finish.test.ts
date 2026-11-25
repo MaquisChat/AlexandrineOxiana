@@ -5,7 +5,7 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -317,6 +317,45 @@ describe("FR-755 (R578 (1)): opening the new place of an unfinished move finishe
     expect((await call({ method: "POST", url: "/libraries/open", body: { path: dest } })).json.mode).toBe("read-write");
     expect(kindsNow()).toEqual(["move-finished-at-opening"]);
     await assertWholeAtNewPlace(path, pid, dest);
+  });
+
+  it("R583 M4: a damaged journal: read-only, and the words say the app cannot finish it", async () => {
+    const { dest } = await stoppedAfter("close-source");
+    await writeFile(join(dest, ".move-journal.json"), "{ damaged");
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect([r.json.mode, r.json.readOnlyReason]).toEqual(["read-only", "move-incomplete"]);
+    expect(kindsNow()).toEqual(["move-cannot-finish-journal-damaged"]);
+  });
+
+  it("R583 M4: the old copy's drive not connected when its mark must be looked at: says so, with the place; connected again, it finishes", async () => {
+    await start();
+    const { path, pid, dest } = await libraryWithSources();
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    expect(lastLine(await move(dest)).error.reason).toBe(MOVE_NOT_FINISHED_REASON);
+    const away = join(tmp, "Unplugged");
+    await rename(path, away);
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect(r.json.mode).toBe("read-only");
+    expect(stateOf().integrityWarnings).toEqual([{ projectId: "*", project: "library", kind: "move-not-finished-old-copy-unreachable", detail: expect.any(String), place: path }]);
+    await rename(away, path);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: dest } })).json.mode).toBe("read-write");
+    await assertWholeAtNewPlace(path, pid, dest);
+  });
+
+  it("R583 M4: a newer format at the new place: read-only, and the words say this version cannot finish it", async () => {
+    const { dest } = await stoppedAfter("close-source");
+    const meta = JSON.parse(await readFile(join(dest, "library.json"), "utf8"));
+    await writeFile(join(dest, "library.json"), JSON.stringify({ ...meta, formatVersion: 99 }));
+    const r = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect(r.json.mode).toBe("read-only");
+    expect(kindsNow()).toEqual(["move-not-finished-newer-format"]);
+  });
+
+  it("R583 M4: the new place held by another program on this computer: the words do not say another computer", async () => {
+    const { dest } = await stoppedAfter("close-source");
+    expect((await acquireLock(dest, { ...deps, pid: process.ppid })).acquired).toBe(true);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: dest } })).json.mode).toBe("read-only");
+    expect(kindsNow()).toEqual(["move-not-finished-in-use"]);
   });
 
   it("the new place held by another computer: read-only as before, said so, nothing written", async () => {

@@ -102,13 +102,20 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   // FR-755 (R578): an opening of the library at the new place of this computer's own unfinished move. For this session only.
   "move-finished-at-opening": () => "The move of this library to this folder had not finished. It was finished when the library was opened here; nothing was lost.",
   "move-not-finished-disk-full": () =>
-    "The move of this library to this folder has not finished, and it could not be finished now because the disk is full. The library is open read-only and nothing was lost; opening it again will try again.",
+    "The move of this library to this folder has not finished, and it could not be finished now because the disk is full. The library is open read-only, and both copies are kept; opening it again will try again.",
   "move-not-finished-not-writable": () =>
-    "The move of this library to this folder has not finished, and it could not be finished now because this folder cannot be written to. The library is open read-only and nothing was lost; opening it again will try again.",
+    "The move of this library to this folder has not finished, and it could not be finished now because this folder cannot be written to. The library is open read-only, and both copies are kept; opening it again will try again.",
+  // R583 M4: held by another program on this computer or by another computer: words true of both.
   "move-not-finished-in-use": () =>
-    "The move of this library to this folder has not finished, and it could not be finished now because the library or its old copy is open on another computer. The library is open read-only and nothing was lost; opening it again will try again.",
+    "The move of this library to this folder has not finished, and it could not be finished now because the library or its old copy is open in another program or on another computer. Close it there; the library is open read-only, both copies are kept, and opening it again will try again.",
+  "move-not-finished-newer-format": () =>
+    "The move of this library to this folder has not finished, and this version of the app cannot finish it: the library was saved by a newer version of the app. Update the app and open the library again; both copies are kept.",
+  "move-cannot-finish-journal-damaged": () =>
+    "The move of this library to this folder has not finished, and the app cannot finish it: the record of the move kept in this folder is damaged. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
+  "move-cannot-finish-source-changed": () =>
+    "The move of these projects to this folder has not finished, and the app cannot finish it: some of them were changed in the library they came from after they were copied. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
   "move-not-finished": () =>
-    "The move of this library to this folder has not finished, and it could not be finished now because a step of it failed. The library is open read-only and nothing was lost; opening it again will try again.",
+    "The move of this library to this folder has not finished, and it could not be finished now because a step of it failed. The library is open read-only, and both copies are kept; opening it again will try again.",
   "rolled-back-incomplete-write": (p) => `An interrupted change in ${p} was undone when the library opened, so nothing half-saved was kept.`,
   "invalid-txn-marker": (p) => `A note left by an interrupted change in ${p} could not be read. It was kept aside and nothing was changed.`,
   "incomplete-write-pending": (p) => `An interrupted change in ${p} could not be finished or undone yet. It is tried again when the library is next opened with write access.`,
@@ -200,6 +207,9 @@ const PLACE_WARNINGS: Record<string, (n: number, place: string) => string> = {
     `The move of this library to this folder has not finished, and the app did not finish it: ${files(n)} what was checked when the library was copied. The old copy at ${place} still holds every file as it was checked. Both copies are kept as they are, and this library is open read-only.`,
   "move-not-finished-files-differ-old-unconfirmed": (n, place) =>
     `The move of this library to this folder has not finished, and the app did not finish it: ${files(n)} what was checked when the library was copied, and the old copy at ${place} could not be confirmed to hold every file either. Both copies are kept as they are, and this library is open read-only. Ask for help before changing or deleting either copy.`,
+  // R583 M4: the old copy's marks must be looked at and its drive is not connected.
+  "move-not-finished-old-copy-unreachable": (_n, place) =>
+    `The move of this library to this folder has not finished, and it could not be finished now because its old copy at ${place} cannot be reached. Connect the drive it is on and open the library again; both copies are kept.`,
 };
 
 /**

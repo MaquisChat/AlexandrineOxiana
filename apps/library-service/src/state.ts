@@ -153,6 +153,11 @@ function notFinishedNote(err: unknown, detail: string): OpeningNote {
   if (err instanceof MoveFinishRefusedError && err.kind === "files-differ") {
     return { kind: err.detail.oldWhole ? "move-not-finished-files-differ" : "move-not-finished-files-differ-old-unconfirmed", detail, count: err.detail.count ?? 0, place: err.detail.oldRoot ?? "" };
   }
+  // R583 M4: what the app cannot finish, or not now, each in its own words.
+  if (err instanceof MoveFinishRefusedError && err.kind === "old-copy-unreachable") return { kind: "move-not-finished-old-copy-unreachable", detail, place: err.detail.oldRoot ?? "" };
+  if (err instanceof MoveFinishRefusedError && err.kind === "journal-damaged") return { kind: "move-cannot-finish-journal-damaged", detail };
+  if (err instanceof MoveFinishRefusedError && err.kind === "source-changed") return { kind: "move-cannot-finish-source-changed", detail };
+  if (err instanceof MoveNotAllowedError && err.code === "newer-format") return { kind: "move-not-finished-newer-format", detail };
   return { kind: notFinishedKind(err), detail };
 }
 

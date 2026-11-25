@@ -478,10 +478,21 @@ describe("FR-755 (R578): a move that had not finished", () => {
   it("the opening that finished it says so once, in plain words; one that could not says why and that opening again tries again", () => {
     expect(sentenceOf("move-finished-at-opening")).toBe("The move of this library to this folder had not finished. It was finished when the library was opened here; nothing was lost.");
     expect(sentenceOf("move-not-finished-disk-full")).toBe(
-      "The move of this library to this folder has not finished, and it could not be finished now because the disk is full. The library is open read-only and nothing was lost; opening it again will try again.",
+      "The move of this library to this folder has not finished, and it could not be finished now because the disk is full. The library is open read-only, and both copies are kept; opening it again will try again.",
     );
     expect(sentenceOf("move-not-finished-not-writable")).toMatch(/because this folder cannot be written to\. .*opening it again will try again\.$/u);
-    expect(sentenceOf("move-not-finished-in-use")).toMatch(/because the library or its old copy is open on another computer\. /u);
+    expect(sentenceOf("move-not-finished-in-use")).toBe(
+      "The move of this library to this folder has not finished, and it could not be finished now because the library or its old copy is open in another program or on another computer. Close it there; the library is open read-only, both copies are kept, and opening it again will try again.",
+    );
+    expect(sentenceOf("move-not-finished-newer-format")).toBe(
+      "The move of this library to this folder has not finished, and this version of the app cannot finish it: the library was saved by a newer version of the app. Update the app and open the library again; both copies are kept.",
+    );
+    expect(sentenceOf("move-cannot-finish-journal-damaged")).toBe(
+      "The move of this library to this folder has not finished, and the app cannot finish it: the record of the move kept in this folder is damaged. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
+    );
+    expect(sentenceOf("move-cannot-finish-source-changed")).toBe(
+      "The move of these projects to this folder has not finished, and the app cannot finish it: some of them were changed in the library they came from after they were copied. Both copies are kept as they are, and this library is open read-only. Tell the developer before changing or deleting either copy.",
+    );
     expect(sentenceOf("move-not-finished")).toMatch(/because a step of it failed\. /u);
     for (const k of ["move-finished-at-opening", "move-not-finished-disk-full"]) expect(sentenceOf(k)).not.toMatch(/ENOSPC|Volumes/u);
   });
@@ -517,6 +528,10 @@ describe("R583 M5: files at the new place that no longer match", () => {
       isolated: [place],
     });
     expect(shown("move-not-finished-files-differ", 3).text).toMatch(/: 3 files here no longer match what was checked/u);
+    expect(shown("move-not-finished-old-copy-unreachable", 0)).toEqual({
+      text: `The move of this library to this folder has not finished, and it could not be finished now because its old copy at ${place} cannot be reached. Connect the drive it is on and open the library again; both copies are kept.`,
+      isolated: [place],
+    });
     expect(shown("move-not-finished-files-differ-old-unconfirmed", 2).text).toBe(
       `The move of this library to this folder has not finished, and the app did not finish it: 2 files here no longer match what was checked when the library was copied, and the old copy at ${place} could not be confirmed to hold every file either. Both copies are kept as they are, and this library is open read-only. Ask for help before changing or deleting either copy.`,
     );
