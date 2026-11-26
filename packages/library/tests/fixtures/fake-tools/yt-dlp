@@ -34,7 +34,10 @@ if (mode === "notfound") {
 // Modes: ratelimit (items from position `rateLimitAfter`, default 3, fail with 429), enumpartial
 // (only the first `cutAfter` entries, default 7, then 429), enumbroken (the same, then an extractor
 // error), enumshort (the same, but no error: a list silently shorter than the profile), enumratelimit
-// (the enumeration fails with 429). Items may have `listing` (YouTube: videos | shorts) and `noMedia`.
+// (the enumeration fails with 429), enumnetwork (the enumeration fails with a lost connection). Items may have `listing` (YouTube: videos | shorts) and `noMedia`,
+// `duration` (seconds, carried on the flat entry) and `error` (private | removed | network | disk:
+// the item's download prints the matching ERROR line and exits 1). With `-x` (audio only) an item
+// writes `<id>.m4a` instead of `<id>.mp4`.
 // YouTube: `<channel>/videos` and `/shorts` list their tab (flat entries carry a truncated
 // description, as YouTube's listings do); the bare channel lists its tabs as nested playlists.
 if (process.env.FAKE_PROFILE_FILE) {
@@ -56,6 +59,17 @@ function profileRun(prof) {
       process.exit(1);
     }
     const it = prof.items[pos];
+    if (it.error) {
+      const tag = `[${yt ? "youtube" : "TikTok"}] ${id}:`;
+      const lines = {
+        private: `ERROR: ${tag} Private video. Sign in if you've been granted access to this video`,
+        removed: `ERROR: ${tag} Video unavailable. This video has been removed by the uploader`,
+        network: `ERROR: ${tag} Unable to download webpage: <urlopen error timed out> (caused by URLError(TimeoutError('timed out')))`,
+        disk: `ERROR: unable to write data: [Errno 28] No space left on device`,
+      };
+      console.error(lines[it.error] ?? `ERROR: ${tag} ${it.error}`);
+      process.exit(1);
+    }
     const info = {
       id: it.id, title: yt ? it.caption.split("\n")[0] : `TikTok video #${it.id}`, description: it.caption,
       channel: prof.displayName, uploader: yt ? prof.displayName : prof.handle, uploader_id: yt ? `@${prof.handle}` : "7000000000000000999",
@@ -72,11 +86,15 @@ function profileRun(prof) {
     }
     writeFileSync(join(out, `${it.id}.info.json`), JSON.stringify(info));
     if (it.noMedia) process.exit(0);
-    if (!args.includes("--skip-download")) writeFileSync(join(out, `${it.id}.mp4`), Buffer.from("\0\0\0\x18ftypmp42 fake profile video " + it.id));
+    if (!args.includes("--skip-download")) writeFileSync(join(out, `${it.id}.${args.includes("-x") ? "m4a" : "mp4"}`), Buffer.from("\0\0\0\x18ftypmp42 fake profile video " + it.id));
     process.exit(0);
   }
   if (mode === "enumratelimit") {
     console.error(`ERROR: [${yt ? "youtube:tab" : "tiktok:user"}] ${prof.handle}: HTTP Error 429: Too Many Requests`);
+    process.exit(1);
+  }
+  if (mode === "enumnetwork") {
+    console.error(`ERROR: [${yt ? "youtube:tab" : "tiktok:user"}] ${prof.handle}: Unable to download webpage: <urlopen error timed out>`);
     process.exit(1);
   }
   const base = url.replace(/\/(videos|shorts)\/?$/, "");
@@ -99,7 +117,7 @@ function profileRun(prof) {
     description: prof.bio, channel_follower_count: prof.followers, playlist_count: total, channel_is_verified: prof.verified ?? false,
     webpage_url: url, original_url: `${url}?lang=en`, extractor_key: yt ? "YoutubeTab" : "TikTokUser",
     thumbnails: [{ id: "avatar_uncropped", url: prof.avatar }], links: prof.links ?? [],
-    entries: items.map((it) => ({ _type: "url", ie_key: yt ? "Youtube" : "TikTok", id: it.id, url: `${itemUrl(it)}?si=track`, title: it.caption.split("\n")[0], description: yt ? `${it.caption.slice(0, 12)}…` : it.caption, timestamp: it.timestamp })),
+    entries: items.map((it) => ({ _type: "url", ie_key: yt ? "Youtube" : "TikTok", id: it.id, url: `${itemUrl(it)}?si=track`, title: it.caption.split("\n")[0], description: yt ? `${it.caption.slice(0, 12)}…` : it.caption, timestamp: it.timestamp, ...(it.duration !== undefined ? { duration: it.duration } : {}) })),
   };
   writeFileSync(join(out, `${playlist.id}.info.json`), JSON.stringify(playlist));
   if (mode === "enumbroken") {
@@ -127,7 +145,7 @@ const id = info.id;
 writeFileSync(join(out, `${id}.info.json`), JSON.stringify(info));
 if (args.includes("--skip-download")) process.exit(0);
 if (mode === "infoonly") process.exit(0); // the post's data but no media file
-writeFileSync(join(out, `${id}.mp4`), Buffer.from("\0\0\0\x18ftypmp42 fake video bytes " + id));
+writeFileSync(join(out, `${id}.${args.includes("-x") ? "m4a" : "mp4"}`), Buffer.from("\0\0\0\x18ftypmp42 fake video bytes " + id));
 for (const pct of [25, 50, 100]) console.log(`[download] ${pct.toFixed(1).padStart(5)}% of 1.00MiB at 1.00MiB/s ETA 00:00`);
 if (mode === "partial") {
   console.error(`ERROR: [youtube] ${id}: HTTP Error 429: Too Many Requests`);

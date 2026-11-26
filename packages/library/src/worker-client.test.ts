@@ -163,6 +163,30 @@ describe("WorkerClient.submit", () => {
     expect(jobRows().map((r) => r.status)).toEqual(["failed"]);
   });
 
+  it("a failure's platformReason is kept on WorkerJobError", async () => {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const worker = await stubWorker(() => ({ status: "failed", error: { code: "NOT_FOUND_OR_REMOVED", message: "the post was not found", platformReason: "Video unavailable." } }));
+    const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 10 });
+    const err = await client
+      .submit(project.id, { type: "capture.download", input: "https://www.youtube.com/watch?v=abc", output: join(files, "cap"), params: { tool: "yt-dlp" } })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(WorkerJobError);
+    expect((err as WorkerJobError).code).toBe("NOT_FOUND_OR_REMOVED");
+    expect((err as WorkerJobError).platformReason).toBe("Video unavailable.");
+
+    // A failure naming a tool keeps it too; one without a reason has none.
+    const tool = await stubWorker(() => ({ status: "failed", error: { code: "TOOL_NOT_INSTALLED", message: "ffmpeg is not installed", tool: "ffmpeg", platformReason: "Requested format is not available." } }));
+    const e2 = await new WorkerClient({ repo, worker: tool, index: { db }, pollMs: 10 })
+      .submit(project.id, { type: "capture.download", input: "https://www.youtube.com/watch?v=abd", output: join(files, "cap2"), params: { tool: "yt-dlp" } })
+      .catch((e: unknown) => e);
+    expect(e2).toMatchObject({ code: "TOOL_NOT_INSTALLED", tool: "ffmpeg", platformReason: "Requested format is not available." });
+    const plain = await stubWorker(() => ({ status: "failed", error: { code: "PRIVATE", message: "private" } }));
+    const e3 = await new WorkerClient({ repo, worker: plain, index: { db }, pollMs: 10 })
+      .submit(project.id, { type: "capture.download", input: "https://www.youtube.com/watch?v=abe", output: join(files, "cap3"), params: { tool: "yt-dlp" } })
+      .catch((e: unknown) => e);
+    expect((e3 as WorkerJobError).platformReason).toBeUndefined();
+  });
+
   it("a denied transcription throws PolicyDeniedError, is audited, and never contacts the worker", async () => {
     const { project } = await repo.createProject({ name: "D", governanceYaml: NO_TRANSCRIPTION_GOV, encryption: { enabled: false } });
     const input = join(files, "a.wav");
