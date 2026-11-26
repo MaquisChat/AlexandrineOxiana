@@ -364,6 +364,53 @@ def test_a_missing_ffmpeg_during_the_job_is_a_missing_tool_not_a_removed_video(w
     assert job["error"]["tool"] == "ffmpeg"
 
 
+FIRST = "abc123.info.json,abc123.en.vtt,abc123.webp,abc123.mp4.part"
+
+
+@pytest.mark.parametrize("stderr,written,code", [
+    ("ERROR: [Errno 54] Connection reset by peer. Giving up after 3 retries", FIRST, "NETWORK_LOST"),
+    ("ERROR: unable to write data: [Errno 28] No space left on device", FIRST, "DISK_FULL"),
+    ("ERROR: Postprocessing: ffprobe and ffmpeg not found. Please install or provide the path using --ffmpeg-location",
+     FIRST + ",abc123.f137.mp4,abc123.f140.m4a,abc123.f251.webm", "TOOL_NOT_INSTALLED"),
+    ("ERROR: [youtube] abc123: HTTP Error 429: Too Many Requests", "abc123.info.json,abc123.en.vtt,abc123.webp", "RATE_LIMITED"),
+    ("ERROR: [youtube] abc123: Private video. Sign in if you've been granted access", "abc123.webp", "PRIVATE"),
+    # a lost connection fails even when a finished file is there
+    ("ERROR: [Errno 54] Connection reset by peer", FIRST + ",abc123.mp4", "NETWORK_LOST"),
+])
+def test_a_failure_in_the_middle_of_a_download_is_a_failure(worker, tmp_path, monkeypatch, stderr, written, code):
+    monkeypatch.setenv("FAKE_YTDLP_STDERR", stderr)
+    monkeypatch.setenv("FAKE_YTDLP_WRITE", written)
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "failed", job
+    assert job["error"]["code"] == code
+    if code == "TOOL_NOT_INSTALLED":
+        assert job["error"]["tool"] == "ffmpeg"
+
+
+def test_a_finished_media_file_keeps_a_failed_download_partial(worker, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_YTDLP_STDERR", "ERROR: [youtube] abc123: HTTP Error 429: Too Many Requests")
+    monkeypatch.setenv("FAKE_YTDLP_WRITE", "abc123.info.json,abc123.mp4,abc123.f140.m4a")
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "done" and job["result"]["meta"]["partial"] is True
+    # unjoined streams alone are not a finished file
+    monkeypatch.setenv("FAKE_YTDLP_WRITE", "abc123.info.json,abc123.f137.mp4,abc123.f251.webm")
+    job = worker.run("capture.download", URL, str(tmp_path / "d"), {"tool": "yt-dlp"})
+    assert job["status"] == "failed" and job["error"]["code"] == "RATE_LIMITED"
+
+
+def test_only_format_stream_names_are_unjoined():
+    from ao_worker.download import _is_finished_media
+    assert _is_finished_media("/o/my.final.mp4") and _is_finished_media("/o/abc.m4a")
+    assert not _is_finished_media("/o/abc.f137.mp4") and not _is_finished_media("/o/abc.f251-1.webm")
+    assert not _is_finished_media("/o/abc.webp") and not _is_finished_media("/o/abc.en.vtt")
+
+
+def test_an_enumeration_keeps_its_partial_rule(worker, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_YTDLP_MODE", "ratelimit-flat")
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp", "flatList": True})
+    assert job["status"] == "done" and job["result"]["meta"]["partial"] is True
+
+
 def test_strip_url():
     assert strip_url("https://www.instagram.com/reel/XYZ/?igsh=abc#frag") == "https://www.instagram.com/reel/XYZ/"
     assert strip_url("see https://a.test/x?token=1 and http://b.test/?q=2 now") == "see https://a.test/x and http://b.test/ now"

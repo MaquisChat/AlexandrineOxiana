@@ -528,6 +528,19 @@ def _list_outputs(out: Path, tool: str, archive: str | None) -> tuple[list[str],
     return files, infos, comments
 
 
+# After these a download never counts as partial, whatever was written.
+DOWNLOAD_FAILS_ALWAYS = ("NETWORK_LOST", "DISK_FULL", "TOOL_NOT_INSTALLED")
+_MEDIA_SUFFIXES = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".flv", ".3gp", ".ts", ".mpg", ".mpeg",
+                   ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".oga", ".wav", ".flac", ".weba"}
+_UNJOINED_RE = re.compile(r"\.f\d+(-\d+)?\.[^.]+$")  # abc.f137.mp4, abc.f251.webm: one stream, not yet joined
+
+
+def _is_finished_media(path: str) -> bool:
+    """A video or audio file that is not an unjoined stream (`.part` and `.ytdl` files are never listed)."""
+    name = Path(path).name
+    return Path(name).suffix.lower() in _MEDIA_SUFFIXES and not _UNJOINED_RE.search(name)
+
+
 def _split_comments(out: Path) -> None:
     """Moves yt-dlp's `comments` out of each info JSON into `<id>.comments.json` next to it."""
     for p in sorted(out.rglob("*.info.json")):
@@ -600,7 +613,14 @@ def run(job: Job, ctx: JobContext) -> dict:
     if rc != 0:
         code = map_error(stderr)
         detail = redact("\n".join(stderr.strip().splitlines()[-20:]))
-        if files or (enumeration and infos):
+        if tool == "yt-dlp" and not enumeration:
+            # Info JSON, captions and the thumbnail are written before the picture and sound, so they
+            # prove nothing. A lost connection, a full disk or a vanished ffmpeg always fails; any other
+            # failure is partial only when a finished video or audio file was written.
+            keep = code not in DOWNLOAD_FAILS_ALWAYS and any(_is_finished_media(f) for f in files)
+        else:
+            keep = bool(files or (enumeration and infos))
+        if keep:
             log.warning("capture job %s partial code=%s", job.id, code)
             meta.update(partial=True, errorCode=code, errorDetail=detail)
         else:
