@@ -280,6 +280,36 @@ def test_downloads_abort_on_unavailable_fragments():
     assert "--abort-on-unavailable-fragments" not in build_ytdlp_args("https://x.test/p", "/out", {"flatList": True})
 
 
+GDL_WARN = "[urllib3.connectionpool][warning] Retrying (Retry(total=3)) after connection broken by 'ReadTimeoutError(\"Read timed out. (read timeout=30)\")'"
+
+
+@pytest.mark.parametrize("stderr,code", [
+    (GDL_WARN + "\n[instagram][error] HttpError: '404 Not Found' for 'https://www.instagram.com/p/abc/'", "NOT_FOUND_OR_REMOVED"),
+    ("[instagram][error] HttpError: '429 Too Many Requests' for 'https://www.instagram.com/p/abc/'", "RATE_LIMITED"),
+    ("ERROR: [youtube] abc: Unable to download webpage: HTTP Error 504: Gateway Time-out (caused by <HTTPError 504: Gateway Time-out>); the read operation timed out", "RATE_LIMITED"),
+    # the HTTP guard: an answer with a timeout word in it is still not a lost connection
+    ("ERROR: [youtube] abc: Unable to download webpage: HTTP Error 404: Not Found (caused by timed out)", "NOT_FOUND_OR_REMOVED"),
+    ("ERROR: [youtube] abc: HTTP Error 403: Forbidden; Connection reset by peer", "EXTRACTOR_ERROR"),
+    ("ERROR: [youtube] abc: Unable to download webpage: HTTP Error 503: Service Unavailable", "RATE_LIMITED"),
+    ("ERROR: [youtube] abc: Unable to download webpage: HTTP Error 500: Internal Server Error", "RATE_LIMITED"),
+    ("ERROR: [youtube] abc: Video unavailable. This content isn't available, try again later.", "RATE_LIMITED"),
+    ("ERROR: [youtube] abc: Video unavailable", "NOT_FOUND_OR_REMOVED"),
+    ("ERROR: Did not get any data blocks", "NETWORK_LOST"),
+    ("ERROR: fragment 3 not found, unable to continue", "NETWORK_LOST"),
+])
+def test_map_error_gallery_dl_http_answers_and_fragments(stderr, code):
+    assert map_error(stderr) == code
+
+
+def test_a_missing_ffmpeg_during_the_job_is_a_missing_tool_not_a_removed_video(worker, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_YTDLP_STDERR", "ERROR: Postprocessing: ffprobe and ffmpeg not found. Please install or provide the path using --ffmpeg-location")
+    assert map_error(os.environ["FAKE_YTDLP_STDERR"]) == "TOOL_NOT_INSTALLED"
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "failed"
+    assert job["error"]["code"] == "TOOL_NOT_INSTALLED"
+    assert job["error"]["tool"] == "ffmpeg"
+
+
 def test_strip_url():
     assert strip_url("https://www.instagram.com/reel/XYZ/?igsh=abc#frag") == "https://www.instagram.com/reel/XYZ/"
     assert strip_url("see https://a.test/x?token=1 and http://b.test/?q=2 now") == "see https://a.test/x and http://b.test/ now"

@@ -79,13 +79,16 @@ YTDLP_MAX_BYTES = 200 * 1024 * 1024
 SUMS_MAX_BYTES = 1024 * 1024
 _TAG_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}(\.\d+)?$")
 
-ERROR_CODES = ("LOGIN_REQUIRED", "RATE_LIMITED", "NOT_FOUND_OR_REMOVED", "GEO_BLOCKED", "PRIVATE", "EXTRACTOR_ERROR", "DISK_FULL", "NETWORK_LOST")
+ERROR_CODES = ("LOGIN_REQUIRED", "RATE_LIMITED", "NOT_FOUND_OR_REMOVED", "GEO_BLOCKED", "PRIVATE", "EXTRACTOR_ERROR", "DISK_FULL", "NETWORK_LOST", "TOOL_NOT_INSTALLED")
 
 # First match wins; the order matters ("Private video. Sign in if ..." is PRIVATE, not LOGIN_REQUIRED).
 _ERROR_PATTERNS = [
+    ("TOOL_NOT_INSTALLED", re.compile(r"ffmpeg not found", re.I)),
     ("PRIVATE", re.compile(r"private video|this (account|profile|user) is private|is private\b|private (account|profile|post)", re.I)),
     ("GEO_BLOCKED", re.compile(r"not (made this video )?available in your (country|region|location)|geo[- ]?(restrict|block)", re.I)),
-    ("RATE_LIMITED", re.compile(r"\b429\b|too many requests|rate[- ]?limit", re.I)),
+    # 5xx: the server asks to be tried later. Placed before NOT_FOUND_OR_REMOVED ("Service Unavailable").
+    ("RATE_LIMITED", re.compile(
+        r"\b429\b|too many requests|rate[- ]?limit|HTTP ?Error:? '?5\d\d|content isn'?t available, try again later", re.I)),
     ("LOGIN_REQUIRED", re.compile(
         r"sign in to confirm|log ?in required|login required|requires? (a )?log ?in|--cookies|authentication|"
         r"age[- ]?restricted|you need to log in|log in to", re.I)),
@@ -93,7 +96,8 @@ _ERROR_PATTERNS = [
     ("NETWORK_LOST", re.compile(
         r"urlopen error|timed out|Connection (reset|refused|aborted)|Network is unreachable|No route to host|"
         r"Temporary failure in name resolution|Name or service not known|nodename nor servname|"
-        r"getaddrinfo failed|Remote end closed connection|IncompleteRead", re.I)),
+        r"getaddrinfo failed|Remote end closed connection|IncompleteRead|"
+        r"Did not get any data blocks|fragment \d+ not found", re.I)),
     ("NOT_FOUND_OR_REMOVED", re.compile(
         r"video unavailable|has been removed|\b404\b|not found|does not exist|no longer available|"
         r"has been deleted|account (has been )?(terminated|suspended)|unavailable", re.I)),
@@ -135,10 +139,11 @@ def redact(text: str) -> str:
 
 
 def map_error(stderr: str) -> str:
-    lines = [l for l in stderr.splitlines() if "ERROR" in l]
+    # yt-dlp writes `ERROR: ...`, gallery-dl `[instagram][error] ...`; warnings are not the failure.
+    lines = [l for l in stderr.splitlines() if "ERROR" in l or re.search(r"\]\[error\]", l, re.I)]
     text = "\n".join(lines) if lines else stderr
     # An HTTP answer means the connection worked: such a text is never a lost connection.
-    http_answer = re.search(r"HTTP Error", text, re.I) is not None
+    http_answer = re.search(r"HTTP ?Error", text, re.I) is not None
     for code, pat in _ERROR_PATTERNS:
         if code == "NETWORK_LOST" and http_answer:
             continue
@@ -575,6 +580,8 @@ def run(job: Job, ctx: JobContext) -> dict:
             log.warning("capture job %s partial code=%s", job.id, code)
             meta.update(partial=True, errorCode=code, errorDetail=detail)
         else:
+            if code == "TOOL_NOT_INSTALLED":  # ffmpeg went away while the job ran
+                raise not_installed("ffmpeg")
             raise JobError(code, f"{tool} failed ({code})", detail, platform_reason=platform_reason(stderr))
     log.info("capture job %s finished files=%d", job.id, len(files))
     return {"output": str(out), "meta": meta}
