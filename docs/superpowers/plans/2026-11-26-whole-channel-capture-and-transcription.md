@@ -800,7 +800,7 @@ whenEnded(s: Session, projectId: string, jobId: string): Promise<TranscriptionJo
 | `GET /projects/:id/transcription-list` | — | `TranscriptionListResponse` |
 | `POST /projects/:id/transcription-list/pause` \| `continue` \| `stop` | — | `TranscriptionListResponse` |
 | `GET /projects/:id/untranscribed` | — | `UntranscribedResponse` |
-| `POST /projects/:id/transcription-list` | `TranscribeAllRequest` | `TranscribeAllResponse` (403 `POLICY_DENIED` when transcription is not allowed; 409 `TOOL_NOT_INSTALLED` reason `speech-<model>` as the transcribe route does) |
+| `POST /projects/:id/transcription-list` | `TranscribeAllRequest` | `TranscribeAllResponse` (403 `POLICY_DENIED` when transcription is not allowed; 409 `TOOL_NOT_INSTALLED` reason `speech-<model>` as the transcribe route does). **(coordinator, R684)** This route and `pause` / `continue` / `stop` are `requireWritable`: a read-only library refuses them as it refuses every change; all of them answer a locked project 423 before anything else |
 | `GET` / `PUT /projects/:id/automation` | `ProjectAutomation` | `ProjectAutomation` (PUT: `requireWritable`; a non-boolean is 400) |
 | `GET` / `PUT /settings/background` | `BackgroundSettings` | `BackgroundSettings` (app setting file `background.json` through `readAppSettingStrict` / `updateAppSettingStrict`, as `routes/appearance.ts`; default `{ keepAwake: true }`) |
 
