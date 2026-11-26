@@ -11,12 +11,14 @@ import { afterAll, afterEach, beforeAll } from "vitest";
 import { createClient } from "../api/client";
 import { toolsApi } from "../api/tools";
 import type { FirstUseAnswer } from "../components/FirstUseTools";
+import { switchDefaults } from "./backgroundService";
 
 export const BASE = "http://127.0.0.1:4319";
 export const TOKEN = "t".repeat(40) + "-task48b";
 export const url = (path: string) => `${BASE}${path}`;
 
-export const server = setupServer();
+/** From the start: the keep-awake setting's read (the Optional tools screen asks it; whole channels, Task 9). */
+export const server = setupServer(...switchDefaults(BASE));
 
 export function useMsw(): void {
   beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -117,8 +119,8 @@ export function catalogue(): ToolInfo[] {
       notice: "gallery-dl is free software under the GNU GPL version 2; it runs as its own program.",
     }),
     tool("ffmpeg", "media", "Video tools (ffmpeg)", 30 * MB, [comp("ffmpeg", "ffmpeg and ffprobe", 30 * MB, { version: "9.0.2", hosts: ["ffmpeg.martin-riedl.de"] })], {
-      purpose: "Makes viewing copies of videos, and copies that leave out or coarsen a recorded location.",
-      without: 'Videos get no viewing copies. Media that carries a location stays "proxy pending" and is left out of exports until ffmpeg is installed.',
+      purpose: "Joins the best picture and sound when videos are downloaded, makes viewing copies of videos, and makes copies that leave out or coarsen a recorded location.",
+      without: 'Videos can be downloaded only as ready-made, lower-quality files, and get no viewing copies. Media that carries a location stays "proxy pending" and is left out of exports until ffmpeg is installed.',
       notice: "This ffmpeg is free software under the GNU GPL; its source is published by its builder.",
     }),
     tool(

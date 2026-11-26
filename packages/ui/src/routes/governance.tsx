@@ -6,6 +6,7 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../api/firstRead";
+import { backgroundApi, type BackgroundApi } from "../api/background";
 import { governanceApi, type GovernanceApi, type ProjectSummary } from "../api/governance";
 import { errorText, type LibraryState } from "../api/library";
 import { PageReads, usePageHost } from "../components/PageReads";
@@ -23,11 +24,15 @@ export interface GovernanceRoute {
   path: string;
   label: string;
   needsProject: boolean;
-  render(api: GovernanceApi, projectId: string, ctx: { readOnlyReason?: string | undefined; encrypted?: boolean | undefined; readOnlyLibrary?: boolean; firstReadMs?: number }): ReactNode;
+  render(
+    api: GovernanceApi,
+    projectId: string,
+    ctx: { readOnlyReason?: string | undefined; encrypted?: boolean | undefined; readOnlyLibrary?: boolean; firstReadMs?: number; background?: BackgroundApi },
+  ): ReactNode;
 }
 
 export const governanceRoutes: GovernanceRoute[] = [
-  { path: PATHS.governance, label: "Governance", needsProject: true, render: (api, pid, ctx) => <GovernanceSettings key={pid} api={api} projectId={pid} readOnlyReason={ctx.readOnlyReason} encrypted={ctx.encrypted} {...(ctx.firstReadMs !== undefined ? { firstReadMs: ctx.firstReadMs } : {})} /> },
+  { path: PATHS.governance, label: "Governance", needsProject: true, render: (api, pid, ctx) => <GovernanceSettings key={pid} api={api} projectId={pid} readOnlyReason={ctx.readOnlyReason} encrypted={ctx.encrypted} background={ctx.background} {...(ctx.firstReadMs !== undefined ? { firstReadMs: ctx.firstReadMs } : {})} /> },
   { path: PATHS.audit, label: "Audit log", needsProject: true, render: (api, pid, ctx) => <AuditLog key={pid} api={api} projectId={pid} {...(ctx.firstReadMs !== undefined ? { firstReadMs: ctx.firstReadMs } : {})} /> },
   { path: PATHS.fieldwork, label: "Fieldwork", needsProject: true, render: (api, pid, ctx) => <Fieldwork key={pid} api={api} projectId={pid} encrypted={ctx.encrypted} readOnly={ctx.readOnlyLibrary === true} {...(ctx.firstReadMs !== undefined ? { firstReadMs: ctx.firstReadMs } : {})} /> },
   { path: PATHS.moveLibrary, label: "Move library", needsProject: false, render: (api) => <MoveLibrary api={api} /> },
@@ -50,6 +55,7 @@ const LISTEN_AGAIN_MS = 2_000;
  */
 export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number }) {
   const api = useMemo(() => governanceApi(client), [client]);
+  const background = useMemo(() => backgroundApi(client), [client]);
   const path = normalisePath(loc.pathname);
   const asked = new URLSearchParams(loc.search).get("project") ?? "";
   const id = useId();
@@ -228,7 +234,7 @@ export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT
         </p>
       )}
       <PageReads value={page}>
-        {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId, { readOnlyReason, encrypted: project?.encrypted === true, readOnlyLibrary: libraryMode === "read-only", firstReadMs }) : null}
+        {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId, { readOnlyReason, encrypted: project?.encrypted === true, readOnlyLibrary: libraryMode === "read-only", firstReadMs, background }) : null}
       </PageReads>
     </div>
   );

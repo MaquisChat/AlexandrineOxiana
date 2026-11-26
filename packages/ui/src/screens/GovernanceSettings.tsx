@@ -12,15 +12,21 @@
  * the policy engine can read the rules is the service's to say (R379 FR-A18, R58): when it cannot,
  * an alert says that every capture, import, change and export is refused and lists the problems;
  * readable rules with notes show them. Both are re-read after a save.
+ *
+ * Whole channels (Task 9): the section "Automatic transcription" holds the project's switch "Transcribe captured audio
+ * and video automatically" (GET/PUT /projects/:id/automation, saved at once and apart from governance.yaml), off with
+ * the screen's reason on a locked project or a read-only library.
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { isMap, isScalar, isSeq, parseDocument, type Document } from "yaml";
-import { GOVERNANCE_UNREADABLE_TEXT, backupsStatusText, GOVERNANCE_WARNINGS_TEXT, type GovernanceReadability } from "@ao/shared";
+import { AUTOMATION_TEXT, GOVERNANCE_UNREADABLE_TEXT, backupsStatusText, GOVERNANCE_WARNINGS_TEXT, type GovernanceReadability } from "@ao/shared";
+import type { BackgroundApi } from "../api/background";
 import { ApiClientError } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { errorText } from "../api/library";
 import type { DestructionCertificate, GovernanceApi, Profile, ProtocolDocument, ProtocolDocumentResult, RetentionDue, Violation } from "../api/governance";
 import { FileDrop } from "../components/FileDrop";
+import { SavedSwitch } from "../components/SavedSwitch";
 import { useLatestRead } from "../components/leaveSignals";
 import { usePageRead } from "../components/PageReads";
 import { TryAgain } from "../components/TryAgain";
@@ -88,6 +94,8 @@ export interface GovernanceSettingsProps {
   encrypted?: boolean | undefined;
   /** FR-756 (R579): how long the rules are waited for before the read is given up (smaller in tests). */
   firstReadMs?: number;
+  /** Whole channels (Task 9): the project's automatic transcription switch is read and saved through it; left out, the section is not shown. */
+  background?: Pick<BackgroundApi, "automation" | "setAutomation"> | undefined;
 }
 
 /**
@@ -103,7 +111,7 @@ const localToday = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
-export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, firstReadMs = FIRST_READ_TIMEOUT_MS }: GovernanceSettingsProps) {
+export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, firstReadMs = FIRST_READ_TIMEOUT_MS, background }: GovernanceSettingsProps) {
   const [saved, setSaved] = useState<{ yaml: string; sha256: string } | null>(null);
   const [text, setTextNow] = useState("");
   // What the cards show is parsed from `parseText`: at once for form edits, 300 ms after the last
@@ -492,6 +500,8 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
         </ControlCard>
       </div>
 
+      {background ? <AutomaticTranscription background={background} projectId={projectId} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} /> : null}
+
       <BackUpNow api={api} projectId={projectId} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} />
 
       <div className="ao-actions">
@@ -532,6 +542,19 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
         />
       ) : null}
     </main>
+  );
+}
+
+/** Whole channels (Task 9): the project's switch, saved at once (Task 7's route; governed and audited by the library). */
+function AutomaticTranscription({ background, projectId, whyId }: { background: Pick<BackgroundApi, "automation" | "setAutomation">; projectId: string; whyId?: string }) {
+  const id = useId();
+  const read = useCallback(async (signal: AbortSignal) => (await background.automation(projectId, { signal })).transcribeNewMedia === true, [background, projectId]);
+  const save = useCallback(async (on: boolean) => (await background.setAutomation(projectId, { transcribeNewMedia: on })).transcribeNewMedia === true, [background, projectId]);
+  return (
+    <section className="ao-card" aria-labelledby={id}>
+      <h2 id={id}>{AUTOMATION_TEXT.heading}</h2>
+      <SavedSwitch label={AUTOMATION_TEXT.label} hint={AUTOMATION_TEXT.hint} read={read} save={save} whyId={whyId} />
+    </section>
   );
 }
 

@@ -3,7 +3,9 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS } from "@ao/shared";
 import { http, HttpResponse } from "msw";
-import { catalogue, catalogueWithoutHosts, makeApi, onComputer, server, toolsService, url, useMsw, withoutHostsFor } from "../test/msw-tools";
+import { backgroundApi } from "../api/background";
+import { mockBackground } from "../test/backgroundService";
+import { BASE, catalogue, catalogueWithoutHosts, makeApi, makeClient, onComputer, server, toolsService, url, useMsw, withoutHostsFor } from "../test/msw-tools";
 import { asksInTurn, hang, REFUSED_READ } from "../test/service";
 import { ToolsSetup } from "./ToolsSetup";
 
@@ -457,5 +459,61 @@ describe("the optional tools screen: a late answer after “Try again”, and an
     // The tools screen offers "Try again" on any failed read (as before FR-756).
     expect(alerts().some((a) => a.includes(REFUSED_READ))).toBe(true);
     expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
+  });
+});
+
+describe("keeping the Mac awake, on the optional tools screen (whole channels, Task 9)", () => {
+  const LABEL = "Keep this Mac awake while downloads or transcriptions run";
+
+  it('the Optional tools screen shows "Keep this Mac awake while downloads or transcriptions run", on by default, and saves it', async () => {
+    const m = mockBackground({ noEvents: true, holdSwitches: true }, BASE);
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()) });
+    const section = screen.getByRole("region", { name: "While downloads or transcriptions run" });
+    const box = (await within(section).findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+    expect(box.disabled).toBe(false);
+    expect(within(section).getByText("The screen may still switch off. Closing the lid still puts the Mac to sleep; downloads and transcriptions carry on when it wakes.")).toBeTruthy();
+    expect(box.getAttribute("aria-describedby")).toBeTruthy();
+    await userEvent.click(box);
+    // Saving: one request per change, the box disabled meanwhile.
+    await waitFor(() => expect(m.count("PUT /settings/background")).toBe(1));
+    expect(box.disabled).toBe(true);
+    expect(box.checked).toBe(false);
+    await userEvent.click(box);
+    expect(m.count("PUT /settings/background")).toBe(1);
+    m.release();
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(false);
+    expect(m.bodies("PUT /settings/background")).toEqual([{ keepAwake: false }]);
+    expect(m.count("GET /settings/background")).toBe(1);
+  });
+
+  it("a failed save of keeping awake puts the switch back and says so", async () => {
+    const m = mockBackground(
+      { noEvents: true, settingsAnswer: () => HttpResponse.json({ error: { code: "INTERNAL", message: "The setting could not be saved." } }, { status: 500 }) },
+      BASE,
+    );
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()) });
+    const box = (await screen.findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+    await userEvent.click(box);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("The setting could not be saved.");
+    expect(box.checked).toBe(true);
+    expect(box.disabled).toBe(false);
+    expect(m.count("PUT /settings/background")).toBe(1);
+  });
+
+  it("the Video tools group says they also join the best picture and sound when videos are downloaded (R671)", async () => {
+    await shown();
+    // The group is found by its heading (its section's label points at an id with a space in it, so it has no name).
+    const group = screen.getByRole("heading", { level: 2, name: "Video conversion" }).closest("section") as HTMLElement;
+    expect(within(group).getByText("Joins the best picture and sound when videos are downloaded, and makes viewing copies of videos, including copies that leave out or coarsen a recorded location.")).toBeTruthy();
+    // The fixture carries the worker catalogue's own two sentences (toolpins.py, the ffmpeg tool).
+    const c = card(FFMPEG);
+    expect(within(c).getByText("Joins the best picture and sound when videos are downloaded, makes viewing copies of videos, and makes copies that leave out or coarsen a recorded location.")).toBeTruthy();
+    expect(within(c).getByText(new RegExp(escape('Videos can be downloaded only as ready-made, lower-quality files, and get no viewing copies. Media that carries a location stays "proxy pending" and is left out of exports until ffmpeg is installed.')))).toBeTruthy();
   });
 });

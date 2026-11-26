@@ -48,6 +48,25 @@ describe("Library screen", () => {
     expect(m.count("GET /events")).toBe(1);
   });
 
+  it("Transcribe everything without a transcript is offered above the sources list, and its list reaches the work lines (Task 9)", async () => {
+    const m = mockBackground({ untranscribed: { p1: { count: 12, soundSeconds: 3.5 * 3600, unknownLengths: 0 } } });
+    server.use(...m.handlers, ...libraryHandlers());
+    renderLibrary();
+    const button = await screen.findByRole("button", { name: "Transcribe everything without a transcript" });
+    const table = await screen.findByRole("table", { name: "Sources" });
+    // Above the sources list, in reading order.
+    expect(button.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await waitFor(() => expect(m.streams()).toBe(1));
+    await userEvent.click(button);
+    await userEvent.click(await screen.findByRole("button", { name: "Transcribe them" }));
+    expect(await screen.findByText("12 sources were put on the transcription list.")).toBeTruthy();
+    // The service publishes the list's change; the screen's own stream brings the line (R679): nothing is read again for it.
+    const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
+    expect(await within(lines).findByText("Transcribing: 0 of 12", { ignore: ".ao-visually-hidden" })).toBeTruthy();
+    expect(m.count("POST /projects/p1/transcription-list")).toBe(1);
+    expect(m.count("GET /events")).toBe(1);
+  });
+
   it("lists projects with their compliance profile badges, and marks locked ones", async () => {
     server.use(...libraryHandlers());
     renderLibrary();

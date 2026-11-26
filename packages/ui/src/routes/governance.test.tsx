@@ -4,6 +4,7 @@ import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createClient } from "../api/client";
 import { useLocation } from "../navigation";
+import { mockBackground } from "../test/backgroundService";
 import { BASE, TOKEN, server, url, useMsw } from "../test/msw-governance";
 import { GovernanceRoutes, governanceRoutes, isGovernancePath } from "./governance";
 
@@ -39,6 +40,24 @@ describe("governance routes (R113, R118)", () => {
     expect(await screen.findByRole("heading", { name: "Audit log", level: 1 })).toBeTruthy();
     expect(screen.getByRole("link", { name: "Audit log" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByRole("link", { name: "Audit log" }).getAttribute("href")).toBe("/audit?project=p2");
+  });
+
+  it("the Governance screen of the app shows the project's automatic transcription switch, read for that project (whole channels, Task 9)", async () => {
+    const m = mockBackground({ noEvents: true, automation: { p2: { transcribeNewMedia: true } } }, BASE);
+    server.use(
+      ...m.handlers,
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Coastal kinship" }, { id: "p2", name: "Clinic" }] })),
+      http.get(url("/projects/p2/governance"), () => HttpResponse.json({ yaml: "", sha256: "a".repeat(64), violations: [] })),
+      http.get(url("/projects/p2/protocol/documents"), () => HttpResponse.json({ documents: [] })),
+      http.get(url("/projects/p2/retention"), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
+    );
+    window.history.replaceState(null, "", "/governance?project=p2");
+    render(<Host />);
+    const section = await screen.findByRole("region", { name: "Automatic transcription" });
+    const box = within(section).getByRole("checkbox", { name: "Transcribe captured audio and video automatically" }) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+    expect(m.count("GET /projects/p2/automation")).toBe(1);
   });
 
   it("an unknown project in the address selects none and says so, instead of showing another project's screen (41b2 M1)", async () => {

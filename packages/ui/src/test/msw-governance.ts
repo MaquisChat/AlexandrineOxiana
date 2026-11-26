@@ -6,12 +6,14 @@ import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll } from "vitest";
 import { createClient } from "../api/client";
 import { governanceApi } from "../api/governance";
+import { switchDefaults } from "./backgroundService";
 
 export const BASE = "http://127.0.0.1:4317";
 export const TOKEN = "t".repeat(40) + "-task36";
 export const url = (path: string) => `${BASE}${path}`;
 
-export const server = setupServer();
+/** From the start: the project's automatic transcription switch (the Governance screen asks it; whole channels, Task 9). */
+export const server = setupServer(...switchDefaults(BASE));
 
 /** Installs the interceptor for the calling test file; unhandled requests fail the test. */
 export function useMsw(): void {

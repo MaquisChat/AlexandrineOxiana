@@ -47,6 +47,16 @@ describe("the optional tools in the app", () => {
     await waitFor(() => expect(document.activeElement?.textContent).toBe("Video tools (ffmpeg)"));
   });
 
+  it("the tools screen of the app shows the keep-awake switch, on by default (whole channels, Task 9)", async () => {
+    server.use(...appearance(), ...toolsService({ base: BASE, tools: allInstalled() }).handlers);
+    window.history.replaceState(null, "", PATHS.tools);
+    render(<App service={service} />);
+    const section = await screen.findByRole("region", { name: "While downloads or transcriptions run" });
+    const box = within(section).getByRole("checkbox", { name: "Keep this Mac awake while downloads or transcriptions run" }) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+    expect(box.disabled).toBe(false);
+  });
+
   it("is reachable from the settings links in the library's header", async () => {
     server.use(...appearance(), ...libraryHandlers(), ...toolsService({ base: BASE, tools: allInstalled() }).handlers);
     const user = userEvent.setup();
