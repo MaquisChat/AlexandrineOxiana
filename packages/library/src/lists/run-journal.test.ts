@@ -275,6 +275,35 @@ describe("download runs in the job journal", () => {
     expect((await setRunState(repo, p.id, "r", "downloading")).record.status).toBe("running");
   });
 
+  it("a run finished with failures that an older build claimed is kept whatever the caps, with its items (R676)", async () => {
+    const p = await makeProject(kit);
+    const folder = kit.repo.getProject(p.id).folder;
+    await createRun(kit.repo, p.id, "r", base);
+    await setRunItems(kit.repo, p.id, "r", items(2));
+    await recordRunItem(kit.repo, p.id, "r", "v0", { status: "done" });
+    await recordRunItem(kit.repo, p.id, "r", "v1", { status: "failed", errorCode: "PRIVATE" });
+    await setRunState(kit.repo, p.id, "r", "finished");
+    // A run finished with nothing left to do still follows the rules of finished jobs.
+    await createRun(kit.repo, p.id, "all-done", base);
+    await setRunItems(kit.repo, p.id, "all-done", items(1));
+    await recordRunItem(kit.repo, p.id, "all-done", "v0", { status: "done" });
+    await setRunState(kit.repo, p.id, "all-done", "finished");
+    await olderBuildOpens(kit.lib.root, folder, p.id, null);
+    expect((await readJobJournal(kit.lib.root, folder, p.id, null)).records.get("r")).toMatchObject({ status: "failed", error: "UNRECOVERABLE" });
+    const at = Date.now();
+    await appendJobRecords(kit.lib.root, folder, null, Array.from({ length: 600 }, (_, i): JobRecord => {
+      const t = new Date(at + (i + 1) * 1000).toISOString();
+      return { v: 1, id: `ocr-${i}`, projectId: p.id, kind: "pdf.ocr", status: "failed", error: "WORKER_FAILED", createdAt: t, updatedAt: t };
+    }));
+    // Two compactions: items of a run dropped in the first would go in the second.
+    await compactJobJournal(kit.lib.root, folder, p.id, null, 0);
+    await compactJobJournal(kit.lib.root, folder, p.id, null, 0);
+    const run = (await readRun(kit.repo, p.id, "r"))!;
+    expect(run.record.run).toMatchObject({ state: "finished", total: 2, done: 1, failed: 1 });
+    expect((await readRunItems(kit.repo, p.id, "r")).map((i) => [i.status, i.item.errorCode])).toEqual([["done", undefined], ["failed", "PRIVATE"]]);
+    expect((await readRun(kit.repo, p.id, "all-done"))?.record.status).toBe("done");
+  });
+
   it("assertNoSecrets refuses options naming a cookie value", async () => {
     const p = await makeProject(kit);
     await expect(createRun(kit.repo, p.id, "r", { ...base, options: { browser: { cookieValue: "abc" } } })).rejects.toBeInstanceOf(TypeError);

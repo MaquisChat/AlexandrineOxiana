@@ -197,7 +197,8 @@ const ENDED: ReadonlySet<JobStatus> = new Set(["done", "failed", "cancelled"]);
  * Records what became of one entry; the list's counters follow (an entry marked twice is counted once). An entry
  * that has ended (done, failed, cancelled) is never moved back to running or queued: such a call writes nothing
  * and returns false (R672: a Stop that came between the start of an entry's job and this mark; the caller then
- * cancels the job it started). Every other move returns true.
+ * cancels the job it started). An entry no longer in the journal (dropped by compaction after a Stop) is treated
+ * the same: nothing is written and false is returned (R676). Every other move returns true.
  */
 export async function markTranscriptionEntry(
   repo: Repo,
@@ -210,7 +211,11 @@ export async function markTranscriptionEntry(
   await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
     const records = repaired(raw);
     const old = records.get(entryId);
-    if (!old || old.kind !== ENTRY_KIND || !old.entry) throw new NotFoundError("Transcription list entry", entryId);
+    // R676: an entry no longer in the journal (a stopped entry compaction dropped) is a late mark: nothing is written.
+    if (!old || old.kind !== ENTRY_KIND || !old.entry) {
+      moves = false;
+      return [];
+    }
     moves = !(ENDED.has(old.status) && (next.status === "running" || (next.status as JobStatus) === "queued"));
     if (!moves) return [];
     const at = repoClock(repo)().toISOString();

@@ -173,9 +173,13 @@ export const DISCARDED_CODE = "DISCARDED";
  */
 export const OLDER_BUILD_CLAIM_CODE = "UNRECOVERABLE";
 
-/** A list record an older build claimed (see OLDER_BUILD_CLAIM_CODE). */
+/**
+ * A list record an older build claimed (see OLDER_BUILD_CLAIM_CODE). Its claim always carries an `attempt` (the
+ * worker client's `claim` writes `attempt: randomUUID()`), which this build never writes on a list record (R676):
+ * a list record this build itself failed is never read as a claim.
+ */
 export function claimedByOlderBuild(r: JobRecord): boolean {
-  return isListKind(r.kind) && r.status === "failed" && r.error === OLDER_BUILD_CLAIM_CODE;
+  return isListKind(r.kind) && r.status === "failed" && r.error === OLDER_BUILD_CLAIM_CODE && typeof r.attempt === "string";
 }
 
 /** What a job is for (see JobRecord.about): ids and a model name only, nothing identifying. */
@@ -475,8 +479,9 @@ export function isPending(r: JobRecord): boolean {
 }
 
 const cancelledEntry = (r: JobRecord) => r.kind === "transcription.entry" && r.status === "cancelled";
+/** A run compaction keeps whatever the caps (R676): one neither discarded nor finished with nothing left to do. */
 const liveRun = (r: JobRecord) =>
-  r.kind === "capture.run" && !!r.run && r.run.state !== "finished" && !(r.status === "cancelled" && r.error === DISCARDED_CODE);
+  r.kind === "capture.run" && !!r.run && !(r.status === "cancelled" && r.error === DISCARDED_CODE) && !(r.run.state === "finished" && r.run.done === r.run.total);
 
 /**
  * The ids compaction drops (R142): see the constants above. Pending records are never dropped. The lists'
@@ -484,8 +489,8 @@ const liveRun = (r: JobRecord) =>
  * count rules never apply to items, so a live run keeps every video); the `transcription.list` record is never
  * dropped; runs and transcription entries follow the rules of finished jobs, except that a cancelled
  * `transcription.entry` is always dropped and never counts toward MAX_FAILED_KEPT (R672: one Stop of a long list
- * must not push out the worker's failed jobs). Never dropped, whatever the caps (R672, I4): a `capture.run` that is
- * neither finished nor discarded, and a `transcription.entry` an older build claimed (it is still pending).
+ * must not push out the worker's failed jobs). Never dropped, whatever the caps and its record status (R672, I4,
+ * R676): a `capture.run` that is neither discarded nor finished with nothing left to do (`done === total`), and a `transcription.entry` an older build claimed (it is still pending).
  */
 function prunable(records: Map<string, JobRecord>, now: number): Set<string> {
   const drop = new Set<string>();

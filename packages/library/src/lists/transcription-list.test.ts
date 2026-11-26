@@ -3,10 +3,11 @@
  * journal (R31) as one `transcription.list` record and a `transcription.entry` record per source.
  */
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import type { Project, SourceDraft, SourceFile } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OPEN_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
-import { appendJobRecords, compactJobJournal, readJobJournal, type JobRecord, type ProjectKey } from "../job-journal.js";
+import { appendJobRecords, compactJobJournal, journalPath, readJobJournal, type JobRecord, type ProjectKey } from "../job-journal.js";
 import { PolicyDeniedError } from "../repo/errors.js";
 import { authorizeProcessing, projectDataKey } from "../repo/repo.js";
 import {
@@ -175,6 +176,36 @@ describe("the transcription list", () => {
     expect(await markTranscriptionEntry(kit.repo, p.id, ec!.entryId, { status: "done" })).toBe(true);
     expect(await markTranscriptionEntry(kit.repo, p.id, ec!.entryId, { status: "running", jobId: "job-again" })).toBe(false);
     expect(await readTranscriptionList(kit.repo, p.id)).toEqual({ state: "running", total: 1, done: 1, failed: 0, pending: [] });
+  });
+
+  it("a late mark for an entry compaction has already removed returns false and writes nothing (R676)", async () => {
+    const p = await makeProject(kit);
+    const folder = kit.repo.getProject(p.id).folder;
+    const s = [await audioSource(p, "Alpha"), await audioSource(p, "Beta")];
+    await addToTranscriptionList(kit.repo, p.id, s.map((x) => ({ sourceId: x.source.id })));
+    const [e0] = (await readTranscriptionList(kit.repo, p.id)).pending;
+    await stopTranscriptionList(kit.repo, p.id);
+    expect(await compactJobJournal(kit.lib.root, folder, p.id, null, 0)).toBe(true);
+    expect((await readJobJournal(kit.lib.root, folder, p.id, null)).records.has(e0!.entryId)).toBe(false);
+    const before = await readFile(journalPath(kit.lib.root, folder));
+    expect(await markTranscriptionEntry(kit.repo, p.id, e0!.entryId, { status: "running", jobId: "late" })).toBe(false);
+    expect(await markTranscriptionEntry(kit.repo, p.id, e0!.entryId, { status: "done" })).toBe(false);
+    expect(await readFile(journalPath(kit.lib.root, folder))).toEqual(before);
+    expect(await readTranscriptionList(kit.repo, p.id)).toEqual({ state: "running", total: 0, done: 0, failed: 0, pending: [] });
+  });
+
+  it("an entry failed UNRECOVERABLE without the older build's attempt mark stays failed (R676)", async () => {
+    const p = await makeProject(kit);
+    const folder = kit.repo.getProject(p.id).folder;
+    const s = [await audioSource(p, "Alpha"), await audioSource(p, "Beta")];
+    await addToTranscriptionList(kit.repo, p.id, s.map((x) => ({ sourceId: x.source.id })));
+    const [e0, e1] = (await readTranscriptionList(kit.repo, p.id)).pending;
+    await markTranscriptionEntry(kit.repo, p.id, e0!.entryId, { status: "failed", error: "UNRECOVERABLE" });
+    expect((await readJobJournal(kit.lib.root, folder, p.id, null)).records.get(e0!.entryId)).toMatchObject({ status: "failed", error: "UNRECOVERABLE" });
+    const list = await readTranscriptionList(kit.repo, p.id);
+    expect(list).toMatchObject({ total: 2, done: 0, failed: 1 });
+    expect(list.pending.map((e) => e.entryId)).toEqual([e1!.entryId]);
+    expect(await markTranscriptionEntry(kit.repo, p.id, e0!.entryId, { status: "running", jobId: "again" })).toBe(false);
   });
 
   it("stop after 3 of 10 done empties the counters and the list stays running (R672)", async () => {

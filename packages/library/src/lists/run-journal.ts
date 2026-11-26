@@ -9,11 +9,11 @@
  *   record written twice is counted once.
  * - The run's record status follows its state: `running` while downloading or waiting, `done` when finished
  *   with no failure, `cancelled` with error DISCARDED once discarded, `queued` otherwise. Compaction keeps a
- *   run's items while the run is neither done nor discarded, and a run that is neither finished nor discarded
- *   whatever the caps (job-journal.ts).
- * - A run or item an older build claimed as failed UNRECOVERABLE (R672, I4: OLDER_BUILD_CLAIM_CODE) is read as it
- *   was: the run with the record status its state gives, the item as queued (not completed). An item that carries
- *   its own failure (`item.errorCode`) stays failed.
+ *   run's items while the run is neither done nor discarded, and a run that is neither discarded nor finished with
+ *   nothing left to do whatever the caps (job-journal.ts, R676).
+ * - A run or item an older build claimed as failed UNRECOVERABLE with its `attempt` mark (R672, I4, R676:
+ *   `claimedByOlderBuild`) is read as it was: the run with the record status its state gives, the item as queued
+ *   (not completed). An item that carries its own failure (`item.errorCode`) stays failed.
  *
  * Every function finds the library root, the project's folder and its key from the repo (ProjectLockedError
  * while the project is locked); every write throws ReadOnlyLibraryError on a read-only library.
