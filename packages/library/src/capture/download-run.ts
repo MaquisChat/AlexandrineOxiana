@@ -13,8 +13,10 @@
  * - `resume` (the researcher's press of "Resume downloads", or a continuation by itself) takes the
  *   videos not done again, in their order, with the project's rules asked again (an audited decision
  *   of its own, R668).
- * - A run cut from outside (a lock, a close, a move: `ctl.cancelled`) writes nothing more. A run whose
- *   journal says queued, downloading or waiting but which nothing holds is shown `interrupted`.
+ * - A run cut from outside (a lock, a close, a move: `ctl.cancelled`) writes nothing more. A move or a
+ *   close asked between videos (`ctl.halt`, `haltSignal`) wakes the turn, the gap and every wait at once
+ *   and ends the run before anything more is asked of the platform. A run whose journal says queued,
+ *   downloading or waiting but which nothing holds is shown `interrupted`.
  * - `finished` is written only when every video of the run is done or failed (R678): a segment that
  *   completed with videos still to do (its listing did not come back whole) ends `failed` with
  *   LIST_INCOMPLETE, and Resume downloads takes them.
@@ -78,6 +80,8 @@ export interface RunControl {
   signal: AbortSignal;
   /** A move or close asks to stop between videos (beforeItem throws CaptureCancelledError). */
   halt(): boolean;
+  /** Aborted when halt() turns true: wakes the turn, the gap and a wait at once (R680). */
+  haltSignal: AbortSignal;
   /** After every journal write. */
   onChange(run: DownloadRunSummary): void;
   onItem?(done: number, total: number, out: CaptureOutcome): void;
@@ -215,13 +219,14 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
   /** The turn (R669), raced with a Stop and a cancel; a Pause asked meanwhile is ignored (the service refuses it). */
   async function awaitTurn(ctl: RunControl): Promise<"go" | "stop"> {
     const stopAsked = () => ctl.requested() === "stop";
-    const cut = () => ctl.cancelled() || ctl.signal.aborted;
+    const cut = () => ctl.cancelled() || ctl.signal.aborted || ctl.halt();
     if (ctl.turn && !cut() && !stopAsked()) {
       const turn = ctl.turn();
       await new Promise<void>((resolve, reject) => {
         const cleanup = () => {
           ctl.requestedSignal.removeEventListener("abort", onAsk);
           ctl.signal.removeEventListener("abort", finish);
+          ctl.haltSignal.removeEventListener("abort", finish);
         };
         function finish() {
           cleanup();
@@ -232,6 +237,7 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
         }
         ctl.requestedSignal.addEventListener("abort", onAsk);
         ctl.signal.addEventListener("abort", finish);
+        ctl.haltSignal.addEventListener("abort", finish);
         turn.then(finish, (err: unknown) => {
           cleanup();
           reject(err);
@@ -276,9 +282,16 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
     }
 
     const root = repoLibrary(repo).root;
-    const wake = AbortSignal.any([ctl.requestedSignal, ctl.signal]);
+    const wake = AbortSignal.any([ctl.requestedSignal, ctl.signal, ctl.haltSignal]);
+    /** After any wait or gap: a cut or a move ends the segment before anything more is asked of the platform. */
+    const awake = () => {
+      guard();
+      if (ctl.halt()) throw new CaptureCancelledError();
+    };
     const quality = opts.quality ?? DEFAULT_QUALITY;
-    const bytesPerSecond = opts.metadataOnly === true ? 0 : BYTES_PER_SECOND[quality].high;
+    /** Keeping only the details needs almost no space: such a run never pauses on the disk floor. */
+    const watchDisk = opts.metadataOnly !== true;
+    const bytesPerSecond = BYTES_PER_SECOND[quality].high;
     let title = run.title;
     let first = true;
     /** The last video needed no download (a duplicate): no gap after it. */
@@ -313,13 +326,14 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
         if (diskPause) return "pause-disk";
         if (!first && !lastNoDownload) {
           await sleep(DOWNLOAD_GAP_MS, wake);
-          guard();
-          if (ctl.halt()) throw new CaptureCancelledError();
+          awake();
           const meanwhile = ctl.requested();
           if (meanwhile) return meanwhile;
         }
-        const free = await readFree(root);
-        if (free !== null && free - (e.durationSec ?? 0) * bytesPerSecond < DISK_FLOOR_BYTES) return "pause-disk";
+        if (watchDisk) {
+          const free = await readFree(root);
+          if (free !== null && free - (e.durationSec ?? 0) * bytesPerSecond < DISK_FLOOR_BYTES) return "pause-disk";
+        }
         await write(() => recordRunItem(repo, projectId, runId, e.id, { status: "running" }));
         inHand = e.id;
         first = false;
@@ -330,7 +344,7 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
         told.add(e.id);
         lastNoDownload = out.status === "duplicate";
         if (out.status === "failed") {
-          const free = await readFree(root);
+          const free = watchDisk ? await readFree(root) : null;
           if (free !== null && free < DISK_FLOOR_BYTES) {
             // Not this video's fault: it stays to do, and the run pauses on the disk.
             diskPause = true;
@@ -364,7 +378,7 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
       wait: async (ms, why) => {
         await write(() => setRunState(repo, projectId, runId, "waiting", { wait: { ms, why } }));
         await sleep(ms, wake);
-        guard();
+        awake();
         const asked = ctl.requested();
         if (asked) return asked;
         await write(() => setRunState(repo, projectId, runId, "downloading"));

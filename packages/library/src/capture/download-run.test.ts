@@ -130,15 +130,18 @@ const listings = () => worker.submitted.filter((j) => j.type === "capture.downlo
 function control(over: Partial<RunControl> = {}) {
   const req = new AbortController();
   const cut = new AbortController();
+  const stop = new AbortController();
   let asked: "pause" | "stop" | undefined;
   let cancelled = false;
+  let halted = false;
   const changes: DownloadRunSummary[] = [];
   const ctl: RunControl = {
     requested: () => asked,
     requestedSignal: req.signal,
     cancelled: () => cancelled,
     signal: cut.signal,
-    halt: () => false,
+    halt: () => halted,
+    haltSignal: stop.signal,
     onChange: (r) => void changes.push(r),
     ...over,
   };
@@ -152,6 +155,11 @@ function control(over: Partial<RunControl> = {}) {
     cancel() {
       cancelled = true;
       cut.abort();
+    },
+    /** A move or a close: the run is asked to stop between videos. */
+    halt() {
+      halted = true;
+      stop.abort();
     },
     /** The states the run went through, each once in a row. */
     states: () => changes.map((c) => c.state).filter((s, i, a) => i === 0 || a[i - 1] !== s),
@@ -401,6 +409,60 @@ describe("download runs", { timeout: 120_000 }, () => {
     onDownloadOf(prof3.items[1]!.id, () => void (free = 5e9));
     const rc = await runs.start(s.id, newRunId(), TT_PROFILE, OPTS, control().ctl);
     expect(rc).toMatchObject({ state: "paused-disk", done: 1, failed: 0, notCompleted: 1 });
+  });
+
+  const runLinesOf = async (folder: string) =>
+    (await readFile(journalPath(lib.root, folder), "utf8")).split("\n").filter((l) => /"kind":"capture\.(run|item)"/.test(l));
+
+  it("a move during the gap wakes it and nothing more is downloaded or written", async () => {
+    const prof = synthetic(3);
+    const p = await project();
+    const id = newRunId();
+    const c = control();
+    let atHalt: string[] = [];
+    const woken: boolean[] = [];
+    sleepImpl = async (ms, signal) => {
+      if (ms !== DOWNLOAD_GAP_MS) return;
+      c.halt();
+      // checked at once, so a gap the move does not wake fails here instead of hanging
+      woken.push(signal?.aborted === true);
+      atHalt = await runLinesOf(p.folder);
+    };
+    await expect(runs.start(p.id, id, TT_PROFILE, OPTS, c.ctl)).rejects.toBeInstanceOf(CaptureCancelledError);
+    expect(woken).toEqual([true]);
+    expect(itemDownloads()).toEqual([prof.items[0]!.id]);
+    expect((await readRunItems(repo, p.id, id)).map((i) => i.status)).toEqual(["done", "queued", "queued"]);
+    expect(await runLinesOf(p.folder)).toEqual(atHalt);
+  });
+
+  it("a move during a slow-down wait wakes it and nothing more is asked of the platform", async () => {
+    await setProfile({ ...synthetic(3), rateLimitAfter: 1 });
+    process.env.FAKE_TOOL_MODE = "ratelimit";
+    const p = await project();
+    const id = newRunId();
+    const c = control();
+    let asked = -1;
+    let atHalt: string[] = [];
+    const woken: boolean[] = [];
+    sleepImpl = async (ms, signal) => {
+      if (ms === DOWNLOAD_GAP_MS) return;
+      c.halt();
+      woken.push(signal?.aborted === true);
+      asked = worker.submitted.length;
+      atHalt = await runLinesOf(p.folder);
+    };
+    await expect(runs.start(p.id, id, TT_PROFILE, OPTS, c.ctl)).rejects.toBeInstanceOf(CaptureCancelledError);
+    expect(woken).toEqual([true]);
+    expect(worker.submitted.length).toBe(asked);
+    expect(await runLinesOf(p.folder)).toEqual(atHalt);
+    expect(c.changes.at(-1)).toMatchObject({ state: "waiting" });
+  });
+
+  it("a run that keeps only the details never pauses on the disk", async () => {
+    free = 5e9;
+    const p = await project();
+    const run = await runs.start(p.id, newRunId(), TT_PROFILE, { ...OPTS, metadataOnly: true }, control().ctl);
+    expect(run).toMatchObject({ state: "finished", done: 3, failed: 0 });
   });
 
   it("a missing tool pauses the run and fails no video", async () => {
