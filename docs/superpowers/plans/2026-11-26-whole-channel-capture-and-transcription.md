@@ -179,6 +179,7 @@ export interface TranscribeAllRequest { model?: SpeechModel }
 export interface TranscribeAllResponse { added: number; list: TranscriptionListSummary }
 export function transcriptionLines(l: TranscriptionListSummary): { title?: string; time?: string };
 export const LIST_BUTTONS: { pause: string; continue: string; stop: string };
+export const LIST_STOPPED_TEXT: string;   // (coordinator, R672) said once after a Stop of the transcription list
 export const transcribeAllText: { button: string; confirm(r: UntranscribedResponse): string; none: string; added(n: number): string; confirmButton: string; cancel: string };
 
 export interface ProjectAutomation { transcribeNewMedia: boolean }
@@ -239,7 +240,8 @@ export function soundSecondsOf(sf: SourceFile): number | undefined;
 export async function readTranscriptionList(repo: Repo, projectId: string): Promise<TranscriptionListView>;
 export async function addToTranscriptionList(repo: Repo, projectId: string, items: Array<{ sourceId: string; model?: string }>): Promise<{ added: number }>;
 export async function markTranscriptionEntry(repo: Repo, projectId: string, entryId: string,
-  next: { status: "running"; jobId: string } | { status: "done" } | { status: "failed"; error: string } | { status: "cancelled"; error?: string }): Promise<void>;
+  next: { status: "running"; jobId: string } | { status: "done" } | { status: "failed"; error: string } | { status: "cancelled"; error?: string }): Promise<boolean>;
+  // (coordinator, R672) false, with nothing written, when the entry has already ended (done, failed, cancelled) and `next` would restart it
 export async function setTranscriptionListState(repo: Repo, projectId: string, state: "running" | "paused"): Promise<void>;
 export async function stopTranscriptionList(repo: Repo, projectId: string): Promise<{ jobIds: string[] }>;
 ```
@@ -276,9 +278,10 @@ export async function stopTranscriptionList(repo: Repo, projectId: string): Prom
 | downloading | title `Downloading "Example Channel": 120 of 412`; while the list is still being read (total 0): `Downloading "Example Channel": reading the list of videos…` (Instagram: "posts"); failures `3 could not be downloaded` (when failed > 0) |
 | waiting | title as downloading; wait `waiting 2 minutes — YouTube asked to slow down` / `waiting 1 minute — the connection was lost` |
 | interrupted | `The capture of 'Example Channel' was interrupted: 120 of 412 done.`; when it never read its list (total 0): `The capture of 'Example Channel' was interrupted before it began.` |
-| paused | `"Example Channel" is paused: 120 of 412 downloaded.` |
+| paused | `"Example Channel" is paused: 120 of 412 downloaded.`; total 0 (R672): `"Example Channel" is paused. The list of videos has not been read yet.` |
 | paused-disk / -rate-limited / -tool / failed | title `"Example Channel": 120 of 412 downloaded.`; why: `Paused: the disk is nearly full. Free some space, then press Resume downloads.` / `Paused: YouTube kept asking the app to slow down for 12 hours. Press Resume downloads to try again.` / `Paused: Video tools are not installed. Install them from the Optional tools screen, then press Resume downloads.` (video-downloader: `Paused: the video downloader is not installed. Install it from …`; image-downloader likewise; other: `a tool this needs is not installed. Install it …`) / the run's `reason` |
-| stopped | `"Example Channel" was stopped: 120 of 412 downloaded.` |
+| stopped | `"Example Channel" was stopped: 120 of 412 downloaded.`; total 0 (R672): `"Example Channel" was stopped before it began.` |
+| paused-disk / -rate-limited / -tool / failed with total 0 (R672) | title `"Example Channel": the list of videos has not been read yet.`; why as for total > 0 |
 | finished | failed > 0: `"Example Channel": 398 of 412 downloaded. 14 could not be downloaded.` (no separate failures line); none failed: `"Example Channel": all 412 downloaded.`; total 0: `"Example Channel": nothing new to download.` |
 | resume | defined only when the state is none of queued, downloading, waiting: `Resume downloads (14 did not complete)` when notCompleted > 0; `Resume downloads` when the run never read its list (total 0) and is not finished; otherwise undefined |
 | `downloadProblemText` | PRIVATE `This video is private.`; NOT_FOUND_OR_REMOVED `This video has been removed, or its address is wrong.`; GEO_BLOCKED `This video is not available in your country.`; LOGIN_REQUIRED `This video needs a sign-in the app does not have.`; NETWORK_LOST `The connection was lost three times.`; EXTRACTOR_ERROR `The downloader could not read this video. Updating the capture tools may help.`; NOTHING_SAVED `Nothing came back from the platform for this video.`; LEGAL_BASIS_REQUIRED `This project's rules need a legal basis for this video, and none was given.`; any other `This video could not be downloaded.` (Instagram: "post") |
@@ -286,6 +289,8 @@ export async function stopTranscriptionList(repo: Repo, projectId: string): Prom
 | `problemLine` | `Title — https://… — reason` plus ` YouTube says: “…”` when given; no title → `(no title)` |
 | `PROBLEMS_TEXT` | heading `Could not be downloaded`; copy `Copy the list`; copied `The list was copied.`; copyFailed `The list could not be copied. Select it and copy it by hand.`; noTitle `(no title)` |
 | `RUN_BUTTONS` / `LIST_BUTTONS` | `Pause`, `Stop`, `Show them`, `Discard` / `Pause`, `Continue`, `Stop` |
+| `LIST_STOPPED_TEXT` (R672) | `The transcriptions were stopped. The sources stay; “Transcribe everything without a transcript” puts them on the list again.` |
+| R672, small rules | `transcribeAllText.confirm` for exactly 1 source ends `It is transcribed on this Mac, after anything already on the list.`; `estimateText.disk` with count 0 is `Nothing new will be downloaded, so no disk space is needed.` and `tooBig` is then undefined; `formatSizeRange` with the low end under 1 MB says `up to 1.2 MB`; `transcribeTime` measured with every length unknown: `Transcribing: the lengths are not known, so the app cannot say how long.`, with some unknown it adds ` The 12 videos of unknown length are not counted.`; rounding never says "60 minutes", "120 minutes" or "48 hours" (the next unit is used); `problemLine` treats an empty title as no title |
 | `transcriptionLines` running | title `Transcribing: 14 of 412 — "Title of the video"` (no title: `Transcribing: 14 of 412`); time `about 6 days left at this Mac's speed (4 minutes of sound per minute)`, plus `, not counting 3 recordings of unknown length` when unknownLeft > 0; unmeasured: `measuring…` |
 | paused | `Transcriptions paused: 14 of 412 done.` |
 | idle | total > 0 and failed > 0: `Transcriptions finished: 410 of 412 done; 2 could not be made.`; failed 0: `Transcriptions finished: all 412 done.`; total 0: no title |
@@ -302,6 +307,7 @@ export async function stopTranscriptionList(repo: Repo, projectId: string): Prom
 - `updateJobRecords` reads the journal, calls `fn` and appends what `fn` returns, all in the file's own turn (`serialize`). It returns the records as they stand after the append.
 - `JobRecord.status` for a run: `running` while downloading or waiting; `done` when finished with no failure; `cancelled` with error `DISCARDED` once discarded; `queued` otherwise (also for the run state `queued`).
 - An item's status is `queued` (not reached or to retry), `running`, `done` or `failed`. Its record id is `<runId>/<index>`.
+- **(coordinator, R672)** `stopTranscriptionList` also sets total, done and failed to 0 and leaves the list `running`. A cancelled `transcription.entry` is dropped at the next compaction and never counts toward the cap of kept failed/cancelled records. `setRunState` recounts a run's counters from its items. `updateJobRecords` compacts in its own turn once the file has more than 2 000 lines of which more than half are superseded. **After an older build opened the journal** (it claims pending list records as `failed` / `UNRECOVERABLE`): the list modules read such a record as `queued` unless it carries its own failure, and `prunable` never drops a `capture.run` that is neither finished nor discarded.
 - The list record's id is `TRANSCRIPTION_LIST_ID`, with status `queued`. An entry's status is `queued`, `running`, `done`, `failed` or `cancelled`; its id is a fresh UUID.
 
 - [ ] **Step 1: Write the failing shared tests** in `packages/shared/src/api/background.test.ts`, one `it` per row group above, asserting the exact strings. They must include:
@@ -703,7 +709,7 @@ The transcription routes are pinned here for the fakes and built by Task 7: `GET
   - when `resume` is defined: `Resume downloads (N did not complete)`;
   - any state but queued, downloading or waiting: `Discard`.
 
-  Below the runs, the transcription line (`transcriptionLines`): running → `Pause`, `Stop`; paused → `Continue`, `Stop`.
+  Below the runs, the transcription line (`transcriptionLines`): running → `Pause`, `Stop`; paused → `Continue`, `Stop`. **(coordinator, R672)** After a successful `Stop` of the transcription list the line is gone (the list is empty, total 0) and the section says `LIST_STOPPED_TEXT` once, as a status; focus moves to the section heading. The section stays rendered while that status is shown, even with no run and an idle list.
 - **Text handling.** Titles and addresses go through `UserText`. Each title line is a polite live region at most every 5 seconds (R658 M3).
 - **"Show them"** opens an inline list headed `PROBLEMS_TEXT.heading` (focus moves to the heading). One row per problem: title (or `(no title)`), address, reason, and `platformSays` when given. `Copy the list` writes `problemLine` rows joined by newlines with `navigator.clipboard.writeText`, then says `PROBLEMS_TEXT.copied`, or `copyFailed` on a refusal.
 - **Reading.** Read both lists at opening and after every reconnect. Apply `background.progress` events of this project only. A `discarded` event removes its run. A double press of any button sends one request. After Discard, focus moves to the section heading.
@@ -723,6 +729,8 @@ The transcription routes are pinned here for the fakes and built by Task 7: `GET
   - `Discard removes the run and focus goes to the heading` (`document.activeElement`).
   - `the transcription line shows "measuring…" until a speed is known, then the time left`.
   - `paused transcriptions show Continue and Stop`.
+  - `Stop of the transcriptions removes the line, says the stopped sentence once and moves focus to the heading` (coordinator, R672).
+  - `a run stopped before it began says so, with "Resume downloads" and Discard`.
   - `events of another project are ignored`.
   - `a stream that does not open within the limit is opened again`.
   - `a stream silent past the limit is opened again`.
@@ -790,12 +798,12 @@ whenEnded(s: Session, projectId: string, jobId: string): Promise<TranscriptionJo
 **Rules:**
 - **The loop**, one per project, registered work `transcription-list`:
   - while the list is running and has pending entries, take the head entry;
-  - if it has no `jobId`: `transcriptionJob` through `state.transcriptions.start` with a fresh id, then `markTranscriptionEntry(running, jobId)`. A `NoMediaError` or `NotFoundError` → `cancelled` (Review Focus 5). A `PolicyDeniedError` → `failed POLICY_DENIED` and the list pauses;
+  - if it has no `jobId`: `transcriptionJob` through `state.transcriptions.start` with a fresh id, then `markTranscriptionEntry(running, jobId)`. **(coordinator, R672)** When that mark answers `false` (a Stop fell between the two), the loop cancels the job it has just started (`state.transcriptions.cancel`) and goes on. A `NoMediaError` or `NotFoundError` → `cancelled` (Review Focus 5). A `PolicyDeniedError` → `failed POLICY_DENIED` and the list pauses;
   - await `whenEnded`: done → `done`; failed → `failed` with the code; cancelled by a lock → the loop ends and the entry stays running;
   - record the wall time and `soundSec` in the meter (done entries with a known length);
   - publish `background.progress { transcriptions }` after every change.
 
-  "Pause" lets the job in hand finish and then waits. "Stop" runs `stopTranscriptionList` and cancels the running job (`state.transcriptions.cancel`).
+  "Pause" lets the job in hand finish and then waits. "Stop" runs `stopTranscriptionList` and cancels the running job (`state.transcriptions.cancel`). **(coordinator, R672)** After a Stop the list is empty with total, done and failed 0 and state `running` (also when it was paused), so its summary is `idle` with total 0 and the screens show no line. `total` never counts cancelled entries: a source deleted before its turn leaves "all 411 done", not "411 of 412".
 - **After a restart:** `resumeWorkerJobs` reruns the head's pending job as today ("carries on by itself"). The loop, started at open for each unlocked project, finds the head running and awaits `whenEnded`.
 - **At the lock:** `stopProject` (the job is cancelled by the lock and reruns at the unlock, R142). **At the unlock:** `kick` — transcriptions carry on by themselves (nothing leaves the Mac); downloads do not (Task 5; R669). `downloads.onQueuedForTranscription` → `kick`.
 - **`summary`:** total, done and failed from the list record; `current` = the running head with its title and progress; `soundSecondsLeft` = the pending entries' lengths, with the head's multiplied by (1 − progress); `unknownLeft`; `soundPerSecond = meter.speed(model of head)`; state `idle` when nothing is pending.
@@ -813,6 +821,7 @@ whenEnded(s: Session, projectId: string, jobId: string): Promise<TranscriptionJo
     - `pause lets the transcription in hand finish and stays paused across a restart`.
     - `continue starts again`.
     - `stop empties the list and cancels the transcription in hand; the sources stay without transcripts`.
+    - `a Stop that falls between starting a job and marking its entry leaves no job running and no entry on the list` (coordinator, R672).
     - `a source deleted before its turn is skipped and the list goes on` (Review Focus 5).
     - `a lock stops the list at once and nothing more is transcribed; the unlock lets it carry on`.
     - `the speed is measured from what this Mac did and the time left follows; before the first, none is given`.
