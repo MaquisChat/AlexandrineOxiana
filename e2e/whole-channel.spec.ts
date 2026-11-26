@@ -11,7 +11,8 @@
  * The fake channel "Fake Channel" has four videos of 60, 120, 180 and 180 seconds (9 minutes in all); the third is
  * private. Every sentence asserted is the product's own (@ao/shared api/background.ts: `runLines`,
  * `transcriptionLines`, `estimateText`), and each wait is for the exact resting sentence, never a fixed time. A video
- * is held at the fake yt-dlp (`hold(tool, match)`) where a scenario needs a run caught in the middle of a video.
+ * is held at the fake yt-dlp (`hold(tool, match)`) where a scenario needs a run caught in the middle of a video, and a
+ * transcription at the fake speech recognition (`holdSpeech()`) where one must still be running across a restart.
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -116,6 +117,8 @@ const isResume = (e: AuditEvent) => e.action === "capture" && e.details?.op === 
 
 /** The fake yt-dlp's runs that asked for something (not its `--version`), oldest first, as their last argument (the address). */
 const asked = (app: AppHarness): string[] => fakesOf(app).runs("yt-dlp").filter((a) => !a.includes("--version")).map((a) => a.at(-1) ?? "");
+/** Whether a run's address is one of "Fake Channel"'s videos (not the channel's listing). */
+const isVideoOfChannel = (u: string) => FAKE_CHANNEL.items.some((i) => u.includes(i.id));
 /** The runs that downloaded the video `id`. */
 const downloadsOf = (app: AppHarness, id: string) => asked(app).filter((u) => u.includes(id));
 
@@ -276,22 +279,31 @@ test.describe("whole channels, downloaded and transcribed in the background (who
     const fakes = fakesOf(app);
     let before = 0;
 
-    await test.step("the channel started with Transcribe; the fake yt-dlp holds video 2", async () => {
+    await test.step("the channel started with Transcribe; video 1's transcription is held in the speech recognition and video 2 at the fake yt-dlp", async () => {
+      await fakes.holdSpeech();
       await fakes.hold("yt-dlp", chId(2));
       await captureChannel(page, projectId, { transcribe: true });
       await expect.poll(() => fakes.held("yt-dlp"), { message: "video 2 waits at the hold", timeout: DONE_WAIT }).toBe(1);
+      await expect.poll(() => fakes.heldSpeech(), { message: "video 1's transcription waits at the speech hold", timeout: DONE_WAIT }).toBe(1);
       await expect(runTitle(page, "Fake Channel")).toHaveText('Downloading "Fake Channel": 1 of 4');
     });
 
-    await test.step("the app quits and starts again: the run is interrupted, nothing more is asked of the platform, and the transcriptions finish by themselves", async () => {
+    await test.step("the app quits and starts again: the transcription carries on by itself and finishes, and only then is it read that nothing more was asked of the platform", async () => {
       before = asked(app).length;
       await app.restart();
       await reopen(page, projectId);
+      // Nobody presses anything: the new service's worker takes video 1's transcription up again by itself.
+      await expect.poll(() => fakes.heldSpeech(), { message: "the new worker transcribes video 1 by itself after the restart", timeout: DONE_WAIT }).toBe(1);
+      await fakes.releaseSpeech();
+      await expect(listTitle(page)).toHaveText("Transcriptions finished: all 1 done.", { timeout: DONE_WAIT });
+      // The new service's worker has served a transcription since the restart: a run continued by itself would have asked by now.
+      expect(asked(app).slice(before), "no run of the fake yt-dlp since the restart (the downloads must wait for Resume downloads)").toEqual([]);
+      expect(
+        (await auditLog(app, projectId)).filter((e) => isResume(e)),
+        "no audited resume decision since the restart (the downloads must wait for Resume downloads)",
+      ).toEqual([]);
       await expect(runTitle(page, "Fake Channel")).toHaveText("The capture of 'Fake Channel' was interrupted: 1 of 4 done.");
       await expect(runLine(page, "Fake Channel").getByRole("button", { name: "Resume downloads (3 did not complete)" })).toBeVisible();
-      await expect(listTitle(page)).toHaveText("Transcriptions finished: all 1 done.", { timeout: DONE_WAIT });
-      expect(asked(app), "no new run of the fake before the click").toHaveLength(before);
-      expect((await auditLog(app, projectId)).filter((e) => isResume(e))).toEqual([]);
     });
 
     await test.step("Resume downloads (3 did not complete): the run finishes, its Resume audited once, and the new videos are transcribed", async () => {
@@ -321,13 +333,23 @@ test.describe("whole channels, downloaded and transcribed in the background (who
       await expect(line().getByRole("button", { name: "Resume downloads (2 did not complete)" })).toBeVisible();
     });
 
-    await test.step("after a restart it is still paused, not interrupted, and nothing was asked of the platform", async () => {
+    await test.step("after a restart the new service's worker answers an estimate of the same channel, and only then is it read: still paused, nothing asked of the platform for the run", async () => {
       const before = asked(app).length;
       await app.restart();
       await reopen(page, projectId);
+      await openCapture(page, LIBRARY);
+      // The estimate is listed by the new service's worker: once it is shown, a run continued by itself would have asked by now.
+      await estimate(page, CHANNEL, 'Capture channel: "Fake Channel"');
+      await expect(page.getByText("2 videos, about 6 minutes.", { exact: true })).toBeVisible();
+      expect(asked(app).slice(before).filter(isVideoOfChannel), "no video of the paused run asked for since the restart (a paused run waits for Resume downloads)").toEqual([]);
+      expect(
+        (await auditLog(app, projectId)).filter((e) => isResume(e)),
+        "no audited resume decision since the restart (a paused run waits for Resume downloads)",
+      ).toEqual([]);
       await expect(runTitle(page, "Fake Channel")).toHaveText('"Fake Channel" is paused: 2 of 4 downloaded.');
       await expect(line().getByRole("button", { name: "Resume downloads (2 did not complete)" })).toBeVisible();
-      expect(asked(app), "no new run of the fake after the restart").toHaveLength(before);
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(page.getByRole("heading", { level: 3, name: 'Capture channel: "Fake Channel"' })).toHaveCount(0);
     });
 
     await test.step("Resume, then Stop while the next video downloads: the run stops after it, and what was downloaded stays", async () => {

@@ -119,6 +119,14 @@ export interface FakeControl {
   release(tool: FakeTool): Promise<void>;
   /** Runs of `tool` waiting at the hold now. */
   held(tool: FakeTool): number;
+  /**
+   * From now on the fake speech recognition waits before it answers (each transcription stays running), until
+   * `releaseSpeech()`; it holds the transcriptions of a service started after a restart too, for as long as the hold is on.
+   */
+  holdSpeech(): Promise<void>;
+  releaseSpeech(): Promise<void>;
+  /** Transcriptions waiting at the speech hold now, in a worker that is alive. */
+  heldSpeech(): number;
   /** The arguments of every run of `tool` so far, oldest first. */
   runs(tool: FakeTool): string[][];
   /**
@@ -322,12 +330,25 @@ function fakeWrapper(tool: FakeTool, control: string): string {
   ].join("\n");
 }
 
+/**
+ * The hold markers in `dir` named `<prefix><pid>[-…]` whose process is still running. A marker of a process that is gone
+ * (a worker the restart stopped) is not counted, so nothing that polls after a restart passes on a stale marker.
+ */
+export function liveMarkers(dir: string, prefix: string): number {
+  return readdirSync(dir).filter((n) => {
+    if (!n.startsWith(prefix)) return false;
+    const pid = Number(n.slice(prefix.length).split("-")[0]);
+    return Number.isInteger(pid) && pid > 0 && running(pid);
+  }).length;
+}
+
 /** A `fakeControl` test's wrappers and its FakeControl (see FakeControl). */
 async function fakeControlFor(root: string): Promise<{ env: Record<string, string>; control: FakeControl }> {
   const dir = join(root, "fake-control");
   const bin = join(dir, "bin");
   await mkdir(bin, { recursive: true });
-  const env: Record<string, string> = { AO_WORKER_BIN: join(FAKE_SPEECH, "ao-worker") };
+  // AO_FAKE_SPEECH_CONTROL: where the fake speech recognition looks for its hold (the worker is given the AO_ variables).
+  const env: Record<string, string> = { AO_WORKER_BIN: join(FAKE_SPEECH, "ao-worker"), AO_FAKE_SPEECH_CONTROL: dir };
   for (const tool of ["yt-dlp", "gallery-dl"] as const) {
     const file = join(bin, tool);
     await writeFile(file, fakeWrapper(tool, dir), { mode: 0o755 });
@@ -338,6 +359,9 @@ async function fakeControlFor(root: string): Promise<{ env: Record<string, strin
     hold: (tool, match) => writeFile(join(dir, `hold-${tool}`), match ?? ""),
     release: (tool) => rm(join(dir, `hold-${tool}`), { force: true }),
     held: (tool) => readdirSync(dir).filter((n) => n.startsWith(`held-${tool}-`)).length,
+    holdSpeech: () => writeFile(join(dir, "hold-speech"), ""),
+    releaseSpeech: () => rm(join(dir, "hold-speech"), { force: true }),
+    heldSpeech: () => liveMarkers(dir, "held-speech-"),
     runs: (tool) => {
       const file = join(dir, `runs-${tool}.jsonl`);
       return existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as string[]) : [];

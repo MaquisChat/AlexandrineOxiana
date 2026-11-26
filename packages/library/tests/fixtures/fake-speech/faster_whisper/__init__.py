@@ -8,11 +8,20 @@ code runs end to end while speech recognition answers from here:
 - `vad.get_speech_timestamps` says the whole 20 s is speech;
 - `WhisperModel.transcribe` gives three English segments, the second with a low average
   log-probability, so the worker's own checks flag it "low-confidence" (hallucination.py);
+- while the file `hold-speech` exists in the folder named by AO_FAKE_SPEECH_CONTROL (the harness's
+  fake-control folder, `holdSpeech()` / `releaseSpeech()`), `WhisperModel.transcribe` waits before it
+  answers, with a marker `held-speech-<worker pid>-<thread>` there for as long as it waits; a held
+  transcription stops waiting once its job is cancelled (a quit), as the real one stops between segments;
 - `utils.download_model` finds a model folder the test planted (`models--Systran--faster-whisper-<name>`,
   `refs/main` naming its snapshot) and never downloads anything.
 """
 from __future__ import annotations
 
+import os
+import sys
+import threading
+import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,6 +44,35 @@ def decode_audio(path, sampling_rate: int = SAMPLE_RATE, **_kw):
     return np.zeros(DURATION_SEC * sampling_rate, dtype=np.float32)
 
 
+def _job_cancelled():
+    """The `cancelled` test of the worker job this call runs in (its JobContext `ctx`, up the stack), or None."""
+    frame = sys._getframe(1)
+    while frame is not None:
+        ctx = frame.f_locals.get("ctx")
+        if ctx is not None and hasattr(ctx, "cancelled") and hasattr(ctx, "job"):
+            return lambda: bool(ctx.cancelled)
+        frame = frame.f_back
+    return None
+
+
+def _wait_while_held() -> None:
+    control = os.environ.get("AO_FAKE_SPEECH_CONTROL")
+    if not control:
+        return
+    hold = Path(control) / "hold-speech"
+    if not hold.exists():
+        return
+    cancelled = _job_cancelled() or (lambda: False)
+    marker = Path(control) / f"held-speech-{os.getpid()}-{threading.get_ident()}"
+    marker.write_text("held")
+    try:
+        # The worker checks for a cancel after this returns, and ends the job cancelled.
+        while hold.exists() and not cancelled():
+            time.sleep(0.05)
+    finally:
+        marker.unlink(missing_ok=True)
+
+
 class WhisperModel:
     def __init__(self, path, device: str = "auto", compute_type: str = "int8", cpu_threads: int = 0, **_kw):
         self.path = path
@@ -43,6 +81,7 @@ class WhisperModel:
         return "en", 0.99, [("en", 0.99)]
 
     def transcribe(self, audio, language=None, multilingual=False, vad_filter=True, word_timestamps=False, **_kw):
+        _wait_while_held()
         segs = [
             SimpleNamespace(start=a, end=b, text=f" {t}", avg_logprob=lp, no_speech_prob=0.02, compression_ratio=1.2, words=[])
             for a, b, t, lp in SEGMENTS
