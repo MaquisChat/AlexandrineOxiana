@@ -153,13 +153,25 @@ def map_error(stderr: str) -> str:
 
 
 _PLATFORM_REASON_RE = re.compile(r"ERROR: \[[^\]]+\] [^:]+: (.+)")
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Control characters, and the invisible direction and zero-width characters.
+_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 PLATFORM_REASON_MAX = 200
+# The platform's words end where yt-dlp starts speaking for itself.
+_REASON_CUTS = (" Use --", "; please report", " (caused by", " See ")
+_REASON_REFUSED = ("Errno", "urlopen", "ConnectionPool", "HTTP Error", "Traceback",
+                   "/Users/", "/home/", "/var/", "/tmp/")
+_DRIVE_RE = re.compile(r"\b[A-Za-z]:[\\/]")
+# Only for these failures is the platform's sentence about the video; for the rest it is yt-dlp's or Python's.
+PLATFORM_REASON_CODES = ("PRIVATE", "GEO_BLOCKED", "NOT_FOUND_OR_REMOVED", "LOGIN_REQUIRED")
 
 
 def platform_reason(stderr: str) -> str | None:
-    """The platform's own words from the last `ERROR: [platform] id: <reason>` line: links and control
-    characters removed, at most 200 characters. None when no line has that shape."""
+    """The platform's own sentence from the last `ERROR: [platform] id: <reason>` line, or None.
+
+    Redacted, links and invisible characters removed, cut where yt-dlp starts speaking itself, and
+    None when what is left is empty or carries a Python or network detail or a path. At most 200
+    characters, cut at a word and ended with an ellipsis. Callers give it only for the codes in
+    PLATFORM_REASON_CODES."""
     reason = None
     for line in stderr.splitlines():
         m = _PLATFORM_REASON_RE.search(line)
@@ -167,9 +179,21 @@ def platform_reason(stderr: str) -> str | None:
             reason = m.group(1)
     if reason is None:
         return None
-    reason = _CONTROL_RE.sub("", _URL_RE.sub("", reason))
-    reason = re.sub(r" {2,}", " ", reason).strip()[:PLATFORM_REASON_MAX].strip()
-    return reason or None
+    reason = _CONTROL_RE.sub("", redact(reason))
+    cuts = [reason.find(c) for c in _REASON_CUTS if c in reason]
+    if cuts:
+        reason = reason[: min(cuts)]
+    reason = re.sub(r" {2,}", " ", _URL_RE.sub("", reason)).strip()
+    if not reason or any(bad in reason for bad in _REASON_REFUSED) or _DRIVE_RE.search(reason):
+        return None
+    slash = reason.find("/")
+    if slash != -1 and "?" in reason[slash:]:
+        return None
+    if len(reason) > PLATFORM_REASON_MAX:
+        head = reason[: PLATFORM_REASON_MAX - 1]
+        space = head.rfind(" ")
+        reason = (head[:space] if space > 0 else head).rstrip() + "…"
+    return reason
 
 
 # ---------- yt-dlp binary management ----------
@@ -582,6 +606,6 @@ def run(job: Job, ctx: JobContext) -> dict:
         else:
             if code == "TOOL_NOT_INSTALLED":  # ffmpeg went away while the job ran
                 raise not_installed("ffmpeg")
-            raise JobError(code, f"{tool} failed ({code})", detail, platform_reason=platform_reason(stderr))
+            raise JobError(code, f"{tool} failed ({code})", detail, platform_reason=platform_reason(stderr) if code in PLATFORM_REASON_CODES else None)
     log.info("capture job %s finished files=%d", job.id, len(files))
     return {"output": str(out), "meta": meta}

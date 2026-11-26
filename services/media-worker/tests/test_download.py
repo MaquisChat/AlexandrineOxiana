@@ -194,9 +194,63 @@ def test_platform_reason_is_the_platforms_words_without_links():
     from ao_worker.download import platform_reason
     assert platform_reason("ERROR: [youtube] abc: Video unavailable. https://x.example/?t=1") == "Video unavailable."
     assert platform_reason("x\nERROR: [youtube] a: First reason\nERROR: [tiktok] b: Second\x07 reason\n") == "Second reason"
-    assert platform_reason("ERROR: [youtube] a: " + "w" * 300) == "w" * 200
+    long_word = platform_reason("ERROR: [youtube] a: " + "w" * 300)
+    assert long_word is not None and len(long_word) <= 200 and long_word.endswith("…")
     assert platform_reason("ERROR: something without a platform tag") is None
     assert platform_reason("") is None
+
+
+@pytest.mark.parametrize("stderr,want", [
+    ("ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See https://github.com/yt-dlp/yt-dlp/wiki/FAQ for how to manually pass cookies",
+     "Sign in to confirm you’re not a bot."),
+    ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video",
+     "Private video. Sign in if you've been granted access to this video"),
+    ("ERROR: [youtube] abc: Video unavailable (caused by <HTTPError 404>)", "Video unavailable"),
+    ("ERROR: [youtube] abc: Video unavailable; please report this issue on https://x.example", "Video unavailable"),
+    ("ERROR: [youtube] abc: Video unavailable. HTTPSConnectionPool(host='www.youtube.com', port=443): Max retries exceeded with url: /watch?v=abc&bpctr=1", None),
+    ("ERROR: [youtube] abc: Video unavailable. Unable to download webpage: HTTP Error 404: Not Found", None),
+    ("ERROR: [youtube] abc: Video unavailable <urlopen error [Errno -2] Name or service not known>", None),
+    ("ERROR: [youtube] abc: Video unavailable. Traceback (most recent call last)", None),
+    ("ERROR: [youtube] abc: Video unavailable. Cookies at /Users/someone/Library/Cookies", None),
+    ("ERROR: [youtube] abc: Video unavailable. Cookies at C:\\Users\\someone\\x", None),
+    ("ERROR: [youtube] abc: Video unavailable. Try /watch?v=1 for more", None),
+    ("ERROR: [youtube] abc: Video un\u202eavailable\u200b now\ufeff", "Video unavailable now"),
+])
+def test_platform_reason_is_only_the_platforms_own_sentence(stderr, want):
+    from ao_worker.download import platform_reason
+    assert platform_reason(stderr) == want
+
+
+def test_platform_reason_hides_the_home_folder(monkeypatch):
+    from ao_worker.download import platform_reason
+    monkeypatch.setenv("HOME", "/Users/zed")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/Users/zed")))
+    reason = platform_reason("ERROR: [youtube] abc: Cannot read cookies of zed from /Users/zed")
+    assert reason is None or "/Users/zed" not in reason
+
+
+def test_a_long_platform_reason_is_cut_at_a_word_with_an_ellipsis():
+    from ao_worker.download import platform_reason
+    reason = platform_reason("ERROR: [youtube] abc: " + " ".join(["wordy"] * 80))
+    assert reason is not None and len(reason) <= 200 and reason.endswith("…")
+    assert reason[:-1].split(" ")[-1] == "wordy"  # not mid-word
+
+
+@pytest.mark.parametrize("stderr,code,given", [
+    ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video", "PRIVATE", True),
+    ("ERROR: [youtube] abc: Video unavailable", "NOT_FOUND_OR_REMOVED", True),
+    ("ERROR: [youtube] abc: The uploader has not made this video available in your country", "GEO_BLOCKED", True),
+    ("ERROR: [youtube] abc: Sign in to confirm you're not a bot", "LOGIN_REQUIRED", True),
+    ("ERROR: [youtube] abc: Unable to extract initial player response; please report this issue on https://x.example", "EXTRACTOR_ERROR", False),
+    ("ERROR: [youtube] abc: Read timed out", "NETWORK_LOST", False),
+    ("ERROR: [youtube] abc: Too Many Requests", "RATE_LIMITED", False),
+    ("ERROR: [youtube] abc: No space left on device", "DISK_FULL", False),
+])
+def test_platform_reason_is_given_only_for_codes_the_platform_explains(worker, tmp_path, monkeypatch, stderr, code, given):
+    monkeypatch.setenv("FAKE_YTDLP_STDERR", stderr)
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "failed" and job["error"]["code"] == code
+    assert ("platformReason" in job["error"]) is given
 
 
 def test_failure_json_carries_platform_reason(worker, tmp_path, monkeypatch):
