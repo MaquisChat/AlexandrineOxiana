@@ -1,5 +1,7 @@
 # The final review — what I need from you
 
+*Updated 25 November 2026, 8:44 pm Central: part 16, at the end, is new — build request 16 (silent connections are opened again, the check for missing files shows its progress, "Back up now", backups said in sentences) passed all its tests and GitHub's check, and MAC BUILD 16 EXISTS. It is NOT in `main` yet: that waits for your word.*
+
 *Updated 24 November 2026, 7 pm Central: MAC BUILD 12 EXISTS — GitHub gave the build a Mac this time and every check passed, the test of Quit among them. Part 12 says where to download it. It replaces build 10.*
 
 *Updated 25 November 2026, 6:53 pm Central: MAC BUILD 15 EXISTS — GitHub gave a Mac this evening and every check passed. Part 15 says where to download it. It replaces Mac build 13 and contains build 14.*
@@ -961,11 +963,11 @@ Nothing new to see. Part 14's list holds, with the Mac build of build 15 once it
 ### Two things I want you to know
 
 1. **In an encrypted project, some words stay readable on the disk.** Each source's files and details are encrypted. Its year, first author and a short title stay readable in the names of its folder and files. The specification designed it so, to keep the library readable by a person, and an earlier ruling accepted the cost. Where participants' names are replaced by codes, the code appears there, not the name. A project that must hide its titles cannot do so today. **Your decision:** leave it as designed (nothing to do), or have coded folder names added for projects that need them (a new piece of work, not a small one).
-2. **A new button is coming with build 16: "Back up now"**, on a project's Governance screen. An existing warning already told you to make a backup "from the project's settings", and no such place existed. The warning will name the button. If you would rather have no button and a shorter warning, say so.
+2. **A new button is coming with build 16: "Back up now"**, on a project's Governance screen. An existing warning already told you to make a backup "from the project's settings", and no such place existed. The warning will name the button. If you would rather have no button and a shorter warning, say so. *(It is built: part 16, C.)*
 
 ### Still open
 
-Being built now for build 16, each reviewed by someone who did not build it:
+Being built now for build 16, each reviewed by someone who did not build it: *(All five are built, reviewed and in build request 16: part 16.)*
 
 - **Nothing is asked for a locked project during imports either (FR-769)** — bulk import, the Zotero import and sync, attaching, and "Look up again". Built and reviewed.
 - **The move:** two rare corners, and a truer sentence for a leftover folder whose library drive is unplugged (FR-760, FR-766). Built and reviewed.
@@ -978,3 +980,69 @@ Listed, not built:
 - **FR-770:** a destruction certificate, which an ethics board may read, gives the state of the backups as a code, not a sentence.
 - **FR-771:** whether a Zotero import's own requests to Zotero stop when its project is locked; to be checked.
 - **FR-752** is answered above (point 1). **FR-761** was checked and is not a fault: the audit log is newest-first on purpose.
+
+## 16. Added on 25 November, evening: silent connections are opened again, "Back up now", and backups said in sentences
+
+Build request 16 holds four pieces. Each was built by one agent and gone through by another who had not built it and tried to break it; I ruled every open point and read the last mends myself.
+
+- **Tested together on my side:** every step passed — 11,946 tests, 230 of 230 browser scenarios, the Python tests, the desktop tests and scenarios, the app started and quit. One test failed at the first run for a reason of my test machine, not of the app: a test that restores a backup of over 4 GB found the machine's disk nearly full. I read that from the test's own output, freed the disk, and ran the whole step again: no failure.
+- **Pushed as build request 16** at 7:34 pm Central on 25 November.
+- **GitHub's own check is green** on exactly this code: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45736712839 (green at 8:35 pm Central).
+- **Not in `main` yet.** `main` holds build 15. Build 16 goes in when you say so.
+- **Mac build 16 exists.** Run 25 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45736712881 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon` (you must be signed in to GitHub). The disk image's SHA-256 is `827058e453509383b0a752aae436a1786fc011271372444a29ed211a0d37e2e3`. GitHub's Mac built it at 7:40 pm Central on 25 November and ran every check on it (the app starts from the disk image, its helpers start and stop cleanly, Quit by a system request goes the orderly way in 2 of 2 runs, nothing is left running). It contains everything up to build 16. Mac build 15 (part 15) is the build of `main` as it stands.
+
+### What you can see
+
+**A. A connection that went silent is opened again.** Many screens follow the app's engine live: the library, Capture, an import while it runs, Find and acquire, watched folders, Zotero sync, the reader, the transcript viewer, Governance. After the Mac slept, such a connection could look open and deliver nothing, and the screen stood still until you left it. Now each of these screens notices a full minute of silence, closes the connection, opens a new one, and reads again only what it may have missed. Nothing you typed and nothing that is running is lost or started again.
+
+One exception, on purpose: words you searched for and carried over to the reader are dropped when the watch over them is lost; the reader then says "Your search was not carried over". They are never kept unwatched, because a project could have been locked in the gap.
+
+**B. The check for missing files shows how far it is, and can be stopped.** On the Governance screen it says "Checked 1,200 of 8,000 files…" with a "Stop" button. After a stop: "The check was stopped. Nothing was changed." with "Check again". A check that fails partway also offers "Check again". A screen reader is told the progress at most every five seconds, not at every file.
+
+**C. "Back up now"**, on a project's Governance screen. It says "Backing up…", then that the backup was made, and shows any warning the backup itself gave. Where changes are switched off, the button is too. The warning after a failed automatic backup now names it:
+
+> The last automatic backup of {project} failed. Your sources are unchanged; the backup is tried again tomorrow, or make one now with “Back up now” on the project's Governance screen.
+
+**D. After a destruction, the Governance screen says how the backups stand in a sentence**, where it showed a code. Each sentence says only what the app can prove:
+
+- "Backups holding them: no listed backup held these files."
+- "…at least one listed backup is still to be removed; the app will try again."
+- "…at least one listed backup that may still hold them is still there."
+- "…none is left that holds them; the app removed each one that did."
+- "…none is left. At least one listed backup is no longer there, and the app has no record of removing it."
+- "…the app cannot tell how they stand."
+
+"Listed" matters: the app sees only the backups it made and lists. A copy you made by hand somewhere else is never seen by it.
+
+**E. A leftover folder of a stopped move, opened while the library's own drive is unplugged**, no longer promises that the move "will be finished" (it would not be). It says the app cannot tell until the library's folder can be reached (FR-766).
+
+**F. Small tidying** of the "did not answer in time" sentence on four screens: it is no longer said twice, or in the wrong panel, and a message about a held file is no longer hidden while a list is read again.
+
+### What became safer underneath
+
+- **Nothing is asked about a locked project during imports either (FR-769).** A bulk import, a Zotero import or sync, attaching a file and "Look up again" all stop asking outside services the moment their project is locked. Before, only Find and acquire did.
+- **Asking a service that said "slow down" (FR-753, FR-768):** two rare corners where the app could ask a moment too early, or make the next project wait longer than needed.
+- **The move (FR-760):** two rare corners where a move could answer "done" for the wrong move, or lean on later checks after an upgrade from an older build. Nothing could be lost in either; the answers are now true at the first step.
+- **A stopped check for missing files really stops**, also in the middle of one very large file.
+- **Tests that could miss a cancelled request** were made certain everywhere (about 25 places, some older than this work), and each new test was run 30 times with the machine kept busy.
+
+### Things only you can check (with the Mac build of build 16)
+
+- [ ] Open the library, close the lid for a few minutes, open it: within about a minute the screens follow again (start an import or a capture before, and watch its progress move on after).
+- [ ] Governance → the check for missing files: the progress line, "Stop", "Check again".
+- [ ] Governance → "Back up now": the words, and that a backup appears.
+- [ ] With VoiceOver, if you use it: the progress of the check is spoken now and then, not at every file; a backup's warning is spoken.
+
+What my tests cannot show: whether the Mac's own web view really ends a silent connection when the app cancels it. That is the first item above.
+
+### Still open
+
+Listed, not built:
+
+- **FR-770:** a destruction certificate, which an ethics board may read, still gives the state of the backups as a code.
+- **FR-771:** whether a Zotero import's own requests to Zotero stop when its project is locked; to be checked.
+- **FR-772:** on the Capture screen, a connection that opens and closes at once is tried again every second without the screen ever saying it is lost. Only a broken engine does that; to be checked.
+- **Held-file cards disappear for the moment a list is read again**, and their notes are announced a second time. Keeping them in place would change an order of focus that was ruled earlier; left as untidy.
+- **FR-760, a remainder:** after an upgrade from an older build, two move destinations whose folders have the same name can still be confused at the first check; the later checks refuse. Accepted.
+
+Waiting for you: the design for whole channels with automatic transcription (its one question), the two decisions of part 15, and your word about `main` for build 16.
