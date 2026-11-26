@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { Writable } from "node:stream";
 import type { AuditEvent } from "@ao/core";
-import { WorkerClient, deviceDeps, type Deps, type WorkerToolsClient } from "@ao/library";
+import { InvalidInputError, WorkerClient, deviceDeps, plainReason, type Deps, type DownloadRuns, type WorkerToolsClient } from "@ao/library";
 import {
   RUN_ALREADY_RUNNING,
   RUN_ALREADY_RUNNING_TEXT,
@@ -591,6 +591,182 @@ describe("after a restart (R668)", () => {
     await svc.state.idle();
     expect(await runOf(pid, runId)).toMatchObject({ state: "paused", done: 2, notCompleted: 1 });
     expect(tw.submitted).toHaveLength(asked);
+  });
+});
+
+describe("around a Resume (R687)", () => {
+  /** Holds the next request for the media helper (inside a Resume's awaits) until released. */
+  function holdWorkerClient(): { reached: Promise<void>; release(): void } {
+    const orig = svc.state.workerClient.bind(svc.state);
+    let reach!: () => void;
+    const reached = new Promise<void>((r) => (reach = r));
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    releases.push(open);
+    let used = false;
+    vi.spyOn(svc.state, "workerClient").mockImplementation(async () => {
+      if (!used) {
+        used = true;
+        reach();
+        await gate;
+      }
+      return orig();
+    });
+    return { reached, release: open };
+  }
+  /** The library's download runs as the runner makes them, with `resume` replaced. */
+  function wrapLibraryResume(resume: (real: DownloadRuns["resume"], ...args: Parameters<DownloadRuns["resume"]>) => ReturnType<DownloadRuns["resume"]>): void {
+    const runner = svc.state.downloads as unknown as { library: (s: unknown, w: unknown) => DownloadRuns };
+    const lib = runner.library.bind(runner);
+    vi.spyOn(runner, "library").mockImplementation((s, w) => {
+      const real = lib(s, w);
+      return { ...real, resume: (...args: Parameters<DownloadRuns["resume"]>) => resume(real.resume.bind(real), ...args) };
+    });
+  }
+  /** A run stopped after its second video (one still to do). */
+  async function stoppedRun(pid: string): Promise<string> {
+    const held = hold(itemOf(idA(2)));
+    const a = await captureProfile(pid, A);
+    await held.reached;
+    expect((await act(pid, a.json.queueId, "stop")).status).toBe(200);
+    held.release();
+    await svc.state.idle();
+    expect(await runOf(pid, a.json.queueId)).toMatchObject({ state: "stopped", done: 2 });
+    return a.json.queueId as string;
+  }
+  const conflict = { code: "CONFLICT", message: RUN_ALREADY_RUNNING_TEXT, reason: RUN_ALREADY_RUNNING };
+
+  it("a Resume of a run whose address another held run is downloading is 409 in plain words; the platform is asked once", async () => {
+    profiles["fake.dancer"]!.items[1]!.error = "private";
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const first = await captureProfile(pid, A);
+    await svc.state.idle();
+    const oldId = first.json.queueId as string;
+    expect(await runOf(pid, oldId)).toMatchObject({ state: "finished", failed: 1 });
+    // The same channel started again: a newer run of the address is held.
+    const held = hold(itemOf(idA(2)));
+    const again = await captureProfile(pid, A);
+    expect(again.status, again.body).toBe(200);
+    await held.reached;
+    const listings = () => runLog.filter((u) => u.includes("fake.dancer") && !u.includes("/video/")).length;
+    const listed = listings();
+    const r = await act(pid, oldId, "resume");
+    expect(r.status).toBe(409);
+    expect(r.json.error).toEqual(conflict);
+    expect(svc.state.downloads.held(oldId)).toBe(false);
+    held.release();
+    await svc.state.idle();
+    expect(listings()).toBe(listed);
+    expect(runLog.filter((u) => u.includes(`/video/${idA(2)}`))).toHaveLength(2);
+    expect(await runOf(pid, oldId)).toMatchObject({ state: "finished", failed: 1 });
+  });
+
+  it("a run being resumed is held from the press: Discard, Pause, a start of its address and a second Resume are refused as for a held run", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const runId = await stoppedRun(pid);
+    const gate = holdWorkerClient();
+    const resuming = act(pid, runId, "resume");
+    await gate.reached;
+    expect(svc.state.downloads.held(runId)).toBe(true);
+    const discard = await act(pid, runId, "discard");
+    expect(discard.status).toBe(409);
+    expect(discard.json.error).toEqual(conflict);
+    expect((await act(pid, runId, "resume")).json.error).toEqual(conflict);
+    expect((await act(pid, runId, "pause")).json.error).toMatchObject({ code: "CONFLICT", message: RUN_NOT_RUNNING_TEXT });
+    const startAgain = await captureProfile(pid, A);
+    expect(startAgain.status).toBe(409);
+    expect(startAgain.json.error).toEqual(conflict);
+    gate.release();
+    const r = await resuming;
+    expect(r.status, r.body).toBe(200);
+    await svc.state.idle();
+    expect(await runOf(pid, runId)).toMatchObject({ state: "finished", done: 3 });
+    expect(await runs(pid)).toHaveLength(1);
+  });
+
+  it("a Stop of a run being resumed stops it with nothing asked of the platform", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const runId = await stoppedRun(pid);
+    const asked = runLog.length;
+    const gate = holdWorkerClient();
+    const resuming = act(pid, runId, "resume");
+    await gate.reached;
+    const stopping = act(pid, runId, "stop");
+    gate.release();
+    const [r, s] = await Promise.all([resuming, stopping]);
+    expect(s.status, s.body).toBe(200);
+    expect(s.json.run).toMatchObject({ runId, state: "stopped" });
+    expect([200, 409]).toContain(r.status);
+    await svc.state.idle();
+    expect(await runOf(pid, runId)).toMatchObject({ state: "stopped", done: 2 });
+    expect(runLog).toHaveLength(asked);
+  });
+
+  it("a lock during a Resume's awaits is 423 and nothing is held or asked of the library", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project({ encrypted: true });
+    const runId = await stoppedRun(pid);
+    let resumed = 0;
+    wrapLibraryResume((real, ...args) => {
+      resumed++;
+      return real(...args);
+    });
+    const gate = holdWorkerClient();
+    const resuming = act(pid, runId, "resume");
+    await gate.reached;
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    gate.release();
+    const r = await resuming;
+    expect(r.status).toBe(423);
+    expect(r.json.error.code).toBe("PROJECT_LOCKED");
+    expect(svc.state.downloads.held(runId)).toBe(false);
+    expect(svc.state.downloads.memory()).toEqual([]);
+    expect(resumed).toBe(0);
+  });
+
+  it("a Resume whose run fails after the answer is logged and published as it now reads", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const runId = await stoppedRun(pid);
+    wrapLibraryResume((real, projectId, id, how, ctl) =>
+      real(projectId, id, how, {
+        ...ctl,
+        onChange: (run) => {
+          ctl.onChange(run);
+          if (run.state === "downloading") throw new Error("the journal could not be written");
+        },
+      }),
+    );
+    const events = collect();
+    const r = await act(pid, runId, "resume");
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.run).toMatchObject({ state: "downloading" });
+    await svc.state.idle();
+    const mine = events.filter((e) => e.type === "background.progress" && e.data.downloads?.runId === runId).map((e) => e.data.downloads as DownloadRunSummary);
+    expect(mine.at(-1)).toMatchObject({ state: "interrupted" });
+    expect(svc.state.downloads.held(runId)).toBe(false);
+    expect(logs).toContain("the journal could not be written");
+    expect(logs).toContain("download-run failed");
+  });
+
+  it("a Resume that reaches the library after its run finished is 409 with the finished sentence", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const runId = await stoppedRun(pid);
+    wrapLibraryResume(() => Promise.reject(new InvalidInputError(plainReason("RUN_FINISHED"))));
+    const r = await act(pid, runId, "resume");
+    expect(r.status).toBe(409);
+    expect(r.json.error).toEqual({ code: "CONFLICT", message: plainReason("RUN_FINISHED"), reason: "RUN_FINISHED" });
+    expect(svc.state.downloads.held(runId)).toBe(false);
   });
 });
 

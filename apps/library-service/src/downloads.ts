@@ -29,6 +29,7 @@ import { randomUUID } from "node:crypto";
 import { classifyUrl } from "@ao/core";
 import {
   CaptureCancelledError,
+  InvalidInputError,
   WorkerUnavailableError,
   checkCaptureAllowed,
   plainReason,
@@ -51,6 +52,7 @@ import {
   type DownloadRunSummary,
 } from "@ao/shared";
 import { ApiError, notFound } from "./errors.js";
+import { requireUnlocked } from "./routes/capture.js";
 import type { ServiceState, Session } from "./state.js";
 
 /** Test seams (R47: the service honours them only under NODE_ENV=test or VITEST). */
@@ -93,6 +95,7 @@ class NotContinued extends Error {
 }
 
 const runningConflict = () => new ApiError(409, "CONFLICT", RUN_ALREADY_RUNNING_TEXT, RUN_ALREADY_RUNNING);
+const runFinished = () => new ApiError(409, "CONFLICT", plainReason("RUN_FINISHED"), "RUN_FINISHED");
 
 /** Stands in for the media helper where none is needed (reading the journal). */
 const NO_WORKER = {
@@ -271,6 +274,8 @@ export class DownloadRunner {
       if (work.stopping) this.haltForMove(h);
       let failure: unknown;
       let ended = false;
+      /** It failed after its route had answered: nobody else is told of it (R687 I1). */
+      let late = false;
       try {
         const run = await body(ctl);
         ended = true;
@@ -283,7 +288,7 @@ export class DownloadRunner {
         if (!answered) {
           answered = true;
           refuse(err);
-        }
+        } else late = true;
       } finally {
         this.forget(h);
         h.settle();
@@ -304,6 +309,12 @@ export class DownloadRunner {
         return;
       }
       this.endQueue(h, ended ? undefined : failure);
+      // Never lost in silence: logged as registered work's failures are, and the run published as it now reads
+      // (interrupted, or failed with its reason). Not for a run a lock or a close cut: nothing more is told of it.
+      if (late && !h.cancelled) {
+        state.opts.log.warn({ err: state.describe(failure) }, "download-run failed");
+        await this.publishRun(s, h);
+      }
       return;
     });
     return answering;
@@ -396,7 +407,7 @@ export class DownloadRunner {
   async start(s: Session, projectId: string, url: string, opts: RunOptions): Promise<DownloadRunSummary> {
     const key = addressKey(url);
     // Checked and recorded with nothing awaited in between.
-    for (const x of this.runs.values()) if (x.projectId === projectId && x.key === key) throw runningConflict();
+    if (this.addressHeld(projectId, key)) throw runningConflict();
     const runId = randomUUID();
     const { h } = this.register(projectId, runId, key, true);
     this.state.captureQueues.startProfile(runId, projectId, url, "desktop");
@@ -410,7 +421,7 @@ export class DownloadRunner {
         // everything missing anyway). A finished one stays.
         for (const old of await runs.list(projectId, this.isHeld)) {
           if (ctl.cancelled()) break;
-          if (old.runId === runId || old.state === "finished" || this.runs.has(old.runId) || addressKey(old.url) !== key) continue;
+          if (old.runId === runId || old.state === "finished" || this.isHeld(old.runId) || addressKey(old.url) !== key) continue;
           if (await runs.discard(projectId, old.runId)) this.state.publishBackground(projectId, { discarded: old.runId });
         }
         return runs.start(projectId, runId, url, opts, ctl);
@@ -419,28 +430,61 @@ export class DownloadRunner {
     );
   }
 
+  /** Another held run of the project (or one being resumed) has this address. */
+  private addressHeld(projectId: string, key: string, except?: Held): boolean {
+    for (const x of this.runs.values()) if (x !== except && x.projectId === projectId && x.key === key) return true;
+    return false;
+  }
+
   /**
-   * The researcher's press of "Resume downloads": the project's rules are asked first (403 with their reason,
-   * the refusal audited), then the run is held and waits its turn; its own decision is audited when it begins
-   * (`capture.profile.resume`, R668).
+   * The researcher's press of "Resume downloads". The run is recorded as held at the press, before anything is
+   * awaited (R687 I3): a Discard, a Pause or Stop, a start of its address and a second Resume all see it held
+   * from that instant, and every early exit lets it go again. Refused when another held run of the project has
+   * its address (as a start is, I2). The project's rules are asked first (403 with their reason, the refusal
+   * audited); the lock is checked again right before the run goes on (423, nothing held). The run then waits
+   * its turn; its own decision is audited when it begins (`capture.profile.resume`, R668).
    */
   async resume(s: Session, projectId: string, runId: string): Promise<DownloadRunSummary> {
-    const found = await this.reader(s).get(projectId, runId, this.isHeld);
-    if (!found) throw notFound("That download run");
     if (this.runs.has(runId)) throw runningConflict();
-    if (found.state === "finished" && found.failed === 0) throw new ApiError(409, "CONFLICT", plainReason("RUN_FINISHED"), "RUN_FINISHED");
-    await checkCaptureAllowed(s.repo, projectId, [found.url]);
-    const worker = await this.state.workerClient();
-    // Checked and recorded with nothing awaited in between: of two presses, one passes.
-    if (this.runs.has(runId)) throw runningConflict();
-    const { h, before } = this.register(projectId, runId, addressKey(found.url), false);
-    return this.launch(
-      s,
-      h,
-      (ctl) => this.library(s, worker).resume(projectId, runId, "researcher", ctl),
-      // The answer says queued only while another run of the project is before it.
-      (run) => run.state !== "queued" || before.length > 0,
-    );
+    const { h, before } = this.register(projectId, runId, undefined, false);
+    let launched = false;
+    /** Cut by a lock (or a close) during an await: 423, and nothing of it stays. */
+    const stillHeld = () => {
+      if (!h.cancelled) return;
+      requireUnlocked(s, projectId);
+      throw new CaptureCancelledError();
+    };
+    try {
+      const found = await this.reader(s).get(projectId, runId, this.isHeld);
+      stillHeld();
+      if (!found) throw notFound("That download run");
+      if (found.state === "finished" && found.failed === 0) throw runFinished();
+      const key = addressKey(found.url);
+      if (this.addressHeld(projectId, key, h)) throw runningConflict();
+      h.key = key;
+      await checkCaptureAllowed(s.repo, projectId, [found.url]);
+      stillHeld();
+      const worker = await this.state.workerClient();
+      stillHeld();
+      requireUnlocked(s, projectId);
+      launched = true;
+      return await this.launch(
+        s,
+        h,
+        (ctl) => this.library(s, worker).resume(projectId, runId, "researcher", ctl),
+        // The answer says queued only while another run of the project is before it.
+        (run) => run.state !== "queued" || before.length > 0,
+      );
+    } catch (err) {
+      // The run finished between the check above and the library's own (Minor 9).
+      if (err instanceof InvalidInputError && err.message === plainReason("RUN_FINISHED")) throw runFinished();
+      throw err;
+    } finally {
+      if (!launched) {
+        this.forget(h);
+        h.settle();
+      }
+    }
   }
 
   async request(s: Session, projectId: string, runId: string, what: "pause" | "stop"): Promise<DownloadRunSummary> {
@@ -454,20 +498,29 @@ export class DownloadRunner {
       return run;
     }
     if (what === "pause") {
-      // A run only waiting its turn is not running: it is stopped, not paused.
+      // A run only waiting its turn (or being resumed) is not running: it is stopped, not paused.
       if (!h.begun) throw new ApiError(409, "CONFLICT", RUN_NOT_RUNNING_TEXT);
       if (h.asked !== "stop") h.asked = "pause";
     } else h.asked = "stop";
     h.req.abort();
-    // Waiting its turn: it leaves the queue at once.
-    if (!h.begun) await h.settled;
+    if (!h.begun) {
+      // Waiting its turn: it leaves the queue at once. Being resumed: it never begins. Either way it is stopped
+      // (a Resume that ended early wrote nothing, so the Stop is written here; a stopped or finished run stays).
+      await h.settled;
+      if (!this.runs.has(runId)) {
+        const run = await reader.stopNotRunning(projectId, runId);
+        if (!run) throw notFound("That download run");
+        this.state.publishBackground(projectId, { downloads: run });
+        return run;
+      }
+    }
     const run = await reader.get(projectId, runId, this.isHeld);
     if (!run) throw notFound("That download run");
     return run;
   }
 
   async discard(s: Session, projectId: string, runId: string): Promise<void> {
-    if (this.runs.has(runId)) throw runningConflict();
+    if (this.isHeld(runId)) throw runningConflict();
     if (!(await this.reader(s).discard(projectId, runId))) throw notFound("That download run");
     this.state.publishBackground(projectId, { discarded: runId });
   }
