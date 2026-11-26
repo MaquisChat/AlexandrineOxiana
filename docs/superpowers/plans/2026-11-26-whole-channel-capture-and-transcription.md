@@ -646,6 +646,7 @@ export class DownloadRunner {
 - **At the lock of an encrypted project** (`routes/projects.ts`) (coordinator, R669, item 1 ruled (b)): `downloads.stopProject(id, "lock")` cuts every held run of the project — the one downloading and the ones waiting their turn — and forgets them entirely: no title, no address, no run id is kept. Nothing more is written or published. The existing ending of profile runs at a lock (`endCaptures`, Task 63 fix round 2, I3) stays as it is. A project that is not encrypted is not touched, as today.
 - **At the unlock nothing continues by itself.** The journal's runs that say queued, downloading or waiting are not held, so they are shown interrupted, with "Resume downloads": one click, as after a quit (R668).
 - **At a close:** `stopProject(p, "close")` for every project. Nothing continues by itself after a quit (R668).
+- **(coordinator, R687)** A move that is REFUSED (its drain ran out of time and was rolled back) leaves the runs as they were: the run halted for it and the runs waiting behind it go on at once. A continuation after a successful move fires only for a run that was held when the move halted it and whose journal state is still queued, downloading or waiting; one the researcher paused or stopped meanwhile is never continued, and a continuation that does not fire is dropped. `resume` marks the run as being resumed synchronously at entry (Discard, Stop, a start of the same address and a second Resume all see it), re-checks the lock before registering, and refuses when any held run of the project has the same address. A run that fails after its route answered is logged and published as it now reads. With NO quality in the request none is passed on (the worker chooses), and the Video tools check applies only to a quality that was sent. The same address started twice answers 409 `CAPTURE_RUNNING` (the existing sentence) for a started run and 409 `RUN_ALREADY_RUNNING` for a resumed one. A Resume of a run that just finished answers 409 with the `RUN_FINISHED` sentence. **Test-only:** `AO_TEST_FREE_BYTES`, honoured only when `NODE_ENV` is exactly `test`, set by `e2e/fixtures.ts`, gives the download runs their free space, so no browser scenario depends on the machine's disk.
 
 - [ ] **Step 1: Write the failing tests** (`downloads-routes.test.ts`, with the service test set-up, the fake worker and the fake yt-dlp profile):
   - `capture-estimate answers the counts, the lengths, the free space and whether Video tools are installed`.
@@ -931,7 +932,7 @@ whenEnded(s: Session, projectId: string, jobId: string): Promise<TranscriptionJo
 
 **Files:**
 - Create: `e2e/whole-channel.spec.ts`
-- Modify only if needed: `e2e/fixtures.ts`. If the fake profile needs no new control, change nothing there.
+- Modify only if needed: `e2e/fixtures.ts`. If the fake profile needs no new control, change nothing there. (Task 5 already sets `AO_TEST_FREE_BYTES` there — R687; a scenario that wants the disk floor to bite can restart the service with a small value.)
 
 **Interfaces:**
 - Consumes: everything above; `test.use({ fakeControl: true })`, `app.fakes.setProfile`, `hold` / `release`, `installSpeechModel`, `app.restart()` (all exist in `e2e/fixtures.ts`).
