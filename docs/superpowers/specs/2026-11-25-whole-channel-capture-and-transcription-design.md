@@ -92,7 +92,7 @@ Before each download the app checks the free space. When less than 10 GB would b
 
 ### 4. Two lists that survive a quit
 
-- **Downloads** for a project run one at a time, with a short wait between videos so that YouTube is asked gently.
+- **Downloads** for a project run one at a time, with a short wait between videos so that YouTube is asked gently. A second channel started while one is downloading is not refused: it waits its turn ("…is waiting its turn. It starts by itself when the downloads before it have finished, paused or stopped.") and begins by itself in the same sitting. After a quit it waits for "Resume downloads" like everything else.
 - **A video that cannot be downloaded** (owner, 26 November) — removed, private, not available in your country, needing a sign-in the app does not have, or a failure that is still there after the downloader's own few tries: its line gets the error, in plain words with the platform's own reason where there is one, and the run goes straight on to the next video. It is not tried again by itself. Nothing half-downloaded is kept for it.
 - **"Resume downloads"** (owner, 26 November): one button on the run's line, there for as long as anything in the run did not complete. It does both things at once: it carries on with the videos not yet reached (after a quit, a Stop or a pause), and it tries again the ones that ended in an error. It says how many: "Resume downloads (14 did not complete)". Videos that fail again keep their error and the button stays. Each press is recorded as your decision, and the project's rules are asked again as they stand at that moment.
 - **When YouTube says "slow down"** this is not a failure of one video — it is the whole connection, and going on down the list would only make YouTube block harder. So the run waits instead: the existing waits of 1, 2 and 4 minutes stay, and after them the run no longer simply pauses for good: it waits longer and tries again by itself — 15 minutes, 30 minutes, 1 hour, then every 2 hours — and says so on its line. After 12 hours without success it pauses until you press Resume downloads.
@@ -102,7 +102,7 @@ Before each download the app checks the free space. When less than 10 GB would b
 - **After a quit or a restart:** transcriptions carry on by themselves, as they already do today (nothing leaves the Mac). Downloads do not start by themselves (owner, 26 November): the app shows "The capture of 'Example Channel' was interrupted: 120 of 412 done." with **Resume downloads** and **Discard**. One click carries on where it stopped, and tries again any that had failed; the click is recorded as your decision, and the project's rules are asked again as they stand now. **Discard** takes the run off the screen; what was downloaded stays in the library.
 - **Pause** (either list) finishes the item in hand and waits; it stays paused across a quit until you press Resume downloads (for the transcriptions: Continue). **Stop** on the downloads ends the run: what was downloaded stays in the library, and its transcriptions stay on their list; capturing the same channel again later takes what is missing. **Stop** on the transcriptions empties that list; the sources stay, without transcripts, and "Transcribe everything without a transcript" can fill it again.
 - A single pasted link is captured and transcribed as today, at once; the lists are for runs of many.
-- Locking a project stops both lists for that project at once, and nothing more is asked of any service for it; unlocking lets them carry on.
+- Locking a project stops both lists for that project at once, and nothing more is asked of any service for it. After unlocking, the transcriptions carry on by themselves; the downloads wait for "Resume downloads", exactly as after a quit (amended on 26 November after the owner's answer: nothing goes out that was not just asked for).
 - Each video and each transcript is recorded exactly as one captured or transcribed by hand is today.
 - The same lists serve Instagram and TikTok profiles, which use the same capture; they are tried and tested on YouTube first.
 
@@ -161,6 +161,11 @@ A standing rule of the project (ruling R41, point I3) said a download cut by a q
 - A "slow down" from YouTube is treated as the connection's problem, not one video's: the run waits, as described, and does not go on down the list failing every video. If you would rather it simply paused at once and left the rest to the button, say so.
 - A video that ends in an error is not tried again by itself, not even once at the end of the run; only the button does that.
 - "Resume downloads" stays on the run's line across quits, until everything completed or you press Discard.
+- After a project was locked and unlocked, its downloads wait for "Resume downloads" too (the page first said they would carry on by themselves; your answer made one click the rule).
+- Several channels can be started one after another; they are downloaded in the order you started them.
+- A single pasted link is captured at once even while a channel is downloading or waiting.
+- The wait between two videos is 10 seconds, on top of the downloader's own short pauses.
+- The switch "Transcribe captured audio and video automatically" is on the project's Governance screen (the app has no other per-project settings screen); the switch for keeping the Mac awake is on the Optional tools screen.
 - When YouTube says "slow down", the run keeps trying by itself at growing intervals for 12 hours before it pauses for good.
 - Without "Video tools" the capture still starts, at the lower quality, and says so.
 - The automatic-transcription switch covers captures, not imported files; "Transcribe everything without a transcript" covers those by hand.
