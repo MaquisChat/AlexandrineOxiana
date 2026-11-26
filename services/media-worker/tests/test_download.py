@@ -114,6 +114,14 @@ def test_ytdlp_quality_selects_a_format(monkeypatch):
     ("ERROR: [youtube] x: Read timed out.", "NETWORK_LOST"),
     ("ERROR: unable to download video data: Connection reset by peer", "NETWORK_LOST"),
     ("ERROR: [youtube] x: Temporary failure in name resolution", "NETWORK_LOST"),
+    ("ERROR: [youtube] abc: Unable to download webpage: HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)", "NOT_FOUND_OR_REMOVED"),
+    ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "EXTRACTOR_ERROR"),
+    ("ERROR: [youtube] abc: Unable to download webpage: HTTP Error 429: Too Many Requests", "RATE_LIMITED"),
+    ("ERROR: [youtube] abc: Unable to download webpage: <urlopen error [Errno -3] Temporary failure in name resolution> (caused by URLError(...))", "NETWORK_LOST"),
+    ("ERROR: [youtube] abc: Unable to download webpage: <urlopen error [Errno 8] nodename nor servname provided, or not known>", "NETWORK_LOST"),
+    ("ERROR: unable to download video data: [Errno 104] Connection reset by peer", "NETWORK_LOST"),
+    ("ERROR: [youtube] abc: Unable to download webpage: The read operation timed out", "NETWORK_LOST"),
+    ("ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader", "NOT_FOUND_OR_REMOVED"),
 ])
 def test_map_error(stderr, code):
     assert map_error(stderr) == code

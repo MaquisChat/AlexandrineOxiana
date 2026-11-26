@@ -79,8 +79,9 @@ _ERROR_PATTERNS = [
         r"age[- ]?restricted|you need to log in|log in to", re.I)),
     ("DISK_FULL", re.compile(r"No space left on device|ENOSPC|disk (is )?full", re.I)),
     ("NETWORK_LOST", re.compile(
-        r"Unable to download|timed out|Connection (reset|refused|aborted)|Network is unreachable|"
-        r"Temporary failure in name resolution|getaddrinfo failed|Read timed out", re.I)),
+        r"urlopen error|timed out|Connection (reset|refused|aborted)|Network is unreachable|No route to host|"
+        r"Temporary failure in name resolution|Name or service not known|nodename nor servname|"
+        r"getaddrinfo failed|Remote end closed connection|IncompleteRead", re.I)),
     ("NOT_FOUND_OR_REMOVED", re.compile(
         r"video unavailable|has been removed|\b404\b|not found|does not exist|no longer available|"
         r"has been deleted|account (has been )?(terminated|suspended)|unavailable", re.I)),
@@ -124,7 +125,11 @@ def redact(text: str) -> str:
 def map_error(stderr: str) -> str:
     lines = [l for l in stderr.splitlines() if "ERROR" in l]
     text = "\n".join(lines) if lines else stderr
+    # An HTTP answer means the connection worked: such a text is never a lost connection.
+    http_answer = re.search(r"HTTP Error", text, re.I) is not None
     for code, pat in _ERROR_PATTERNS:
+        if code == "NETWORK_LOST" and http_answer:
+            continue
         if pat.search(text):
             return code
     return "EXTRACTOR_ERROR"
