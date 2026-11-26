@@ -758,10 +758,11 @@ describe("the switches", () => {
       { method: "POST", url: `/projects/${pid}/transcription-list/stop` },
       { method: "GET", url: `/projects/${pid}/untranscribed` },
       { method: "POST", url: `/projects/${pid}/transcription-list`, body: {} },
+      // R692 (I2): the switch of a locked project cannot be read under its key either.
+      { method: "GET", url: `/projects/${pid}/automation` },
     ];
     const all: Array<{ method: "GET" | "POST" | "PUT"; url: string; body?: unknown }> = [
       ...locked,
-      { method: "GET", url: `/projects/${pid}/automation` },
       { method: "PUT", url: `/projects/${pid}/automation`, body: { transcribeNewMedia: true } },
       { method: "GET", url: "/settings/background" },
       { method: "PUT", url: "/settings/background", body: { keepAwake: false } },

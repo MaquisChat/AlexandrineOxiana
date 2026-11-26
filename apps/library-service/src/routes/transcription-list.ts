@@ -9,8 +9,8 @@
  *   GET | PUT /projects/:id/automation                        ProjectAutomation
  *   GET | PUT /settings/background                            BackgroundSettings (app setting file background.json)
  *
- * The desktop app only (none is an extension route, server.ts). The list's routes and `untranscribed` answer a locked
- * project 423 before anything else (R684); the ones that change the list are `requireWritable` and publish
+ * The desktop app only (none is an extension route, server.ts). The list's routes, `untranscribed` and the automation
+ * GET answer a locked project 423 before anything else (R684, R692); the ones that change the list are `requireWritable` and publish
  * `background.progress { transcriptions }` before they answer (R679).
  */
 import type { FastifyInstance } from "fastify";
@@ -112,8 +112,7 @@ export function registerTranscriptionList(app: FastifyInstance, ctx: Ctx): void 
   });
 
   app.get("/projects/:id/automation", async (req): Promise<ProjectAutomation> => {
-    const s = state.requireSession();
-    const projectId = projectParam(ctx, req);
+    const { s, projectId } = unlocked(req); // 423 first, like the PUT (R692 I2)
     return { transcribeNewMedia: s.repo.getProject(projectId).automation?.transcribeNewMedia === true };
   });
 

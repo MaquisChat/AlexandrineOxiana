@@ -5,7 +5,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Project, SourceDraft, SourceFile } from "@ao/core";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
 import { appendJobRecords, type JobRecord } from "./job-journal.js";
 import { addToTranscriptionList } from "./lists/transcription-list.js";
@@ -77,5 +77,51 @@ describe("untranscribedSources", () => {
       { sourceId: plain.source.id, title: "Plain", soundSec: 90 },
       { sourceId: unknown.source.id, title: "Unknown" },
     ]);
+  });
+
+  it("a source a link capture is transcribing right now is left out (its job names the recording, not the source) (R692)", async () => {
+    const p = await makeProject(kit);
+    const capturing = await audioSource(p, "Capturing", 60);
+    const ended = await audioSource(p, "Ended", 60);
+    const at = kit.clock.now.toISOString();
+    const linkJob = (id: string, assetId: string, status: JobRecord["status"], linked = false): JobRecord => ({
+      v: 1, id, projectId: p.id, kind: "audio.transcribe", status, createdAt: at, updatedAt: at,
+      // As link-capture's runTranscription submits it: no `about`, the recording as the job's entity.
+      ...(status === "queued" || status === "running"
+        ? { job: { type: "audio.transcribe", input: linked ? "" : "x.mp3", ...(linked ? { inputAsset: { sourceId: "", assetId } } : {}), output: "out", params: { model: "medium" }, ...(linked ? {} : { entity: { type: "asset" as const, id: assetId } }) } }
+        : {}),
+    });
+    await appendJobRecords(kit.lib.root, kit.repo.getProject(p.id).folder, projectDataKey(kit.repo, p.id), [
+      linkJob("link-1", capturing.assets[0]!.id, "running"),
+      linkJob("link-2", ended.assets[0]!.id, "done"),
+    ]);
+    expect((await untranscribedSources(kit.repo, p.id)).map((x) => x.title)).toEqual(["Ended"]);
+    // "Transcribe everything" puts nothing on the list for it.
+    const listed = await untranscribedSources(kit.repo, p.id);
+    expect(await addToTranscriptionList(kit.repo, p.id, listed.map((x) => ({ sourceId: x.sourceId })))).toEqual({ added: 1 });
+    // A file linked in place is named by its input asset.
+    const linked = await audioSource(p, "Linked", 60);
+    await appendJobRecords(kit.lib.root, kit.repo.getProject(p.id).folder, projectDataKey(kit.repo, p.id), [linkJob("link-3", linked.assets[0]!.id, "queued", true)]);
+    expect(await untranscribedSources(kit.repo, p.id)).toEqual([]);
+  });
+
+  it("only a derived transcript that is not destroyed counts, and a running job leaves the source out (R692)", async () => {
+    const p = await makeProject(kit);
+    const original = await audioSource(p, "Original transcript", 60);
+    const destroyed = await audioSource(p, "Destroyed transcript", 60);
+    await transcribed(p, destroyed);
+    const running = await audioSource(p, "Running", 60);
+    await job(p, running.source.id, "running");
+    const real = kit.repo.getSource.bind(kit.repo);
+    vi.spyOn(kit.repo, "getSource").mockImplementation(async (pid, sid) => {
+      const sf = await real(pid, sid);
+      if (sid === original.source.id) {
+        // A transcript file the researcher brought in as an original (not one the app derived).
+        return { ...sf, assets: [...sf.assets, { ...sf.assets[0]!, id: "original-vtt", kind: "transcript", role: "original" }] };
+      }
+      if (sid === destroyed.source.id) return { ...sf, assets: sf.assets.map((a) => (a.kind === "transcript" ? { ...a, status: "destroyed" as const } : a)) };
+      return sf;
+    });
+    expect((await untranscribedSources(kit.repo, p.id)).map((x) => x.title).sort()).toEqual(["Destroyed transcript", "Original transcript"]);
   });
 });
