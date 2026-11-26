@@ -153,7 +153,7 @@ export { ResourceMissingError } from "./resources.js";
 export { DISCARDED_CODE, LIST_KINDS, isListKind } from "./job-journal.js";
 export type { CaptureItemData, CaptureRunData, JobStatus, TranscriptionEntryData, TranscriptionListData } from "./job-journal.js";
 export {
-  createRun, discardRun, readRun, readRunItems, readRuns, recordRunItem, requeueFailedItems, setRunItems, setRunState,
+  createRun, discardRun, readRun, readRunItems, readRuns, recordRunItem, requeueFailedItems, setRunItems, setRunState, setRunTitle,
 } from "./lists/run-journal.js";
 export type { RunItemView, RunView } from "./lists/run-journal.js";
 export {

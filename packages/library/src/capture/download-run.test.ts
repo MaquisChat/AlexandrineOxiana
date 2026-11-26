@@ -687,7 +687,10 @@ describe("download runs", { timeout: 120_000 }, () => {
     expect(await runs.start(p.id, id, TT_PROFILE, OPTS, control().ctl)).toMatchObject({ state: "finished", failed: 0 });
     const asked = worker.submitted.length;
     const c = control();
-    await expect(runs.resume(p.id, id, "researcher", c.ctl)).rejects.toBeInstanceOf(InvalidInputError);
+    const err = await runs.resume(p.id, id, "researcher", c.ctl).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InvalidInputError);
+    expect((err as Error).message).toBe("These downloads have finished, so there is nothing to resume.");
+    expect((err as Error).message).toBe(plainReason("RUN_FINISHED"));
     expect(worker.submitted.length).toBe(asked);
     expect(c.changes).toHaveLength(0);
     expect(await runs.get(p.id, id, () => false)).toMatchObject({ state: "finished" });
@@ -704,6 +707,36 @@ describe("download runs", { timeout: 120_000 }, () => {
     expect(await runs.discard(p.id, id)).toBe(false);
   });
 
+  /**
+   * Waits until the run asks for its turn, or fails at once when the run settles without asking (a turn
+   * that is not awaited fails here, fast, instead of at the test's time limit).
+   */
+  function turnAsked(waitingTurn: Promise<void>, started: Promise<unknown>): Promise<void> {
+    return Promise.race([
+      waitingTurn,
+      started.then(
+        () => Promise.reject(new Error("the run went ahead without waiting its turn")),
+        (err: unknown) => Promise.reject(new Error(`the run ended without waiting its turn: ${String(err)}`)),
+      ),
+    ]);
+  }
+
+  it("Pause and Stop wake the gap at once", async () => {
+    for (const a of ["pause", "stop"] as const) {
+      const p = await project();
+      const c = control();
+      const woken: boolean[] = [];
+      sleepImpl = async (ms, signal) => {
+        if (ms !== DOWNLOAD_GAP_MS) return;
+        c.ask(a);
+        woken.push(signal?.aborted === true);
+      };
+      const run = await runs.start(p.id, newRunId(), TT_PROFILE, OPTS, c.ctl);
+      expect(woken).toEqual([true]);
+      expect(run).toMatchObject({ state: a === "pause" ? "paused" : "stopped", done: 1, notCompleted: 2 });
+    }
+  });
+
   it("a run whose turn has not come is written queued, asks nothing of the platform, and starts when the turn comes", async () => {
     const p = await project();
     let release: () => void = () => {};
@@ -714,7 +747,7 @@ describe("download runs", { timeout: 120_000 }, () => {
     const c = control({ turn: () => (called(), turn) });
     const id = newRunId();
     const started = runs.start(p.id, id, TT_PROFILE, OPTS, c.ctl);
-    await waitingTurn;
+    await turnAsked(waitingTurn, started);
     expect(worker.submitted).toHaveLength(0);
     expect(c.changes).toHaveLength(1);
     expect(c.changes[0]).toMatchObject({ state: "queued", total: 0 });
@@ -736,7 +769,7 @@ describe("download runs", { timeout: 120_000 }, () => {
     const c = control({ turn: () => (called(), turn) });
     const id = newRunId();
     const started = runs.start(p.id, id, TT_PROFILE, OPTS, c.ctl);
-    await waitingTurn;
+    await turnAsked(waitingTurn, started);
     c.ask("stop");
     const run = await started;
     expect(run).toMatchObject({ state: "stopped", total: 0, done: 0 });
@@ -757,7 +790,7 @@ describe("download runs", { timeout: 120_000 }, () => {
     const c = control({ turn: () => (called(), turn) });
     const id = newRunId();
     const started = runs.start(p.id, id, TT_PROFILE, OPTS, c.ctl);
-    await waitingTurn;
+    await turnAsked(waitingTurn, started);
     c.cancel(); // a quit while it waited its turn
     await expect(started).rejects.toBeInstanceOf(CaptureCancelledError);
     expect(c.changes).toHaveLength(1);
@@ -837,6 +870,8 @@ describe("download runs", { timeout: 120_000 }, () => {
     const denied = await project(GOV.replace("[downloader]", "[manual_upload]"));
     await expect(runs.estimate(denied.id, TT_PROFILE, OPTS)).rejects.toBeInstanceOf(PolicyDeniedError);
     expect(listings()).toBe(1);
-    expect((await auditEvents(denied.folder)).filter((x) => x.action === "capture").at(-1)?.decision?.result).toBe("deny");
+    const denials = (await auditEvents(denied.folder)).filter((x) => x.decision?.result === "deny");
+    expect(denials).toHaveLength(1);
+    expect(denials[0]).toMatchObject({ action: "capture", details: { op: "capture.profile.list" } });
   });
 });

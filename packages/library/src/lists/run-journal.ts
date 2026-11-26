@@ -246,6 +246,18 @@ export async function setRunState(
   return view(records, runId);
 }
 
+/** Sets the run's title (the listing's title once it is read); its state and the rest are kept, the counters follow. */
+export async function setRunTitle(repo: Repo, projectId: string, runId: string, title: string): Promise<RunView> {
+  const p = writable(repo, projectId);
+  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
+    const run = liveRun(records, runId);
+    const at = repoClock(repo)().toISOString();
+    return [recount({ ...run, run: { ...run.run, title } }, itemsOf(records, runId), at)];
+  });
+  return view(records, runId);
+}
+
 /** The project's runs that are not discarded, newest first. */
 export async function readRuns(repo: Repo, projectId: string): Promise<RunView[]> {
   const p = place(repo, projectId);

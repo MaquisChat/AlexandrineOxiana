@@ -36,7 +36,6 @@ import {
   type DownloadRunSummary,
 } from "@ao/shared";
 import type { IndexDb } from "../index/db.js";
-import { DISCARDED_CODE, updateJobRecords } from "../job-journal.js";
 import {
   createRun,
   discardRun,
@@ -46,11 +45,12 @@ import {
   recordRunItem,
   setRunItems,
   setRunState,
+  setRunTitle,
   type RunView,
 } from "../lists/run-journal.js";
 import { addToTranscriptionList } from "../lists/transcription-list.js";
-import { InvalidInputError, NotFoundError, PolicyDeniedError, ReadOnlyLibraryError } from "../repo/errors.js";
-import { projectDataKey, repoClock, repoLibrary, type Repo } from "../repo/repo.js";
+import { InvalidInputError, NotFoundError, PolicyDeniedError } from "../repo/errors.js";
+import { repoLibrary, type Repo } from "../repo/repo.js";
 import type { WorkerClient } from "../worker-client.js";
 import { diskName, freeBytes } from "./disk.js";
 import { CaptureCancelledError, plainReason } from "./errors.js";
@@ -110,8 +110,6 @@ export interface DownloadRuns {
   discard(projectId: string, runId: string): Promise<boolean>;
 }
 
-/** Said when Resume downloads is asked of a run that has nothing left to do. */
-const NOTHING_TO_RESUME = "Every video of these downloads is already in the project, so there is nothing to resume.";
 const TITLE_MAX = 300;
 
 /** A real timer, woken early by the signal. */
@@ -190,23 +188,6 @@ function summarize(v: RunView, held: (runId: string) => boolean): DownloadRunSum
     startedAt: v.record.createdAt,
     updatedAt: v.record.updatedAt,
   };
-}
-
-/**
- * The run's title once the list is read (run-journal.ts has no setter for it; this writes the run's
- * record again with the title, in the journal's own turn, as every run-journal write does).
- */
-async function setRunTitle(repo: Repo, projectId: string, runId: string, title: string): Promise<RunView | undefined> {
-  const library = repoLibrary(repo);
-  if (library.mode !== "read-write") throw new ReadOnlyLibraryError(library.readOnlyReason);
-  let changed = false;
-  await updateJobRecords(library.root, repo.getProject(projectId).folder, projectId, projectDataKey(repo, projectId), (records) => {
-    const r = records.get(runId);
-    if (!r || r.kind !== "capture.run" || !r.run || r.run.title === title || (r.status === "cancelled" && r.error === DISCARDED_CODE)) return [];
-    changed = true;
-    return [{ ...r, updatedAt: repoClock(repo)().toISOString(), run: { ...r.run, title } }];
-  });
-  return changed ? readRun(repo, projectId, runId) : undefined;
 }
 
 export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
@@ -467,7 +448,7 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
     async resume(projectId, runId, how, ctl) {
       const v = await readRun(repo, projectId, runId);
       if (!v) throw new NotFoundError("Download run", runId);
-      if (v.record.run.state === "finished" && v.record.run.failed === 0) throw new InvalidInputError(NOTHING_TO_RESUME);
+      if (v.record.run.state === "finished" && v.record.run.failed === 0) throw new InvalidInputError(plainReason("RUN_FINISHED"));
       if (ctl.cancelled()) throw new CaptureCancelledError();
       ctl.onChange(summarize(await setRunState(repo, projectId, runId, "queued"), () => true));
       return segment(projectId, runId, ctl, how);

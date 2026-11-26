@@ -14,7 +14,7 @@ import { NotFoundError, ProjectLockedError, ReadOnlyLibraryError } from "../repo
 import { projectDataKey } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
 import {
-  createRun, discardRun, readRun, readRunItems, readRuns, recordRunItem, requeueFailedItems, setRunItems, setRunState,
+  createRun, discardRun, readRun, readRunItems, readRuns, recordRunItem, requeueFailedItems, setRunItems, setRunState, setRunTitle,
 } from "./run-journal.js";
 
 const MARKER = "zebra-channel-7f3a9c";
@@ -302,6 +302,35 @@ describe("download runs in the job journal", () => {
     expect(run.record.run).toMatchObject({ state: "finished", total: 2, done: 1, failed: 1 });
     expect((await readRunItems(kit.repo, p.id, "r")).map((i) => [i.status, i.item.errorCode])).toEqual([["done", undefined], ["failed", "PRIVATE"]]);
     expect((await readRun(kit.repo, p.id, "all-done"))?.record.status).toBe("done");
+  });
+
+  it("setRunTitle writes the run's title sealed, keeps its state and recounts it; refused read-only, locked or discarded", async () => {
+    const p = await makeProject(kit, OPEN_GOV, true);
+    await createRun(kit.repo, p.id, "r", { ...base, title: "@handle" });
+    await setRunItems(kit.repo, p.id, "r", items(3));
+    await setRunState(kit.repo, p.id, "r", "downloading");
+    const folder = kit.repo.getProject(p.id).folder;
+    const key = projectDataKey(kit.repo, p.id);
+    // A torn final append left the items written and the run's record stale (R672).
+    const recs = (await readJobJournal(kit.lib.root, folder, p.id, key)).records;
+    await appendJobRecords(kit.lib.root, folder, key, [{ ...recs.get("r/0")!, status: "done", updatedAt: kit.clock.now.toISOString() }]);
+    const v = await setRunTitle(kit.repo, p.id, "r", `Titled ${MARKER}`);
+    expect(v.record).toMatchObject({ status: "running", run: { title: `Titled ${MARKER}`, state: "downloading", url: base.url, total: 3, done: 1, failed: 0 } });
+    expect((await readFile(journalPath(kit.lib.root, folder))).includes(MARKER)).toBe(false);
+    expect((await readRun(kit.repo, p.id, "r"))!.record.run).toMatchObject({ title: `Titled ${MARKER}`, state: "downloading", done: 1 });
+
+    const ro = await openLibrary(kit.lib.root, {
+      clock: () => kit.clock.now, deviceId: "dev-B", hostname: "host-B", pid: process.pid, isPidAlive: () => true,
+      appConfigDir: join(kit.tmp, "config-B"), settleMs: 0, setInterval: () => ({}), clearInterval: () => {},
+    });
+    onTestFinished(() => ro.close());
+    const roRepo = await openTestRepo(ro, new KeyRing(), { clock: () => kit.clock.now, tz: "UTC", actor: "tester", scryptN: FAST });
+    await expect(setRunTitle(roRepo, p.id, "r", "Other")).rejects.toBeInstanceOf(ReadOnlyLibraryError);
+
+    expect(await discardRun(kit.repo, p.id, "r")).toBe(true);
+    await expect(setRunTitle(kit.repo, p.id, "r", "Other")).rejects.toBeInstanceOf(NotFoundError);
+    await kit.repo.lockProject(p.id);
+    await expect(setRunTitle(kit.repo, p.id, "r", "Other")).rejects.toBeInstanceOf(ProjectLockedError);
   });
 
   it("assertNoSecrets refuses options naming a cookie value", async () => {
