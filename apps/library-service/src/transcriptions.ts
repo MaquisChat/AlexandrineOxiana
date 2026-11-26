@@ -27,6 +27,7 @@ import {
   WorkerJobError,
   WorkerUnavailableError,
   transcriptionJob,
+  transcriptionRecords,
   transcriptionRerun,
   type JobRecord,
   type ResumeExtras,
@@ -101,6 +102,10 @@ export class Transcriptions {
   private readonly live = new Map<string, Live>();
   /** Per source (project and source id): the live job's id, or a reservation token. */
   private readonly bySource = new Map<string, string | symbol>();
+  /** Told when a job this run holds has ended (whenEnded). */
+  private readonly waiters = new Map<string, Set<(job: TranscriptionJob) => void>>();
+  /** Per source key: told when a reservation becomes a job (its id) or is given up (undefined) (whenStarted). */
+  private readonly starts = new Map<string, Set<(jobId: string | undefined) => void>>();
 
   constructor(private readonly state: ServiceState) {}
 
@@ -137,7 +142,9 @@ export class Transcriptions {
     return {
       token,
       release: () => {
-        if (this.bySource.get(key) === token) this.bySource.delete(key);
+        if (this.bySource.get(key) !== token) return;
+        this.bySource.delete(key);
+        this.told(key, undefined);
       },
     };
   }
@@ -148,7 +155,15 @@ export class Transcriptions {
     let entry: Live | undefined;
     const job = await transcriptionJob(s.repo, projectId, sourceId, params, { id, onStored: (st) => entry && this.stored(entry, st) });
     const key = this.key(projectId, sourceId);
-    if (this.bySource.get(key) !== token) throw busyError(); // released meanwhile (a close)
+    if (this.bySource.get(key) !== token) throw busyError(); // released meanwhile (a close, a lock)
+    // Locked meanwhile (R692 M4, R693): a second line of defence. The first is the lock route, which drops the
+    // reservation (forgetProject: the token check above throws busy), with the library refusing a locked project
+    // inside transcriptionJob; this re-check keeps nothing of the project tracked should either ever change.
+    if (!s.repo.isUnlocked(projectId)) {
+      this.bySource.delete(key);
+      this.told(key, undefined);
+      throw new ProjectLockedError(projectId);
+    }
     entry = this.track(s, id, projectId, sourceId, typeof job.about?.model === "string" ? job.about.model : undefined);
     const live = entry;
     void this.state.startWork("transcription", async (ctl) => {
@@ -215,6 +230,97 @@ export class Transcriptions {
     return { ...l.job };
   }
 
+  /**
+   * Resolves with the job once it has ended (done, failed, or cancelled — except cancelled by a lock, which runs again
+   * at the unlock, R142): at once when the journal record has ended, else when the run this service holds (a new one,
+   * or a rerun of a pending one) ends. A job left pending (interrupted, the media helper gone) is waited for until it
+   * runs again. `signal` gives up the wait (it rejects with the signal's reason).
+   */
+  whenEnded(s: Session, projectId: string, jobId: string, signal?: AbortSignal): Promise<TranscriptionJob> {
+    return new Promise<TranscriptionJob>((resolve, reject) => {
+      const set = this.waiters.get(jobId) ?? new Set();
+      this.waiters.set(jobId, set);
+      let settled = false;
+      const cleanup = () => {
+        settled = true;
+        set.delete(done);
+        if (set.size === 0 && this.waiters.get(jobId) === set) this.waiters.delete(jobId);
+        signal?.removeEventListener("abort", aborted);
+      };
+      const done = (job: TranscriptionJob) => {
+        if (settled) return;
+        cleanup();
+        resolve(job);
+      };
+      const aborted = () => {
+        if (settled) return;
+        cleanup();
+        reject(signal?.reason instanceof Error ? signal.reason : new Error("the wait was given up"));
+      };
+      if (signal?.aborted) return aborted();
+      signal?.addEventListener("abort", aborted, { once: true });
+      set.add(done);
+      // Registered first, then the journal read: an end between the two is not missed.
+      transcriptionRecords(s.repo, projectId).then(
+        (recs) => {
+          const rec = recs.find((r) => r.id === jobId);
+          if (rec && recordEnded(rec)) done(fromRecord(rec));
+        },
+        (err: unknown) => {
+          if (settled) return;
+          cleanup();
+          reject(err instanceof Error ? err : new Error(String(err)));
+        },
+      );
+    });
+  }
+
+  /**
+   * For a source taken by a start at this moment (`reserve` refused): resolves with the job's id once that start has
+   * made it, or with undefined when the start gave up (or nothing holds the source any more). A job already queued or
+   * running for the source is answered at once. `signal` gives up the wait (R692 M3).
+   */
+  whenStarted(projectId: string, sourceId: string, signal?: AbortSignal): Promise<string | undefined> {
+    const key = this.key(projectId, sourceId);
+    return new Promise<string | undefined>((resolve, reject) => {
+      const held = this.bySource.get(key);
+      if (typeof held === "string" && this.active(this.live.get(held))) return resolve(held);
+      if (typeof held !== "symbol") return resolve(undefined);
+      if (signal?.aborted) return reject(signal.reason instanceof Error ? signal.reason : new Error("the wait was given up"));
+      const set = this.starts.get(key) ?? new Set();
+      this.starts.set(key, set);
+      const cleanup = () => {
+        set.delete(done);
+        if (set.size === 0 && this.starts.get(key) === set) this.starts.delete(key);
+        signal?.removeEventListener("abort", aborted);
+      };
+      const done = (jobId: string | undefined) => {
+        cleanup();
+        resolve(jobId);
+      };
+      const aborted = () => {
+        cleanup();
+        reject(signal?.reason instanceof Error ? signal.reason : new Error("the wait was given up"));
+      };
+      signal?.addEventListener("abort", aborted, { once: true });
+      set.add(done);
+    });
+  }
+
+  private told(key: string, jobId: string | undefined): void {
+    const set = this.starts.get(key);
+    if (set) for (const fn of [...set]) fn(jobId);
+  }
+
+  /** What this run holds, for tests and diagnostics: the live jobs' and held sources' project ids; the waited job ids, and the projects of waited starts. */
+  memory(): { live: string[]; waiters: string[]; sources: string[] } {
+    return {
+      live: [...this.live.values()].map((l) => l.job.projectId),
+      waiters: [...this.waiters.keys(), ...[...this.starts.keys()].map((k) => k.split("\u0000")[0]!)],
+      sources: [...this.bySource.keys()].map((k) => k.split("\u0000")[0]!),
+    };
+  }
+
   /** Forgets everything held for a library that was closed (its jobs stay in its journal). */
   forget(lib: object): void {
     this.drop((l) => l.lib === lib);
@@ -241,7 +347,11 @@ export class Transcriptions {
       l.forgotten = true;
       this.live.delete(id);
     }
-    for (const [key, v] of this.bySource) if (typeof v === "symbol" || !this.live.has(v)) this.bySource.delete(key);
+    for (const [key, v] of this.bySource) {
+      if (typeof v !== "symbol" && this.live.has(v)) continue;
+      this.bySource.delete(key);
+      if (typeof v === "symbol") this.told(key, undefined);
+    }
   }
 
   // ---- internals ----
@@ -256,8 +366,10 @@ export class Transcriptions {
     };
     this.live.set(id, entry);
     this.bySource.set(this.key(projectId, sourceId), id);
+    this.told(this.key(projectId, sourceId), id);
     this.prune();
     this.publish(entry);
+    this.state.updateKeepAwake(); // a job the list follows is live again (R692 M5)
     return entry;
   }
 
@@ -336,6 +448,8 @@ export class Transcriptions {
     const key = this.key(l.job.projectId, l.job.sourceId);
     if (this.bySource.get(key) === l.job.jobId) this.bySource.delete(key);
     this.publish(l);
+    const waiting = this.waiters.get(l.job.jobId);
+    if (waiting) for (const fn of [...waiting]) fn({ ...l.job });
   }
 
   /**
@@ -365,6 +479,11 @@ export class Transcriptions {
     const finished = [...this.live.values()].filter((l) => !this.active(l));
     for (const l of finished.slice(0, Math.max(0, finished.length - KEEP_FINISHED))) this.live.delete(l.job.jobId);
   }
+}
+
+/** A job record that has ended for good (a cancel by a lock is pending: it runs again at the unlock, R142). */
+function recordEnded(rec: JobRecord): boolean {
+  return rec.status === "done" || rec.status === "failed" || (rec.status === "cancelled" && rec.error !== "PROJECT_LOCKED");
 }
 
 function event(job: TranscriptionJob, finished: boolean): TranscriptionProgressEvent & Record<string, unknown> {

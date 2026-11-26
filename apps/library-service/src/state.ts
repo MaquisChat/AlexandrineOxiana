@@ -96,6 +96,8 @@ import { ZoteroSyncHolder } from "./routes/zotero-sync.js";
 import { readFindScreen } from "./find-screen.js";
 import { Transcriptions } from "./transcriptions.js";
 import { DownloadRunner, type DownloadSeams } from "./downloads.js";
+import { KeepAwake } from "./keep-awake.js";
+import { SpeedMeter, TranscriptionListRunner } from "./transcription-list.js";
 
 /** A running media worker, shared by every library the service opens. */
 export interface ServiceWorker {
@@ -270,6 +272,10 @@ export interface StateOptions {
   zoteroTickMs?: number;
   /** Test seams (honoured only when NODE_ENV is exactly "test", R47): the download runs' sleep and free-space reading. */
   downloads?: DownloadSeams;
+  /** Test seam (honoured only when NODE_ENV is exactly "test", R47): keeping the Mac awake's platform, spawn and pid. */
+  keepAwake?: ConstructorParameters<typeof KeepAwake>[0];
+  /** Test seam (honoured only when NODE_ENV is exactly "test", R47): the transcription list's retry timer; returns its cancel. */
+  transcriptionListTimer?: (fire: () => void, ms: number) => () => void;
 }
 
 /** An entry's key for the look-ups under way. */
@@ -374,10 +380,43 @@ export class ServiceState {
   private downloadRunner: DownloadRunner | undefined;
   /** The download runs this service holds (whole channels, R668, R669). */
   get downloads(): DownloadRunner {
-    return (this.downloadRunner ??= new DownloadRunner(this));
+    if (!this.downloadRunner) {
+      const runner = new DownloadRunner(this);
+      // A run with transcribe puts each stored video on the transcription list: its loop is started (Task 7).
+      runner.onQueuedForTranscription = (projectId) => {
+        const s = this.session;
+        if (s) this.transcriptionList.kick(s, projectId);
+      };
+      this.downloadRunner = runner;
+    }
+    return this.downloadRunner;
   }
   /** Told after every `background.progress` event (Task 7 keeps the Mac awake from here). */
   readonly onBackground: Array<() => void> = [];
+  private listRunner: TranscriptionListRunner | undefined;
+  /** The projects' transcription lists, one loop per project (whole channels, Task 7). */
+  get transcriptionList(): TranscriptionListRunner {
+    return (this.listRunner ??= new TranscriptionListRunner(this));
+  }
+  /** Transcription speed measured on this Mac, per speech model (memory only). */
+  readonly speedMeter = new SpeedMeter();
+  private awake: KeepAwake | undefined;
+  /** `caffeinate` while downloads or transcriptions run (macOS only). */
+  get keepAwake(): KeepAwake {
+    return (this.awake ??= new KeepAwake({ log: this.opts.log, ...(this.opts.keepAwake ?? {}) }));
+  }
+  /** The researcher's setting "Keep this Mac awake while downloads or transcriptions run" (default on; background.json). */
+  private keepAwakeSetting = true;
+  /** Sets the keep-awake setting (as read or saved) and follows it at once. */
+  setKeepAwakeSetting(on: boolean): void {
+    this.keepAwakeSetting = on;
+    this.updateKeepAwake();
+  }
+  /** Keeps the Mac awake exactly while the setting is on and a list of any project is active. */
+  updateKeepAwake(): void {
+    const wanted = !this.shuttingDown && this.session !== undefined && this.keepAwakeSetting && (this.downloads.active() || this.transcriptionList.active());
+    this.keepAwake.update(wanted);
+  }
 
   /**
    * Publishes a `background.progress` event, only while the project is unlocked: nothing of a locked project's
@@ -790,7 +829,9 @@ export class ServiceState {
     if (this.moving) throw new ApiError(503, "MOVE_IN_PROGRESS", "The library is being moved. Try again when the move has finished.");
   }
 
-  constructor(readonly opts: StateOptions) {}
+  constructor(readonly opts: StateOptions) {
+    this.onBackground.push(() => this.updateKeepAwake());
+  }
 
   get deps(): Deps {
     return this.opts.deps;
@@ -1492,6 +1533,9 @@ export class ServiceState {
     for (const p of s.repo.listProjects()) if (p.encryption.enabled) this.endCaptures(p.id, "close");
     // Every download run ends here and writes nothing more; nothing continues by itself after a quit (R668).
     for (const p of s.repo.listProjects()) this.downloads.stopProject(p.id, "close");
+    // The transcription lists' loops end too; their transcription in hand stays pending and runs again at the next open.
+    this.transcriptionList.stopAll();
+    this.keepAwake.stop();
     // Find and acquire stops for good, awaited (bounded): its own work and the researcher's acts already in their store
     // turn end first, and any act still waiting for its turn is refused by the runner (R245). So none of its writes
     // lands after the lock is released. Then the lookup client sends nothing more (FR-749, R546): see beginClosing.
@@ -1879,6 +1923,8 @@ export class ServiceState {
     if (s.lib.mode !== "read-write" || this.startsHeld) return;
     this.resumeWorkerJobs(s);
     for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) this.resumeProject(s, p.id);
+    // The transcription lists carry on by themselves (whole channels, R668): each unlocked project's loop starts.
+    for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) this.transcriptionList.kick(s, p.id);
   }
 
   /**
@@ -2360,6 +2406,7 @@ export class ServiceState {
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     await this.closeLibrary();
+    this.keepAwake.stop();
     const w = this.worker ?? (await this.workerStarting?.catch(() => undefined));
     this.worker = undefined;
     await w?.stop().catch(() => {});

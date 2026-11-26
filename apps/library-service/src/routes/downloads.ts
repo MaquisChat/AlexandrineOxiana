@@ -77,7 +77,10 @@ export function registerDownloads(app: FastifyInstance, ctx: Ctx): void {
     }
     // Locked while it listed: nothing of the listing (the channel's title) is answered (R30, R50).
     requireUnlocked(s, projectId);
-    return estimate;
+    // The transcription speed this Mac has shown for the estimate's speech model, once measured (Task 7).
+    const { measuredSpeed: _given, ...rest } = estimate;
+    const measuredSpeed = state.speedMeter.speed(estimate.speechModel);
+    return measuredSpeed !== undefined ? { ...rest, measuredSpeed } : rest;
   });
 
   app.get("/projects/:id/downloads", async (req): Promise<DownloadRunListResponse> => {

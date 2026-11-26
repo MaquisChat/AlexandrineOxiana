@@ -157,6 +157,8 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     await limit.guard(id, () => s.repo.unlockProject(id, secret, lockAsks));
     // Work that waited for the key: viewing proxies, OCR and worker jobs of this project (R142), and its daily backup (R99 I7).
     state.resumeProject(s, id, { workerJobs: true });
+    // Its transcription list carries on by itself (whole channels, R669: nothing leaves the Mac); downloads do not.
+    state.transcriptionList.kick(s, id);
     state.resumeFind(s, id); // Find and acquire (Task F5): its queue goes on (the runner waits for the index itself)
     state.startWork("backup", async () => {
       await state.runScheduledBackups(id);
@@ -189,6 +191,9 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
       // more written or published; after the unlock they are shown interrupted, with Resume downloads (R669).
       state.downloads.stopProject(id, "lock");
       state.transcriptions.forgetProject(id); // what it was transcribing too (Task 62 R1-2); its journal keeps the run
+      // Its transcription list's loop ends at once; the transcription in hand runs again at the unlock (R142).
+      state.transcriptionList.stopProject(id);
+      state.updateKeepAwake();
     }
     state.publishState();
     return { unlocked: false };

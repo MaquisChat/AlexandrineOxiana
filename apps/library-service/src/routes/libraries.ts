@@ -448,6 +448,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     } finally {
       state.moving = false;
       state.planningMove = false;
+      state.transcriptionList.afterMove(); // what was kicked during the move starts now (R692 M9)
     }
   };
 
