@@ -3,7 +3,7 @@
  * the media worker's HTTP API that runs `capture.download` with whatever `yt-dlp` / `gallery-dl` is
  * first on PATH (the fake tools in tests/fixtures/fake-tools), mirroring the Python worker's
  * arguments, refusals, output listing (comments split out, partial results) and error mapping (as of
- * worker commit c4b43b8; see "The worker's own rules" below and testing.test.ts), and answers `audio.transcribe` with a canned
+ * worker commit 6814636; see "The worker's own rules" below and testing.test.ts), and answers `audio.transcribe` with a canned
  * transcript (one of two segments flagged).
  */
 import { spawn } from "node:child_process";
@@ -32,8 +32,8 @@ export interface ToolWorker {
   close(): Promise<void>;
 }
 
-// ---- The worker's own rules (services/media-worker/ao_worker/download.py at worker commit c4b43b8,
-// branch wc-2-worker, R674 B): the error patterns in the same order with the same HTTP-answer guard,
+// ---- The worker's own rules (services/media-worker/ao_worker/download.py at worker commit 6814636,
+// the integration branch, R674 B and R678): the error patterns in the same order with the same HTTP-answer guard,
 // the arguments per quality, the ffmpeg refusal, when a failed download is kept as partial, and the
 // platform's reason. Not copied: the worker's redaction of the reason and of the error detail, the
 // progress lines, the JavaScript runtime argument, and its recursive output listing.
@@ -132,12 +132,14 @@ export function gallerydlArgs(url: string, out: string, p: Record<string, unknow
 /** After these a download never counts as partial, whatever was written. */
 const DOWNLOAD_FAILS_ALWAYS = new Set(["NETWORK_LOST", "DISK_FULL", "TOOL_NOT_INSTALLED"]);
 const MEDIA_SUFFIXES = new Set([".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".flv", ".3gp", ".ts", ".mpg", ".mpeg", ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".oga", ".wav", ".flac", ".weba"]);
-/** abc.f137.mp4, abc.f251.webm: one stream, not yet joined. */
-const UNJOINED_RE = /\.f\d+(-\d+)?\.[^.]+$/;
+/** abc.f137.mp4, abc.fhls-720p.mp4: one stream, not yet joined. */
+const UNJOINED_RE = /\.f[^.]+\.[^.]+$/;
 const SKIP_SUFFIXES = [".part", ".ytdl", ".temp", ".tmp"];
 
 function isFinishedMedia(path: string): boolean {
   const name = basename(path);
+  // A join or download still in progress.
+  if (name.includes(".temp.") || name.includes(".part") || name.endsWith(".ytdl")) return false;
   const dot = name.lastIndexOf(".");
   return dot > 0 && MEDIA_SUFFIXES.has(name.slice(dot).toLowerCase()) && !UNJOINED_RE.test(name);
 }
@@ -155,7 +157,7 @@ export function downloadKept(tool: string, p: Record<string, unknown>, code: str
 
 const PLATFORM_REASON_RE = /ERROR: \[[^\]]+\] [^:]+: (.+)/;
 const REASON_CUTS = ["; please report", " (caused by", " See "];
-const OPTION_CUT_RE = / (?:[A-Za-z]+ )?--[A-Za-z]/;
+const OPTION_CUT_RE = /\s+(?:use\s+)?--[A-Za-z]/i;
 const URL_RE = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s'"<>]+/g;
 const REASON_REFUSED = ["Errno", "urlopen", "ConnectionPool", "HTTP Error", "Traceback", "/Users/", "/home/", "/var/", "/tmp/", "~/"];
 /** Only for these failures is the platform's sentence about the video. */

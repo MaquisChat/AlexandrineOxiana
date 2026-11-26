@@ -1219,6 +1219,28 @@ describe("run hooks (whole channels, Task 3)", { timeout: 120_000 }, () => {
     ]);
   });
 
+  it("a Resume whose listing did not come back whole tells nothing of the ids past the cut (R678)", async () => {
+    const prof = synthetic();
+    await setProfile({ ...prof, cutAfter: 7 });
+    process.env.FAKE_TOOL_MODE = "enumbroken";
+    const p = await project();
+    const before = prof.items[2]!.id;
+    const past = prof.items[9]!.id;
+    const asked: string[] = [];
+    const told: Array<[string, string, string | undefined]> = [];
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, onlyIds: [before, past] }, undefined, {
+      hooks: {
+        beforeItem: async (e) => (asked.push(e.id), "go"),
+        afterItem: async (e, out) => void told.push([e.id, out.status, out.errorCode]),
+      },
+    });
+    expect(asked).toEqual([before]);
+    expect(told).toEqual([[before, "created", undefined]]);
+    expect(r).toMatchObject({ status: "completed", created: 1, failed: 0, listComplete: false });
+    expect(r.items).toHaveLength(1);
+    // guard: with a whole listing, an id that is really gone is still told failed (the R674 A test above)
+  });
+
   it("a Resume after a failed journal write tells the stored post again, as a duplicate (R674 A)", async () => {
     const prof = synthetic();
     const p = await project();

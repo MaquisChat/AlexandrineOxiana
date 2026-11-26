@@ -94,6 +94,13 @@ describe("the stand-in worker mirrors the real one (R674 B)", () => {
     expect(downloadKept("yt-dlp", {}, "RATE_LIMITED", media, [])).toBe(true);
     expect(downloadKept("yt-dlp", {}, "RATE_LIMITED", unjoined, [])).toBe(false);
     expect(downloadKept("yt-dlp", {}, "EXTRACTOR_ERROR", ["/o/a.webp", "/o/a.en.vtt"], [])).toBe(false);
+    // the worker's test_a_failed_join_leaves_no_finished_recording and _is_finished_media cases
+    for (const leftover of ["abc.temp.mp4", "abc.fhls-720p.mp4", "abc.f251-drc.webm", "abc.mp4.part", "abc.mp4.ytdl"]) {
+      expect([leftover, downloadKept("yt-dlp", {}, "EXTRACTOR_ERROR", ["/o/abc123.info.json", "/o/abc123.webp", `/o/${leftover}`], [])]).toEqual([leftover, false]);
+    }
+    expect(downloadKept("yt-dlp", {}, "RATE_LIMITED", ["/o/abc123.info.json", "/o/abc.mp4"], [])).toBe(true);
+    expect(downloadKept("yt-dlp", {}, "RATE_LIMITED", ["/o/my-video.mp4"], [])).toBe(true);
+    expect(downloadKept("yt-dlp", {}, "RATE_LIMITED", ["/o/abc.m4a"], [])).toBe(true);
     // an enumeration keeps what it listed; gallery-dl keeps any file
     expect(downloadKept("yt-dlp", { flatList: true }, "RATE_LIMITED", [], ["/o/p.info.json"])).toBe(true);
     expect(downloadKept("gallery-dl", {}, "NETWORK_LOST", ["/o/1.jpg"], [])).toBe(true);
@@ -108,6 +115,12 @@ describe("the stand-in worker mirrors the real one (R674 B)", () => {
       "Sign in to confirm you're not a bot.",
     );
     expect(platformReason("ERROR: [youtube] abc: Private video; please report this issue on https://x", "PRIVATE")).toBe("Private video");
+    // the worker's sign-in cases: "use" in either case goes with the advice; a bare option is cut too
+    const signIn = "ERROR: [youtube] abc: Sign in to confirm you’re not a bot. %s --cookies-from-browser or --cookies";
+    expect(platformReason(signIn.replace("%s", "Use"), "LOGIN_REQUIRED")).toBe("Sign in to confirm you’re not a bot.");
+    expect(platformReason(signIn.replace("%s", "use"), "LOGIN_REQUIRED")).toBe("Sign in to confirm you’re not a bot.");
+    expect(platformReason("ERROR: [youtube] abc: This video is private --ask the owner", "PRIVATE")).toBe("This video is private");
+    expect(platformReason("ERROR: [youtube] abc: Removed. Please see --help", "NOT_FOUND_OR_REMOVED")).toBe("Removed. Please see");
     expect(platformReason("ERROR: [youtube] abc: The uploader has not made this video available (caused by X)", "GEO_BLOCKED")).toBe("The uploader has not made this video available");
     // the last such line counts
     expect(platformReason("ERROR: [youtube] abc: first\nERROR: [youtube] abc: second", "NOT_FOUND_OR_REMOVED")).toBe("second");

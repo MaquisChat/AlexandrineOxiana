@@ -706,8 +706,15 @@ export function createProfileCapture(core: CaptureCore) {
       cancelled: isCancelled,
       ...(signal ? { signal } : {}),
     };
+    // Whether this listing can be trusted to show what is gone (also used for removed detection below).
+    const wholeListings = new Set(results.map((r) => r.listing.listing).filter((l) => !incompleteListings.has(l)));
+    const checked = Object.entries(knownBefore).filter(([, k]) => wholeListings.has(k.listing)).map(([id]) => id);
+    const overlap = checked.filter((id) => listedIds.has(id)).length;
+    // Sanity guard: a list that shares less than half of the known posts is more likely the wrong
+    // list (or a login wall) than half the profile deleted.
+    const plausible = checked.length === 0 || overlap * 2 >= checked.length;
     let fresh = entries.filter((e) => !isKnown(e.id));
-    /** `onlyIds` the listing no longer has: each is told as failed (removed), after the listed ones (R674 A). */
+    /** `onlyIds` a whole listing no longer has: each is told as failed (removed), after the listed ones (R674 A, R678). */
     let unlisted: ListedEntry[] = [];
     if (opts.onlyIds) {
       // Only these, in the order given, among everything the listing has: not cut by the run's dates
@@ -718,7 +725,11 @@ export function createProfileCapture(core: CaptureCore) {
       const pool = new Map(listed.map((e) => [e.id, e] as const));
       const ids = [...new Set(opts.onlyIds)];
       fresh = ids.flatMap((id) => (pool.has(id) ? [pool.get(id)!] : []));
-      unlisted = ids.filter((id) => !listedIds.has(id)).map((id) => ({ id, url: postUrl(platform, id, handle) ?? "", raw: {}, listing: fallbackListing }));
+      // Only a whole and plausible listing proves an id gone (R678): the same test as the whole list
+      // below, without the run's dates and maximum, which no longer cut a Resume's listing (R677).
+      // Otherwise an id not listed is told nothing: it stays to do, and the next Resume takes it.
+      const provesGone = incompleteListings.size === 0 && plausible && !(listed.length === 0 && checked.length > 0);
+      if (provesGone) unlisted = ids.filter((id) => !listedIds.has(id)).map((id) => ({ id, url: postUrl(platform, id, handle) ?? "", raw: {}, listing: fallbackListing }));
     }
     const freshIds = new Set(fresh.map((e) => e.id));
     check();
@@ -806,12 +817,6 @@ export function createProfileCapture(core: CaptureCore) {
     }
 
     // 5–6. Known posts: edits, reappearance; removed detection only for whole lists.
-    const wholeListings = new Set(results.map((r) => r.listing.listing).filter((l) => !incompleteListings.has(l)));
-    const checked = Object.entries(knownBefore).filter(([, k]) => wholeListings.has(k.listing)).map(([id]) => id);
-    const overlap = checked.filter((id) => listedIds.has(id)).length;
-    // Sanity guard: a list that shares less than half of the known posts is more likely the wrong
-    // list (or a login wall) than half the profile deleted.
-    const plausible = checked.length === 0 || overlap * 2 >= checked.length;
     /** The whole profile was listed; the check for missing posts runs only when the run also completes. */
     const wholeList = !filtered && incompleteListings.size === 0 && plausible && !(entries.length === 0 && checked.length > 0);
     if (!stopped && (await core.stillAllowed(projectId, platform))) {
