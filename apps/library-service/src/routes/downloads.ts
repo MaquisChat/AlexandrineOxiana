@@ -15,7 +15,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import { MAX_ADDRESS_LENGTH, classifyUrl } from "@ao/core";
-import { WorkerJobError, checkCaptureAllowed } from "@ao/library";
+import { WorkerJobError, WorkerToolError, checkCaptureAllowed } from "@ao/library";
 import {
   estimateRateLimitedText,
   type CaptureEstimate,
@@ -26,7 +26,7 @@ import {
   type DownloadRunResponse,
   type ProfileCaptureRequestOptions,
 } from "@ao/shared";
-import { ApiError, badRequest } from "../errors.js";
+import { ApiError, TOOL_NOT_INSTALLED_TEXT, badRequest } from "../errors.js";
 import type { Session } from "../state.js";
 import { profileRunOptions, requireAcknowledged, requireUnlocked } from "./capture.js";
 import { bodyAs, optObj, paramsOf, projectParam, str, type BodyOf, type Ctx } from "./util.js";
@@ -60,14 +60,24 @@ export function registerDownloads(app: FastifyInstance, ctx: Ctx): void {
     // The project's rules first: a refusal is 403 with their reason (audited), and nothing is listed.
     await checkCaptureAllowed(s.repo, projectId, [url]);
     requireAcknowledged(s, projectId, opts);
+    let estimate: CaptureEstimate;
     try {
-      return await state.downloads.estimate(s, projectId, url, opts);
+      estimate = await state.downloads.estimate(s, projectId, url, opts);
     } catch (err) {
-      // The listing's own refusal by the rules is 403 and a missing tool 409 TOOL_NOT_INSTALLED with its id
-      // (errors.ts); a slowed-down listing is said in plain words, naming the platform.
+      // Locked during the listing: 423, whatever the listing met.
+      requireUnlocked(s, projectId);
+      // The listing's own refusal by the rules is 403 and a missing tool it names 409 TOOL_NOT_INSTALLED with its
+      // id (errors.ts); a slowed-down listing is said in plain words, naming the platform; a missing tool it does
+      // not name is said in general words; any other failure in the capture's own plain sentence for it (R687 C).
+      if (err instanceof WorkerToolError) throw err;
       if (err instanceof WorkerJobError && err.code === "RATE_LIMITED") throw new ApiError(429, "RATE_LIMITED", estimateRateLimitedText(c.platform), "RATE_LIMITED");
+      if (err instanceof WorkerJobError && err.code === "TOOL_NOT_INSTALLED") throw new ApiError(409, "TOOL_NOT_INSTALLED", TOOL_NOT_INSTALLED_TEXT);
+      if (err instanceof WorkerJobError && !err.code.startsWith("TOOL_")) throw new ApiError(502, "INTERNAL", err.message, err.code);
       throw err;
     }
+    // Locked while it listed: nothing of the listing (the channel's title) is answered (R30, R50).
+    requireUnlocked(s, projectId);
+    return estimate;
   });
 
   app.get("/projects/:id/downloads", async (req): Promise<DownloadRunListResponse> => {

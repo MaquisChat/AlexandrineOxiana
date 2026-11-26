@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { Writable } from "node:stream";
 import type { AuditEvent } from "@ao/core";
-import { InvalidInputError, WorkerClient, deviceDeps, plainReason, type Deps, type DownloadRuns, type WorkerToolsClient } from "@ao/library";
+import { InvalidInputError, WorkerClient, WorkerJobError, deviceDeps, plainReason, type Deps, type DownloadRuns, type WorkerToolsClient } from "@ao/library";
 import {
   RUN_ALREADY_RUNNING,
   RUN_ALREADY_RUNNING_TEXT,
@@ -25,6 +25,7 @@ import {
 } from "@ao/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FAKE_TOOLS_DIR, startToolWorker, type SubmittedJob, type ToolWorker } from "../../../packages/library/src/capture/testing.js";
+import { TOOL_NOT_INSTALLED_TEXT } from "./errors.js";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -297,6 +298,73 @@ describe("the estimate", () => {
   });
 });
 
+describe("the estimate says what happened (R687 C)", () => {
+  it("a lock during the estimate's listing is 423 and no title is answered", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project({ encrypted: true });
+    // The listing has come back (the channel's title is known); the lock falls before the answer.
+    let reach!: () => void;
+    const listed = new Promise<void>((r) => (reach = r));
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    releases.push(open);
+    vi.spyOn(svc.state.downloads, "videoToolsInstalled").mockImplementation(async () => {
+      reach();
+      await gate;
+      return null;
+    });
+    const estimating = call({ method: "POST", url: `/projects/${pid}/capture-estimate`, body: { url: A } });
+    await listed;
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    open();
+    const r = await estimating;
+    expect(r.status).toBe(423);
+    expect(r.json.error.code).toBe("PROJECT_LOCKED");
+    expect(r.body).not.toMatch(/Fake Dancer|fake\.dancer/);
+  });
+
+  it("a listing that fails for another reason answers the capture's own plain sentence", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project();
+    for (const [mode, code] of [
+      ["login", "LOGIN_REQUIRED"],
+      ["notfound", "NOT_FOUND_OR_REMOVED"],
+    ] as const) {
+      process.env.FAKE_TOOL_MODE = mode;
+      const r = await call({ method: "POST", url: `/projects/${pid}/capture-estimate`, body: { url: A } });
+      expect(r.status, r.body).toBe(502);
+      expect(r.json.error).toEqual({ code: "INTERNAL", message: plainReason(code), reason: code });
+    }
+  });
+
+  it("a missing tool is 409 TOOL_NOT_INSTALLED: with its id when the listing names it, in general words when it does not", async () => {
+    await tw.close();
+    tw = await startToolWorker({ beforeCapture, missing: ["video-downloader"] });
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const named = await call({ method: "POST", url: `/projects/${pid}/capture-estimate`, body: { url: A } });
+    expect(named.status).toBe(409);
+    expect(named.json.error).toEqual({ code: "TOOL_NOT_INSTALLED", message: TOOL_NOT_INSTALLED_TEXT, reason: "video-downloader" });
+    vi.spyOn(svc.state.downloads, "estimate").mockRejectedValue(new WorkerJobError("TOOL_NOT_INSTALLED", plainReason("TOOL_NOT_INSTALLED")));
+    const general = await call({ method: "POST", url: `/projects/${pid}/capture-estimate`, body: { url: A } });
+    expect(general.status).toBe(409);
+    expect(general.json.error).toEqual({ code: "TOOL_NOT_INSTALLED", message: TOOL_NOT_INSTALLED_TEXT });
+  });
+
+  it("an estimate with an unknown quality is 400 in plain words, and nothing is listed", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const r = await call({ method: "POST", url: `/projects/${pid}/capture-estimate`, body: { url: A, options: { quality: "4k" } } });
+    expect(r.status).toBe(400);
+    expect(r.json.error.message).toBe('"4k" is not a quality.');
+    expect(tw.submitted).toHaveLength(0);
+  });
+});
+
 describe("a run started from capture-profile", () => {
   it("capture-profile starts a journaled run; background.progress and capture.progress events follow it to the end", async () => {
     await start();
@@ -477,6 +545,36 @@ describe("a run started from capture-profile", () => {
     expect(ready.status, ready.body).toBe(200);
     await svc.state.idle();
     expect(await runOf(pid, ready.json.queueId)).toMatchObject({ quality: "ready", state: "finished" });
+  });
+});
+
+describe("capture-profile says what happened (R687 C)", () => {
+  it("a run started without a quality on a computer without Video tools downloads: no quality is passed on", async () => {
+    await tw.close();
+    tw = await startToolWorker({ beforeCapture, ffmpeg: false });
+    await start({}, { ffmpeg: false });
+    await openLibrary();
+    const pid = await project();
+    const r = await captureProfile(pid, A);
+    expect(r.status, r.body).toBe(200);
+    await svc.state.idle();
+    expect(await runOf(pid, r.json.queueId)).toMatchObject({ state: "finished", done: 3 });
+    expect(itemDownloads()).toEqual([idA(3), idA(2), idA(1)]);
+    expect(tw.submitted.filter((j) => j.type === "capture.download").every((j) => j.params.quality === undefined)).toBe(true);
+  });
+
+  it("a link the runs refuse (a single post, another site) is 400 in plain words before any capture or run exists", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project();
+    for (const url of [`https://www.tiktok.com/@fake.dancer/video/${idA(1)}`, "https://example.com/somebody"]) {
+      const r = await captureProfile(pid, url);
+      expect(r.status, url).toBe(400);
+      expect(r.json.error).toEqual({ code: "VALIDATION", message: plainReason("UNSUPPORTED_URL") });
+    }
+    expect((await call({ url: `/projects/${pid}/captures` })).json.queues).toEqual([]);
+    expect(await runs(pid)).toEqual([]);
+    expect(tw.submitted).toHaveLength(0);
   });
 });
 

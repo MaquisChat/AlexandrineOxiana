@@ -105,6 +105,9 @@ export const SETTINGS_FILES: Record<string, { reason?: ResettableSetting; what: 
   "notices.json": { what: "The app's list of notices on this computer", it: "it was" },
 };
 
+/** A missing optional tool, in general words (409 TOOL_NOT_INSTALLED; its id, when known, is the reason). */
+export const TOOL_NOT_INSTALLED_TEXT = "A tool this needs is not installed on this computer. The Optional tools screen shows how to get it.";
+
 /** Library error → status, code, plain message. Unknown errors are INTERNAL with a generic message. */
 export function toApiError(err: unknown): ApiError {
   if (err instanceof ApiError) return err;
@@ -206,7 +209,7 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof WorkerUnavailableError) return new ApiError(503, "WORKER_UNAVAILABLE", "The media helper is not running.", err.message);
   // An optional tool (Task 48a, R126): a missing one is named (reason = its tool id) so the interface
   // can offer the Optional tools screen; a failed install or update keeps the worker's code (reason).
-  if (err instanceof WorkerToolError && err.code === "TOOL_NOT_INSTALLED") return new ApiError(409, "TOOL_NOT_INSTALLED", "A tool this needs is not installed on this computer. The Optional tools screen shows how to get it.", err.tool);
+  if (err instanceof WorkerToolError && err.code === "TOOL_NOT_INSTALLED") return new ApiError(409, "TOOL_NOT_INSTALLED", TOOL_NOT_INSTALLED_TEXT, err.tool);
   if (err instanceof WorkerJobError && err.code.startsWith("TOOL_")) return new ApiError(502, "TOOL_FAILED", "The tool could not be installed or updated. Nothing was left half-installed; try again later.", err.code);
   if (err instanceof WorkerJobError) return new ApiError(502, "INTERNAL", "The media helper could not finish the job.", err.code);
   // R439 (1): a full disk (or a quota), by its code or one it wraps, in plain words on every route: a condition the

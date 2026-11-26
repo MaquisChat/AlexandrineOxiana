@@ -25,6 +25,7 @@ import { COOKIES_ACKNOWLEDGEMENT, MAX_ADDRESS_LENGTH, classifyUrl, isCollectionL
 import {
   captureBrowserPage,
   checkCaptureAllowed,
+  plainReason,
   createLinkCapture,
   type BrowserName,
   type CaptureOutcome,
@@ -260,6 +261,9 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const url = urlList({ u: [str(b, "url", MAX_ADDRESS_LENGTH)] }, "u", 1)[0]!;
     const opts = profileRunOptions(s, projectId, (optObj(b, "options") ?? {}) as BodyOf<ProfileCaptureRequestOptions>);
     requireUnlocked(s, projectId); // nothing about its captures before the lock and the rules (I1)
+    // A link the runs refuse (a single post, another site) is refused here, before any capture queue or run exists (R687 C).
+    const c = classifyUrl(url);
+    if (c.platform === "other" || (c.kind !== "profile" && c.kind !== "playlist")) throw badRequest(plainReason("UNSUPPORTED_URL"));
     await checkCaptureAllowed(s.repo, projectId, [url]);
     requireAcknowledged(s, projectId, opts);
     await state.workerClient();
