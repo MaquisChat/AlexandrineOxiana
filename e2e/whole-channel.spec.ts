@@ -206,6 +206,8 @@ const sourcesTable = (page: Page) => page.getByRole("table", { name: "Sources" }
 // The fixed sentences of these scenarios (packages/shared/src/api/background.ts).
 const FINISHED_ONE_FAILED = '"Fake Channel": 3 of 4 downloaded. 1 could not be downloaded.';
 const DONE_WAIT = 180_000;
+/** The run of "Fake Channel" started again after the Stop: only the two missing videos, of which the private one fails again. */
+const LATER_RUN = '"Fake Channel": 1 of 2 downloaded. 1 could not be downloaded.';
 
 test.describe("whole channels, downloaded and transcribed in the background (whole-channel Task 10)", () => {
   test.use({ fakeControl: true });
@@ -213,6 +215,8 @@ test.describe("whole channels, downloaded and transcribed in the background (who
   test("a channel pasted, estimated, downloaded past a private video, and every video transcribed", async ({ page, app }) => {
     test.setTimeout(480_000);
     const { projectId } = await setUp(page, app, FAKE_CHANNEL);
+    /** The quality the estimate chose, by what the catalogue reports of Video tools. */
+    let quality: "720p" | "ready" = "ready";
 
     await test.step("Capture profile shows the estimate: the channel's name, its count and length, and the quality that Video tools allow", async () => {
       await estimate(page, CHANNEL, 'Capture channel: "Fake Channel"');
@@ -220,7 +224,9 @@ test.describe("whole channels, downloaded and transcribed in the background (who
       const tools = await app.api<{ tools: Array<{ id: string; installed?: boolean }> }>("GET", "/tools");
       expect(tools.status).toBe(200);
       const ffmpeg = tools.body.tools.find((t) => t.id === "ffmpeg");
-      if (ffmpeg?.installed === true) {
+      quality = ffmpeg?.installed === true ? "720p" : "ready";
+      test.info().annotations.push({ type: "quality", description: `Video tools installed: ${String(ffmpeg?.installed === true)}; the branch asserted: ${quality}` });
+      if (quality === "720p") {
         await expect(page.getByRole("radio", { name: "Up to 720p" })).toBeChecked();
         await expect(page.getByText("These need Video tools.")).toHaveCount(0);
       } else {
@@ -235,7 +241,22 @@ test.describe("whole channels, downloaded and transcribed in the background (who
       await page.getByRole("checkbox", { name: TRANSCRIBE }).check();
       const options = await start(page, projectId);
       expect(options.transcribe).toBe(true);
+      expect(options.quality, "the quality sent is the one the estimate chose").toBe(quality);
       await expect(runTitle(page, "Fake Channel")).toHaveText(FINISHED_ONE_FAILED, { timeout: DONE_WAIT });
+      // What the fake yt-dlp was asked for, for video 1: the format of the quality chosen, written out per branch.
+      const runOf1 = fakesOf(app).runs("yt-dlp").filter((a) => (a.at(-1) ?? "").includes(chId(1)));
+      expect(runOf1, "video 1 was downloaded by one run").toHaveLength(1);
+      const argAfter = (flag: string) => {
+        const i = runOf1[0]!.indexOf(flag);
+        return i < 0 ? undefined : runOf1[0]![i + 1];
+      };
+      if (quality === "720p") {
+        expect(argAfter("-f"), "Up to 720p: best picture and sound, else the best single file").toBe("bv*+ba/b");
+        expect(argAfter("-S"), "Up to 720p: sorted by a size of at most 720, then H.264 and AAC").toBe("res:720,fps,vcodec:h264,acodec:m4a");
+      } else {
+        expect(argAfter("-f"), "Ready-made file: the best single file").toBe("b");
+        expect(argAfter("-S"), "Ready-made file: no sorting").toBeUndefined();
+      }
       const line = runLine(page, "Fake Channel");
       await expect(line.getByRole("button", { name: "Resume downloads (1 did not complete)" })).toBeVisible();
       await line.getByRole("button", { name: "Show them" }).click();
@@ -247,8 +268,18 @@ test.describe("whole channels, downloaded and transcribed in the background (who
       for (const n of [1, 2, 3, 4]) expect(downloadsOf(app, chId(n)), `video ${n} was asked for once`).toHaveLength(1);
     });
 
-    await test.step("the transcription line reaches every downloaded video", async () => {
+    await test.step("the transcription line reaches every downloaded video, and each has a stored machine transcript", async () => {
       await expect(listTitle(page)).toHaveText("Transcriptions finished: all 3 done.", { timeout: DONE_WAIT });
+      const videos = (await storedSources(app, projectId)).filter((s) => s.source.identifiers.platformPostId !== undefined);
+      expect(videos.map((s) => s.source.identifiers.platformPostId).sort(), "the private video has no source").toEqual([chId(1), chId(2), chId(4)]);
+      for (const v of videos) {
+        const r = await app.api<{ versions: Array<{ origin: string; format: string }> }>("GET", `/projects/${projectId}/sources/${v.source.id}/transcripts`);
+        expect(r.status).toBe(200);
+        expect(
+          r.body.versions.filter((x) => x.origin === "machine").map((x) => x.format).sort(),
+          `${String(v.source.identifiers.platformPostId)} has one machine transcript (its WebVTT and its segments)`,
+        ).toEqual(["json", "vtt"]);
+      }
     });
 
     await test.step("the Library screen shows both lines for the project", async () => {
@@ -369,6 +400,19 @@ test.describe("whole channels, downloaded and transcribed in the background (who
       const removing = /delete|destroy|remove|trash/i;
       expect((await auditLog(app, projectId)).filter((e) => removing.test(e.action ?? "") || removing.test(String(e.details?.op ?? ""))), "nothing deleted").toEqual([]);
     });
+
+    await test.step("the same channel captured again later: the estimate counts only the videos that are missing, and the videos already downloaded are not asked for again", async () => {
+      await estimate(page, CHANNEL, 'Capture channel: "Fake Channel"');
+      await expect(page.getByText("2 videos, about 6 minutes.", { exact: true })).toBeVisible();
+      await expect(page.getByText("2 more are already in this project and are not downloaded again.", { exact: true })).toBeVisible();
+      await start(page, projectId);
+      await expect(runTitle(page, LATER_RUN)).toHaveText(LATER_RUN, { timeout: DONE_WAIT });
+      for (const n of [1, 2]) expect(downloadsOf(app, chId(n)), `video ${n} is not asked for again`).toHaveLength(1);
+      expect(downloadsOf(app, chId(3)), "the video that could not be downloaded is tried again").toHaveLength(2);
+      expect(downloadsOf(app, chId(4)), "the missing video is downloaded").toHaveLength(1);
+      const videos = (await storedSources(app, projectId)).filter((s) => s.source.identifiers.platformPostId !== undefined);
+      expect(videos.map((s) => s.source.identifiers.platformPostId).sort()).toEqual([chId(1), chId(2), chId(4)]);
+    });
   });
 
   test("a second channel started while one downloads waits its turn and begins by itself when the first has finished", async ({ page, app }) => {
@@ -411,7 +455,7 @@ test.describe("whole channels, downloaded and transcribed in the background (who
 
   test("a finished line is taken off the screen with “Remove from this list”, and everything downloaded stays in the library", async ({ page, app }) => {
     test.setTimeout(300_000);
-    const { projectId } = await setUp(page, app, SHORT_CHANNEL);
+    const { projectId, libraryPath } = await setUp(page, app, SHORT_CHANNEL);
 
     await test.step("a channel downloaded whole: its line has one button, Remove from this list", async () => {
       await estimate(page, SHORT, 'Capture channel: "Short Fake Channel"');
@@ -432,6 +476,15 @@ test.describe("whole channels, downloaded and transcribed in the background (who
       expect((await app.api<{ runs: unknown[] }>("GET", `/projects/${projectId}/downloads`)).body.runs).toEqual([]);
       const videos = (await storedSources(app, projectId)).filter((s) => s.source.identifiers.platformPostId !== undefined);
       expect(videos.map((s) => s.source.identifiers.platformPostId).sort()).toEqual([shortId(1), shortId(2)]);
+      for (const s of videos) {
+        expect(s.assets.length, `${String(s.source.identifiers.platformPostId)} has its files`).toBeGreaterThan(0);
+        for (const a of s.assets) expect(existsSync(join(libraryPath, ...a.path.split("/"))), `${a.path} is on disk`).toBe(true);
+      }
+      const removing = /delete|destroy|remove|trash/i;
+      expect((await auditLog(app, projectId)).filter((e) => removing.test(e.action ?? "") || removing.test(String(e.details?.op ?? ""))), "nothing deleted").toEqual([]);
+      await reopen(page, projectId);
+      for (const n of [1, 2]) await expect(sourcesTable(page).getByRole("button", { name: shortTitle(n), exact: true })).toBeVisible();
+      await expect(runLine(page, "Short Fake Channel"), "the line does not come back after a second reload").toHaveCount(0);
     });
   });
 });
