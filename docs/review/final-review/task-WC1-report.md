@@ -70,3 +70,39 @@ None blocking. Decisions Tasks 4, 5 and 7 should know about:
 - `@ao/library` vitest `src/job-journal-paths.test.ts`: Tests 25 passed (25)
 - `@ao/library` vitest `src/worker-client.test.ts`: Tests 31 passed (31)
 - typecheck `@ao/library`, `@ao/library-service`, `@ao/ui`: clean
+
+## Fix round (R672)
+
+Branch `wc-1-contract`, three commits on 0b7e336: `774ceda` (A), `fac1d1e` (B), `e1f8ce9` (C). D needed no code change, so it has no commit. `git status --short` is empty. Every new or changed test below was run before its fix and FAILED for the right reason; the result is given per point.
+
+### A. Sentences (`packages/shared/src/api/background.ts`); tests in `background.test.ts:331` `describe("fix round (R672)")`, 8 tests, all 8 failed first
+- A1 (I2): `runLines` :326–369. With total 0: stopped gives `"T" was stopped before it began.`, paused gives `"T" is paused. The list of videos has not been read yet.`, and paused-disk, paused-rate-limited, paused-tool and failed give `"T": the list of videos has not been read yet.` (the `notRead` title, :328), each with its `why` unchanged. Instagram uses "posts". Failed first: "…was stopped: 0 of 0 downloaded."
+- A2: `LIST_STOPPED_TEXT` :486, exactly as pinned. Failed first: not exported.
+- A3: `transcribeAllText.confirm` :490–500. For 1 source the ending is `It is transcribed on this Mac, after anything already on the list.`, including the unknown-length case. Failed first: "They are transcribed one at a time…".
+- A4: `estimateText.disk` :208 gives `Nothing new will be downloaded, so no disk space is needed.` when count is 0. `tooBig` is undefined when count is 0. Both checks come first, before `metadataOnly`; the brief's rule has no exception for metadata-only. Failed first: "Roughly less than 1 MB…".
+- A5: `formatSizeRange` :103–111 gives `up to 1.2 MB` and `less than 1 MB`, so `disk` reads "Roughly up to 1.2 MB at this quality." Failed first: "less than 1 MB–1.2 MB".
+- A6: `transcribeTime` :229–236 gives the unknown-lengths sentence, or the measured sentence followed by ` The N videos/posts of unknown length are not counted.` (singular "is"). Failed first.
+- A7: `formatSoundLength` :114–117 (60 rounded minutes become "about 1 hour"). `formatTimeLeft` :132–139 (120 minutes become "about 2 hours", 48 hours become "about 2 days"). The boundaries are tested on both sides. Failed first: "about 60 minutes".
+- A8: `problemLine` :434 uses `||`. Failed first.
+
+### B. Transcription list
+- B1 (I1): `markTranscriptionEntry` (`transcription-list.ts:194–227`) returns `Promise<boolean>`. It refuses ended → running or queued, writes nothing and returns false. Test: `transcription-list.test.ts:160` (the reviewer's probe, plus true for every other move). Failed first: the call returned undefined.
+- B2 (I3): `stopTranscriptionList` :245–260 sets total, done and failed to 0, and the state to running. Test :180 ("stop after 3 of 10 done"). Failed first: total 3. **Existing test changed:** "stopTranscriptionList cancels every pending entry…" (:155) asserted `done 1, total 1` after Stop. It now asserts `{state:"running",total:0,done:0,failed:0,pending:[]}`, as B2 requires.
+- B3 (Minor 9): `prunable` in `job-journal.ts` (:477, :494–497) always drops a cancelled `transcription.entry` and leaves it out of the MAX_FAILED_KEPT list. Test: `job-journal.test.ts:766`, with 120 failed worker jobs and 400 cancelled entries. Failed first: 100 of 120 were kept.
+- B4 (Minor 10): seam is `vi.mock("../repo/repo.js")`, which wraps the real `authorizeProcessing` in `vi.fn` (`transcription-list.test.ts:17–23`); product code unchanged. The test asserts 1 call for the deny case and 1 for the four items. Mutation check: an extra call per item made it FAIL ("expected 4 to be 1"). It passed before the fix because the product code was already right.
+
+### C. Run journal and journal file
+- C1 (Minor 6): `run-journal.ts:181` now throws `NotFoundError("Item of download run", runId)`. **Not as written:** an item that is not found has no index (it is looked up by post id), so the message names the run only. Test `run-journal.test.ts:205`. Failed first.
+- C2 (Minor 8): `setRunState` (:244) recounts through `recount`. Test :215, which writes item records directly. Failed first: the counters were stale.
+- C3 (Minor 7): `updateJobRecords` (:436–457) compacts in its own turn when the file has more than `UPDATE_COMPACT_LINES` (2 000, :460) lines and more than half of them are superseded. The compaction body is factored out as `compactNow` (:535), and `compactJobJournal` calls it. Records that are dropped leave the returned map. Test `job-journal.test.ts:788`: 3 000 writes to 500 items. The file never goes over 2 000 lines and ends under 2 000, and every record reads back equal. Limit 120 s; it takes about 16 s. Failed first: 6000 lines.
+- C4 (I4): `OLDER_BUILD_CLAIM_CODE` and `claimedByOlderBuild` are in `job-journal.ts:169–179`. `repaired()` in `run-journal.ts:64` handles runs (status from `run.state`) and items (queued unless `item.errorCode`). `repaired()` in `transcription-list.ts:89` reads entries and the list record as queued. Both apply to every read and every write callback. `prunable` never drops a run that is neither finished nor discarded (:478). **Beyond the brief:** it also never drops an entry an older build claimed, because the cap would otherwise lose a pending entry. Tests: `run-journal.test.ts:236` and `transcription-list.test.ts:193`. Each simulates the older build exactly (`next()` plus `attempt`) and adds 600 newer failed worker jobs before compaction. Both failed first: the run and the entries were dropped or read as not pending.
+
+### D.
+Nothing else needed mending. Stale cached rows that an older build leaves for list records are already deleted by `syncJobRows`.
+
+### NEEDS A RULING
+1. C4 ambiguity: an entry that this build marks failed with error `UNRECOVERABLE` would be read as pending. This happens if Task 7 copies a worker job's `UNRECOVERABLE` (`worker-client.ts:475`) into the entry. Recommendation: Task 7 marks such an entry with its own code, for example `TRANSCRIPTION_FAILED`.
+2. The transcription list's counters are still kept as deltas (Minor 8, first half). They cannot be recounted, because nothing records where the current list began. One option is to store a `since` time on the list record. My recommendation is to leave them as they are.
+
+### Runs
+@ao/shared `background.test.ts`, `boundary.test.ts` and `shared.test.ts`: 60 passed. @ao/library: `job-journal.test.ts` 28, `lists/run-journal.test.ts` 12, `lists/transcription-list.test.ts` 9, `job-journal-paths.test.ts` 25, `worker-client.test.ts` 31, all passed. Typecheck: @ao/shared, @ao/library, @ao/library-service and @ao/ui are clean.

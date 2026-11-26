@@ -803,6 +803,7 @@ whenEnded(s: Session, projectId: string, jobId: string): Promise<TranscriptionJo
   - while the list is running and has pending entries, take the head entry;
   - if it has no `jobId`: `transcriptionJob` through `state.transcriptions.start` with a fresh id, then `markTranscriptionEntry(running, jobId)`. **(coordinator, R672)** When that mark answers `false` (a Stop fell between the two), the loop cancels the job it has just started (`state.transcriptions.cancel`) and goes on. A `NoMediaError` or `NotFoundError` → `cancelled` (Review Focus 5). A `PolicyDeniedError` → `failed POLICY_DENIED` and the list pauses;
   - await `whenEnded`: done → `done`; failed → `failed` with the code; cancelled by a lock → the loop ends and the entry stays running;
+  - **(coordinator, R672)** an entry is never marked failed with the bare code `UNRECOVERABLE` (Task 1 reads `failed` + `UNRECOVERABLE` on a list record as an older build's damage and repairs it to "still to do"): when the job itself ended `UNRECOVERABLE`, the entry's error is `TRANSCRIPTION_UNRECOVERABLE`;
   - record the wall time and `soundSec` in the meter (done entries with a known length);
   - publish `background.progress { transcriptions }` after every change.
 
