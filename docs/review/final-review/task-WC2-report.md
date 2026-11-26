@@ -28,3 +28,15 @@ Commits: A efdbed7, B 0f0d1a4, C 20d4568, D (head, see git log). All in services
 - D: test_ffmpeg_catalogue_sentences_are_exactly_the_plans in test_tools.py (guard; passed at once, as the text was already right).
 Runs: test_download.py 89 passed; test_tools.py 62 passed; test_api.py 30 passed; git status clean.
 Uncertain: `-S res:720,...` with `-f bv*+ba/b`: correct in yt-dlp (res is the smaller side); H.264 for "best" above 1080p falls back to VP9/AV1 (WebM/MKV may not play in the app), as the review noted.
+
+## Second fix round (R673)
+Commits: A c0ee14f, B c2df883, C and D together (head, see git log; they share one test file).
+- A (download.py `DOWNLOAD_FAILS_ALWAYS`, `_is_finished_media`, `run`): for a yt-dlp download, NETWORK_LOST / DISK_FULL / TOOL_NOT_INSTALLED always fail; any other code is partial only if a finished video/audio file (not `.fNNN` stream, not `.part`) exists; flatList/metadataOnly and gallery-dl keep the old rule. The unjoined-stream pattern is `\.f\d+(-\d+)?\.ext` so "my.final.mp4" still counts. Tests (7 failed first): 6 parametrised failures incl. the brief's five and one lost-connection-with-a-finished-mp4; partial-with-mp4 and streams-only; enumeration partial unchanged; name pattern test. Fake yt-dlp: FAKE_YTDLP_WRITE writes files before failing.
+- B: `--merge-output-format mp4` for best/1080p/720p and the no-quality default with ffmpeg; test failed first (checked by reverting the file).
+- C: `platform_reason` also refuses `~/` and a `?` followed later by `=`; removes U+061C, U+2060, U+00AD; cuts at ` --letter` including its introducing word ("Use", "use"), so no stray "Use" is left. Four tests, each failed first. Changed existing test: test_platform_reason_hides_the_home_folder (a home path now gives None).
+- D: test for `[urllib3...][warning] ...Read timed out` + `[instagram][error] NotFoundError: ...` gives EXTRACTOR_ERROR; breaking B1 locally makes it fail (1 failed), restored.
+Runs: test_download.py 103 passed; test_tools.py 62 passed; test_api.py 30 passed; git status clean.
+Uncertain: the cut removes one word before ` --letter`, a small step beyond the brief's wording, needed so "Use" is not left behind.
+
+## Last fix (R675)
+One commit (head, see git log). `_is_finished_media`: a name with `.temp.` or `.part`, or ending `.ytdl`, is never finished; an unjoined stream is `\.f[^.]+\.[^.]+$`. Tests (5 failed first): failed join with abc.temp.mp4 / abc.fhls-720p.mp4 / abc.f251-drc.webm (and .part, .ytdl as guards) fails EXTRACTOR_ERROR; a finished mp4 then 429 stays partial (guard). `platform_reason`: cut at `\s+(?:use\s+)?--[A-Za-z]` (case-insensitive); three tests (Use, use, "private --ask the owner"). Existing test edited: the name-pattern test used "my.final.mp4" as a finished file, which the ruled pattern now treats as a stream; it uses "my-video.mp4". Runs: test_download 109, test_tools 62, test_api 30 passed; status clean.

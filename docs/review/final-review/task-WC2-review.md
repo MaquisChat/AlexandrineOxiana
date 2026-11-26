@@ -153,3 +153,60 @@ What still gets through (all Minor):
 ### What I could not check
 - Real yt-dlp file order and output on a live network. N1 rests on yt-dlp's known order: info JSON, captions and thumbnail, then the download.
 - MKV, VP9-in-MP4 and AV1-in-MP4 playback in WKWebView on M1/M2 compared with M3.
+
+---
+
+## Third look (R673) — 4ecfc44..c4b43b8
+
+**Verdict: CHANGES NEEDED, one small mend.**
+- B, C and D are as ruled.
+- A fixes the shape of N1. But `_is_finished_media` still counts two kinds of leftover as a finished recording: yt-dlp's half-written merge output, and unjoined streams whose format id is not a number.
+
+Runs: test_download 103 passed, test_tools 62 passed, test_api 30 passed. `git status --short` is empty.
+
+### Important
+**T1. `abc.temp.mp4` and `abc.fhls-720p.mp4` are counted as finished media.** `download.py:545-552`.
+
+yt-dlp's merger, and its fixups, write to `prepend_extension(name, "temp")`, which gives `<id>.temp.mp4`. On an ffmpeg failure that file is left half-written. `_list_outputs` skips only names ENDING in `.temp`, and `_is_finished_media` accepts any media suffix. `_UNJOINED_RE` (`\.f\d+(-\d+)?\.`) catches only numeric ids. These all pass as finished media:
+- `.f251-drc.webm` (YouTube's DRC audio);
+- `.fhls-1080p.mp4` and `.fdash-…` (Vimeo, X and many generic sites);
+- `.temp.mp4` and `.temp.m4a`.
+
+I ran two probes through the worker. Both failed with `ERROR: Postprocessing: Conversion failed!`, which is EXTRACTOR_ERROR. That error is what ffmpeg most likely leaves when the disk fills during the merge (Review Focus 2).
+- Files `.webp`, `.vtt`, `.f136.mp4`, `.f140.m4a`, `.temp.mp4` gave `done, partial, EXTRACTOR_ERROR`. The half-written `.temp.mp4` and both streams were listed as files.
+- Files `.webp`, `.fhls-720p.mp4`, `.fdash-audio.m4a` gave the same.
+
+The library then stores those files as an incomplete source.
+
+Smallest fix:
+- in `_is_finished_media`, refuse names containing `.temp.` or `.part`;
+- make the stream pattern `\.f[^.]+\.[^.]+$`. The output template is `%(id)s.%(ext)s`, so only a stream has a second dotted segment that starts with `f`.
+- add tests for `.temp.mp4`, `.f251-drc.webm` and `.fhls-720p.mp4`.
+
+`.part`, `.part-FragN` and `.ytdl` are already never listed. yt-dlp's fragments are `.part-FragN`, not `.frag`.
+
+### The other questions about A
+- **Finished audio file plus a failed thumbnail.** No thumbnail conversion or embedding is asked for, so a failed thumbnail is only a warning, and a finished `.m4a` with a later failure is partial, which is right. I could not confirm whether ffmpeg's `-x` writes straight to `<id>.m4a`; if it does, a cut-off extraction would look finished. Only a real run shows it.
+- **Multi-video jobs.** No caller sends one to yt-dlp today. Link capture canonicalises a YouTube video to `watch?v=<id>`. Channels and playlists go to profile capture, which enumerates and then sends one job per entry. gallery-dl jobs (Instagram posts and carousels) keep the old rule. Only an "unknown"-kind link on another site could hold several videos. There, "always fail" on a lost connection drops a video that had finished, but stores nothing half-done, so a retry downloads it again. That is acceptable.
+- **What did not change.** The rate-limit partial (an mp4 written, then 429) is still kept. `flatList`, `metadataOnly` and gallery-dl keep `files or (enumeration and infos)`. Removing the always-fail rule fails 7 tests.
+
+### B
+`--merge-output-format mp4` is present for best, 1080p, 720p, and for the default when ffmpeg is found. It is absent for audio, ready, the default without ffmpeg, and metadata-only. All six cases were checked by a probe.
+
+### C
+- `~/…` gives None. A bare `?a=1` gives None. U+061C, U+2060 and U+00AD are removed. `USE --cookies` is cut.
+- A platform dash (`private -- ask the owner`, with a space after the hyphens) is kept whole, because the cut needs a letter straight after `--`.
+- Minor: the extra cut word can bite. `private --ask the owner` becomes "This video is". `Use the --cookies option` leaves a stray "Use". Both are contrived.
+- Minor: a sentence with `?` and then `=` gives None. That is conservative.
+- The four codes still give their sentences (Private, bot check, age, country).
+
+### D
+Removing the `][error]` pick-up now fails 1 test, so it is pinned.
+
+### Other changes
+The only test whose assertion changed is the home-folder test, and it is stronger now (it requires None). The fake yt-dlp gained only `FAKE_YTDLP_WRITE`. The wire is unchanged.
+
+### What I could not check
+- Whether real yt-dlp leaves `.temp.mp4` behind after a failed merge. Its code does not remove it.
+- ffmpeg's exact last line on a full disk.
+- How `-x` writes its output.
