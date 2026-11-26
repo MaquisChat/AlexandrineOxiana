@@ -27,6 +27,7 @@ import {
   WorkerJobError,
   WorkerUnavailableError,
   transcriptionJob,
+  transcriptionRecords,
   transcriptionRerun,
   type JobRecord,
   type ResumeExtras,
@@ -101,6 +102,8 @@ export class Transcriptions {
   private readonly live = new Map<string, Live>();
   /** Per source (project and source id): the live job's id, or a reservation token. */
   private readonly bySource = new Map<string, string | symbol>();
+  /** Told when a job this run holds has ended (whenEnded). */
+  private readonly waiters = new Map<string, Set<(job: TranscriptionJob) => void>>();
 
   constructor(private readonly state: ServiceState) {}
 
@@ -213,6 +216,51 @@ export class Transcriptions {
       this.publish(l);
     }
     return { ...l.job };
+  }
+
+  /**
+   * Resolves with the job once it has ended (done, failed, or cancelled — except cancelled by a lock, which runs again
+   * at the unlock, R142): at once when the journal record has ended, else when the run this service holds (a new one,
+   * or a rerun of a pending one) ends. A job left pending (interrupted, the media helper gone) is waited for until it
+   * runs again. `signal` gives up the wait (it rejects with the signal's reason).
+   */
+  whenEnded(s: Session, projectId: string, jobId: string, signal?: AbortSignal): Promise<TranscriptionJob> {
+    return new Promise<TranscriptionJob>((resolve, reject) => {
+      const set = this.waiters.get(jobId) ?? new Set();
+      this.waiters.set(jobId, set);
+      let settled = false;
+      const cleanup = () => {
+        settled = true;
+        set.delete(done);
+        if (set.size === 0 && this.waiters.get(jobId) === set) this.waiters.delete(jobId);
+        signal?.removeEventListener("abort", aborted);
+      };
+      const done = (job: TranscriptionJob) => {
+        if (settled) return;
+        cleanup();
+        resolve(job);
+      };
+      const aborted = () => {
+        if (settled) return;
+        cleanup();
+        reject(signal?.reason instanceof Error ? signal.reason : new Error("the wait was given up"));
+      };
+      if (signal?.aborted) return aborted();
+      signal?.addEventListener("abort", aborted, { once: true });
+      set.add(done);
+      // Registered first, then the journal read: an end between the two is not missed.
+      transcriptionRecords(s.repo, projectId).then(
+        (recs) => {
+          const rec = recs.find((r) => r.id === jobId);
+          if (rec && recordEnded(rec)) done(fromRecord(rec));
+        },
+        (err: unknown) => {
+          if (settled) return;
+          cleanup();
+          reject(err instanceof Error ? err : new Error(String(err)));
+        },
+      );
+    });
   }
 
   /** Forgets everything held for a library that was closed (its jobs stay in its journal). */
@@ -336,6 +384,8 @@ export class Transcriptions {
     const key = this.key(l.job.projectId, l.job.sourceId);
     if (this.bySource.get(key) === l.job.jobId) this.bySource.delete(key);
     this.publish(l);
+    const waiting = this.waiters.get(l.job.jobId);
+    if (waiting) for (const fn of [...waiting]) fn({ ...l.job });
   }
 
   /**
@@ -365,6 +415,11 @@ export class Transcriptions {
     const finished = [...this.live.values()].filter((l) => !this.active(l));
     for (const l of finished.slice(0, Math.max(0, finished.length - KEEP_FINISHED))) this.live.delete(l.job.jobId);
   }
+}
+
+/** A job record that has ended for good (a cancel by a lock is pending: it runs again at the unlock, R142). */
+function recordEnded(rec: JobRecord): boolean {
+  return rec.status === "done" || rec.status === "failed" || (rec.status === "cancelled" && rec.error !== "PROJECT_LOCKED");
 }
 
 function event(job: TranscriptionJob, finished: boolean): TranscriptionProgressEvent & Record<string, unknown> {

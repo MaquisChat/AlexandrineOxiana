@@ -21,6 +21,7 @@ import { registerAudit } from "./routes/audit.js";
 import { registerLibraryAudit } from "./routes/library-audit.js";
 import { registerCapture } from "./routes/capture.js";
 import { registerDownloads } from "./routes/downloads.js";
+import { readBackgroundSettings, registerTranscriptionList } from "./routes/transcription-list.js";
 import { registerCitations } from "./routes/citations.js";
 import { isDocumentPreflight, registerDocuments } from "./routes/documents.js";
 import { registerFieldwork } from "./routes/fieldwork.js";
@@ -105,6 +106,11 @@ export interface ServiceOptions {
   downloadSleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Test seam (only when NODE_ENV is exactly "test", R47): the download runs' reading of the free space (main.ts: AO_TEST_FREE_BYTES). */
   downloadFreeBytes?: (dir: string) => Promise<number | null>;
+  /**
+   * Test seam (only when NODE_ENV is exactly "test", R47): keeping the Mac awake's platform, `spawn` and pid. Under
+   * NODE_ENV=test without it, no `caffeinate` is ever started (the platform is taken as not a Mac).
+   */
+  keepAwake?: { platform?: NodeJS.Platform; spawn?: typeof import("node:child_process").spawn; pid?: number };
 }
 
 export interface LibraryService {
@@ -153,6 +159,12 @@ const OPEN_ROUTES = new Set(["POST /extension/pair/confirm"]);
 
 /** Log redaction (R96): credentials never reach the log, whatever object carries them. */
 const REDACT = ["authorization", "secret", "passphrase", "recoveryCode", "apiKey", "token", "code", "cookie", "ticket", "link"].flatMap((k) => [k, `*.${k}`, `*.*.${k}`, `req.headers.${k}`]);
+
+/** Keeping awake's test seam: honoured only when NODE_ENV is exactly "test", where nothing is started without it. */
+function keepAwakeSeam(opts: ServiceOptions): { keepAwake?: NonNullable<ServiceOptions["keepAwake"]> } {
+  if (process.env.NODE_ENV !== "test") return {};
+  return { keepAwake: opts.keepAwake ?? { platform: "linux" } };
+}
 
 /** The download runs' test seams, honoured only when NODE_ENV is exactly "test" (R47, R687 D). */
 function downloadSeams(opts: ServiceOptions): { downloads?: { sleep?: ServiceOptions["downloadSleep"]; freeBytes?: ServiceOptions["downloadFreeBytes"] } } {
@@ -205,11 +217,14 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     ...(opts.rebuildIndexIfNeeded ? { rebuildIndexIfNeeded: opts.rebuildIndexIfNeeded } : {}),
     ...(opts.startupTimer ? { startupTimer: opts.startupTimer } : {}),
     ...downloadSeams(opts),
+    ...keepAwakeSeam(opts),
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },
   });
   const pairing = new Pairing(deps.appConfigDir, opts.pairing);
   const folderGrants = opts.folderGrants ?? new FolderGrants();
   await pairing.load();
+  // Keeping the Mac awake follows the researcher's setting from the start (default on).
+  state.setKeepAwakeSetting((await readBackgroundSettings(deps.appConfigDir)).keepAwake);
   let port: number | undefined;
   /** Set when shutdown starts: new requests are refused before the library is closed (R98). */
   let closingNow = false;
@@ -364,6 +379,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerAnnotations(app, ctx);
   registerCapture(app, ctx);
   registerDownloads(app, ctx);
+  registerTranscriptionList(app, ctx);
   registerImport(app, ctx);
   registerReview(app, ctx);
   registerGovernance(app, ctx);

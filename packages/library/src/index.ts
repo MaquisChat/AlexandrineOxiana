@@ -161,6 +161,7 @@ export {
   stopTranscriptionList,
 } from "./lists/transcription-list.js";
 export type { TranscriptionEntryView, TranscriptionListView } from "./lists/transcription-list.js";
+export { untranscribedSources } from "./untranscribed.js";
 
 export { classifyUrl, isCollectionLink, isPostLink } from "./capture/platforms.js";
 export type { ClassifiedUrl, LinkKind, Platform } from "./capture/platforms.js";
