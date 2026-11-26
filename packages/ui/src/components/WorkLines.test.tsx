@@ -120,10 +120,27 @@ describe("WorkLines: the download runs", () => {
     expect(buttonNames()).toEqual(["Resume downloads (292 did not complete)", "Discard"]);
   });
 
-  it("a run that completed everything says so and has no button", async () => {
-    start({ runs: [exampleRun({ state: "finished", done: 412 })] });
-    await shown('"Example Channel": all 412 downloaded.');
-    expect(buttonNames()).toEqual([]);
+  it('a run that completed everything says so and offers only "Remove from this list", which discards it (R679 C2)', async () => {
+    const DONE = '"Example Channel": all 412 downloaded.';
+    const { m } = start({ runs: [exampleRun({ state: "finished", done: 412 }), exampleRun({ runId: "run-2", title: "Second Channel", state: "paused", startedAt: later(5) })] });
+    await shown(DONE);
+    expect(within(lineOf(DONE)).getAllByRole("button").map((b) => b.textContent)).toEqual(["Remove from this list"]);
+    await userEvent.setup().click(buttonOf(DONE, "Remove from this list"));
+    await waitFor(() => notShown(DONE));
+    expect(m.count("POST /projects/p1/downloads/run-1/discard")).toBe(1);
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+    expect(getShown('"Second Channel" is paused: 120 of 412 downloaded.')).toBeTruthy();
+  });
+
+  it('a run with nothing new to download offers only "Remove from this list" (R679 C2)', async () => {
+    const NONE = '"Example Channel": nothing new to download.';
+    const { m } = start({ runs: [exampleRun({ state: "finished", total: 0, done: 0 })] });
+    await shown(NONE);
+    expect(buttonNames()).toEqual(["Remove from this list"]);
+    await userEvent.setup().click(buttonOf(NONE, "Remove from this list"));
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+    notShown(NONE);
+    expect(m.count("POST /projects/p1/downloads/run-1/discard")).toBe(1);
   });
 
   it("a run waiting its turn says so and offers Stop only", async () => {
@@ -280,6 +297,30 @@ describe("WorkLines: the transcription line", () => {
     expect(buttonNames()).toEqual([]);
     await waitFor(() => expect(document.activeElement).toBe(heading()));
     expect(m.count("POST /projects/p1/transcription-list/stop")).toBe(1);
+  });
+
+  it("paused transcriptions stopped say the stopped sentence too", async () => {
+    const PAUSED = "Transcriptions paused: 14 of 412 done.";
+    const { m } = start({ lists: { p1: { ...running, state: "paused" } } });
+    await shown(PAUSED);
+    await userEvent.setup().click(buttonOf(PAUSED, "Stop"));
+    await shown(LIST_STOPPED_TEXT);
+    notShown(PAUSED);
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+    expect(m.count("POST /projects/p1/transcription-list/stop")).toBe(1);
+  });
+
+  it('finished transcriptions offer only "Remove from this list": the line goes, nothing says they were stopped, focus goes to the heading (R679 C3)', async () => {
+    const FINISHED = "Transcriptions finished: all 3 done.";
+    const { m } = start({ runs: [exampleRun({ state: "paused" })], lists: { p1: idleList("p1", { total: 3, done: 3 }) } });
+    await shown(FINISHED);
+    expect(within(lineOf(FINISHED)).getAllByRole("button").map((b) => b.textContent)).toEqual(["Remove from this list"]);
+    await userEvent.setup().click(buttonOf(FINISHED, "Remove from this list"));
+    await waitFor(() => notShown(FINISHED));
+    expect(m.count("POST /projects/p1/transcription-list/stop")).toBe(1);
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+    notShown(LIST_STOPPED_TEXT);
+    expect(screen.queryByText(LIST_STOPPED_TEXT)).toBeNull();
   });
 
   it("nothing to show renders nothing: no run and an idle list with nothing on it (the stream is followed all the same)", async () => {

@@ -405,6 +405,15 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
       }
     });
 
+  /** R679 C3: a finished list taken off the screen: a stop of an idle list only sets its counters to zero, so nothing was stopped and nothing says so. */
+  const removeList = () =>
+    void act("list", () => api.listAction(projectId, "stop"), (l) => {
+      listChanged();
+      setList(l);
+      setHoldFocus(true);
+      focusHeading.current = true;
+    });
+
   const showProblems = (run: DownloadRunSummary) => {
     if (problems[run.runId]) {
       setProblems(({ [run.runId]: _closed, ...rest }) => rest);
@@ -483,7 +492,7 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
         </ul>
       )}
       {listOfProject && listLines.title !== undefined && (
-        <ListLine list={listOfProject} title={listLines.title} time={listLines.time} busy={busy.has("list")} error={errors.list} onAction={listAction} />
+        <ListLine list={listOfProject} title={listLines.title} time={listLines.time} busy={busy.has("list")} error={errors.list} onAction={listAction} onRemove={removeList} />
       )}
     </section>
   );
@@ -526,7 +535,7 @@ function RunLine({
   const id = useId();
   const lines = runLines(run);
   const running = RUNNING.has(run.state);
-  /** A run that completed everything says so and has no button (the spec's sketch). */
+  /** A run that completed everything (or found nothing new) says so and has one button, "Remove from this list" (R679 C2). */
   const allDone = run.state === "finished" && run.failed === 0 && run.notCompleted === 0;
   const problemsHeading = useRef<HTMLHeadingElement>(null);
   const open = problems !== undefined;
@@ -548,7 +557,13 @@ function RunLine({
           {run.state === "failed" ? <UserText>{lines.why}</UserText> : lines.why}
         </p>
       )}
-      {!allDone && (
+      {allDone ? (
+        <div className="ao-worklines__actions">
+          <button type="button" disabled={busy} {...named(id, "remove")} onClick={onDiscard}>
+            {RUN_BUTTONS.remove}
+          </button>
+        </div>
+      ) : (
         <div className="ao-worklines__actions">
           {(run.state === "downloading" || run.state === "waiting") && (
             <button type="button" disabled={busy} {...named(id, "pause")} onClick={() => onAction("pause")}>
@@ -612,7 +627,23 @@ function RunLine({
   );
 }
 
-function ListLine({ list, title, time, busy, error, onAction }: { list: TranscriptionListSummary; title: string; time: string | undefined; busy: boolean; error: string | undefined; onAction(what: "pause" | "continue" | "stop"): void }) {
+function ListLine({
+  list,
+  title,
+  time,
+  busy,
+  error,
+  onAction,
+  onRemove,
+}: {
+  list: TranscriptionListSummary;
+  title: string;
+  time: string | undefined;
+  busy: boolean;
+  error: string | undefined;
+  onAction(what: "pause" | "continue" | "stop"): void;
+  onRemove(): void;
+}) {
   const id = useId();
   return (
     <div className="ao-worklines__list">
@@ -621,7 +652,13 @@ function ListLine({ list, title, time, busy, error, onAction }: { list: Transcri
       </p>
       <Said text={title} />
       {time && <p className="ao-worklines__detail">{time}</p>}
-      {list.state !== "idle" && (
+      {list.state === "idle" ? (
+        <div className="ao-worklines__actions">
+          <button type="button" disabled={busy} {...named(id, "remove")} onClick={onRemove}>
+            {LIST_BUTTONS.remove}
+          </button>
+        </div>
+      ) : (
         <div className="ao-worklines__actions">
           {list.state === "running" ? (
             <button type="button" disabled={busy} {...named(id, "pause")} onClick={() => onAction("pause")}>

@@ -434,7 +434,8 @@ export function problemLine(pr: DownloadProblem, p: CapturePlatform): string {
   return `${pr.title || PROBLEMS_TEXT.noTitle} — ${pr.url} — ${pr.reason}${says}`;
 }
 
-export const RUN_BUTTONS = { pause: "Pause", stop: "Stop", showThem: "Show them", discard: "Discard" };
+/** `remove` (R679 C1): the one button of a finished run with nothing left to do; it discards the run. */
+export const RUN_BUTTONS = { pause: "Pause", stop: "Stop", showThem: "Show them", discard: "Discard", remove: "Remove from this list" };
 
 // ---- the transcription list --------------------------------------------------------------------------
 
@@ -480,7 +481,8 @@ export function transcriptionLines(l: TranscriptionListSummary): { title?: strin
   return { title, time: `${formatTimeLeft(l.soundSecondsLeft / sps)} left at this Mac's speed (${formatSpeed(sps)})${unknown}` };
 }
 
-export const LIST_BUTTONS = { pause: "Pause", continue: "Continue", stop: "Stop" };
+/** `remove` (R679 C1): the one button of a finished list; it empties the list (a stop of an idle list). */
+export const LIST_BUTTONS = { pause: "Pause", continue: "Continue", stop: "Stop", remove: "Remove from this list" };
 
 /** Said once after a Stop of the transcription list (R672). */
 export const LIST_STOPPED_TEXT: string =
