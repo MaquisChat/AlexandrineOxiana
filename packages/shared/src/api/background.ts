@@ -458,6 +458,10 @@ export interface TranscriptionListSummary {
   soundSecondsLeft: number;
   unknownLeft: number;
   soundPerSecond?: number;
+  /** A paused list waits for this tool to be installed (e.g. `speech-medium`) (R692). */
+  tool?: string;
+  /** A paused list: its loop failed twice (R692). */
+  stalled?: boolean;
 }
 export interface TranscriptionListResponse {
   list: TranscriptionListSummary;
@@ -475,9 +479,25 @@ export interface TranscribeAllResponse {
   list: TranscriptionListSummary;
 }
 
+/** Why a paused list waits (R692): a tool not installed, or a loop that failed twice. */
+function listPausedWhy(l: TranscriptionListSummary): string | undefined {
+  const then = "from the Optional tools screen, then press Continue.";
+  if (l.tool !== undefined) {
+    const model = /^speech-(.+)$/.exec(l.tool)?.[1];
+    if (model !== undefined) return `Paused: the speech model “${model}” is not installed. Install it ${then}`;
+    return `Paused: a tool this needs is not installed. Install it ${then}`;
+  }
+  if (l.stalled) return "Paused: something went wrong while transcribing. Press Continue to try again.";
+  return undefined;
+}
+
 /** The sentences of the transcription line on the screens. */
-export function transcriptionLines(l: TranscriptionListSummary): { title?: string; time?: string } {
-  if (l.state === "paused") return { title: `Transcriptions paused: ${l.done} of ${l.total} done.` };
+export function transcriptionLines(l: TranscriptionListSummary): { title?: string; time?: string; why?: string } {
+  if (l.state === "paused") {
+    const title = `Transcriptions paused: ${l.done} of ${l.total} done.`;
+    const why = listPausedWhy(l);
+    return why !== undefined ? { title, why } : { title };
+  }
   if (l.state === "idle") {
     if (l.total <= 0) return {};
     return { title: l.failed > 0 ? `Transcriptions finished: ${l.done} of ${l.total} done; ${l.failed} could not be made.` : `Transcriptions finished: all ${l.total} done.` };

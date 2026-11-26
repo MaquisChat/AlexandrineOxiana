@@ -297,6 +297,26 @@ describe("the transcription line", () => {
     expect(transcriptionLines({ ...l, state: "idle", done: 412, failed: 0 }).title).toBe("Transcriptions finished: all 412 done.");
     expect(transcriptionLines({ ...l, state: "idle", total: 0, done: 0, failed: 0 })).toEqual({});
   });
+
+  it("a paused list says why: a speech model or another tool not installed, or something gone wrong (R692)", () => {
+    expect(transcriptionLines({ ...l, state: "paused", tool: "speech-medium" })).toEqual({
+      title: "Transcriptions paused: 14 of 412 done.",
+      why: "Paused: the speech model “medium” is not installed. Install it from the Optional tools screen, then press Continue.",
+    });
+    expect(transcriptionLines({ ...l, state: "paused", tool: "speech-large-v3" }).why).toBe(
+      "Paused: the speech model “large-v3” is not installed. Install it from the Optional tools screen, then press Continue.",
+    );
+    expect(transcriptionLines({ ...l, state: "paused", tool: "ffmpeg" })).toEqual({
+      title: "Transcriptions paused: 14 of 412 done.",
+      why: "Paused: a tool this needs is not installed. Install it from the Optional tools screen, then press Continue.",
+    });
+    expect(transcriptionLines({ ...l, state: "paused", stalled: true })).toEqual({
+      title: "Transcriptions paused: 14 of 412 done.",
+      why: "Paused: something went wrong while transcribing. Press Continue to try again.",
+    });
+    // Only a paused list says why.
+    expect(transcriptionLines({ ...l, state: "running", tool: "speech-medium" }).why).toBeUndefined();
+  });
 });
 
 describe("transcribe everything", () => {

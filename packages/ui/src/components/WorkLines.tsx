@@ -541,7 +541,7 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
         </ul>
       )}
       {listOfProject && listLines.title !== undefined && (
-        <ListLine list={listOfProject} title={listLines.title} time={listLines.time} busy={busy.has("list")} error={errors.list} onAction={listAction} onRemove={removeList} />
+        <ListLine list={listOfProject} title={listLines.title} time={listLines.time} why={listLines.why} busy={busy.has("list")} error={errors.list} onAction={listAction} onRemove={removeList} />
       )}
     </section>
   );
@@ -689,6 +689,7 @@ function ListLine({
   list,
   title,
   time,
+  why,
   busy,
   error,
   onAction,
@@ -697,6 +698,8 @@ function ListLine({
   list: TranscriptionListSummary;
   title: string;
   time: string | undefined;
+  /** Why a paused list waits (R692): fixed words of @ao/shared. */
+  why: string | undefined;
   busy: boolean;
   error: string | undefined;
   onAction(what: "pause" | "continue" | "stop"): void;
@@ -710,6 +713,7 @@ function ListLine({
       </p>
       <Said text={title} />
       {time && <p className="ao-worklines__detail">{time}</p>}
+      {why && <p className="ao-worklines__detail">{why}</p>}
       {list.state === "idle" ? (
         <div className="ao-worklines__actions">
           <button type="button" disabled={busy} {...named(id, "remove")} onClick={onRemove}>

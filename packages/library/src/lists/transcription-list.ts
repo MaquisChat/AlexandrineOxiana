@@ -44,6 +44,10 @@ export interface TranscriptionListView {
   total: number;
   done: number;
   failed: number;
+  /** A paused list waits for this tool to be installed (R692). */
+  tool?: string;
+  /** A paused list: its loop failed twice (R692). */
+  stalled?: boolean;
   /** Queued and running entries, in the order they were added. */
   pending: TranscriptionEntryView[];
 }
@@ -122,7 +126,10 @@ export async function readTranscriptionList(repo: Repo, projectId: string): Prom
   const pending = entriesOf(records)
     .filter(isPendingEntry)
     .map((r) => ({ entryId: r.id, status: r.status, entry: r.entry, addedAt: r.createdAt }));
-  return { state: data.state, total: data.total, done: data.done, failed: data.failed, pending };
+  return {
+    state: data.state, total: data.total, done: data.done, failed: data.failed,
+    ...(data.tool !== undefined ? { tool: data.tool } : {}), ...(data.stalled ? { stalled: true } : {}), pending,
+  };
 }
 
 /**
@@ -204,7 +211,7 @@ export async function markTranscriptionEntry(
   repo: Repo,
   projectId: string,
   entryId: string,
-  next: { status: "running"; jobId: string } | { status: "done" } | { status: "failed"; error: string } | { status: "cancelled"; error?: string },
+  next: { status: "running"; jobId: string } | { status: "queued" } | { status: "done" } | { status: "failed"; error: string } | { status: "cancelled"; error?: string },
 ): Promise<boolean> {
   const p = writable(repo, projectId);
   let moves = true;
@@ -222,7 +229,9 @@ export async function markTranscriptionEntry(
     }
     const at = repoClock(repo)().toISOString();
     const { error: _error, ...base } = old;
-    const entry: TranscriptionEntryData = next.status === "running" ? { ...old.entry, jobId: next.jobId } : old.entry;
+    const { jobId: _jobId, ...waiting } = old.entry;
+    // Back to waiting (a tool not installed, R692): its job is forgotten.
+    const entry: TranscriptionEntryData = next.status === "running" ? { ...old.entry, jobId: next.jobId } : next.status === "queued" ? waiting : old.entry;
     const error = next.status === "failed" ? errorCode(next.error) : next.status === "cancelled" ? errorCode(next.error ?? "CANCELLED") : undefined;
     const rec: JobRecord = { ...base, status: next.status, updatedAt: at, entry, ...(error !== undefined ? { error } : {}) };
     const { data } = listOf(records);
@@ -231,13 +240,28 @@ export async function markTranscriptionEntry(
   return moves;
 }
 
-/** Pauses the list (the transcription in hand finishes) or lets it run. */
-export async function setTranscriptionListState(repo: Repo, projectId: string, state: "running" | "paused"): Promise<void> {
+/** The list's data without what a paused list waits for. */
+function plain(data: TranscriptionListData): TranscriptionListData {
+  const { tool: _tool, stalled: _stalled, ...rest } = data;
+  return rest;
+}
+
+/**
+ * Pauses the list (the transcription in hand finishes) or lets it run. A pause may say what the list waits for
+ * (`tool`: a tool not installed; `stalled`: the loop failed twice) (R692); running clears both.
+ */
+export async function setTranscriptionListState(
+  repo: Repo,
+  projectId: string,
+  state: "running" | "paused",
+  extra?: { tool?: string; stalled?: boolean },
+): Promise<void> {
   const p = writable(repo, projectId);
   await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
     const records = repaired(raw);
     const { data } = listOf(records);
-    return [listRecord(projectId, records, { ...data, state }, repoClock(repo)().toISOString())];
+    const why = state === "paused" && extra ? { ...(extra.tool !== undefined ? { tool: extra.tool } : {}), ...(extra.stalled ? { stalled: true } : {}) } : {};
+    return [listRecord(projectId, records, { ...plain(data), state, ...why }, repoClock(repo)().toISOString())];
   });
 }
 
@@ -259,8 +283,8 @@ export async function stopTranscriptionList(repo: Repo, projectId: string): Prom
       const { error: _error, ...base } = e;
       return { ...base, status: "cancelled", updatedAt: at, error: "STOPPED" };
     });
-    const emptied: TranscriptionListData = { ...data, state: "running", total: 0, done: 0, failed: 0 };
-    if (recs.length === 0 && data.state === "running" && data.total === 0 && data.done === 0 && data.failed === 0) return [];
+    const emptied: TranscriptionListData = { ...plain(data), state: "running", total: 0, done: 0, failed: 0 };
+    if (recs.length === 0 && data.state === "running" && data.total === 0 && data.done === 0 && data.failed === 0 && data.tool === undefined && !data.stalled) return [];
     return [...recs, listRecord(projectId, records, emptied, at)];
   });
   return { jobIds };

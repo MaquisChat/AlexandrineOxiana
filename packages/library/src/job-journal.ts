@@ -152,6 +152,10 @@ export interface TranscriptionListData {
   total: number;
   done: number;
   failed: number;
+  /** A paused list waits for this tool to be installed (e.g. `speech-medium`) (R692). */
+  tool?: string;
+  /** A paused list: its loop failed twice (R692). */
+  stalled?: boolean;
 }
 
 /** One source on the transcription list. Its record's status is queued, running, done, failed or cancelled. */

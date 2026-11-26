@@ -111,6 +111,8 @@ export interface ServiceOptions {
    * NODE_ENV=test without it, no `caffeinate` is ever started (the platform is taken as not a Mac).
    */
   keepAwake?: { platform?: NodeJS.Platform; spawn?: typeof import("node:child_process").spawn; pid?: number };
+  /** Test seam (only when NODE_ENV is exactly "test", R47): the transcription list's retry timer; returns its cancel. */
+  transcriptionListTimer?: (fire: () => void, ms: number) => () => void;
 }
 
 export interface LibraryService {
@@ -218,6 +220,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     ...(opts.startupTimer ? { startupTimer: opts.startupTimer } : {}),
     ...downloadSeams(opts),
     ...keepAwakeSeam(opts),
+    ...(process.env.NODE_ENV === "test" && opts.transcriptionListTimer ? { transcriptionListTimer: opts.transcriptionListTimer } : {}),
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },
   });
   const pairing = new Pairing(deps.appConfigDir, opts.pairing);

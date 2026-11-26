@@ -274,6 +274,8 @@ export interface StateOptions {
   downloads?: DownloadSeams;
   /** Test seam (honoured only when NODE_ENV is exactly "test", R47): keeping the Mac awake's platform, spawn and pid. */
   keepAwake?: ConstructorParameters<typeof KeepAwake>[0];
+  /** Test seam (honoured only when NODE_ENV is exactly "test", R47): the transcription list's retry timer; returns its cancel. */
+  transcriptionListTimer?: (fire: () => void, ms: number) => () => void;
 }
 
 /** An entry's key for the look-ups under way. */

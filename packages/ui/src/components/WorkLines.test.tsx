@@ -286,6 +286,17 @@ describe("WorkLines: the transcription line", () => {
     expect(m.count("POST /projects/p1/transcription-list/continue")).toBe(1);
   });
 
+  it.each([
+    [{ tool: "speech-medium" }, "Paused: the speech model “medium” is not installed. Install it from the Optional tools screen, then press Continue."],
+    [{ tool: "ffmpeg" }, "Paused: a tool this needs is not installed. Install it from the Optional tools screen, then press Continue."],
+    [{ stalled: true }, "Paused: something went wrong while transcribing. Press Continue to try again."],
+  ])("a paused list says why under its title and keeps Continue and Stop (R692): %o", async (extra, why) => {
+    start({ lists: { p1: { ...running, state: "paused", ...extra } } });
+    await shown("Transcriptions paused: 14 of 412 done.");
+    expect(within(lineOf("Transcriptions paused: 14 of 412 done.")).getByText(whole(why))).toBeTruthy();
+    expect(buttonNames()).toEqual(["Continue", "Stop"]);
+  });
+
   it("Stop of the transcriptions removes the line, says the stopped sentence once and moves focus to the heading", async () => {
     const { m } = start({ lists: { p1: running } });
     await shown('Transcribing: 14 of 412 — "Title of the video"');

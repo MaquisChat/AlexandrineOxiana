@@ -282,6 +282,39 @@ describe("the transcription list", () => {
     expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ state: "paused", total: 4, done: 2, failed: 1, pending: [{ entryId: e3!.entryId }] });
   });
 
+  it("a running entry goes back to waiting, its job forgotten; a paused list says what it waits for (R692)", async () => {
+    const p = await makeProject(kit);
+    const s = [await audioSource(p, "Alpha"), await audioSource(p, "Beta")];
+    await addToTranscriptionList(kit.repo, p.id, s.map((x) => ({ sourceId: x.source.id })));
+    const [e0, e1] = (await readTranscriptionList(kit.repo, p.id)).pending;
+    await markTranscriptionEntry(kit.repo, p.id, e0!.entryId, { status: "running", jobId: "job-0" });
+    expect(await markTranscriptionEntry(kit.repo, p.id, e0!.entryId, { status: "queued" })).toBe(true);
+    let list = await readTranscriptionList(kit.repo, p.id);
+    expect(list.pending.map((e) => [e.entryId, e.status, e.entry.jobId])).toEqual([[e0!.entryId, "queued", undefined], [e1!.entryId, "queued", undefined]]);
+    expect(list).toMatchObject({ total: 2, done: 0, failed: 0 });
+    expect(list.tool).toBeUndefined();
+
+    await setTranscriptionListState(kit.repo, p.id, "paused", { tool: "speech-medium" });
+    list = await readTranscriptionList(kit.repo, p.id);
+    expect(list).toMatchObject({ state: "paused", tool: "speech-medium" });
+    expect(list.stalled).toBeUndefined();
+    // Running again clears it.
+    await setTranscriptionListState(kit.repo, p.id, "running");
+    list = await readTranscriptionList(kit.repo, p.id);
+    expect(list.state).toBe("running");
+    expect(list.tool).toBeUndefined();
+    await setTranscriptionListState(kit.repo, p.id, "paused", { stalled: true });
+    list = await readTranscriptionList(kit.repo, p.id);
+    expect(list).toMatchObject({ state: "paused", stalled: true });
+    expect(list.tool).toBeUndefined();
+    // A plain Pause says nothing more; a Stop clears it too.
+    await setTranscriptionListState(kit.repo, p.id, "paused");
+    expect((await readTranscriptionList(kit.repo, p.id)).stalled).toBeUndefined();
+    await setTranscriptionListState(kit.repo, p.id, "paused", { tool: "speech-small" });
+    await stopTranscriptionList(kit.repo, p.id);
+    expect(await readTranscriptionList(kit.repo, p.id)).toEqual({ state: "running", total: 0, done: 0, failed: 0, pending: [] });
+  });
+
   it("the list state survives a re-read", async () => {
     const p = await makeProject(kit, OPEN_GOV, true);
     const a = await audioSource(p, "Alpha");

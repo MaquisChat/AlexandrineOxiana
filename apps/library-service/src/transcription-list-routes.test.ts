@@ -51,6 +51,8 @@ interface Run {
   params: Record<string, unknown>;
   released: boolean;
   cancelled: boolean;
+  /** Ends failed with this worker error as soon as it is asked for. */
+  fail?: { code: string; message: string; tool?: string };
 }
 
 interface StubWorker {
@@ -58,6 +60,8 @@ interface StubWorker {
   endpoint: { baseUrl: string; token: string };
   /** Every transcription ends at once. */
   instant: boolean;
+  /** Every job posted from now on fails with this worker error. */
+  failWith?: { code: string; message: string; tool?: string };
   /** Resolves when the n-th job (1-based) has been posted. */
   posted(n: number): Promise<Run>;
   close(): Promise<void>;
@@ -86,7 +90,7 @@ async function stubWorker(): Promise<StubWorker> {
     };
     if (req.method === "POST" && req.url === "/jobs") {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { type: string; output: string; params: Record<string, unknown> };
-      const run: Run = { id: `w${runs.length + 1}`, type: body.type, output: body.output, params: body.params, released: w.instant, cancelled: false };
+      const run: Run = { id: `w${runs.length + 1}`, type: body.type, output: body.output, params: body.params, released: w.instant, cancelled: false, ...(w.failWith ? { fail: w.failWith } : {}) };
       runs.push(run);
       for (const x of waiting.splice(0)) {
         if (runs.length >= x.n) x.resolve(runs[x.n - 1]!);
@@ -102,6 +106,7 @@ async function stubWorker(): Promise<StubWorker> {
       return send(202, { id: run.id, status: "running" });
     }
     if (run.cancelled) return send(200, { id: run.id, status: "cancelled" });
+    if (run.fail) return send(200, { id: run.id, status: "failed", error: run.fail });
     if (!run.released && !w.instant) return send(200, { id: run.id, status: "running", progress: 0 });
     await mkdir(run.output, { recursive: true });
     await writeFile(join(run.output, "segments.json"), JSON.stringify([{ start: 0, end: 2, text: "Welcome.", lang: "en", flags: [] }]));
@@ -482,6 +487,106 @@ describe("the transcription list", () => {
     expect(worker.runs).toHaveLength(3); // the first run again, then the second
     expect(await transcripts(pid, one)).toBe(2);
     expect(await transcripts(pid, two)).toBe(2);
+  });
+
+  it("a speech model not installed pauses the list and says why; Continue tries again; also for the rerun after a restart (R692)", async () => {
+    worker = await stubWorker();
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const one = await audioSource(pid, "One", 60);
+    const two = await audioSource(pid, "Two", 60);
+    worker.failWith = { code: "TOOL_NOT_INSTALLED", message: "not installed", tool: "speech-medium" };
+    const events = collect();
+    await transcribeAll(pid);
+    await worker.posted(1);
+    await svc!.state.idle();
+    const published = events.filter((e) => e.type === BACKGROUND_EVENT && e.data.projectId === pid && e.data.transcriptions).at(-1);
+    expect(published?.data.transcriptions).toMatchObject({ state: "paused", tool: "speech-medium", total: 2, done: 0, failed: 0 });
+    expect(svc!.state.transcriptionList.active()).toBe(false);
+    expect(worker.runs).toHaveLength(1); // nothing else was tried
+    const shown = await list(pid);
+    expect(shown).toMatchObject({ state: "paused", tool: "speech-medium", total: 2, done: 0, failed: 0 });
+    expect(transcriptionLines(shown).why).toBe("Paused: the speech model “medium” is not installed. Install it from the Optional tools screen, then press Continue.");
+    // The entry waits again, not failed: both are still to do.
+    const rows = await import("@ao/library").then((m) => m.readTranscriptionList(svc!.state.session!.repo, pid));
+    expect(rows.pending.map((e) => [e.entry.sourceId, e.status, e.entry.jobId])).toEqual([[one, "queued", undefined], [two, "queued", undefined]]);
+
+    // Continue clears it and tries again; a quit while it runs, and the rerun after the relaunch finds it missing again.
+    delete worker.failWith;
+    const c = await listAct(pid, "continue");
+    expect(c.status, c.body).toBe(200);
+    expect(c.json.list.tool).toBeUndefined();
+    await worker.posted(2);
+    worker.failWith = { code: "TOOL_NOT_INSTALLED", message: "not installed", tool: "speech-medium" };
+    await restart();
+    const again = await listEvent(pid, (l) => l.state === "paused");
+    expect(again).toMatchObject({ tool: "speech-medium", total: 2, done: 0, failed: 0 });
+    await svc!.state.idle();
+    expect(worker.runs).toHaveLength(3);
+
+    delete worker.failWith;
+    worker.instant = true;
+    const done = listEvent(pid, (l) => l.state === "idle" && l.done === 2);
+    expect((await listAct(pid, "continue")).status).toBe(200);
+    expect(await done).toMatchObject({ total: 2, done: 2, failed: 0 });
+    await svc!.state.idle();
+    expect((await list(pid)).tool).toBeUndefined();
+    for (const sid of [one, two]) expect(await transcripts(pid, sid)).toBe(2);
+  });
+
+  it("a loop that fails is tried once more after 30 seconds, then pauses the list and says so (R692)", async () => {
+    worker = await stubWorker();
+    worker.instant = true;
+    const timers: Array<{ fire: () => void; ms: number }> = [];
+    let scheduled!: () => void;
+    let onSchedule = new Promise<void>((r) => (scheduled = r));
+    await start({
+      transcriptionListTimer: (fire, ms) => {
+        timers.push({ fire, ms });
+        scheduled();
+        return () => {};
+      },
+    });
+    await openLibrary();
+    const pid = await project();
+    await audioSource(pid, "One", 60);
+    await audioSource(pid, "Two", 60);
+    const t = svc!.state.transcriptions;
+    const real = t.start.bind(t);
+    const spy = vi.spyOn(t, "start").mockRejectedValue(new Error("the journal could not be written"));
+    await transcribeAll(pid);
+    await svc!.state.idle();
+    // Logged, and one retry asked for in 30 seconds; the list is not paused yet.
+    expect(logs).toContain("transcription-list failed");
+    expect(timers.map((x) => x.ms)).toEqual([30_000]);
+    expect(svc!.state.transcriptionList.active()).toBe(false);
+    expect((await list(pid)).state).toBe("running");
+    // The retry fails too: the list is paused, saying that something went wrong.
+    const events = collect();
+    timers[0]!.fire();
+    await svc!.state.idle();
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(timers).toHaveLength(1); // no second retry
+    const shown = await list(pid);
+    expect(shown).toMatchObject({ state: "paused", stalled: true, total: 2, done: 0 });
+    expect(transcriptionLines(shown).why).toBe("Paused: something went wrong while transcribing. Press Continue to try again.");
+    expect(events.some((e) => e.type === BACKGROUND_EVENT && e.data.transcriptions?.stalled === true)).toBe(true);
+
+    // Continue clears it; a failure that the retry gets past carries on by itself.
+    spy.mockImplementation(real);
+    spy.mockRejectedValueOnce(new Error("once more"));
+    onSchedule = new Promise<void>((r) => (scheduled = r));
+    const c = await listAct(pid, "continue");
+    expect(c.json.list.stalled).toBeUndefined();
+    await onSchedule;
+    await svc!.state.idle();
+    expect(timers.map((x) => x.ms)).toEqual([30_000, 30_000]);
+    const done = listEvent(pid, (l) => l.state === "idle" && l.done === 2);
+    timers[1]!.fire();
+    expect(await done).toMatchObject({ total: 2, done: 2, failed: 0 });
+    await svc!.state.idle();
+    expect((await list(pid)).stalled).toBeUndefined();
   });
 
   it("the speed is measured from what this Mac did and the time left follows; before the first, none is given", async () => {

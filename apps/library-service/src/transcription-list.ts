@@ -40,6 +40,14 @@ import type { ServiceState, Session } from "./state.js";
 
 /** The last transcriptions per speech model the speed is measured over. */
 export const SPEED_SAMPLES = 10;
+/** A loop that failed is tried once more after this long; failing again, the list is paused (R692). */
+export const LIST_RETRY_MS = 30_000;
+
+const realTimer = (fire: () => void, ms: number): (() => void) => {
+  const t = setTimeout(fire, ms);
+  t.unref();
+  return () => clearTimeout(t);
+};
 
 export class SpeedMeter {
   private readonly samples = new Map<string, Array<{ sound: number; wall: number }>>();
@@ -89,6 +97,8 @@ function endCode(job: TranscriptionJob): string {
 
 export class TranscriptionListRunner {
   private readonly loops = new Map<string, Loop>();
+  /** Per project: the loop failed once and is tried again (R692): the retry's cancel. */
+  private readonly retries = new Map<string, () => void>();
 
   constructor(private readonly state: ServiceState) {}
 
@@ -128,10 +138,12 @@ export class TranscriptionListRunner {
       if (work.stopping) halt();
       try {
         await this.run(s, l);
+        if (!l.cut.signal.aborted) this.failedOnce.delete(projectId);
       } catch (err) {
         if (!l.cut.signal.aborted) {
-          // Never lost in silence (R687 I1): logged, and the list published as it now reads.
+          // Never lost in silence (R687 I1): logged; tried once more, then paused (R692); the list published.
           state.opts.log.warn({ err: state.describe(err) }, "transcription-list failed");
+          await this.failed(s, projectId);
           await this.publish(s, projectId);
         }
       } finally {
@@ -141,6 +153,33 @@ export class TranscriptionListRunner {
       if (l.halted && work.stopping) return (next: Session) => this.kick(next, projectId);
       return;
     });
+  }
+
+  /** Projects whose loop failed once and has not since run to its end (R692). */
+  private readonly failedOnce = new Set<string>();
+
+  /**
+   * A loop that failed (not a lock, a close, a move or a Stop): the first time it is kicked again after
+   * LIST_RETRY_MS; failing again, the list is paused saying so (`stalled`), and Continue tries again (R692 M1).
+   */
+  private async failed(s: Session, projectId: string): Promise<void> {
+    if (!this.failedOnce.has(projectId)) {
+      this.failedOnce.add(projectId);
+      this.retries.get(projectId)?.();
+      const timer = this.state.opts.transcriptionListTimer ?? realTimer;
+      const cancel = timer(() => {
+        if (this.retries.get(projectId) === cancel) this.retries.delete(projectId);
+        this.kick(s, projectId);
+      }, LIST_RETRY_MS);
+      this.retries.set(projectId, cancel);
+      return;
+    }
+    this.failedOnce.delete(projectId);
+    try {
+      await setTranscriptionListState(s.repo, projectId, "paused", { stalled: true });
+    } catch (err) {
+      this.state.opts.log.warn({ err: this.state.describe(err) }, "transcription-list could not be paused");
+    }
   }
 
   private async run(s: Session, l: Loop): Promise<void> {
@@ -206,6 +245,14 @@ export class TranscriptionListRunner {
     }
     if (l.cut.signal.aborted) return false;
     if (job.status === "cancelled" && job.error?.code === "PROJECT_LOCKED") return false; // runs again at the unlock (R142)
+    if (job.status === "failed" && job.error?.code === "TOOL_NOT_INSTALLED") {
+      // A tool not installed (R692): the entry waits again and the list is paused for it; Continue tries again.
+      if (await markTranscriptionEntry(s.repo, pid, head.entryId, { status: "queued" })) {
+        await setTranscriptionListState(s.repo, pid, "paused", { tool: job.error.reason ?? "unknown" });
+      }
+      await this.publish(s, pid);
+      return false;
+    }
     let next: Parameters<typeof markTranscriptionEntry>[3];
     if (job.status === "done") next = { status: "done" };
     else if (job.status === "cancelled") next = { status: "cancelled", error: "CANCELLED" };
@@ -283,9 +330,12 @@ export class TranscriptionListRunner {
       else soundSecondsLeft += e === head ? e.entry.soundSec * (1 - Math.min(1, Math.max(0, progress ?? 0))) : e.entry.soundSec;
     }
     const soundPerSecond = head ? this.state.speedMeter.speed(head.entry.model) : undefined;
+    const paused = head !== undefined && view.state === "paused";
     return {
       projectId,
       state: head ? view.state : "idle",
+      ...(paused && view.tool !== undefined ? { tool: view.tool } : {}),
+      ...(paused && view.stalled ? { stalled: true } : {}),
       total: view.total,
       done: view.done,
       failed: view.failed,
@@ -345,6 +395,9 @@ export class TranscriptionListRunner {
 
   /** At the lock: the project's loop ends at once and nothing of it stays here. */
   stopProject(projectId: string): void {
+    this.retries.get(projectId)?.();
+    this.retries.delete(projectId);
+    this.failedOnce.delete(projectId);
     const l = this.loops.get(projectId);
     if (!l) return;
     l.cut.abort(new LoopEnded());
@@ -353,6 +406,6 @@ export class TranscriptionListRunner {
 
   /** At a close: every loop ends. */
   stopAll(): void {
-    for (const pid of [...this.loops.keys()]) this.stopProject(pid);
+    for (const pid of new Set([...this.loops.keys(), ...this.retries.keys(), ...this.failedOnce])) this.stopProject(pid);
   }
 }
