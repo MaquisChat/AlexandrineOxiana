@@ -277,7 +277,8 @@ describe("captureUrl", () => {
     const p = await project();
     process.env.FAKE_TOOL_MODE = "login";
     const out = await capture.captureUrl(p.id, YT, { transcribe: false });
-    expect(out).toEqual({ url: YT, status: "failed", errorCode: "LOGIN_REQUIRED", reason: LOGIN_SENTENCE });
+    // The stand-in gives the platform's own words as the worker does (R674 B), cut where yt-dlp speaks.
+    expect(out).toEqual({ url: YT, status: "failed", errorCode: "LOGIN_REQUIRED", reason: LOGIN_SENTENCE, platformReason: "Sign in to confirm you're not a bot." });
     expect(repo.listSourceIds(p.id)).toEqual([]);
   });
 
