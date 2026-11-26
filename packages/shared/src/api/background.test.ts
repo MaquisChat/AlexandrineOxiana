@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AUTOMATION_TEXT, BACKGROUND_EVENT, BYTES_PER_SECOND, DEFAULT_QUALITY, DISK_FLOOR_BYTES, DOWNLOAD_QUALITIES, FALLBACK_QUALITY, KEEP_AWAKE_TEXT,
-  LIST_BUTTONS, PROBLEMS_TEXT, QUALITIES_NEEDING_VIDEO_TOOLS, QUALITY_LABELS, RUN_ALREADY_RUNNING, RUN_ALREADY_RUNNING_TEXT, RUN_BUTTONS,
+  LIST_BUTTONS, LIST_STOPPED_TEXT, PROBLEMS_TEXT, QUALITIES_NEEDING_VIDEO_TOOLS, QUALITY_LABELS, RUN_ALREADY_RUNNING, RUN_ALREADY_RUNNING_TEXT, RUN_BUTTONS,
   RUN_NOT_RUNNING_TEXT, VIDEO_TOOLS_NEEDED_TEXT, WORK_LINES_TEXT, downloadProblemText, estimateBytes, estimateRateLimitedText, estimateText,
   formatSize, formatSizeRange, formatSoundLength, formatSpeed, formatTimeLeft, formatWait, platformName, platformSays, problemLine, runLines,
   transcribeAllText, transcriptionLines,
@@ -325,5 +325,90 @@ describe("the switches and the work lines", () => {
       reconnect: "Reconnect",
     });
     expect(BACKGROUND_EVENT).toBe("background.progress");
+  });
+});
+
+describe("fix round (R672)", () => {
+  const zero = { ...run, total: 0, done: 0, failed: 0, notCompleted: 0 };
+
+  it("a run that never read its list never says 0 of 0", () => {
+    expect(runLines({ ...zero, state: "stopped" }).title).toBe('"Example Channel" was stopped before it began.');
+    expect(runLines({ ...zero, state: "paused" }).title).toBe('"Example Channel" is paused. The list of videos has not been read yet.');
+    expect(runLines({ ...zero, platform: "instagram", state: "paused" }).title).toBe('"Example Channel" is paused. The list of posts has not been read yet.');
+    const disk = runLines({ ...zero, state: "paused-disk" });
+    expect(disk.title).toBe('"Example Channel": the list of videos has not been read yet.');
+    expect(disk.why).toBe("Paused: the disk is nearly full. Free some space, then press Resume downloads.");
+    const rate = runLines({ ...zero, state: "paused-rate-limited" });
+    expect(rate.title).toBe('"Example Channel": the list of videos has not been read yet.');
+    expect(rate.why).toBe("Paused: YouTube kept asking the app to slow down for 12 hours. Press Resume downloads to try again.");
+    const tool = runLines({ ...zero, state: "paused-tool", tool: "ffmpeg" });
+    expect(tool.title).toBe('"Example Channel": the list of videos has not been read yet.');
+    expect(tool.why).toBe("Paused: Video tools are not installed. Install them from the Optional tools screen, then press Resume downloads.");
+    const f = runLines({ ...zero, platform: "instagram", state: "failed", reason: "The media helper is not running." });
+    expect(f.title).toBe('"Example Channel": the list of posts has not been read yet.');
+    expect(f.why).toBe("The media helper is not running.");
+    expect(f.resume).toBe("Resume downloads");
+  });
+
+  it("the sentence after a Stop of the transcription list", () => {
+    expect(LIST_STOPPED_TEXT).toBe(
+      "The transcriptions were stopped. The sources stay; “Transcribe everything without a transcript” puts them on the list again.",
+    );
+  });
+
+  it("transcribing everything for exactly 1 source", () => {
+    expect(transcribeAllText.confirm({ count: 1, soundSeconds: 60, unknownLengths: 0 })).toBe(
+      "1 source has audio or video and no transcript: about 1 minute of sound. It is transcribed on this Mac, after anything already on the list.",
+    );
+    expect(transcribeAllText.confirm({ count: 1, soundSeconds: 0, unknownLengths: 1 })).toBe(
+      "1 source has audio or video and no transcript; its length is not known. It is transcribed on this Mac, after anything already on the list.",
+    );
+  });
+
+  it("the disk sentence when nothing new will be downloaded", () => {
+    expect(estimateText.disk({ ...e, count: 0, soundSeconds: 0 }, "720p")).toBe("Nothing new will be downloaded, so no disk space is needed.");
+    expect(estimateText.tooBig({ ...e, count: 0, soundSeconds: 0, freeBytes: 1_000_000_000 }, "720p")).toBeUndefined();
+  });
+
+  it("a size range whose low end is below 1 MB", () => {
+    expect(formatSizeRange(500_000, 1_200_000)).toBe("up to 1.2 MB");
+    expect(formatSizeRange(100_000, 900_000)).toBe("less than 1 MB");
+    expect(estimateText.disk({ ...e, count: 1, soundSeconds: 60, freeBytes: null }, "audio")).toBe("Roughly up to 1.2 MB at this quality.");
+    expect(estimateText.disk({ ...e, count: 1, soundSeconds: 30, freeBytes: null }, "audio")).toBe("Roughly less than 1 MB at this quality.");
+  });
+
+  it("the measured transcription time with lengths not known", () => {
+    expect(estimateText.transcribeTime({ ...e, soundSeconds: 0, unknownLengths: 412, measuredSpeed: 4 })).toBe(
+      "Transcribing: the lengths are not known, so the app cannot say how long.",
+    );
+    expect(estimateText.transcribeTime({ ...e, soundSeconds: 6 * 86_400 * 4, unknownLengths: 12, measuredSpeed: 4 })).toBe(
+      "Transcribing: about 6 days at this Mac's speed (4 minutes of sound per minute). The 12 videos of unknown length are not counted.",
+    );
+    expect(estimateText.transcribeTime({ ...e, soundSeconds: 6 * 86_400 * 4, unknownLengths: 1, measuredSpeed: 4 })).toBe(
+      "Transcribing: about 6 days at this Mac's speed (4 minutes of sound per minute). The 1 video of unknown length is not counted.",
+    );
+    expect(estimateText.transcribeTime({ ...e, platform: "instagram", soundSeconds: 6 * 86_400 * 4, unknownLengths: 12, measuredSpeed: 4 })).toBe(
+      "Transcribing: about 6 days at this Mac's speed (4 minutes of sound per minute). The 12 posts of unknown length are not counted.",
+    );
+    expect(estimateText.transcribeTime({ ...e, platform: "instagram", soundSeconds: 6 * 86_400 * 4, unknownLengths: 1, measuredSpeed: 4 })).toBe(
+      "Transcribing: about 6 days at this Mac's speed (4 minutes of sound per minute). The 1 post of unknown length is not counted.",
+    );
+  });
+
+  it("rounding never says 60 minutes, 120 minutes or 48 hours", () => {
+    expect(formatSoundLength(3599)).toBe("about 1 hour");
+    expect(formatSoundLength(3570)).toBe("about 1 hour");
+    expect(formatSoundLength(3569)).toBe("about 59 minutes");
+    expect(formatTimeLeft(7199)).toBe("about 2 hours");
+    expect(formatTimeLeft(7169)).toBe("about 119 minutes");
+    expect(formatTimeLeft(172_799)).toBe("about 2 days");
+    expect(formatTimeLeft(171_000)).toBe("about 2 days");
+    expect(formatTimeLeft(170_999)).toBe("about 47 hours");
+  });
+
+  it("a problem with an empty title says (no title)", () => {
+    expect(problemLine({ title: "", url: "https://youtu.be/abc", reason: "This video is private." }, "youtube")).toBe(
+      "(no title) — https://youtu.be/abc — This video is private.",
+    );
   });
 });

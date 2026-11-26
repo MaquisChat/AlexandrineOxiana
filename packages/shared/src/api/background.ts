@@ -98,18 +98,23 @@ export function formatSize(bytes: number): string {
   return s ? `${s.value} ${s.unit}` : "less than 1 MB";
 }
 
-/** "150–250 GB" in one unit, else "900 MB–1.5 GB" (en dash, no spaces). */
+/** "150–250 GB" in one unit, else "900 MB–1.5 GB" (en dash, no spaces); "up to 1.2 MB" when only the high end reaches 1 MB. */
 export function formatSizeRange(low: number, high: number): string {
   const a = sizeParts(low);
   const b = sizeParts(high);
   if (a && b && a.unit === b.unit) return a.value === b.value ? `${b.value} ${b.unit}` : `${a.value}–${b.value} ${b.unit}`;
+  if (!b) return "less than 1 MB";
+  if (!a) return `up to ${formatSize(high)}`;
   const lo = formatSize(low);
   const hi = formatSize(high);
   return lo === hi ? hi : `${lo}–${hi}`;
 }
 
 export function formatSoundLength(seconds: number): string {
-  if (seconds < 3600) return `about ${plural(Math.max(1, Math.round(seconds / 60)), "minute")}`;
+  if (seconds < 3600) {
+    const m = Math.max(1, Math.round(seconds / 60));
+    return m >= 60 ? "about 1 hour" : `about ${plural(m, "minute")}`;
+  }
   if (seconds < 36_000) {
     const h = Math.round(seconds / 360) / 10;
     return h === 1 ? "about 1 hour" : `about ${h} hours`;
@@ -124,8 +129,14 @@ export function formatWait(ms: number): string {
 
 export function formatTimeLeft(seconds: number): string {
   if (seconds < 60) return "less than a minute";
-  if (seconds < 7200) return `about ${plural(Math.round(seconds / 60), "minute")}`;
-  if (seconds < 172_800) return `about ${plural(Math.round(seconds / 3600), "hour")}`;
+  if (seconds < 7200) {
+    const m = Math.round(seconds / 60);
+    return m >= 120 ? "about 2 hours" : `about ${plural(m, "minute")}`;
+  }
+  if (seconds < 172_800) {
+    const h = Math.round(seconds / 3600);
+    return h >= 48 ? "about 2 days" : `about ${plural(h, "hour")}`;
+  }
   return `about ${plural(Math.round(seconds / 86_400), "day")}`;
 }
 
@@ -194,6 +205,7 @@ export const estimateText = {
     return e.listComplete ? undefined : `${platformName(e.platform)} stopped listing part-way, so this may not be the whole ${e.kind}.`;
   },
   disk(e: CaptureEstimate, q: DownloadQuality): string {
+    if (e.count === 0) return "Nothing new will be downloaded, so no disk space is needed.";
     if (e.metadataOnly) return "Metadata only: almost no disk space is needed.";
     if (e.count > 0 && e.unknownLengths >= e.count) {
       return `Size unknown: ${platformName(e.platform)} did not give the ${noun(e.platform, 2)}' lengths.${freePart(e)}`;
@@ -204,7 +216,7 @@ export const estimateText = {
     return `Roughly ${range} at this quality${more}.${freePart(e)}`;
   },
   tooBig(e: CaptureEstimate, q: DownloadQuality): string | undefined {
-    if (e.metadataOnly || e.freeBytes === null) return undefined;
+    if (e.count === 0 || e.metadataOnly || e.freeBytes === null) return undefined;
     return estimateBytes(e.soundSeconds, q).high > e.freeBytes - DISK_FLOOR_BYTES
       ? "This may need more space than the disk has free, less the 10 GB the app keeps free."
       : undefined;
@@ -216,7 +228,11 @@ export const estimateText = {
   },
   transcribeTime(e: CaptureEstimate): string {
     if (e.measuredSpeed !== undefined && e.measuredSpeed > 0) {
-      return `Transcribing: ${formatTimeLeft(e.soundSeconds / e.measuredSpeed)} at this Mac's speed (${formatSpeed(e.measuredSpeed)}).`;
+      if (e.soundSeconds === 0 && e.unknownLengths > 0) return "Transcribing: the lengths are not known, so the app cannot say how long.";
+      const measured = `Transcribing: ${formatTimeLeft(e.soundSeconds / e.measuredSpeed)} at this Mac's speed (${formatSpeed(e.measuredSpeed)}).`;
+      if (e.unknownLengths <= 0) return measured;
+      const n = e.unknownLengths;
+      return `${measured} The ${n} ${noun(e.platform, n)} of unknown length ${n === 1 ? "is" : "are"} not counted.`;
     }
     const first = `the first ${noun(e.platform, 1)} on this Mac`;
     return e.soundSeconds >= 86_400
@@ -308,6 +324,8 @@ export function runLines(run: DownloadRunSummary): { title: string; wait?: strin
   const t = run.title;
   const of = `${run.done} of ${run.total}`;
   const downloading = run.total === 0 ? `Downloading "${t}": reading the list of ${noun(run.platform, 2)}…` : `Downloading "${t}": ${of}`;
+  /** The paused and failed title of a run whose list was never read (total 0). */
+  const notRead = run.total === 0 ? `"${t}": the list of ${noun(run.platform, 2)} has not been read yet.` : undefined;
   let title: string;
   let why: string | undefined;
   let wait: string | undefined;
@@ -328,26 +346,26 @@ export function runLines(run: DownloadRunSummary): { title: string; wait?: strin
       title = run.total === 0 ? `The capture of '${t}' was interrupted before it began.` : `The capture of '${t}' was interrupted: ${of} done.`;
       break;
     case "paused":
-      title = `"${t}" is paused: ${of} downloaded.`;
+      title = run.total === 0 ? `"${t}" is paused. The list of ${noun(run.platform, 2)} has not been read yet.` : `"${t}" is paused: ${of} downloaded.`;
       break;
     case "paused-disk":
-      title = `"${t}": ${of} downloaded.`;
+      title = notRead ?? `"${t}": ${of} downloaded.`;
       why = "Paused: the disk is nearly full. Free some space, then press Resume downloads.";
       break;
     case "paused-rate-limited":
-      title = `"${t}": ${of} downloaded.`;
+      title = notRead ?? `"${t}": ${of} downloaded.`;
       why = `Paused: ${platformName(run.platform)} kept asking the app to slow down for 12 hours. Press Resume downloads to try again.`;
       break;
     case "paused-tool":
-      title = `"${t}": ${of} downloaded.`;
+      title = notRead ?? `"${t}": ${of} downloaded.`;
       why = toolMissing(run.tool);
       break;
     case "failed":
-      title = `"${t}": ${of} downloaded.`;
+      title = notRead ?? `"${t}": ${of} downloaded.`;
       why = run.reason;
       break;
     case "stopped":
-      title = `"${t}" was stopped: ${of} downloaded.`;
+      title = run.total === 0 ? `"${t}" was stopped before it began.` : `"${t}" was stopped: ${of} downloaded.`;
       break;
     case "finished":
       title =
@@ -413,7 +431,7 @@ export const PROBLEMS_TEXT = {
 /** One problem as a line of the copied list. */
 export function problemLine(pr: DownloadProblem, p: CapturePlatform): string {
   const says = pr.platformReason ? ` ${platformSays(p, pr.platformReason)}` : "";
-  return `${pr.title ?? PROBLEMS_TEXT.noTitle} — ${pr.url} — ${pr.reason}${says}`;
+  return `${pr.title || PROBLEMS_TEXT.noTitle} — ${pr.url} — ${pr.reason}${says}`;
 }
 
 export const RUN_BUTTONS = { pause: "Pause", stop: "Stop", showThem: "Show them", discard: "Discard" };
@@ -464,16 +482,22 @@ export function transcriptionLines(l: TranscriptionListSummary): { title?: strin
 
 export const LIST_BUTTONS = { pause: "Pause", continue: "Continue", stop: "Stop" };
 
+/** Said once after a Stop of the transcription list (R672). */
+export const LIST_STOPPED_TEXT: string =
+  "The transcriptions were stopped. The sources stay; “Transcribe everything without a transcript” puts them on the list again.";
+
 const ONE_AT_A_TIME = "They are transcribed one at a time on this Mac, after anything already on the list.";
+const ONE_SOURCE = "It is transcribed on this Mac, after anything already on the list.";
 
 export const transcribeAllText = {
   button: "Transcribe everything without a transcript",
   confirm(r: UntranscribedResponse): string {
     if (r.count <= 0) return transcribeAllText.none;
+    const after = r.count === 1 ? ONE_SOURCE : ONE_AT_A_TIME;
     const have = r.count === 1 ? "1 source has audio or video and no transcript" : `${r.count} sources have audio or video and no transcript`;
-    if (r.unknownLengths >= r.count) return `${have}; ${r.count === 1 ? "its length is" : "their lengths are"} not known. ${ONE_AT_A_TIME}`;
+    if (r.unknownLengths >= r.count) return `${have}; ${r.count === 1 ? "its length is" : "their lengths are"} not known. ${after}`;
     const unknown = r.unknownLengths > 0 ? ` ${r.unknownLengths} of them ${r.unknownLengths === 1 ? "has" : "have"} no known length.` : "";
-    return `${have}: ${formatSoundLength(r.soundSeconds)} of sound.${unknown} ${ONE_AT_A_TIME}`;
+    return `${have}: ${formatSoundLength(r.soundSeconds)} of sound.${unknown} ${after}`;
   },
   none: "Every source with audio or video already has a transcript, or is already on the transcription list.",
   added(n: number): string {
