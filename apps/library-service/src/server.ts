@@ -101,9 +101,9 @@ export interface ServiceOptions {
   browserStallMs?: number;
   /** Test seam (NODE_ENV=test or VITEST only, R47): how long after the ticket's check the browser's PDF must have ended (default FIND_BROWSER_TAKE_MS; R353 a). */
   browserTakeMs?: number;
-  /** Test seam (NODE_ENV=test or VITEST only, R47): the download runs' sleep (the gap between downloads and every wait). */
+  /** Test seam (only when NODE_ENV is exactly "test", R47): the download runs' sleep (the gap between downloads and every wait). */
   downloadSleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
-  /** Test seam (NODE_ENV=test or VITEST only, R47): the download runs' reading of the free space. */
+  /** Test seam (only when NODE_ENV is exactly "test", R47): the download runs' reading of the free space (main.ts: AO_TEST_FREE_BYTES). */
   downloadFreeBytes?: (dir: string) => Promise<number | null>;
 }
 
@@ -154,9 +154,9 @@ const OPEN_ROUTES = new Set(["POST /extension/pair/confirm"]);
 /** Log redaction (R96): credentials never reach the log, whatever object carries them. */
 const REDACT = ["authorization", "secret", "passphrase", "recoveryCode", "apiKey", "token", "code", "cookie", "ticket", "link"].flatMap((k) => [k, `*.${k}`, `*.*.${k}`, `req.headers.${k}`]);
 
-/** The download runs' test seams, honoured only under NODE_ENV=test or VITEST (R47). */
+/** The download runs' test seams, honoured only when NODE_ENV is exactly "test" (R47, R687 D). */
 function downloadSeams(opts: ServiceOptions): { downloads?: { sleep?: ServiceOptions["downloadSleep"]; freeBytes?: ServiceOptions["downloadFreeBytes"] } } {
-  const testing = process.env.NODE_ENV === "test" || process.env.VITEST !== undefined;
+  const testing = process.env.NODE_ENV === "test";
   if (!testing || (!opts.downloadSleep && !opts.downloadFreeBytes)) return {};
   return { downloads: { ...(opts.downloadSleep ? { sleep: opts.downloadSleep } : {}), ...(opts.downloadFreeBytes ? { freeBytes: opts.downloadFreeBytes } : {}) } };
 }

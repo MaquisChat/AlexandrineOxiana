@@ -39,6 +39,7 @@
  * Test-only (honoured ONLY when NODE_ENV is exactly "test"; otherwise not looked at; Task Z11, R289 a):
  *   AO_SECRETS=memory     keys are kept in this process's memory only (a restart forgets them)
  *   AO_ZOTERO_API_ORIGIN  exactly http://127.0.0.1:<port>: a stand-in for Zotero, the API and the only file origin
+ *   AO_TEST_FREE_BYTES    a whole number of bytes: the free space the download runs see (the disk floor, the estimate)
  * In test mode a value not in that exact form refuses the start, naming the variable.
  *
  * Once listening it prints `AO_SERVICE_READY port=<n>` on stdout. On SIGTERM (or SIGINT) it refuses
@@ -50,6 +51,7 @@
 import { openLibrary, useSecretsFromEnv, useZoteroApiOriginFromEnv } from "@ao/library";
 import { listenOnRememberedPort } from "./port-memory.js";
 import { createService } from "./server.js";
+import { downloadFreeBytesFromEnv } from "./downloads.js";
 import { FolderGrants } from "./folder-grants.js";
 import { inputLineHandler } from "./file-grants.js";
 import { libraryFileHandler } from "./routes/your-library.js";
@@ -71,8 +73,9 @@ async function main(): Promise<void> {
   // value not in its exact form refuses the start with a sentence naming the variable.
   useSecretsFromEnv(process.env);
   useZoteroApiOriginFromEnv(process.env);
+  const downloadFreeBytes = downloadFreeBytesFromEnv(process.env);
   const folderGrants = new FolderGrants();
-  const svc = await createService({ token, folderGrants, ...(process.env.AO_NO_WORKER === "1" ? { worker: null } : {}) });
+  const svc = await createService({ token, folderGrants, ...(downloadFreeBytes ? { downloadFreeBytes } : {}), ...(process.env.AO_NO_WORKER === "1" ? { worker: null } : {}) });
 
   let stopping = false;
   const stop = (signal: string) => {

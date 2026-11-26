@@ -25,6 +25,7 @@ import {
 } from "@ao/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FAKE_TOOLS_DIR, startToolWorker, type SubmittedJob, type ToolWorker } from "../../../packages/library/src/capture/testing.js";
+import { downloadFreeBytesFromEnv } from "./downloads.js";
 import { TOOL_NOT_INSTALLED_TEXT } from "./errors.js";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
@@ -461,16 +462,29 @@ describe("a run started from capture-profile", () => {
     await openLibrary();
     for (const what of ["pause", "stop"] as const) {
       const pid = await project();
+      runLog.length = 0;
       const first = hold(itemOf(idA(2)));
       const a = await captureProfile(pid, A);
+      const aId = a.json.queueId as string;
       await first.reached;
       const b = await captureProfile(pid, B);
       expect(b.status, b.body).toBe(200);
-      expect((await act(pid, a.json.queueId, what)).status).toBe(200);
+      const ended = what === "pause" ? "paused" : "stopped";
+      const off = svc.state.events.subscribe((e) => {
+        const run = (e.data as { downloads?: DownloadRunSummary }).downloads;
+        if (e.type === "background.progress" && run?.runId === aId && run.state === ended) runLog.push("END A");
+      });
+      expect((await act(pid, aId, what)).status).toBe(200);
       first.release();
       await svc.state.idle();
-      expect(await runOf(pid, a.json.queueId)).toMatchObject({ state: what === "pause" ? "paused" : "stopped", done: 2 });
+      off();
+      expect(await runOf(pid, aId)).toMatchObject({ state: ended, done: 2 });
       expect(await runOf(pid, b.json.queueId)).toMatchObject({ state: "finished", done: 3 });
+      // Nothing of the second address was asked of the platform before the first run paused or stopped.
+      const end = runLog.indexOf("END A");
+      expect(end).toBeGreaterThan(0);
+      expect(runLog.slice(0, end).some((u) => u.includes("other.dancer"))).toBe(false);
+      expect(runLog.slice(end).some((u) => u.includes("other.dancer"))).toBe(true);
     }
   });
 
@@ -1171,6 +1185,34 @@ describe("a move (R680, R106, R534 b)", () => {
     expect(asked()).toBe(atMove);
     expect(runLog.some((u) => u.includes("other.dancer"))).toBe(false);
     expect(await runs(plain)).toEqual([]);
+  });
+});
+
+describe("the test-only free space (R687 D, R47)", () => {
+  const savedNodeEnv = process.env.NODE_ENV;
+  afterEach(() => {
+    process.env.NODE_ENV = savedNodeEnv;
+  });
+
+  it("AO_TEST_FREE_BYTES gives the download runs their free space only when NODE_ENV is exactly test", async () => {
+    const read = downloadFreeBytesFromEnv({ NODE_ENV: "test", AO_TEST_FREE_BYTES: "500000000000" });
+    expect(await read?.("/anywhere")).toBe(500_000_000_000);
+    for (const NODE_ENV of [undefined, "production", "development", "Test", "test "]) {
+      expect(downloadFreeBytesFromEnv({ ...(NODE_ENV === undefined ? {} : { NODE_ENV }), AO_TEST_FREE_BYTES: "500000000000" }), String(NODE_ENV)).toBeUndefined();
+    }
+    expect(downloadFreeBytesFromEnv({ NODE_ENV: "test" })).toBeUndefined();
+    // In test mode a value that is not a whole number of bytes refuses the start, naming the variable.
+    for (const bad of ["", "12.5", "-1", "1e9", "lots"]) expect(() => downloadFreeBytesFromEnv({ NODE_ENV: "test", AO_TEST_FREE_BYTES: bad }), bad).toThrow(/AO_TEST_FREE_BYTES/);
+  });
+
+  it("the download runs' test seams are ignored unless NODE_ENV is exactly test", async () => {
+    process.env.NODE_ENV = "development";
+    await start({ downloadFreeBytes: async () => 1, downloadSleep: async () => {} });
+    expect(svc.state.opts.downloads).toBeUndefined();
+    await svc.close();
+    process.env.NODE_ENV = "test";
+    await start({ downloadFreeBytes: async () => 1 });
+    expect(svc.state.opts.downloads?.freeBytes).toBeDefined();
   });
 });
 

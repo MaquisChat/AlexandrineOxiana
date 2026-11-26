@@ -268,7 +268,7 @@ export interface StateOptions {
   startupTimer?: (fire: () => void, ms: number) => () => void;
   /** Test seam: the tick of the automatic Zotero sync's scheduler (Task Z10; default 60,000 ms). Not an environment variable. */
   zoteroTickMs?: number;
-  /** Test seams (honoured only under NODE_ENV=test or VITEST, R47): the download runs' sleep and free-space reading. */
+  /** Test seams (honoured only when NODE_ENV is exactly "test", R47): the download runs' sleep and free-space reading. */
   downloads?: DownloadSeams;
 }
 

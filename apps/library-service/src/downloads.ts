@@ -55,7 +55,7 @@ import { ApiError, notFound } from "./errors.js";
 import { requireUnlocked } from "./routes/capture.js";
 import type { ServiceState, Session } from "./state.js";
 
-/** Test seams (R47: the service honours them only under NODE_ENV=test or VITEST). */
+/** Test seams (R47: the service honours them only when NODE_ENV is exactly "test"). */
 export interface DownloadSeams {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   freeBytes?: (dir: string) => Promise<number | null>;
@@ -552,4 +552,21 @@ export class DownloadRunner {
       this.forget(h);
     }
   }
+}
+
+/** The test-only switch for the free space the download runs see (R687 D, R289 a). */
+export const TEST_FREE_BYTES_ENV = "AO_TEST_FREE_BYTES";
+
+/**
+ * Test-only (honoured ONLY when NODE_ENV is exactly "test"; otherwise not looked at): `AO_TEST_FREE_BYTES`, a whole
+ * number of bytes, is the free space every download run reads (the disk floor and the estimate), so that no browser
+ * scenario depends on the disk of the machine it runs on. In test mode a value not in that form refuses the start.
+ */
+export function downloadFreeBytesFromEnv(env: NodeJS.ProcessEnv): ((dir: string) => Promise<number | null>) | undefined {
+  if (env.NODE_ENV !== "test") return undefined;
+  const raw = env[TEST_FREE_BYTES_ENV];
+  if (raw === undefined) return undefined;
+  if (!/^\d{1,16}$/.test(raw)) throw new Error(`${TEST_FREE_BYTES_ENV} must be a whole number of bytes.`);
+  const bytes = Number(raw);
+  return async () => bytes;
 }

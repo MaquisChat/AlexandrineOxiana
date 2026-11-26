@@ -7,7 +7,8 @@
  *  - starts the service as its `start` script does (`node --max-old-space-size=512 --import tsx
  *    src/main.ts`), with a fresh random token written on its standard input as one line (R98: never
  *    in its environment or command line; standard input is left open), port 0, NODE_ENV=test,
- *    AO_CONFIG_DIR in the temporary folder, the recorded lookup answers (AO_LOOKUP_FIXTURES, honoured only in test mode) and the
+ *    AO_CONFIG_DIR in the temporary folder, the recorded lookup answers (AO_LOOKUP_FIXTURES, honoured only in test mode), 500 GB
+ *    of free space for the download runs (AO_TEST_FREE_BYTES, honoured only in test mode) and the
  *    fake yt-dlp / gallery-dl named in AO_YTDLP_BIN / AO_GALLERYDL_BIN (the worker would otherwise
  *    run the real gallery-dl from its venv) and first on PATH; it waits for
  *    `AO_SERVICE_READY port=<n>`. The service starts the real media worker itself when a library
@@ -381,6 +382,8 @@ export async function startService(root: string, opts: StartOptions = {}): Promi
   const token = randomBytes(32).toString("hex");
   const env = serviceEnv({
     NODE_ENV: "test",
+    // Test-only (honoured only under NODE_ENV=test): the download runs see 500 GB free, so no scenario depends on this machine's disk (R687 D).
+    AO_TEST_FREE_BYTES: "500000000000",
     AO_SERVICE_PORT: "0",
     AO_CONFIG_DIR: join(root, "config"),
     AO_TOOLS_DIR: join(root, "tools"),
