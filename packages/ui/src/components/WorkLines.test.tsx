@@ -679,3 +679,135 @@ describe("WorkLines: names and what a screen reader is told (R679 B)", () => {
     expect(within(lineOf(SECOND)).getByRole("alert")).toBe(alert);
   });
 });
+
+describe("WorkLines: smaller points (R679 D)", () => {
+  /** Two presses in the same tick, before anything is drawn again (M1). */
+  const twice = (b: HTMLElement) =>
+    act(() => {
+      fireEvent.click(b);
+      fireEvent.click(b);
+    });
+
+  it("two presses in one tick of a run's action send one request", async () => {
+    const TITLE = 'Downloading "Example Channel": 120 of 412';
+    const { m } = start({ runs: [exampleRun()] });
+    await shown(TITLE);
+    await twice(buttonOf(TITLE, "Pause"));
+    await shown('"Example Channel" is paused: 120 of 412 downloaded.');
+    expect(m.count("POST /projects/p1/downloads/run-1/pause")).toBe(1);
+  });
+
+  it("two presses in one tick of Discard send one request", async () => {
+    const TITLE = "The capture of 'Example Channel' was interrupted: 120 of 412 done.";
+    const { m } = start({ runs: [exampleRun({ state: "interrupted" })] });
+    await shown(TITLE);
+    await twice(buttonOf(TITLE, "Discard"));
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+    expect(m.count("POST /projects/p1/downloads/run-1/discard")).toBe(1);
+  });
+
+  it('two presses in one tick of a run\'s "Remove from this list" send one request', async () => {
+    const TITLE = '"Example Channel": all 412 downloaded.';
+    const { m } = start({ runs: [exampleRun({ state: "finished", done: 412 })] });
+    await shown(TITLE);
+    await twice(buttonOf(TITLE, "Remove from this list"));
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+    expect(m.count("POST /projects/p1/downloads/run-1/discard")).toBe(1);
+  });
+
+  it("two presses in one tick of the list's action send one request", async () => {
+    const TITLE = "Transcribing: 1 of 5";
+    const { m } = start({ lists: { p1: idleList("p1", { state: "running", total: 5, done: 1 }) } });
+    await shown(TITLE);
+    await twice(buttonOf(TITLE, "Pause"));
+    await shown("Transcriptions paused: 1 of 5 done.");
+    expect(m.count("POST /projects/p1/transcription-list/pause")).toBe(1);
+  });
+
+  it('two presses in one tick of the list\'s "Remove from this list" send one request', async () => {
+    const TITLE = "Transcriptions finished: all 3 done.";
+    const { m } = start({ lists: { p1: idleList("p1", { total: 3, done: 3 }) } });
+    await shown(TITLE);
+    await twice(buttonOf(TITLE, "Remove from this list"));
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+    expect(m.count("POST /projects/p1/transcription-list/stop")).toBe(1);
+  });
+
+  it('a title is found with its quotation marks: the titles "of" and "Downloading" (M4)', async () => {
+    const OF = "The capture of 'of' was interrupted: 120 of 412 done.";
+    const DL = 'Downloading "Downloading": 120 of 412';
+    start({ runs: [exampleRun({ title: "of", state: "interrupted" }), exampleRun({ runId: "run-2", title: "Downloading", startedAt: later(5) })] });
+    for (const [text, title, before] of [
+      [OF, "of", "The capture of '"],
+      [DL, "Downloading", 'Downloading "'],
+    ] as const) {
+      const p = await shown(text);
+      const outside = p.querySelectorAll("[dir=auto]");
+      expect(outside).toHaveLength(1);
+      expect(outside[0]!.textContent).toBe(title);
+      expect(p.firstChild!.textContent).toBe(before);
+    }
+  });
+
+  it('"Show them" says nothing under its heading until the list arrives; a failure says so with "Try again" inside that run\'s block (M8)', async () => {
+    const TITLE = '"Example Channel": 409 of 412 downloaded. 3 could not be downloaded.';
+    let failing = true;
+    const problems = holding("/projects/p1/downloads/run-1/problems", (n) => n === 1);
+    const fail = http.get(url("/projects/p1/downloads/run-1/problems"), () => (failing ? HttpResponse.error() : undefined));
+    start({ runs: [exampleRun({ state: "finished", done: 409, failed: 3 })], problems: { "run-1": { platform: "youtube", problems: PROBLEMS } }, extra: [problems.handler, fail] });
+    await shown(TITLE);
+    const user = userEvent.setup();
+    await user.click(buttonOf(TITLE, "Show them"));
+    await waitFor(() => expect(problems.count()).toBe(1));
+    // While the read is out: no empty heading.
+    expect(screen.queryByRole("heading", { name: "Could not be downloaded" })).toBeNull();
+    problems.release();
+    const alert = await within(lineOf(TITLE)).findByRole("alert");
+    expect(alert.textContent).toBe("The library service could not be reached.");
+    const h = within(lineOf(TITLE)).getByRole("heading", { name: "Could not be downloaded" });
+    await waitFor(() => expect(document.activeElement).toBe(h));
+    failing = false;
+    await user.click(buttonOf(TITLE, "Try again"));
+    await shown("Interview with the mayor");
+    expect(within(lineOf(TITLE)).queryByRole("alert")).toBeNull();
+    expect(problems.count()).toBe(2);
+  });
+
+  it('the "Show them" read is cancelled when the block closes, and when the lines go (M8)', async () => {
+    const TITLE = '"Example Channel": 409 of 412 downloaded. 3 could not be downloaded.';
+    const problems = holding("/projects/p1/downloads/run-1/problems", () => true);
+    const { view } = start({ runs: [exampleRun({ state: "finished", done: 409, failed: 3 })], extra: [problems.handler] });
+    await shown(TITLE);
+    const user = userEvent.setup();
+    await user.click(buttonOf(TITLE, "Show them"));
+    await waitFor(() => expect(problems.count()).toBe(1));
+    await user.click(buttonOf(TITLE, "Show them"));
+    await waitFor(() => expect(problems.requests[0]!.signal.aborted).toBe(true));
+    await user.click(buttonOf(TITLE, "Show them"));
+    await waitFor(() => expect(problems.count()).toBe(2));
+    view.unmount();
+    await waitFor(() => expect(problems.requests[1]!.signal.aborted).toBe(true));
+    problems.release();
+  });
+
+  it('the "Show them" read has the first-read time limit (M8)', async () => {
+    const TITLE = '"Example Channel": 409 of 412 downloaded. 3 could not be downloaded.';
+    const problems = holding("/projects/p1/downloads/run-1/problems", () => true);
+    start({ runs: [exampleRun({ state: "finished", done: 409, failed: 3 })], extra: [problems.handler] });
+    await shown(TITLE);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      fireEvent.click(buttonOf(TITLE, "Show them"));
+      await vi.waitFor(() => expect(problems.count()).toBe(1));
+      // (vi.waitFor moved the fake clock a little on its own.)
+      await act(async () => vi.advanceTimersByTimeAsync(19_000));
+      expect(within(lineOf(TITLE)).queryByRole("alert")).toBeNull();
+      expect(problems.requests[0]!.signal.aborted).toBe(false);
+      await act(async () => vi.advanceTimersByTimeAsync(1_000));
+      await vi.waitFor(() => expect(within(lineOf(TITLE)).getByRole("alert").textContent).toBe("The library service did not answer in time."));
+      expect(problems.requests[0]!.signal.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

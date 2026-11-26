@@ -29,7 +29,7 @@ import {
 } from "@ao/shared";
 import { backgroundApi, backgroundProgress } from "../api/background";
 import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient, type ServiceEvent } from "../api/client";
-import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
+import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../api/firstRead";
 import { errorText } from "../api/library";
 import { UserText } from "./UserText";
 import "./WorkLines.css";
@@ -81,6 +81,9 @@ const SAY_EVERY_MS = 5_000;
 
 const RUNNING = new Set(["queued", "downloading", "waiting"]);
 
+/** A failed read in one plain sentence, as the screens say it: no answer (none at all, or none in time), else the service's words. */
+const readFailure = (err: unknown) => (isUnreachable(err) ? (err as ApiClientError).message : errorText(err, "The list could not be read."));
+
 /** The service does not know the route (an older service): nothing to show. */
 const unknownRoute = (err: unknown) => err instanceof ApiClientError && err.status === 404;
 
@@ -111,17 +114,25 @@ function upsert(held: DownloadRunSummary[], run: DownloadRunSummary): DownloadRu
   return newestFirst([...held.filter((r) => r.runId !== run.runId), run]);
 }
 
-/** A sentence with the outside words in it (a title) shown through UserText; the rest is the app's own. */
+/**
+ * A sentence with the outside words in it (a title) shown through UserText; the rest is the app's own. The title is
+ * found with its quotation marks as the sentence has them, so a title that is also one of the fixed words ("of",
+ * "Downloading") cannot wrap the wrong ones; not found, the whole sentence goes through UserText (R679 D2).
+ */
 function Sentence({ text, part }: { text: string; part: string | undefined }): ReactNode {
-  const at = part ? text.indexOf(part) : -1;
-  if (!part || at < 0) return text;
-  return (
-    <>
-      {text.slice(0, at)}
-      <UserText>{part}</UserText>
-      {text.slice(at + part.length)}
-    </>
-  );
+  if (!part) return text;
+  for (const q of ['"', "'"]) {
+    const at = text.indexOf(`${q}${part}${q}`);
+    if (at < 0) continue;
+    return (
+      <>
+        {text.slice(0, at + 1)}
+        <UserText>{part}</UserText>
+        {text.slice(at + 1 + part.length)}
+      </>
+    );
+  }
+  return <UserText>{text}</UserText>;
 }
 
 /**
@@ -158,6 +169,7 @@ function Said({ text, tellFirst }: { text: string | undefined; tellFirst?: boole
   );
 }
 
+/** A run's "Show them" block: open with nothing yet while its read is out. */
 interface ProblemsView {
   data?: DownloadProblemsResponse;
   error?: string;
@@ -183,6 +195,15 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
   const busyNow = useRef(new Set<string>());
   const [problems, setProblems] = useState<Record<string, ProblemsView>>({});
+  /** The "Show them" reads out, per run: cancelled when the block closes, the project changes or the lines go (R679 D3). */
+  const problemReads = useRef(new Map<string, AbortController>());
+  useEffect(
+    () => () => {
+      for (const c of problemReads.current.values()) c.abort();
+      problemReads.current.clear();
+    },
+    [projectId],
+  );
   const focusHeading = useRef(false);
   /**
    * R679 A4: a count of what arrived (events and answers), and for each run, and for the list, the count when it last
@@ -414,17 +435,32 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
       focusHeading.current = true;
     });
 
+  /** The run's problems, read with the first-read time limit (R679 D3). */
+  const readProblems = (runId: string) => {
+    problemReads.current.get(runId)?.abort();
+    const ctl = new AbortController();
+    problemReads.current.set(runId, ctl);
+    setProblems((p) => ({ ...p, [runId]: {} }));
+    const pid = projectId;
+    const mine = () => !ctl.signal.aborted && current.current === pid;
+    readWithin((s) => api.problems(pid, runId, { signal: s }), FIRST_READ_TIMEOUT_MS, ctl.signal)
+      .then(
+        (data) => mine() && setProblems((p) => (p[runId] ? { ...p, [runId]: { data } } : p)),
+        (err: unknown) => mine() && setProblems((p) => (p[runId] ? { ...p, [runId]: { error: readFailure(err) } } : p)),
+      )
+      .finally(() => {
+        if (problemReads.current.get(runId) === ctl) problemReads.current.delete(runId);
+      });
+  };
+
   const showProblems = (run: DownloadRunSummary) => {
     if (problems[run.runId]) {
+      problemReads.current.get(run.runId)?.abort();
+      problemReads.current.delete(run.runId);
       setProblems(({ [run.runId]: _closed, ...rest }) => rest);
       return;
     }
-    setProblems((p) => ({ ...p, [run.runId]: {} }));
-    const pid = projectId;
-    api.problems(pid, run.runId).then(
-      (data) => current.current === pid && setProblems((p) => (p[run.runId] ? { ...p, [run.runId]: { data } } : p)),
-      (err: unknown) => current.current === pid && setProblems((p) => (p[run.runId] ? { ...p, [run.runId]: { error: errorText(err, "The list could not be read. Try again.") } } : p)),
-    );
+    readProblems(run.runId);
   };
 
   const copy = async (run: DownloadRunSummary, data: DownloadProblemsResponse) => {
@@ -486,6 +522,7 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
               onAction={(what) => runAction(run, what)}
               onDiscard={() => discard(run)}
               onShowProblems={() => showProblems(run)}
+              onRetryProblems={() => readProblems(run.runId)}
               onCopy={(data) => void copy(run, data)}
             />
           ))}
@@ -520,6 +557,7 @@ function RunLine({
   onAction,
   onDiscard,
   onShowProblems,
+  onRetryProblems,
   onCopy,
 }: {
   run: DownloadRunSummary;
@@ -530,6 +568,7 @@ function RunLine({
   onAction(what: "pause" | "stop" | "resume"): void;
   onDiscard(): void;
   onShowProblems(): void;
+  onRetryProblems(): void;
   onCopy(data: DownloadProblemsResponse): void;
 }) {
   const id = useId();
@@ -539,11 +578,13 @@ function RunLine({
   const allDone = run.state === "finished" && run.failed === 0 && run.notCompleted === 0;
   const problemsHeading = useRef<HTMLHeadingElement>(null);
   const open = problems !== undefined;
-  const wasOpen = useRef(open);
+  /** The heading comes with what is under it (the list, or why it could not be read), never on its own (R679 D3). */
+  const ready = open && (problems.data !== undefined || problems.error !== undefined);
+  const wasReady = useRef(ready);
   useEffect(() => {
-    if (open && !wasOpen.current) problemsHeading.current?.focus();
-    wasOpen.current = open;
-  }, [open]);
+    if (ready && !wasReady.current) problemsHeading.current?.focus();
+    wasReady.current = ready;
+  }, [ready]);
   return (
     <li className="ao-worklines__run">
       <p id={`${id}-title`} className="ao-worklines__title">
@@ -593,15 +634,20 @@ function RunLine({
         </div>
       )}
       <LineError text={error} />
-      {open && (
+      {ready && (
         <div className="ao-worklines__problems">
           <h3 ref={problemsHeading} tabIndex={-1}>
             {PROBLEMS_TEXT.heading}
           </h3>
           {problems.error && (
-            <div role="alert">
-              <UserText as="p">{problems.error}</UserText>
-            </div>
+            <>
+              <div role="alert">
+                <UserText as="p">{problems.error}</UserText>
+              </div>
+              <button type="button" {...named(id, "retry")} onClick={onRetryProblems}>
+                Try again
+              </button>
+            </>
           )}
           {problems.data && (
             <>
