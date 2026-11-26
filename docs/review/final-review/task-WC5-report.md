@@ -134,3 +134,40 @@ Fresh implementer. Branch `wc-5-service`, five commits after a0a1226. Each test 
 ### Runs
 - See the final message.
 - downloads-routes 42 passed; capture-queues 31; capture-routes 10; server 160 passed | 1 skipped; ui-only-routes 128; transcription-jobs 40; streams 3; move-finish 48; library-place-routes 8; lock-during-change 3; typecheck @ao/library-service exit 0; e2e tsc exit 0; `@ao/ui build` built; `e2e/capture.spec.ts` (chromium) 4 passed, scenario 10 included; `git status --short` empty.
+
+## Last fix (R690)
+
+One commit after 1181aa2. `packages/library` is untouched.
+
+### I4: the rest of a slow-down wait
+- **Where (`downloads.ts`, the continuation body in `afterMove`):**
+  - After the journal check, if the run is `waiting` with a `wait`, the continuation sleeps first. The length is `Date.parse(updatedAt) + wait.ms - opts.now()`.
+  - The sleep goes through the sleep seam. Outside tests the seam falls back to a new local `realSleep`. The sleep is woken by a Pause, a Stop, a cut or a halt.
+  - While it sleeps, the run stays held and its journal still says `waiting`. The runner marks it as begun so that Pause works.
+- **How the sleep ends:**
+  - A cut (lock or close), or another halt, ends it with `CaptureCancelledError`. A halt follows the usual move path.
+  - A Pause or Stop is written by the new `writeAsked`:
+    - Stop goes through `stopNotRunning`.
+    - Pause goes through the library's exported `setRunState(…, "paused", RUN_PAUSED)`, but only when the run is still going on.
+  - A wait that has already run out is not slept again.
+
+### Minor 1: a Pause or Stop asked while halted
+- `publishRun` (used when a continuation does not go on) now writes the Pause or Stop through `writeAsked`.
+- The run ends `paused` or `stopped`, is published, and is not continued.
+
+### Tests (`describe "a slow-down wait across a move (R690)"`)
+All four failed with 1181aa2's `downloads.ts`:
+- after a successful move: rest slept, no new line in the run log, the run still waiting and held; then it goes on;
+- after a refused move: the same. Here the refusal comes from a spied `drainWork`: it runs the real drain, then answers false.
+  - The first attempt was a second project's held video, but it blocked the stand-in, so the slowed-down listing never ran.
+- a Stop during the rest of the wait: the run ends stopped, with no new line;
+- a Pause while a run finishes its video after a refused move: the run ends paused, with done 2.
+
+### Runs
+- downloads-routes: 46 passed
+- move-finish: 48 passed
+- library-place-routes: 8 passed
+- lock-during-change: 3 passed
+- capture-queues: 31 passed
+- typecheck `@ao/library-service`: exit 0
+- `git status --short`: empty
