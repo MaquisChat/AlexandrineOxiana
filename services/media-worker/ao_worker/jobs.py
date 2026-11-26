@@ -54,17 +54,21 @@ def child_env(tmpdir: str | None = None) -> dict[str, str]:
 class JobError(Exception):
     """A job failure with a stable code. `message` and `detail` must not contain user file paths or full URLs."""
 
-    def __init__(self, code: str, message: str, detail: str | None = None, tool: str | None = None):
+    def __init__(self, code: str, message: str, detail: str | None = None, tool: str | None = None,
+                 platform_reason: str | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.detail = detail
         # The optional tool (tools.py catalogue id) the failure is about, e.g. TOOL_NOT_INSTALLED.
         self.tool = tool
+        # The platform's own words for why it refused (download.platform_reason), links removed.
+        self.platform_reason = platform_reason
 
     def to_json(self) -> dict:
         return {"code": self.code, "message": self.message, **({"detail": self.detail} if self.detail else {}),
-                **({"tool": self.tool} if self.tool else {})}
+                **({"tool": self.tool} if self.tool else {}),
+                **({"platformReason": self.platform_reason} if self.platform_reason else {})}
 
 
 class JobCancelled(Exception):

@@ -49,7 +49,14 @@ QUALITY_FORMATS = {
     "best": "bv*+ba/b",
     "1080p": "bv*[height<=1080]+ba/b[height<=1080]/b",
     "720p": "bv*[height<=720]+ba/b[height<=720]/b",
+    "audio": "ba/b",
+    "ready": "b",
 }
+# Extra yt-dlp arguments per quality choice ("Audio only" is saved as an m4a file).
+QUALITY_EXTRA_ARGS = {"audio": ["-x", "--audio-format", "m4a"]}
+# Only "ready" (a file already joined by the platform) can be saved without ffmpeg: the others join
+# picture and sound, or extract the sound, and refuse to run rather than save a lower quality silently.
+QUALITY_WITHOUT_FFMPEG = ("ready",)
 DATE_RE = re.compile(r"^\d{8}$")
 YTDLP_RELEASES = "https://github.com/yt-dlp/yt-dlp/releases/"
 # Hosts the release files may come from (GitHub redirects downloads to its file host): the
@@ -60,7 +67,7 @@ YTDLP_MAX_BYTES = 200 * 1024 * 1024
 SUMS_MAX_BYTES = 1024 * 1024
 _TAG_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}(\.\d+)?$")
 
-ERROR_CODES = ("LOGIN_REQUIRED", "RATE_LIMITED", "NOT_FOUND_OR_REMOVED", "GEO_BLOCKED", "PRIVATE", "EXTRACTOR_ERROR")
+ERROR_CODES = ("LOGIN_REQUIRED", "RATE_LIMITED", "NOT_FOUND_OR_REMOVED", "GEO_BLOCKED", "PRIVATE", "EXTRACTOR_ERROR", "DISK_FULL", "NETWORK_LOST")
 
 # First match wins; the order matters ("Private video. Sign in if ..." is PRIVATE, not LOGIN_REQUIRED).
 _ERROR_PATTERNS = [
@@ -70,6 +77,10 @@ _ERROR_PATTERNS = [
     ("LOGIN_REQUIRED", re.compile(
         r"sign in to confirm|log ?in required|login required|requires? (a )?log ?in|--cookies|authentication|"
         r"age[- ]?restricted|you need to log in|log in to", re.I)),
+    ("DISK_FULL", re.compile(r"No space left on device|ENOSPC|disk (is )?full", re.I)),
+    ("NETWORK_LOST", re.compile(
+        r"Unable to download|timed out|Connection (reset|refused|aborted)|Network is unreachable|"
+        r"Temporary failure in name resolution|getaddrinfo failed|Read timed out", re.I)),
     ("NOT_FOUND_OR_REMOVED", re.compile(
         r"video unavailable|has been removed|\b404\b|not found|does not exist|no longer available|"
         r"has been deleted|account (has been )?(terminated|suspended)|unavailable", re.I)),
@@ -117,6 +128,26 @@ def map_error(stderr: str) -> str:
         if pat.search(text):
             return code
     return "EXTRACTOR_ERROR"
+
+
+_PLATFORM_REASON_RE = re.compile(r"ERROR: \[[^\]]+\] [^:]+: (.+)")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+PLATFORM_REASON_MAX = 200
+
+
+def platform_reason(stderr: str) -> str | None:
+    """The platform's own words from the last `ERROR: [platform] id: <reason>` line: links and control
+    characters removed, at most 200 characters. None when no line has that shape."""
+    reason = None
+    for line in stderr.splitlines():
+        m = _PLATFORM_REASON_RE.search(line)
+        if m:
+            reason = m.group(1)
+    if reason is None:
+        return None
+    reason = _CONTROL_RE.sub("", _URL_RE.sub("", reason))
+    reason = re.sub(r" {2,}", " ", reason).strip()[:PLATFORM_REASON_MAX].strip()
+    return reason or None
 
 
 # ---------- yt-dlp binary management ----------
@@ -319,7 +350,7 @@ def update_tools() -> dict:
 # ---------- arguments ----------
 
 
-def build_ytdlp_args(url: str, out: str, params: dict, js_runtime: str | None = None) -> list[str]:
+def build_ytdlp_args(url: str, out: str, params: dict, js_runtime: str | None = None, ffmpeg: str | None = None) -> list[str]:
     args = [
         "--ignore-config", "--newline", "--no-color",
         "-o", os.path.join(out, "%(id)s.%(ext)s"),
@@ -345,7 +376,9 @@ def build_ytdlp_args(url: str, out: str, params: dict, js_runtime: str | None = 
     if params.get("cookiesFromBrowser"):
         args += ["--cookies-from-browser", params["cookiesFromBrowser"]]
     if params.get("quality"):
-        args += ["-f", QUALITY_FORMATS[params["quality"]]]
+        args += ["-f", QUALITY_FORMATS[params["quality"]], *QUALITY_EXTRA_ARGS.get(params["quality"], [])]
+    if ffmpeg:
+        args += ["--ffmpeg-location", ffmpeg]
     if js_runtime:
         # Named explicitly (ADR 0014, R133): yt-dlp needs a JavaScript runtime for YouTube.
         args += ["--js-runtimes", f"deno:{js_runtime}"]
@@ -398,7 +431,7 @@ def validate_params(url: str, params: dict) -> str | None:
             return f"params.{k} must be a boolean"
     q = params.get("quality")
     if q is not None and (q not in QUALITY_FORMATS or params.get("tool", "yt-dlp") != "yt-dlp"):
-        return "params.quality must be best, 1080p or 720p (yt-dlp only)"
+        return "params.quality must be best, 1080p, 720p, audio or ready (yt-dlp only)"
     m = params.get("maxItems")
     if m is not None and (isinstance(m, bool) or not isinstance(m, int) or m < 1):
         return "params.maxItems must be a positive integer"
@@ -462,6 +495,7 @@ def run(job: Job, ctx: JobContext) -> dict:
     out = Path(job.output)
     out.mkdir(parents=True, exist_ok=True)
     log.info("capture job %s tool=%s url=%s", job.id, tool, strip_url(job.input))
+    from . import tools
     from .tools import deno_path, not_installed
 
     extra_env: dict[str, str] = {}
@@ -469,9 +503,12 @@ def run(job: Job, ctx: JobContext) -> dict:
         resolved = resolve_ytdlp(download=False)
         if resolved is None:
             raise not_installed("video-downloader")
+        ffmpeg = tools.which("ffmpeg")
+        if ffmpeg is None and params.get("quality") not in (None, *QUALITY_WITHOUT_FFMPEG):
+            raise not_installed("ffmpeg")
         cmd = [resolved[0]]
         version = tool_version(cmd)
-        argv = [*cmd, *build_ytdlp_args(job.input, str(out), params, js_runtime=deno_path())]
+        argv = [*cmd, *build_ytdlp_args(job.input, str(out), params, js_runtime=deno_path(), ffmpeg=ffmpeg)]
     else:
         g = gallerydl_cmd()
         if g is None:
@@ -512,6 +549,6 @@ def run(job: Job, ctx: JobContext) -> dict:
             log.warning("capture job %s partial code=%s", job.id, code)
             meta.update(partial=True, errorCode=code, errorDetail=detail)
         else:
-            raise JobError(code, f"{tool} failed ({code})", detail)
+            raise JobError(code, f"{tool} failed ({code})", detail, platform_reason=platform_reason(stderr))
     log.info("capture job %s finished files=%d", job.id, len(files))
     return {"output": str(out), "meta": meta}

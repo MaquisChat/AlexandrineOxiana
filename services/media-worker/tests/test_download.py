@@ -84,8 +84,11 @@ def test_build_ytdlp_args_params():
     assert args[args.index("--sleep-interval") + 1] == "3" and args[args.index("--max-sleep-interval") + 1] == "8"
 
 
-def test_ytdlp_quality_selects_a_format():
+def test_ytdlp_quality_selects_a_format(monkeypatch):
+    from ao_worker import tools
     from ao_worker.download import validate_params
+    # The four better choices need ffmpeg, so the job's lookup finds a fake one here.
+    monkeypatch.setattr(tools, "which", lambda program: "/fake/ffmpeg")
     assert "-f" not in build_ytdlp_args("https://x.test/p", "/out", {})
     best = build_ytdlp_args("https://x.test/p", "/out", {"quality": "best"})
     assert best[best.index("-f") + 1] == "bv*+ba/b"
@@ -106,9 +109,98 @@ def test_ytdlp_quality_selects_a_format():
     ("ERROR: [youtube] x: The uploader has not made this video available in your country", "GEO_BLOCKED"),
     ("ERROR: [youtube] x: Private video. Sign in if you've been granted access to this video", "PRIVATE"),
     ("ERROR: [tiktok] x: Unable to extract universal data for rehydration", "EXTRACTOR_ERROR"),
+    ("ERROR: unable to write data: [Errno 28] No space left on device", "DISK_FULL"),
+    ("ERROR: [youtube] x: Unable to download webpage: <urlopen error timed out>", "NETWORK_LOST"),
+    ("ERROR: [youtube] x: Read timed out.", "NETWORK_LOST"),
+    ("ERROR: unable to download video data: Connection reset by peer", "NETWORK_LOST"),
+    ("ERROR: [youtube] x: Temporary failure in name resolution", "NETWORK_LOST"),
 ])
 def test_map_error(stderr, code):
     assert map_error(stderr) == code
+
+
+def test_ffmpeg_location_is_handed_to_ytdlp_when_found(worker, tmp_path, monkeypatch):
+    from ao_worker import tools
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_ARGV_FILE", str(argv_file))
+    monkeypatch.setattr(tools, "which", lambda program: "/fake/bin/ffmpeg")
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "done", job
+    args = json.loads(argv_file.read_text())
+    assert args[args.index("--ffmpeg-location") + 1] == "/fake/bin/ffmpeg"
+    assert args.index("--ffmpeg-location") < args.index("--")
+    monkeypatch.setattr(tools, "which", lambda program: None)
+    job = worker.run("capture.download", URL, str(tmp_path / "d"), {"tool": "yt-dlp"})
+    assert job["status"] == "done", job
+    assert "--ffmpeg-location" not in json.loads(argv_file.read_text())
+
+
+def test_audio_only_extracts_m4a():
+    from ao_worker.download import validate_params
+    args = build_ytdlp_args("https://x.test/p", "/out", {"quality": "audio"})
+    assert args[args.index("-f") + 1] == "ba/b"
+    assert args[args.index("-x") + 1] == "--audio-format" and args[args.index("--audio-format") + 1] == "m4a"
+    assert args.index("-x") < args.index("--")
+    assert validate_params("https://x.test/p", {"quality": "audio"}) is None
+
+
+def test_ready_made_selects_b():
+    from ao_worker.download import validate_params
+    args = build_ytdlp_args("https://x.test/p", "/out", {"quality": "ready"})
+    assert args[args.index("-f") + 1] == "b"
+    assert "-x" not in args
+    assert validate_params("https://x.test/p", {"quality": "ready"}) is None
+
+
+def test_ffmpeg_argument_is_added_by_build_ytdlp_args():
+    args = build_ytdlp_args("https://x.test/p", "/out", {}, ffmpeg="/fake/ffmpeg")
+    assert args[args.index("--ffmpeg-location") + 1] == "/fake/ffmpeg"
+    assert "--ffmpeg-location" not in build_ytdlp_args("https://x.test/p", "/out", {})
+
+
+@pytest.mark.parametrize("quality", ["best", "1080p", "720p", "audio"])
+def test_better_qualities_need_ffmpeg(worker, tmp_path, monkeypatch, quality):
+    from ao_worker import tools
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_ARGV_FILE", str(argv_file))
+    monkeypatch.setattr(tools, "which", lambda program: None)
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp", "quality": quality})
+    assert job["status"] == "failed"
+    assert job["error"]["code"] == "TOOL_NOT_INSTALLED"
+    assert job["error"]["tool"] == "ffmpeg"
+    assert not argv_file.exists()  # yt-dlp was never run
+
+
+def test_ready_made_runs_without_ffmpeg(worker, tmp_path, monkeypatch):
+    from ao_worker import tools
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_ARGV_FILE", str(argv_file))
+    monkeypatch.setattr(tools, "which", lambda program: None)
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp", "quality": "ready"})
+    assert job["status"] == "done", job
+    args = json.loads(argv_file.read_text())
+    assert args[args.index("-f") + 1] == "b" and "--ffmpeg-location" not in args
+
+
+def test_platform_reason_is_the_platforms_words_without_links():
+    from ao_worker.download import platform_reason
+    assert platform_reason("ERROR: [youtube] abc: Video unavailable. https://x.example/?t=1") == "Video unavailable."
+    assert platform_reason("x\nERROR: [youtube] a: First reason\nERROR: [tiktok] b: Second\x07 reason\n") == "Second reason"
+    assert platform_reason("ERROR: [youtube] a: " + "w" * 300) == "w" * 200
+    assert platform_reason("ERROR: something without a platform tag") is None
+    assert platform_reason("") is None
+
+
+def test_failure_json_carries_platform_reason(worker, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_YTDLP_MODE", "login")
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "failed"
+    assert job["error"]["platformReason"].startswith("Sign in to confirm you're not a bot.")
+    assert "://" not in job["error"]["platformReason"]
+    # a job that fails for another reason carries no such key
+    from ao_worker.jobs import JobError
+    assert "platformReason" not in JobError("X", "m").to_json()
+    assert JobError("X", "m", platform_reason="why").to_json()["platformReason"] == "why"
 
 
 def test_strip_url():
