@@ -1,6 +1,6 @@
 /**
  * Capture (spec 5.1, 5.5): links queued for the downloader (per-item outcomes as `capture.progress`
- * events), whole profiles, transcription of a source, the capture tools' versions and update, and
+ * events), whole profiles (a download run since whole channels, R668, R669: downloads.ts), transcription of a source, the capture tools' versions and update, and
  * browser capture from the paired extension (its pairing too, and its link lists: R111; R116: both
  * capture methods authorised, links deduplicated, single posts and videos only, one running and one
  * waiting list per extension).
@@ -31,8 +31,8 @@ import {
   type CaptureStatus,
   type ProfileCaptureReport,
   type CaptureOptions,
-  type ProfileCaptureOptions,
   type ProfileContentType,
+  type RunOptions,
 } from "@ao/library";
 // Request and answer shapes: one declaration with the interface (@ao/shared, Task 47).
 import {
@@ -41,8 +41,12 @@ import {
   CAPTURE_LINKS_MAX,
   CAPTURE_RUNNING,
   CAPTURE_STOPPING,
+  DOWNLOAD_QUALITIES,
   PAIRING_CODE_ID,
+  QUALITIES_NEEDING_VIDEO_TOOLS,
   SPEECH_MODELS,
+  VIDEO_TOOLS_NEEDED_TEXT,
+  type DownloadQuality,
   type BrowserCaptureProgressEvent,
   type CaptureBrowser,
   type CaptureCutByLockAcknowledged,
@@ -85,6 +89,9 @@ true satisfies Same<ProfileContentType, CaptureContentType>;
 true satisfies Same<CaptureStatus, CaptureItemStatus>;
 true satisfies Same<keyof CaptureOutcome, keyof CaptureItemOutcome>;
 true satisfies Same<keyof ProfileCaptureReport, keyof CaptureProfileReport>;
+// The qualities a capture may ask for are exactly the shared list's (whole channels, R668).
+true satisfies Same<DownloadQuality, NonNullable<CaptureOptions["quality"]>>;
+const QUALITIES: readonly string[] = DOWNLOAD_QUALITIES;
 const BROWSERS: readonly BrowserName[] = CAPTURE_BROWSERS;
 // The speech models the app accepts (R158, one definition in @ao/shared).
 const MODELS: readonly string[] = SPEECH_MODELS;
@@ -101,8 +108,11 @@ function captureOptions(o: BodyOf<CaptureRequestOptions> | undefined): CaptureOp
   const transcribe = opts.transcribe === undefined ? "project-default" : optBool(opts, "transcribe")!;
   const refresh = optBool(opts, "refreshIfExists");
   const legalBasis = optStr(opts, "legalBasis", 2000);
+  const quality = optStr(opts, "quality", 32);
+  if (quality !== undefined && !QUALITIES.includes(quality)) throw badRequest(`"${quality}" is not a quality.`);
   return {
     transcribe,
+    ...(quality ? { quality: quality as DownloadQuality } : {}),
     ...(browser ? { cookiesFromBrowser: browser as BrowserName } : {}),
     ...(model ? { transcribeModel: model } : {}),
     ...(refresh ? { refreshIfExists: true } : {}),
@@ -110,8 +120,34 @@ function captureOptions(o: BodyOf<CaptureRequestOptions> | undefined): CaptureOp
   };
 }
 
+/**
+ * A profile run's options from its request (capture-profile and the estimate). Its transcription follows the
+ * request when it says, else the project's switch (R669 item 3): each new video then goes on the transcription list.
+ */
+export function profileRunOptions(s: Session, projectId: string, o: BodyOf<ProfileCaptureRequestOptions>): RunOptions {
+  const { transcribe: asked, ...base } = captureOptions(o);
+  const since = optStr(o, "since", 10);
+  const until = optStr(o, "until", 10);
+  if ((since && !DAY.test(since)) || (until && !DAY.test(until))) throw badRequest("since and until are dates written YYYY-MM-DD.");
+  const maxItems = o.maxItems === undefined ? undefined : Number(o.maxItems);
+  if (maxItems !== undefined && (!Number.isInteger(maxItems) || maxItems < 1)) throw badRequest('"maxItems" must be a whole number of 1 or more.');
+  const contentTypes = o.contentTypes === undefined ? undefined : strArray(o, "contentTypes", { max: 5 });
+  if (contentTypes?.some((t) => !TYPES.includes(t as ProfileContentType))) throw badRequest(`"contentTypes" are: ${TYPES.join(", ")}.`);
+  const transcribe = asked === "project-default" ? s.repo.getProject(projectId).automation?.transcribeNewMedia === true : asked;
+  return {
+    ...base,
+    transcribe,
+    ...(since ? { since } : {}),
+    ...(until ? { until } : {}),
+    ...(maxItems ? { maxItems } : {}),
+    ...(contentTypes ? { contentTypes: contentTypes as ProfileContentType[] } : {}),
+    ...(optBool(o, "metadataOnly") ? { metadataOnly: true } : {}),
+    ...(optBool(o, "includeComments") ? { includeComments: true } : {}),
+  };
+}
+
 /** Using the browser session needs the project's one-time acknowledgement (POST /projects/:id/acknowledge). */
-function requireAcknowledged(s: Session, projectId: string, opts: CaptureOptions): void {
+export function requireAcknowledged(s: Session, projectId: string, opts: Pick<CaptureOptions, "cookiesFromBrowser">): void {
   if (opts.cookiesFromBrowser && !s.repo.getProject(projectId).captureAcknowledgements?.cookies) {
     throw new ApiError(409, "ACKNOWLEDGEMENT_REQUIRED", COOKIES_ACKNOWLEDGEMENT, "cookies");
   }
@@ -150,7 +186,7 @@ const stopping = (why: "lock" | "close"): string =>
 const PROFILE_RUNNING = "This profile, channel or playlist is already being captured in this project, so nothing new was started. Wait until that capture has finished.";
 
 /** A locked project's queues are not shown (423), as its sources are not. */
-function requireUnlocked(s: Session, projectId: string): void {
+export function requireUnlocked(s: Session, projectId: string): void {
   if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
 }
 
@@ -213,69 +249,31 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     return queueLinks(s, projectId, urls, opts);
   });
 
+  // A whole profile, channel or playlist is a download run (whole channels, R668, R669): journaled, one
+  // video at a time, held by the service's DownloadRunner (downloads.ts). Its id is the queue's: the
+  // Capture screen's queue and `capture.progress` events follow it as before. While another run of the
+  // project is held it waits its turn; it is not refused (R669).
   app.post("/projects/:id/capture-profile", async (req): Promise<CaptureStartedResponse> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     const b = bodyAs<CaptureProfileRequest>(req);
     const url = urlList({ u: [str(b, "url", MAX_ADDRESS_LENGTH)] }, "u", 1)[0]!;
-    const o = (optObj(b, "options") ?? {}) as BodyOf<ProfileCaptureRequestOptions>;
-    const base = captureOptions(o);
-    const since = optStr(o, "since", 10);
-    const until = optStr(o, "until", 10);
-    if ((since && !DAY.test(since)) || (until && !DAY.test(until))) throw badRequest("since and until are dates written YYYY-MM-DD.");
-    const maxItems = o.maxItems === undefined ? undefined : Number(o.maxItems);
-    if (maxItems !== undefined && (!Number.isInteger(maxItems) || maxItems < 1)) throw badRequest('"maxItems" must be a whole number of 1 or more.');
-    const contentTypes = o.contentTypes === undefined ? undefined : strArray(o, "contentTypes", { max: 5 });
-    if (contentTypes?.some((t) => !TYPES.includes(t as ProfileContentType))) throw badRequest(`"contentTypes" are: ${TYPES.join(", ")}.`);
-    const opts: ProfileCaptureOptions = {
-      ...base,
-      transcribe: base.transcribe === true,
-      ...(since ? { since } : {}),
-      ...(until ? { until } : {}),
-      ...(maxItems ? { maxItems } : {}),
-      ...(contentTypes ? { contentTypes: contentTypes as ProfileContentType[] } : {}),
-      ...(optBool(o, "metadataOnly") ? { metadataOnly: true } : {}),
-      ...(optBool(o, "includeComments") ? { includeComments: true } : {}),
-    };
+    const opts = profileRunOptions(s, projectId, (optObj(b, "options") ?? {}) as BodyOf<ProfileCaptureRequestOptions>);
     requireUnlocked(s, projectId); // nothing about its captures before the lock and the rules (I1)
     await checkCaptureAllowed(s.repo, projectId, [url]);
     requireAcknowledged(s, projectId, opts);
-    const worker = await state.workerClient();
+    await state.workerClient();
+    // A quality that needs Video tools is not started without them: a low-quality file is never saved silently.
+    if (opts.quality && QUALITIES_NEEDING_VIDEO_TOOLS.includes(opts.quality) && (await state.downloads.videoToolsInstalled()) === false) {
+      throw new ApiError(409, "TOOL_NOT_INSTALLED", VIDEO_TOOLS_NEEDED_TEXT, "ffmpeg");
+    }
     // Checked and recorded with nothing awaited in between (as for links).
     requireUnlocked(s, projectId);
     const ending = state.captureStopping(projectId);
     if (ending) throw new ApiError(409, "CONFLICT", stopping(ending), CAPTURE_STOPPING);
     if (state.captureQueues.runningConflict(projectId, [url])) throw new ApiError(409, "CONFLICT", PROFILE_RUNNING, CAPTURE_RUNNING);
-    const queueId = randomUUID();
-    const queues = state.captureQueues;
-    queues.startProfile(queueId, projectId, url, "desktop");
-    state.profileRunStarted(queueId, projectId);
-    const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
-    // A profile run cannot stop part-way here: a move waits for it to finish (drained, R106).
-    state.startWork("profile-capture", async () => {
-      try {
-        const report = await capture.captureProfile(
-          projectId,
-          url,
-          opts,
-          (done, total, outcome) => {
-            // Ended meanwhile (a lock, a close): nothing more of it is recorded or published (I3).
-            if (state.captureEnded(queueId)) return;
-            queues.progress(queueId, done, total, outcome);
-            state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false } satisfies CaptureQueueProgressEvent);
-          },
-          { cancelled: () => state.captureEnded(queueId), signal: state.captureSignal(queueId) },
-        );
-        if (state.profileRunEnded(queueId)) return; // its end was published when it was ended
-        queues.finish(queueId, { report });
-        state.events.publish("capture.progress", { queueId, projectId, finished: true, report } satisfies CaptureQueueProgressEvent);
-      } catch (err) {
-        if (state.profileRunEnded(queueId)) return;
-        queues.finish(queueId, { error: err });
-        state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) } satisfies CaptureQueueProgressEvent);
-      }
-    });
-    return { queueId };
+    const run = await state.downloads.start(s, projectId, url, opts);
+    return { queueId: run.runId };
   });
 
   // ---- a capture's state, read again (Task 63) ----

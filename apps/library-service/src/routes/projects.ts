@@ -185,6 +185,9 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     s.http.purgeSensitive();
     if (s.repo.getProject(id).encryption.enabled) {
       state.endCaptures(id, "lock");
+      // Its download runs too, the one downloading and those waiting their turn: cut and forgotten, nothing
+      // more written or published; after the unlock they are shown interrupted, with Resume downloads (R669).
+      state.downloads.stopProject(id, "lock");
       state.transcriptions.forgetProject(id); // what it was transcribing too (Task 62 R1-2); its journal keeps the run
     }
     state.publishState();

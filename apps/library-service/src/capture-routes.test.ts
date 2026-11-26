@@ -178,6 +178,20 @@ describe("POST /projects/:id/capture-profile", () => {
     await svc.state.idle();
   });
 
+  it("capture-profile passes the quality to the run", async () => {
+    const worker = stubWorker();
+    await start({ worker, autoStartWorker: false });
+    const pid = await library();
+    const ok = await call({ method: "POST", url: `/projects/${pid}/capture-profile`, body: { url: "https://www.youtube.com/@channel", options: { quality: "audio" } } });
+    expect(ok.status, ok.body).toBe(200);
+    await svc.state.idle();
+    const runs = await call({ url: `/projects/${pid}/downloads` });
+    expect(runs.json.runs).toEqual([expect.objectContaining({ runId: ok.json.queueId, quality: "audio" })]);
+    const bad = await call({ method: "POST", url: `/projects/${pid}/capture-profile`, body: { url: "https://www.youtube.com/@channel", options: { quality: "4k" } } });
+    expect(bad.status).toBe(400);
+    expect(bad.json.error).toMatchObject({ code: "VALIDATION", message: '"4k" is not a quality.' });
+  });
+
   it("a project whose rules do not allow the downloader: 403 POLICY_DENIED with the reason, nothing queued", async () => {
     const worker = stubWorker();
     await start({ worker, autoStartWorker: false });
