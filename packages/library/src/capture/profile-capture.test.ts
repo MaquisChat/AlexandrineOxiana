@@ -7,7 +7,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { toCslItem, type AuditEvent, type SourceDraft, type SourceFile } from "@ao/core";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { IndexHandle } from "../index/db.js";
@@ -16,9 +16,11 @@ import { createLibrary, type Library } from "../library.js";
 import { PolicyDeniedError, type Repo } from "../repo/index.js";
 import { decryptBytes } from "../repo/io.js";
 import { openTestRepo } from "../repo/testing.js";
-import { WorkerClient } from "../worker-client.js";
-import { AcknowledgementRequiredError, toolMissingReason } from "./errors.js";
-import { createLinkCapture, type LinkCapture } from "./link-capture.js";
+import { WorkerClient, WorkerToolError } from "../worker-client.js";
+import { AcknowledgementRequiredError, plainReason, toolMissingReason } from "./errors.js";
+import { createLinkCapture, type CaptureOutcome, type LinkCapture } from "./link-capture.js";
+import type { RunHooks } from "./profile-capture.js";
+import type { ProfileEntry } from "./profile-snapshot.js";
 import { FAKE_TOOLS_DIR, startToolWorker, type ToolWorker } from "./testing.js";
 
 const FAST = 2 ** 10;
@@ -69,6 +71,10 @@ interface Item {
   id: string;
   caption: string;
   timestamp: number;
+  /** Seconds, carried on the listing's entry (whole channels, Task 3). */
+  duration?: number;
+  /** The fake downloader fails this item with the matching error line. */
+  error?: "private" | "removed" | "network" | "disk";
 }
 interface Profile {
   platform: "tiktok" | "instagram" | "youtube";
@@ -949,5 +955,277 @@ describe("a missing tool (Task 48a, R126)", () => {
     const p = await project();
     const r = await c.captureProfile(p.id, TT_PROFILE, { transcribe: false });
     expect(r).toMatchObject({ status: "failed", errorCode: "TOOL_NOT_INSTALLED", tool: "video-downloader", reason: toolMissingReason("video-downloader") });
+  });
+});
+
+describe("run hooks (whole channels, Task 3)", { timeout: 120_000 }, () => {
+  const batchOf = async (folder: string) =>
+    JSON.parse(await readFile(join(lib.root, folder, "imports", "batch-0001", "batch.json"), "utf8")) as { state: string; counts: Record<string, number> };
+  const reportsOf = async (folder: string) => (await walk(join(lib.root, folder, "profiles", "tiktok-fake.dancer"))).filter((f) => f.startsWith("reports/"));
+  const itemDownloads = () => worker.submitted.filter((j) => j.type === "capture.download" && !j.params.flatList);
+  const idOfUrl = (u: string) => /\/video\/(\d+)/.exec(u)?.[1];
+
+  it("onListed gets the fresh entries with their lengths before any download", async () => {
+    const prof = synthetic();
+    prof.items[0]!.duration = 3600;
+    prof.items[1]!.duration = 0; // not a length
+    await setProfile(prof);
+    const p = await project();
+    let seen: { fresh: Array<ProfileEntry & { listing: string }>; title: string; downloadsBefore: number } | undefined;
+    const hooks: RunHooks = {
+      onListed: async (fresh, meta) => {
+        seen = { fresh, title: meta.title, downloadsBefore: itemDownloads().length };
+      },
+    };
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks });
+    expect(r).toMatchObject({ status: "completed", created: 12 });
+    expect(seen!.downloadsBefore).toBe(0);
+    expect(seen!.title).toBe("Fake Dancer");
+    expect(seen!.fresh.map((e) => e.id)).toEqual(prof.items.map((it) => it.id));
+    expect(seen!.fresh.map((e) => e.listing)).toEqual(prof.items.map(() => "videos"));
+    expect(seen!.fresh[0]!.durationSec).toBe(3600);
+    expect(seen!.fresh[1]!.durationSec).toBeUndefined();
+    expect(seen!.fresh[2]!.durationSec).toBeUndefined();
+  });
+
+  it("beforeItem pause, stop and pause-disk end the run with that status and write its batch as paused", async () => {
+    const cases = [
+      ["pause", "paused", plainReason("RUN_PAUSED")],
+      ["stop", "stopped", plainReason("RUN_STOPPED")],
+      ["pause-disk", "paused-disk", plainReason("DISK_NEARLY_FULL")],
+    ] as const;
+    for (const [answer, status, reason] of cases) {
+      const p = await project();
+      const asked: string[] = [];
+      const hooks: RunHooks = {
+        beforeItem: async (e) => {
+          asked.push(e.id);
+          return asked.length <= 2 ? "go" : answer;
+        },
+      };
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks });
+      expect([answer, r.status, r.reason, r.created, r.failed, r.newlyUnavailable, r.items.length]).toEqual([answer, status, reason, 2, 0, 0, 2]);
+      expect(asked).toHaveLength(3);
+      expect(await posts(p.id)).toHaveLength(2);
+      const batch = await batchOf(p.folder);
+      expect([answer, batch.state, batch.counts.created]).toEqual([answer, "paused", 2]);
+      const reports = await reportsOf(p.folder);
+      expect(reports).toHaveLength(1);
+      const text = await readFile(join(lib.root, p.folder, "profiles", "tiktok-fake.dancer", reports[0]!), "utf8");
+      expect(text).toContain(`- Result: ${reason}`);
+      const audit = (await auditEvents(p.folder)).filter((e) => e.action === "capture.profile");
+      expect(audit.at(-1)?.details).toMatchObject({ status });
+    }
+  });
+
+  it("afterItem is told each final outcome and never a video put back", async () => {
+    const prof = synthetic();
+    prof.items[1]!.error = "private";
+    await setProfile({ ...prof, rateLimitAfter: 3 });
+    process.env.FAKE_TOOL_MODE = "ratelimit";
+    const p = await project();
+    const told: CaptureOutcome[] = [];
+    const progress: CaptureOutcome[] = [];
+    const hooks: RunHooks = { afterItem: async (_e, out) => void told.push(out), wait: async () => "pause" };
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, (_d, _t, o) => progress.push(o), { hooks });
+    expect(r.status).toBe("paused");
+    expect(told.map((o) => [idOfUrl(o.url), o.status, o.errorCode])).toEqual([
+      [prof.items[0]!.id, "created", undefined],
+      [prof.items[1]!.id, "failed", "PRIVATE"],
+      [prof.items[2]!.id, "created", undefined],
+    ]);
+    expect(progress).toEqual(told);
+    expect(r.items).toEqual(told);
+    expect(r).toMatchObject({ created: 2, failed: 1 });
+  });
+
+  it("with hooks.wait a slow-down waits on the growing schedule and pauses after 12 hours", async () => {
+    process.env.FAKE_TOOL_MODE = "ratelimit";
+    const p = await project();
+    const asked: Array<[number, string]> = [];
+    const hooks: RunHooks = { wait: async (ms, why) => (asked.push([ms, why]), "go") };
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks });
+    expect(asked.map(([ms]) => ms / 1000)).toEqual([60, 120, 240, 900, 1_800, 3_600, 7_200, 7_200, 7_200, 7_200, 7_200, 480]);
+    expect(new Set(asked.map(([, why]) => why))).toEqual(new Set(["rate-limited"]));
+    expect(r).toMatchObject({ status: "paused-rate-limited", reason: plainReason("RATE_LIMITED_GAVE_UP"), created: 3, failed: 0 });
+    expect(waits).toEqual([]); // every wait went through the hook
+    // the slowed video was tried once, then once after each wait
+    const slowed = synthetic().items[3]!.id;
+    expect(itemDownloads().filter((j) => j.input.includes(slowed))).toHaveLength(13);
+    expect(r.items.map((o) => idOfUrl(o.url))).not.toContain(slowed);
+    expect((await batchOf(p.folder)).state).toBe("paused");
+  });
+
+  it("a wait answered \"pause\" ends the run paused and the slowed video stays not reported", async () => {
+    process.env.FAKE_TOOL_MODE = "ratelimit";
+    for (const [answer, status, reason] of [["pause", "paused", plainReason("RUN_PAUSED")], ["stop", "stopped", plainReason("RUN_STOPPED")]] as const) {
+      const p = await project();
+      const told: string[] = [];
+      const hooks: RunHooks = { wait: async () => answer, afterItem: async (e) => void told.push(e.id) };
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks });
+      expect([r.status, r.reason, r.created, r.failed]).toEqual([status, reason, 3, 0]);
+      const slowed = synthetic().items[3]!.id;
+      expect(told).toEqual(synthetic().items.slice(0, 3).map((it) => it.id));
+      expect(r.items.map((o) => idOfUrl(o.url))).not.toContain(slowed);
+      expect((await batchOf(p.folder)).state).toBe("paused");
+    }
+  });
+
+  it("without hooks the old 60, 120, 240 waits and pause stay", async () => {
+    process.env.FAKE_TOOL_MODE = "ratelimit";
+    const p = await project();
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(waits).toEqual([60_000, 120_000, 240_000]);
+    expect(r).toMatchObject({ status: "paused-rate-limited", reason: plainReason("RATE_LIMITED_PAUSED"), created: 3, failed: 0 });
+    // hooks without a wait keep the old waits too
+    waits.length = 0;
+    const q = await project();
+    const told: string[] = [];
+    const r2 = await capture.captureProfile(q.id, TT_PROFILE, { transcribe: false }, undefined, { hooks: { afterItem: async (e) => void told.push(e.id) } });
+    expect(waits).toEqual([60_000, 120_000, 240_000]);
+    expect(r2).toMatchObject({ status: "paused-rate-limited", reason: plainReason("RATE_LIMITED_PAUSED"), created: 3 });
+    expect(told).toHaveLength(3);
+  });
+
+  it("a second lost connection in a row waits instead of failing the next video", async () => {
+    const prof = synthetic();
+    prof.items[1]!.error = "network";
+    prof.items[2]!.error = "network";
+    await setProfile(prof);
+    const p = await project();
+    const told: CaptureOutcome[] = [];
+    const asked: Array<[number, string]> = [];
+    const hooks: RunHooks = {
+      afterItem: async (_e, out) => void told.push(out),
+      wait: async (ms, why) => {
+        asked.push([ms, why]);
+        // the connection is back by the time the wait ends
+        const back = structuredClone(prof);
+        delete back.items[2]!.error;
+        await setProfile(back);
+        return "go";
+      },
+    };
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks });
+    expect(asked).toEqual([[60_000, "connection"]]);
+    expect(told[1]).toMatchObject({ status: "failed", errorCode: "NETWORK_LOST", reason: "The connection was lost three times." });
+    expect(told[2]).toMatchObject({ status: "created" });
+    expect(idOfUrl(told[2]!.url)).toBe(prof.items[2]!.id);
+    expect(told.filter((o) => idOfUrl(o.url) === prof.items[2]!.id)).toHaveLength(1);
+    expect(r).toMatchObject({ status: "completed", created: 11, failed: 1 });
+  });
+
+  it("a full disk during a download pauses on the disk and reports nothing for that video", async () => {
+    const prof = synthetic();
+    prof.items[2]!.error = "disk";
+    await setProfile(prof);
+    const p = await project();
+    const told: string[] = [];
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks: { afterItem: async (e) => void told.push(e.id) } });
+    expect(r).toMatchObject({ status: "paused-disk", errorCode: "DISK_FULL", reason: plainReason("DISK_FULL"), created: 2, failed: 0 });
+    expect(told).toEqual(prof.items.slice(0, 2).map((it) => it.id));
+    expect(r.items).toHaveLength(2);
+    expect((await posts(p.id)).map((sf) => sf.source.identifiers.platformPostId)).not.toContain(prof.items[2]!.id);
+    expect((await batchOf(p.folder)).state).toBe("paused");
+  });
+
+  it("a missing tool pauses the run and names the tool", async () => {
+    const p = await project();
+    const missingFor = synthetic().items[1]!.id;
+    const submit = client.submit.bind(client);
+    vi.spyOn(client, "submit").mockImplementation(async (...args) => {
+      if (args[1].input.includes(missingFor) && !args[1].params?.flatList) throw new WorkerToolError("TOOL_NOT_INSTALLED", "ffmpeg is not installed", "ffmpeg");
+      return submit(...args);
+    });
+    const told: string[] = [];
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks: { afterItem: async (e) => void told.push(e.id) } });
+    expect(r).toMatchObject({ status: "paused-tool", tool: "ffmpeg", errorCode: "TOOL_NOT_INSTALLED", reason: toolMissingReason("ffmpeg"), created: 1, failed: 0 });
+    expect(told).toEqual([synthetic().items[0]!.id]);
+    expect((await batchOf(p.folder)).state).toBe("paused");
+  });
+
+  it("onlyIds captures only those ids, in that order", async () => {
+    const prof = synthetic();
+    const p = await project();
+    const only = [prof.items[5]!.id, prof.items[2]!.id, prof.items[9]!.id];
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, onlyIds: only });
+    expect(r.items.map((o) => idOfUrl(o.url))).toEqual(only);
+    expect(itemDownloads().map((j) => idOfUrl(j.input))).toEqual(only);
+    expect(r).toMatchObject({ status: "completed", created: 3, listComplete: true });
+    // not a filter for removed detection: a known post missing from the list is still noticed
+    const gone = prof.items[5]!.id;
+    await setProfile({ ...prof, items: prof.items.filter((it) => it.id !== gone) });
+    const again = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, onlyIds: [prof.items[0]!.id] });
+    expect(again).toMatchObject({ status: "completed", created: 1, newlyUnavailable: 1, listComplete: true });
+    expect((await byPost(p.id, gone)).source.availability.status).toBe("unavailable-on-platform");
+  });
+
+  it("resume researcher audits capture.profile.resume once and asks the rules again", async () => {
+    const p = await project();
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 2, resume: "researcher" });
+    expect(r).toMatchObject({ status: "completed", created: 2 });
+    const allows = (await auditEvents(p.folder)).filter((e) => e.action === "capture" && e.decision?.result === "allow");
+    expect(allows.map((e) => e.details)).toEqual([expect.objectContaining({ op: "capture.profile.resume", resume: true, platform: "tiktok" })]);
+
+    const c = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 3, resume: "continue" });
+    expect(c.created).toBe(1);
+    const allows2 = (await auditEvents(p.folder)).filter((e) => e.action === "capture" && e.decision?.result === "allow");
+    expect(allows2.at(-1)?.details).toMatchObject({ op: "capture.profile.continue", continued: true });
+    expect(allows2.at(-1)?.details).not.toHaveProperty("resume");
+
+    // the rules changed meanwhile: the press is refused, audited, and nothing is asked of the platform
+    await writeFile(join(lib.root, p.folder, "governance.yaml"), GOV.replace("[downloader]", "[manual_upload]"));
+    const before = worker.submitted.length;
+    await expect(capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, resume: "researcher" })).rejects.toBeInstanceOf(PolicyDeniedError);
+    expect(worker.submitted.length).toBe(before);
+    const caps = (await auditEvents(p.folder)).filter((e) => e.action === "capture");
+    expect(caps.at(-1)?.decision?.result).toBe("deny");
+    expect(await posts(p.id)).toHaveLength(3);
+  });
+
+  it("a single link captured while a run waits goes ahead before the wait ends", async () => {
+    process.env.FAKE_TOOL_MODE = "ratelimit";
+    const p = await project();
+    let release: (a: "go" | "pause" | "stop") => void = () => {};
+    let waiting: () => void = () => {};
+    const entered = new Promise<void>((r) => (waiting = r));
+    const held = new Promise<"go" | "pause" | "stop">((r) => (release = r));
+    onTestFinished(() => release("stop"));
+    const run = capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, {
+      hooks: {
+        wait: async () => {
+          waiting();
+          return held;
+        },
+      },
+    });
+    await entered;
+    const single = await capture.captureUrl(p.id, "https://www.tiktok.com/@fake.dancer/video/7000000000000000001", { transcribe: false });
+    expect(single).toMatchObject({ status: "created" });
+    release("stop");
+    expect(await run).toMatchObject({ status: "stopped", created: 3 });
+  });
+
+  it("listProfile lists once, with the lengths and what the project already has, and stores nothing", async () => {
+    const prof = synthetic();
+    prof.items[0]!.duration = 125;
+    await setProfile(prof);
+    const p = await project();
+    await capture.captureUrl(p.id, `https://www.tiktok.com/@fake.dancer/video/${prof.items[1]!.id}`, { transcribe: false });
+    const sourcesBefore = repo.listSourceIds(p.id).length;
+    const before = worker.submitted.length;
+    const l = await capture.listProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(l).toMatchObject({ status: "listed", platform: "tiktok", kind: "profile", title: "Fake Dancer", listComplete: true });
+    expect(l.entries.map((e) => e.id)).toEqual(prof.items.map((it) => it.id));
+    expect(l.entries.map((e) => e.known)).toEqual(prof.items.map((_, i) => i === 1));
+    expect(l.entries[0]!.durationSec).toBe(125);
+    expect(worker.submitted.slice(before).map((j) => j.params.flatList)).toEqual([true]);
+    expect(repo.listSourceIds(p.id)).toHaveLength(sourcesBefore);
+
+    // a limit makes it incomplete; a slowed-down listing waits for nothing
+    expect(await capture.listProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 3 })).toMatchObject({ status: "listed", listComplete: false });
+    process.env.FAKE_TOOL_MODE = "enumratelimit";
+    expect(await capture.listProfile(p.id, TT_PROFILE, { transcribe: false })).toMatchObject({ status: "rate-limited", entries: [] });
+    expect(waits).toEqual([]);
   });
 });

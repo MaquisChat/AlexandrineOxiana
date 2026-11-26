@@ -31,12 +31,15 @@ export interface ToolWorker {
   close(): Promise<void>;
 }
 
-// Same order and patterns as services/media-worker/ao_worker/download.py.
+// Same order and patterns as services/media-worker/ao_worker/download.py (with the worker's
+// DISK_FULL and NETWORK_LOST, placed before NOT_FOUND_OR_REMOVED).
 const ERROR_PATTERNS: Array<[string, RegExp]> = [
   ["PRIVATE", /private video|this (account|profile|user) is private|is private\b|private (account|profile|post)/i],
   ["GEO_BLOCKED", /not (made this video )?available in your (country|region|location)|geo[- ]?(restrict|block)/i],
   ["RATE_LIMITED", /\b429\b|too many requests|rate[- ]?limit/i],
   ["LOGIN_REQUIRED", /sign in to confirm|log ?in required|login required|requires? (a )?log ?in|--cookies|authentication|age[- ]?restricted|you need to log in|log in to/i],
+  ["DISK_FULL", /No space left on device|ENOSPC|disk (is )?full/i],
+  ["NETWORK_LOST", /Unable to download|timed out|Connection (reset|refused|aborted)|Network is unreachable|Temporary failure in name resolution|getaddrinfo failed|Read timed out/i],
   ["NOT_FOUND_OR_REMOVED", /video unavailable|has been removed|\b404\b|not found|does not exist|no longer available|has been deleted|account (has been )?(terminated|suspended)|unavailable/i],
 ];
 
@@ -74,6 +77,15 @@ async function runCapture(body: SubmittedJob): Promise<Record<string, unknown>> 
     if (p.dateBefore) args.push("--datebefore", String(p.dateBefore));
     if (p.metadataOnly) args.push("--skip-download");
     if (p.includeComments) args.push("--write-comments");
+    // The worker's QUALITY_FORMATS ("audio" also extracts the sound to m4a).
+    const formats: Record<string, string[]> = {
+      best: ["-f", "bv*+ba/b"],
+      "1080p": ["-f", "bv*[height<=1080]+ba/b[height<=1080]/b"],
+      "720p": ["-f", "bv*[height<=720]+ba/b[height<=720]/b"],
+      audio: ["-f", "ba/b", "-x", "--audio-format", "m4a"],
+      ready: ["-f", "b"],
+    };
+    if (typeof p.quality === "string" && formats[p.quality]) args.push(...formats[p.quality]!);
   } else {
     args = ["--config-ignore", "--write-metadata", "-D", out];
     if (p.archiveFile) args.push("--download-archive", String(p.archiveFile));

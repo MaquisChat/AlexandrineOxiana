@@ -40,6 +40,8 @@ export interface ProfileEntry {
   title?: string;
   /** Unix seconds, when listed. */
   timestamp?: number;
+  /** The recording's length in seconds, when the listing gives one (a finite number above 0). */
+  durationSec?: number;
   /** The listing's own JSON for this post. */
   raw: Record<string, unknown>;
 }
@@ -136,7 +138,16 @@ export function readEnumeration(docs: unknown[], c: ClassifiedUrl, tool: Capture
         const url = id ? entryLink(platform, id, e.url ?? e.webpage_url, handle) : undefined;
         if (!id || !url) continue;
         const ts = num(e.timestamp);
-        add({ id, url, ...(typeof captionOf(e) === "string" ? { caption: captionOf(e) } : {}), ...(str(e.title) ? { title: str(e.title) } : {}), ...(ts !== undefined ? { timestamp: ts } : {}), raw: e });
+        const dur = num(e.duration);
+        add({
+          id,
+          url,
+          ...(typeof captionOf(e) === "string" ? { caption: captionOf(e) } : {}),
+          ...(str(e.title) ? { title: str(e.title) } : {}),
+          ...(ts !== undefined ? { timestamp: ts } : {}),
+          ...(dur !== undefined && dur > 0 ? { durationSec: dur } : {}),
+          raw: e,
+        });
       }
     }
   } else {

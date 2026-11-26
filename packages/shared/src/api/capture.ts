@@ -67,6 +67,8 @@ export interface CaptureItemOutcome {
   errorCode?: string;
   /** The optional tool that was missing (a ToolId), with TOOL_NOT_INSTALLED or a transcript note. */
   tool?: string;
+  /** The platform's own words for why it refused (no link, at most 200 characters); shown through UserText. */
+  platformReason?: string;
 }
 
 /** A profile run's report (the library's ProfileCaptureReport without its items, which are the queue's). */
@@ -171,6 +173,8 @@ export interface CaptureRequestOptions {
   refreshIfExists?: boolean;
   /** At most 2000 characters; the project's default for social media when left out (R41). */
   legalBasis?: string;
+  /** The requested quality of a video download (the downloader's own choice when left out). */
+  quality?: "best" | "1080p" | "720p" | "audio" | "ready";
 }
 
 /** A profile run's options: the links options and these (`since`/`until` are YYYY-MM-DD). */
