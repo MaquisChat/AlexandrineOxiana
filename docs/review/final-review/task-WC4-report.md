@@ -70,3 +70,71 @@ None blocking. One point for the coordinator to confirm:
 - `pnpm --filter @ao/library typecheck`: clean (tsc, no output)
 - `pnpm --filter @ao/library-service typecheck`: clean (tsc, no output)
 - `git status --short`: empty
+
+## Fix round (R680)
+
+Worktree `.claude/worktrees/kg-3b`, branch `wc-4-runs`. There is one commit per group on top of a57650f: A `cfd97c5`, B `316bc72`, C `d22b2bb`, D (see the last line). Every new or changed test was seen failing before its mend unless it is named a guard below.
+
+### A. A Resume never loses what the run knows (I1, Minor 3)
+- **A1.** The wholesale `requeueFailedItems` at the start of a Resume is gone (`download-run.ts`, `segment`). `onlyIds` is still the items that are not done. A failed item goes back to work only in `beforeItem` → `recordRunItem(running)`, which clears its error. The segment's start also notes the items that were `running` (used by B2).
+  - **A consequence I had to handle:** the failed items are no longer queued at the end of the segment, so a Resume whose cut listing never reached a failed item would have read "every item done or failed" and written `finished`. The run now ends `finished` only when every `onlyIds` item was also told an outcome in this segment (the `told` set in `afterItem`). Otherwise it ends as before: `paused-disk` if the floor flag is set, or else `failed`/`LIST_INCOMPLETE` (R678's intent). This is not a new rule, but the coordinator may want to confirm it.
+  - Tests:
+    - `resume after a quit audits capture.profile.resume and asks the rules again`, changed (see below): it now has a failed item, and after the denied Resume it is still `failed 1` and `problems` lists it. It failed first (failed 0).
+    - New, `a Resume whose listing fails keeps the failures the run knew` (enumnetwork). It failed first.
+    - New, `a Resume whose listing came back cut short before a failed video keeps its failure and says why`. It failed first, because it gave `finished`.
+- **A2.** The `captureProfile` call is wrapped. On a `PolicyDeniedError` (and not cancelled), the item in hand is put back, and the run is written `failed` with `errorCode: "POLICY_DENIED"` and `reason: err.reason`. That is the rule's own reason, the same one `link-capture.ts:724`/`profile-capture.ts:941` give a person. Then `onChange` is told, and the error is rethrown.
+  - Tests:
+    - The changed resume-after-a-quit test asserts state `failed`, the reason, the journal's `errorCode`, `runLines().why` = the reason, and "Resume downloads (3 did not complete)".
+    - New, `a start the project's rules refuse ends failed with the rule's reason and still offers Resume downloads`. It failed first against a57650f's code.
+
+### B. A stored video is never left off the transcription list (I2)
+- **B1.** In `afterItem`, a stored video goes to `addToTranscriptionList` first, then `recordRunItem(done)`, then `onQueuedForTranscription`. No `guard()` sits between the add and the done write. Any throw from the add (the rules, a read-only library) sets `transcribeRefused`, and the outcome is still written `done`.
+- **B2.** A duplicate for an item that was `running` at the segment's start counts as this run's own.
+- Tests:
+  - `a video stored just before a cut reaches the transcription list at the Resume` failed first: 2 listed of 3. The cut is made by `cancelled()` turning true once the first post source exists.
+  - `a lock during a video's done write still leaves it on the transcription list` failed first: 0 listed after the lock.
+  - `a video another capture stored is not put on the transcription list at a Resume` is a guard for B2.
+  - `a refused transcription keeps the run going` is a guard. It asserts exactly one deny.
+
+### C. Waking up, and where the disk floor applies (Minors 4, 5)
+- **C1.** `RunControl.haltSignal: AbortSignal` was added (the interface in `download-run.ts`).
+  - The gap and every wait sleep on `AbortSignal.any([requestedSignal, signal, haltSignal])`. After each one, `awake()` checks `cancelled` and then `halt()`, and throws `CaptureCancelledError` before anything more is written or asked.
+  - The turn is also raced with `haltSignal`, and a halt there rejects with `CaptureCancelledError`. This is my reading of "every wait".
+  - Tests:
+    - `a move during the gap wakes it and nothing more is downloaded or written` failed first: the sleep's signal was not aborted.
+    - `a move during a slow-down wait wakes it and nothing more is asked of the platform` failed first: the run went on.
+    - Both check `signal.aborted` at once inside the controlled sleep, so they fail fast.
+- **C2.** A `metadataOnly` run reads no free space. It never pauses before a video and never puts a failure back for the disk. Test `a run that keeps only the details never pauses on the disk` failed first (`paused-disk`). The brief called this a guard test.
+
+### D. Smaller points (Minors 1, 2, 6)
+- **D1.** `setRunTitle(repo, projectId, runId, title): Promise<RunView>` is now in `lists/run-journal.ts`. It goes through `writable` (read-only and locked are refused), `repaired`, `liveRun` (a discarded run gives NotFoundError) and `recount`, and it is sealed. It is exported from `index.ts`. The local copy in `download-run.ts` is gone. The test `setRunTitle writes the run's title sealed, keeps its state and recounts it; refused read-only, locked or discarded` in `run-journal.test.ts` failed first: not a function.
+- **D2.** New reason `RUN_FINISHED` in `capture/errors.ts`, thrown as `InvalidInputError(plainReason("RUN_FINISHED"))`. `a run finished with no failure cannot be resumed` now asserts the sentence, and it failed first.
+- **D3.**
+  - The three turn tests race the wait for the turn with the run itself (`turnAsked`). A mutation that never calls `turn` now fails all three in about 2 s, not at the 120 s limit. These are guards.
+  - New guard `Pause and Stop wake the gap at once`. A mutation where the gap sleeps on `haltSignal` only made it fail at once.
+  - The estimate test now asserts exactly one deny (`capture.profile.list`). This is a guard.
+
+### Researcher-visible sentences, new or changed
+- `RUN_FINISHED`: "These downloads have finished, so there is nothing to resume." It replaces my earlier sentence.
+- A run refused by the rules now shows the rule's own reason as its `reason`/`why`. No new sentence.
+
+### Existing tests changed
+- `resume after a quit audits capture.profile.resume and asks the rules again`: it pinned "stays downloading / interrupted" after the denied Resume. It now pins `failed` with the rule's reason, and it has a failed item.
+- `a run finished with no failure cannot be resumed`: it now also asserts the sentence.
+- The three turn tests: the wait is now raced, and nothing in them was loosened.
+- `estimate lists once…`: exactly one deny, instead of the last capture event.
+- The test helper `control()` gains `haltSignal` and `halt()`.
+
+### NEEDS A RULING
+None blocking. Two points to confirm:
+- **The `told` check in A1.** A Resume that never reached a failed video ends `LIST_INCOMPLETE`, not `finished`.
+- **The turn woken by a halt (C1).**
+
+### Runs (fix round)
+- `vitest run src/capture/download-run.test.ts`: Tests 33 passed (33)
+- `vitest run src/capture/estimate.test.ts`: Tests 3 passed (3)
+- `vitest run src/capture/disk.test.ts`: Tests 4 passed (4)
+- `vitest run src/lists/run-journal.test.ts`: Tests 14 passed (14)
+- `vitest run src/capture/profile-capture.test.ts`: Tests 64 passed (64)
+- `pnpm --filter @ao/library typecheck` and `@ao/library-service typecheck`: clean
+- `git status --short`: empty. Group D commit: `318f1b4` (head).

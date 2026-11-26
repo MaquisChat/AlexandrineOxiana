@@ -107,3 +107,94 @@ No existing test was changed. The lines are outside `PageReads`, so the screens'
 - Whether the unlock route has written the running list before the Library's mount read lands.
 - VoiceOver on a real Mac: how `aria-describedby`, the 5-second hidden status, and an already-filled status are read.
 - WebKit: I ran no end-to-end run. The implementer reports Chromium only.
+
+---
+
+## Second look (R679)
+
+Range 45b6aa7..a047cd2 (A 3542a3a, B bdd28a7, C 2926bf9, D a047cd2). I probed the code and broke it on purpose; every probe was removed and every mutation restored. `git status --short` is empty.
+
+### Verdict: APPROVED WITH MINORS
+
+Every finding of the first review is mended as R679 rules, and each mend is pinned by a test that fails without it. Two small faults remain (S1, S2). Each is a one-line fix and should go in before the merge.
+
+### What I checked
+
+**A. One stream per screen.**
+- `useEventFeed` is stable (`useState`), so adding `feed` to the screens' effect dependencies does not restart their streams.
+- With the `events` prop, the lines open no stream of their own (tests count `/events` = 0). They subscribe at mount and unsubscribe at unmount and at a project change (effect cleanup, `WorkLines.tsx:322-339`; test "the lines unsubscribe at unmount").
+- They apply every `background.progress` event of their project and read both lists at mount and at every `onOpen`. My probes P1 and P2 are now tests and pass.
+- A subscriber added during a delivery is not called in that delivery: it iterates over a copy (probe Q2).
+- A 500 shows `WORK_LINES_TEXT.lost` with Reconnect. Reconnect reads again, and a later successful read clears the notice, also one at the next open.
+- A 404 keeps the runs learned from events (mutation M4 caught).
+- A late read never overwrites a newer event, for the runs or the list (mutation M2 caught).
+- Without the prop, the lines' own loop still meets R597/R649/R658/R659: the five stream tests are unchanged and pass.
+- The screens' own stream counts are untouched. The only screen test that changed is this task's own profile test, which now emits on the screen's stream and asserts one stream.
+
+**B. Names and announcements.**
+- Three "Stop" buttons now have three names, and no button is named plain "Stop".
+- The stopped status is rendered empty first and then filled.
+- A run first seen through an event is told once (mutation M5 caught), and a later read does not tell it again.
+- An action's error is shown inside its own line's block.
+
+**C. "Remove from this list".**
+- A run finished with nothing left, and the "nothing new to download" run, have exactly one button, which calls discard. The idle list with total > 0 has exactly one button, which calls `listAction("stop")`.
+- `LIST_STOPPED_TEXT` is said after a Stop of a running or paused list and not after a removal.
+- In `packages/shared/src/api/background.ts`, only the two `remove` keys were added (and their test). Nothing else in that file changed.
+
+**D. Smaller points.**
+- Without the synchronous guard, all five "two presses in one tick" tests fail.
+- The titles `of` and `Downloading` are found with their quotes; the bare-`indexOf` version fails the test.
+- A title with a quotation mark inside (`He said "hi"`) is wrapped correctly (probe Q3).
+- An empty title is not wrapped and shows `Downloading "": …`. That wording comes from Task 1's `runLines`, not this task (S3).
+- The "Show them" read is cancelled on close and at unmount, has the first-read time limit, and a failure shows "Try again" inside its run's block.
+
+**Runs.** Each file was run on its own:
+- `WorkLines.test.tsx` 49/49, and 15 of 15 runs under four busy loops (killed afterwards)
+- `Library.test.tsx` 51/51
+- `Library.firstReads.test.tsx` 18/18
+- `Capture.test.tsx` 67/67
+- `Capture.firstReads.test.tsx` 15/15
+- shared `background.test.ts` 27/27
+
+No test was skipped or deleted. The changed tests are the ones the report names, and the reasons hold.
+
+### Findings (Minor)
+
+- **S1. A subscriber that throws breaks the screen's own loop** (`WorkLines.tsx:69-70`). Probe Q1: `feed.event` and `feed.opened` rethrow, and later subscribers are not called.
+  - On Capture, `feed.opened()` is the first statement of `onOpen` (`Capture.tsx:620`). A throw there would skip `connected`, the reset of the try count and `readQueues`.
+  - `feed.event(ev)` sits inside both screens' `for await` loops (`Capture.tsx:632`, `Library.tsx:374`). A throw there ends the stream as if it had dropped.
+  - No current subscriber can throw: WorkLines' handlers only parse with guards and set state. The fault is latent, but the requirement in the coordinator's brief is not met.
+  - Fix: wrap each subscriber call in `try { … } catch { /* a subscriber's fault is its own */ }`.
+- **S2. After Discard or Remove leaves nothing to show, switching to another app drops focus to the page body** (`WorkLines.tsx:488`).
+  - A window blur also fires `blur` on the focused heading. `onBlur` then clears `holdFocus` and the section unmounts with focus inside it. When the researcher comes back, focus is on `<body>` (probe Q4 shows the unmount and the focus on body).
+  - Fix: in `onBlur`, clear the hold only when focus really moved within the page: `if (document.hasFocus()) setHoldFocus(false)`. Then also clear it at the next `focusin` elsewhere, or simply when the window regains focus and the heading is no longer focused.
+- **S3. An empty run title reads `Downloading "": …`.** This is Task 1's `runLines` and not this task's to change. Noted for the coordinator: `(no title)` already exists in `PROBLEMS_TEXT.noTitle`.
+- **S4. On Capture, the lines can go stale once the screen's own stream gives up.** Capture's consumer stops after 2 reconnects and shows its own notice; from then on the lines get no events. This follows from design (c) and the screen's notice covers it, so no change is needed; I list it only so that it is known.
+
+### The implementer's open point (focus after Discard or Remove leaves nothing)
+
+I would rule it as built, with S2 fixed:
+- Focus goes to the heading and is never dropped by the app itself.
+- The section goes when the researcher moves focus on.
+- A screen reader hears "Downloads and transcriptions, heading level 2" followed by nothing, which is acceptable, and the section then disappears without an announcement.
+
+The alternatives are worse:
+- The screen's main heading is a different place on each screen and would need a prop.
+- Keeping the empty section until the next change brings M6 back.
+
+### Mutations (all restored)
+
+| Mutation | Result |
+|---|---|
+| Synchronous guard removed | 5 failed |
+| Late read allowed to overwrite (runs and list) | 1 failed |
+| Title found by the bare `indexOf` | 1 failed |
+| A 404 wipes runs | 1 failed |
+| A run first seen through an event not told | 1 failed |
+
+### Not checked
+
+- VoiceOver: whether `aria-labelledby` names are read in full in the rotor, and the timing of the hidden status.
+- How WebKit really behaves on a window blur (S2 is a reading, plus a jsdom probe of the unmount).
+- The real Task 5 and Task 7 routes.

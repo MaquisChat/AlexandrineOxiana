@@ -54,3 +54,59 @@ None changed. Added: the 25 in WorkLines.test.tsx, 1 in Library.test.tsx, 2 in C
 - `pnpm --filter @ao/ui build` — ✓ built in 5.19s
 - `playwright test capture.spec.ts --project=chromium --trace off` — 4 passed (46.0s)
 - `playwright test library.spec.ts --project=chromium --trace off` — 6 passed (1.0m)
+
+## Fix round (R679)
+
+Branch `wc-6-lines`, commits on top of 45b6aa7: A 3542a3a, B bdd28a7, C 2926bf9, D a047cd2 (head). E needed no code. Not pushed. `git status --short` is empty.
+
+**A. One stream per screen (I1, I2, M6, M7).** `WorkLinesProps.events?: WorkLinesEvents` (`subscribe(onEvent, onOpen) → unsubscribe`) and `useEventFeed()` in `components/WorkLines.tsx`. With the prop, the lines open no stream. From mount to unmount they apply every `background.progress` of their project, and they read both lists at mount and at every `onOpen`. Without the prop, the lines' own loop runs from mount. Library.tsx and Capture.tsx hand over their own `/events` consumer (`feed.event(e)` for every event, `feed.opened()` at every open). The Capture `key` re-mount is gone. No stream count in any screen test changed.
+- A failed read other than 404 shows `WORK_LINES_TEXT.lost` with Reconnect. Reconnect reads again, and a successful read (also one at the next `onOpen`) clears the notice. A 404 is a no-op and keeps runs learned from events.
+- A4: an arrival counter per run and for the list. A read's answer about something an event or an answer changed after the read was sent is dropped.
+- A5: the section renders nothing without a run, list, notice or status.
+- New tests, all seen failing first: P1, P2, re-read at onOpen, 500 + Reconnect, 404 keeps runs, a late read does not overwrite, after Discard nothing is left once focus leaves, unsubscribe at unmount. Library.test "an event on the screen's own stream shows its line…" also failed first. Capture.test's profile test now emits on the screen's stream and asserts one stream; it failed first.
+
+**B (I3, M2, M5, M9).** Each button has `aria-labelledby="<own id> <line title id>"`. This covers Copy the list and Try again too. The stopped status is always rendered: empty, then filled. A run first seen through an event is told once (`useSaid(text, tellFirst)`). An action's refusal shows in its own run's or the list's block. Four new tests, each seen failing first.
+
+**C (I4).** `RUN_BUTTONS.remove` and `LIST_BUTTONS.remove`, both `Remove from this list` (shared test updated, seen failing first). A finished run with nothing left, and "nothing new to download", gets that one button, which calls discard; focus goes to the heading. An idle list with total > 0 gets that one button, which sends `listAction("stop")` without `LIST_STOPPED_TEXT`; focus goes to the heading. Tests: run remove, nothing-new remove, list remove (all failed first). "paused list Stop says the stopped sentence" pins behaviour that already existed, so it passed from the start.
+
+**D (M1, M4, M8).**
+- Five "two presses in one tick" tests (run action, Discard, run Remove, list action, list Remove). They passed with the guard; with the guard removed, all five failed.
+- Titles are found with their quotes, and if not found the whole sentence goes through UserText. Test with the titles `of` and `Downloading`, seen failing first. The not-found case cannot be reached through `runLines` or `transcriptionLines` (they always quote), so it has no test.
+- "Show them" reads with `readWithin(FIRST_READ_TIMEOUT_MS)`. The read is cancelled when the block closes, the project changes or the lines unmount. No heading is shown until the list or a failure arrives. A failure shows the no-answer sentence as the screens say it (`err.message`), otherwise `errorText(err, "The list could not be read.")`, which is an existing sentence. A `Try again` button reads again. Three tests, seen failing first. The sentence "The list could not be read. Try again." from the first round is gone.
+
+**Researcher-visible words:** new: `Remove from this list` (C1, as ruled). Otherwise only existing words: `Try again`, "The list could not be read.", the no-answer sentences.
+
+**Existing tests changed** (all in this task's own files except background.test.ts):
+- WorkLines.test: "nothing to show…" (now follows the stream; renamed "…(the stream is followed all the same)") and "404 shows nothing" (the stream opens, 4 asks). Both changed because the loop runs from mount (A1).
+- WorkLines.test: "answers after the project changed…" now counts 2 reads per mount and checks that both are cancelled.
+- WorkLines.test: "a run that completed everything says so and has no button" became "…offers only Remove from this list…" (C2).
+- WorkLines.test: every button lookup is now scoped to its line with the full name (B1).
+- Library.test and Capture.test "the work lines are shown…": the button's full name (B1).
+- Capture.test: the profile test is now the screen-stream test (the key re-mount is gone).
+- shared background.test.ts: RUN_BUTTONS and LIST_BUTTONS now include `remove`.
+
+**NEEDS A RULING**
+1. A5 conflicts with "focus goes to the heading" after a Discard or Remove that leaves nothing on screen. Built: the section stays while focus is on its heading and disappears when focus leaves it (heading `onBlur`). So focus is never dropped to the page body, and no empty section stays (M6). Alternatives: move focus elsewhere (for example the screen's main heading), or keep the section until the next change. I recommend keeping what is built.
+
+**Runs**
+- WorkLines.test 49/49, and 15/15 under four busy loops (killed after)
+- Library.test 51/51; Library.firstReads 18/18; Capture.test 67/67; Capture.firstReads 15/15
+- shared background.test 27/27
+- typecheck @ao/shared and @ao/ui clean; lint:css clean; lint:colours ok
+- UI build ✓
+- e2e Chromium: capture.spec 4 passed, library.spec 6 passed (no scenario changed)
+
+## Last fix (R681)
+
+Commit 3fbfb33 on `wc-6-lines`. Not pushed. `git status --short` is empty. The open point about focus is ruled AS BUILT.
+
+- **S1.** The event feed now calls each subscriber in its own try/catch (`each()` in `WorkLines.tsx`), so a subscriber that throws no longer breaks the screen's stream loop or skips the subscribers after it. The error is dropped, because the components have no pattern for reporting errors in development.
+  - New test: "a subscriber that throws does not stop the ones after it…" (`renderHook(useEventFeed)`). It failed first: the throw reached the caller.
+- **S2.** The heading's `onBlur` now clears the hold only when `document.hasFocus()` is true, i.e. when focus moved within the page. When the whole window loses focus, the empty section and its heading stay.
+  - New test: "after a Remove of the last line, the window losing focus keeps the heading; …". It failed first: the heading was gone.
+  - Changed test: "after a Discard here, once focus leaves the heading, nothing is left on screen (M6)". It now stubs `document.hasFocus()` to true, because jsdom returns false there.
+- **Runs:**
+  - `WorkLines.test.tsx`: 51/51, and 15/15 under four busy loops (killed afterwards).
+  - `Library.test.tsx`: 51/51.
+  - `Capture.test.tsx`: 67/67.
+  - `typecheck @ao/ui`: clean.
