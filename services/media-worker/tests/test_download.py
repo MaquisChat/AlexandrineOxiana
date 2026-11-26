@@ -93,7 +93,7 @@ def test_ytdlp_quality_selects_a_format(monkeypatch):
     best = build_ytdlp_args("https://x.test/p", "/out", {"quality": "best"})
     assert best[best.index("-f") + 1] == "bv*+ba/b"
     hd = build_ytdlp_args("https://x.test/p", "/out", {"quality": "720p"})
-    assert hd[hd.index("-f") + 1] == "bv*[height<=720]+ba/b[height<=720]/b"
+    assert hd[hd.index("-f") + 1] == "bv*+ba/b" and hd[hd.index("-S") + 1] == "res:720,fps,vcodec:h264,acodec:m4a"
     assert hd.index("-f") < hd.index("--")
     assert validate_params("https://x.test/p", {"quality": "1080p"}) is None
     assert validate_params("https://x.test/p", {"quality": "4k"}) is not None
@@ -146,7 +146,7 @@ def test_ffmpeg_location_is_handed_to_ytdlp_when_found(worker, tmp_path, monkeyp
 def test_audio_only_extracts_m4a():
     from ao_worker.download import validate_params
     args = build_ytdlp_args("https://x.test/p", "/out", {"quality": "audio"})
-    assert args[args.index("-f") + 1] == "ba/b"
+    assert args[args.index("-f") + 1] == "ba[ext=m4a]/ba/b"
     assert args[args.index("-x") + 1] == "--audio-format" and args[args.index("--audio-format") + 1] == "m4a"
     assert args.index("-x") < args.index("--")
     assert validate_params("https://x.test/p", {"quality": "audio"}) is None
@@ -209,6 +209,75 @@ def test_failure_json_carries_platform_reason(worker, tmp_path, monkeypatch):
     from ao_worker.jobs import JobError
     assert "platformReason" not in JobError("X", "m").to_json()
     assert JobError("X", "m", platform_reason="why").to_json()["platformReason"] == "why"
+
+
+_FORMAT_ROWS = {
+    "best": ["-f", "bv*+ba/b", "-S", "res,fps,vcodec:h264,acodec:m4a"],
+    "1080p": ["-f", "bv*+ba/b", "-S", "res:1080,fps,vcodec:h264,acodec:m4a"],
+    "720p": ["-f", "bv*+ba/b", "-S", "res:720,fps,vcodec:h264,acodec:m4a"],
+    "audio": ["-f", "ba[ext=m4a]/ba/b", "-x", "--audio-format", "m4a"],
+    "ready": ["-f", "b"],
+}
+
+
+def _format_args(args):
+    """The format-related arguments of a yt-dlp argument list, in order."""
+    out, i = [], 0
+    while i < len(args) and args[i] != "--":
+        if args[i] in ("-f", "-S", "--audio-format"):
+            out += args[i:i + 2]
+            i += 2
+            continue
+        if args[i] == "-x":
+            out.append("-x")
+        i += 1
+    return out
+
+
+@pytest.mark.parametrize("quality", list(_FORMAT_ROWS))
+def test_each_quality_asks_for_exactly_its_format_arguments(quality):
+    args = build_ytdlp_args("https://x.test/p", "/out", {"quality": quality})
+    want = _FORMAT_ROWS[quality]
+    i = args.index("-f")
+    assert args[i:i + len(want)] == want
+    assert sorted(_format_args(args)) == sorted(want)
+
+
+def test_no_quality_with_ffmpeg_asks_for_720p_and_without_ffmpeg_for_nothing():
+    with720 = build_ytdlp_args("https://x.test/p", "/out", {"quality": "720p"}, ffmpeg="/fake/ffmpeg")
+    assert build_ytdlp_args("https://x.test/p", "/out", {}, ffmpeg="/fake/ffmpeg") == with720
+    bare = build_ytdlp_args("https://x.test/p", "/out", {})
+    for flag in ("-f", "-S", "--ffmpeg-location", "-x"):
+        assert flag not in bare
+    # byte for byte what the worker sent before this branch, plus the fragments rule
+    before = [
+        "--ignore-config", "--newline", "--no-color", "-o", os.path.join("/out", "%(id)s.%(ext)s"),
+        "--write-info-json", "--write-subs", "--write-auto-subs", "--sub-langs", "all",
+        "--write-thumbnail", "--no-overwrites",
+        "--sleep-requests", "2", "--sleep-interval", "3", "--max-sleep-interval", "8",
+        "--retries", "3", "--", "https://x.test/p",
+    ]
+    assert [a for a in bare if a != "--abort-on-unavailable-fragments"] == before
+
+
+def test_metadata_only_and_flat_list_get_no_format_and_are_never_refused_for_ffmpeg(worker, tmp_path, monkeypatch):
+    from ao_worker import tools
+    for flat in ({"metadataOnly": True}, {"flatList": True}):
+        args = build_ytdlp_args("https://x.test/p", "/out", {**flat, "quality": "720p"}, ffmpeg="/fake/ffmpeg")
+        for flag in ("-f", "-S", "-x", "--abort-on-unavailable-fragments"):
+            assert flag not in args
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_ARGV_FILE", str(argv_file))
+    monkeypatch.setattr(tools, "which", lambda program: None)
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp", "metadataOnly": True, "quality": "720p"})
+    assert job["status"] == "done", job
+    assert "-f" not in json.loads(argv_file.read_text())
+
+
+def test_downloads_abort_on_unavailable_fragments():
+    assert "--abort-on-unavailable-fragments" in build_ytdlp_args("https://x.test/p", "/out", {})
+    assert "--abort-on-unavailable-fragments" in build_ytdlp_args("https://x.test/p", "/out", {"quality": "ready"})
+    assert "--abort-on-unavailable-fragments" not in build_ytdlp_args("https://x.test/p", "/out", {"flatList": True})
 
 
 def test_strip_url():

@@ -45,18 +45,30 @@ log = logging.getLogger("ao_worker.download")
 TOOLS = ("yt-dlp", "gallery-dl")
 BROWSERS = ("chrome", "firefox", "safari", "edge", "brave")
 # yt-dlp format selection per quality choice (best video+audio, falling back to the best single file).
+_H264_AAC = "vcodec:h264,acodec:m4a"
 QUALITY_FORMATS = {
     "best": "bv*+ba/b",
-    "1080p": "bv*[height<=1080]+ba/b[height<=1080]/b",
-    "720p": "bv*[height<=720]+ba/b[height<=720]/b",
-    "audio": "ba/b",
+    "1080p": "bv*+ba/b",
+    "720p": "bv*+ba/b",
+    "audio": "ba[ext=m4a]/ba/b",
     "ready": "b",
+}
+# Format sorting per quality choice. `res:N` takes the best picture whose SMALLER side is at most N (an
+# upright video is not thrown out by a height filter) and never fails for lack of a match; the H.264/AAC
+# preference comes after the size, so the codec never lowers the size, and yt-dlp joins that pair into an
+# MP4 that plays in the app on every Mac.
+QUALITY_SORT = {
+    "best": f"res,fps,{_H264_AAC}",
+    "1080p": f"res:1080,fps,{_H264_AAC}",
+    "720p": f"res:720,fps,{_H264_AAC}",
 }
 # Extra yt-dlp arguments per quality choice ("Audio only" is saved as an m4a file).
 QUALITY_EXTRA_ARGS = {"audio": ["-x", "--audio-format", "m4a"]}
 # Only "ready" (a file already joined by the platform) can be saved without ffmpeg: the others join
 # picture and sound, or extract the sound, and refuse to run rather than save a lower quality silently.
 QUALITY_WITHOUT_FFMPEG = ("ready",)
+# Asked for nothing and ffmpeg is there: the default quality of the app.
+DEFAULT_QUALITY = "720p"
 DATE_RE = re.compile(r"^\d{8}$")
 YTDLP_RELEASES = "https://github.com/yt-dlp/yt-dlp/releases/"
 # Hosts the release files may come from (GitHub redirects downloads to its file host): the
@@ -380,8 +392,16 @@ def build_ytdlp_args(url: str, out: str, params: dict, js_runtime: str | None = 
         args.append("--write-comments")
     if params.get("cookiesFromBrowser"):
         args += ["--cookies-from-browser", params["cookiesFromBrowser"]]
-    if params.get("quality"):
-        args += ["-f", QUALITY_FORMATS[params["quality"]], *QUALITY_EXTRA_ARGS.get(params["quality"], [])]
+    enumeration = bool(params.get("flatList") or params.get("metadataOnly"))
+    quality = params.get("quality") or (DEFAULT_QUALITY if ffmpeg else None)
+    if quality and not enumeration:
+        args += ["-f", QUALITY_FORMATS[quality]]
+        if quality in QUALITY_SORT:
+            args += ["-S", QUALITY_SORT[quality]]
+        args += QUALITY_EXTRA_ARGS.get(quality, [])
+    if not enumeration:
+        # A video whose pieces could not all be fetched fails; it is never stored cut short.
+        args.append("--abort-on-unavailable-fragments")
     if ffmpeg:
         args += ["--ffmpeg-location", ffmpeg]
     if js_runtime:
@@ -509,7 +529,8 @@ def run(job: Job, ctx: JobContext) -> dict:
         if resolved is None:
             raise not_installed("video-downloader")
         ffmpeg = tools.which("ffmpeg")
-        if ffmpeg is None and params.get("quality") not in (None, *QUALITY_WITHOUT_FFMPEG):
+        downloads = not (params.get("flatList") or params.get("metadataOnly"))
+        if ffmpeg is None and downloads and params.get("quality") not in (None, *QUALITY_WITHOUT_FFMPEG):
             raise not_installed("ffmpeg")
         cmd = [resolved[0]]
         version = tool_version(cmd)
