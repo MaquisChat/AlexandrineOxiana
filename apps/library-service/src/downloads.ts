@@ -18,9 +18,12 @@
  *   unlock its runs are shown interrupted, with Resume downloads (R669 item 1).
  * - **A close** cuts every run (nothing more is written once the library's lock goes; nothing continues
  *   after a quit, R668). **A move** asks each run to stop between videos and wakes its waits at once
- *   (R680); a plain project's run that was downloading continues on the moved library by itself
- *   (`capture.profile.continue`, R106); an encrypted project's run, or one only waiting its turn, does not
- *   (R534 b, R668) and is shown interrupted.
+ *   (R680). A move that is refused or rolled back leaves the runs as they were: each halted run takes
+ *   its place in the order again at once (R687). A move that goes ahead: a plain project's run that was
+ *   downloading continues on the moved library by itself (`capture.profile.continue`, R106), only if its
+ *   journal still says queued, downloading or waiting and nobody paused, stopped or resumed it meanwhile;
+ *   an encrypted project's run, or one only waiting its turn, does not (R534 b, R668) and is shown
+ *   interrupted. A continuation that does not go on is dropped, never kept for a later move.
  */
 import { randomUUID } from "node:crypto";
 import { classifyUrl } from "@ao/core";
@@ -76,7 +79,17 @@ interface Held {
   /** It feeds the Capture screen's queue (a start, and its continuation after a move). */
   queue: boolean;
   report: ProfileCaptureReport | undefined;
+  /** Resolves when the run is no longer held (it ended, or it never began: an early exit). */
   settled: Promise<void>;
+  settle: () => void;
+}
+
+/** The journal states of a run that is going on (a continuation goes on only from one of them, R687). */
+const LIVE = new Set<DownloadRunState>(["queued", "downloading", "waiting"]);
+
+/** A continuation that found its run no longer going on (paused, stopped, finished, discarded): it is dropped. */
+class NotContinued extends Error {
+  override name = "NotContinued";
 }
 
 const runningConflict = () => new ApiError(409, "CONFLICT", RUN_ALREADY_RUNNING_TEXT, RUN_ALREADY_RUNNING);
@@ -156,13 +169,19 @@ export class DownloadRunner {
     return { ...e, videoToolsInstalled: await this.videoToolsInstalled() };
   }
 
-  /** Records a run as held, in its project's order, before anything is awaited. */
-  private register(projectId: string, runId: string, key: string | undefined, queue: boolean): { h: Held; before: Held[] } {
-    const before = [...(this.order.get(projectId) ?? [])];
+  /**
+   * Records a run as held, in its project's order, before anything is awaited. A continuation keeps the place
+   * (`seq`) its run had, so after a refused move the runs go on in the order they were in (R687).
+   */
+  private register(projectId: string, runId: string, key: string | undefined, queue: boolean, seq = ++this.seq): { h: Held; before: Held[] } {
+    const all = this.order.get(projectId) ?? [];
+    const before = all.filter((x) => x.seq < seq);
+    let settle!: () => void;
+    const settled = new Promise<void>((r) => (settle = r));
     const h: Held = {
       runId,
       projectId,
-      seq: ++this.seq,
+      seq,
       key,
       asked: undefined,
       req: new AbortController(),
@@ -174,10 +193,11 @@ export class DownloadRunner {
       state: undefined,
       queue,
       report: undefined,
-      settled: Promise.resolve(),
+      settled,
+      settle,
     };
     this.runs.set(runId, h);
-    this.order.set(projectId, [...before, h]);
+    this.order.set(projectId, [...before, h, ...all.filter((x) => x.seq >= seq)]);
     return { h, before };
   }
 
@@ -196,7 +216,6 @@ export class DownloadRunner {
   private launch(
     s: Session,
     h: Held,
-    before: Held[],
     body: (ctl: RunControl) => Promise<DownloadRunSummary>,
     answerWhen: (run: DownloadRunSummary) => boolean,
   ): Promise<DownloadRunSummary> {
@@ -209,9 +228,12 @@ export class DownloadRunner {
       answer = res;
       refuse = rej;
     });
-    let settle!: () => void;
-    h.settled = new Promise<void>((r) => (settle = r));
-    const turn = before.length ? { turn: () => Promise.all(before.map((b) => b.settled)).then(() => undefined) } : {};
+    // The turn comes when no run before it in the project's order is held any more. Read again after each
+    // wait: a run halted by a refused move takes its place again at once (R687).
+    const ahead = () => (this.order.get(pid) ?? []).filter((x) => x.seq < h.seq);
+    const turn = async (): Promise<void> => {
+      for (let a = ahead(); a.length; a = ahead()) await Promise.all(a.map((x) => x.settled));
+    };
     const ctl: RunControl = {
       requested: () => h.asked,
       requestedSignal: h.req.signal,
@@ -241,7 +263,7 @@ export class DownloadRunner {
       onQueuedForTranscription: (sourceId) => {
         if (!h.cancelled) this.onQueuedForTranscription(pid, sourceId);
       },
-      ...turn,
+      turn,
     };
     void state.startWork("download-run", async (work) => {
       // A move's drain: the run stops between videos and its waits wake at once (R680).
@@ -264,12 +286,23 @@ export class DownloadRunner {
         }
       } finally {
         this.forget(h);
-        settle();
+        h.settle();
       }
-      // A plain project's run that was downloading when a move stopped it continues on the moved library.
-      const fromRoot = s.lib.root;
-      const continues = !ended && h.halted && !h.cancelled && h.begun && failure instanceof CaptureCancelledError && !this.encrypted(s, pid);
-      if (continues) return (next: Session) => this.continueRun(next, pid, h, fromRoot);
+      // Halted by a move between videos. While the move still stops work, what comes next is decided when the
+      // library it belongs to is open again (refused: the same library; moved: the new one). A move already rolled
+      // back (its drain ran out of time) leaves the run as it was: it takes its place again at once (R687).
+      if (!ended && h.halted && !h.cancelled && failure instanceof CaptureCancelledError) {
+        const fromRoot = s.lib.root;
+        if (work.stopping) return (next: Session) => this.afterMove(next, h, fromRoot);
+        this.afterMove(s, h, fromRoot);
+        return;
+      }
+      if (failure instanceof NotContinued) {
+        // A continuation whose run the researcher paused, stopped, finished or discarded meanwhile: dropped.
+        this.endQueue(h, new CaptureCancelledError());
+        await this.publishRun(s, h);
+        return;
+      }
       this.endQueue(h, ended ? undefined : failure);
       return;
     });
@@ -310,19 +343,54 @@ export class DownloadRunner {
     h.stop.abort();
   }
 
-  /** After a move: the run that was downloading carries on by itself (`capture.profile.continue`). */
-  private continueRun(next: Session, projectId: string, old: Held, fromRoot: string): void {
-    // Left behind by a move that did not take its project, or the project is not there: shown interrupted.
-    if (this.encrypted(next, projectId) && next.lib.root !== fromRoot) return this.endQueue(old, new CaptureCancelledError());
-    if (this.runs.has(old.runId)) return;
-    const { h, before } = this.register(projectId, old.runId, old.key, old.queue);
+  /**
+   * A run halted by a move, once the library it belongs to is open again (R687, R668):
+   * - the move was refused or rolled back (the same library): every halted run goes on, in its place in the order;
+   * - the move went ahead: only a plain project's run that was downloading carries on by itself
+   *   (`capture.profile.continue`); an encrypted project's run, and one that was only waiting its turn, do not.
+   * Never a run the researcher asked to pause or stop, one held again meanwhile, one of a project that is locked
+   * now, or (checked against its journal as it continues) one no longer queued, downloading or waiting.
+   * A continuation that does not go on is dropped, and its run is published as it now reads.
+   */
+  private afterMove(next: Session, old: Held, fromRoot: string): void {
+    const pid = old.projectId;
+    const refused = next.lib.root === fromRoot;
+    let unlocked = false;
+    try {
+      unlocked = next.repo.isUnlocked(pid);
+    } catch {
+      // not a project of this library
+    }
+    const goesOn = this.state.session === next && unlocked && old.asked === undefined && !this.runs.has(old.runId) && (refused || (old.begun && !this.encrypted(next, pid)));
+    if (!goesOn) {
+      this.endQueue(old, new CaptureCancelledError());
+      this.state.track(this.publishRun(next, old), "publishing a download run");
+      return;
+    }
+    const { h } = this.register(pid, old.runId, old.key, old.queue, old.seq);
     this.launch(
       next,
       h,
-      before,
-      async (ctl) => this.library(next, await this.state.workerClient()).resume(projectId, old.runId, "continue", ctl),
+      async (ctl) => {
+        const now = await this.reader(next).get(pid, old.runId, () => true);
+        if (!now || !LIVE.has(now.state)) throw new NotContinued();
+        return this.library(next, await this.state.workerClient()).resume(pid, old.runId, "continue", ctl);
+      },
       () => true,
     ).catch(() => {});
+  }
+
+  /** Publishes the run as it now reads (a Stop asked of it while it ended is written first). Never throws. */
+  private async publishRun(s: Session, h: Held): Promise<void> {
+    if (h.cancelled) return;
+    try {
+      const reader = this.reader(s);
+      if (h.asked === "stop" && !this.runs.has(h.runId)) await reader.stopNotRunning(h.projectId, h.runId);
+      const run = await reader.get(h.projectId, h.runId, this.isHeld);
+      if (run) this.state.publishBackground(h.projectId, { downloads: run });
+    } catch {
+      // a project locked or gone meanwhile: nothing is told of it
+    }
   }
 
   async start(s: Session, projectId: string, url: string, opts: RunOptions): Promise<DownloadRunSummary> {
@@ -330,13 +398,12 @@ export class DownloadRunner {
     // Checked and recorded with nothing awaited in between.
     for (const x of this.runs.values()) if (x.projectId === projectId && x.key === key) throw runningConflict();
     const runId = randomUUID();
-    const { h, before } = this.register(projectId, runId, key, true);
+    const { h } = this.register(projectId, runId, key, true);
     this.state.captureQueues.startProfile(runId, projectId, url, "desktop");
     this.state.profileRunStarted(runId, projectId);
     return this.launch(
       s,
       h,
-      before,
       async (ctl) => {
         const runs = this.library(s, await this.state.workerClient());
         // Starting an address again: its older unfinished runs that nothing holds go (the new run takes
@@ -370,7 +437,6 @@ export class DownloadRunner {
     return this.launch(
       s,
       h,
-      before,
       (ctl) => this.library(s, worker).resume(projectId, runId, "researcher", ctl),
       // The answer says queued only while another run of the project is before it.
       (run) => run.state !== "queued" || before.length > 0,

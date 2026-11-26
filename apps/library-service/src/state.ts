@@ -538,6 +538,11 @@ export class ServiceState {
     return [...this.work.values()].map((w) => w.kind);
   }
 
+  /** How many continuations of work stopped for a move are kept, waiting for their library (diagnostics, tests). */
+  stoppedWorkCount(): number {
+    return this.stoppedWork.length;
+  }
+
   /** Asks every registered item (those `which` selects) to stop between items and waits for all to end; false if one did not in time. */
   async drainWork(timeoutMs: number, which: (w: { kind: string; ctl: WorkControl }) => boolean = () => true): Promise<boolean> {
     const items = [...this.work.values()].filter(which);

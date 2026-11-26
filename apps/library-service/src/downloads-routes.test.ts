@@ -778,6 +778,103 @@ describe("a move (R680, R106, R534 b)", () => {
     expect(await runOf(pid, runId)).toMatchObject({ state: "finished", done: 3 });
     expect(itemDownloads()).toEqual([idA(3), idA(2), idA(1)]);
     expect((await auditOps(pid)).filter((op) => op === "capture.profile.continue")).toHaveLength(1);
+    // Continued once; nothing is kept for a later move.
+    expect(svc.state.stoppedWorkCount()).toBe(0);
+  });
+
+  it("a move refused for time leaves the runs as they were: the run halted for it and the run waiting behind it go on, and no continuation is left (R687)", async () => {
+    await start({ suspendTimeoutMs: 300 });
+    await openLibrary();
+    const pid = await project();
+    const held = hold(itemOf(idA(2)));
+    const a = await captureProfile(pid, A);
+    const aId = a.json.queueId as string;
+    await held.reached;
+    const b = await captureProfile(pid, B);
+    const bId = b.json.queueId as string;
+    svc.state.events.subscribe((e) => {
+      const run = (e.data as { downloads?: DownloadRunSummary }).downloads;
+      if (e.type === "background.progress" && run?.runId === aId && run.state === "finished") runLog.push("END A");
+    });
+    // The video in hand outlasts the move's drain: the move is refused and rolled back.
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.status).toBe(409);
+    expect(svc.state.session!.lib.root).toBe(join(tmp, "Lib"));
+    // Both runs are still held: the first downloading, the second waiting its turn behind it.
+    expect(svc.state.downloads.held(aId)).toBe(true);
+    expect(svc.state.downloads.held(bId)).toBe(true);
+    expect(await runOf(pid, bId)).toMatchObject({ state: "queued" });
+    held.release();
+    await svc.state.idle();
+    expect(await runOf(pid, aId)).toMatchObject({ state: "finished", done: 3 });
+    expect(await runOf(pid, bId)).toMatchObject({ state: "finished", done: 3 });
+    expect(itemDownloads()).toEqual([idA(3), idA(2), idA(1), idB(3), idB(2), idB(1)]);
+    // Still in their order: nothing of the second address before the first run ended.
+    const end = runLog.indexOf("END A");
+    expect(end).toBeGreaterThan(0);
+    expect(runLog.slice(0, end).some((u) => u.includes("other.dancer"))).toBe(false);
+    expect(svc.state.stoppedWorkCount()).toBe(0);
+  });
+
+  it("after a refused move, a run paused meanwhile stays paused through a later successful move, and nothing is asked of the platform (R687)", async () => {
+    profiles["fake.dancer"] = profile("fake.dancer", "Fake Dancer", idA, 4);
+    await start({ suspendTimeoutMs: 300 });
+    await openLibrary();
+    const pid = await project();
+    const held = hold(itemOf(idA(3)));
+    const a = await captureProfile(pid, A);
+    const aId = a.json.queueId as string;
+    await held.reached;
+    const b = await captureProfile(pid, B);
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } })).status).toBe(409);
+    // The first run goes on; the researcher pauses it at its next video.
+    const next = hold(itemOf(idA(2)));
+    held.release();
+    await next.reached;
+    expect((await act(pid, aId, "pause")).status).toBe(200);
+    next.release();
+    await svc.state.idle();
+    expect(await runOf(pid, aId)).toMatchObject({ state: "paused", done: 3, notCompleted: 1 });
+    expect(await runOf(pid, b.json.queueId)).toMatchObject({ state: "finished", done: 3 });
+    const asked = runLog.length;
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    await svc.state.idle();
+    expect(svc.state.session!.lib.root).toBe(join(tmp, "Moved"));
+    expect(await runOf(pid, aId)).toMatchObject({ state: "paused", done: 3, notCompleted: 1 });
+    expect(runLog).toHaveLength(asked);
+    expect(svc.state.stoppedWorkCount()).toBe(0);
+  });
+
+  it("a run stopped after the move halted it is not continued on the moved library; its continuation is dropped (R687)", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const held = hold(itemOf(idA(2)));
+    const a = await captureProfile(pid, A);
+    const aId = a.json.queueId as string;
+    await held.reached;
+    // The run is stopped (as a Stop of a run nothing holds writes it) once the move's drain has ended it.
+    const drain = svc.state.drainWork.bind(svc.state);
+    let first = true;
+    vi.spyOn(svc.state, "drainWork").mockImplementation(async (ms, which) => {
+      const drained = drain(ms, which);
+      if (!first) return drained;
+      first = false;
+      held.release();
+      const ok = await drained;
+      expect(svc.state.downloads.held(aId)).toBe(false);
+      await svc.state.downloads.request(svc.state.session!, pid, aId, "stop");
+      return ok;
+    });
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    await svc.state.idle();
+    expect(await runOf(pid, aId)).toMatchObject({ state: "stopped", done: 2 });
+    expect(itemDownloads()).toEqual([idA(3), idA(2)]);
+    expect((await auditOps(pid)).filter((op) => op === "capture.profile.continue")).toHaveLength(0);
+    expect(svc.state.downloads.held(aId)).toBe(false);
+    expect(svc.state.stoppedWorkCount()).toBe(0);
   });
 
   it("an encrypted project's run, and a run waiting its turn, do not begin again after the move: they are shown interrupted", async () => {
