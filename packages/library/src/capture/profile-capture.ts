@@ -86,7 +86,7 @@ import { AcknowledgementRequiredError, CaptureCancelledError, plainReason, toolM
 import { nextWaitMs } from "./waits.js";
 import type { CaptureCore, CaptureOptions, CaptureOutcome, ItemContext } from "./link-capture.js";
 import { classifyUrl, type ClassifiedUrl, type Platform } from "./platforms.js";
-import { captionOf, profileSnapshot, readEnumeration, type ProfileEntry, type ProfileMeta } from "./profile-snapshot.js";
+import { captionOf, postUrl, profileSnapshot, readEnumeration, type ProfileEntry, type ProfileMeta } from "./profile-snapshot.js";
 import { firstLine, stripSnapshot, type CaptureTool } from "./snapshot.js";
 
 export type ProfileContentType = "posts" | "reels" | "videos" | "shorts" | "highlights";
@@ -104,8 +104,9 @@ export interface ProfileCaptureOptions extends CaptureOptions {
   /** Also save each new post's comments (third-party personal data; default false). */
   includeComments?: boolean;
   /**
-   * Only these posts (by the platform's id), in this order, among those listed and not yet known
-   * (a download run's Resume). Not a filter for removed detection.
+   * Only these posts (by the platform's id), in this order, among those listed (a download run's
+   * Resume). Every id is reported: one already stored as a duplicate, one no longer listed as failed
+   * (`NOT_FOUND_OR_REMOVED`, after the listed ones). Not a filter for removed detection.
    */
   onlyIds?: string[];
   /**
@@ -127,7 +128,10 @@ export type RunWaitWhy = "rate-limited" | "connection";
  * the platform's lane. Without hooks the capture behaves as it always has.
  */
 export interface RunHooks {
-  /** The fresh posts (not yet in the project, after `onlyIds`), with their lengths, before any download. */
+  /**
+   * The posts the run will take, with their lengths, before any download: those not yet in the
+   * project, or with `onlyIds` those of its ids that are listed (known ones too).
+   */
   onListed?(fresh: Array<ProfileEntry & { listing: string }>, meta: { title: string }): Promise<void>;
   /** Asked before each fresh post (a duplicate too); may throw CaptureCancelledError. */
   beforeItem?(e: ProfileEntry): Promise<"go" | "pause" | "stop" | "pause-disk">;
@@ -687,10 +691,16 @@ export function createProfileCapture(core: CaptureCore) {
       ...(signal ? { signal } : {}),
     };
     let fresh = entries.filter((e) => !isKnown(e.id));
+    /** `onlyIds` the listing no longer has: each is told as failed (removed), after the listed ones (R674 A). */
+    let unlisted: ListedEntry[] = [];
     if (opts.onlyIds) {
-      // Only these, in the order given, among the posts listed (within the dates) and not yet known.
-      const pool = new Map(dated.filter((e) => !isKnown(e.id)).map((e) => [e.id, e] as const));
-      fresh = [...new Set(opts.onlyIds)].flatMap((id) => (pool.has(id) ? [pool.get(id)!] : []));
+      // Only these, in the order given, among the posts listed (within the dates). A post already
+      // stored is not left out: it takes the duplicate path below and is reported as a duplicate,
+      // so a Resume reports every id it was given (R674 A).
+      const pool = new Map(dated.map((e) => [e.id, e] as const));
+      const ids = [...new Set(opts.onlyIds)];
+      fresh = ids.flatMap((id) => (pool.has(id) ? [pool.get(id)!] : []));
+      unlisted = ids.filter((id) => !listedIds.has(id)).map((id) => ({ id, url: postUrl(platform, id, handle) ?? "", raw: {}, listing: fallbackListing }));
     }
     const freshIds = new Set(fresh.map((e) => e.id));
     check();
@@ -699,6 +709,17 @@ export function createProfileCapture(core: CaptureCore) {
     let stopped = false;
     /** The last post ended with a lost connection (a second one in a row waits instead, with hooks). */
     let lastLost = false;
+    const total = fresh.length + unlisted.length;
+    const told = async (e: ListedEntry, out: CaptureOutcome) => {
+      report.items.push(out);
+      await hooks?.afterItem?.(e, out);
+      done++;
+      try {
+        onProgress?.(done, total, out);
+      } catch {
+        // a progress callback must not stop the run
+      }
+    };
     for (const e of fresh) {
       check();
       if (hooks?.beforeItem) {
@@ -754,14 +775,16 @@ export function createProfileCapture(core: CaptureCore) {
         resetWaits();
       }
       lastLost = out.status === "failed" && out.errorCode === "NETWORK_LOST";
-      report.items.push(out);
-      await hooks?.afterItem?.(e, out);
-      done++;
-      try {
-        onProgress?.(done, fresh.length, out);
-      } catch {
-        // a progress callback must not stop the run
-      }
+      await told(e, out);
+    }
+    // A Resume's ids the platform no longer lists: a final failure each, nothing asked of the
+    // platform, no beforeItem and no wait (R674 A).
+    for (const e of stopped ? [] : unlisted) {
+      check();
+      const out: CaptureOutcome = { url: e.url, status: "failed", errorCode: "NOT_FOUND_OR_REMOVED", reason: plainReason("NOT_FOUND_OR_REMOVED") };
+      report.failed++;
+      await save([], { key: e.id, outcome: out.status, errorCode: out.errorCode });
+      await told(e, out);
     }
 
     // 5–6. Known posts: edits, reappearance; removed detection only for whole lists.

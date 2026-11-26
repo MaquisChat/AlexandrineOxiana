@@ -1160,6 +1160,60 @@ describe("run hooks (whole channels, Task 3)", { timeout: 120_000 }, () => {
     expect((await byPost(p.id, gone)).source.availability.status).toBe("unavailable-on-platform");
   });
 
+  it("a Resume reports every id it was given: a known one as a duplicate, one no longer listed as failed (R674 A)", async () => {
+    const prof = synthetic();
+    const p = await project();
+    expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 2 })).toMatchObject({ status: "completed", created: 2 });
+    const known = prof.items[0]!.id;
+    const fresh = prof.items[5]!.id;
+    const gone = ttId(99); // not in the listing
+    const asked: string[] = [];
+    const told: Array<[string, ProfileEntry, CaptureOutcome]> = [];
+    const before = itemDownloads().length;
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, onlyIds: [known, fresh, gone] }, undefined, {
+      hooks: {
+        beforeItem: async (e) => (asked.push(e.id), "go"),
+        afterItem: async (e, out) => void told.push([e.id, e, out]),
+      },
+    });
+    expect(asked).toEqual([known, fresh]);
+    expect(told.map(([id, , o]) => [id, o.status, o.errorCode])).toEqual([
+      [known, "duplicate", undefined],
+      [fresh, "created", undefined],
+      [gone, "failed", "NOT_FOUND_OR_REMOVED"],
+    ]);
+    expect(told[2]![1].id).toBe(gone);
+    expect(told[2]![2].reason).toBe(plainReason("NOT_FOUND_OR_REMOVED"));
+    // nothing was asked of the platform for the id no longer listed
+    expect(itemDownloads().slice(before).map((j) => idOfUrl(j.input))).toEqual([fresh]);
+    expect(r).toMatchObject({ status: "completed", created: 1, duplicates: 1, failed: 1 });
+  });
+
+  it("a Resume after a failed journal write tells the stored post again, as a duplicate (R674 A)", async () => {
+    const prof = synthetic();
+    const p = await project();
+    let n = 0;
+    await expect(
+      capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, {
+        hooks: {
+          afterItem: async () => {
+            if (++n === 2) throw new Error("the journal could not be written");
+          },
+        },
+      }),
+    ).rejects.toThrow("the journal could not be written");
+    expect(await posts(p.id)).toHaveLength(2);
+    const told: Array<[string, string]> = [];
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, onlyIds: [prof.items[0]!.id, prof.items[1]!.id] }, undefined, {
+      hooks: { afterItem: async (e, out) => void told.push([e.id, out.status]) },
+    });
+    expect(told).toEqual([
+      [prof.items[0]!.id, "duplicate"],
+      [prof.items[1]!.id, "duplicate"],
+    ]);
+    expect(r).toMatchObject({ status: "completed", created: 0, duplicates: 2 });
+  });
+
   it("resume researcher audits capture.profile.resume once and asks the rules again", async () => {
     const p = await project();
     const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 2, resume: "researcher" });
