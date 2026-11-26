@@ -333,3 +333,14 @@ describe("the first-use tools dialogue", () => {
     expect(svc.state.requests.filter((r) => r === "POST /tools/image-downloader/install")).toHaveLength(2);
   });
 });
+
+describe("the video tools' words in the first-use dialogue (whole channels, Task 9; R671)", () => {
+  it("say that the video tools also join the best picture and sound when videos are downloaded", async () => {
+    const { dialog } = await opened();
+    expect(
+      within(dialog).getByText(
+        "Transcribe interviews and other recordings with the app's default speech model. The video tools join the best picture and sound when videos are downloaded, and make viewing copies of videos, also copies that leave out a recorded location.",
+      ),
+    ).toBeTruthy();
+  });
+});

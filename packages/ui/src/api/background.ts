@@ -8,19 +8,29 @@
  *   POST /projects/:id/downloads/:runId/discard          → DownloadRunDiscarded
  *   GET  /projects/:id/transcription-list                → TranscriptionListResponse
  *   POST /projects/:id/transcription-list/{pause|continue|stop} → TranscriptionListResponse
+ *   GET/PUT /projects/:id/automation                     → ProjectAutomation (Task 9: the project's switch)
+ *   GET/PUT /settings/background                         → BackgroundSettings (Task 9: keeping the Mac awake)
+ *   GET  /projects/:id/untranscribed                     → UntranscribedResponse
+ *   POST /projects/:id/transcription-list (TranscribeAllRequest) → TranscribeAllResponse ("Transcribe everything")
  *
  * Progress comes as `background.progress` events on GET /events (BackgroundProgressEvent).
  */
 import {
   BACKGROUND_EVENT,
   type BackgroundProgressEvent,
+  type BackgroundSettings,
   type DownloadProblemsResponse,
   type DownloadRunDiscarded,
   type DownloadRunListResponse,
   type DownloadRunResponse,
   type DownloadRunSummary,
+  type ProjectAutomation,
+  type SpeechModel,
+  type TranscribeAllRequest,
+  type TranscribeAllResponse,
   type TranscriptionListResponse,
   type TranscriptionListSummary,
+  type UntranscribedResponse,
 } from "@ao/shared";
 import type { ApiClient, ServiceEvent } from "./client";
 
@@ -44,6 +54,16 @@ export function backgroundApi(client: ApiClient) {
       (await r<TranscriptionListResponse>("GET", `${proj(projectId)}/transcription-list`, withSignal(opts))).list,
     listAction: async (projectId: string, what: "pause" | "continue" | "stop"): Promise<TranscriptionListSummary> =>
       (await r<TranscriptionListResponse>("POST", `${proj(projectId)}/transcription-list/${what}`)).list,
+    automation: (projectId: string, opts: { signal?: AbortSignal } = {}): Promise<ProjectAutomation> =>
+      r<ProjectAutomation>("GET", `${proj(projectId)}/automation`, withSignal(opts)),
+    setAutomation: (projectId: string, a: ProjectAutomation): Promise<ProjectAutomation> =>
+      r<ProjectAutomation>("PUT", `${proj(projectId)}/automation`, { body: { transcribeNewMedia: a.transcribeNewMedia } }),
+    untranscribed: (projectId: string, opts: { signal?: AbortSignal } = {}): Promise<UntranscribedResponse> =>
+      r<UntranscribedResponse>("GET", `${proj(projectId)}/untranscribed`, withSignal(opts)),
+    transcribeAll: (projectId: string, model?: SpeechModel): Promise<TranscribeAllResponse> =>
+      r<TranscribeAllResponse>("POST", `${proj(projectId)}/transcription-list`, { body: (model ? { model } : {}) satisfies TranscribeAllRequest }),
+    settings: (opts: { signal?: AbortSignal } = {}): Promise<BackgroundSettings> => r<BackgroundSettings>("GET", "/settings/background", withSignal(opts)),
+    setSettings: (s: BackgroundSettings): Promise<BackgroundSettings> => r<BackgroundSettings>("PUT", "/settings/background", { body: { keepAwake: s.keepAwake } }),
   };
 }
 

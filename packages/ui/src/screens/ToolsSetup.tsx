@@ -18,13 +18,17 @@
  *   finds a running job again, because the catalogue carries each tool's latest job. One request per
  *   action; answers that arrive after the screen was left, or after a newer reading, are dropped;
  *   every failure is said in plain words, and its Try again repeats exactly what failed.
+ * - Whole channels (Task 9): the section "While downloads or transcriptions run" holds the switch "Keep this Mac awake
+ *   while downloads or transcriptions run" (GET/PUT /settings/background; on by default), saved at once.
  */
-import type { ToolAction, ToolId, ToolInfo, ToolJob } from "@ao/shared";
+import { KEEP_AWAKE_TEXT, type ToolAction, type ToolId, type ToolInfo, type ToolJob } from "@ao/shared";
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { backgroundApi, type BackgroundApi } from "../api/background";
 import { ApiClientError, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
 import { DEFAULT_SPEECH_MODEL, describeHosts, formatSize, hostsOf, PUBLISHER_SERVERS, remainingOf, speechSize, toolsApi, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
 import { recordToolsScreenSeen, type FirstUseMemory } from "../components/FirstUseTools";
+import { SavedSwitch } from "../components/SavedSwitch";
 import { TryAgain } from "../components/TryAgain";
 import { UserText } from "../components/UserText";
 import type { AppLocation } from "../navigation";
@@ -34,7 +38,8 @@ import "./ToolsSetup.css";
 const GROUPS: Array<{ id: ToolInfo["group"]; title: string; hint: string }> = [
   { id: "speech", title: "Speech recognition", hint: "Speech models turn recordings into transcripts. Bigger models are slower and more accurate." },
   { id: "capture", title: "Saving from the web", hint: "Downloaders save videos and picture posts from the links you capture." },
-  { id: "media", title: "Video conversion", hint: "Makes viewing copies of videos, including copies that leave out or coarsen a recorded location." },
+  // R671: as the worker's catalogue says it (toolpins.py, the ffmpeg tool's purpose).
+  { id: "media", title: "Video conversion", hint: "Joins the best picture and sound when videos are downloaded, and makes viewing copies of videos, including copies that leave out or coarsen a recorded location." },
   { id: "documents", title: "Scanned documents", hint: "Reads the text of scanned pages so they can be searched." },
 ];
 
@@ -79,14 +84,46 @@ function installedNow(t: ToolInfo): string {
 /** The route's wrapper: one api object per client; `?tool=<id>` brings that tool into view. */
 export function ToolsSetupRoute({ client, loc, memory }: { client: ApiClient; loc: AppLocation; memory?: FirstUseMemory }) {
   const api = useMemo(() => toolsApi(client), [client]);
+  const background = useMemo(() => backgroundApi(client), [client]);
   // Reaching this screen, by whatever route, answers the first-use question (R163, R164).
   useEffect(() => recordToolsScreenSeen(memory), [memory]);
   const focusTool = new URLSearchParams(loc.search).get("tool") ?? undefined;
-  return <ToolsSetup api={api} {...(focusTool ? { focusTool } : {})} />;
+  return <ToolsSetup api={api} background={background} {...(focusTool ? { focusTool } : {})} />;
 }
 
-/** `firstReadMs` (FR-756, R579): how long a reading of the catalogue is waited for before it is given up (smaller in tests). */
-export function ToolsSetup({ api, pollMs = 1000, focusTool, firstReadMs = FIRST_READ_TIMEOUT_MS }: { api: ToolsApi; pollMs?: number; focusTool?: string; firstReadMs?: number }) {
+/** Whole channels (Task 9): keeping the Mac awake while either list runs (Task 7's setting), saved at once. */
+function KeepAwake({ background, firstReadMs }: { background: Pick<BackgroundApi, "settings" | "setSettings">; firstReadMs: number }) {
+  const id = useId();
+  const heading = useRef<HTMLHeadingElement>(null);
+  const read = useCallback(async (signal: AbortSignal) => (await background.settings({ signal })).keepAwake !== false, [background]);
+  const save = useCallback(async (on: boolean) => (await background.setSettings({ keepAwake: on })).keepAwake !== false, [background]);
+  return (
+    <section className="ao-tools__group" aria-labelledby={id}>
+      <h2 id={id} ref={heading} tabIndex={-1}>
+        {KEEP_AWAKE_TEXT.heading}
+      </h2>
+      <SavedSwitch label={KEEP_AWAKE_TEXT.label} hint={KEEP_AWAKE_TEXT.hint} read={read} save={save} focusTo={heading} firstReadMs={firstReadMs} />
+    </section>
+  );
+}
+
+/**
+ * `firstReadMs` (FR-756, R579): how long a reading of the catalogue is waited for before it is given up (smaller in tests).
+ * `background` (whole channels, Task 9): the keep-awake setting is read and saved through it; left out, its section is not shown.
+ */
+export function ToolsSetup({
+  api,
+  pollMs = 1000,
+  focusTool,
+  firstReadMs = FIRST_READ_TIMEOUT_MS,
+  background,
+}: {
+  api: ToolsApi;
+  pollMs?: number;
+  focusTool?: string;
+  firstReadMs?: number;
+  background?: Pick<BackgroundApi, "settings" | "setSettings">;
+}) {
   const ids = useId();
   const [tools, setTools] = useState<ToolInfo[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -549,13 +586,15 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool, firstReadMs = FIRST_
       {tools === null && !loadError ? <p className="ao-hint">Reading the list of tools…</p> : null}
       {groups
         .filter((g) => g.tools.length > 0)
-        .map((g) => (
-          <section key={g.title} className="ao-tools__group" aria-labelledby={`${ids}-g-${g.title}`}>
-            <h2 id={`${ids}-g-${g.title}`}>{g.title}</h2>
+        .map((g, i) => (
+          // The label's id has no space in it (aria-labelledby is a list of ids): the group's place, not its title (R684).
+          <section key={g.title} className="ao-tools__group" aria-labelledby={`${ids}-g-${i}`}>
+            <h2 id={`${ids}-g-${i}`}>{g.title}</h2>
             {g.hint ? <p className="ao-hint">{g.hint}</p> : null}
             {g.tools.map(card)}
           </section>
         ))}
+      {background ? <KeepAwake background={background} firstReadMs={firstReadMs} /> : null}
     </main>
   );
 }

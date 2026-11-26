@@ -20,6 +20,7 @@ import { JobsIndicator, type Job } from "../components/JobsIndicator";
 import { PageReads, usePageHost } from "../components/PageReads";
 import { ProjectNav } from "../components/ProjectNav";
 import { RecheckProjectButton, useProjectRecheck } from "../components/RecheckProject";
+import { TranscribeAll } from "../components/TranscribeAll";
 import { useEventFeed, WorkLines } from "../components/WorkLines";
 import { SearchBox } from "../components/SearchBox";
 import { SourceTable } from "../components/SourceTable";
@@ -1146,6 +1147,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                 ))}
               </ul>
             )}
+            <TranscribeAll client={api.client} projectId={project.id} readOnly={readOnly} />
             {sourcesError && (
               <p role="alert" className="ao-error">
                 {sourcesError}

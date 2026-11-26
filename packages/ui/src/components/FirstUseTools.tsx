@@ -66,7 +66,8 @@ const ACTIVITIES: Activity[] = [
   {
     id: "recordings",
     label: "Work with recordings",
-    hint: "Transcribe interviews and other recordings with the app's default speech model. The video tools make viewing copies of videos, also copies that leave out a recorded location.",
+    // R671: the video tools as the worker's catalogue says it (toolpins.py, the ffmpeg tool's purpose).
+    hint: "Transcribe interviews and other recordings with the app's default speech model. The video tools join the best picture and sound when videos are downloaded, and make viewing copies of videos, also copies that leave out a recorded location.",
     tools: [speechTool(DEFAULT_SPEECH_MODEL), "ffmpeg"],
   },
   { id: "videos", label: "Save videos from the web", hint: "Capture links to YouTube, TikTok and similar video posts.", tools: ["video-downloader", "ffmpeg"] },

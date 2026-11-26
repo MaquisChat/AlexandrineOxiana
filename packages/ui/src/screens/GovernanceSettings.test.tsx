@@ -3,7 +3,10 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
-import { makeApi, server, url, useMsw } from "../test/msw-governance";
+import { BASE, lockedAutomation, makeApi, server, TOKEN, url, useMsw } from "../test/msw-governance";
+import { backgroundApi } from "../api/background";
+import { createClient } from "../api/client";
+import { mockBackground } from "../test/backgroundService";
 import { CAPTURE_METHODS } from "@ao/core/governance/schema";
 import { GovernanceSettings } from "./GovernanceSettings";
 import { CAPTURE_LABEL, DEFAULTS } from "./governanceModel";
@@ -1253,5 +1256,151 @@ describe("rules the engine cannot read are said (R379 FR-A18, R58)", () => {
     expect(screen.queryByText(ALERT)).toBeNull();
     expect(screen.queryByText("The rules were read, with these notes:")).toBeNull();
     expect(screen.queryAllByRole("alert")).toHaveLength(0);
+  });
+});
+
+describe("Automatic transcription, on the Governance screen (whole channels, Task 9)", () => {
+  const LABEL = "Transcribe captured audio and video automatically";
+  const background = () => backgroundApi(createClient(BASE, TOKEN));
+
+  it('the Governance screen shows "Transcribe captured audio and video automatically" and saves it once', async () => {
+    serve();
+    const m = mockBackground({ noEvents: true, holdSwitches: true }, BASE);
+    server.use(...m.handlers);
+    render(<GovernanceSettings api={makeApi()} projectId={PID} background={background()} />);
+    const section = await screen.findByRole("region", { name: "Automatic transcription" });
+    const box = (await within(section).findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(false);
+    expect(
+      within(section).getByText(
+        "Applies to captures from links, channels, playlists and profiles. Files you import or drop in are not transcribed by this switch; “Transcribe everything without a transcript” in the sources list covers them.",
+      ),
+    ).toBeTruthy();
+    await userEvent.click(box);
+    await waitFor(() => expect(m.count(`PUT /projects/${PID}/automation`)).toBe(1));
+    // Disabled while saving: a second press sends nothing.
+    expect(box.disabled).toBe(true);
+    expect(box.checked).toBe(true);
+    await userEvent.click(box);
+    m.release();
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(true);
+    expect(m.bodies(`PUT /projects/${PID}/automation`)).toEqual([{ transcribeNewMedia: true }]);
+    // The governance rules themselves are not saved by the switch.
+    expect(screen.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("a failed save puts the switch back and says so", async () => {
+    serve();
+    const m = mockBackground(
+      {
+        noEvents: true,
+        automation: { [PID]: { transcribeNewMedia: true } },
+        automationAnswer: () => HttpResponse.json({ error: { code: "READ_ONLY", message: "This library is read-only." } }, { status: 409 }),
+      },
+      BASE,
+    );
+    server.use(...m.handlers);
+    render(<GovernanceSettings api={makeApi()} projectId={PID} background={background()} />);
+    const box = (await screen.findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+    await userEvent.click(box);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("This library is read-only, so nothing was changed.");
+    expect(box.checked).toBe(true);
+    expect(box.disabled).toBe(false);
+    expect(m.count(`PUT /projects/${PID}/automation`)).toBe(1);
+  });
+
+  it("the project's switch is off on a read-only library, with the screen's reason", async () => {
+    serve();
+    const m = mockBackground({ noEvents: true }, BASE);
+    server.use(...m.handlers);
+    const why = "This library is read-only, so its rules cannot be changed here.";
+    render(<GovernanceSettings api={makeApi()} projectId={PID} background={background()} readOnlyReason={why} />);
+    const box = (await screen.findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(m.count(`GET /projects/${PID}/automation`)).toBe(1));
+    expect(box.disabled).toBe(true);
+    const described = (box.getAttribute("aria-describedby") ?? "").split(" ").map((id) => document.getElementById(id)?.textContent ?? "");
+    expect(described).toContain(why);
+    await userEvent.click(box);
+    expect(m.count(`PUT /projects/${PID}/automation`)).toBe(0);
+  });
+
+  it("a failed first read of the project's switch says so, with Try again; pressed, it reads again and the switch is shown (R684)", async () => {
+    serve();
+    const m = mockBackground(
+      { noEvents: true, extra: [http.get(`${BASE}/projects/:id/automation`, () => HttpResponse.json({ error: { code: "INTERNAL", message: "Something went wrong." } }, { status: 500 }), { once: true })] },
+      BASE,
+    );
+    server.use(...m.handlers);
+    render(<GovernanceSettings api={makeApi()} projectId={PID} background={background()} />);
+    const section = await screen.findByRole("region", { name: "Automatic transcription" });
+    const alert = await within(section).findByRole("alert");
+    expect(alert.textContent).toBe("This setting could not be read.Try again");
+    const box = within(section).getByRole("checkbox", { name: LABEL }) as HTMLInputElement;
+    expect(box.disabled).toBe(true);
+    await userEvent.click(within(alert).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(within(section).queryByRole("alert")).toBeNull();
+    expect(m.count(`GET /projects/${PID}/automation`)).toBe(1);
+    expect(document.activeElement).toBe(within(section).getByRole("heading", { level: 2, name: "Automatic transcription" }));
+  });
+
+  it("a first read of the project's switch that never answers is given up at the screen's first-read limit, with Try again (R684)", async () => {
+    serve();
+    const m = mockBackground({ noEvents: true, holdReads: true }, BASE);
+    server.use(...m.handlers);
+    render(<GovernanceSettings api={makeApi()} projectId={PID} background={background()} firstReadMs={300} />);
+    const section = await screen.findByRole("region", { name: "Automatic transcription" });
+    const alert = await within(section).findByRole("alert", {}, { timeout: 5000 });
+    expect(alert.textContent).toBe("This setting could not be read.Try again");
+    m.release();
+    await userEvent.click(within(alert).getByRole("button", { name: "Try again" }));
+    const box = within(section).getByRole("checkbox", { name: LABEL }) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(m.count(`GET /projects/${PID}/automation`)).toBe(2);
+  });
+
+  it("two changes of the project's switch in the same moment send one request (R684)", async () => {
+    serve();
+    const m = mockBackground({ noEvents: true }, BASE);
+    server.use(...m.handlers);
+    render(<GovernanceSettings api={makeApi()} projectId={PID} background={background()} />);
+    const box = (await screen.findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    act(() => {
+      fireEvent.click(box);
+      fireEvent.click(box);
+    });
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(m.bodies(`PUT /projects/${PID}/automation`)).toEqual([{ transcribeNewMedia: true }]);
+    expect(box.checked).toBe(true);
+  });
+
+  it("on a locked project the section is not shown and nothing is read for it; unlocked, it appears with the read value (R686)", async () => {
+    serve();
+    // The service refuses a locked project's switch (423), as it refuses the project's other routes.
+    server.use(...lockedAutomation());
+    const m = mockBackground({ noEvents: true, automation: { [PID]: { transcribeNewMedia: true } }, locked: [PID] }, BASE);
+    server.use(...m.handlers);
+    const why = "This project is locked, so its rules cannot be changed until it is unlocked.";
+    const api = makeApi();
+    const bg = background();
+    const view = render(<GovernanceSettings api={api} projectId={PID} background={bg} readOnlyReason={why} projectLocked />);
+    // The screen's other sections have been read and shown: the switch has had every chance to read.
+    await screen.findByText("Nothing is due for destruction.");
+    expect(screen.queryByRole("heading", { name: "Automatic transcription" })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: LABEL })).toBeNull();
+    expect(m.count(`GET /projects/${PID}/automation`)).toBe(0);
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    // Unlocked: the section appears and reads the project's value.
+    server.use(...mockBackground({ noEvents: true, automation: { [PID]: { transcribeNewMedia: true } } }, BASE).handlers);
+    view.rerender(<GovernanceSettings api={api} projectId={PID} background={bg} />);
+    const section = await screen.findByRole("region", { name: "Automatic transcription" });
+    const box = within(section).getByRole("checkbox", { name: LABEL }) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(true);
   });
 });

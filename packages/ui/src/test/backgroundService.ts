@@ -6,10 +6,24 @@
  *
  * `backgroundDefaults(base)`: the two reads every screen with the work lines makes, answered with nothing to show (no
  * run, an idle list), for the screens' own fakes (service.ts, captureService.ts).
+ *
+ * Task 9 adds the switches and "Transcribe everything" (routes pinned in Task 7): GET/PUT …/automation, GET/PUT
+ * /settings/background, GET …/untranscribed and POST …/transcription-list. `switchDefaults(base)`: the two switch reads,
+ * answered with the service's defaults (automatic transcription off, keeping awake on), for the fakes of the screens
+ * that show a switch (service.ts, msw-governance.ts, msw-tools.ts).
  */
 import { http, HttpResponse, type RequestHandler } from "msw";
 import { onTestFinished } from "vitest";
-import { BACKGROUND_EVENT, type BackgroundProgressEvent, type DownloadProblemsResponse, type DownloadRunSummary, type TranscriptionListSummary } from "@ao/shared";
+import {
+  BACKGROUND_EVENT,
+  type BackgroundProgressEvent,
+  type BackgroundSettings,
+  type DownloadProblemsResponse,
+  type DownloadRunSummary,
+  type ProjectAutomation,
+  type TranscriptionListSummary,
+  type UntranscribedResponse,
+} from "@ao/shared";
 
 export const BG_BASE = "http://127.0.0.1:4100";
 
@@ -48,9 +62,27 @@ export function backgroundDefaults(base: string = BG_BASE): RequestHandler[] {
   ];
 }
 
+/** GET …/automation answered "off" and GET /settings/background answered "on" (the service's defaults), for every project. */
+export function switchDefaults(base: string = BG_BASE): RequestHandler[] {
+  return [
+    http.get(`${base}/projects/:id/automation`, () => HttpResponse.json({ transcribeNewMedia: false } satisfies ProjectAutomation)),
+    http.get(`${base}/settings/background`, () => HttpResponse.json({ keepAwake: true } satisfies BackgroundSettings)),
+  ];
+}
+
+/** The service's answer for a locked project (423 PROJECT_LOCKED), as the project routes give it. */
+export const projectLocked = (): Response => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "This project is locked." } }, { status: 423 });
+
+/** GET and PUT …/automation answered 423 for every project (a locked project), for the screens' own fakes (msw-governance.ts). */
+export function automationLocked(base: string = BG_BASE): RequestHandler[] {
+  return [http.get(`${base}/projects/:id/automation`, projectLocked), http.put(`${base}/projects/:id/automation`, projectLocked)];
+}
+
 export interface BackgroundRecorded {
   method: string;
   path: string;
+  /** The JSON body of a PUT or POST that has one. */
+  body?: unknown;
 }
 
 export interface BackgroundSetup {
@@ -65,6 +97,24 @@ export interface BackgroundSetup {
   runAnswer?: (what: string, runId: string) => Response | undefined;
   /** Answer of a POST on the transcription list (default: the list in its new state). */
   listAnswer?: (what: string) => Response | undefined;
+  /** The project's switch, per project; left out: off. */
+  automation?: Record<string, ProjectAutomation>;
+  /** Answer of a PUT of the project's switch (default: the switch saved and sent back). */
+  automationAnswer?: (body: unknown) => Response | undefined;
+  /** The keep-awake setting; left out: on. */
+  settings?: BackgroundSettings;
+  /** Answer of a PUT of the keep-awake setting (default: saved and sent back). */
+  settingsAnswer?: (body: unknown) => Response | undefined;
+  /** What GET …/untranscribed says, per project; left out: nothing to transcribe. */
+  untranscribed?: Record<string, UntranscribedResponse>;
+  /** Answer of POST …/transcription-list (default: the untranscribed sources put on the list, and an event sent). */
+  transcribeAllAnswer?: (body: unknown) => Response | undefined;
+  /** Hold the PUTs of the switches and POST …/transcription-list too until `release()` (or the test's end). */
+  holdSwitches?: boolean;
+  /** Hold the GETs of the switches and of …/untranscribed until `release()` (or the test's end). */
+  holdReads?: boolean;
+  /** Projects that are locked: GET and PUT …/automation answer 423, as the service answers a locked project. */
+  locked?: string[];
   /** Leave out the /events handler (the test gives its own). */
   noEvents?: boolean;
   /** Handlers tried first. */
@@ -76,6 +126,8 @@ export interface BackgroundMock {
   calls: BackgroundRecorded[];
   /** How many times "METHOD path" was asked. */
   count(key: string): number;
+  /** The bodies sent with "METHOD path", in order. */
+  bodies(key: string): unknown[];
   /** Sends a `background.progress` event (or any event) on every open /events stream. */
   emit(data: BackgroundProgressEvent, type?: string): void;
   /** The /events requests, kept (their signals are read when asserting a cancel). */
@@ -102,6 +154,26 @@ export function mockBackground(o: BackgroundSetup = {}, base: string = BG_BASE):
   const rec = (request: Request, path: string) => calls.push({ method: request.method, path });
   const hold = () => (o.holdActions ? released : Promise.resolve());
   const listOf = (pid: string) => lists[pid] ?? idleList(pid);
+  const automation: Record<string, ProjectAutomation> = { ...(o.automation ?? {}) };
+  let settings: BackgroundSettings = o.settings ?? { keepAwake: true };
+  const untranscribed: Record<string, UntranscribedResponse> = { ...(o.untranscribed ?? {}) };
+  const holdSwitch = () => (o.holdSwitches ? released : Promise.resolve());
+  const holdRead = () => (o.holdReads ? released : Promise.resolve());
+  const isLocked = (pid: string) => (o.locked ?? []).includes(pid);
+  const nothing: UntranscribedResponse = { count: 0, soundSeconds: 0, unknownLengths: 0 };
+  const readBody = async (request: Request): Promise<unknown> => {
+    const text = await request.text();
+    return text ? (JSON.parse(text) as unknown) : undefined;
+  };
+  const emitOn = (data: BackgroundProgressEvent, type: string = BACKGROUND_EVENT) => {
+    for (const c of open) {
+      try {
+        c.enqueue(enc.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`));
+      } catch {
+        open.delete(c);
+      }
+    }
+  };
 
   const handlers: RequestHandler[] = [
     ...(o.extra ?? []),
@@ -129,6 +201,57 @@ export function mockBackground(o: BackgroundSetup = {}, base: string = BG_BASE):
       const next = { ...r, state: STATE_AFTER[what] ?? r.state, updatedAt: new Date(Date.parse(r.updatedAt) + 1000).toISOString() };
       runs = runs.map((x) => (x.runId === runId ? next : x));
       return HttpResponse.json({ run: next });
+    }),
+    http.get(`${base}/projects/:id/automation`, async ({ request, params }) => {
+      rec(request, `/projects/${String(params.id)}/automation`);
+      await holdRead();
+      if (isLocked(String(params.id))) return projectLocked();
+      return HttpResponse.json(automation[String(params.id)] ?? { transcribeNewMedia: false });
+    }),
+    http.put(`${base}/projects/:id/automation`, async ({ request, params }) => {
+      const pid = String(params.id);
+      const body = await readBody(request);
+      calls.push({ method: "PUT", path: `/projects/${pid}/automation`, body });
+      await holdSwitch();
+      if (isLocked(pid)) return projectLocked();
+      const answer = o.automationAnswer?.(body);
+      if (answer) return answer;
+      automation[pid] = body as ProjectAutomation;
+      return HttpResponse.json(automation[pid]);
+    }),
+    http.get(`${base}/settings/background`, async ({ request }) => {
+      rec(request, "/settings/background");
+      await holdRead();
+      return HttpResponse.json(settings);
+    }),
+    http.put(`${base}/settings/background`, async ({ request }) => {
+      const body = await readBody(request);
+      calls.push({ method: "PUT", path: "/settings/background", body });
+      await holdSwitch();
+      const answer = o.settingsAnswer?.(body);
+      if (answer) return answer;
+      settings = body as BackgroundSettings;
+      return HttpResponse.json(settings);
+    }),
+    http.get(`${base}/projects/:id/untranscribed`, async ({ request, params }) => {
+      rec(request, `/projects/${String(params.id)}/untranscribed`);
+      await holdRead();
+      return HttpResponse.json(untranscribed[String(params.id)] ?? nothing);
+    }),
+    http.post(`${base}/projects/:id/transcription-list`, async ({ request, params }) => {
+      const pid = String(params.id);
+      const body = await readBody(request);
+      calls.push({ method: "POST", path: `/projects/${pid}/transcription-list`, body });
+      await holdSwitch();
+      const answer = o.transcribeAllAnswer?.(body);
+      if (answer) return answer;
+      const added = (untranscribed[pid] ?? nothing).count;
+      untranscribed[pid] = nothing;
+      const l = listOf(pid);
+      lists[pid] = added > 0 ? { ...l, state: l.state === "paused" ? "paused" : "running", total: l.total + added } : l;
+      // As the service does (Task 7, R679): the change is published before the answer.
+      emitOn({ projectId: pid, transcriptions: lists[pid] });
+      return HttpResponse.json({ added, list: lists[pid] });
     }),
     http.get(`${base}/projects/:id/transcription-list`, ({ request, params }) => {
       rec(request, `/projects/${String(params.id)}/transcription-list`);
@@ -172,6 +295,7 @@ export function mockBackground(o: BackgroundSetup = {}, base: string = BG_BASE):
     handlers,
     calls,
     count: (key) => calls.filter((c) => `${c.method} ${c.path}` === key).length,
+    bodies: (key) => calls.filter((c) => `${c.method} ${c.path}` === key).map((c) => c.body),
     emit(data, type = BACKGROUND_EVENT) {
       for (const c of open) {
         try {

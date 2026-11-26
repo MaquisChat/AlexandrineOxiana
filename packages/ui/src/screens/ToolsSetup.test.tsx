@@ -1,9 +1,11 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS } from "@ao/shared";
 import { http, HttpResponse } from "msw";
-import { catalogue, catalogueWithoutHosts, makeApi, onComputer, server, toolsService, url, useMsw, withoutHostsFor } from "../test/msw-tools";
+import { backgroundApi } from "../api/background";
+import { mockBackground } from "../test/backgroundService";
+import { BASE, catalogue, catalogueWithoutHosts, makeApi, makeClient, onComputer, server, toolsService, url, useMsw, withoutHostsFor } from "../test/msw-tools";
 import { asksInTurn, hang, REFUSED_READ } from "../test/service";
 import { ToolsSetup } from "./ToolsSetup";
 
@@ -457,5 +459,167 @@ describe("the optional tools screen: a late answer after “Try again”, and an
     // The tools screen offers "Try again" on any failed read (as before FR-756).
     expect(alerts().some((a) => a.includes(REFUSED_READ))).toBe(true);
     expect(alerts().some((a) => a.includes(NO_ANSWER))).toBe(false);
+  });
+});
+
+describe("keeping the Mac awake, on the optional tools screen (whole channels, Task 9)", () => {
+  const LABEL = "Keep this Mac awake while downloads or transcriptions run";
+
+  it('the Optional tools screen shows "Keep this Mac awake while downloads or transcriptions run", on by default, and saves it', async () => {
+    const m = mockBackground({ noEvents: true, holdSwitches: true }, BASE);
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()) });
+    const section = screen.getByRole("region", { name: "While downloads or transcriptions run" });
+    const box = (await within(section).findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+    expect(box.disabled).toBe(false);
+    expect(within(section).getByText("The screen may still switch off. Closing the lid still puts the Mac to sleep; downloads and transcriptions carry on when it wakes.")).toBeTruthy();
+    expect(box.getAttribute("aria-describedby")).toBeTruthy();
+    await userEvent.click(box);
+    // Saving: one request per change, the box disabled meanwhile.
+    await waitFor(() => expect(m.count("PUT /settings/background")).toBe(1));
+    expect(box.disabled).toBe(true);
+    expect(box.checked).toBe(false);
+    await userEvent.click(box);
+    expect(m.count("PUT /settings/background")).toBe(1);
+    m.release();
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(false);
+    expect(m.bodies("PUT /settings/background")).toEqual([{ keepAwake: false }]);
+    expect(m.count("GET /settings/background")).toBe(1);
+  });
+
+  it("a failed save of keeping awake puts the switch back and says so", async () => {
+    const m = mockBackground(
+      { noEvents: true, settingsAnswer: () => HttpResponse.json({ error: { code: "INTERNAL", message: "The setting could not be saved." } }, { status: 500 }) },
+      BASE,
+    );
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()) });
+    const box = (await screen.findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+    await userEvent.click(box);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("The setting could not be saved.");
+    expect(box.checked).toBe(true);
+    expect(box.disabled).toBe(false);
+    expect(m.count("PUT /settings/background")).toBe(1);
+  });
+
+  const SECTION = "While downloads or transcriptions run";
+  const dropFocus = (el: HTMLInputElement) => {
+    el.disabled = false;
+    el.blur();
+    el.disabled = true;
+  };
+
+  it("a failed first read of keeping awake says so, with Try again; pressed, it reads again and the switch is shown (R684)", async () => {
+    const m = mockBackground(
+      { noEvents: true, extra: [http.get(`${BASE}/settings/background`, () => HttpResponse.json({ error: { code: "INTERNAL", message: "Something went wrong." } }, { status: 500 }), { once: true })] },
+      BASE,
+    );
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()) });
+    const section = screen.getByRole("region", { name: SECTION });
+    const alert = await within(section).findByRole("alert");
+    expect(alert.textContent).toBe("This setting could not be read.Try again");
+    const box = within(section).getByRole("checkbox", { name: LABEL }) as HTMLInputElement;
+    expect(box.disabled).toBe(true);
+    await userEvent.click(within(alert).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(true);
+    expect(within(section).queryByRole("alert")).toBeNull();
+    expect(m.count("GET /settings/background")).toBe(1);
+    // Focus, which was on "Try again", went to the section's heading, not to the page.
+    expect(document.activeElement).toBe(within(section).getByRole("heading", { level: 2, name: SECTION }));
+  });
+
+  it("a first read of keeping awake that never answers is given up at the screen's first-read limit, with Try again (R684)", async () => {
+    const m = mockBackground({ noEvents: true, holdReads: true }, BASE);
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()), firstReadMs: 300 });
+    const section = screen.getByRole("region", { name: SECTION });
+    const alert = await within(section).findByRole("alert", {}, { timeout: 5000 });
+    expect(alert.textContent).toBe("This setting could not be read.Try again");
+    expect(m.count("GET /settings/background")).toBe(1);
+    m.release();
+    await userEvent.click(within(alert).getByRole("button", { name: "Try again" }));
+    const box = within(section).getByRole("checkbox", { name: LABEL }) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(true);
+    expect(m.count("GET /settings/background")).toBe(2);
+  });
+
+  it("two changes of keeping awake in the same moment send one request (R684)", async () => {
+    const m = mockBackground({ noEvents: true }, BASE);
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()) });
+    const box = (await screen.findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    // Both changes land before the box re-renders (it is not yet disabled): the synchronous guard holds.
+    act(() => {
+      fireEvent.click(box);
+      fireEvent.click(box);
+    });
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(m.bodies("PUT /settings/background")).toEqual([{ keepAwake: false }]);
+    expect(box.checked).toBe(false);
+  });
+
+  it("focus stays on the switch after a save, and after a failed one (R684)", async () => {
+    // Each save is held until the test lets it answer: the first is saved, the second refused.
+    const gates: Array<() => void> = [];
+    onTestFinished(() => gates.forEach((g) => g()));
+    let puts = 0;
+    const m = mockBackground(
+      {
+        noEvents: true,
+        extra: [
+          http.put(`${BASE}/settings/background`, async ({ request }) => {
+            const n = ++puts;
+            const body = (await request.json()) as { keepAwake: boolean };
+            await new Promise<void>((r) => gates.push(r));
+            return n === 1 ? HttpResponse.json(body) : HttpResponse.json({ error: { code: "INTERNAL", message: "The setting could not be saved." } }, { status: 500 });
+          }),
+        ],
+      },
+      BASE,
+    );
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()) });
+    const box = (await screen.findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    for (const outcome of ["saved", "refused"]) {
+      await userEvent.click(box);
+      await waitFor(() => expect(gates.length).toBe(outcome === "saved" ? 1 : 2));
+      expect(box.disabled).toBe(true);
+      dropFocus(box);
+      expect(document.activeElement).toBe(document.body);
+      gates[gates.length - 1]!();
+      // The focus itself is waited for (R689), not "enabled" and then focus.
+      await waitFor(() => expect(document.activeElement).toBe(box));
+      expect(box.disabled).toBe(false);
+      // Saved: off now; refused: put back to the saved value (off), with the alert.
+      expect(box.checked).toBe(false);
+      if (outcome === "refused") expect(screen.getByRole("alert").textContent).toContain("The setting could not be saved.");
+    }
+  });
+
+  it("each group of tools is a region named by its heading (its label points at an id without spaces) (R684)", async () => {
+    await shown();
+    const headings = screen.getAllByRole("heading", { level: 2 });
+    expect(headings.length).toBeGreaterThan(0);
+    for (const h of headings) expect(h.closest("section")).toBe(screen.getByRole("region", { name: h.textContent ?? "" }));
+  });
+
+  it("the Video tools group says they also join the best picture and sound when videos are downloaded (R671)", async () => {
+    await shown();
+    // The group is found by its heading (its section's label points at an id with a space in it, so it has no name).
+    const group = screen.getByRole("heading", { level: 2, name: "Video conversion" }).closest("section") as HTMLElement;
+    expect(within(group).getByText("Joins the best picture and sound when videos are downloaded, and makes viewing copies of videos, including copies that leave out or coarsen a recorded location.")).toBeTruthy();
+    // The fixture carries the worker catalogue's own two sentences (toolpins.py, the ffmpeg tool).
+    const c = card(FFMPEG);
+    expect(within(c).getByText("Joins the best picture and sound when videos are downloaded, makes viewing copies of videos, and makes copies that leave out or coarsen a recorded location.")).toBeTruthy();
+    expect(within(c).getByText(new RegExp(escape('Videos can be downloaded only as ready-made, lower-quality files, and get no viewing copies. Media that carries a location stays "proxy pending" and is left out of exports until ffmpeg is installed.')))).toBeTruthy();
   });
 });
