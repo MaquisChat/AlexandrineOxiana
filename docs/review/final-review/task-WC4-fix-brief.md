@@ -1,0 +1,30 @@
+# Task 4 (download runs and the estimate, library) — fix round after the review (Ruling R680)
+
+You are a FRESH implementer (the first one is at its size limit). Read the common brief first, in full: `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/wc-common.md` (your task is Task 4). Then the review in full: `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task-WC4-review.md` — the finding numbers below are its numbers — and the first implementer's report `task-WC4-report.md`.
+
+Worktree `/home/user/AlexandrineOxiana/.claude/worktrees/kg-3b`, branch `wc-4-runs`, head a57650f. Tests first for every point: each new or changed test must fail before its mend (say so per point; a pure guard is named as a guard). One commit per group A–D. Where this brief pins something it replaces or adds to the plan's Task 4 text (the plan has been updated to match). Do NOT touch `packages/shared/src/api/background.ts` (another fix round is adding to it right now).
+
+## A. A Resume never loses what the run knows (I1, Minor 3)
+A1. (I1) `requeueFailedItems` runs before the project's rules are asked, so a Resume that the rules refuse — or whose listing ends early — wipes the run's failures: "failed 0", "Show them" empty. Ruled: the wholesale requeue at the start of a Resume goes. A failed item goes back to work only at the moment it is taken (`beforeItem` → `recordRunItem(running)`); `onlyIds` already names the failed items. So after a Resume that never reached an item, that item is exactly as it was, error and all. Test: the reviewer's probe (a paused run with 1 failed; a Resume refused by the rules → still failed 1, `problems` still lists it); the same when the listing fails.
+A2. (Minor 3) When a start or a Resume is refused by the project's rules (`PolicyDeniedError` from the capture), the run does not stay "downloading" (shown as interrupted, with no reason): it ends `failed` with `errorCode: "POLICY_DENIED"` and as `reason` the rule's own plain reason (the denial's message as the capture's existing code gives it to a person), and the call still rejects with the `PolicyDeniedError` (Task 5 answers 403). The line then says why, and "Resume downloads" is still offered (the researcher may change the rules and press again). The existing test that pinned "stays downloading" is changed and named in the report.
+
+## B. A stored video is never left off the transcription list (I2)
+With `transcribe`, a video that this run stored must reach the transcription list even when the run was cut between the store and its own `done` write.
+B1. In `afterItem`, for a newly stored video: `addToTranscriptionList` FIRST, then `recordRunItem(done)`, then `onQueuedForTranscription`. (If the add throws — transcription not allowed by the rules, a read-only library — the video's own outcome is still recorded `done`, the run goes on, and the run remembers that transcription was refused: it does not try to add the following videos either; a guard test: "a refused transcription keeps the run going".)
+B2. At a Resume, a DUPLICATE outcome for an item that the journal held as `running` (the item in hand when the segment was cut) is this run's own video: it is put on the transcription list like a newly stored one. A duplicate for an item the journal held as `queued` or `failed` is not (it was stored by something else).
+Tests: the reviewer's probe (a cut between the store and the `done` write, then a Resume → every stored video is on the list: 3 stored, 3 listed); a lock (cancel) during the `done` write → the video is on the list after the Resume; a duplicate that was `queued` is not added.
+
+## C. Waking up, and where the disk floor applies (Minors 4, 5)
+C1. (Minor 4) `RunControl` gains `haltSignal: AbortSignal` — aborted when a move or a close asks the run to stop between videos (when `halt()` turns true). The gap and every wait are woken by it too, and after any wait or gap `halt()` is checked BEFORE anything more is asked of the platform (→ `CaptureCancelledError`, nothing more written), so a move never sits behind a two-hour wait and never downloads one more video first. Tests with a controlled sleep: halt during the gap; halt during a slow-down wait.
+C2. (Minor 5) A `metadataOnly` run never pauses on the disk floor (it needs almost no space). Guard test.
+
+## D. Smaller points (Minors 1, 2, 6)
+D1. (Minor 1) Move the title write into Task 1's file: `export async function setRunTitle(repo: Repo, projectId: string, runId: string, title: string): Promise<RunView>` in `packages/library/src/lists/run-journal.ts`, written the way that file's other writers are (through its own live-run reading and recount; sealed; refused on a read-only library and a locked project), exported from `packages/library/src/index.ts`, with a test in `run-journal.test.ts`; `download-run.ts` uses it and its local copy goes.
+D2. (Minor 2) The sentence for a Resume of a run with nothing left becomes a reason in `capture/errors.ts`, `RUN_FINISHED` = `These downloads have finished, so there is nothing to resume.`, thrown as now.
+D3. (Minor 6) The three turn tests fail FAST when the turn is implemented wrongly (race the wait with a bounded check through the controlled sleep, not a 120 s test timeout); a test that Pause and Stop wake the gap at once; the estimate's test asserts exactly ONE audited denial.
+
+## Accepted as they are (say nothing more unless you find them wrong)
+The disk check also runs before a duplicate; a failure put back for the disk still counts as failed in the profile report that goes to `onReport` while the journal holds it as `queued`; a `turn` that rejects leaves the run `queued`, shown interrupted.
+
+## Runs and report
+`src/capture/download-run.test.ts`, `estimate.test.ts`, `disk.test.ts`, `src/lists/run-journal.test.ts`, `src/capture/profile-capture.test.ts`, each alone; typecheck `@ao/library` and `@ao/library-service`; `git status --short` empty. Append "Fix round (R680)" to `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task-WC4-report.md`. Final message at most 150 words.
