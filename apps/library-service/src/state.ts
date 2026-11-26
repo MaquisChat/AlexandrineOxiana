@@ -403,7 +403,7 @@ export class ServiceState {
   private awake: KeepAwake | undefined;
   /** `caffeinate` while downloads or transcriptions run (macOS only). */
   get keepAwake(): KeepAwake {
-    return (this.awake ??= new KeepAwake(this.opts.keepAwake ?? {}));
+    return (this.awake ??= new KeepAwake({ log: this.opts.log, ...(this.opts.keepAwake ?? {}) }));
   }
   /** The researcher's setting "Keep this Mac awake while downloads or transcriptions run" (default on; background.json). */
   private keepAwakeSetting = true;

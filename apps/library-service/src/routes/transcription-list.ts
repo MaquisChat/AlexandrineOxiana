@@ -32,10 +32,10 @@ import { requireUnlocked } from "./capture.js";
 import { bodyAs, bodyOf, optStr, projectParam, type Ctx } from "./util.js";
 
 export const BACKGROUND_FILE = "background.json";
-const DEFAULT_BACKGROUND: BackgroundSettings = { keepAwake: true };
+export const DEFAULT_BACKGROUND: BackgroundSettings = { keepAwake: true };
 const MODELS: readonly string[] = SPEECH_MODELS;
 
-const isBackgroundFile = (v: unknown): v is BackgroundSettings =>
+export const isBackgroundFile = (v: unknown): v is BackgroundSettings =>
   !!v && typeof v === "object" && !Array.isArray(v) && typeof (v as { keepAwake?: unknown }).keepAwake === "boolean";
 
 /** The background settings as stored; the defaults when the file is missing or cannot be read. */

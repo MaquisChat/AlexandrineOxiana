@@ -9,6 +9,7 @@
  */
 import { writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -17,6 +18,8 @@ import { WorkerClient, deviceDeps, type Deps, type WorkerToolsClient } from "@ao
 import { BACKGROUND_EVENT, transcriptionLines, type BackgroundProgressEvent, type CaptureEstimate, type TranscriptionListSummary } from "@ao/shared";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { FAKE_TOOLS_DIR, startToolWorker, type SubmittedJob, type ToolWorker } from "../../../packages/library/src/capture/testing.js";
+import { appendJobRecords, type JobRecord } from "../../../packages/library/src/job-journal.js";
+import { projectDataKey } from "../../../packages/library/src/repo/repo.js";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -697,6 +700,43 @@ describe("the transcription list", () => {
     vi.mocked(svc!.state.downloads.estimate).mockResolvedValue({ ...(e.json as CaptureEstimate), measuredSpeed: undefined, speechModel: "small" } as CaptureEstimate);
     const unmeasured = await call({ method: "POST", url: `/projects/${pid}/capture-estimate`, body: { url: "https://www.tiktok.com/@fake.dancer" } });
     expect(unmeasured.json.measuredSpeed).toBeUndefined();
+  });
+});
+
+describe("the list and keeping awake", () => {
+  it("a loop waiting on a job that nothing runs does not keep the Mac awake (R692)", async () => {
+    const spawned: Array<{ killed: boolean }> = [];
+    const fakeSpawn = (() => {
+      const c = Object.assign(new EventEmitter(), { killed: false, unref: () => {}, kill: () => ((c.killed = true), true) });
+      spawned.push(c);
+      return c;
+    }) as never;
+    await start({ worker: null, keepAwake: { platform: "darwin", spawn: fakeSpawn, pid: 1 } });
+    await openLibrary();
+    const pid = await project();
+    const sid = await audioSource(pid, "One", 60);
+    // A transcription of the source pending in the journal from before (the media helper is gone: nothing reruns it).
+    const s = svc!.state.session!;
+    const at = clock.toISOString();
+    const rec: JobRecord = { v: 1, id: "pending-job", projectId: pid, kind: "audio.transcribe", status: "queued", createdAt: at, updatedAt: at, about: { sourceId: sid, model: "medium" } };
+    await appendJobRecords(s.lib.root, s.repo.getProject(pid).folder, projectDataKey(s.repo, pid), [rec]);
+    const { addToTranscriptionList } = await import("@ao/library");
+    await addToTranscriptionList(s.repo, pid, [{ sourceId: sid }]);
+    const t = svc!.state.transcriptions;
+    const realWhenEnded = t.whenEnded.bind(t);
+    let waits!: () => void;
+    const waiting = new Promise<void>((r) => (waits = r));
+    vi.spyOn(t, "whenEnded").mockImplementation((...args) => {
+      const p = realWhenEnded(...args);
+      waits();
+      return p;
+    });
+    svc!.state.transcriptionList.kick(s, pid);
+    await waiting; // the loop follows the pending job and waits on it
+    expect((await list(pid)).current?.sourceId).toBe(sid);
+    expect(svc!.state.transcriptionList.memory()).toEqual([{ projectId: pid }]);
+    expect(svc!.state.transcriptionList.active()).toBe(false);
+    expect(spawned.filter((c) => !c.killed)).toHaveLength(0);
   });
 });
 

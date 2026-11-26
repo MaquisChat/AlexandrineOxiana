@@ -60,13 +60,15 @@ describe("KeepAwake", () => {
     // Wanted again: one new process.
     k.update(true);
     expect(sp.calls).toHaveLength(2);
-    // It ended by itself (killed from outside): the next update starts one again, never two.
+    // It ended by itself (killed from outside): the next change of wanted starts one again, never two.
     sp.children[1]!.emit("exit", 0, null);
+    k.update(false);
     k.update(true);
     k.update(true);
     expect(sp.calls).toHaveLength(3);
     // A spawn that fails is not thrown and not left behind.
     sp.children[2]!.emit("error", new Error("ENOENT"));
+    k.update(false);
     k.update(true);
     expect(sp.calls).toHaveLength(4);
     k.stop();
@@ -79,6 +81,64 @@ describe("KeepAwake", () => {
     linux.update(true);
     linux.stop();
     expect(other.calls).toHaveLength(0);
+  });
+});
+
+describe("KeepAwake when caffeinate fails (R692)", () => {
+  it("a caffeinate that fails to start is logged once, and tried again only at the next change", () => {
+    const warned: string[] = [];
+    const log = { warn: (_o: object, msg?: string) => warned.push(msg ?? "") };
+    const sp = fakeSpawn();
+    const k = new KeepAwake({ platform: "darwin", spawn: sp.fn, pid: 1, log, now: () => 0 });
+    k.update(true);
+    sp.children[0]!.emit("error", new Error("ENOENT"));
+    sp.children[0]!.emit("exit", null, null);
+    for (let i = 0; i < 5; i++) k.update(true); // every publish
+    expect(sp.calls).toHaveLength(1);
+    expect(warned).toEqual(["keeping the Mac awake could not start"]);
+    // A spawn that throws: the same.
+    const throwing = (() => {
+      throw new Error("EACCES");
+    }) as unknown as typeof spawn;
+    const t = new KeepAwake({ platform: "darwin", spawn: throwing, pid: 1, log, now: () => 0 });
+    t.update(true);
+    t.update(true);
+    expect(warned).toEqual(["keeping the Mac awake could not start", "keeping the Mac awake could not start"]);
+    // The next change tries again.
+    k.update(false);
+    k.update(true);
+    expect(sp.calls).toHaveLength(2);
+    expect(k.running).toBe(true);
+  });
+
+  it("a caffeinate that exits while still wanted is started again; dying again within 10 seconds waits for the next change", () => {
+    const warned: string[] = [];
+    let now = 1_000_000;
+    const sp = fakeSpawn();
+    const k = new KeepAwake({ platform: "darwin", spawn: sp.fn, pid: 1, log: { warn: (_o, m) => warned.push(m ?? "") }, now: () => now });
+    k.update(true);
+    // Hours later it is killed from outside: started again at once, without waiting for a publish.
+    now += 3 * 3600_000;
+    sp.children[0]!.emit("exit", null, "SIGKILL");
+    expect(sp.calls).toHaveLength(2);
+    expect(k.running).toBe(true);
+    // It dies again 5 seconds later: no restart storm.
+    now += 5_000;
+    sp.children[1]!.emit("exit", 1, null);
+    expect(sp.calls).toHaveLength(2);
+    expect(k.running).toBe(false);
+    k.update(true);
+    expect(sp.calls).toHaveLength(2);
+    expect(warned).toEqual(["keeping the Mac awake stopped", "keeping the Mac awake stopped"]);
+    // The next change starts it again; at most one process at any time.
+    k.update(false);
+    k.update(true);
+    k.update(true);
+    expect(sp.calls).toHaveLength(3);
+    // Ended because it was no longer wanted: not started again.
+    k.update(false);
+    sp.children[2]!.emit("exit", null, "SIGTERM");
+    expect(sp.calls).toHaveLength(3);
   });
 });
 

@@ -102,6 +102,7 @@ export const SETTINGS_FILES: Record<string, { reason?: ResettableSetting; what: 
   "extension-pairings.json": { reason: "extension-pairings", what: "The list of paired browsers", it: "it was" },
   "fonts.json": { reason: "fonts", what: "The list of added fonts", it: "it was" },
   "appearance.json": { reason: "appearance", what: "The appearance settings", it: "they were" },
+  "background.json": { reason: "background", what: "The setting for keeping this Mac awake", it: "it was" },
   "notices.json": { what: "The app's list of notices on this computer", it: "it was" },
 };
 

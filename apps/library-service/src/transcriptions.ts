@@ -367,6 +367,7 @@ export class Transcriptions {
     this.told(this.key(projectId, sourceId), id);
     this.prune();
     this.publish(entry);
+    this.state.updateKeepAwake(); // a job the list follows is live again (R692 M5)
     return entry;
   }
 

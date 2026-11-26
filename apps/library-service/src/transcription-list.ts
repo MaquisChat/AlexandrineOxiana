@@ -83,6 +83,8 @@ interface Loop {
   wake: AbortController;
   /** Ended for a move: started again on the library open afterwards. */
   halted: boolean;
+  /** The job the loop waits on now (R692 M5: the loop keeps the Mac awake only while that job is live). */
+  following?: string;
 }
 
 const pendingJob = (r: { status: string; error?: string }) => r.status === "queued" || r.status === "running" || (r.status === "cancelled" && r.error === "PROJECT_LOCKED");
@@ -102,9 +104,19 @@ export class TranscriptionListRunner {
 
   constructor(private readonly state: ServiceState) {}
 
-  /** A loop is going on in some project. */
+  /**
+   * A loop is at work in some project: between two entries of a running list, or following a job that is live here
+   * (queued or running in this service). A loop waiting on a job that nothing runs now (pending in the journal, the
+   * media helper gone) does not count: it must not keep the Mac awake for ever (R692 M5).
+   */
   active(): boolean {
-    return this.loops.size > 0;
+    const lib = this.state.session?.lib;
+    for (const l of this.loops.values()) {
+      if (l.following === undefined) return true;
+      const job = lib ? this.state.transcriptions.byId(l.following, lib) : undefined;
+      if (job && (job.status === "queued" || job.status === "running")) return true;
+    }
+    return false;
   }
 
   /** What this runner holds, for tests and diagnostics: project ids only. */
@@ -259,6 +271,8 @@ export class TranscriptionListRunner {
       await this.publish(s, pid);
     }
     let job: TranscriptionJob;
+    l.following = jobId;
+    state.updateKeepAwake();
     try {
       job = await state.transcriptions.whenEnded(s, pid, jobId, AbortSignal.any([l.cut.signal, l.wake.signal]));
     } catch (err) {
@@ -268,6 +282,9 @@ export class TranscriptionListRunner {
         return true; // read the list again
       }
       throw err;
+    } finally {
+      delete l.following;
+      state.updateKeepAwake();
     }
     if (l.cut.signal.aborted) return false;
     if (job.status === "cancelled" && job.error?.code === "PROJECT_LOCKED") return false; // runs again at the unlock (R142)

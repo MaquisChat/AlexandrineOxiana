@@ -329,7 +329,28 @@ describe("POST /settings/reset (Task 68)", () => {
         expect((await call({ method: "PUT", url: "/settings/appearance", body: { density: "compact" } })).status).toBe(200);
       },
     },
+    {
+      // R692 (M6): keeping the Mac awake's setting has the same way out; it starts again from the default (on).
+      file: "background",
+      name: "background.json",
+      prepare: async () => {
+        expect((await call({ method: "PUT", url: "/settings/background", body: { keepAwake: false } })).status).toBe(200);
+      },
+      works: async () => {
+        expect((await call({ url: "/settings/background" })).json).toEqual({ keepAwake: true });
+        expect((await call({ method: "PUT", url: "/settings/background", body: { keepAwake: false } })).status).toBe(200);
+        expect((await call({ url: "/settings/background" })).json).toEqual({ keepAwake: false });
+      },
+    },
   ] as const;
+
+  it("an unreadable background.json refuses the change and names itself, so its reset can be offered (R692)", async () => {
+    await start();
+    await writeFile(cfg("background.json"), "garbage{");
+    const put = await call({ method: "PUT", url: "/settings/background", body: { keepAwake: false } });
+    expect(put.status).toBe(503);
+    expect(put.json.error).toMatchObject({ code: "UNAVAILABLE", reason: "background", message: "The setting for keeping this Mac awake could not be read, so it was not changed." });
+  });
 
   for (const f of files) {
     it(`${f.file}: refused without confirmation and while the file can be read; with it, the damaged file is kept aside and the feature works again`, async () => {
