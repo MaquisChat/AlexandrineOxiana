@@ -92,3 +92,89 @@ These pass:
 - `statfs` on APFS (purgeable space).
 - Real yt-dlp behaviour for DISK_FULL in the middle of a download.
 - Crashes at the process level, beyond the cuts I simulated.
+
+---
+
+# Second look (R680)
+
+Range a57650f..318f1b4 (cfd97c5 A, 316bc72 B, d22b2bb C, 318f1b4 D). The probes and mutations were reverted, and `git status --short` is empty.
+
+## Verdict: APPROVED WITH MINORS
+
+## What I checked
+
+**A1. A Resume no longer wipes failures.** Probe: a run with 3 failed of 4, then a Resume the rules refuse. Result: `failed`, failed 3, `problems` 3, the rule's own reason, one audited deny.
+- New tests cover a Resume whose listing fails (NETWORK_LOST, failures kept) and one cut short before a failed video.
+- Probe: a Resume that takes 2 of the 3 failed items (one succeeds, one fails again), then a Pause before the third. Items read `[done, failed PRIVATE, failed PRIVATE, done]`, with done 2, failed 2, notCompleted 2 and `problems` 2. An item is cleared only when it is taken.
+
+**A2. A refusal ends the run `failed`.** The start or Resume ends `failed` with `POLICY_DENIED` and `err.reason`, still rejects with `PolicyDeniedError`, is audited once (probe), and can be resumed after the rules change (test).
+
+**The changed existing test** ("resume after a quit…"):
+- Its new first item fails as private, which adds I1 coverage.
+- "interrupted" became "failed POLICY_DENIED with the rule's reason", which is A2.
+- The private item is cleared before the last Resume.
+- Nothing was loosened. It goes slightly beyond A2: the I1 part was asked for by the brief's A1 test.
+
+**B. The transcription list:**
+- The add now comes before the `done` write, and `onQueuedForTranscription` after it.
+- A `running` item that comes back as a duplicate is added. A `queued` one is not (test). For a `failed` one, the code takes the same path as `queued`.
+- A refused transcription is asked once and the run goes on (test: 1 deny for 3 videos).
+- Can a video be added twice? I probed both cases (the add succeeded, the `done` write was cut, then a Resume):
+  - The first entry is still pending: `addToTranscriptionList` skips it. Nothing is added, and nothing is told.
+  - The first entry already finished: a second entry is added for the same source, and it is told once. See Minor S1.
+
+**C. `haltSignal`:**
+- It is in `wake`, so it wakes the gap and every wait. `awake()` checks for a cut and for `halt()` before anything more is asked of the platform.
+- It also wakes the turn: `cut()` includes `halt()`, and a halt rejects with `CaptureCancelledError` and nothing written.
+- Tests: halt during the gap and during a slow-down wait. Nothing more is submitted or written.
+- `metadataOnly`: the floor is skipped both before an item and after a failure (guard test).
+
+**D. Title, sentence and test speed:**
+- `run-journal.setRunTitle` goes through `writable` (read-only refused), `projectDataKey` (locked refused), `repaired`/`liveRun` (discarded → NotFound) and `recount`. It is sealed, and exported.
+- `RUN_FINISHED` reads "These downloads have finished, so there is nothing to resume." It is in `errors.ts` and asserted.
+- With the turn broken, the three turn tests now fail in 2.5–2.8 s each (2.5 s was 120 s before).
+
+**Point 5 (R678).** `finished` needs every item done or failed AND every `onlyIds` entry told. `told` is filled by `afterItem`, which also runs for duplicates and for ids no longer listed. An empty `onlyIds` finishes.
+- A run with every item done or failed is not `finished` in two cases:
+  - a Resume whose listing missed a failed video (`LIST_INCOMPLETE`, accepted);
+  - a Resume that ended early for another reason, such as NETWORK_LOST, a slow-down, a tool, POLICY_DENIED or a Stop (correct).
+- No path writes `finished` with an item `queued` or `running`: the item in hand is put back before the check.
+
+## Mutations
+
+| Mutation | Tests failed |
+|---|---|
+| Wholesale requeue put back | 3: the changed resume test, listing fails, cut short before a failed video |
+| `wasRunning` dropped | 1: "stored just before a cut" |
+| `done` written before the add | 1: "lock during a video's done write" |
+| `haltSignal` out of `wake` | 2: the halt tests, each in under 1.5 s |
+| `allTold` always true | 1: cut short before a failed video |
+| Turn not awaited | 3, fast |
+
+## Runs
+
+All pass:
+
+| File | Tests |
+|---|---|
+| `download-run.test.ts` | 33 |
+| `estimate.test.ts` | 3 |
+| `disk.test.ts` | 4 |
+| `lists/run-journal.test.ts` | 14 |
+| `lists/transcription-list.test.ts` | 11 |
+| `profile-capture.test.ts` | 64 |
+| `link-capture.test.ts` | 66 |
+| `job-journal.test.ts` | 28 |
+
+`@ao/library` and `@ao/library-service` typecheck with exit 0.
+
+## Minor
+
+- **S1. A video can be transcribed twice.** If a cut lands between a successful add and the `done` write, and the transcription list finishes that entry before the Resume, the Resume adds a second entry for the same source (probe: pending holds the source again). Whether it is transcribed twice depends on Task 7's runner. The window is one journal append, but it can happen: after an unlock, transcriptions carry on by themselves while downloads wait for a click. Smallest fix: in B2, skip a source that already has a transcript or a `done` entry. Or Task 7 skips sources that already have a transcript.
+- **S2. Any failed add stops transcription for the rest of the segment.** The `catch {}` around `addToTranscriptionList` (`download-run.ts` afterItem) takes any error as a refusal, a passing failure too (an unreadable source file, the journal append failing). Every later video of that segment then stays off the list for good, and nothing tells the researcher. The brief named the rules and a read-only library. Narrow it to `PolicyDeniedError` and `ReadOnlyLibraryError`, and let other errors through.
+- **S3. A `wasRunning` duplicate may not be this run's video.** If the item was cut before its store and something else, such as a single pasted link, stored that video meanwhile, the Resume still puts it on the list. This is harmless.
+- **S4. The refusal can be replaced by another error.** If the `failed` write in the `PolicyDeniedError` catch throws (a read-only library, ENOSPC), its error replaces the `PolicyDeniedError`. Task 5 would then answer 500, not 403.
+
+## Not checked
+
+The same real-Mac items as in the first review. How Task 7 treats a second entry for a source that already has a transcript.

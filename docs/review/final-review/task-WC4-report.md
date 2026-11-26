@@ -138,3 +138,27 @@ None blocking. Two points to confirm:
 - `vitest run src/capture/profile-capture.test.ts`: Tests 64 passed (64)
 - `pnpm --filter @ao/library typecheck` and `@ao/library-service typecheck`: clean
 - `git status --short`: empty. Group D commit: `318f1b4` (head).
+
+## Last fix (R682)
+
+One commit: `6f0af33`. Each new test was seen failing first.
+
+- **S2.** The catch around `addToTranscriptionList` now counts only `PolicyDeniedError` and `ReadOnlyLibraryError` as a refusal. Any other error is rethrown before the `done` write, so the item stays `running` and the next Resume adds it.
+  - Test: `an add to the transcription list that fails for another reason ends the segment and the Resume adds the video`. Before the fix it failed because the run resolved: the error was swallowed.
+  - How the test makes the add fail: `repo.getSource` throws once, but only when the stack shows it was called from `addToTranscriptionList`.
+- **S1.** On the path "a duplicate that was `running`" only, the source is read and is not offered when `transcriptVersions(sf)` is not empty. That is the library's existing test for a transcript (`source-actions.ts:138`, the derived `transcript` assets). A pending entry is still skipped by the add itself.
+  - Test: `a video already transcribed is not put on the transcription list again at a Resume`.
+  - How the test sets it up:
+    - The cut is made once the journal holds a `transcription.entry`.
+    - The transcript is given with `storeTranscript`, as in `transcript-store.test.ts`.
+    - The entry is marked done with `markTranscriptionEntry`.
+  - Before the fix it failed because a second entry was pending.
+- **S4.** The `failed`/`POLICY_DENIED` write (and the put-back) now runs inside a try that drops its own failure, and then the denial is rethrown.
+  - Test: `a refusal whose own state write fails still reaches the caller as the refusal`. Only the run's state writer sees the library as read-only. The call rejects with `PolicyDeniedError`, there is one audited deny, and the journal stays `downloading`.
+  - Before the fix it rejected with `ReadOnlyLibraryError`. This was checked with a `finally` mutation.
+
+Runs:
+- `download-run.test.ts`: Tests 36 passed (36)
+- `lists/transcription-list.test.ts`: Tests 11 passed (11)
+- `@ao/library` and `@ao/library-service` typecheck clean
+- `git status --short`: empty
