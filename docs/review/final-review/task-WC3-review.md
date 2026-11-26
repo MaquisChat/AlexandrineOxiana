@@ -103,3 +103,85 @@ The one changed existing test (the fake `ffmpeg` in the real-worker test) has a 
 
 - Typecheck: I did not re-run it.
 - The real worker together with the real yt-dlp, the real error texts, a real 12-hour wait across a sleep or wake, and a real disk filling up: these need a real Mac and a real platform.
+
+---
+
+# Second look (R674)
+
+Range 5810efe..e3ade24 (bf63dc1, f4c8890, 3a6fa79, 2039786, d08b2ec, e3ade24).
+
+## Verdict: CHANGES NEEDED (one Important; the rest holds)
+
+## Important
+
+**S1. A Resume against a listing that did NOT come back whole tells ids beyond the cut "removed".**
+- **Where:** `profile-capture.ts` ≈ l.721. `unlisted = ids.filter((id) => !listedIds.has(id))` is computed whatever the state of the listing. Neither `incompleteListings` nor the `plausible` guard is consulted.
+- **What happens:** the id is told to `afterItem` as failed `NOT_FOUND_OR_REMOVED`, so Task 4 records the video as failed with "removed" when it was only beyond the cut. R674 rules exactly the opposite: only a whole listing proves an id is gone.
+- **Probe** (temporary test, removed): `FAKE_TOOL_MODE=enumbroken`, then again with `enumshort` (the list is cut after 7 entries); hooks given; `onlyIds = [an id inside the cut, an id beyond it]`. Both modes gave status `completed`, `listComplete: false`, and told `[…010 created], […002 failed NOT_FOUND_OR_REMOVED]`.
+- **Same fault, other case:** a listing that is whole but not `plausible` (shares less than half of the known posts, as a login wall can) would tell every missing id "removed".
+- **Smallest fix:** build `unlisted` only when `incompleteListings.size === 0 && plausible`; otherwise leave those ids untold, so they stay to do. `filtered` must not count here, because a Resume asks for the listing unlimited (R677). Add the probe as a test: a cut listing tells nothing for the id beyond the cut.
+- **Note for Task 4:** a run can then end `completed` with untold items still queued. Task 4 must not treat such a run as "finished with no failure", which Resume refuses.
+
+## Minor
+
+1. **The stand-in names worker commit c4b43b8, but the integration branch has one more commit (6814636).** I diffed kg-join HEAD's `download.py` against kg-2 HEAD: they are identical. Three differences remain against that worker:
+   - **`.temp.` files and named streams.** The stand-in counts `abc.temp.mp4`, `abc.fhls-720p.mp4` and `abc.f251-drc.webm` as finished recordings, so a failed download that left one is kept as partial; the worker fails it. In the other direction, the worker now treats `my.final.mp4` as an unjoined stream.
+   - **The advice cut.** The stand-in's `/ (?:[A-Za-z]+ )?--[A-Za-z]/` takes any word before the option; the worker's `\s+(?:use\s+)?--` takes only "use". Example: "This video is private --ask the owner" gives "This video is" here and "This video is private" in the worker.
+   - **The table copy.** The new test's table is a faithful copy of the worker's `test_map_error` cases as of c4b43b8. The worker's new `platform_reason` and `_is_finished_media` cases are not copied.
+
+   None of this matters to Tasks 4, 5 or 10 as they are pinned: the fake yt-dlp writes no such leftovers and prints none of those texts. A test that drives a half-joined leftover through the stand-in would prove the opposite of the worker. Fix: copy `_UNJOINED_RE`, the `.temp.`/`.part`/`.ytdl` check and `_OPTION_CUT_RE`, and name 6814636.
+2. **A Resume now lists without limits (R677).** On YouTube that is one flat listing of the whole channel: one request sequence, acceptable. On Instagram (gallery-dl, metadata only) it means paging the whole profile when the run had a maximum. That costs more requests and more slow-downs on a large profile.
+   Nothing else reads the unlimited listing as if it were the run's own:
+   - `entries` (edits and reappearance), `filtered` and `wholeList` still come from the run's own options;
+   - the snapshot is built from the profile's own data;
+   - `knownPosts` takes only stored posts;
+   - `reportedCount` compares against the full list, which can only make it more complete.
+3. **An unlisted id gets an empty address on some platforms.** Its outcome `url` is `postUrl(…) ?? ""`. For an empty address the report's problem line reads "Post unknown post: …". It is cosmetic: the id travels on the entry.
+
+## Checked and holding
+
+- **A + e3ade24.**
+  - A stored id goes through `beforeItem`, then the duplicate path. A listed id outside the run's dates is captured.
+  - An unlisted id: no `beforeItem`, nothing asked of the platform, one batch-journal line. These come after the listed ones and are skipped after a pause or stop.
+  - The probe from my first look is now a test, and so is the `afterItem`-throws Resume.
+- **C1.**
+  - With hooks, the listing waits for `RATE_LIMITED` and for `NETWORK_LOST` from the first failure, and 12 hours of either end the run as `gaveUp` does.
+  - `TOOL_NOT_INSTALLED` gives `paused-tool` with the tool; `DISK_FULL` gives `paused-disk`. `WORKER_UNAVAILABLE` and `POLICY_DENIED` give `failed`, as before.
+  - Pause or stop during the listing writes no batch (C3).
+  - After a successful listing the waits start again only with hooks. Without hooks, every branch is guarded by `hooked`.
+- **C2.** `listComplete` is now true only for `completed`, in the report, the audit and the queue summary. That also changes it for a hookless `paused-rate-limited` run: true before, false now. Readers:
+  - The CLI prints its line only for `completed`, so it is unchanged.
+  - The Capture queue screen now shows "the list was limited … or did not come back whole" for a paused run. The reason it gives is wrong, but that is the note the report says was ruled to Task 8.
+  - The report file gives the new middle sentence when the listing was whole but the run did not finish.
+- **D.** The run ends `failed` with `NETWORK_LOST`; the sentence matches character for character; the video is put back; the batch is `failed`; the report's "Result:" line uses the sentence.
+- **Mutations.** Each was applied alone and restored:
+
+  | Mutation | Result |
+  |---|---|
+  | M1 | fails D2 |
+  | M3 | fails D3 |
+  | M4 | fails D3 |
+
+- **The one changed existing test.** The login-wall test now expects `platformReason: "Sign in to confirm you're not a bot."`. That is only what B requires, and the worker gives the same text with either version of its advice cut. Nothing else was loosened.
+- **R116.** The listing's waits and the unlisted reports run outside the lane and ask nothing of the platform; every `worker.submit` is still inside `inLane`.
+
+## Runs (single files, nice -n 10)
+
+| File | Result |
+|---|---|
+| `profile-capture.test.ts` | 63/63 passed |
+| `testing.test.ts` | 6/6 passed |
+| `link-capture.test.ts` | 66/66 passed |
+| `queues.test.ts` | 13/13 passed |
+| `worker-client.test.ts` | 32/32 passed |
+| `waits.test.ts` | 1/1 passed |
+| service `capture-queues.test.ts` | 31/31 passed |
+| service `capture-routes.test.ts` | 9/9 passed |
+| typecheck `@ao/library` | exit 0 |
+
+`git status --short` is empty.
+
+## Not checked
+
+- Typecheck of the other four packages.
+- The real worker, the real platforms, and a real 12 hours.

@@ -106,3 +106,32 @@ Existing test changed: `link-capture.test.ts` › "a login wall fails with the p
 
 **Runs** (nice -n 10, one file at a time): see the final message.
 - waits 1/1; profile-capture 62/62; link-capture 66/66; queues 13/13; worker-client 32/32; testing 6/6; service capture-queues 31/31; capture-routes 9/9; typecheck @ao/library, @ao/shared, @ao/library-service, @ao/ui, @ao/core all exit 0; `git status --short` empty.
+
+## Last fix (R677)
+
+Commit e3ade24; `profile-capture.ts` changes:
+- The `onlyIds` pool is now built from everything listed, ignoring the run's dates and maximum, and not checking `isKnown`.
+- An `onlyIds` run also asks the worker for the listing without `maxItems`, `dateAfter` or `dateBefore`. Without that, the platform itself cut the list (`--playlist-end`), so the pool change alone did not make the test pass. The run's own limits still decide `filtered` (removed detection).
+
+Test, which failed at d08b2ec: "a Resume takes an id the listing still has even when its date now lies outside the run's dates (R677)". Its guards:
+- a run without `onlyIds` still filters by date (7 of 12 posts);
+- the listing jobs carry `dateAfter` only without `onlyIds`;
+- the existing date and maximum tests are unchanged.
+
+Ruling item 1 (the queue screen's note) goes to Task 8; nothing was changed for it here.
+
+Runs: `profile-capture.test.ts` 63/63 passed; typecheck `@ao/library` exit 0; `git status --short` empty.
+
+## Last fix (R678)
+
+Commit 0d821b6.
+1. (S1) In `profile-capture.ts`, the ids reported as failed `NOT_FOUND_OR_REMOVED` (`unlisted`) are now built only when the listing proves them gone: `incompleteListings.size === 0 && plausible && !(listed.length === 0 && checked.length > 0)`. This is the test the code already used to call a list whole (`wholeList`), minus `filtered`, because since R677 the run's dates and maximum no longer cut a Resume's listing. I kept the empty-list guard so that a login wall cannot mark every id as removed. To do this, the computation of `wholeListings`, `checked` and `plausible` moved up to just before `onlyIds` is applied; removed detection itself is unchanged. When the listing does not prove an id gone, that id is reported nothing: no `beforeItem`, no `afterItem`.
+   - New test, which failed at e3ade24: "a Resume whose listing did not come back whole tells nothing of the ids past the cut (R678)" (`enumbroken`, cut after 7).
+   - Guard: the R674 A test, where a whole listing still reports a really gone id as failed.
+2. `testing.ts` now follows the worker at commit 6814636 on the integration branch:
+   - a name with `.temp.` or `.part`, or ending in `.ytdl`, is never a finished recording;
+   - an unjoined stream is `\.f[^.]+\.[^.]+$`;
+   - the downloader's advice is cut at `\s+(?:use\s+)?--[A-Za-z]`, case-insensitive.
+   - `testing.test.ts` gained the worker's new cases: the failed-join leftovers, the finished-media names, and the "Use"/"use" and "--ask" reason cases. Both changed tests failed first. The worker's `test_map_error` table is unchanged.
+
+Runs: profile-capture 64/64; testing 6/6; link-capture 66/66; typecheck @ao/library exit 0; `git status --short` empty.
