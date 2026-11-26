@@ -1,0 +1,83 @@
+/*
+ * The work lines (whole channels): one block per download run and one line for the transcription list. Tokens only
+ * (spec 8A.1, R105). Every state is written out in words; nothing is shown by colour alone.
+ */
+
+.ao-worklines {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: var(--space-2) var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.ao-worklines h2 {
+  margin-top: 0;
+  font-size: 1.1rem;
+}
+
+.ao-worklines h3 {
+  font-size: 1rem;
+  margin: var(--space-2) 0 var(--space-1);
+}
+
+.ao-worklines__runs,
+.ao-worklines__problem-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.ao-worklines__run,
+.ao-worklines__list {
+  padding: var(--space-1) 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.ao-worklines__title {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.ao-worklines__detail {
+  margin: var(--space-1) 0 0;
+  padding-inline-start: var(--space-3);
+}
+
+.ao-worklines__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
+.ao-worklines__problem {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-1) 0;
+  border-bottom: 1px solid var(--line-soft);
+  overflow-wrap: anywhere;
+}
+
+.ao-worklines__error {
+  border-inline-start: 4px solid var(--deny);
+  padding-inline-start: var(--space-2);
+  color: var(--ink);
+}
+
+.ao-worklines__note {
+  border-inline-start: 4px solid var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+  padding: var(--space-1) var(--space-2);
+}
+
+.ao-worklines .ao-worklines__said {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

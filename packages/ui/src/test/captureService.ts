@@ -7,6 +7,7 @@ import { http, HttpResponse, type RequestHandler } from "msw";
 import { setupServer } from "msw/node";
 import type { CaptureQueueDetail } from "@ao/shared";
 import { createClient, type ApiClient } from "../api/client";
+import { backgroundDefaults } from "./backgroundService";
 
 export const BASE = "http://127.0.0.1:4100";
 export const TOKEN = "t".repeat(40);
@@ -193,6 +194,8 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
       request.signal.addEventListener("abort", () => open.delete(ctl));
       return new HttpResponse(stream, { headers: { "Content-Type": "text/event-stream" } });
     }),
+    // The work lines (whole channels): no download run, and an idle transcription list (not recorded in `calls`).
+    ...backgroundDefaults(BASE),
   );
 
   return {

@@ -5,6 +5,7 @@ import { StrictMode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { LOOKUP_WAITING_TEXT, attachClosedSentence } from "@ao/shared";
 import { CURRENT_RW, libraryHandlers, PROJECTS, server, SOURCES, TAGS, serviceError, testApi, url, useMockService } from "../test/service";
+import { exampleRun, idleList, mockBackground } from "../test/backgroundService";
 import { Library } from "./Library";
 
 useMockService();
@@ -19,6 +20,20 @@ function drop(zone: HTMLElement, paths: string[]) {
 }
 
 describe("Library screen", () => {
+  it("the work lines are shown for the open project", async () => {
+    const run = exampleRun({ projectId: "p1", state: "interrupted" });
+    const m = mockBackground({ runs: [run, exampleRun({ projectId: "p2", runId: "run-9", title: "Locked Channel" })], lists: { p1: idleList("p1", { state: "paused", total: 412, done: 14 }) }, noEvents: true });
+    server.use(...m.handlers, ...libraryHandlers());
+    renderLibrary();
+    const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
+    expect(await within(lines).findByText((_c, el) => el?.textContent === "The capture of 'Example Channel' was interrupted: 120 of 412 done." && el.tagName === "P")).toBeTruthy();
+    expect(within(lines).getByText("Transcriptions paused: 14 of 412 done.", { ignore: ".ao-visually-hidden" })).toBeTruthy();
+    expect(within(lines).getByRole("button", { name: "Resume downloads (292 did not complete)" })).toBeTruthy();
+    expect(within(lines).queryByText(/Locked Channel/)).toBeNull();
+    expect(m.count("GET /projects/p1/downloads")).toBeGreaterThan(0);
+    expect(m.count("GET /projects/p2/downloads")).toBe(0);
+  });
+
   it("lists projects with their compliance profile badges, and marks locked ones", async () => {
     server.use(...libraryHandlers());
     renderLibrary();

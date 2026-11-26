@@ -1,0 +1,391 @@
+/**
+ * The work lines (whole channels, Task 6; R668, R669, R672): one line per download run and one for the transcription
+ * list, with their buttons, "Show them" and its copied list, and the event stream that keeps them current (R597, R641
+ * D2, R658, R659). The sentences come from @ao/shared; the expected strings here are the plan's own.
+ */
+import { act, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { http, HttpResponse } from "msw";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { LIST_STOPPED_TEXT, problemLine, WORK_LINES_TEXT, type DownloadProblem } from "@ao/shared";
+import { exampleRun, idleList, mockBackground, type BackgroundSetup } from "../test/backgroundService";
+import { hang, server, testClient, url, useMockService } from "../test/service";
+import { WorkLines } from "./WorkLines";
+
+useMockService();
+
+afterEach(() => {
+  Reflect.deleteProperty(navigator, "clipboard");
+});
+
+/** What is shown (the visually hidden telling for a screen reader left out, as in MissingFiles.test.tsx). */
+const SHOWN = { ignore: "script, style, .ao-visually-hidden" };
+/** A sentence as shown, also when a title in it is its own element (UserText): the innermost element holding all of it. */
+const whole = (text: string) => (_content: string, el: Element | null) => !!el && el.textContent === text && ![...el.children].some((c) => c.textContent === text);
+const shown = (text: string) => screen.findByText(whole(text), SHOWN);
+const notShown = (text: string) => expect(screen.queryByText(whole(text), SHOWN)).toBeNull();
+const getShown = (text: string) => screen.getByText(whole(text), SHOWN);
+const heading = () => screen.getByRole("heading", { level: 2, name: WORK_LINES_TEXT.heading });
+const buttonNames = () => within(screen.getByRole("region", { name: WORK_LINES_TEXT.heading })).queryAllByRole("button").map((b) => b.textContent);
+const LOST = WORK_LINES_TEXT.lost;
+
+function start(o: BackgroundSetup = {}, props: { streamOpenMs?: number; streamQuietMs?: number; projectId?: string } = {}) {
+  const m = mockBackground(o);
+  server.use(...m.handlers);
+  const client = testClient();
+  const view = render(<WorkLines client={client} projectId={props.projectId ?? "p1"} {...(props.streamOpenMs !== undefined ? { streamOpenMs: props.streamOpenMs } : {})} {...(props.streamQuietMs !== undefined ? { streamQuietMs: props.streamQuietMs } : {})} />);
+  return { m, client, view };
+}
+
+const later = (n: number) => new Date(Date.parse("2026-11-26T11:00:00.000Z") + n * 1000).toISOString();
+
+const PROBLEMS: DownloadProblem[] = [
+  { title: "Interview with the mayor", url: "https://www.youtube.com/watch?v=aaa", reason: "This video is private.", platformReason: "Private video" },
+  { url: "https://www.youtube.com/watch?v=bbb", reason: "The connection was lost three times." },
+  { title: "مقابلة", url: "https://www.youtube.com/watch?v=ccc", reason: "This video has been removed, or its address is wrong." },
+];
+
+describe("WorkLines: the download runs", () => {
+  it('a downloading run shows "Downloading "Example Channel": 120 of 412" with Pause and Stop; a wait shows "waiting 2 minutes — YouTube asked to slow down"', async () => {
+    const { m } = start({ runs: [exampleRun()] });
+    await shown('Downloading "Example Channel": 120 of 412');
+    expect(heading()).toBeTruthy();
+    expect(buttonNames()).toEqual(["Pause", "Stop"]);
+    await waitFor(() => expect(m.streams()).toBe(1));
+    await act(async () => m.emit({ projectId: "p1", downloads: exampleRun({ state: "waiting", wait: { ms: 120_000, why: "rate-limited" }, updatedAt: later(1) }) }));
+    await shown("waiting 2 minutes — YouTube asked to slow down");
+    expect(getShown('Downloading "Example Channel": 120 of 412')).toBeTruthy();
+    expect(buttonNames()).toEqual(["Pause", "Stop"]);
+  });
+
+  it('a run with failures shows "3 could not be downloaded" and Show them lists title, address and reason through UserText', async () => {
+    const { m } = start({ runs: [exampleRun({ failed: 3 })], problems: { "run-1": { platform: "youtube", problems: PROBLEMS } } });
+    await shown("3 could not be downloaded");
+    expect(buttonNames()).toEqual(["Pause", "Stop", "Show them"]);
+    await userEvent.setup().click(screen.getByRole("button", { name: "Show them" }));
+    const h = await screen.findByRole("heading", { name: "Could not be downloaded" });
+    await waitFor(() => expect(document.activeElement).toBe(h));
+    const title = await shown("Interview with the mayor");
+    expect(title.getAttribute("dir")).toBe("auto");
+    expect(getShown("https://www.youtube.com/watch?v=aaa").getAttribute("dir")).toBe("auto");
+    expect(getShown("This video is private.").getAttribute("dir")).toBe("auto");
+    expect(getShown("YouTube says: “Private video”").getAttribute("dir")).toBe("auto");
+    expect(getShown("(no title)")).toBeTruthy();
+    expect(getShown("The connection was lost three times.")).toBeTruthy();
+    expect(getShown("مقابلة").getAttribute("dir")).toBe("auto");
+    expect(m.count("GET /projects/p1/downloads/run-1/problems")).toBe(1);
+  });
+
+  it('a finished run with failures shows the fixed line and "Resume downloads (14 did not complete)"', async () => {
+    start({ runs: [exampleRun({ state: "finished", done: 398, failed: 14 })] });
+    await shown('"Example Channel": 398 of 412 downloaded. 14 could not be downloaded.');
+    notShown("14 could not be downloaded");
+    expect(buttonNames()).toEqual(["Show them", "Resume downloads (14 did not complete)", "Discard"]);
+  });
+
+  it("an interrupted run shows \"The capture of 'Example Channel' was interrupted: 120 of 412 done.\" with Resume downloads and Discard", async () => {
+    start({ runs: [exampleRun({ state: "interrupted" })] });
+    await shown("The capture of 'Example Channel' was interrupted: 120 of 412 done.");
+    expect(buttonNames()).toEqual(["Resume downloads (292 did not complete)", "Discard"]);
+  });
+
+  it("a run that completed everything says so and has no button", async () => {
+    start({ runs: [exampleRun({ state: "finished", done: 412 })] });
+    await shown('"Example Channel": all 412 downloaded.');
+    expect(buttonNames()).toEqual([]);
+  });
+
+  it("a run waiting its turn says so and offers Stop only", async () => {
+    start({ runs: [exampleRun({ state: "queued", total: 0, done: 0 })] });
+    await shown('"Example Channel" is waiting its turn. It starts by itself when the downloads before it have finished, paused or stopped.');
+    expect(buttonNames()).toEqual(["Stop"]);
+  });
+
+  it('a run interrupted before it began offers "Resume downloads" without a count', async () => {
+    start({ runs: [exampleRun({ state: "interrupted", total: 0, done: 0 })] });
+    await shown("The capture of 'Example Channel' was interrupted before it began.");
+    expect(buttonNames()).toEqual(["Resume downloads", "Discard"]);
+  });
+
+  it('a run stopped before it began says so, with "Resume downloads" and Discard', async () => {
+    start({ runs: [exampleRun({ state: "stopped", total: 0, done: 0 })] });
+    await shown('"Example Channel" was stopped before it began.');
+    expect(buttonNames()).toEqual(["Resume downloads", "Discard"]);
+  });
+
+  it("Resume downloads pressed twice sends one request", async () => {
+    const { m } = start({ runs: [exampleRun({ state: "interrupted" })], holdActions: true });
+    const user = userEvent.setup();
+    await shown("The capture of 'Example Channel' was interrupted: 120 of 412 done.");
+    const resume = screen.getByRole("button", { name: "Resume downloads (292 did not complete)" });
+    await user.dblClick(resume);
+    await waitFor(() => expect(m.count("POST /projects/p1/downloads/run-1/resume")).toBe(1));
+    expect((resume as HTMLButtonElement).disabled).toBe(true);
+    await user.click(resume);
+    m.release();
+    await shown('Downloading "Example Channel": 120 of 412');
+    expect(m.count("POST /projects/p1/downloads/run-1/resume")).toBe(1);
+  });
+
+  it("Copy the list copies one line per video and says so", async () => {
+    start({ runs: [exampleRun({ state: "finished", done: 409, failed: 3 })], problems: { "run-1": { platform: "youtube", problems: PROBLEMS } } });
+    const user = userEvent.setup(); // installs its own clipboard: stubbed after it
+    const writeText = vi.fn(async (_text: string) => {});
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    await user.click(await screen.findByRole("button", { name: "Show them" }));
+    await shown("Interview with the mayor");
+    await user.click(screen.getByRole("button", { name: "Copy the list" }));
+    await shown("The list was copied.");
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText.mock.calls[0]![0]).toBe(PROBLEMS.map((p) => problemLine(p, "youtube")).join("\n"));
+    expect(writeText.mock.calls[0]![0].split("\n")).toEqual([
+      "Interview with the mayor — https://www.youtube.com/watch?v=aaa — This video is private. YouTube says: “Private video”",
+      "(no title) — https://www.youtube.com/watch?v=bbb — The connection was lost three times.",
+      "مقابلة — https://www.youtube.com/watch?v=ccc — This video has been removed, or its address is wrong.",
+    ]);
+    // A refusal says so, in plain words.
+    writeText.mockRejectedValueOnce(new Error("denied"));
+    await user.click(screen.getByRole("button", { name: "Copy the list" }));
+    await shown("The list could not be copied. Select it and copy it by hand.");
+    notShown("The list was copied.");
+  });
+
+  it("Discard removes the run and focus goes to the heading", async () => {
+    const { m } = start({ runs: [exampleRun({ state: "interrupted" })] });
+    await shown("The capture of 'Example Channel' was interrupted: 120 of 412 done.");
+    await userEvent.setup().click(screen.getByRole("button", { name: "Discard" }));
+    await waitFor(() => notShown("The capture of 'Example Channel' was interrupted: 120 of 412 done."));
+    expect(m.count("POST /projects/p1/downloads/run-1/discard")).toBe(1);
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+  });
+
+  it("a discarded event removes its run", async () => {
+    const { m } = start({ runs: [exampleRun({ state: "paused" }), exampleRun({ runId: "run-2", title: "Second Channel", state: "stopped", startedAt: "2026-11-26T12:00:00.000Z" })] });
+    await shown('"Example Channel" is paused: 120 of 412 downloaded.');
+    // Newest first.
+    const titles = screen.getAllByText(/Channel/, SHOWN).map((e) => e.closest("p")?.textContent);
+    expect(titles[0]).toBe('"Second Channel" was stopped: 120 of 412 downloaded.');
+    await waitFor(() => expect(m.streams()).toBe(1));
+    await act(async () => m.emit({ projectId: "p1", discarded: "run-1" }));
+    await waitFor(() => notShown('"Example Channel" is paused: 120 of 412 downloaded.'));
+    expect(getShown('"Second Channel" was stopped: 120 of 412 downloaded.')).toBeTruthy();
+  });
+
+  it("events of another project are ignored", async () => {
+    const { m } = start({ runs: [exampleRun()] });
+    await shown('Downloading "Example Channel": 120 of 412');
+    await waitFor(() => expect(m.streams()).toBe(1));
+    await act(async () => {
+      m.emit({ projectId: "p2", downloads: exampleRun({ projectId: "p2", done: 200, updatedAt: later(1) }) });
+      m.emit({ projectId: "p2", discarded: "run-1" });
+      m.emit({ projectId: "p2", transcriptions: idleList("p2", { state: "running", total: 5, done: 1 }) });
+      m.emit({ projectId: "p1", downloads: exampleRun({ done: 130, updatedAt: later(2) }) });
+    });
+    await shown('Downloading "Example Channel": 130 of 412');
+    notShown('Downloading "Example Channel": 200 of 412');
+    notShown("Transcribing: 1 of 5");
+  });
+
+  it("a title line is told to a screen reader at most every five seconds (R658 M3)", async () => {
+    const said = () => screen.queryAllByRole("status").map((s) => s.textContent);
+    const { m } = start({ runs: [exampleRun()] });
+    await shown('Downloading "Example Channel": 120 of 412');
+    await waitFor(() => expect(m.streams()).toBe(1));
+    // The line as read at the opening is shown, not told.
+    expect(said().some((t) => t?.includes("120 of 412"))).toBe(false);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await act(async () => m.emit({ projectId: "p1", downloads: exampleRun({ done: 121, updatedAt: later(1) }) }));
+      await vi.waitFor(() => expect(said()).toContain('Downloading "Example Channel": 121 of 412'));
+      await act(async () => {
+        m.emit({ projectId: "p1", downloads: exampleRun({ done: 122, updatedAt: later(2) }) });
+        m.emit({ projectId: "p1", downloads: exampleRun({ done: 123, updatedAt: later(3) }) });
+      });
+      await vi.waitFor(() => expect(getShown('Downloading "Example Channel": 123 of 412')).toBeTruthy());
+      await act(async () => vi.advanceTimersByTimeAsync(4_000));
+      expect(said()).toContain('Downloading "Example Channel": 121 of 412');
+      expect(said().some((t) => t?.includes("123 of"))).toBe(false);
+      await act(async () => vi.advanceTimersByTimeAsync(1_000));
+      await vi.waitFor(() => expect(said()).toContain('Downloading "Example Channel": 123 of 412'));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("WorkLines: the transcription line", () => {
+  const running = idleList("p1", { state: "running", total: 412, done: 14, current: { sourceId: "s1", title: "Title of the video" }, soundSecondsLeft: 6 * 86_400 * 4, unknownLeft: 0 });
+
+  it('the transcription line shows "measuring…" until a speed is known, then the time left', async () => {
+    const { m } = start({ lists: { p1: running } });
+    await shown('Transcribing: 14 of 412 — "Title of the video"');
+    expect(getShown("measuring…")).toBeTruthy();
+    expect(buttonNames()).toEqual(["Pause", "Stop"]);
+    await waitFor(() => expect(m.streams()).toBe(1));
+    await act(async () => m.emit({ projectId: "p1", transcriptions: { ...running, soundPerSecond: 4 } }));
+    await shown("about 6 days left at this Mac's speed (4 minutes of sound per minute)");
+    notShown("measuring…");
+  });
+
+  it("paused transcriptions show Continue and Stop", async () => {
+    const { m } = start({ lists: { p1: { ...running, state: "paused" } } });
+    await shown("Transcriptions paused: 14 of 412 done.");
+    expect(buttonNames()).toEqual(["Continue", "Stop"]);
+    await userEvent.setup().click(screen.getByRole("button", { name: "Continue" }));
+    await shown('Transcribing: 14 of 412 — "Title of the video"');
+    expect(m.count("POST /projects/p1/transcription-list/continue")).toBe(1);
+  });
+
+  it("Stop of the transcriptions removes the line, says the stopped sentence once and moves focus to the heading", async () => {
+    const { m } = start({ lists: { p1: running } });
+    await shown('Transcribing: 14 of 412 — "Title of the video"');
+    await userEvent.setup().click(screen.getByRole("button", { name: "Stop" }));
+    await shown(LIST_STOPPED_TEXT);
+    expect(screen.getAllByText(LIST_STOPPED_TEXT)).toHaveLength(1);
+    expect(screen.getByText(LIST_STOPPED_TEXT).getAttribute("role")).toBe("status");
+    notShown('Transcribing: 14 of 412 — "Title of the video"');
+    expect(buttonNames()).toEqual([]);
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+    expect(m.count("POST /projects/p1/transcription-list/stop")).toBe(1);
+  });
+
+  it("nothing to show renders nothing: no run and an idle list with nothing on it (and no stream is opened)", async () => {
+    const { m } = start();
+    await waitFor(() => expect(m.count("GET /projects/p1/transcription-list")).toBe(1));
+    await waitFor(() => expect(m.count("GET /projects/p1/downloads")).toBe(1));
+    expect(m.count("GET /events")).toBe(0);
+    expect(screen.queryByRole("heading", { name: WORK_LINES_TEXT.heading })).toBeNull();
+    expect(screen.queryByRole("region")).toBeNull();
+  });
+
+  it("a service that does not know the two routes (404) shows nothing and says no error", async () => {
+    // Fastify's own answer for a route it does not have.
+    let asks = 0;
+    const unknown = (path: string) => () => (asks++, HttpResponse.json({ message: `Route GET:${path} not found`, error: "Not Found", statusCode: 404 }, { status: 404 }));
+    const { m } = start({
+      runs: [exampleRun()],
+      extra: [http.get(url("/projects/p1/downloads"), unknown("/projects/p1/downloads")), http.get(url("/projects/p1/transcription-list"), unknown("/projects/p1/transcription-list"))],
+    });
+    await waitFor(() => expect(asks).toBe(2));
+    // Nothing to show: no stream is followed, no error said.
+    expect(m.count("GET /events")).toBe(0);
+    expect(screen.queryByRole("region")).toBeNull();
+    expect(screen.queryAllByRole("alert")).toEqual([]);
+  });
+});
+
+/** A GET whose asks are counted; the asks `hold(n)` picks are held until `release()` (or the test's end), else answered by the next handler. */
+function holding(path: string, hold: (n: number) => boolean) {
+  let n = 0;
+  const requests: Request[] = [];
+  const gate = hang();
+  let release!: () => void;
+  const released = new Promise<void>((r) => (release = r));
+  return {
+    handler: http.get(url(path), async ({ request }) => {
+      requests.push(request);
+      if (hold(++n)) await Promise.race([gate, released]);
+      return undefined;
+    }),
+    count: () => n,
+    requests,
+    release: () => release(),
+  };
+}
+
+/** R659: `/events` answered as the real service does: the opening `library.state` event, then `then`, then the stream ends. Connections after `upTo` are held, never opening. */
+function dropping(then: string, upTo = Infinity) {
+  let n = 0;
+  const requests: Request[] = [];
+  const gate = hang();
+  const opening = `event: library.state\ndata: ${JSON.stringify({ open: true, libraryId: "lib-1", mode: "read-write" })}\n\n`;
+  return {
+    handler: http.get(url("/events"), async ({ request }) => {
+      requests.push(request);
+      if (++n <= upTo) return new HttpResponse(`${opening}${then}`, { headers: { "Content-Type": "text/event-stream" } });
+      await gate;
+      return undefined;
+    }),
+    n: () => n,
+    requests,
+  };
+}
+const progress = (projectId: string) => `event: background.progress\ndata: ${JSON.stringify({ projectId, downloads: exampleRun({ projectId, done: 121, updatedAt: later(1) }) })}\n\n`;
+
+describe("WorkLines: the event stream (R597, R641 D2, R658, R659)", () => {
+  it("a stream that does not open within the limit is opened again", async () => {
+    const events = holding("/events", (n) => n === 1);
+    const { m } = start({ runs: [exampleRun()], extra: [events.handler] }, { streamOpenMs: 300 });
+    await shown('Downloading "Example Channel": 120 of 412');
+    await waitFor(() => expect(events.count()).toBe(2), { timeout: 5000 });
+    expect(events.requests[0]!.signal.aborted).toBe(true);
+    // At the opening, and at the new stream's opening.
+    await waitFor(() => expect(m.count("GET /projects/p1/downloads")).toBe(2));
+    await waitFor(() => expect(m.streams()).toBe(1));
+    await act(async () => m.emit({ projectId: "p1", downloads: exampleRun({ done: 125, updatedAt: later(1) }) }));
+    await shown('Downloading "Example Channel": 125 of 412');
+    notShown(LOST);
+  });
+
+  it("a stream silent past the limit is opened again", async () => {
+    // The second try is held, never opening: the lines rest there (its opening limit is the default 20 s).
+    const events = holding("/events", (n) => n === 2);
+    start({ runs: [exampleRun()], extra: [events.handler] }, { streamQuietMs: 300 });
+    await shown('Downloading "Example Channel": 120 of 412');
+    await waitFor(() => expect(events.count()).toBe(2), { timeout: 10_000 });
+    expect(events.requests[0]!.signal.aborted).toBe(true);
+    expect(events.requests[1]!.signal.aborted).toBe(false);
+    notShown(LOST);
+  });
+
+  it("the opening state then an end, repeated, ends in the notice", async () => {
+    const events = dropping("", 3);
+    start({ runs: [exampleRun()], extra: [events.handler] });
+    await shown(LOST);
+    expect(events.n()).toBe(3);
+    const reconnect = screen.getByRole("button", { name: "Reconnect" });
+    await userEvent.setup().click(reconnect);
+    // A fresh try (held, never opening): the notice goes while it is made.
+    await waitFor(() => expect(events.n()).toBe(4));
+    notShown(LOST);
+  });
+
+  it("this project's background.progress then a drop keeps following", async () => {
+    const events = dropping(progress("p1"), 5);
+    start({ runs: [exampleRun()], extra: [events.handler] });
+    await waitFor(() => expect(events.n()).toBe(6), { timeout: 20_000 });
+    expect(events.requests[5]!.signal.aborted).toBe(false);
+    notShown(LOST);
+    expect(getShown('Downloading "Example Channel": 121 of 412')).toBeTruthy();
+  });
+
+  it("another project's background.progress then a drop ends in the notice", async () => {
+    const events = dropping(progress("p2"));
+    start({ runs: [exampleRun()], extra: [events.handler] });
+    await shown(LOST);
+    expect(events.n()).toBe(3);
+    expect(getShown('Downloading "Example Channel": 120 of 412')).toBeTruthy();
+  });
+
+  it("answers after the project changed or after unmount are dropped", async () => {
+    // The read of p1's runs is held.
+    const reads = holding("/projects/p1/downloads", () => true);
+    const { m, client, view } = start({ runs: [exampleRun()], extra: [reads.handler] });
+    await waitFor(() => expect(reads.count()).toBe(1));
+    view.rerender(<WorkLines client={client} projectId="p2" />);
+    await waitFor(() => expect(m.count("GET /projects/p2/downloads")).toBe(1));
+    expect(reads.requests[0]!.signal.aborted).toBe(true);
+    reads.release();
+    await waitFor(() => expect(m.count("GET /projects/p2/transcription-list")).toBeGreaterThanOrEqual(1));
+    notShown('Downloading "Example Channel": 120 of 412');
+    expect(screen.queryByRole("region")).toBeNull();
+    // After unmount: a held read is cancelled, and its answer changes nothing.
+    const later2 = holding("/projects/p2/transcription-list", () => true);
+    server.use(later2.handler);
+    view.rerender(<WorkLines client={client} projectId="p2" key="again" />);
+    await waitFor(() => expect(later2.count()).toBe(1));
+    view.unmount();
+    await waitFor(() => expect(later2.requests[0]!.signal.aborted).toBe(true));
+    later2.release();
+  });
+});

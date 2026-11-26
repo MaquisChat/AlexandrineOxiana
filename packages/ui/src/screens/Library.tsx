@@ -20,6 +20,7 @@ import { JobsIndicator, type Job } from "../components/JobsIndicator";
 import { PageReads, usePageHost } from "../components/PageReads";
 import { ProjectNav } from "../components/ProjectNav";
 import { RecheckProjectButton, useProjectRecheck } from "../components/RecheckProject";
+import { WorkLines } from "../components/WorkLines";
 import { SearchBox } from "../components/SearchBox";
 import { SourceTable } from "../components/SourceTable";
 import { PendingWritesDialog } from "../components/PendingWritesDialog";
@@ -1096,6 +1097,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         )}
         {project && !locked && (
           <>
+            <WorkLines client={api.client} projectId={project.id} streamOpenMs={streamOpenMs} streamQuietMs={streamQuietMs} />
             <SearchBox label="Search sources" onSearch={(text) => setFilter((f) => (f.text === text ? f : { ...f, text }))} />
             <DropZone onPaths={(paths) => void attach(paths)} disabled={readOnly || attaching} disabledReason={attaching ? "Attaching…" : readOnlyReason} target={project.name} />
             {outcomes && (

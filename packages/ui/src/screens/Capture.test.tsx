@@ -5,6 +5,7 @@ import { COOKIES_ACKNOWLEDGEMENT } from "../api/capture";
 import type { CaptureQueueDetail } from "@ao/shared";
 import { http } from "msw";
 import { ANON_RULES, BASE, errorResponse, mockCapture, P1, P2, server, STRICT_RULES, type CaptureSetup } from "../test/captureService";
+import { exampleRun, idleList, mockBackground } from "../test/backgroundService";
 import { Capture, CaptureRoute } from "./Capture";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -780,6 +781,32 @@ describe("Capture screen — profile", () => {
     await user.click(screen.getByRole("button", { name: "Capture profile" }));
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
     expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({ url: PROFILE, options: { transcribeModel: "medium", includeComments: true, legalBasis: "Legitimate interests" } });
+  });
+
+  it("the work lines are shown for the open project", async () => {
+    const bg = mockBackground({ runs: [exampleRun({ projectId: P1, state: "interrupted" }), exampleRun({ projectId: P2, runId: "run-9", title: "Other Channel" })], lists: { [P1]: idleList(P1, { state: "paused", total: 412, done: 14 }) }, noEvents: true }, BASE);
+    const m = mockCapture({ extra: bg.handlers });
+    render(<Capture client={m.client} projectId={P1} />);
+    const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
+    expect(await within(lines).findByText((_c, el) => el?.textContent === "The capture of 'Example Channel' was interrupted: 120 of 412 done." && el.tagName === "P")).toBeTruthy();
+    expect(within(lines).getByText("Transcriptions paused: 14 of 412 done.", { ignore: ".ao-visually-hidden" })).toBeTruthy();
+    expect(within(lines).getByRole("button", { name: "Resume downloads (292 did not complete)" })).toBeTruthy();
+    expect(within(lines).queryByText(/Other Channel/)).toBeNull();
+    expect(bg.count(`GET /projects/${P2}/downloads`)).toBe(0);
+  });
+
+  it("a profile capture started here shows its run in the work lines", async () => {
+    const bg = mockBackground({ noEvents: true }, BASE);
+    const { user } = await setup({ extra: bg.handlers });
+    await waitFor(() => expect(bg.count(`GET /projects/${P1}/downloads`)).toBe(1));
+    expect(screen.queryByRole("region", { name: "Downloads and transcriptions" })).toBeNull();
+    bg.setRuns([exampleRun({ projectId: P1, runId: "qp1", title: "someone", url: PROFILE, platform: "instagram", state: "downloading", total: 0, done: 0 })]);
+    await user.type(screen.getByRole("textbox", { name: "Profile, channel or playlist link" }), PROFILE);
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
+    expect(await within(lines).findByText((_c, el) => el?.textContent === 'Downloading "someone": reading the list of posts…' && el.tagName === "P")).toBeTruthy();
+    // Read at the opening, again once the capture started, and at the opening of the stream it now follows.
+    await waitFor(() => expect(bg.count(`GET /projects/${P1}/downloads`)).toBe(3));
   });
 
   it("a profile run's posts and summary appear as its events arrive", async () => {

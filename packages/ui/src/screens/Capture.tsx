@@ -55,6 +55,7 @@ import {
 import { isValidId } from "../api/import";
 import { errorText } from "../api/library";
 import { CaptureQueue } from "../components/CaptureQueue";
+import { WorkLines } from "../components/WorkLines";
 import { PageReads, usePageHost, usePageRead } from "../components/PageReads";
 import { modelOptionLabel, SpeechModelNotice, ToolsLink, useSpeechModels } from "../components/MissingToolNotice";
 import { DEFAULT_SPEECH_MODEL, toolsApi } from "../api/tools";
@@ -375,6 +376,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   const [formError, setFormError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [queues, setQueues] = useState<CaptureQueueState[]>([]);
+  /** The work lines are mounted afresh (and read again) after a profile capture is started here. */
+  const [linesKey, setLinesKey] = useState(0);
   const queuesNow = useRef(queues);
   queuesNow.current = queues;
   /** Queues in the list (started here, or read from the service). */
@@ -779,6 +782,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         const { queueId } = await api.captureProfile(projectId, url, options);
         if (!live.current) return;
         addQueue(profileQueue(queueId, url));
+        // The work lines read the project's runs again: the one just started is among them.
+        setLinesKey((k) => k + 1);
         setProfileUrl("");
       } catch (err) {
         if (live.current) refused(err, "The profile capture could not be started.");
@@ -1145,6 +1150,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       <p className="ao-capture__hint">
         Captures started earlier or from the browser extension are shown here too, for as long as the library service runs; a finished capture stays listed for up to an hour.
       </p>
+      {!locked && <WorkLines key={linesKey} client={client} projectId={projectId} streamOpenMs={streamOpenMs} streamQuietMs={streamQuietMs} />}
       <CaptureQueue queues={queues} />
 
       <CaptureTools api={api} />
