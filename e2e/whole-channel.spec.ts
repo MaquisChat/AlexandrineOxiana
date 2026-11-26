@@ -14,7 +14,7 @@
  * is held at the fake yt-dlp (`hold(tool, match)`) where a scenario needs a run caught in the middle of a video, and a
  * transcription at the fake speech recognition (`holdSpeech()`) where one must still be running across a restart.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { APP_ORIGIN, expect, gotoWhenQuiet, libraryWithProject, test, type AppHarness, type FakeControl, type Page } from "./fixtures.js";
 
@@ -322,6 +322,9 @@ test.describe("whole channels, downloaded and transcribed in the background (who
     await test.step("the app quits and starts again: the transcription carries on by itself and finishes, and only then is it read that nothing more was asked of the platform", async () => {
       before = asked(app).length;
       await app.restart();
+      // The held yt-dlp run was stopped with the service: its marker is left behind, and is not counted (R697 M-c).
+      expect(readdirSync(join(app.root, "fake-control")).filter((n) => n.startsWith("held-yt-dlp-")), "the stopped run's marker is still there").toHaveLength(1);
+      expect(fakes.held("yt-dlp"), "a marker of a stopped run is not counted as held").toBe(0);
       await reopen(page, projectId);
       // Nobody presses anything: the new service's worker takes video 1's transcription up again by itself.
       await expect.poll(() => fakes.heldSpeech(), { message: "the new worker transcribes video 1 by itself after the restart", timeout: DONE_WAIT }).toBe(1);

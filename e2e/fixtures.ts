@@ -117,7 +117,10 @@ export interface FakeControl {
    */
   hold(tool: FakeTool, match?: string): Promise<void>;
   release(tool: FakeTool): Promise<void>;
-  /** Runs of `tool` waiting at the hold now. */
+  /**
+   * Runs of `tool` waiting at the hold now: only those whose process is alive. A run waiting at the hold when
+   * `app.restart()` stopped the service leaves its marker behind; it is not counted (R697 M-c).
+   */
   held(tool: FakeTool): number;
   /**
    * From now on the fake speech recognition waits before it answers (each transcription stays running), until
@@ -332,7 +335,7 @@ function fakeWrapper(tool: FakeTool, control: string): string {
 
 /**
  * The hold markers in `dir` named `<prefix><pid>[-…]` whose process is still running. A marker of a process that is gone
- * (a worker the restart stopped) is not counted, so nothing that polls after a restart passes on a stale marker.
+ * (a held run the restart killed) is not counted, so nothing that polls `held` after a restart passes on a stale marker.
  */
 export function liveMarkers(dir: string, prefix: string): number {
   return readdirSync(dir).filter((n) => {
@@ -358,7 +361,7 @@ async function fakeControlFor(root: string): Promise<{ env: Record<string, strin
     setProfile: (profile) => writeFile(join(dir, "profile.json"), JSON.stringify(profile)),
     hold: (tool, match) => writeFile(join(dir, `hold-${tool}`), match ?? ""),
     release: (tool) => rm(join(dir, `hold-${tool}`), { force: true }),
-    held: (tool) => readdirSync(dir).filter((n) => n.startsWith(`held-${tool}-`)).length,
+    held: (tool) => liveMarkers(dir, `held-${tool}-`),
     holdSpeech: () => writeFile(join(dir, "hold-speech"), ""),
     releaseSpeech: () => rm(join(dir, "hold-speech"), { force: true }),
     heldSpeech: () => liveMarkers(dir, "held-speech-"),
