@@ -1,6 +1,12 @@
 # The final review — what I need from you
 
+*Updated 26 November 2026, just after midnight Central: BUILD 16 IS IN `main`, on your word "Merge". Mac build 16 (part 16) is now the build of `main` and the build to use.*
+
+*Updated 25 November 2026, 8:44 pm Central: part 16, at the end, is new — build request 16 (silent connections are opened again, the check for missing files shows its progress, "Back up now", backups said in sentences) passed all its tests and GitHub's check, and MAC BUILD 16 EXISTS. It is NOT in `main` yet: that waits for your word.*
+
 *Updated 24 November 2026, 7 pm Central: MAC BUILD 12 EXISTS — GitHub gave the build a Mac this time and every check passed, the test of Quit among them. Part 12 says where to download it. It replaces build 10.*
+
+*Updated 25 November 2026, 6:53 pm Central: MAC BUILD 15 EXISTS — GitHub gave a Mac this evening and every check passed. Part 15 says where to download it. It replaces Mac build 13 and contains build 14.*
 
 *Updated 25 November 2026, 11:37 am Central: part 15, at the end, is new and short — build request 15 (after a stop nothing more is asked; after a lock nothing about the project stays in memory) passed GitHub's check and **is merged to `main` on your word**. It also tells you two things that are yours to decide. **There is still no Mac build of build 14 or 15** (GitHub gives no Mac during the day; I ask again this evening) — Mac build 13 remains the build to use.*
 
@@ -387,7 +393,7 @@ All are confirmed by a test that shows the problem. **The four most serious are 
 
 Everything built up to 23 November is on `main`, checked by GitHub and on a Mac. The rough-edge fixes of 24 November are in Mac build 10 and, by your word, on `main` too (part 10). What is left is yours. In the order I would do it:
 
-- [ ] **1. Install Mac build 13** (part 13 says where: run 20's download). It replaces builds 8, 9, 10 and 12: build 9 mended the optional tools' downloads, build 10 added the rough-edge fixes, build 12 added the known gaps, the safe closing of the library and attaching without the wait, and build 13 adds the move fix, the screens that no longer wait for ever, and "Look up again". *(Build request 14 is on its way: when part 14 names Mac build 14, install that one instead.)*
+- [ ] **1. Install Mac build 13** (part 13 says where: run 20's download). It replaces builds 8, 9, 10 and 12: build 9 mended the optional tools' downloads, build 10 added the rough-edge fixes, build 12 added the known gaps, the safe closing of the library and attaching without the wait, and build 13 adds the move fix, the screens that no longer wait for ever, and "Look up again". *(Build request 14 is on its way: when part 14 names Mac build 14, install that one instead.)* *(Mac build 15 exists since the evening of 25 November: install that one — part 15 says where. It contains builds 13 and 14.)*
 - [ ] **2. Undo the import that stopped when the disk filled, then import again** with enough free space, or with "leave the files where they are".
 - [ ] **3. Work through the hands-on checklist in part 4** (51 boxes, about ten areas). Tell me what you find, in any form; a sentence per problem is enough. Three areas matter most because nothing but your Mac can test them: "Get through my library" (the sign-in window), watched cloud folders, and the macOS prompts.
 - [ ] **4. Answer the decisions.** There are 30 (28, 29 and 30 are new, in part 10); two are already answered (14 and 25). Each has my recommendation. The quickest reply is "accept all your recommendations except numbers …". They are in part 2 (1–21), part 6 (22–25), part 7 (26), part 8 (27) and part 10 (28–30).
@@ -719,7 +725,7 @@ After build 12, three more pieces were built for the next Mac build (build reque
 - **Tested together on my side:** every step passes: the tests of every part, the service, the Mac shell's own tests, a Linux build, the app started and quit, and 228 of 228 browser scenarios. The first full run had two of those scenarios fail. I read both before believing them: the test harness had opened the next page while the page before was between two of its own readings. Nothing in the app was at fault; I mended the harness, and the whole browser step was run again and passed.
 - **Pushed as build request 13** at 12:35 am Central on 25 November.
 - **GitHub's own check passed** on this code: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45557680438 (green at 1:02 am Central, after an hour). **Afterwards one test failed on GitHub, twice**: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45561718000. It is one of about 11,600 tests, a test of Find and acquire (listed as FR-757). *(Corrected at 5:57 am Central on 25 November. I wrote here that this test failed every time and that the date and time caused it. Both were wrong; I had guessed and not yet tested the guess. The test fails about one run in four, and what it caught is a small fault in the app itself, older than this build: when a download of a free copy was stopped at one exact moment — by stopping the search, or by locking or closing the library — the app could still open a connection to the site it was about to download from. An independent review measured how far that went: the app could look up the site's name and connect to it, so the site could see that your computer connected; no request was sent, nothing about what you were looking for went out, and nothing was downloaded or kept. The mend is three lines, the review confirmed it, and it comes with build request 14. So Mac build 13 has this small fault, as the builds before it have; it is safe to use.)* Because GitHub's check fails often until the mend is in, I do not recommend merging build 13 by itself; build request 14 is otherwise ready.
-- **Mac build 13 exists, and it is the build to use now** (it replaces build 12). Run 20 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45561718089 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon` (you must be signed in to GitHub). The disk image's SHA-256 is `cc6d1f090860486c8706511a2a6b396cc99c0f6a32253f0022cf2059d7250288`. GitHub's Mac built it at 12:36 am Central on 25 November and ran every check on it: the app starts from the disk image, its helpers start and stop cleanly, Quit by a system request goes the orderly way (2 of 2 runs), and nothing is left running.
+- **Mac build 13 exists, and it is the build to use now** (it replaces build 12). Run 20 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45561718089 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon` (you must be signed in to GitHub). The disk image's SHA-256 is `cc6d1f090860486c8706511a2a6b396cc99c0f6a32253f0022cf2059d7250288`. GitHub's Mac built it at 12:36 am Central on 25 November and ran every check on it: the app starts from the disk image, its helpers start and stop cleanly, Quit by a system request goes the orderly way (2 of 2 runs), and nothing is left running. *(Superseded on the evening of 25 November: Mac build 15 exists — part 15 says where to download it.)*
 - **It is not in `main`** until you say so. *(Changed at 3:15 am: my recommendation is now to merge build request 14 instead, which holds all of this plus the mend of that test — part 14 will ask.)*
 
 ### What you will notice
@@ -847,7 +853,7 @@ After build request 13, three more pieces were built for the next Mac build (bui
 - **Pushed as build request 14** at 7:28 am Central on 25 November.
 - **GitHub's own check is green** on exactly this code: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45623952522 (green at 8:38 am Central, after 70 minutes). The test that failed on build request 13 passed.
 - **It is in `main`.** At 8:28 am Central you wrote "merge build 14 to main when the check is green"; I merged exactly build request 14 at 8:43 am. `main`'s own check passed too, at 9:45 am Central: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45637345358
-- **Mac build 14 does not exist yet.** GitHub has not given the build a Mac: three attempts (7:28, 7:46 and 8:05 am Central) each waited fifteen minutes and were cancelled by GitHub with nothing run. Nothing on our side changed since Mac build 13, which got a Mac within seconds; GitHub's status page reports no incident, and its documentation says queued jobs can be dropped when its machines are busy. I try again at intervals and will put the download and its SHA-256 here. *(Added at 9:02 am: the build started from `main` was dropped the same way. Yesterday GitHub also gave no Mac during the day, and gave one at once in the evening and at night; so Mac build 14 will most likely exist this evening, about 7 pm Central.)* *(Added at midday: the Mac build made this evening will be of build 15, which contains all of build 14: part 15.)* **Until then Mac build 13 is the build to use** (part 13 says where); it lacks only what this part describes.
+- **Mac build 14 does not exist yet.** GitHub has not given the build a Mac: three attempts (7:28, 7:46 and 8:05 am Central) each waited fifteen minutes and were cancelled by GitHub with nothing run. Nothing on our side changed since Mac build 13, which got a Mac within seconds; GitHub's status page reports no incident, and its documentation says queued jobs can be dropped when its machines are busy. I try again at intervals and will put the download and its SHA-256 here. *(Added at 9:02 am: the build started from `main` was dropped the same way. Yesterday GitHub also gave no Mac during the day, and gave one at once in the evening and at night; so Mac build 14 will most likely exist this evening, about 7 pm Central.)* *(Added at midday: the Mac build made this evening will be of build 15, which contains all of build 14: part 15.)* **Until then Mac build 13 is the build to use** (part 13 says where); it lacks only what this part describes. *(No separate Mac build 14 was made: Mac build 15, made on the evening of 25 November, contains it — part 15.)*
 
 ### What you will notice
 
@@ -939,8 +945,8 @@ A short part. Build request 15 holds two safety mends that the review of the sto
 - **Tested together on my side:** every step passed at the first run (11,864 tests, 228 of 228 browser scenarios, the desktop scenarios, the app started and quit).
 - **Pushed as build request 15** at 10:21 am Central on 25 November.
 - **GitHub's own check is green** on exactly this code: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45652933197 (green at 11:34 am Central).
-- **It is in `main`.** At 10:17 am Central you wrote "merge build 15 to main when the check is green"; I merged exactly build request 15 at 11:37 am Central.
-- **No Mac build yet, of build 14 or of build 15.** GitHub gives this project no Mac during the US working day and gives one at once in the evening; I ask again at 6:30 pm Central. The build made then will be build 15, which contains all of build 14. Until then Mac build 13 is the build to use.
+- **It is in `main`.** At 10:17 am Central you wrote "merge build 15 to main when the check is green"; I merged exactly build request 15 at 11:37 am Central. `main`'s own check passed too, at 12:49 pm: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45666793004
+- **Mac build 15 exists, and it is the build to use now** (it replaces build 13 and contains all of build 14). Run 24 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45666793010 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon` (you must be signed in to GitHub). The disk image's SHA-256 is `4d39b818f6ab75e94894d88a153de11afe7837e19de12a1bce233b856e198157`. GitHub gave no Mac during the US working day (four tries were dropped); asked again at 6:31 pm Central on 25 November, it gave one at once. The Mac built the app at 6:36 pm and ran every check on it: the app starts from the disk image, its helpers start and stop cleanly, Quit by a system request goes the orderly way (2 of 2 runs), and nothing is left running. It was built from `main` as it stands, which is exactly build request 15. *(Superseded just after midnight on 26 November: build 16 is in `main` and Mac build 16 is the build to use — part 16.)*
 
 ### What it mends
 
@@ -959,11 +965,11 @@ Nothing new to see. Part 14's list holds, with the Mac build of build 15 once it
 ### Two things I want you to know
 
 1. **In an encrypted project, some words stay readable on the disk.** Each source's files and details are encrypted. Its year, first author and a short title stay readable in the names of its folder and files. The specification designed it so, to keep the library readable by a person, and an earlier ruling accepted the cost. Where participants' names are replaced by codes, the code appears there, not the name. A project that must hide its titles cannot do so today. **Your decision:** leave it as designed (nothing to do), or have coded folder names added for projects that need them (a new piece of work, not a small one).
-2. **A new button is coming with build 16: "Back up now"**, on a project's Governance screen. An existing warning already told you to make a backup "from the project's settings", and no such place existed. The warning will name the button. If you would rather have no button and a shorter warning, say so.
+2. **A new button is coming with build 16: "Back up now"**, on a project's Governance screen. An existing warning already told you to make a backup "from the project's settings", and no such place existed. The warning will name the button. If you would rather have no button and a shorter warning, say so. *(It is built: part 16, C.)*
 
 ### Still open
 
-Being built now for build 16, each reviewed by someone who did not build it:
+Being built now for build 16, each reviewed by someone who did not build it: *(All five are built, reviewed and in build request 16: part 16.)*
 
 - **Nothing is asked for a locked project during imports either (FR-769)** — bulk import, the Zotero import and sync, attaching, and "Look up again". Built and reviewed.
 - **The move:** two rare corners, and a truer sentence for a leftover folder whose library drive is unplugged (FR-760, FR-766). Built and reviewed.
@@ -976,3 +982,69 @@ Listed, not built:
 - **FR-770:** a destruction certificate, which an ethics board may read, gives the state of the backups as a code, not a sentence.
 - **FR-771:** whether a Zotero import's own requests to Zotero stop when its project is locked; to be checked.
 - **FR-752** is answered above (point 1). **FR-761** was checked and is not a fault: the audit log is newest-first on purpose.
+
+## 16. Added on 25 November, evening: silent connections are opened again, "Back up now", and backups said in sentences
+
+Build request 16 holds four pieces. Each was built by one agent and gone through by another who had not built it and tried to break it; I ruled every open point and read the last mends myself.
+
+- **Tested together on my side:** every step passed — 11,946 tests, 230 of 230 browser scenarios, the Python tests, the desktop tests and scenarios, the app started and quit. One test failed at the first run for a reason of my test machine, not of the app: a test that restores a backup of over 4 GB found the machine's disk nearly full. I read that from the test's own output, freed the disk, and ran the whole step again: no failure.
+- **Pushed as build request 16** at 7:34 pm Central on 25 November.
+- **GitHub's own check is green** on exactly this code: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45736712839 (green at 8:35 pm Central).
+- **It is in `main`.** At 11:58 pm Central on 25 November you wrote "Merge"; I merged exactly build request 16 a few minutes after midnight on the 26th. `main`, the reader branch and Mac build 16 now hold the same code.
+- **Mac build 16 exists.** Run 25 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45736712881 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon` (you must be signed in to GitHub). The disk image's SHA-256 is `827058e453509383b0a752aae436a1786fc011271372444a29ed211a0d37e2e3`. GitHub's Mac built it at 7:40 pm Central on 25 November and ran every check on it (the app starts from the disk image, its helpers start and stop cleanly, Quit by a system request goes the orderly way in 2 of 2 runs, nothing is left running). It contains everything up to build 16. Since the merge it is the build of `main`, and the build to use.
+
+### What you can see
+
+**A. A connection that went silent is opened again.** Many screens follow the app's engine live: the library, Capture, an import while it runs, Find and acquire, watched folders, Zotero sync, the reader, the transcript viewer, Governance. After the Mac slept, such a connection could look open and deliver nothing, and the screen stood still until you left it. Now each of these screens notices a full minute of silence, closes the connection, opens a new one, and reads again only what it may have missed. Nothing you typed and nothing that is running is lost or started again.
+
+One exception, on purpose: words you searched for and carried over to the reader are dropped when the watch over them is lost; the reader then says "Your search was not carried over". They are never kept unwatched, because a project could have been locked in the gap.
+
+**B. The check for missing files shows how far it is, and can be stopped.** On the Governance screen it says "Checked 1,200 of 8,000 files…" with a "Stop" button. After a stop: "The check was stopped. Nothing was changed." with "Check again". A check that fails partway also offers "Check again". A screen reader is told the progress at most every five seconds, not at every file.
+
+**C. "Back up now"**, on a project's Governance screen. It says "Backing up…", then that the backup was made, and shows any warning the backup itself gave. Where changes are switched off, the button is too. The warning after a failed automatic backup now names it:
+
+> The last automatic backup of {project} failed. Your sources are unchanged; the backup is tried again tomorrow, or make one now with “Back up now” on the project's Governance screen.
+
+**D. After a destruction, the Governance screen says how the backups stand in a sentence**, where it showed a code. Each sentence says only what the app can prove:
+
+- "Backups holding them: no listed backup held these files."
+- "…at least one listed backup is still to be removed; the app will try again."
+- "…at least one listed backup that may still hold them is still there."
+- "…none is left that holds them; the app removed each one that did."
+- "…none is left. At least one listed backup is no longer there, and the app has no record of removing it."
+- "…the app cannot tell how they stand."
+
+"Listed" matters: the app sees only the backups it made and lists. A copy you made by hand somewhere else is never seen by it.
+
+**E. A leftover folder of a stopped move, opened while the library's own drive is unplugged**, no longer promises that the move "will be finished" (it would not be). It says the app cannot tell until the library's folder can be reached (FR-766).
+
+**F. Small tidying** of the "did not answer in time" sentence on four screens: it is no longer said twice, or in the wrong panel, and a message about a held file is no longer hidden while a list is read again.
+
+### What became safer underneath
+
+- **Nothing is asked about a locked project during imports either (FR-769).** A bulk import, a Zotero import or sync, attaching a file and "Look up again" all stop asking outside services the moment their project is locked. Before, only Find and acquire did.
+- **Asking a service that said "slow down" (FR-753, FR-768):** two rare corners where the app could ask a moment too early, or make the next project wait longer than needed.
+- **The move (FR-760):** two rare corners where a move could answer "done" for the wrong move, or lean on later checks after an upgrade from an older build. Nothing could be lost in either; the answers are now true at the first step.
+- **A stopped check for missing files really stops**, also in the middle of one very large file.
+- **Tests that could miss a cancelled request** were made certain everywhere (about 25 places, some older than this work), and each new test was run 30 times with the machine kept busy.
+
+### Things only you can check (with the Mac build of build 16)
+
+- [ ] Open the library, close the lid for a few minutes, open it: within about a minute the screens follow again (start an import or a capture before, and watch its progress move on after).
+- [ ] Governance → the check for missing files: the progress line, "Stop", "Check again".
+- [ ] Governance → "Back up now": the words, and that a backup appears.
+- [ ] With VoiceOver, if you use it: the progress of the check is spoken now and then, not at every file; a backup's warning is spoken.
+
+What my tests cannot show: whether the Mac's own web view really ends a silent connection when the app cancels it. That is the first item above.
+
+### Still open
+
+Listed, not built:
+
+- **FR-770:** a destruction certificate, which an ethics board may read, still gives the state of the backups as a code.
+- **FR-771:** whether a Zotero import's own requests to Zotero stop when its project is locked; to be checked.
+- **FR-772:** on the Capture screen, a connection that opens and closes at once is tried again every second without the screen ever saying it is lost. Only a broken engine does that; to be checked.
+- **Held-file cards disappear for the moment a list is read again**, and their notes are announced a second time. Keeping them in place would change an order of focus that was ruled earlier; left as untidy.
+- **FR-760, a remainder:** after an upgrade from an older build, two move destinations whose folders have the same name can still be confused at the first check; the later checks refuse. Accepted.
+
+Waiting for you: the design for whole channels with automatic transcription (its one question), and the two decisions of part 15.
