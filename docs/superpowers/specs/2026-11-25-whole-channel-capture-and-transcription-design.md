@@ -1,8 +1,8 @@
 # Whole channels, transcribed without watching over them — design
 
-Written 25 November 2026 for the project's owner, who asked: "how long until I can start downloading YouTube channels in full and transcribing them automatically?" and then "Yes write the design please." Nothing here is built until the owner approves this page.
+Written 25 November 2026 for the project's owner, who asked: "how long until I can start downloading YouTube channels in full and transcribing them automatically?" and then "Yes write the design please." **Approved by the owner on 26 November 2026**, with two directions that are worked in below: "For the whole channel design just throw an error on any that don't download and continue down the line. Leave a button to resume any downloads that didn't complete". Where the page changed because of them, it says "(owner, 26 November)".
 
-A fresh reader checked this page against the code before it was handed over. That check corrected four statements about what exists today, and raised one question that only the owner can answer; it is under "One question for you".
+A fresh reader checked this page against the code before it was handed over. That check corrected four statements about what exists today, and raised one question that only the owner could answer; the owner has answered it (see "The owner's answer").
 
 ## What this is for
 
@@ -15,9 +15,10 @@ Most of this exists already (see "What exists today"). This design closes the ga
 1. **See before you start:** how many videos, how many hours, roughly how much disk, roughly how long.
 2. **Choose the quality**, including "audio only" for people who want only the transcripts.
 3. **Never fill the disk.**
-4. **Lose nothing to a quit, a restart or a sleep.** Transcription carries on by itself. Downloading carries on by itself after a sleep, and with one click after a quit (see "One question for you").
-5. **Transcribe everything without being asked each time**, for a new capture and for what is already in the library.
-6. **Always show where it is** and how long is left, from the speed measured on this Mac.
+4. **Lose nothing to a quit, a restart or a sleep.** Transcription carries on by itself. Downloading carries on by itself after a sleep, and with one click on "Resume downloads" after a quit (owner, 26 November).
+5. **One video that cannot be downloaded never stops the rest** (owner, 26 November): it gets an error on its own line, the run goes on down the list, and one button tries again whatever did not complete.
+6. **Transcribe everything without being asked each time**, for a new capture and for what is already in the library.
+7. **Always show where it is** and how long is left, from the speed measured on this Mac.
 
 ## Not in this piece
 
@@ -43,7 +44,7 @@ Most of this exists already (see "What exists today"). This design closes the ga
 - Unfinished transcriptions are already written to the app's sealed record of jobs and carry on when the library is opened or a project is unlocked.
 - The engine already understands "best", "up to 1080p" and "up to 720p"; the screen offers no such choice.
 - ffmpeg, the tool that joins the best picture and sound into one file, is not part of the app: the researcher installs it from the Optional tools screen ("Video tools").
-- **Gaps:** no count, size or disk check before starting; no quality choice on the screen, no "audio only", and ffmpeg is not handed to the downloader even when it is installed, so the file saved is probably a low-quality one (read from the code, not yet run); the list of downloads still to do lives only in memory, and a standing rule marks a download cut by a quit as failed, never to be resumed (see the question below); the Capture screen can follow "the project's setting" for transcription, but no screen lets you set it; nothing transcribes sources already in the library in bulk; transcription speed on a Mac was never measured.
+- **Gaps:** no count, size or disk check before starting; no quality choice on the screen, no "audio only", and ffmpeg is not handed to the downloader even when it is installed, so the file saved is probably a low-quality one (read from the code, not yet run); the list of downloads still to do lives only in memory, and a standing rule marks a download cut by a quit as failed, never to be resumed (amended by the owner's answer below); the Capture screen can follow "the project's setting" for transcription, but no screen lets you set it; nothing transcribes sources already in the library in bulk; transcription speed on a Mac was never measured.
 
 ## Approaches considered
 
@@ -87,17 +88,19 @@ The four choices above. The downloader is given the installed ffmpeg, which it n
 
 ### 3. The disk
 
-Before each download the app checks the free space. When less than 10 GB would be left, downloading pauses and says: "Paused: the disk is nearly full. Free some space, then press Continue." Nothing half-written is left behind; the video in hand is finished or removed.
+Before each download the app checks the free space. When less than 10 GB would be left, downloading pauses and says: "Paused: the disk is nearly full. Free some space, then press Resume downloads." Nothing half-written is left behind; the video in hand is finished or removed.
 
 ### 4. Two lists that survive a quit
 
 - **Downloads** for a project run one at a time, with a short wait between videos so that YouTube is asked gently.
-- **When YouTube says "slow down":** the existing waits of 1, 2 and 4 minutes stay. After them the run no longer simply pauses for good: it waits longer and tries again by itself — 15 minutes, 30 minutes, 1 hour, then every 2 hours — and says so on its line. After 12 hours without success it pauses until you press Continue.
+- **A video that cannot be downloaded** (owner, 26 November) — removed, private, not available in your country, needing a sign-in the app does not have, or a failure that is still there after the downloader's own few tries: its line gets the error, in plain words with the platform's own reason where there is one, and the run goes straight on to the next video. It is not tried again by itself. Nothing half-downloaded is kept for it.
+- **"Resume downloads"** (owner, 26 November): one button on the run's line, there for as long as anything in the run did not complete. It does both things at once: it carries on with the videos not yet reached (after a quit, a Stop or a pause), and it tries again the ones that ended in an error. It says how many: "Resume downloads (14 did not complete)". Videos that fail again keep their error and the button stays. Each press is recorded as your decision, and the project's rules are asked again as they stand at that moment.
+- **When YouTube says "slow down"** this is not a failure of one video — it is the whole connection, and going on down the list would only make YouTube block harder. So the run waits instead: the existing waits of 1, 2 and 4 minutes stay, and after them the run no longer simply pauses for good: it waits longer and tries again by itself — 15 minutes, 30 minutes, 1 hour, then every 2 hours — and says so on its line. After 12 hours without success it pauses until you press Resume downloads.
 - **Transcriptions** run one at a time: the Mac's processor is the limit.
 - Both lists are written to the app's sealed record of jobs as they go.
 - **After a sleep** the app is still running: both lists carry on by themselves when the Mac wakes.
-- **After a quit or a restart:** transcriptions carry on by themselves, as they already do today (nothing leaves the Mac). Downloads do not start by themselves: the app shows "The capture of 'Example Channel' was interrupted: 120 of 412 done." with **Continue** and **Discard**. One click carries on where it stopped; the click is recorded as your decision, and the project's rules are asked again as they stand now. This is the recommended answer to the question below.
-- **Pause** (either list) finishes the item in hand and waits; it stays paused across a quit until you press Continue. **Stop** on the downloads ends the run: what was downloaded stays in the library, and its transcriptions stay on their list; capturing the same channel again later takes what is missing. **Stop** on the transcriptions empties that list; the sources stay, without transcripts, and "Transcribe everything without a transcript" can fill it again.
+- **After a quit or a restart:** transcriptions carry on by themselves, as they already do today (nothing leaves the Mac). Downloads do not start by themselves (owner, 26 November): the app shows "The capture of 'Example Channel' was interrupted: 120 of 412 done." with **Resume downloads** and **Discard**. One click carries on where it stopped, and tries again any that had failed; the click is recorded as your decision, and the project's rules are asked again as they stand now. **Discard** takes the run off the screen; what was downloaded stays in the library.
+- **Pause** (either list) finishes the item in hand and waits; it stays paused across a quit until you press Resume downloads (for the transcriptions: Continue). **Stop** on the downloads ends the run: what was downloaded stays in the library, and its transcriptions stay on their list; capturing the same channel again later takes what is missing. **Stop** on the transcriptions empties that list; the sources stay, without transcripts, and "Transcribe everything without a transcript" can fill it again.
 - A single pasted link is captured and transcribed as today, at once; the lists are for runs of many.
 - Locking a project stops both lists for that project at once, and nothing more is asked of any service for it; unlocking lets them carry on.
 - Each video and each transcript is recorded exactly as one captured or transcribed by hand is today.
@@ -115,33 +118,49 @@ On the Capture screen, and as one line wherever the project is open:
 ```
 Downloading "Example Channel": 120 of 412           [ Pause ]  [ Stop ]
   waiting 2 minutes — YouTube asked to slow down
+  3 could not be downloaded                          [ Show them ]
 Transcribing: 14 of 412 — "Title of the video"      [ Pause ]  [ Stop ]
   about 6 days left at this Mac's speed (4 minutes of sound per minute)
 ```
 
 The time left comes from what this Mac has actually done so far, never from a table. Before the first transcript is finished the line says "measuring…".
 
+When the run has gone down the whole list (owner, 26 November):
+
+```
+"Example Channel": 398 of 412 downloaded. 14 could not be downloaded.
+                              [ Show them ]  [ Resume downloads (14 did not complete) ]
+```
+
+"Show them" lists each one with its title, its address and its reason, for example "This video is private." or "The connection was lost three times." The list can be copied. A run in which everything completed says so and has no button.
+
 ### 7. Keeping the Mac awake
 
 While either list is running, the app asks the Mac not to go to sleep by itself (the screen may still switch off). A switch in the settings turns this off. Closing the lid still sleeps the Mac; the lists carry on when it wakes. This part can only be checked on a real Mac.
 
-## One question for you
+## The owner's answer (26 November 2026)
 
-**After the app was quit in the middle of a channel, may it start downloading again by itself when you next open the library — or should it wait for one click?**
+The question was: after the app was quit in the middle of a channel, may it start downloading again by itself, or should it wait for one click?
 
-A standing rule of the project says a download cut by a quit is never resumed, because the decision to capture was made, and recorded, by a person at the screen. Two ways to keep faith with that:
+The owner's words: "For the whole channel design just throw an error on any that don't download and continue down the line. Leave a button to resume any downloads that didn't complete".
 
-- **One click (what this page describes, and what I recommend).** The app shows where it stopped and waits for Continue. Nothing goes out to YouTube that you did not just ask for — which matters if the Mac is opened on another network, at a border, or with the VPN off. The cost is one click after a quit. A sleep costs nothing: the app was never closed.
-- **By itself.** The original decision is kept in the sealed record; at opening the app asks the project's rules again, records "continued after a restart", and carries on with nobody at the screen. Truly unattended, also across a restart of the Mac. A run that uses your browser's sign-in would still wait for a click.
+So:
 
-Either can be built. The second can also be added later as a switch that is off until you turn it on.
+- **One click, not by itself.** Nothing goes out to YouTube that the researcher did not just ask for. The button is "Resume downloads".
+- **The same button covers every download that did not complete**, whatever the reason: a quit, a Stop, a pause, a full disk, a video that ended in an error.
+- **A failed video never holds up the rest.**
+
+A standing rule of the project (ruling R41, point I3) said a download cut by a quit is never resumed. It is amended by this answer (ruling R668): it is never resumed *by itself*; a person's press of "Resume downloads" continues it, recorded as a new decision, with the project's rules asked again. Continuing by itself across a restart is not built; it can be added later as a switch that is off until turned on.
 
 ## My calls, for you to correct
 
 - Quality starts at **Up to 720p**: a watchable copy at about half the disk of 1080p.
 - One download and one transcription at a time.
 - The disk floor is **10 GB**.
-- After a quit, transcriptions carry on by themselves and downloads wait for one click (the question above).
+- After a quit, transcriptions carry on by themselves and downloads wait for one click (the owner's answer above).
+- A "slow down" from YouTube is treated as the connection's problem, not one video's: the run waits, as described, and does not go on down the list failing every video. If you would rather it simply paused at once and left the rest to the button, say so.
+- A video that ends in an error is not tried again by itself, not even once at the end of the run; only the button does that.
+- "Resume downloads" stays on the run's line across quits, until everything completed or you press Discard.
 - When YouTube says "slow down", the run keeps trying by itself at growing intervals for 12 hours before it pauses for good.
 - Without "Video tools" the capture still starts, at the lower quality, and says so.
 - The automatic-transcription switch covers captures, not imported files; "Transcribe everything without a transcript" covers those by hand.
@@ -156,11 +175,11 @@ The exact layout; how the two lists are stored within the existing job record; t
 
 ## How it will be checked
 
-- Tests for each part, written first: the estimate, each quality with and without Video tools, the disk floor, the growing waits, carrying on after a quit (transcriptions by themselves, downloads at one click), a pause that stays paused, both Stops, a lock that stops both lists, automatic transcription, the measured time left.
+- Tests for each part, written first: the estimate, each quality with and without Video tools, the disk floor, the growing waits, a video that fails and the run going on past it, "Resume downloads" for the ones that failed and for the ones not reached, carrying on after a quit (transcriptions by themselves, downloads at one click), a pause that stays paused, both Stops, a lock that stops both lists, automatic transcription, the measured time left.
 - A browser scenario from pasting a channel to the last transcript, against a stand-in for YouTube.
 - An independent review, then the full test run and a Mac build.
-- **On your Mac:** a small real channel end to end; quitting in the middle and opening again; one video at each quality; leaving it running with the screen off.
+- **On your Mac:** a small real channel end to end; quitting in the middle, opening again and pressing "Resume downloads"; a list with one address that does not exist, to see its error and the run going on; one video at each quality; leaving it running with the screen off.
 
 ## Size
 
-About two days of building and review, then a Mac build (GitHub gives Mac machines in the evening). If approved on 25 November: a Mac build on the evening of Thursday 26 November at the earliest, Friday 27 November more likely.
+About two days of building and review, then a Mac build (GitHub gives Mac machines in the evening). Approved early on the morning of Thursday 26 November: a Mac build on the evening of Friday 27 November at the earliest, Saturday 28 November more likely.
