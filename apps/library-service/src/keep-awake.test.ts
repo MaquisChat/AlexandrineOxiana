@@ -142,6 +142,40 @@ describe("KeepAwake when caffeinate fails (R692)", () => {
   });
 });
 
+describe("KeepAwake after two quick deaths (R693)", () => {
+  it("is tried again at the first update at least 60 seconds after the last failure, while still wanted", () => {
+    const warned: string[] = [];
+    let now = 1_000_000;
+    const sp = fakeSpawn();
+    const k = new KeepAwake({ platform: "darwin", spawn: sp.fn, pid: 1, log: { warn: (_o, m) => warned.push(m ?? "") }, now: () => now });
+    k.update(true);
+    now += 2_000;
+    sp.children[0]!.emit("exit", 1, null); // dies quickly
+    now += 2_000;
+    k.update(false);
+    k.update(true);
+    now += 2_000;
+    sp.children[1]!.emit("exit", 1, null); // and again
+    expect(sp.calls).toHaveLength(2);
+    now += 5_000;
+    k.update(true); // 5 s later: not yet
+    expect(sp.calls).toHaveLength(2);
+    now += 56_000;
+    k.update(true); // 61 s after the last failure
+    expect(sp.calls).toHaveLength(3);
+    k.update(true);
+    expect(sp.calls).toHaveLength(3); // at most one process
+    expect(warned).toEqual(["keeping the Mac awake stopped", "keeping the Mac awake stopped"]);
+    // A start that fails is tried again the same way, logged once per failure.
+    sp.children[2]!.emit("error", new Error("ENOENT"));
+    k.update(true);
+    now += 60_000;
+    k.update(true);
+    expect(sp.calls).toHaveLength(4);
+    expect(warned).toHaveLength(3);
+  });
+});
+
 describe("keeping awake in the service", () => {
   let tmp: string;
   let svc: LibraryService | undefined;

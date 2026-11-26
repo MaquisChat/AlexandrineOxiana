@@ -196,6 +196,8 @@ export class TranscriptionListRunner {
     }
     this.failedOnce.delete(projectId);
     try {
+      // A Stop that emptied the list meanwhile: it stays as the Stop left it (R693).
+      if ((await readTranscriptionList(s.repo, projectId)).pending.length === 0) return;
       await setTranscriptionListState(s.repo, projectId, "paused", { stalled: true });
     } catch (err) {
       this.state.opts.log.warn({ err: this.state.describe(err) }, "transcription-list could not be paused");

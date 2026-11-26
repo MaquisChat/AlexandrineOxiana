@@ -204,7 +204,7 @@ const ENDED: ReadonlySet<JobStatus> = new Set(["done", "failed", "cancelled"]);
  * cancelled) never moves again: any call that would move it out of its ended state writes nothing and returns
  * false (R672: a Stop that came between the start of an entry's job and this mark, the caller then cancels the
  * job it started; R692: a Stop that landed just as the job ended, so the list stays empty with its counters at
- * 0). Marking an ended entry with the status it already has writes nothing and returns true. An entry no longer in the journal (dropped by compaction after a Stop) is treated
+ * 0). Any mark of an ended entry, even with the status it already has, writes nothing and returns false (R693). An entry no longer in the journal (dropped by compaction after a Stop) is treated
  * the same: nothing is written and false is returned (R676). Every other move returns true.
  */
 export async function markTranscriptionEntry(
@@ -224,7 +224,7 @@ export async function markTranscriptionEntry(
       return [];
     }
     if (ENDED.has(old.status)) {
-      moves = next.status === old.status;
+      moves = false;
       return [];
     }
     const at = repoClock(repo)().toISOString();

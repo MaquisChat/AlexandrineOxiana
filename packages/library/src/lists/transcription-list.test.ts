@@ -144,6 +144,11 @@ describe("the transcription list", () => {
     const [eb] = (await readTranscriptionList(kit.repo, p.id)).pending;
     await markTranscriptionEntry(kit.repo, p.id, eb!.entryId, { status: "done" });
     expect(await markTranscriptionEntry(kit.repo, p.id, eb!.entryId, { status: "failed", error: "WORKER_FAILED" })).toBe(false);
+    // R693: a mark with the status it already has is refused too, and writes nothing.
+    const folder = kit.repo.getProject(p.id).folder;
+    const before = await readFile(journalPath(kit.lib.root, folder));
+    expect(await markTranscriptionEntry(kit.repo, p.id, eb!.entryId, { status: "done" })).toBe(false);
+    expect(await readFile(journalPath(kit.lib.root, folder))).toEqual(before);
     expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ total: 1, done: 1, failed: 0 });
   });
 

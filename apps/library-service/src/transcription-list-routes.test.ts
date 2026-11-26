@@ -609,6 +609,32 @@ describe("the transcription list", () => {
     expect((await list(pid)).stalled).toBeUndefined();
   });
 
+  it("a Stop that empties the list as its retry fails leaves it as the Stop left it, not paused (R693)", async () => {
+    worker = await stubWorker();
+    const timers: Array<() => void> = [];
+    await start({ transcriptionListTimer: (fire) => (timers.push(fire), () => {}) });
+    await openLibrary();
+    const pid = await project();
+    await audioSource(pid, "One", 60);
+    const t = svc!.state.transcriptions;
+    let n = 0;
+    vi.spyOn(t, "start").mockImplementation(async () => {
+      if (++n === 2) expect((await listAct(pid, "stop")).status).toBe(200); // the Stop lands just before the second failure
+      throw new Error("the journal could not be written");
+    });
+    await transcribeAll(pid);
+    await svc!.state.idle();
+    expect(timers).toHaveLength(1);
+    timers[0]!();
+    await svc!.state.idle();
+    expect(n).toBe(2);
+    const shown = await list(pid);
+    expect(shown).toMatchObject({ state: "idle", total: 0, done: 0, failed: 0 });
+    expect(shown.stalled).toBeUndefined();
+    const rows = await readTranscriptionList(svc!.state.session!.repo, pid);
+    expect(rows).toEqual({ state: "running", total: 0, done: 0, failed: 0, pending: [] });
+  });
+
   it("a transcription started by hand at the very moment the list reaches its source is followed, then the list goes on (R692)", async () => {
     worker = await stubWorker();
     await start();
@@ -647,7 +673,7 @@ describe("the transcription list", () => {
     for (const sid of [one, two]) expect(await transcripts(pid, sid)).toBe(2);
   });
 
-  it("a lock that lands while the list starts a transcription leaves nothing of the project in memory (R692)", async () => {
+  it("a lock landing while a job is being started leaves no live job and no waiter of that project (R692, R693)", async () => {
     worker = await stubWorker();
     await start();
     await openLibrary();

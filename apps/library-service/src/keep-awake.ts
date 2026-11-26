@@ -8,12 +8,16 @@
  * R692 (M5): a caffeinate that fails to start is logged once, and tried again only at the next change (no longer
  * wanted, then wanted again), never at every publish. One that exits while still wanted is started again at once,
  * unless it had run less than RESTART_AFTER_MS: then it is logged and waits for the next change (no restart storm).
+ * R693: while still wanted, it is also tried again at the first update at least RETRY_AFTER_MS after the last
+ * failure, so a run of days is not left without it.
  */
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 
 export const CAFFEINATE = "/usr/bin/caffeinate";
 /** A caffeinate that ran at least this long before it exited is started again at once. */
 export const RESTART_AFTER_MS = 10_000;
+/** After a failure, while still wanted, it is tried again at the first update at least this long after (R693). */
+export const RETRY_AFTER_MS = 60_000;
 
 export class KeepAwake {
   private readonly platform: NodeJS.Platform;
@@ -25,6 +29,7 @@ export class KeepAwake {
   private wanted = false;
   /** Failed (to start, or died soon after): nothing is tried until wanted changes. */
   private held = false;
+  private failedAt = 0;
 
   constructor(opts: { platform?: NodeJS.Platform; spawn?: typeof nodeSpawn; pid?: number; log?: { warn(o: object, msg?: string): void }; now?: () => number } = {}) {
     this.platform = opts.platform ?? process.platform;
@@ -44,6 +49,7 @@ export class KeepAwake {
     if (this.platform !== "darwin") return;
     this.wanted = wanted;
     if (!wanted) this.held = false; // a change: what failed may be tried again next time
+    else if (this.held && this.now() - this.failedAt >= RETRY_AFTER_MS) this.held = false;
     if (wanted && !this.child && !this.held) this.start();
     else if (!wanted && this.child) {
       const child = this.child;
@@ -89,6 +95,7 @@ export class KeepAwake {
 
   private failed(err: unknown, msg: string): void {
     this.held = true;
+    this.failedAt = this.now();
     this.log?.warn({ err: err instanceof Error ? err.message : err }, msg);
   }
 }

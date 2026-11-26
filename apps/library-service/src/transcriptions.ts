@@ -156,7 +156,9 @@ export class Transcriptions {
     const job = await transcriptionJob(s.repo, projectId, sourceId, params, { id, onStored: (st) => entry && this.stored(entry, st) });
     const key = this.key(projectId, sourceId);
     if (this.bySource.get(key) !== token) throw busyError(); // released meanwhile (a close, a lock)
-    // Locked meanwhile (R692 M4): nothing of the project is tracked or kept here.
+    // Locked meanwhile (R692 M4, R693): a second line of defence. The first is the lock route, which drops the
+    // reservation (forgetProject: the token check above throws busy), with the library refusing a locked project
+    // inside transcriptionJob; this re-check keeps nothing of the project tracked should either ever change.
     if (!s.repo.isUnlocked(projectId)) {
       this.bySource.delete(key);
       this.told(key, undefined);
