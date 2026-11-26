@@ -108,10 +108,14 @@ export type FakeTool = "yt-dlp" | "gallery-dl";
  * PYTHONPATH (through AO_WORKER_BIN, as the packaged app names its worker).
  */
 export interface FakeControl {
-  /** The synthetic profile the fake downloaders list and download (their FAKE_PROFILE_FILE); read at every run, so it can change between captures. */
+  /** The synthetic profile the fake downloaders list and download (their FAKE_PROFILE_FILE), or a list of them for fake yt-dlp (two channels at once); read at every run, so it can change between captures. */
   setProfile(profile: unknown): Promise<void>;
-  /** From now on every run of `tool` (but `--version`) waits before it starts, until `release(tool)`: a capture that is still running for as long as the test needs. */
-  hold(tool: FakeTool): Promise<void>;
+  /**
+   * From now on every run of `tool` (but `--version`) waits before it starts, until `release(tool)`: a capture that is
+   * still running for as long as the test needs. With `match`, only a run one of whose arguments contains it waits (one
+   * video of a channel, say), and every other run goes on.
+   */
+  hold(tool: FakeTool, match?: string): Promise<void>;
   release(tool: FakeTool): Promise<void>;
   /** Runs of `tool` waiting at the hold now. */
   held(tool: FakeTool): number;
@@ -280,7 +284,7 @@ function fakeWrapper(tool: FakeTool, control: string): string {
   return [
     "#!/usr/bin/env node",
     '"use strict";',
-    'const { appendFileSync, existsSync, rmSync, writeFileSync } = require("node:fs");',
+    'const { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } = require("node:fs");',
     'const { spawnSync } = require("node:child_process");',
     `const CONTROL = ${JSON.stringify(control)};`,
     `const TOOL = ${JSON.stringify(join(FAKE_TOOLS, tool))};`,
@@ -294,11 +298,21 @@ function fakeWrapper(tool: FakeTool, control: string): string {
     "  process.exit(r.status ?? 1);",
     "};",
     'const hold = CONTROL + "/hold-" + NAME;',
-    'if (!args.includes("--version") && existsSync(hold)) {',
+    "// The hold file holds what an argument must contain for this run to wait; empty, every run waits.",
+    "const holding = () => {",
+    "  let match;",
+    "  try {",
+    '    match = readFileSync(hold, "utf8");',
+    "  } catch {",
+    "    return false;",
+    "  }",
+    '  return match === "" || args.some((a) => a.includes(match));',
+    "};",
+    'if (!args.includes("--version") && holding()) {',
     '  const marker = CONTROL + "/held-" + NAME + "-" + process.pid;',
     "  writeFileSync(marker, JSON.stringify(args));",
     "  const timer = setInterval(() => {",
-    "    if (existsSync(hold)) return;",
+    "    if (holding()) return;",
     "    clearInterval(timer);",
     "    rmSync(marker, { force: true });",
     "    run();",
@@ -321,7 +335,7 @@ async function fakeControlFor(root: string): Promise<{ env: Record<string, strin
   }
   const control: FakeControl = {
     setProfile: (profile) => writeFile(join(dir, "profile.json"), JSON.stringify(profile)),
-    hold: (tool) => writeFile(join(dir, `hold-${tool}`), ""),
+    hold: (tool, match) => writeFile(join(dir, `hold-${tool}`), match ?? ""),
     release: (tool) => rm(join(dir, `hold-${tool}`), { force: true }),
     held: (tool) => readdirSync(dir).filter((n) => n.startsWith(`held-${tool}-`)).length,
     runs: (tool) => {

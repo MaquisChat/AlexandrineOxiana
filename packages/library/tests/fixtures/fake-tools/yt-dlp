@@ -40,9 +40,10 @@ if (mode === "notfound") {
 // writes `<id>.m4a` instead of `<id>.mp4`.
 // YouTube: `<channel>/videos` and `/shorts` list their tab (flat entries carry a truncated
 // description, as YouTube's listings do); the bare channel lists its tabs as nested playlists.
+// The file may hold one profile or a list of them (two channels at once); the first that knows the link answers.
 if (process.env.FAKE_PROFILE_FILE) {
-  const prof = JSON.parse(readFileSync(process.env.FAKE_PROFILE_FILE, "utf8"));
-  if (prof.platform !== "instagram") profileRun(prof);
+  const read = JSON.parse(readFileSync(process.env.FAKE_PROFILE_FILE, "utf8"));
+  for (const prof of Array.isArray(read) ? read : [read]) if (prof.platform !== "instagram") profileRun(prof);
 }
 
 function profileRun(prof) {
