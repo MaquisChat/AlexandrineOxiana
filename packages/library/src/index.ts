@@ -149,6 +149,19 @@ export type {
 } from "./worker-client.js";
 export { ResourceMissingError } from "./resources.js";
 
+// Whole-channel capture and transcription (R668, R669): the lists' records in the job journal.
+export { DISCARDED_CODE, LIST_KINDS, isListKind } from "./job-journal.js";
+export type { CaptureItemData, CaptureRunData, JobStatus, TranscriptionEntryData, TranscriptionListData } from "./job-journal.js";
+export {
+  createRun, discardRun, readRun, readRunItems, readRuns, recordRunItem, requeueFailedItems, setRunItems, setRunState,
+} from "./lists/run-journal.js";
+export type { RunItemView, RunView } from "./lists/run-journal.js";
+export {
+  TRANSCRIPTION_LIST_ID, addToTranscriptionList, markTranscriptionEntry, readTranscriptionList, setTranscriptionListState, soundSecondsOf,
+  stopTranscriptionList,
+} from "./lists/transcription-list.js";
+export type { TranscriptionEntryView, TranscriptionListView } from "./lists/transcription-list.js";
+
 export { classifyUrl, isCollectionLink, isPostLink } from "./capture/platforms.js";
 export type { ClassifiedUrl, LinkKind, Platform } from "./capture/platforms.js";
 export { AcknowledgementRequiredError, CaptureCancelledError, COOKIES_ACKNOWLEDGEMENT, incompleteReason, plainReason } from "./capture/errors.js";

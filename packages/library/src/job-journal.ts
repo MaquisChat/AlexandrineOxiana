@@ -86,7 +86,85 @@ export interface JobRecord {
    * reload or a restart. Older lines have none (they are read as before).
    */
   about?: JobAbout;
+  /** A `capture.run` record (R668, R669): one download run of a channel, playlist or profile. */
+  run?: CaptureRunData;
+  /** A `capture.item` record: one video (or post) of a run. Its id is `<runId>/<index>`. */
+  item?: CaptureItemData;
+  /** The `transcription.list` record: the project's transcription list (id `transcription-list`). */
+  list?: TranscriptionListData;
+  /** A `transcription.entry` record: one source on the transcription list. */
+  entry?: TranscriptionEntryData;
 }
+
+// ---- the lists (R668, R669) ------------------------------------------------------------------------
+
+/**
+ * The record kinds of the two lists of whole-channel capture: the download runs with their videos, and the
+ * transcription list with its entries. They live in the job journal beside the worker's jobs, sealed the same
+ * way, but they are not worker jobs: never pending (no resubmission, no cancel of a pending job), never cached
+ * as job rows. What they lead to (each stored video, each stored transcript) is governed and audited as ever.
+ */
+export const LIST_KINDS = ["capture.run", "capture.item", "transcription.list", "transcription.entry"] as const;
+const LIST_KIND_SET: ReadonlySet<string> = new Set(LIST_KINDS);
+
+export function isListKind(kind: string): boolean {
+  return LIST_KIND_SET.has(kind);
+}
+
+/**
+ * A download run. Its record's status is `running` while downloading or waiting, `done` when finished with no
+ * failure, `cancelled` (error DISCARDED) once discarded, and `queued` otherwise. "Interrupted" is never written:
+ * a run that says downloading or waiting and that no service holds is shown so.
+ */
+export interface CaptureRunData {
+  url: string;
+  title: string;
+  platform: "youtube" | "instagram" | "tiktok";
+  /** The run's options as given; checked with assertNoSecrets. */
+  options: Record<string, unknown>;
+  state: "queued" | "downloading" | "waiting" | "paused" | "paused-disk" | "paused-rate-limited" | "paused-tool" | "stopped" | "finished" | "failed";
+  total: number;
+  done: number;
+  failed: number;
+  wait?: { ms: number; why: "rate-limited" | "connection" };
+  tool?: string;
+  errorCode?: string;
+  reason?: string;
+  startedBy: "desktop";
+}
+
+/** One video (or post) of a run. Its record's status is queued (not reached, or to retry), running, done or failed. */
+export interface CaptureItemData {
+  runId: string;
+  index: number;
+  postId: string;
+  url: string;
+  title?: string;
+  durationSec?: number;
+  sourceId?: string;
+  errorCode?: string;
+  platformReason?: string;
+}
+
+/** The project's transcription list (its record's status is always queued). */
+export interface TranscriptionListData {
+  state: "running" | "paused";
+  total: number;
+  done: number;
+  failed: number;
+}
+
+/** One source on the transcription list. Its record's status is queued, running, done, failed or cancelled. */
+export interface TranscriptionEntryData {
+  sourceId: string;
+  model: string;
+  jobId?: string;
+  soundSec?: number;
+  title?: string;
+}
+
+/** The error of a run the researcher discarded. */
+export const DISCARDED_CODE = "DISCARDED";
 
 /** What a job is for (see JobRecord.about): ids and a model name only, nothing identifying. */
 export interface JobAbout {
@@ -289,6 +367,7 @@ export async function appendJobRecords(root: string, projectRel: string, key: Pr
 
 /** The append itself; callers hold the file's turn in `serialize`. */
 async function appendNow(root: string, projectRel: string, key: ProjectKey, recs: JobRecord[]): Promise<void> {
+  if (recs.length === 0) return;
   const text = recs.map((r) => `${encode(r, key)}\n`).join("");
   const path = await prepare(root, projectRel);
   const torn = await incompleteTail(path);
@@ -333,6 +412,30 @@ export async function appendNewJobRecord(root: string, projectRel: string, key: 
   });
 }
 
+/**
+ * Reads the journal, asks `fn` for the records to append, and appends them, all in the file's turn: of two
+ * calls at once, the second reads what the first appended. Returns the records as they stand after the append
+ * (newest per id). `fn` may throw: nothing is appended then. Callers check that the library is writable.
+ */
+export async function updateJobRecords(
+  root: string,
+  projectRel: string,
+  projectId: string,
+  key: ProjectKey,
+  fn: (records: ReadonlyMap<string, JobRecord>) => JobRecord[],
+): Promise<ReadonlyMap<string, JobRecord>> {
+  return serialize(journalPath(root, projectRel), async () => {
+    const records = (await readJobJournal(root, projectRel, projectId, key)).records;
+    const next = fn(records);
+    await appendNow(root, projectRel, key, next);
+    for (const r of next) {
+      records.delete(r.id);
+      records.set(r.id, r);
+    }
+    return records;
+  });
+}
+
 /** Lines beyond which a journal is compacted. */
 const COMPACT_MIN_LINES = 64;
 /** R142: succeeded (done) jobs are dropped at compaction once older than this many days ... */
@@ -344,19 +447,31 @@ export const MAX_FAILED_KEPT = 500;
 
 /** A record that will run again: unfinished, or cancelled because its project was locked before it started (R142). */
 export function isPending(r: JobRecord): boolean {
+  if (isListKind(r.kind)) return false; // the lists' records are not worker jobs: nothing resubmits them
   return UNFINISHED.has(r.status) || (r.status === "cancelled" && r.error === LOCKED_CODE && r.job !== undefined);
 }
 
-/** The ids compaction drops (R142): see the constants above. Pending records are never dropped. */
+/**
+ * The ids compaction drops (R142): see the constants above. Pending records are never dropped. The lists'
+ * records: a `capture.item` is dropped exactly when its run's record is absent, done, or discarded (the age and
+ * count rules never apply to items, so a live run keeps every video); the `transcription.list` record is never
+ * dropped; runs and transcription entries follow the rules of finished jobs.
+ */
 function prunable(records: Map<string, JobRecord>, now: number): Set<string> {
   const drop = new Set<string>();
   const newestFirst = (a: JobRecord, b: JobRecord) => (a.updatedAt === b.updatedAt ? 0 : a.updatedAt < b.updatedAt ? 1 : -1);
-  const done = [...records.values()].filter((r) => r.status === "done").sort(newestFirst);
+  const all = [...records.values()].filter((r) => r.kind !== "capture.item" && r.kind !== "transcription.list");
+  for (const r of records.values()) {
+    if (r.kind !== "capture.item") continue;
+    const run = r.item ? records.get(r.item.runId) : undefined;
+    if (!run || run.kind !== "capture.run" || run.status === "done" || (run.status === "cancelled" && run.error === DISCARDED_CODE)) drop.add(r.id);
+  }
+  const done = all.filter((r) => r.status === "done").sort(newestFirst);
   const oldest = new Date(now - SUCCEEDED_MAX_AGE_DAYS * 86_400_000).toISOString();
   done.forEach((r, i) => {
     if (i >= MAX_SUCCEEDED_KEPT || r.updatedAt < oldest) drop.add(r.id);
   });
-  const failed = [...records.values()].filter((r) => (r.status === "failed" || r.status === "cancelled") && !isPending(r)).sort(newestFirst);
+  const failed = all.filter((r) => (r.status === "failed" || r.status === "cancelled") && !isPending(r)).sort(newestFirst);
   failed.slice(MAX_FAILED_KEPT).forEach((r) => drop.add(r.id));
   return drop;
 }
@@ -437,8 +552,9 @@ export async function refreshJobRows(
 
 // ---- the cache -----------------------------------------------------------------------------------
 
-/** Writes a job's cache row from its record (nothing identifying: see the module comment). */
+/** Writes a job's cache row from its record (nothing identifying: see the module comment). The lists' records have none. */
 export function upsertJobRow(db: IndexDb, rec: JobRecord): void {
+  if (isListKind(rec.kind)) return;
   db.prepare(
     `INSERT INTO jobs (id, project_id, kind, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET project_id = excluded.project_id, kind = excluded.kind, status = excluded.status,
@@ -446,11 +562,12 @@ export function upsertJobRow(db: IndexDb, rec: JobRecord): void {
   ).run(rec.id, rec.projectId, rec.kind, rec.status, rec.error ? JSON.stringify({ error: rec.error }) : "{}", rec.createdAt);
 }
 
-/** Makes the project's job rows match its journal (the file wins). */
+/** Makes the project's job rows match its journal (the file wins). The lists' records are never cached. */
 export function syncJobRows(db: IndexDb, projectId: string, records: Iterable<JobRecord>): void {
   db.transaction(() => {
     const seen = new Set<string>();
     for (const r of records) {
+      if (isListKind(r.kind)) continue;
       upsertJobRow(db, r);
       seen.add(r.id);
     }
