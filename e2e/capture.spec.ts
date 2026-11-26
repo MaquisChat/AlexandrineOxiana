@@ -332,6 +332,11 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
     const EDITED = "The traders open their stalls before dawn.";
     let human: { id: string; text: string } | undefined;
     await test.step("edit the flagged segment and save: a version edited by a person is listed, its changed segment marked not checked; the machine version is kept", async () => {
+      // The recording's player first tries, renews, and then says that it cannot play the fake recording. Each of
+      // those changes the height of the Recording region and so moves the segments below it. A click that falls
+      // between two of them loses its `click` event (the pointer goes down on the button and up on another
+      // element). So the player's resting state is waited for first (R696; the page's own jump is listed as FR-775).
+      await expect(page.getByRole("region", { name: "Recording" }).getByRole("button", { name: "Try the recording again" })).toBeVisible();
       await page.getByRole("button", { name: "Edit segment at 0:06" }).click();
       await page.getByRole("textbox", { name: "Text of the segment at 0:06" }).fill(EDITED);
       await page.getByRole("button", { name: "Done", exact: true }).click();
