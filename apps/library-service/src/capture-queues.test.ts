@@ -175,7 +175,9 @@ describe("GET /projects/:id/captures and /captures/:queueId", () => {
     expect(d.finished).toBe(true);
     expect(d.urls).toBeUndefined();
     expect(d.report).toBeDefined();
-    expect(d.report!.status).toBe("failed");
+    // A profile run is a download run now (whole channels, Task 5): a missing tool pauses it, naming the tool,
+    // rather than failing it (Review Focus 3); Resume downloads takes it up once the tool is installed.
+    expect(d.report!.status).toBe("paused-tool");
     expect(d.report).toMatchObject({ errorCode: "TOOL_NOT_INSTALLED", tool: "video-downloader" });
     expect(typeof d.report!.reason).toBe("string");
     expect(d.report).not.toHaveProperty("items");

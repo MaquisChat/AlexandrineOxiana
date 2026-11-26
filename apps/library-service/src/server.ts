@@ -20,6 +20,7 @@ import { registerAppearance } from "./routes/appearance.js";
 import { registerAudit } from "./routes/audit.js";
 import { registerLibraryAudit } from "./routes/library-audit.js";
 import { registerCapture } from "./routes/capture.js";
+import { registerDownloads } from "./routes/downloads.js";
 import { registerCitations } from "./routes/citations.js";
 import { isDocumentPreflight, registerDocuments } from "./routes/documents.js";
 import { registerFieldwork } from "./routes/fieldwork.js";
@@ -100,6 +101,10 @@ export interface ServiceOptions {
   browserStallMs?: number;
   /** Test seam (NODE_ENV=test or VITEST only, R47): how long after the ticket's check the browser's PDF must have ended (default FIND_BROWSER_TAKE_MS; R353 a). */
   browserTakeMs?: number;
+  /** Test seam (only when NODE_ENV is exactly "test", R47): the download runs' sleep (the gap between downloads and every wait). */
+  downloadSleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Test seam (only when NODE_ENV is exactly "test", R47): the download runs' reading of the free space (main.ts: AO_TEST_FREE_BYTES). */
+  downloadFreeBytes?: (dir: string) => Promise<number | null>;
 }
 
 export interface LibraryService {
@@ -149,6 +154,13 @@ const OPEN_ROUTES = new Set(["POST /extension/pair/confirm"]);
 /** Log redaction (R96): credentials never reach the log, whatever object carries them. */
 const REDACT = ["authorization", "secret", "passphrase", "recoveryCode", "apiKey", "token", "code", "cookie", "ticket", "link"].flatMap((k) => [k, `*.${k}`, `*.*.${k}`, `req.headers.${k}`]);
 
+/** The download runs' test seams, honoured only when NODE_ENV is exactly "test" (R47, R687 D). */
+function downloadSeams(opts: ServiceOptions): { downloads?: { sleep?: ServiceOptions["downloadSleep"]; freeBytes?: ServiceOptions["downloadFreeBytes"] } } {
+  const testing = process.env.NODE_ENV === "test";
+  if (!testing || (!opts.downloadSleep && !opts.downloadFreeBytes)) return {};
+  return { downloads: { ...(opts.downloadSleep ? { sleep: opts.downloadSleep } : {}), ...(opts.downloadFreeBytes ? { freeBytes: opts.downloadFreeBytes } : {}) } };
+}
+
 export async function createService(opts: ServiceOptions): Promise<LibraryService> {
   const deps = opts.deps ?? deviceDeps(appConfigDir());
   // A notice raised while this device's identity was read (Task 68) is written before the first state.
@@ -192,6 +204,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     ...(opts.closeGraceMs !== undefined ? { closeGraceMs: opts.closeGraceMs } : {}),
     ...(opts.rebuildIndexIfNeeded ? { rebuildIndexIfNeeded: opts.rebuildIndexIfNeeded } : {}),
     ...(opts.startupTimer ? { startupTimer: opts.startupTimer } : {}),
+    ...downloadSeams(opts),
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },
   });
   const pairing = new Pairing(deps.appConfigDir, opts.pairing);
@@ -350,6 +363,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerSources(app, ctx);
   registerAnnotations(app, ctx);
   registerCapture(app, ctx);
+  registerDownloads(app, ctx);
   registerImport(app, ctx);
   registerReview(app, ctx);
   registerGovernance(app, ctx);

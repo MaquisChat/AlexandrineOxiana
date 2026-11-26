@@ -84,7 +84,7 @@ import {
   MoveNotAllowedError,
   MoveFinishRefusedError,
 } from "@ao/library";
-import type { CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent, IncompleteRollback } from "@ao/shared";
+import type { BackgroundProgressEvent, CaptureQueueProgressEvent, CaptureStartedBy, DestructionOldCopiesPending, DestructionOldCopiesState, DestructionOldCopy, DeviceNotice, FindProgressEvent, IncompleteRollback } from "@ao/shared";
 import { DESTRUCTION_OLD_COPIES_PENDING_WARNING, oldCopiesPendingText } from "@ao/shared";
 import { AppSettingUnreadableError, forgetSensitiveIfLocked, readDeviceNotices } from "@ao/library";
 
@@ -95,6 +95,7 @@ import { MediaTickets } from "./media.js";
 import { ZoteroSyncHolder } from "./routes/zotero-sync.js";
 import { readFindScreen } from "./find-screen.js";
 import { Transcriptions } from "./transcriptions.js";
+import { DownloadRunner, type DownloadSeams } from "./downloads.js";
 
 /** A running media worker, shared by every library the service opens. */
 export interface ServiceWorker {
@@ -267,6 +268,8 @@ export interface StateOptions {
   startupTimer?: (fire: () => void, ms: number) => () => void;
   /** Test seam: the tick of the automatic Zotero sync's scheduler (Task Z10; default 60,000 ms). Not an environment variable. */
   zoteroTickMs?: number;
+  /** Test seams (honoured only when NODE_ENV is exactly "test", R47): the download runs' sleep and free-space reading. */
+  downloads?: DownloadSeams;
 }
 
 /** An entry's key for the look-ups under way. */
@@ -322,6 +325,11 @@ export interface WorkControl {
   interrupt?: () => void;
   /** A rerun of pending jobs (`worker-resume`) whose job in hand is a transcription (R466 I1): a move stops it as it stops one. */
   transcribing?: boolean;
+  /**
+   * Told when `stopping` is set by a move's drain (whole channels, R680): work that sleeps for long (a download
+   * run's gap or a two-hour wait) wakes at once instead of being found only at its next check.
+   */
+  onStopping?: () => void;
 }
 
 /** A transcription running now, whatever started it: one asked for here, or a rerun of a pending one (R466 I1). */
@@ -363,6 +371,35 @@ export class ServiceState {
   readonly transcriptions = new Transcriptions(this);
   /** Zotero account sync (Task Z8): the one run in progress, its abort and the back-off; stopped (with its record) before batches are suspended at a close or move. */
   readonly zoteroSync = new ZoteroSyncHolder();
+  private downloadRunner: DownloadRunner | undefined;
+  /** The download runs this service holds (whole channels, R668, R669). */
+  get downloads(): DownloadRunner {
+    return (this.downloadRunner ??= new DownloadRunner(this));
+  }
+  /** Told after every `background.progress` event (Task 7 keeps the Mac awake from here). */
+  readonly onBackground: Array<() => void> = [];
+
+  /**
+   * Publishes a `background.progress` event, only while the project is unlocked: nothing of a locked project's
+   * work goes out (R30, R50).
+   */
+  publishBackground(projectId: string, payload: Omit<BackgroundProgressEvent, "projectId">): void {
+    const s = this.session;
+    if (!s) return;
+    try {
+      if (!s.repo.isUnlocked(projectId)) return;
+    } catch {
+      return; // not a project of this library
+    }
+    this.events.publish("background.progress", { projectId, ...payload } satisfies BackgroundProgressEvent);
+    for (const fn of [...this.onBackground]) {
+      try {
+        fn();
+      } catch {
+        // one listener's failure never stops the others
+      }
+    }
+  }
   private worker: ServiceWorker | undefined;
   private workerStarting: Promise<ServiceWorker> | undefined;
   private readonly tasks = new Set<Promise<unknown>>();
@@ -501,10 +538,16 @@ export class ServiceState {
     return [...this.work.values()].map((w) => w.kind);
   }
 
+  /** How many continuations of work stopped for a move are kept, waiting for their library (diagnostics, tests). */
+  stoppedWorkCount(): number {
+    return this.stoppedWork.length;
+  }
+
   /** Asks every registered item (those `which` selects) to stop between items and waits for all to end; false if one did not in time. */
   async drainWork(timeoutMs: number, which: (w: { kind: string; ctl: WorkControl }) => boolean = () => true): Promise<boolean> {
     const items = [...this.work.values()].filter(which);
     for (const w of items) w.ctl.stopping = true;
+    for (const w of items) w.ctl.onStopping?.();
     const all = Promise.allSettled(items.map((w) => w.done)).then(() => true);
     const ok = (await withTimeout(all, timeoutMs).catch(() => undefined)) === true;
     if (!ok) for (const w of items) w.ctl.stopping = false; // rolled back: the rest carries on
@@ -1447,6 +1490,8 @@ export class ServiceState {
     this.session = undefined;
     // An encrypted project's capture queues go with its key (R30, R50); a plain project's stay readable.
     for (const p of s.repo.listProjects()) if (p.encryption.enabled) this.endCaptures(p.id, "close");
+    // Every download run ends here and writes nothing more; nothing continues by itself after a quit (R668).
+    for (const p of s.repo.listProjects()) this.downloads.stopProject(p.id, "close");
     // Find and acquire stops for good, awaited (bounded): its own work and the researcher's acts already in their store
     // turn end first, and any act still waiting for its turn is refused by the runner (R245). So none of its writes
     // lands after the lock is released. Then the lookup client sends nothing more (FR-749, R546): see beginClosing.
