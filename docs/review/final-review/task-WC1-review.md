@@ -103,3 +103,70 @@ No existing test was changed. Only an import line was widened.
 - An older build actually opening the new journal: I4 comes from reading the code, not from running it.
 - A real torn write after a crash: Minor 8 comes from reading the code.
 - Nothing in this task needs a real Mac.
+
+---
+
+## Second look (R672)
+
+Range 0b7e336..e1f8ce9 (774ceda, fac1d1e, e1f8ce9), against `task-WC1-fix-brief.md`. After review `git status --short` is empty.
+
+### Verdict: CHANGES NEEDED
+
+One small change. Everything else is as the brief asks.
+
+### Important
+
+**S1. A late mark throws `NotFoundError` instead of returning `false` once compaction has removed the cancelled entry** (`packages/library/src/lists/transcription-list.ts:212`, together with B3 and C3).
+- B3 drops a cancelled entry at the next compaction.
+- C3 now runs that compaction inside any `updateJobRecords` once the file passes 2 000 lines and half of them are superseded. During a download run that writes to the same journal, that is a normal state.
+- Probe: I added two entries and stopped the list. Then other writes triggered a compaction, and the entry was gone from the file. The late mark `markTranscriptionEntry(running, "late")` then threw `NotFoundError: Transcription list entry … not found`. The same happens after the compaction at launch.
+- R672's contract for Task 7 is "`false` → cancel the job you just started". A throw is a different path, and Task 7 is told only about `false`.
+- Smallest fix: when the entry is absent, write nothing and return `false`, at least for `running` and `queued`, and add one test (compact between Stop and the mark). Otherwise, Task 7's text needs a line saying that `NotFoundError` from the mark means the same as `false`.
+
+### Minor (3)
+
+1. **A finished run with failures can still be lost after a downgrade** (`job-journal.ts:478` `liveRun`).
+   - In this build such a run has record status `queued` and is never dropped.
+   - After an older build claims it (`failed UNRECOVERABLE`), `run.state` is `finished`, so the run falls under the MAX_FAILED_KEPT cap.
+   - Probe: with 600 newer failed worker jobs, compaction dropped the run, although "Resume downloads (1 did not complete)" was still offered. Its items stayed behind as orphans until the next compaction.
+   - Fix: also keep a run that is `finished` with `run.failed > 0`. That run is exactly the one whose status is not `done` in this build.
+2. **Items whose run is dropped in the same compaction stay until the next one.** `prunable` decides the items from the records as they were before the drop. This was already so in the first round; it only means one extra compaction.
+3. **C4's guard can be made firmer inside Task 1 itself.**
+   - An older build's claim always adds `attempt` (`worker-client.ts:357`), and this build never writes `attempt` on a list record.
+   - Requiring `r.attempt !== undefined` in `claimedByOlderBuild` makes the repair independent of Task 7's discipline.
+   - The coordinator's rule (Task 7 writes `TRANSCRIPTION_UNRECOVERABLE`, never the bare code) is enough as long as Task 7 keeps to it. The current repair reads any entry failed with the bare `UNRECOVERABLE` as pending, so a slip in Task 7 would rerun that entry for ever.
+   - I recommend the one-line guard.
+
+### Checked
+
+- **A: the sentences.**
+  - I re-ran the first-round probe of the whole table at 0b7e336 and at e1f8ce9 and diffed the two outputs. The only lines that differ are A1–A8, and each matches the brief character for character. These include `LIST_STOPPED_TEXT` with its curly quotes, "up to 1.2 MB", "about 1 hour" at 3 570 and 3 599 s, "about 2 hours" at 7 170 and 7 199 s, "about 2 days" from 171 000 s, the Instagram "posts" forms, the singular "It is transcribed on this Mac…", and `(no title)` for an empty title.
+  - Nothing else in the table moved.
+  - A4 puts the count-0 check before `metadataOnly`. That is right, because the brief makes no exception.
+- **B1.** My first-round Stop probe now returns `false` and leaves the list empty, with total unchanged. Every other move returns `true`. S1 is the exception.
+- **B2.** After a Stop of a paused list, the list reads exactly `{ state: "running", total: 0, done: 0, failed: 0, pending: [] }` (tests at :155 and :180).
+- **B3.** Cancelled entries are left out of the MAX_FAILED_KEPT list and dropped (test at :766).
+- **B4.** An extra policy evaluation per item made the test fail with "expected 4 to be 1". I mutated the product code and restored it.
+- **C1.** The error message names the run only. That is acceptable, since an item looked up by post id has no index to give.
+- **C2.** `setRunState` recounts the counters from the items.
+- **C3: the compaction inside `updateJobRecords`.**
+  - It runs inside `serialize` on the same path as the worker client's appends, claims and transitions, so it never interleaves with another writer of this process.
+  - Nothing live is dropped: pending worker jobs, queued or running entries, the list record and live runs are never dropped, and items go only with a done, discarded or absent run.
+  - The count is right: complete lines plus the appended records, minus distinct ids and unreadable lines. When this trigger fires, `compactNow` always rewrites.
+  - A crash keeps the existing guarantee: the records were appended durably before the compaction, which then writes a temporary file, renames it, and sweeps leftover temporary files.
+  - A mostly live file is never compacted. Each write still reads every live line, but the file stays below about twice the live records. That is acceptable.
+  - Cache rows of worker records dropped here stay until the next `syncJobRows`. That is harmless.
+  - Mutation: with the trigger removed, "updateJobRecords compacts a mostly superseded journal…" FAILED.
+- **C4: the repair after an older build.**
+  - I rebuilt the damaged journal as the brief describes, in the implementer's tests at `run-journal.test.ts:236` and `transcription-list.test.ts:193`, plus my own probe.
+  - The run, its items, the entries and the list record read back as still to do.
+  - An item with its own failure (`PRIVATE`) and an entry failed by this build (`WORKER_FAILED`) stay failed.
+  - Compaction keeps them, even with 600 newer failed worker jobs.
+  - Mutation: with the `liveRun` exclusion removed, the run test FAILED.
+  - Keeping claimed entries in compaction, as the implementer added, is right: they are pending. They stay only until the list processes or stops them, so nothing is kept for ever unless the bare code is written by this build (Minor 3).
+- **The one existing test changed** (`transcription-list.test.ts:155`): only its post-Stop assertion changed, from `done 1, total 1` to the B2 shape. That is exactly what B2 requires. No other existing test was loosened or removed; elsewhere only import lines changed.
+- **Runs:**
+  - `background.test.ts`: 27 passed.
+  - `job-journal.test.ts`, `run-journal.test.ts` and `transcription-list.test.ts`: 49 passed.
+  - `worker-client.test.ts`: 31 passed.
+  - `@ao/shared` and `@ao/library` typecheck: clean.

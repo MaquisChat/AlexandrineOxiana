@@ -106,3 +106,12 @@ Nothing else needed mending. Stale cached rows that an older build leaves for li
 
 ### Runs
 @ao/shared `background.test.ts`, `boundary.test.ts` and `shared.test.ts`: 60 passed. @ao/library: `job-journal.test.ts` 28, `lists/run-journal.test.ts` 12, `lists/transcription-list.test.ts` 9, `job-journal-paths.test.ts` 25, `worker-client.test.ts` 31, all passed. Typecheck: @ao/shared, @ao/library, @ao/library-service and @ao/ui are clean.
+
+## Last fix (R676)
+
+This is one commit on top of e1f8ce9. Each new test failed first. `git status --short` is empty.
+1. **S1.** `markTranscriptionEntry` now handles an entry that is no longer in the journal the same way as an ended one: it writes nothing and returns `false`, whatever the requested status (`transcription-list.ts`). Test: "a late mark for an entry compaction has already removed returns false and writes nothing (R676)" adds entries, stops the list and compacts. The marks to running and to done both return false, the file is byte-identical and the list is empty. Failed first with `NotFoundError`.
+2. **Finished runs with work left.** In `prunable`, `liveRun` (`job-journal.ts`) keeps every `capture.run` except a discarded one and a finished one with `done === total`; those two still follow the existing rules. Test (`run-journal.test.ts`): a run finished with one failure, claimed by an older build, then 600 newer failed worker jobs and two compactions. The run and both its items stay, and a fully done run still reads as done. Failed first: the run was dropped.
+3. **The repair needs the claim's mark.** The worker client's claim writes `{ ...next(rec, "failed", code), attempt: randomUUID() }`, so `claimedByOlderBuild` now also requires `typeof r.attempt === "string"`. This build never writes `attempt` on a list record. Test (`transcription-list.test.ts`): an entry this build marks failed with `UNRECOVERABLE` stays failed and refuses a late running mark. Failed first: it was read as pending.
+
+Runs: `transcription-list.test.ts` 11 passed, `run-journal.test.ts` 13, `job-journal.test.ts` 28, `job-journal-paths.test.ts` 25, `worker-client.test.ts` 31. Typecheck of @ao/library and @ao/library-service is clean.
