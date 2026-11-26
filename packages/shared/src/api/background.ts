@@ -253,6 +253,9 @@ export const estimateText = {
   listingSlow(p: CapturePlatform): string {
     return `Still asking ${platformName(p)} for the list. A long list can take a few minutes.`;
   },
+  /** The same, for an address whose platform is not known yet (R685). */
+  listingAny: "Asking the platform for the list…",
+  listingSlowAny: "Still asking the platform for the list. A long list can take a few minutes.",
   legends: { quality: "Quality", transcribe: "Transcribe", disk: "Disk", time: "Time" },
 };
 

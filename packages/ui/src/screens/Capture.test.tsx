@@ -962,15 +962,28 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
     expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(0);
   });
 
-  it("a refusal of Start shows the service's sentence and keeps the estimate", async () => {
+  it("a refusal of Start for missing Video tools names them with the link, and keeps the estimate (R685)", async () => {
     const SAID = "Video tools are not installed, so this quality cannot be downloaded. Install them from the Optional tools screen, or choose “Ready-made file (lower quality)”.";
     const { user } = await setup({ profileAnswer: () => errorResponse(409, "TOOL_NOT_INSTALLED", SAID, "ffmpeg") });
     await user.type(profileBox(), YT_CHANNEL);
     await captureAndStart(user);
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain(SAID);
+    expect(alert.textContent).toContain(
+      "The video tools (ffmpeg) are not installed on this computer. Until they are, videos can be downloaded only as ready-made, lower-quality files and get no viewing copies, and media that carries a location stays “proxy pending” and is left out of exports.",
+    );
+    expect(within(alert).getByRole("link", { name: "Install it from the Optional tools screen" }).getAttribute("href")).toBe("/settings/tools?tool=ffmpeg");
     expect(screen.getByRole("region", { name: HEADING })).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Capture queue" })).toBeNull();
+  });
+
+  it("a refusal of Start for a missing downloader names that tool (R685)", async () => {
+    const { user } = await setup({ profileAnswer: () => errorResponse(409, "TOOL_NOT_INSTALLED", "A tool this needs is not installed on this computer.", "video-downloader") });
+    await user.type(profileBox(), YT_CHANNEL);
+    await captureAndStart(user);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("The video downloader is not installed on this computer, so videos cannot be saved from the web.");
+    expect(within(alert).getByRole("link", { name: "Install it from the Optional tools screen" }).getAttribute("href")).toBe("/settings/tools?tool=video-downloader");
+    expect(screen.getByRole("region", { name: HEADING })).toBeTruthy();
   });
 
   describe("an estimate is only ever started for what the screen shows (R683 B)", () => {
@@ -1174,6 +1187,27 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
       // No hard limit: the request is still out, and Cancel still gives it up.
       expect(m.estimateRequests()[0]!.signal.aborted).toBe(false);
       expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    });
+
+    it("an address the preview cannot place still gets words and Cancel, and the slow words after the limit (R685)", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
+      const gate = held();
+      const m = mockCapture({ estimateHold: gate.p });
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      render(<Capture client={m.client} projectId={P1} firstReadMs={10_000} />);
+      await screen.findByRole("button", { name: "Capture links" });
+      await waitFor(() => expect(screen.queryByText(/Reading this project's rules/)).toBeNull());
+      await user.type(profileBox(), "https://example.org/someone");
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      const status = (await screen.findByText("Asking the platform for the list…")).closest("[role=status]")!;
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+      await act(async () => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(status.textContent).toBe("Still asking the platform for the list. A long list can take a few minutes.");
     });
 
     it("“Capture links” works while an estimate is asked for and while one is open", async () => {

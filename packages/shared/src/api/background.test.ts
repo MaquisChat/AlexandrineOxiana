@@ -162,6 +162,8 @@ describe("the estimate's words", () => {
     );
     expect(estimateText.listingSlow("youtube")).toBe("Still asking YouTube for the list. A long list can take a few minutes.");
     expect(estimateText.listingSlow("instagram")).toBe("Still asking Instagram for the list. A long list can take a few minutes.");
+    expect(estimateText.listingAny).toBe("Asking the platform for the list…");
+    expect(estimateText.listingSlowAny).toBe("Still asking the platform for the list. A long list can take a few minutes.");
   });
 });
 

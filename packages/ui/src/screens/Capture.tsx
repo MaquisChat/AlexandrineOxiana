@@ -890,10 +890,10 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       const stillHere = () => live.current && projectNow.current === asked && estimateOf.current === mine;
       const platform = previewLink(url).platform;
       const listed = LISTED.includes(platform) ? (platform as CapturePlatform) : undefined;
-      setEstStatus(listed ? estimateText.listing(listed) : "");
+      setEstStatus(listed ? estimateText.listing(listed) : estimateText.listingAny);
       setListing(true);
       // No hard limit (a large channel takes minutes), but past the first-read limit it says it is still asking.
-      const slow = listed ? setTimeout(() => stillHere() && setEstStatus(estimateText.listingSlow(listed)), firstReadMs) : undefined;
+      const slow = setTimeout(() => stillHere() && setEstStatus(listed ? estimateText.listingSlow(listed) : estimateText.listingSlowAny), firstReadMs);
       // The Transcribe box starts from the Transcription choice; "Use the project's setting" is the project's switch,
       // read beside the estimate with the first-read limit, never holding it back (R683 C2).
       estTouched.current = false;
@@ -966,7 +966,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         }
         profileRef.current?.focus();
       } catch (err) {
-        if (live.current && projectNow.current === asked) refused(err, "The profile capture could not be started.");
+        // A missing tool is named as for a refused estimate; the estimate stays, so another quality can be chosen (R685).
+        if (live.current && projectNow.current === asked) refused(err, "The profile capture could not be started.", true);
       }
     });
 
