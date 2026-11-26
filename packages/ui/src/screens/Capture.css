@@ -176,3 +176,38 @@
   margin-top: 0;
   font-size: 1.2rem;
 }
+
+/* The estimate before a channel, playlist or profile is captured (whole channels; CaptureEstimate). */
+.ao-capture-estimate {
+  border-top: 1px solid var(--line-soft);
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+}
+
+.ao-capture-estimate h3 {
+  margin: 0 0 var(--space-1);
+  font-size: 1.05rem;
+}
+
+.ao-capture-estimate__choices legend {
+  font-weight: 600;
+}
+
+.ao-capture-estimate__facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.ao-capture-estimate__facts dt {
+  font-weight: 600;
+}
+
+.ao-capture-estimate__facts dd {
+  margin: 0;
+}
+
+.ao-capture-estimate__facts p {
+  margin: 0 0 var(--space-1);
+}

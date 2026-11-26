@@ -247,6 +247,15 @@ export const estimateText = {
   start: "Start",
   startAnyway: "Start anyway — it will pause when the disk is nearly full",
   cancel: "Cancel",
+  settingsChanged: "The settings changed, so the estimate was closed. Press “Capture profile” to see it again.",
+  switchNotRead:
+    "The project's switch for automatic transcription could not be read. This capture follows the switch as it stands, unless you tick the box.",
+  listingSlow(p: CapturePlatform): string {
+    return `Still asking ${platformName(p)} for the list. A long list can take a few minutes.`;
+  },
+  /** The same, for an address whose platform is not known yet (R685). */
+  listingAny: "Asking the platform for the list…",
+  listingSlowAny: "Still asking the platform for the list. A long list can take a few minutes.",
   legends: { quality: "Quality", transcribe: "Transcribe", disk: "Disk", time: "Time" },
 };
 

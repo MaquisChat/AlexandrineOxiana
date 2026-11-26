@@ -28,7 +28,7 @@ const TOOL_SENTENCE: Record<ToolId, string> = {
   "video-downloader": "The video downloader is not installed on this computer, so videos cannot be saved from the web.",
   "image-downloader": "The image downloader is not installed on this computer, so photo posts cannot be saved from the web.",
   ffmpeg:
-    "The video tools (ffmpeg) are not installed on this computer. Until they are, videos get no viewing copies, and media that carries a location stays “proxy pending” and is left out of exports.",
+    "The video tools (ffmpeg) are not installed on this computer. Until they are, videos can be downloaded only as ready-made, lower-quality files and get no viewing copies, and media that carries a location stays “proxy pending” and is left out of exports.",
   ocr: "Text recognition (OCR) is not installed on this computer, so scanned pages are not read.",
 };
 

@@ -4,7 +4,9 @@
  * and answer shapes are declared once, in @ao/shared (api/capture.ts, Task 47):
  *
  *   POST /projects/:id/capture           { urls, options? } → { queueId }  (capture.ts)
- *   POST /projects/:id/capture-profile   { url, options? }  → { queueId }  (capture.ts)
+ *   POST /projects/:id/capture-profile   { url, options? }  → { queueId }  (capture.ts; `options.quality`, whole channels)
+ *   POST /projects/:id/capture-estimate  { url, options? }  → CaptureEstimate (downloads.ts; whole channels, Task 5)
+ *   GET  /projects/:id/automation        → ProjectAutomation (whole channels, Task 7)
  *   POST /projects/:id/acknowledge       { kind: "cookies" } → { acknowledgements } (projects.ts)
  *   GET  /projects/:id/captures          → CaptureQueueListResponse (@ao/shared; Task 63)
  *   GET  /projects/:id/captures/:queueId → CaptureQueueDetail
@@ -44,6 +46,8 @@ import {
   type AcknowledgeResponse,
   type CaptureBrowser,
   type CaptureContentType,
+  type CaptureEstimate,
+  type CaptureEstimateRequest,
   type CaptureItemOutcome,
   type CaptureItemStatus,
   type CaptureLinksRequest,
@@ -61,6 +65,7 @@ import {
   type CaptureToolVersionsResponse,
   type GovernanceReadability,
   type ProfileCaptureRequestOptions,
+  type ProjectAutomation,
   type SpeechModel,
 } from "@ao/shared";
 import type { ApiClient, ServiceEvent } from "./client";
@@ -600,6 +605,16 @@ export function captureApi(client: ApiClient) {
       const body: CaptureProfileRequest = { url, options };
       return r<CaptureStartedResponse>("POST", `/projects/${pid(projectId)}/capture-profile`, { body });
     },
+    /**
+     * What capturing a profile, channel or playlist would take (whole channels): the platform is asked only for the
+     * list. Nothing is captured; the options are the ones `captureProfile` would send.
+     */
+    estimate: (projectId: string, url: string, options: ProfileCaptureOptions, o: { signal?: AbortSignal } = {}): Promise<CaptureEstimate> => {
+      const body: CaptureEstimateRequest = { url, options };
+      return r<CaptureEstimate>("POST", `/projects/${pid(projectId)}/capture-estimate`, { body, ...o });
+    },
+    /** The project's automation switch ("Transcribe captured audio and video automatically"), for the estimate's Transcribe box. */
+    automation: (projectId: string, o: { signal?: AbortSignal } = {}) => r<ProjectAutomation>("GET", `/projects/${pid(projectId)}/automation`, o),
     /** Records the one-time browser-session acknowledgement (audited by the service). */
     acknowledge: async (projectId: string) => {
       const body: AcknowledgeRequest = { kind: "cookies" };

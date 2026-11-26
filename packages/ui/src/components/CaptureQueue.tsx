@@ -126,9 +126,12 @@ function QueueView({ q }: { q: CaptureQueueState }) {
       {r && (r.status !== "failed" || hasCounts(r) || q.items.length > 0) && (
         <>
           <p>{reportSummary(r)}</p>
+          {/* A run that did not finish never looks for removed posts, whatever its list (R677). */}
           {!r.listComplete && (
             <p className="ao-capture-queue__note">
-              Removed posts were not looked for in this run: the list was limited (by dates or a maximum number of items) or did not come back whole.
+              {r.status === "completed"
+                ? "Removed posts were not looked for in this run: the list was limited (by dates or a maximum number of items) or did not come back whole."
+                : "Removed posts were not looked for in this run, because it did not finish."}
             </p>
           )}
         </>
