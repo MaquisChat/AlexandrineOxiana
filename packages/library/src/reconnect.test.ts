@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs";
 import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { Readable } from "node:stream";
 import type { AuditEvent, Provenance, SourceDraft } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeyRing } from "./crypto/keys.js";
@@ -445,6 +446,56 @@ describe("checkIntegrity", () => {
     expect(pickSample(ids, "lib-1", 0.25)).toEqual(pickSample([...ids].reverse(), "lib-1", 0.25));
     expect(pickSample(ids, "lib-1", 0.25)).toHaveLength(10);
     expect(pickSample(ids, "lib-1", 0.25)).not.toEqual(pickSample(ids, "lib-2", 0.25));
+  });
+
+  it("R641 D3: says how far it is — `onProgress(checked, total)` before the first file, after each, and ends at the total; a stopped check ends at its signal", async () => {
+    const { lib } = await fixture();
+    const seen: Array<[number, number]> = [];
+    const r = await checkIntegrity(lib, "full", { onProgress: (n, m) => seen.push([n, m]) });
+    const total = r.checked;
+    expect(total).toBeGreaterThan(0);
+    expect(seen[0]).toEqual([0, total]);
+    expect(seen.at(-1)).toEqual([total, total]);
+    expect(seen.map(([n]) => n)).toEqual(Array.from({ length: total + 1 }, (_, i) => i));
+    const ac = new AbortController();
+    const stopped = checkIntegrity(lib, "full", { signal: ac.signal, onProgress: (n) => n === 1 && ac.abort() });
+    await expect(stopped).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("review M2: a stop while a large file is being hashed abandons that file: the check ends at once, the file's read is closed, nothing is reported", async () => {
+    const { lib } = await fixture();
+    const ac = new AbortController();
+    const reads: Readable[] = [];
+    // The first file hashed is "large": one chunk comes, then the rest never does until the read is closed.
+    const openRead = (p: string) => {
+      if (reads.length) return createReadStream(p);
+      const r = new Readable({ read() {} });
+      r.push(Buffer.alloc(64 * 1024));
+      reads.push(r);
+      queueMicrotask(() => ac.abort());
+      return r;
+    };
+    await expect(checkIntegrity(lib, "full", { openRead, signal: ac.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(reads).toHaveLength(1);
+    expect(reads[0]!.destroyed).toBe(true);
+  });
+
+  it("review M2: a stop that comes while the confirming turn is waited for: the turn does nothing (no file looked at again) and the check ends stopped", async () => {
+    const { lib, assets } = await fixture();
+    await unlink(join(lib.root, assets[0]!.path));
+    const ac = new AbortController();
+    let lookedAfterStop = 0;
+    const statFn = async (p: string) => {
+      if (ac.signal.aborted) lookedAfterStop++;
+      return stat(p);
+    };
+    // The stop comes after the turn was asked for and before it runs.
+    const confirm = async <T,>(fn: () => Promise<T>) => {
+      ac.abort();
+      return fn();
+    };
+    await expect(checkIntegrity(lib, "full", { stat: statFn, confirm, signal: ac.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(lookedAfterStop).toBe(0);
   });
 
   it("finds same-size content changes when hashing, and size changes always", async () => {

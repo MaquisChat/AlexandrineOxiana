@@ -41,7 +41,7 @@ import {
   type ZoteroSyncStateResponse,
 } from "@ao/shared";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type ReactNode } from "react";
-import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { useLeaveSignal } from "../components/leaveSignals";
 import { importApi, isValidId, type ProjectInfo } from "../api/import";
@@ -131,7 +131,7 @@ function refusedField(message: string, links: ZoteroSyncSettingsRequest["links"]
 
 /** `firstReadMs` (FR-750, R579): how long a read of the state and the history is waited for before it is given up. */
 /** `streamOpenMs` (FR-756 C, R597): how long the event stream is waited for to open before it is closed and tried afresh after the screen's pause (STREAM_OPEN_TIMEOUT_MS; smaller in tests); an open stream is never ended by it. */
-export function ZoteroSync({ client, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: { client: ApiClient; firstReadMs?: number; streamOpenMs?: number }) {
+export function ZoteroSync({ client, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: { client: ApiClient; firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number }) {
   const api = useMemo(() => zoteroSyncApi(client), [client]);
   const imp = useMemo(() => importApi(client), [client]);
   const lib = useMemo(() => libraryApi(client), [client]);
@@ -367,7 +367,7 @@ export function ZoteroSync({ client, firstReadMs = FIRST_READ_TIMEOUT_MS, stream
           else if (opened) void read();
           opened = true;
         };
-        for await (const ev of client.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs })) {
+        for await (const ev of client.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
           if (!alive.current) return;
           if (ev.type === "library.state" && ev.data && typeof ev.data === "object") {
             const d = ev.data as LibraryState;
@@ -432,7 +432,7 @@ export function ZoteroSync({ client, firstReadMs = FIRST_READ_TIMEOUT_MS, stream
       ac.abort();
       clearTimeout(retry);
     };
-  }, [client, read, readProjects, forget, say, setRunning, setNoLibrary, streamOpenMs]);
+  }, [client, read, readProjects, forget, say, setRunning, setNoLibrary, streamOpenMs, streamQuietMs]);
 
   // ---- back-off: the button comes back by one timer to that instant, not by asking again ----
   const backoffAt = state?.backoffUntil ? Date.parse(state.backoffUntil) : NaN;

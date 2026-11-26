@@ -4,7 +4,7 @@
  * a link names it. Links and the project picker use the shared pushState navigation (navigation.tsx).
  */
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
-import type { ApiClient } from "../api/client";
+import { STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, isUnreachable, readWithin } from "../api/firstRead";
 import { governanceApi, type GovernanceApi, type ProjectSummary } from "../api/governance";
 import { errorText, type LibraryState } from "../api/library";
@@ -39,11 +39,16 @@ export const isGovernancePath = (path: string): boolean => governanceRoutes.some
 /** A link to one of these screens, for a project (when it needs one). */
 export const governanceHref = (path: string, projectId?: string): string => (projectId ? `${path}?project=${encodeURIComponent(projectId)}` : path);
 
+/** R641 D1: the pause before the event stream, lost or not opened in time, is opened again. */
+const LISTEN_AGAIN_MS = 2_000;
+
 /**
  * `firstReadMs` (FR-756, R579): how long the list of projects, and each screen's own first reads, are waited for before
- * the read is given up (smaller in tests).
+ * the read is given up (smaller in tests). `streamOpenMs` (R641 D1, R597): how long the event stream is waited for to
+ * open before it is given up and, after a pause, opened afresh; `streamQuietMs` (R641 D2): how long an open stream may
+ * deliver nothing (not even the service's keep-alive) before it is given up and opened afresh the same way.
  */
-export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number }) {
+export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: { client: ApiClient; loc: AppLocation; firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number }) {
   const api = useMemo(() => governanceApi(client), [client]);
   const path = normalisePath(loc.pathname);
   const asked = new URLSearchParams(loc.search).get("project") ?? "";
@@ -67,28 +72,45 @@ export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT
   const [libraryMode, setLibraryMode] = useState<string | undefined>();
   /** Set once an event has said the mode: the opening read's answer, if later, is then older. */
   const modeFromEvent = useRef(false);
+  // R641 D1: a stream that is lost, or not opened within `streamOpenMs`, is opened again after a pause. On a reopened
+  // stream the state it opens with counts as a change (one may have been missed meanwhile): the projects are read again.
   useEffect(() => {
     if (!onGovernance) return;
     const ac = new AbortController();
     void (async () => {
-      let first = true;
-      try {
-        for await (const e of client.events({ signal: ac.signal })) {
-          if (e.type !== "library.state") continue;
-          const mode = e.data && typeof e.data === "object" ? (e.data as LibraryState).mode : undefined;
-          if (typeof mode === "string") {
-            modeFromEvent.current = true;
-            setLibraryMode(mode);
+      let opened = false;
+      while (!ac.signal.aborted) {
+        let first = !opened;
+        try {
+          for await (const e of client.events({ signal: ac.signal, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
+            if (e.type !== "library.state") continue;
+            opened = true;
+            const mode = e.data && typeof e.data === "object" ? (e.data as LibraryState).mode : undefined;
+            if (typeof mode === "string") {
+              modeFromEvent.current = true;
+              setLibraryMode(mode);
+            }
+            if (first) first = false;
+            else setStateSeq((n) => n + 1);
           }
-          if (first) first = false;
-          else setStateSeq((n) => n + 1);
+        } catch {
+          // Lost, or not opened in time: opened again below. Meanwhile the reason stays as last known; the service still
+          // refuses a change it may not make.
         }
-      } catch {
-        // No event stream: the reason stays as read when the form opened; the service still refuses a change it may not make.
+        if (ac.signal.aborted) return;
+        await new Promise<void>((r) => {
+          const stop = () => (clearTimeout(t), r());
+          // The pause's listener goes when its timer fires, so a long outage leaves none behind (review M4).
+          const t = setTimeout(() => {
+            ac.signal.removeEventListener("abort", stop);
+            r();
+          }, LISTEN_AGAIN_MS);
+          ac.signal.addEventListener("abort", stop, { once: true });
+        });
       }
     })();
     return () => ac.abort();
-  }, [client, onGovernance]);
+  }, [client, onGovernance, streamOpenMs, streamQuietMs]);
   useEffect(() => {
     let live = true;
     const ac = new AbortController();

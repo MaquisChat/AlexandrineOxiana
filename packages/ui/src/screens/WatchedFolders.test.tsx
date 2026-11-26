@@ -1446,6 +1446,16 @@ describe("Watched folders: first reads that never settle (FR-750, R579)", () => 
     expect(ev.signals()[0]!.aborted).toBe(false);
   });
 
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh", async () => {
+    useService([]);
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} streamQuietMs={300} />);
+    await waitFor(() => expect(ev.attempts()).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(ev.signals()[0]!.aborted).toBe(true);
+    expect(tryAgain()).toBeNull();
+  });
+
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
     useService([]);
     const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
@@ -1475,9 +1485,9 @@ describe("Watched folders: first reads that never settle (FR-750, R579)", () => 
 describe("Watched folders: the side reads are given up silently at the limit (FR-756 remainder)", () => {
   function heldSide() {
     const gate = hang();
-    const seen = new Map<string, AbortSignal>();
+    const seen = new Map<string, Request>();
     const held = (name: string, body: unknown) => async ({ request }: { request: Request }) => {
-      seen.set(name, request.signal);
+      seen.set(name, request);
       await gate;
       return HttpResponse.json(body as never);
     };
@@ -1495,7 +1505,7 @@ describe("Watched folders: the side reads are given up silently at the limit (FR
     render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} firstReadMs={300} />);
     await screen.findByRole("region", { name: "Fieldwork scans" });
     await waitFor(() => expect([...seen.keys()].sort()).toEqual(["collections", "libraries", "projects"]));
-    await waitFor(() => expect([...seen.values()].every((s) => s.aborted)).toBe(true), { timeout: 3000 });
+    await waitFor(() => expect([...seen.values()].every((r) => r.signal.aborted)).toBe(true), { timeout: 3000 });
     expect(screen.queryAllByRole("alert")).toHaveLength(0);
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   });
@@ -1506,8 +1516,8 @@ describe("Watched folders: the side reads are given up silently at the limit (FR
     const view = render(<WatchedFoldersRoute client={testClient()} loc={{ pathname: "/settings/watched-folders", search: "?project=p1" }} firstReadMs={60_000} />);
     await screen.findByRole("region", { name: "Fieldwork scans" });
     await waitFor(() => expect([...seen.keys()].sort()).toEqual(["collections", "libraries", "projects"]));
-    expect([...seen.values()].some((s) => s.aborted)).toBe(false);
+    expect([...seen.values()].some((r) => r.signal.aborted)).toBe(false);
     view.unmount();
-    await waitFor(() => expect([...seen.values()].every((s) => s.aborted)).toBe(true), { timeout: 1000 });
+    await waitFor(() => expect([...seen.values()].every((r) => r.signal.aborted)).toBe(true), { timeout: 1000 });
   });
 });

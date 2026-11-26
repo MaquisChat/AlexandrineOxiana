@@ -1428,8 +1428,10 @@ describe("files found for records (F11; R277 d, R296 b, R303)", () => {
 
   /** R478: the held-file decisions' requests, each open until it answers or its signal aborts. */
   const openDecisions = () => {
-    const st = { open: 0, most: 0, aborted: 0, gates: [] as Array<() => void> };
+    // Each request is kept (`requests`), so its signal's abort reaches the listener (a request no longer held can miss it).
+    const st = { open: 0, most: 0, aborted: 0, gates: [] as Array<() => void>, requests: [] as Request[] };
     const handler = http.post(`${SERVICE}/review/:itemId/held-file`, async ({ request, params }) => {
+      st.requests.push(request);
       heldCalls.push({ id: params.itemId as string, body: await request.json() });
       st.open++;
       st.most = Math.max(st.most, st.open);

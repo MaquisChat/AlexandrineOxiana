@@ -46,7 +46,7 @@ function serve(o: { events?: ReturnType<typeof sseAttempts>; source?: () => Prom
   return n;
 }
 
-const show = (p: { firstReadMs?: number; streamOpenMs?: number } = {}) =>
+const show = (p: { firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number } = {}) =>
   render(<ReaderRoute client={testClient()} loc={{ pathname: "/reader", search: "?project=p1&source=s1" }} {...p} />);
 
 describe("ReaderRoute: a first read that never settles (FR-756)", () => {
@@ -97,39 +97,95 @@ describe("ReaderRoute: an event stream that does not open within the limit is tr
   });
 
   it("a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     serve();
     server.use(
       http.get(url("/events"), ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         return new HttpResponse(new ReadableStream(), { headers: { "content-type": "text/event-stream" } });
       }),
     );
     show({ streamOpenMs: 200 });
     await screen.findByTestId("reader-screen");
-    await waitFor(() => expect(signals).toHaveLength(1));
+    await waitFor(() => expect(requests).toHaveLength(1));
     await new Promise((r) => setTimeout(r, 3_000));
     // Still the first stream, and its request not cancelled (R602).
-    expect(signals).toHaveLength(1);
-    expect(signals[0]!.aborted).toBe(false);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.signal.aborted).toBe(false);
+  });
+
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh; the reader stays", async () => {
+    const requests: Request[] = [];
+    serve();
+    server.use(
+      http.get(url("/events"), ({ request }) => {
+        requests.push(request);
+        return new HttpResponse(new ReadableStream(), { headers: { "content-type": "text/event-stream" } });
+      }),
+    );
+    show({ streamQuietMs: 300 });
+    await screen.findByTestId("reader-screen");
+    await waitFor(() => expect(requests.length).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(requests[0]!.signal.aborted).toBe(true);
+    expect(screen.getByTestId("reader-screen")).toBeTruthy();
+  });
+
+  it("R658: each pause before the stream is listened to again leaves no abort listener behind once it is over (as review M4)", async () => {
+    serve();
+    server.use(http.get(url("/events"), () => HttpResponse.error()));
+    // The reader's own signal, as it is handed to the stream; its live "abort" listeners are counted.
+    const client = testClient();
+    let live = 0;
+    let watched: AbortSignal | undefined;
+    const opened = vi.fn((o: Parameters<typeof client.events>[0]) => {
+      const signal = o?.signal;
+      if (signal && !watched) {
+        watched = signal;
+        const add = signal.addEventListener.bind(signal);
+        const remove = signal.removeEventListener.bind(signal);
+        signal.addEventListener = ((type: string, fn: EventListenerOrEventListenerObject, opts?: AddEventListenerOptions | boolean) => {
+          if (type === "abort") live++;
+          add(type, fn, opts);
+        }) as AbortSignal["addEventListener"];
+        signal.removeEventListener = ((type: string, fn: EventListenerOrEventListenerObject, opts?: EventListenerOptions | boolean) => {
+          if (type === "abort") live--;
+          remove(type, fn, opts);
+        }) as AbortSignal["removeEventListener"];
+      }
+      return client.events(o);
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      render(<ReaderRoute client={{ ...client, events: opened }} loc={{ pathname: "/reader", search: "?project=p1&source=s1" }} />);
+      await vi.waitFor(() => expect(screen.getByTestId("reader-screen")).toBeTruthy());
+      // Each try fails at once; after it the reader pauses (2 s), then listens again. Five pauses go by.
+      for (let n = 1; n <= 6; n++) {
+        await vi.waitFor(() => expect(opened).toHaveBeenCalledTimes(n));
+        if (n < 6) await vi.advanceTimersByTimeAsync(2_000);
+      }
+      // At rest in the sixth pause: its own listener, and none left from the five pauses before.
+      await vi.waitFor(() => expect(live).toBe(1));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
 describe("ReaderRoute: its two first reads are one read (FR-756, R605 M6)", () => {
   it("a source read that fails cancels the read of the libraries still out, long before the limit", async () => {
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     const gate = hang();
     serve({ source: () => HttpResponse.error() });
     server.use(
       http.get(url("/libraries"), async ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         await gate;
         return HttpResponse.json({ ...LIBRARIES, current: CURRENT_RW });
       }),
     );
     show();
     await screen.findByRole("button", { name: "Open again" });
-    await waitFor(() => expect(signals).toHaveLength(1));
-    await waitFor(() => expect(signals[0]!.aborted).toBe(true), { timeout: 1000 });
+    await waitFor(() => expect(requests).toHaveLength(1));
+    await waitFor(() => expect(requests[0]!.signal.aborted).toBe(true), { timeout: 1000 });
   });
 });

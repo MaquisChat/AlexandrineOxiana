@@ -127,6 +127,7 @@ export function transcriptService(opts: { versions?: TranscriptVersionSummary[];
     fileDestroyed: false,
   };
   const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
+  const held: Request[] = [];
   const enc = new TextEncoder();
   /** Pushes one SSE event to every open /events stream. */
   const emit = (type: string, data: unknown) => {
@@ -202,6 +203,9 @@ export function transcriptService(opts: { versions?: TranscriptVersionSummary[];
           streams.delete(ctl);
         },
       });
+      // The request is kept: Node's Request passes the caller's abort on through a weak reference, so a listener on the
+      // signal of a request no longer held can miss it.
+      held.push(request);
       request.signal.addEventListener("abort", () => streams.delete(ctl));
       return new HttpResponse(stream, { headers: { "Content-Type": "text/event-stream" } });
     }),

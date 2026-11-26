@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { CREDENTIAL_QUERY_KEYS } from "@ao/shared";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
-import { ApiClientError, SERVICE_NO_ANSWER, SseParser, createClient } from "./client";
+import { ApiClientError, SERVICE_NO_ANSWER, STREAM_QUIET_TIMEOUT_MS, SseParser, createClient } from "./client";
 
 const TOKEN = "t".repeat(40) + "SECRET";
 const BASE = "http://127.0.0.1:4317";
@@ -476,6 +476,92 @@ describe("events() — SSE over fetch streaming (not EventSource)", () => {
       expect(r).toBe("waiting");
       ac.abort();
       await expect(next).resolves.toMatchObject({ done: true });
+    });
+  });
+
+  describe("R641 D2: a stream that opens and then delivers nothing is given up after a silence", () => {
+    /** A stream that sends `first`, then whatever `more(enqueue)` sends; it does NOT end when its request is cancelled. */
+    const quietStream = (first: string, more?: (send: (text: string) => void) => void) => {
+      const signals: AbortSignal[] = [];
+      const f = fakeFetch((_u, init) => {
+        if (init.signal) signals.push(init.signal);
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            const send = (t: string) => c.enqueue(new TextEncoder().encode(t));
+            send(first);
+            more?.(send);
+          },
+        });
+        return new Response(body, { headers: { "content-type": "text/event-stream" } });
+      });
+      return { f, signals };
+    };
+
+    it("an open stream silent for `quietWithinMs` is given up: its request cancelled, the stream ends with “did not answer in time”", async () => {
+      const { f, signals } = quietStream("event: library.state\ndata: {}\n\n");
+      const it = createClient(BASE, TOKEN, { fetch: f.fetch }).events({ quietWithinMs: 100 });
+      expect((await it.next()).value).toEqual({ type: "library.state", data: {} });
+      await expect(it.next()).rejects.toMatchObject({ status: 0, code: "UNAVAILABLE", message: SERVICE_NO_ANSWER });
+      expect(signals[0]!.aborted).toBe(true);
+    });
+
+    it("anything that arrives, the service's keep-alive comment included, starts the silence again", async () => {
+      // On a fake clock: the beats and the silence limit keep their order whatever the machine's load.
+      vi.useFakeTimers();
+      const timers: ReturnType<typeof setInterval>[] = [];
+      const { f, signals } = quietStream("event: library.state\ndata: {}\n\n", (send) => {
+        let beats = 0;
+        const t = setInterval(() => {
+          if (++beats <= 8) send(": keep-alive\n\n");
+          else {
+            clearInterval(t);
+            send("event: job.progress\ndata: {\"done\":1}\n\n");
+          }
+        }, 40);
+        timers.push(t);
+      });
+      const ac = new AbortController();
+      try {
+        const it = createClient(BASE, TOKEN, { fetch: f.fetch }).events({ signal: ac.signal, openWithinMs: 5_000, quietWithinMs: 150 });
+        await it.next();
+        // 360 ms with no event, but a beat every 40 ms: still open, and the next event is delivered.
+        const next = it.next();
+        await vi.advanceTimersByTimeAsync(400);
+        expect((await next).value).toEqual({ type: "job.progress", data: { done: 1 } });
+        expect(signals[0]!.aborted).toBe(false);
+      } finally {
+        timers.forEach(clearInterval);
+        ac.abort();
+        vi.useRealTimers();
+      }
+    });
+
+    it("STREAM_QUIET_TIMEOUT_MS is more than two of the service's keep-alives (every 25 s); without `quietWithinMs` an open stream is never given up for its silence, `openWithinMs` or not", async () => {
+      expect(STREAM_QUIET_TIMEOUT_MS).toBeGreaterThan(2 * 25_000);
+      vi.useFakeTimers();
+      try {
+        const limited = quietStream("event: library.state\ndata: {}\n\n");
+        const opening = quietStream("event: library.state\ndata: {}\n\n");
+        const ac = new AbortController();
+        const a = createClient(BASE, TOKEN, { fetch: limited.f.fetch }).events({ signal: ac.signal, quietWithinMs: STREAM_QUIET_TIMEOUT_MS });
+        const b = createClient(BASE, TOKEN, { fetch: opening.f.fetch }).events({ signal: ac.signal, openWithinMs: 5_000 });
+        await a.next();
+        await b.next();
+        let aEnded: unknown;
+        let bEnded: unknown;
+        a.next().then((r) => (aEnded = r), (e: unknown) => (aEnded = e));
+        b.next().then((r) => (bEnded = r), (e: unknown) => (bEnded = e));
+        await vi.advanceTimersByTimeAsync(STREAM_QUIET_TIMEOUT_MS - 1_000);
+        expect(aEnded).toBeUndefined();
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(aEnded).toMatchObject({ status: 0, code: "UNAVAILABLE", message: SERVICE_NO_ANSWER });
+        await vi.advanceTimersByTimeAsync(10 * STREAM_QUIET_TIMEOUT_MS);
+        expect(bEnded).toBeUndefined();
+        expect(opening.signals[0]!.aborted).toBe(false);
+        ac.abort();
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

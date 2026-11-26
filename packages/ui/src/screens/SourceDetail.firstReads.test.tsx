@@ -86,11 +86,11 @@ describe("the source's detail alone: its read has the limit (FR-756 remainder)",
   for (const reRead of ["given up", "failed with no answer"] as const)
     it(`a refused read, then a re-read (the badges refreshed) ${reRead}: the refusal stands while the re-read is out, then one alert, the re-read's (R623 Minor 1)`, async () => {
       styles();
-      const signals: AbortSignal[] = [];
+      const requests: Request[] = [];
       server.use(
         http.get(url("/projects/:id/sources/:sid"), async ({ request }) => {
-          signals.push(request.signal);
-          if (signals.length === 1) return HttpResponse.json({ error: { code: "INTERNAL", message: REFUSED_READ } }, { status: 500 });
+          requests.push(request);
+          if (requests.length === 1) return HttpResponse.json({ error: { code: "INTERNAL", message: REFUSED_READ } }, { status: 500 });
           if (reRead === "failed with no answer") return HttpResponse.error();
           await hang();
           return undefined;
@@ -100,7 +100,7 @@ describe("the source's detail alone: its read has the limit (FR-756 remainder)",
       const { rerender } = render(<SourceDetail {...props} refreshKey={0} />);
       await waitFor(() => expect(alerts().join(" ")).toContain(REFUSED_READ));
       rerender(<SourceDetail {...props} refreshKey={1} />);
-      await waitFor(() => expect(signals).toHaveLength(2));
+      await waitFor(() => expect(requests).toHaveLength(2));
       if (reRead === "given up") {
         expect(alerts()).toHaveLength(1);
         expect(alerts().join(" ")).toContain(REFUSED_READ);

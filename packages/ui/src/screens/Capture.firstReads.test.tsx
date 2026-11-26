@@ -33,24 +33,26 @@ const heading = () => screen.getByRole("heading", { level: 1, name: "Capture" })
  */
 function holding(path: string, hold: (n: number) => boolean) {
   let n = 0;
-  const signals: AbortSignal[] = [];
+  const requests: Request[] = [];
   const gate = hang();
   let release!: () => void;
   const released = new Promise<void>((r) => (release = r));
   return {
     handler: http.get(url(path), async ({ request }) => {
-      signals.push(request.signal);
+      requests.push(request);
       if (hold(++n)) await Promise.race([gate, released]);
       return undefined;
     }),
     count: () => n,
     /** Each ask's request signal (an open stream's must not be aborted). */
-    signals,
+    get signals(): AbortSignal[] {
+      return requests.map((r) => r.signal);
+    },
     release: () => release(),
   };
 }
 
-const show = (m: ReturnType<typeof mockCapture>, p: { firstReadMs?: number; streamOpenMs?: number } = {}) => render(<Capture client={m.client} projectId={P1} {...p} />);
+const show = (m: ReturnType<typeof mockCapture>, p: { firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number } = {}) => render(<Capture client={m.client} projectId={P1} {...p} />);
 
 describe("Capture: first reads that never settle or fail (FR-756)", () => {
   it("a rules read that hangs is given up at the limit: the loading words give way to the alert and “Try again”; pressing it reads again and the screen is ready, focus not lost", async () => {
@@ -266,5 +268,14 @@ describe("Capture: an event stream that does not open within the limit is tried 
     expect(events.count()).toBe(1);
     expect(m.streams()).toBe(1);
     expect(events.signals[0]!.aborted).toBe(false);
+  });
+
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh; the notice does not come (an opening starts the count again)", async () => {
+    const events = holding("/events", () => false);
+    const m = mockCapture({ extra: [events.handler] });
+    show(m, { streamQuietMs: 300 });
+    await waitFor(() => expect(events.count()).toBeGreaterThanOrEqual(5), { timeout: 30_000 });
+    expect(events.signals[0]!.aborted).toBe(true);
+    expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
   });
 });

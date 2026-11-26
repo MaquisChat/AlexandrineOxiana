@@ -5,7 +5,7 @@
  * kept online only download, so the search warns before it starts (Task 14 deferred minor). The
  * library's other maintenance action, "Rebuild library from folder" (spec 4.3, D8), is here too.
  */
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { GovernanceApi, IntegrityAnswer, RelinkResult } from "../api/governance";
 import { RebuildIndex } from "../components/RebuildIndex";
 import { PathField } from "../components/PathField";
@@ -19,6 +19,9 @@ const SKIP_REASON: Record<string, string> = {
   "verify-failed": "a file with the same name was found but its content is different",
   "target-exists": "a different file already sits where it belongs",
 };
+
+/** Review M3: the check's progress is told to a screen reader at most this often (it is shown as it comes). */
+const SAY_PROGRESS_MS = 5_000;
 
 const files = (n: number) => (n === 1 ? "1 file" : `${n.toLocaleString("en-US")} files`);
 
@@ -35,17 +38,70 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
   const [folder, setFolder] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<RelinkResult | null>(null);
+  /** R641 D3: how far the running check is (none while its files are listed), and whether it was stopped. */
+  const [progress, setProgress] = useState<{ checked: number; total: number } | null>(null);
+  const [stopped, setStopped] = useState(false);
+  const running = useRef<AbortController | null>(null);
+  const checkAgainRef = useRef<HTMLButtonElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  /** Review M3: the progress line as last told to a screen reader, and when. */
+  const [said, setSaid] = useState("");
+  const saidAt = useRef(Number.NEGATIVE_INFINITY);
+  const line = progress ? `Checked ${progress.checked.toLocaleString("en-US")} of ${progress.total.toLocaleString("en-US")} files…` : null;
+  useEffect(() => {
+    if (line === null) return;
+    const say = () => {
+      saidAt.current = Date.now();
+      setSaid(line);
+    };
+    const wait = saidAt.current + SAY_PROGRESS_MS - Date.now();
+    if (wait <= 0) return say();
+    const t = setTimeout(say, wait);
+    return () => clearTimeout(t);
+  }, [line]);
 
   const load = useCallback(async () => {
+    running.current?.abort();
+    const ac = new AbortController();
+    running.current = ac;
+    saidAt.current = Number.NEGATIVE_INFINITY;
+    setSaid("");
+    setError(null);
+    setStopped(false);
+    setProgress(null);
+    setIntegrity(null);
     try {
-      setIntegrity(await api.integrity());
+      // No time limit (R601): a large library on a slow disk takes as long as it takes; "Stop" ends it.
+      const answer = await api.integrityProgress({ signal: ac.signal, onProgress: (checked, total) => !ac.signal.aborted && setProgress({ checked, total }) });
+      if (!ac.signal.aborted) setIntegrity(answer);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "The library could not be checked.");
+      if (!ac.signal.aborted) setError(err instanceof Error ? err.message : "The library could not be checked.");
+    } finally {
+      if (running.current === ac) {
+        running.current = null;
+        setProgress(null);
+      }
     }
   }, [api]);
   useEffect(() => {
     void load();
+    return () => running.current?.abort();
   }, [load]);
+  /** Stops the running check: it only reads, so nothing was changed; the page says so and offers to check again. */
+  const stop = () => {
+    running.current?.abort();
+    running.current = null;
+    setProgress(null);
+    setStopped(true);
+  };
+  useEffect(() => {
+    if (stopped) checkAgainRef.current?.focus();
+  }, [stopped]);
+  /** R658: "Check again" goes away as the check starts; focus, which was on it, is handed to the heading. */
+  const checkAgain = () => {
+    headingRef.current?.focus();
+    void load();
+  };
 
   const search = async () => {
     setBusy(true);
@@ -63,14 +119,43 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
   const missing = integrity?.report.missing ?? [];
   return (
     <main className="ao-screen">
-      <h1>Missing files</h1>
+      <h1 ref={headingRef} tabIndex={-1}>
+        Missing files
+      </h1>
       {error ? (
         <p role="alert" className="ao-warning">
           {error}
         </p>
       ) : null}
-      {!integrity ? (
-        !error ? <p role="status">Checking the library…</p> : null
+      {stopped ? (
+        <div className="ao-actions">
+          <p role="status">The check was stopped. Nothing was changed.</p>
+          <button type="button" ref={checkAgainRef} onClick={checkAgain}>
+            Check again
+          </button>
+        </div>
+      ) : !integrity ? (
+        error ? (
+          // A check that failed (partway or at once) has a way on (review I2).
+          <div className="ao-actions">
+            <button type="button" onClick={checkAgain}>
+              Check again
+            </button>
+          </div>
+        ) : progress ? (
+          <div className="ao-actions">
+            {/* Shown as it comes; told to a screen reader by the status below, at most every SAY_PROGRESS_MS (review M3). */}
+            <p>{line}</p>
+            <p role="status" className="ao-visually-hidden">
+              {said}
+            </p>
+            <button type="button" onClick={stop}>
+              Stop
+            </button>
+          </div>
+        ) : (
+          <p role="status">Checking the library…</p>
+        )
       ) : missing.length === 0 ? (
         <p>No files are missing.</p>
       ) : (

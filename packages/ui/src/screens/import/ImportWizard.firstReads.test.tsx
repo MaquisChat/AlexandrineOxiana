@@ -8,7 +8,7 @@
  */
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { http } from "msw";
+import { http, HttpResponse } from "msw";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { B1, BASE, mockService, P1, server, type ServiceSetup } from "../../test/importService";
 import { hang } from "../../test/service";
@@ -28,20 +28,22 @@ const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent);
 /** A GET whose asks are counted; the asks `hold(n)` picks are held until `release()` (or the test's end), else answered by the mocked service. */
 function holding(path: string, hold: (n: number) => boolean) {
   let n = 0;
-  const signals: AbortSignal[] = [];
+  const requests: Request[] = [];
   const gate = hang();
   let release!: () => void;
   const released = new Promise<void>((r) => (release = r));
   let freed = false;
   return {
     handler: http.get(url(path), async ({ request }) => {
-      signals.push(request.signal);
+      requests.push(request);
       if (hold(++n) && !freed) await Promise.race([gate, released]);
       return undefined;
     }),
     count: () => n,
     /** Each ask's request signal (an open stream's must not be aborted). */
-    signals,
+    get signals(): AbortSignal[] {
+      return requests.map((r) => r.signal);
+    },
     /** Lets every held ask, and every later one, be answered. */
     release: () => {
       freed = true;
@@ -50,9 +52,9 @@ function holding(path: string, hold: (n: number) => boolean) {
   };
 }
 
-function open(o: ServiceSetup, p: { firstReadMs?: number; streamOpenMs?: number; batch?: boolean } = {}) {
+function open(o: ServiceSetup, p: { firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number; batch?: boolean } = {}) {
   const m = mockService(o);
-  render(<ImportWizard client={m.client} projectId={P1} {...(p.batch === false ? {} : { batchId: B1 })} {...(p.firstReadMs !== undefined ? { firstReadMs: p.firstReadMs } : {})} {...(p.streamOpenMs !== undefined ? { streamOpenMs: p.streamOpenMs } : {})} />);
+  render(<ImportWizard client={m.client} projectId={P1} {...(p.batch === false ? {} : { batchId: B1 })} {...(p.firstReadMs !== undefined ? { firstReadMs: p.firstReadMs } : {})} {...(p.streamOpenMs !== undefined ? { streamOpenMs: p.streamOpenMs } : {})} {...(p.streamQuietMs !== undefined ? { streamQuietMs: p.streamQuietMs } : {})} />);
   return m;
 }
 
@@ -214,6 +216,81 @@ describe("Import wizard, run step: its first read and its event stream (FR-756, 
     expect(events.count()).toBe(1);
     expect(events.signals[0]!.aborted).toBe(false);
     expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
+  });
+
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled, the batch's state checked, and the stream opened afresh", async () => {
+    // The second try is held, never opening: the step rests there (its opening limit is the default 20 s).
+    const events = holding("/events", (n) => n === 2);
+    const batches = holding(`/projects/${P1}/imports`, () => false);
+    open({ batches: [running], extra: [events.handler, batches.handler] }, { streamQuietMs: 300 });
+    await screen.findByRole("heading", { name: "Run" });
+    await waitFor(() => expect(events.count()).toBe(2), { timeout: 10_000 });
+    expect(events.signals[0]!.aborted).toBe(true);
+    expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
+  });
+
+  // R658 (review M5): a connection that proved itself starts the step's count of tries again. The step's own limit is
+  // three tries in a row (two reconnects); five proven connections in a row are more than that. The sixth try is held,
+  // never opening (its opening limit is the default 20 s): the step rests there, still following.
+  it("R658: more silences in a row than the step's tries, each after the stream opened, do not end in the notice: the step keeps following", async () => {
+    const events = holding("/events", (n) => n === 6);
+    open({ batches: [running], extra: [events.handler] }, { streamQuietMs: 300 });
+    await screen.findByRole("heading", { name: "Run" });
+    await waitFor(() => expect(events.count()).toBe(6), { timeout: 20_000 });
+    for (let i = 0; i < 5; i++) expect(events.signals[i]!.aborted).toBe(true);
+    expect(events.signals[5]!.aborted).toBe(false);
+    expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+  });
+
+  /** R659: `/events` answered as the real service does: the opening `library.state` event, then `then`, then the stream
+   *  ends. Connections after `upTo` are held, never opening (the step rests there); `n()` counts the connections. */
+  function dropping(then: string, upTo = Infinity) {
+    let n = 0;
+    const requests: Request[] = [];
+    const gate = hang();
+    const opening = `event: library.state\ndata: ${JSON.stringify({ open: true, libraryId: "lib-1", mode: "read-write" })}\n\n`;
+    return {
+      handler: http.get(url("/events"), async ({ request }) => {
+        requests.push(request);
+        if (++n <= upTo) return new HttpResponse(`${opening}${then}`, { headers: { "Content-Type": "text/event-stream" } });
+        await gate;
+        return undefined;
+      }),
+      n: () => n,
+      requests,
+    };
+  }
+  const progress = (batchId: string) => `event: import.progress\ndata: ${JSON.stringify({ batchId, projectId: P1, state: "running", done: 1, total: 3 })}\n\n`;
+
+  it("R659: a stream that sends only the service's opening state and ends, every time, ends after the step's tries in the notice with “Check again”; the step then rests", async () => {
+    const events = dropping("");
+    open({ batches: [running], extra: [events.handler] });
+    await screen.findByText(/Progress updates are not available right now/, {}, { timeout: 20_000 });
+    expect(screen.getByRole("button", { name: "Check again" })).toBeTruthy();
+    // The step's loop has ended with the notice: no further connection is made.
+    expect(events.n()).toBe(3);
+  });
+
+  it("R658, R659: a stream that delivered a progress event of this batch and then dropped, more times than the step's tries, does not end in the notice: the step keeps following", async () => {
+    // Each of the first five streams sends the opening state, then this batch's progress, and ends; the sixth is held.
+    const events = dropping(progress(B1), 5);
+    open({ batches: [running], extra: [events.handler] });
+    await screen.findByRole("heading", { name: "Run" });
+    await waitFor(() => expect(events.n()).toBe(6), { timeout: 20_000 });
+    expect(events.requests[5]!.signal.aborted).toBe(false);
+    expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+    expect(screen.getByText("1 of 3 items")).toBeTruthy();
+  });
+
+  it("R659: a stream that delivered the opening state and another batch's event and then dropped, every time, ends after the step's tries in the notice", async () => {
+    const events = dropping(progress("another-batch"));
+    open({ batches: [running], extra: [events.handler] });
+    await screen.findByText(/Progress updates are not available right now/, {}, { timeout: 20_000 });
+    expect(screen.getByRole("button", { name: "Check again" })).toBeTruthy();
+    expect(events.n()).toBe(3);
+    expect(screen.getByText("Starting…")).toBeTruthy();
   });
 });
 

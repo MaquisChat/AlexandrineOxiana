@@ -82,6 +82,7 @@ export const errorResponse = (status: number, code: string, message: string, rea
 export function mockCapture(o: CaptureSetup = {}): CaptureMock {
   const calls: Recorded[] = [];
   const open = new Set<ReadableStreamDefaultController<Uint8Array>>();
+  const held: Request[] = [];
   const enc = new TextEncoder();
   const acks = new Set(o.acknowledged ?? []);
   const url = (p: string) => `${BASE}${p}`;
@@ -186,6 +187,9 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
           open.delete(ctl);
         },
       });
+      // The request is kept: Node's Request passes the caller's abort on through a weak reference, so a listener on the
+      // signal of a request no longer held can miss it.
+      held.push(request);
       request.signal.addEventListener("abort", () => open.delete(ctl));
       return new HttpResponse(stream, { headers: { "Content-Type": "text/event-stream" } });
     }),

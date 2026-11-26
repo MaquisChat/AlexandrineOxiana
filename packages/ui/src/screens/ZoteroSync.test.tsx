@@ -19,7 +19,7 @@ import {
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ImportApi, ImportReport } from "../api/import";
 import { zoteroSyncApi } from "../api/zoteroSync";
 import { App } from "../App";
@@ -102,6 +102,24 @@ function eventStream() {
       const body = new ReadableStream<Uint8Array>({
         start(c) {
           ctl = c;
+          // As the real service does (routes/libraries.ts), a keep-alive every 25 seconds, so a screen's silence limit
+          // (R641 D2) never takes this stream for lost, under the test's own clock too. It stops when the stream ends.
+          let beat: ReturnType<typeof setTimeout> | undefined;
+          const next = () => {
+            beat = setTimeout(() => {
+              try {
+                c.enqueue(enc.encode(": keep-alive\n\n"));
+                next();
+              } catch {
+                // the stream has ended
+              }
+            }, 25_000);
+          };
+          next();
+          onTestFinished(() => clearTimeout(beat));
+        },
+        cancel() {
+          // nothing more is sent (the timer's next enqueue fails and stops it)
         },
       });
       return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
@@ -1384,6 +1402,15 @@ describe("Zotero: first reads that never settle (FR-750, R579)", () => {
     expect(ev.signals()[0]!.aborted).toBe(false);
   });
 
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh", async () => {
+    useSvc();
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<ZoteroSync client={testClient()} streamQuietMs={300} />);
+    await waitFor(() => expect(ev.attempts()).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(ev.signals()[0]!.aborted).toBe(true);
+  });
+
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
     const svc = useSvc();
     const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
@@ -1414,10 +1441,10 @@ describe("Zotero: first reads that never settle (FR-750, R579)", () => {
 describe("Zotero: the read of the projects beside the screen (FR-756 remainder)", () => {
   function heldProjects() {
     const gate = hang();
-    const seen: AbortSignal[] = [];
+    const seen: Request[] = [];
     server.use(
       http.get(url("/projects"), async ({ request }) => {
-        seen.push(request.signal);
+        seen.push(request);
         await gate;
         return HttpResponse.json({ projects: [] });
       }),
@@ -1431,7 +1458,7 @@ describe("Zotero: the read of the projects beside the screen (FR-756 remainder)"
     render(<ZoteroSync client={testClient()} firstReadMs={300} />);
     await screen.findByTestId("zotero-libraries");
     await waitFor(() => expect(seen.length).toBeGreaterThan(0));
-    await waitFor(() => expect(seen.every((s) => s.aborted)).toBe(true), { timeout: 3000 });
+    await waitFor(() => expect(seen.every((r) => r.signal.aborted)).toBe(true), { timeout: 3000 });
     expect(screen.queryAllByRole("alert")).toHaveLength(0);
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   });
@@ -1442,8 +1469,8 @@ describe("Zotero: the read of the projects beside the screen (FR-756 remainder)"
     const view = render(<ZoteroSync client={testClient()} firstReadMs={60_000} />);
     await screen.findByTestId("zotero-libraries");
     await waitFor(() => expect(seen.length).toBeGreaterThan(0));
-    expect(seen.some((s) => s.aborted)).toBe(false);
+    expect(seen.some((r) => r.signal.aborted)).toBe(false);
     view.unmount();
-    await waitFor(() => expect(seen.every((s) => s.aborted)).toBe(true), { timeout: 1000 });
+    await waitFor(() => expect(seen.every((r) => r.signal.aborted)).toBe(true), { timeout: 1000 });
   });
 });
