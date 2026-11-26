@@ -1189,6 +1189,36 @@ describe("run hooks (whole channels, Task 3)", { timeout: 120_000 }, () => {
     expect(r).toMatchObject({ status: "completed", created: 1, duplicates: 1, failed: 1 });
   });
 
+  it("a Resume takes an id the listing still has even when its date now lies outside the run's dates (R677)", async () => {
+    const prof = synthetic();
+    const p = await project();
+    // guard: without onlyIds the date filter works as before (items 6 to 12 are on or after 2026-01-08)
+    const first = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, since: "2026-01-08" });
+    expect(first).toMatchObject({ status: "completed", created: 7, listComplete: false });
+    const old = item(3).id; // dated 2026-01-05: before the run's dates
+    const asked: string[] = [];
+    const told: Array<[string, string]> = [];
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, since: "2026-01-08", maxItems: 1, onlyIds: [old, prof.items[0]!.id] }, undefined, {
+      hooks: {
+        beforeItem: async (e) => (asked.push(e.id), "go"),
+        afterItem: async (e, out) => void told.push([e.id, out.status]),
+      },
+    });
+    expect(asked).toEqual([old, prof.items[0]!.id]);
+    expect(told).toEqual([
+      [old, "created"],
+      [prof.items[0]!.id, "duplicate"],
+    ]);
+    expect(itemDownloads().map((j) => idOfUrl(j.input))).toContain(old);
+    expect(r).toMatchObject({ status: "completed", created: 1, duplicates: 1, failed: 0 });
+    // the listing is cut by the platform only without onlyIds
+    const listings = worker.submitted.filter((j) => j.params.flatList).map((j) => [j.params.dateAfter, j.params.maxItems]);
+    expect(listings).toEqual([
+      ["20260108", undefined],
+      [undefined, undefined],
+    ]);
+  });
+
   it("a Resume after a failed journal write tells the stored post again, as a duplicate (R674 A)", async () => {
     const prof = synthetic();
     const p = await project();

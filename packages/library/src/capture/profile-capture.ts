@@ -106,8 +106,8 @@ export interface ProfileCaptureOptions extends CaptureOptions {
   /** Also save each new post's comments (third-party personal data; default false). */
   includeComments?: boolean;
   /**
-   * Only these posts (by the platform's id), in this order, among those listed (a download run's
-   * Resume). Every id is reported: one already stored as a duplicate, one no longer listed as failed
+   * Only these posts (by the platform's id), in this order, among those listed, whatever the dates
+   * and the maximum (a download run's Resume). Every id is reported: one already stored as a duplicate, one no longer listed as failed
    * (`NOT_FOUND_OR_REMOVED`, after the listed ones). Not a filter for removed detection.
    */
   onlyIds?: string[];
@@ -710,10 +710,12 @@ export function createProfileCapture(core: CaptureCore) {
     /** `onlyIds` the listing no longer has: each is told as failed (removed), after the listed ones (R674 A). */
     let unlisted: ListedEntry[] = [];
     if (opts.onlyIds) {
-      // Only these, in the order given, among the posts listed (within the dates). A post already
-      // stored is not left out: it takes the duplicate path below and is reported as a duplicate,
-      // so a Resume reports every id it was given (R674 A).
-      const pool = new Map(dated.map((e) => [e.id, e] as const));
+      // Only these, in the order given, among everything the listing has: not cut by the run's dates
+      // or maximum (the ids were chosen by an earlier listing under the same options; a post whose
+      // date the platform changed is still taken, R677). A post already stored is not left out: it
+      // takes the duplicate path below and is reported as a duplicate, so a Resume reports every id
+      // it was given (R674 A).
+      const pool = new Map(listed.map((e) => [e.id, e] as const));
       const ids = [...new Set(opts.onlyIds)];
       fresh = ids.flatMap((id) => (pool.has(id) ? [pool.get(id)!] : []));
       unlisted = ids.filter((id) => !listedIds.has(id)).map((id) => ({ id, url: postUrl(platform, id, handle) ?? "", raw: {}, listing: fallbackListing }));
@@ -974,9 +976,11 @@ export function createProfileCapture(core: CaptureCore) {
               tool,
               ...(tool === "yt-dlp" ? { flatList: true } : {}),
               metadataOnly: true,
-              ...(opts.maxItems ? { maxItems: opts.maxItems } : {}),
-              ...(opts.since ? { dateAfter: ymd(opts.since) } : {}),
-              ...(opts.until ? { dateBefore: ymd(opts.until) } : {}),
+              // A Resume's `onlyIds` are looked for in the whole listing, so the platform is not
+              // asked to cut it by date or number (R677); the run's own limits still apply below.
+              ...(opts.maxItems && !opts.onlyIds ? { maxItems: opts.maxItems } : {}),
+              ...(opts.since && !opts.onlyIds ? { dateAfter: ymd(opts.since) } : {}),
+              ...(opts.until && !opts.onlyIds ? { dateBefore: ymd(opts.until) } : {}),
               ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
             },
           });
