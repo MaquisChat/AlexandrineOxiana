@@ -267,8 +267,12 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
     // A failed video goes back to work only when it is taken (beforeItem → running clears its error):
     // a Resume that the rules refuse, or whose listing ends early, leaves every failure as it was (I1).
     let onlyIds: string[] | undefined;
+    /** The video in hand when the last segment was cut: stored by this run if it now comes as a duplicate (I2). */
+    const wasRunning = new Set<string>();
     if (!readList) {
-      onlyIds = (await readRunItems(repo, projectId, runId)).filter((i) => i.status !== "done").map((i) => i.item.postId);
+      const items = await readRunItems(repo, projectId, runId);
+      onlyIds = items.filter((i) => i.status !== "done").map((i) => i.item.postId);
+      for (const i of items) if (i.status === "running") wasRunning.add(i.item.postId);
     }
 
     const root = repoLibrary(repo).root;
@@ -283,7 +287,7 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
     let inHand: string | undefined;
     /** A failure left less than the floor free: the next video pauses on the disk (Review Focus 2). */
     let diskPause = false;
-    /** The project's rules refused transcription: not asked again in this segment. */
+    /** Transcription was refused (the rules, a read-only library): not asked again in this segment. */
     let transcribeRefused = false;
     /** The videos told an outcome in this segment. */
     const told = new Set<string>();
@@ -338,18 +342,24 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
           }
           return;
         }
-        await write(() => recordRunItem(repo, projectId, runId, e.id, { status: "done", ...(out.sourceId ? { sourceId: out.sourceId } : {}) }));
-        if (opts.transcribe && out.sourceId && out.status !== "duplicate" && !transcribeRefused) {
+        // A video this run stored goes on the transcription list BEFORE its own outcome is written, so a
+        // cut between the two never leaves it off the list (the add skips a source already pending). A
+        // duplicate is this run's own only when it was the video in hand when the last segment was cut.
+        const stored = out.status !== "duplicate" || wasRunning.has(e.id);
+        let queued: string | undefined;
+        if (opts.transcribe && out.sourceId && stored && !transcribeRefused) {
           guard();
           try {
             const { added } = await addToTranscriptionList(repo, projectId, [{ sourceId: out.sourceId, ...(opts.transcribeModel ? { model: opts.transcribeModel } : {}) }]);
-            if (added > 0) ctl.onQueuedForTranscription?.(out.sourceId);
-          } catch (err) {
-            // The deny is audited; the downloads go on without it.
-            if (err instanceof PolicyDeniedError) transcribeRefused = true;
-            else throw err;
+            if (added > 0) queued = out.sourceId;
+          } catch {
+            // Refused by the rules (audited) or not writable: the downloads go on without it, and the
+            // following videos are not offered to the list either.
+            transcribeRefused = true;
           }
         }
+        await write(() => recordRunItem(repo, projectId, runId, e.id, { status: "done", ...(out.sourceId ? { sourceId: out.sourceId } : {}) }));
+        if (queued !== undefined) ctl.onQueuedForTranscription?.(queued);
       },
       wait: async (ms, why) => {
         await write(() => setRunState(repo, projectId, runId, "waiting", { wait: { ms, why } }));

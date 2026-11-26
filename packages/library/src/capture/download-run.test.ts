@@ -434,6 +434,80 @@ describe("download runs", { timeout: 120_000 }, () => {
     expect(worker.submitted.filter((j) => j.type === "audio.transcribe")).toHaveLength(0);
   });
 
+  it("a video stored just before a cut reaches the transcription list at the Resume", async () => {
+    const prof = synthetic(3);
+    const p = await project();
+    const id = newRunId();
+    const TR: RunOptions = { transcribe: true, quality: "720p" };
+    // the cut comes once the first video is stored, before its own outcome is written
+    let baseline = Infinity;
+    let cut = false;
+    onDownloadOf(prof.items[0]!.id, () => void (baseline = repo.listSourceIds(p.id).length));
+    const c = control({ cancelled: () => (cut ||= repo.listSourceIds(p.id).length > baseline) });
+    await expect(runs.start(p.id, id, TT_PROFILE, TR, c.ctl)).rejects.toBeInstanceOf(CaptureCancelledError);
+    vi.restoreAllMocks();
+    expect(await posts(p.id)).toHaveLength(1);
+    expect((await readRunItems(repo, p.id, id)).map((i) => i.status)).toEqual(["running", "queued", "queued"]);
+
+    const told: string[] = [];
+    const run = await runs.resume(p.id, id, "researcher", control({ onQueuedForTranscription: (sid) => void told.push(sid) }).ctl);
+    expect(run).toMatchObject({ state: "finished", done: 3 });
+    const stored = (await posts(p.id)).map((sf) => sf.source.id).sort();
+    expect(stored).toHaveLength(3);
+    expect((await readTranscriptionList(repo, p.id)).pending.map((e) => e.entry.sourceId).sort()).toEqual(stored);
+    expect([...told].sort()).toEqual(stored);
+  });
+
+  it("a lock during a video's done write still leaves it on the transcription list", async () => {
+    const p = await project();
+    const id = newRunId();
+    const TR: RunOptions = { transcribe: true, quality: "720p" };
+    const c = control({
+      onChange: (r) => {
+        c.changes.push(r);
+        if (r.done === 1) c.cancel();
+      },
+    });
+    await expect(runs.start(p.id, id, TT_PROFILE, TR, c.ctl)).rejects.toBeInstanceOf(CaptureCancelledError);
+    expect((await readTranscriptionList(repo, p.id)).pending).toHaveLength(1);
+    expect(await runs.resume(p.id, id, "researcher", control().ctl)).toMatchObject({ state: "finished", done: 3 });
+    const stored = (await posts(p.id)).map((sf) => sf.source.id).sort();
+    expect(stored).toHaveLength(3);
+    expect((await readTranscriptionList(repo, p.id)).pending.map((e) => e.entry.sourceId).sort()).toEqual(stored);
+  });
+
+  it("a video another capture stored is not put on the transcription list at a Resume", async () => {
+    const prof = synthetic(3);
+    const p = await project();
+    const id = newRunId();
+    const TR: RunOptions = { transcribe: true, quality: "720p" };
+    const c = control({ onItem: (done) => (done === 1 ? c.ask("pause") : undefined) });
+    expect(await runs.start(p.id, id, TT_PROFILE, TR, c.ctl)).toMatchObject({ state: "paused", done: 1 });
+    const first = (await readRunItems(repo, p.id, id))[0]!.item.sourceId!;
+    // another run, not transcribing, stores the other two meanwhile
+    expect(await runs.start(p.id, newRunId(), TT_PROFILE, OPTS, control().ctl)).toMatchObject({ state: "finished", total: 2, done: 2 });
+    expect(await posts(p.id)).toHaveLength(3);
+    const told: string[] = [];
+    const run = await runs.resume(p.id, id, "researcher", control({ onQueuedForTranscription: (sid) => void told.push(sid) }).ctl);
+    expect(run).toMatchObject({ state: "finished", done: 3 });
+    expect(itemDownloads().filter((x) => x === prof.items[1]!.id || x === prof.items[2]!.id)).toHaveLength(2); // only by the other run
+    expect((await readTranscriptionList(repo, p.id)).pending.map((e) => e.entry.sourceId)).toEqual([first]);
+    expect(told).toEqual([]);
+  });
+
+  it("a refused transcription keeps the run going", async () => {
+    const p = await project(`${GOV}processing:\n  transcription: []\n`);
+    const id = newRunId();
+    const told: string[] = [];
+    const run = await runs.start(p.id, id, TT_PROFILE, { transcribe: true, quality: "720p" }, control({ onQueuedForTranscription: (sid) => void told.push(sid) }).ctl);
+    expect(run).toMatchObject({ state: "finished", done: 3, failed: 0 });
+    expect((await readRunItems(repo, p.id, id)).map((i) => i.status)).toEqual(["done", "done", "done"]);
+    expect((await readTranscriptionList(repo, p.id)).pending).toHaveLength(0);
+    expect(told).toEqual([]);
+    // asked once, refused once: not asked again for the videos after it
+    expect((await auditEvents(p.folder)).filter((e) => e.decision?.result === "deny")).toHaveLength(1);
+  });
+
   it("a run cut by a cancel writes nothing more and shows as interrupted when not held", async () => {
     const prof = synthetic(3);
     const p = await project();
