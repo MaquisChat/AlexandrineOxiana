@@ -84,3 +84,72 @@ Runs: test_download.py 47 passed, test_tools.py 61 passed, test_api.py 30 passed
   - JS-solver timeouts that might contain "timed out".
 - WKWebView playback of AV1, VP9 and MKV on M1/M2 compared with M3, and on the macOS versions the app supports (I4).
 - Disk use and time for "best" with no quality on real channels (I3).
+
+---
+
+## Second look (R671) — cbec715..4ecfc44
+
+**Verdict: CHANGES NEEDED.** Points A1–A3, B1–B5, C1–C5 and D1 are built as pinned and are tested. The three test files pass (test_download 89, test_tools 62, test_api 30). One finding I missed in the first round decides the verdict: the new failure codes do not come back as failures in the order real yt-dlp works.
+
+### Important (new)
+**N1. A connection lost, a disk filled or ffmpeg gone in the middle of a download comes back as a "done" job, not as a failure.** `download.py:602-608` (`run`). A job counts as partial whenever `files` is non-empty. Real yt-dlp writes the info JSON, the captions (`--write-subs --write-auto-subs`) and the thumbnail (`--write-thumbnail`) BEFORE it downloads the picture and sound. After a failure during the download itself, the folder therefore holds a `.webp` and some `.vtt` files.
+
+I ran a probe with a fake yt-dlp that writes the info JSON, a `.vtt`, a `.webp` and a `.part`, then fails with `ERROR: [Errno 54] Connection reset by peer. Giving up after 3 retries`. The result is `status done, partial True, errorCode NETWORK_LOST`, with no error. The library then stores an incomplete source holding only the thumbnail and captions (`link-capture.ts:565`, `:628`). In that case:
+- Task 3's rules never see a failure. The second lost connection in a row does not wait (Review Focus 1). DISK_FULL does not pause (Review Focus 2). A vanished ffmpeg (B5) is not a missing tool, because the real yt-dlp leaves the unmerged `.fNNN` streams.
+- A later retry of that video finds a duplicate, so the video is never downloaded.
+- The design's "nothing half-downloaded is kept" is broken.
+
+The new tests miss this because `FAKE_YTDLP_STDERR` fails before writing anything.
+
+Smallest fix, in the worker, for a yt-dlp download (not `flatList` or `metadataOnly`):
+- raise the JobError for NETWORK_LOST, DISK_FULL and TOOL_NOT_INSTALLED whatever was written;
+- otherwise, count a job as partial only when a video or audio file other than a `.fNNN` stream was written.
+
+Tests: a fake that writes a thumbnail and captions, then fails with each of those codes, gives `failed`. The existing `ratelimit-partial` test (an mp4 written, then 429) stays partial.
+
+### The pinned yt-dlp arguments (point 2)
+- `-S res:N`: `res` is the smaller side, and a limit prefers the largest value up to N, else the smallest above it. So an upright video is not thrown out and the sort never fails. User fields come before the defaults (only `hasvid` and `ie_pref` are forced ahead), so the size is never lowered for the codec's sake.
+- `vcodec:h264` matches `[hx]264|avc` and puts H.264 first, with other codecs as fallback. `acodec:m4a` matches `mp?4a?`. avc1 with mp4a is joined into MP4 (`get_compatible_ext`). All of these flags exist in every yt-dlp recent enough for `--js-runtimes`, which the app already requires. `--abort-on-unavailable-fragments` is long-standing and not deprecated.
+- `-f "bv*+ba/b"` cannot give "Requested format is not available" on YouTube. On a site with only video-only formats and no separate audio it still can, and so can `-f b` ("ready").
+- With `ba[ext=m4a]` and `-x --audio-format m4a`, yt-dlp copies the AAC without re-encoding. That is right.
+- **What I would add:** `--merge-output-format mp4` on the three video qualities and on the no-quality default. Above 1080p YouTube has no H.264. There, `acodec:m4a` combined with a VP9 picture (the codec ordered next after H.264 among the codecs above the limit) gives VP9 with AAC. That pair is incompatible with both MP4 and WebM, so yt-dlp writes **`.mkv`**, which WKWebView does not play at all. With `--merge-output-format mp4` the file is always `.mp4`. VP9 or AV1 inside MP4 still needs a Mac that can decode them; only a real Mac shows whether it plays. It costs nothing when the pair is already H.264/AAC.
+- Smaller points:
+  - `fps` before `vcodec` lets a 60 fps VP9 beat a 30 fps H.264 at the same size. YouTube usually has H.264 at 60 fps up to 1080p.
+  - Audio that a site labels `aac` ranks above `mp4a` in yt-dlp's order, so it counts as "over the limit" and is ranked lower. This is rare.
+
+### Guard and order (point 3)
+- Removing the `HTTP ?Error` guard now fails 2 tests, so it is pinned.
+- Removing the 5xx alternative from RATE_LIMITED fails 3 tests.
+- Every case in the brief is named as the brief says (all 11 pass). The order (TOOL_NOT_INSTALLED, PRIVATE, GEO_BLOCKED, RATE_LIMITED, LOGIN_REQUIRED, DISK_FULL, NETWORK_LOST, NOT_FOUND_OR_REMOVED) is right for them. The 504 with "timed out" is RATE_LIMITED before the guard matters, so the implementer's added 404 case is the right pin.
+
+### Mutations (each restored)
+- **A2.** Removing the 720p default when ffmpeg is found and no quality is given: 1 test failed.
+- **B1.** Removing the `][error]` line pick-up: **all 89 passed.** The brief's gallery-dl case is rescued by B2's `HttpError` guard. A gallery-dl failure without an HTTP answer is not pinned. A probe shows it: a retry warning with "Read timed out", followed by `[instagram][error] NotFoundError: Requested user could not be found`, gives NETWORK_LOST without B1 and EXTRACTOR_ERROR with it. Minor: add that case. gallery-dl's "could not be found" is not NOT_FOUND_OR_REMOVED either; that gap predates this round.
+- **C4.** Removing the refusals: 5 tests failed.
+
+### platform_reason (point 4)
+The four codes still give their sentence. Probes:
+- PRIVATE gives "This video is private…".
+- GEO_BLOCKED gives "The uploader has not made this video available in your country".
+- LOGIN_REQUIRED gives "Sign in to confirm your age. This video may be inappropriate for some users.", cut before " Use --".
+- NOT_FOUND_OR_REMOVED gives "Video unavailable. This video is no longer available due to a copyright claim by …".
+- HTTP 404 and ConnectionPool texts give None. EXTRACTOR_ERROR and RATE_LIMITED give none.
+
+What still gets through (all Minor):
+- **A home path.** `redact()` runs before the path refusal, so `<home>/Library/Cookies/x` becomes `~/Library/Cookies/x` and passes. `test_platform_reason_hides_the_home_folder` accepts this. Fix: refuse `~/` too.
+- **A query with no `/` before it**, for example `token=s3cr3t&sig=AAA watch?v=1`. This shape is synthetic. Fix: refuse any `?` followed by `=`.
+- **Invisible characters** U+061C (a direction mark), U+2060 and U+00AD survive. Fix: add them to `_CONTROL_RE`.
+- **Program words in lower case.** "use --cookies …" passes because the cut is ` Use --` only. Fix: cut at any ` --` followed by a letter.
+
+### Contract and tests (point 5)
+- The wire is unchanged: the quality values, `platformReason`, the codes, and the refusal before yt-dlp starts for a download.
+- `ERROR_CODES` gained `TOOL_NOT_INSTALLED`. The constant is internal; nothing outside `download.py` reads it.
+- Three existing tests changed, each named, each for a pinned new value: the format strings (×2) and the ellipsis.
+- A2 says "byte for byte what the worker sent before", and A3 adds `--abort-on-unavailable-fragments`. The implementer followed A3 and the test says so. That is right.
+- No test was loosened, except the weak home-folder assertion above.
+- The fake yt-dlp gained only `FAKE_YTDLP_STDERR`.
+- `git status --short` is empty.
+
+### What I could not check
+- Real yt-dlp file order and output on a live network. N1 rests on yt-dlp's known order: info JSON, captions and thumbnail, then the download.
+- MKV, VP9-in-MP4 and AV1-in-MP4 playback in WKWebView on M1/M2 compared with M3.
