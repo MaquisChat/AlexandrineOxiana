@@ -42,7 +42,6 @@ import {
   readRunItems,
   readRuns,
   recordRunItem,
-  requeueFailedItems,
   setRunItems,
   setRunState,
   type RunView,
@@ -265,9 +264,10 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
     const opts = runOptionsOf(run.options);
     /** A run that never read its list is resumed as a start (its decision is still the resume's). */
     const readList = resume === undefined || run.total === 0;
+    // A failed video goes back to work only when it is taken (beforeItem → running clears its error):
+    // a Resume that the rules refuse, or whose listing ends early, leaves every failure as it was (I1).
     let onlyIds: string[] | undefined;
     if (!readList) {
-      await write(() => requeueFailedItems(repo, projectId, runId));
       onlyIds = (await readRunItems(repo, projectId, runId)).filter((i) => i.status !== "done").map((i) => i.item.postId);
     }
 
@@ -285,6 +285,8 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
     let diskPause = false;
     /** The project's rules refused transcription: not asked again in this segment. */
     let transcribeRefused = false;
+    /** The videos told an outcome in this segment. */
+    const told = new Set<string>();
 
     const hooks: RunHooks = {
       onListed: async (fresh, meta) => {
@@ -321,6 +323,7 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
       },
       afterItem: async (e, out) => {
         inHand = undefined;
+        told.add(e.id);
         lastNoDownload = out.status === "duplicate";
         if (out.status === "failed") {
           const free = await readFree(root);
@@ -359,24 +362,42 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
       },
     };
 
-    const report = await capture.captureProfile(
-      projectId,
-      run.url,
-      { ...profileOptions(opts), ...(onlyIds ? { onlyIds } : {}), ...(resume ? { resume } : {}) },
-      (done, total, out) => ctl.onItem?.(done, total, out),
-      { cancelled: () => ctl.cancelled(), signal: ctl.signal, hooks },
-    );
+    /** The video in hand goes back to be done again when the segment ends without it. */
+    const putBackInHand = async () => {
+      if (inHand === undefined) return;
+      const back = inHand;
+      inHand = undefined;
+      await write(() => recordRunItem(repo, projectId, runId, back, { status: "queued" }));
+    };
+    let report: ProfileCaptureReport;
+    try {
+      report = await capture.captureProfile(
+        projectId,
+        run.url,
+        { ...profileOptions(opts), ...(onlyIds ? { onlyIds } : {}), ...(resume ? { resume } : {}) },
+        (done, total, out) => ctl.onItem?.(done, total, out),
+        { cancelled: () => ctl.cancelled(), signal: ctl.signal, hooks },
+      );
+    } catch (err) {
+      // Refused by the project's rules (Minor 3): the run ends failed with the rule's own reason, so
+      // its line says why and still offers Resume downloads; the refusal itself goes on to the caller.
+      if (err instanceof PolicyDeniedError && !ctl.cancelled()) {
+        await putBackInHand();
+        await write(() => setRunState(repo, projectId, runId, "failed", { errorCode: "POLICY_DENIED", reason: err.reason }));
+      }
+      throw err;
+    }
 
     // The segment's end.
-    if (inHand !== undefined) {
-      const back = inHand;
-      await write(() => recordRunItem(repo, projectId, runId, back, { status: "queued" }));
-    }
+    await putBackInHand();
     let state: Exclude<DownloadRunState, "interrupted">;
     let extra: { tool?: string; errorCode?: string; reason?: string } = {};
     if (report.status === "completed") {
       const items = await readRunItems(repo, projectId, runId);
-      if (items.every((i) => i.status === "done" || i.status === "failed")) state = "finished";
+      // Every video is done or failed, and every one this Resume was to look for was told (a failure the
+      // listing did not reach is kept, but the run is not finished: R678).
+      const allTold = onlyIds === undefined || onlyIds.every((id) => told.has(id));
+      if (allTold && items.every((i) => i.status === "done" || i.status === "failed")) state = "finished";
       else if (diskPause) {
         state = "paused-disk";
         extra = { reason: plainReason("DISK_NEARLY_FULL") };

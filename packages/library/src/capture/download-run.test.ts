@@ -16,7 +16,7 @@ import { IndexHandle } from "../index/db.js";
 import { createIndexSink } from "../index/sink.js";
 import { journalPath } from "../job-journal.js";
 import { createLibrary, type Library } from "../library.js";
-import { readRunItems } from "../lists/run-journal.js";
+import { readRun, readRunItems } from "../lists/run-journal.js";
 import { readTranscriptionList } from "../lists/transcription-list.js";
 import { InvalidInputError, PolicyDeniedError, type Repo } from "../repo/index.js";
 import { openTestRepo } from "../repo/testing.js";
@@ -463,29 +463,86 @@ describe("download runs", { timeout: 120_000 }, () => {
 
   it("resume after a quit audits capture.profile.resume and asks the rules again", async () => {
     const prof = synthetic(3);
+    prof.items[0]!.error = "private";
+    await setProfile(prof);
     const p = await project();
     const id = newRunId();
     const c = control();
     onDownloadOf(prof.items[1]!.id, () => c.cancel());
     await expect(runs.start(p.id, id, TT_PROFILE, OPTS, c.ctl)).rejects.toBeInstanceOf(CaptureCancelledError);
     vi.restoreAllMocks();
-    expect(await runs.get(p.id, id, () => false)).toMatchObject({ state: "interrupted", done: 1 });
+    expect(await runs.get(p.id, id, () => false)).toMatchObject({ state: "interrupted", done: 0, failed: 1 });
 
-    // the rules changed meanwhile: the press is refused, audited, and nothing is asked of the platform
+    // the rules changed meanwhile: the press is refused, audited, and nothing is asked of the platform;
+    // the run ends failed with the rule's own reason, and the failure it knew is kept (I1, Minor 3)
     const gov = join(lib.root, p.folder, "governance.yaml");
     await writeFile(gov, GOV.replace("[downloader]", "[manual_upload]"));
     const asked = worker.submitted.length;
-    await expect(runs.resume(p.id, id, "researcher", control().ctl)).rejects.toBeInstanceOf(PolicyDeniedError);
+    const r = control();
+    const err = await runs.resume(p.id, id, "researcher", r.ctl).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PolicyDeniedError);
     expect(worker.submitted.length).toBe(asked);
     expect((await auditEvents(p.folder)).filter((e) => e.action === "capture").at(-1)?.decision?.result).toBe("deny");
-    expect(await runs.get(p.id, id, () => false)).toMatchObject({ state: "interrupted", done: 1 });
+    const refused = await runs.get(p.id, id, () => false);
+    expect(refused).toMatchObject({ state: "failed", done: 0, failed: 1, notCompleted: 3, reason: (err as PolicyDeniedError).reason });
+    expect(r.changes.at(-1)).toEqual({ ...refused, updatedAt: expect.any(String) });
+    expect((await readRun(repo, p.id, id))?.record.run.errorCode).toBe("POLICY_DENIED");
+    expect(runLines(refused!).why).toBe((err as PolicyDeniedError).reason);
+    expect(runLines(refused!).resume).toBe("Resume downloads (3 did not complete)");
+    expect((await runs.problems(p.id, id)).problems.map((x) => x.reason)).toEqual(["This video is private."]);
+    expect((await readRunItems(repo, p.id, id)).map((i) => [i.status, i.item.errorCode])).toEqual([["failed", "PRIVATE"], ["running", undefined], ["queued", undefined]]);
 
     await writeFile(gov, GOV);
+    delete prof.items[0]!.error;
+    await setProfile(prof);
     const run = await runs.resume(p.id, id, "researcher", control().ctl);
     expect(run).toMatchObject({ state: "finished", done: 3, failed: 0 });
     const allows = await captureAllows(p.folder);
     expect(allows.map((e) => (e.details as { op?: string }).op)).toEqual(["capture.profile", "capture.profile.resume"]);
     expect(allows.at(-1)?.details).toMatchObject({ resume: true });
+  });
+
+  it("a start the project's rules refuse ends failed with the rule's reason and still offers Resume downloads", async () => {
+    const p = await project(GOV.replace("[downloader]", "[manual_upload]"));
+    const id = newRunId();
+    const c = control();
+    const err = await runs.start(p.id, id, TT_PROFILE, OPTS, c.ctl).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PolicyDeniedError);
+    expect(worker.submitted).toHaveLength(0);
+    const shown = await runs.get(p.id, id, () => false);
+    expect(shown).toMatchObject({ state: "failed", total: 0, reason: (err as PolicyDeniedError).reason });
+    expect(c.states()).toEqual(["queued", "downloading", "failed"]);
+    expect((await readRun(repo, p.id, id))?.record.run.errorCode).toBe("POLICY_DENIED");
+    expect(runLines(shown!).resume).toBe("Resume downloads");
+  });
+
+  it("a Resume whose listing fails keeps the failures the run knew", async () => {
+    const prof = synthetic(3);
+    prof.items[0]!.error = "private";
+    await setProfile(prof);
+    const p = await project();
+    const id = newRunId();
+    const c = control({ onItem: (done) => (done === 2 ? c.ask("pause") : undefined) });
+    expect(await runs.start(p.id, id, TT_PROFILE, OPTS, c.ctl)).toMatchObject({ state: "paused", done: 1, failed: 1 });
+    process.env.FAKE_TOOL_MODE = "enumnetwork";
+    const run = await runs.resume(p.id, id, "researcher", control().ctl);
+    expect(run).toMatchObject({ state: "failed", done: 1, failed: 1, reason: plainReason("NETWORK_LOST_GAVE_UP") });
+    expect((await runs.problems(p.id, id)).problems.map((x) => x.reason)).toEqual(["This video is private."]);
+    expect((await readRunItems(repo, p.id, id)).map((i) => [i.status, i.item.errorCode])).toEqual([["failed", "PRIVATE"], ["done", undefined], ["queued", undefined]]);
+  });
+
+  it("a Resume whose listing came back cut short before a failed video keeps its failure and says why", async () => {
+    const prof = synthetic(12);
+    prof.items[9]!.error = "private";
+    await setProfile(prof);
+    const p = await project();
+    const id = newRunId();
+    expect(await runs.start(p.id, id, TT_PROFILE, OPTS, control().ctl)).toMatchObject({ state: "finished", done: 11, failed: 1 });
+    await setProfile({ ...prof, cutAfter: 5 });
+    process.env.FAKE_TOOL_MODE = "enumbroken";
+    const cut = await runs.resume(p.id, id, "researcher", control().ctl);
+    expect(cut).toMatchObject({ state: "failed", done: 11, failed: 1, reason: plainReason("LIST_INCOMPLETE") });
+    expect((await runs.problems(p.id, id)).problems.map((x) => x.reason)).toEqual(["This video is private."]);
   });
 
   it("a run finished with no failure cannot be resumed", async () => {
