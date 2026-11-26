@@ -604,6 +604,13 @@ describe("keeping the Mac awake, on the optional tools screen (whole channels, T
     }
   });
 
+  it("each group of tools is a region named by its heading (its label points at an id without spaces) (R684)", async () => {
+    await shown();
+    const headings = screen.getAllByRole("heading", { level: 2 });
+    expect(headings.length).toBeGreaterThan(0);
+    for (const h of headings) expect(h.closest("section")).toBe(screen.getByRole("region", { name: h.textContent ?? "" }));
+  });
+
   it("the Video tools group says they also join the best picture and sound when videos are downloaded (R671)", async () => {
     await shown();
     // The group is found by its heading (its section's label points at an id with a space in it, so it has no name).

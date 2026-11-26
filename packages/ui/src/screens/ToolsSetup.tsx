@@ -586,9 +586,10 @@ export function ToolsSetup({
       {tools === null && !loadError ? <p className="ao-hint">Reading the list of tools…</p> : null}
       {groups
         .filter((g) => g.tools.length > 0)
-        .map((g) => (
-          <section key={g.title} className="ao-tools__group" aria-labelledby={`${ids}-g-${g.title}`}>
-            <h2 id={`${ids}-g-${g.title}`}>{g.title}</h2>
+        .map((g, i) => (
+          // The label's id has no space in it (aria-labelledby is a list of ids): the group's place, not its title (R684).
+          <section key={g.title} className="ao-tools__group" aria-labelledby={`${ids}-g-${i}`}>
+            <h2 id={`${ids}-g-${i}`}>{g.title}</h2>
             {g.hint ? <p className="ao-hint">{g.hint}</p> : null}
             {g.tools.map(card)}
           </section>
