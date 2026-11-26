@@ -1123,6 +1123,87 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
     });
   });
 
+  describe("the listing can be given up, and locks nothing else (R683 D)", () => {
+    const LISTING = "Asking YouTube for the list of videos…";
+
+    it("Cancel during the listing cancels the request, drops its answer and puts focus on the profile field", async () => {
+      const gate = held();
+      const { m, user } = await setup({ estimateHold: gate.p });
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      const status = (await screen.findByText(LISTING)).closest("[role=status]")!;
+      await waitFor(() => expect(m.estimateRequests()).toHaveLength(1));
+      const request = m.estimateRequests()[0]!;
+      await user.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(request.signal.aborted).toBe(true);
+      expect(document.activeElement).toBe(profileBox());
+      expect(status.isConnected).toBe(true);
+      expect(status.textContent).toBe("");
+      await act(async () => gate.release());
+      await waitFor(() => expect(m.settled(`POST /projects/${P1}/capture-estimate`)).toBe(1));
+      await act(async () => {});
+      expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByRole("button", { name: "Capture profile" })).toBeTruthy();
+      expect((profileBox() as HTMLInputElement).value).toBe(YT_CHANNEL);
+    });
+
+    it("once the first-read limit has passed with no list, the status says it is still asking", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
+      const gate = held();
+      const m = mockCapture({ estimateHold: gate.p });
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      render(<Capture client={m.client} projectId={P1} firstReadMs={10_000} />);
+      await screen.findByRole("button", { name: "Capture links" });
+      await waitFor(() => expect(screen.queryByText(/Reading this project's rules/)).toBeNull());
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      const status = (await screen.findByText(LISTING)).closest("[role=status]")!;
+      await act(async () => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(status.textContent).toBe("Still asking YouTube for the list. A long list can take a few minutes.");
+      // No hard limit: the request is still out, and Cancel still gives it up.
+      expect(m.estimateRequests()[0]!.signal.aborted).toBe(false);
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    });
+
+    it("“Capture links” works while an estimate is asked for and while one is open", async () => {
+      const gate = held();
+      const { m, user } = await setup({ estimateHold: gate.p });
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByText(LISTING);
+      await paste(user, [YT]);
+      await user.click(screen.getByRole("button", { name: "Capture links" }));
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture`)).toHaveLength(1));
+      expect(screen.getByText(LISTING)).toBeTruthy();
+      await act(async () => gate.release());
+      await screen.findByRole("region", { name: HEADING });
+      await waitFor(() => expect((links() as HTMLTextAreaElement).value).toBe(""));
+      await paste(user, [IG]);
+      await user.click(screen.getByRole("button", { name: "Capture links" }));
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture`)).toHaveLength(2));
+      expect((m.bodies(`POST /projects/${P1}/capture`)[1] as { urls: string[] }).urls).toEqual([IG]);
+      expect(screen.getByRole("region", { name: HEADING })).toBeTruthy();
+    });
+
+    it("an estimate refused for a missing tool names the tool, with its link to the Optional tools screen", async () => {
+      const { user } = await setup({
+        estimateAnswer: () =>
+          errorResponse(409, "TOOL_NOT_INSTALLED", "A tool this needs is not installed on this computer, so nothing was saved. Install it from the Optional tools screen, then try again.", "video-downloader"),
+      });
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toContain("The video downloader is not installed on this computer, so videos cannot be saved from the web.");
+      expect(within(alert).getByRole("link", { name: "Install it from the Optional tools screen" }).getAttribute("href")).toBe("/settings/tools?tool=video-downloader");
+    });
+  });
+
   it("an answer after the project changed is dropped", async () => {
     const gate = held();
     const { m, user, view } = await setup({ estimateHold: gate.p });

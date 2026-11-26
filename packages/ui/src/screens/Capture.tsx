@@ -74,7 +74,7 @@ import { CaptureEstimate, initialQuality } from "../components/CaptureEstimate";
 import { CaptureQueue } from "../components/CaptureQueue";
 import { useEventFeed, WorkLines } from "../components/WorkLines";
 import { PageReads, usePageHost, usePageRead } from "../components/PageReads";
-import { modelOptionLabel, SpeechModelNotice, ToolsLink, useSpeechModels } from "../components/MissingToolNotice";
+import { MissingToolNotice, modelOptionLabel, SpeechModelNotice, ToolsLink, useSpeechModels } from "../components/MissingToolNotice";
 import { DEFAULT_SPEECH_MODEL, toolsApi } from "../api/tools";
 import { useTrap } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
@@ -423,6 +423,13 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   const [submitting, setSubmitting] = useState(false);
   const busy = useRef(false);
   const [formError, setFormError] = useState<string | null>(null);
+  /** The refusal behind `formError` where a missing tool is named from it (an estimate refused, R683 D3). */
+  const [formErrorFrom, setFormErrorFrom] = useState<unknown>();
+  /** The profile form's own "busy" (R683 D2): while an estimate is read or started, the links form stays usable. */
+  const profileBusy = useRef(false);
+  const [profileSubmitting, setProfileSubmitting] = useState(false);
+  /** The list is being asked for: its status and Cancel are shown (R683 D1). */
+  const [listing, setListing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [queues, setQueues] = useState<CaptureQueueState[]>([]);
   /** The work lines follow this screen's own event stream (R679 A2). */
@@ -760,7 +767,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   };
 
   /** A refusal of a start, in plain words; the service asking for the acknowledgement opens it. */
-  const refused = (err: unknown, fallbackText: string) => {
+  const refused = (err: unknown, fallbackText: string, namesTool = false) => {
     if (err instanceof ApiClientError && err.code === "ACKNOWLEDGEMENT_REQUIRED") {
       setAcknowledged(false);
       setAckError(null);
@@ -768,6 +775,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       return;
     }
     setFormError(plainError(err, fallbackText));
+    // The error as the service sent it, with its `reason` (the tool's id), so the notice can name the tool.
+    setFormErrorFrom(namesTool ? err : undefined);
     // The same link is still being captured: make sure that capture is in the list.
     if (err instanceof ApiClientError && err.code === "CONFLICT" && err.reason === CAPTURE_RUNNING) void readQueues();
   };
@@ -777,12 +786,29 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
     busy.current = true;
     setSubmitting(true);
     setFormError(null);
+    setFormErrorFrom(undefined);
     setNotice(null);
     try {
       await run();
     } finally {
       busy.current = false;
       if (live.current) setSubmitting(false);
+    }
+  };
+
+  /** As `start`, for the profile form: its own synchronous guard and busy, so the links form is never held (R683 D2). */
+  const startProfileWork = async (run: () => Promise<void>) => {
+    if (profileBusy.current) return;
+    profileBusy.current = true;
+    setProfileSubmitting(true);
+    setFormError(null);
+    setFormErrorFrom(undefined);
+    setNotice(null);
+    try {
+      await run();
+    } finally {
+      profileBusy.current = false;
+      if (live.current) setProfileSubmitting(false);
     }
   };
 
@@ -826,6 +852,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
     estimateOf.current?.ac.abort();
     estimateOf.current = null;
     setShown(null);
+    setListing(false);
   }
 
   // One place (R683 B1): the form no longer as it was when "Capture profile" was pressed closes the estimate, said once.
@@ -837,7 +864,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
 
   /** "Capture profile": the form checked as before, then the estimate is asked for and shown (nothing is captured yet). */
   const captureProfile = () =>
-    start(async () => {
+    startProfileWork(async () => {
       const url = profileUrl.trim();
       if (!url) return setProfileError("Paste the link of a profile, channel or playlist.");
       if (!isWebAddress(url)) return setProfileError("This is not a web address. It must start with https:// or http://.");
@@ -862,7 +889,11 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       // Only the estimate of the form as it still is, for this project, is shown.
       const stillHere = () => live.current && projectNow.current === asked && estimateOf.current === mine;
       const platform = previewLink(url).platform;
-      setEstStatus(LISTED.includes(platform) ? estimateText.listing(platform as CapturePlatform) : "");
+      const listed = LISTED.includes(platform) ? (platform as CapturePlatform) : undefined;
+      setEstStatus(listed ? estimateText.listing(listed) : "");
+      setListing(true);
+      // No hard limit (a large channel takes minutes), but past the first-read limit it says it is still asking.
+      const slow = listed ? setTimeout(() => stillHere() && setEstStatus(estimateText.listingSlow(listed)), firstReadMs) : undefined;
       // The Transcribe box starts from the Transcription choice; "Use the project's setting" is the project's switch,
       // read beside the estimate with the first-read limit, never holding it back (R683 C2).
       estTouched.current = false;
@@ -883,22 +914,24 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         );
       }
       try {
-        const estimate = await api.estimate(projectId, url, options, { signal: mine.ac.signal });
+        const estimate = await api.estimate(projectId, url, options, { signal: mine.ac.signal }).finally(() => clearTimeout(slow));
         if (!stillHere()) return;
         setEstStatus("");
+        setListing(false);
         setQuality(initialQuality(estimate));
         setShown({ estimate, url, options, form: mine.form });
       } catch (err) {
         if (!stillHere()) return;
         estimateOf.current = null;
         setEstStatus("");
-        refused(err, "The profile capture could not be started.");
+        setListing(false);
+        refused(err, "The profile capture could not be started.", true);
       }
     });
 
   /** "Start": the estimated profile with the chosen quality and an explicit transcription choice. */
   const startProfile = () =>
-    start(async () => {
+    startProfileWork(async () => {
       if (!shown) return;
       const asked = projectId;
       const { url, estimate } = shown;
@@ -939,7 +972,14 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
 
   /** "Cancel": the estimate goes and the profile field takes focus. */
   const cancelEstimate = () => {
-    if (busy.current) return;
+    if (profileBusy.current) return;
+    dropEstimate();
+    setEstStatus("");
+    profileRef.current?.focus();
+  };
+
+  /** "Cancel" while the list is asked for: the request is cancelled, its answer dropped, focus on the profile field. */
+  const cancelListing = () => {
     dropEstimate();
     setEstStatus("");
     profileRef.current?.focus();
@@ -1301,23 +1341,30 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
             {...(switchNote ? { transcribeNote: switchNote } : {})}
             onStart={() => void startProfile()}
             onCancel={cancelEstimate}
-            busy={submitting}
+            busy={profileSubmitting}
           />
         )}
         <div className="ao-capture__actions">
           {!shown && (
-            <button type="submit" className="ao-capture__primary" disabled={submitting || !ready}>
+            <button type="submit" className="ao-capture__primary" disabled={profileSubmitting || !ready}>
               Capture profile
             </button>
           )}
           <span role="status">{estStatus}</span>
+          {listing && (
+            <button type="button" onClick={cancelListing}>
+              {estimateText.cancel}
+            </button>
+          )}
         </div>
       </form>
 
       {formError && (
         <div className="ao-capture__error" role="alert">
-          {/* It carries the service's message and a rule's own reason (review M6). */}
-          <UserText as="p">{formError}</UserText>
+          {/* It carries the service's message and a rule's own reason (review M6); a missing tool is named (R683 D3). */}
+          <MissingToolNotice from={formErrorFrom} as="p">
+            <UserText as="p">{formError}</UserText>
+          </MissingToolNotice>
         </div>
       )}
       {notice && <p role="status">{notice}</p>}
