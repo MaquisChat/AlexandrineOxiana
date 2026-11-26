@@ -2,11 +2,13 @@
  * Whole-channel capture and transcription (R668, R669): the project's transcription list, written to its job
  * journal (R31) as one `transcription.list` record and a `transcription.entry` record per source.
  */
+import { randomUUID } from "node:crypto";
 import type { Project, SourceDraft, SourceFile } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OPEN_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
+import { appendJobRecords, compactJobJournal, readJobJournal, type JobRecord, type ProjectKey } from "../job-journal.js";
 import { PolicyDeniedError } from "../repo/errors.js";
-import { authorizeProcessing } from "../repo/repo.js";
+import { authorizeProcessing, projectDataKey } from "../repo/repo.js";
 import {
   TRANSCRIPTION_LIST_ID, addToTranscriptionList, markTranscriptionEntry, readTranscriptionList, setTranscriptionListState, soundSecondsOf,
   stopTranscriptionList,
@@ -18,6 +20,21 @@ vi.mock("../repo/repo.js", async (importOriginal) => {
   return { ...actual, authorizeProcessing: vi.fn(actual.authorizeProcessing) };
 });
 const asked = () => vi.mocked(authorizeProcessing).mock.calls.filter(([, , req]) => req.action === "process" && req.process?.op === "transcription").length;
+
+/**
+ * What an older build does to this journal when it opens it (R672, I4): it takes every queued or running record
+ * with no worker job for a worker job it cannot resume, and claims it as failed UNRECOVERABLE, keeping the data.
+ */
+async function olderBuildOpens(root: string, folder: string, projectId: string, key: ProjectKey): Promise<void> {
+  const records = (await readJobJournal(root, folder, projectId, key)).records;
+  const claimed: JobRecord[] = [...records.values()]
+    .filter((r) => (r.status === "queued" || r.status === "running") && !r.job)
+    .map((r) => {
+      const { job: _job, error: _error, ...b } = r;
+      return { ...b, status: "failed", updatedAt: new Date().toISOString(), error: "UNRECOVERABLE", attempt: randomUUID() };
+    });
+  await appendJobRecords(root, folder, key, claimed);
+}
 
 let kit: Kit;
 beforeEach(async () => {
@@ -171,6 +188,42 @@ describe("the transcription list", () => {
     expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ state: "paused", total: 10, done: 3, failed: 0 });
     await stopTranscriptionList(kit.repo, p.id);
     expect(await readTranscriptionList(kit.repo, p.id)).toEqual({ state: "running", total: 0, done: 0, failed: 0, pending: [] });
+  });
+
+  it("a journal an older build opened: the pending entries and the counters stay (R672)", async () => {
+    const p = await makeProject(kit, OPEN_GOV, true);
+    const key = projectDataKey(kit.repo, p.id);
+    const folder = kit.repo.getProject(p.id).folder;
+    const s = [await audioSource(p, "Alpha"), await audioSource(p, "Beta"), await audioSource(p, "Gamma"), await audioSource(p, "Delta")];
+    await addToTranscriptionList(kit.repo, p.id, s.map((x) => ({ sourceId: x.source.id })));
+    const [e0, e1, e2, e3] = (await readTranscriptionList(kit.repo, p.id)).pending;
+    await markTranscriptionEntry(kit.repo, p.id, e0!.entryId, { status: "done" });
+    await markTranscriptionEntry(kit.repo, p.id, e1!.entryId, { status: "failed", error: "WORKER_FAILED" });
+    await markTranscriptionEntry(kit.repo, p.id, e2!.entryId, { status: "running", jobId: "job-2" });
+    await setTranscriptionListState(kit.repo, p.id, "paused");
+    await olderBuildOpens(kit.lib.root, folder, p.id, key);
+    const raw = (await readJobJournal(kit.lib.root, folder, p.id, key)).records;
+    expect([TRANSCRIPTION_LIST_ID, e2!.entryId, e3!.entryId].map((id) => [raw.get(id)!.status, raw.get(id)!.error])).toEqual([
+      ["failed", "UNRECOVERABLE"], ["failed", "UNRECOVERABLE"], ["failed", "UNRECOVERABLE"],
+    ]);
+    // 600 newer failed worker jobs: the claimed entries would be beyond the cap of kept failed records.
+    const at = Date.now();
+    await appendJobRecords(kit.lib.root, folder, key, Array.from({ length: 600 }, (_, i): JobRecord => {
+      const t = new Date(at + (i + 1) * 1000).toISOString();
+      return { v: 1, id: `ocr-${i}`, projectId: p.id, kind: "pdf.ocr", status: "failed", error: "WORKER_FAILED", createdAt: t, updatedAt: t };
+    }));
+    expect(await compactJobJournal(kit.lib.root, folder, p.id, key, 0)).toBe(true);
+
+    const list = await readTranscriptionList(kit.repo, p.id);
+    expect(list).toMatchObject({ state: "paused", total: 4, done: 1, failed: 1 });
+    expect(list.pending.map((e) => [e.entryId, e.status, e.entry.sourceId])).toEqual([
+      [e2!.entryId, "queued", s[2]!.source.id],
+      [e3!.entryId, "queued", s[3]!.source.id],
+    ]);
+    // The list carries on from there.
+    expect(await markTranscriptionEntry(kit.repo, p.id, e2!.entryId, { status: "running", jobId: "job-2b" })).toBe(true);
+    await markTranscriptionEntry(kit.repo, p.id, e2!.entryId, { status: "done" });
+    expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ state: "paused", total: 4, done: 2, failed: 1, pending: [{ entryId: e3!.entryId }] });
   });
 
   it("the list state survives a re-read", async () => {

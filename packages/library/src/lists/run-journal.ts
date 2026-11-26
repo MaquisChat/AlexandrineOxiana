@@ -9,13 +9,17 @@
  *   record written twice is counted once.
  * - The run's record status follows its state: `running` while downloading or waiting, `done` when finished
  *   with no failure, `cancelled` with error DISCARDED once discarded, `queued` otherwise. Compaction keeps a
- *   run's items while the run is neither done nor discarded (job-journal.ts).
+ *   run's items while the run is neither done nor discarded, and a run that is neither finished nor discarded
+ *   whatever the caps (job-journal.ts).
+ * - A run or item an older build claimed as failed UNRECOVERABLE (R672, I4: OLDER_BUILD_CLAIM_CODE) is read as it
+ *   was: the run with the record status its state gives, the item as queued (not completed). An item that carries
+ *   its own failure (`item.errorCode`) stays failed.
  *
  * Every function finds the library root, the project's folder and its key from the repo (ProjectLockedError
  * while the project is locked); every write throws ReadOnlyLibraryError on a read-only library.
  */
 import {
-  DISCARDED_CODE, assertNoSecrets, errorCode, readJobJournal, updateJobRecords,
+  DISCARDED_CODE, assertNoSecrets, claimedByOlderBuild, errorCode, readJobJournal, updateJobRecords,
   type CaptureItemData, type CaptureRunData, type JobRecord, type JobStatus, type ProjectKey,
 } from "../job-journal.js";
 import { NotFoundError, ReadOnlyLibraryError } from "../repo/errors.js";
@@ -56,6 +60,18 @@ function writable(repo: Repo, projectId: string): Place {
 const isRun = (r: JobRecord | undefined): r is JobRecord & { run: CaptureRunData } => !!r && r.kind === RUN_KIND && !!r.run;
 const isDiscarded = (r: JobRecord) => r.status === "cancelled" && r.error === DISCARDED_CODE;
 
+/** The records with what an older build claimed read as it was (see the module comment). */
+function repaired(records: ReadonlyMap<string, JobRecord>): Map<string, JobRecord> {
+  const out = new Map(records);
+  for (const r of records.values()) {
+    if (!claimedByOlderBuild(r)) continue;
+    const { error: _error, attempt: _attempt, ...base } = r;
+    if (r.kind === RUN_KIND && r.run) out.set(r.id, { ...base, status: runStatus(r.run.state, r.run.failed) });
+    else if (r.kind === ITEM_KIND && r.item && r.item.errorCode === undefined) out.set(r.id, { ...base, status: "queued" });
+  }
+  return out;
+}
+
 /** The record status of a run in `state` with `failed` failures (see the module comment). */
 function runStatus(state: CaptureRunData["state"], failed: number): JobStatus {
   if (state === "downloading" || state === "waiting") return "running";
@@ -84,8 +100,8 @@ function recount(run: JobRecord & { run: CaptureRunData }, items: Array<JobRecor
   return { ...run, status: isDiscarded(run) ? run.status : runStatus(data.state, failed), updatedAt: at, run: data };
 }
 
-function view(records: ReadonlyMap<string, JobRecord>, runId: string): RunView {
-  const r = records.get(runId);
+function view(raw: ReadonlyMap<string, JobRecord>, runId: string): RunView {
+  const r = repaired(raw).get(runId);
   if (!isRun(r)) throw new NotFoundError("Download run", runId);
   return { runId, record: r };
 }
@@ -102,7 +118,8 @@ function merged(records: ReadonlyMap<string, JobRecord>, runId: string, changed:
 export async function createRun(repo: Repo, projectId: string, runId: string, data: Omit<CaptureRunData, "state" | "total" | "done" | "failed">): Promise<RunView> {
   const p = writable(repo, projectId);
   assertNoSecrets(data.options, "options");
-  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
+  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
     if (records.has(runId)) throw new TypeError(`the run id ${runId} is already in the journal`);
     // A run started later is always newer, even within one millisecond: `readRuns` orders by it.
     const newest = Math.max(0, ...[...records.values()].filter((r) => r.kind === RUN_KIND).map((r) => Date.parse(r.createdAt) || 0));
@@ -124,7 +141,8 @@ export async function setRunItems(
   items: Array<Pick<CaptureItemData, "postId" | "url" | "title" | "durationSec">>,
 ): Promise<RunView> {
   const p = writable(repo, projectId);
-  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
+  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
     const run = liveRun(records, runId);
     const existing = itemsOf(records, runId);
     const known = new Set(existing.map((i) => i.item.postId));
@@ -156,10 +174,11 @@ export async function recordRunItem(
   next: { status: "running" } | { status: "queued" } | { status: "done"; sourceId?: string } | { status: "failed"; errorCode: string; platformReason?: string },
 ): Promise<RunView> {
   const p = writable(repo, projectId);
-  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
+  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
     const run = liveRun(records, runId);
     const old = itemsOf(records, runId).find((i) => i.item.postId === postId);
-    if (!old) throw new NotFoundError("Download run item", postId);
+    if (!old) throw new NotFoundError("Item of download run", runId); // never the post id (R672)
     const at = repoClock(repo)().toISOString();
     const { errorCode: _code, platformReason: _reason, ...rest } = old.item;
     const { error: _error, ...base } = old;
@@ -180,7 +199,8 @@ export async function recordRunItem(
 /** Puts every failed item of the run back to be tried again (queued, its error gone); `failed` becomes 0. */
 export async function requeueFailedItems(repo: Repo, projectId: string, runId: string): Promise<RunView> {
   const p = writable(repo, projectId);
-  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
+  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
     const run = liveRun(records, runId);
     const at = repoClock(repo)().toISOString();
     const back: JobRecord[] = itemsOf(records, runId)
@@ -207,10 +227,12 @@ export async function setRunState(
   extra: { wait?: CaptureRunData["wait"]; tool?: string; errorCode?: string; reason?: string } = {},
 ): Promise<RunView> {
   const p = writable(repo, projectId);
-  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
+  const records = await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
     const run = liveRun(records, runId);
     const at = repoClock(repo)().toISOString();
     const { wait: _w, tool: _t, errorCode: _c, reason: _r, ...rest } = run.run;
+    // The counters are worked out from the items here too (R672: a torn final append leaves them stale).
     const data: CaptureRunData = {
       ...rest,
       state,
@@ -219,7 +241,7 @@ export async function setRunState(
       ...(extra.errorCode !== undefined ? { errorCode: errorCode(extra.errorCode) } : {}),
       ...(extra.reason !== undefined ? { reason: extra.reason } : {}),
     };
-    return [{ ...run, status: runStatus(state, data.failed), updatedAt: at, run: data }];
+    return [recount({ ...run, run: data }, itemsOf(records, runId), at)];
   });
   return view(records, runId);
 }
@@ -227,7 +249,7 @@ export async function setRunState(
 /** The project's runs that are not discarded, newest first. */
 export async function readRuns(repo: Repo, projectId: string): Promise<RunView[]> {
   const p = place(repo, projectId);
-  const records = (await readJobJournal(p.root, p.folder, projectId, p.key)).records;
+  const records = repaired((await readJobJournal(p.root, p.folder, projectId, p.key)).records);
   return [...records.values()]
     .filter((r): r is JobRecord & { run: CaptureRunData } => isRun(r) && !isDiscarded(r))
     .sort((a, b) => (a.createdAt === b.createdAt ? 0 : a.createdAt < b.createdAt ? 1 : -1))
@@ -237,14 +259,14 @@ export async function readRuns(repo: Repo, projectId: string): Promise<RunView[]
 /** One run; undefined when it is not known or was discarded. */
 export async function readRun(repo: Repo, projectId: string, runId: string): Promise<RunView | undefined> {
   const p = place(repo, projectId);
-  const r = (await readJobJournal(p.root, p.folder, projectId, p.key)).records.get(runId);
+  const r = repaired((await readJobJournal(p.root, p.folder, projectId, p.key)).records).get(runId);
   return isRun(r) && !isDiscarded(r) ? { runId, record: r } : undefined;
 }
 
 /** The run's items, by index. */
 export async function readRunItems(repo: Repo, projectId: string, runId: string): Promise<RunItemView[]> {
   const p = place(repo, projectId);
-  const records = (await readJobJournal(p.root, p.folder, projectId, p.key)).records;
+  const records = repaired((await readJobJournal(p.root, p.folder, projectId, p.key)).records);
   return itemsOf(records, runId).map((r) => ({ id: r.id, status: r.status, item: r.item }));
 }
 
@@ -256,7 +278,8 @@ export async function readRunItems(repo: Repo, projectId: string, runId: string)
 export async function discardRun(repo: Repo, projectId: string, runId: string): Promise<boolean> {
   const p = writable(repo, projectId);
   let changed = false;
-  await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
+  await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
     const r = records.get(runId);
     if (!isRun(r) || isDiscarded(r)) return [];
     changed = true;

@@ -12,6 +12,10 @@
  *   is audited and thrown, an allow is not audited here: each transcription audits its own decision when it runs
  *   (as `transcriptionJob` does). The records themselves are not governed changes, as the worker's are not.
  *
+ * - An entry an older build claimed as failed UNRECOVERABLE (R672, I4: OLDER_BUILD_CLAIM_CODE) is read as queued
+ *   (pending), and the list record it claimed as if untouched; an entry this build marked failed with another
+ *   error stays failed.
+ *
  * Every function finds the library root, the project's folder and its key from the repo (ProjectLockedError
  * while the project is locked); every write throws ReadOnlyLibraryError on a read-only library.
  */
@@ -19,7 +23,7 @@ import { randomUUID } from "node:crypto";
 import { primary, type SourceFile } from "@ao/core";
 import { DEFAULT_SPEECH_MODEL } from "@ao/shared";
 import {
-  errorCode, readJobJournal, updateJobRecords,
+  claimedByOlderBuild, errorCode, readJobJournal, updateJobRecords,
   type JobRecord, type JobStatus, type ProjectKey, type TranscriptionEntryData, type TranscriptionListData,
 } from "../job-journal.js";
 import { NotFoundError, ReadOnlyLibraryError } from "../repo/errors.js";
@@ -81,6 +85,17 @@ export function soundSecondsOf(sf: SourceFile): number | undefined {
   return positive(meta?.durationSec);
 }
 
+/** The records with what an older build claimed read as it was (see the module comment). */
+function repaired(records: ReadonlyMap<string, JobRecord>): Map<string, JobRecord> {
+  const out = new Map(records);
+  for (const r of records.values()) {
+    if (!claimedByOlderBuild(r) || (r.kind !== ENTRY_KIND && r.kind !== LIST_KIND)) continue;
+    const { error: _error, attempt: _attempt, ...base } = r;
+    out.set(r.id, { ...base, status: "queued" });
+  }
+  return out;
+}
+
 function listOf(records: ReadonlyMap<string, JobRecord>): { rec?: JobRecord; data: TranscriptionListData } {
   const rec = records.get(TRANSCRIPTION_LIST_ID);
   return rec?.kind === LIST_KIND && rec.list ? { rec, data: rec.list } : { data: EMPTY };
@@ -102,7 +117,7 @@ function listRecord(projectId: string, records: ReadonlyMap<string, JobRecord>, 
 
 export async function readTranscriptionList(repo: Repo, projectId: string): Promise<TranscriptionListView> {
   const p = place(repo, projectId);
-  const records = (await readJobJournal(p.root, p.folder, projectId, p.key)).records;
+  const records = repaired((await readJobJournal(p.root, p.folder, projectId, p.key)).records);
   const { data } = listOf(records);
   const pending = entriesOf(records)
     .filter(isPendingEntry)
@@ -133,7 +148,8 @@ export async function addToTranscriptionList(repo: Repo, projectId: string, item
   }
   if (wanted.length === 0) return { added: 0 };
   let added = 0;
-  await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
+  await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
     const entries = entriesOf(records);
     const pending = entries.filter(isPendingEntry);
     const onList = new Set(pending.map((e) => e.entry.sourceId));
@@ -191,7 +207,8 @@ export async function markTranscriptionEntry(
 ): Promise<boolean> {
   const p = writable(repo, projectId);
   let moves = true;
-  await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
+  await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
     const old = records.get(entryId);
     if (!old || old.kind !== ENTRY_KIND || !old.entry) throw new NotFoundError("Transcription list entry", entryId);
     moves = !(ENDED.has(old.status) && (next.status === "running" || (next.status as JobStatus) === "queued"));
@@ -210,7 +227,8 @@ export async function markTranscriptionEntry(
 /** Pauses the list (the transcription in hand finishes) or lets it run. */
 export async function setTranscriptionListState(repo: Repo, projectId: string, state: "running" | "paused"): Promise<void> {
   const p = writable(repo, projectId);
-  await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
+  await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
     const { data } = listOf(records);
     return [listRecord(projectId, records, { ...data, state }, repoClock(repo)().toISOString())];
   });
@@ -223,7 +241,8 @@ export async function setTranscriptionListState(repo: Repo, projectId: string, s
 export async function stopTranscriptionList(repo: Repo, projectId: string): Promise<{ jobIds: string[] }> {
   const p = writable(repo, projectId);
   const jobIds: string[] = [];
-  await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
+  await updateJobRecords(p.root, p.folder, projectId, p.key, (raw) => {
+    const records = repaired(raw);
     const pending = entriesOf(records).filter(isPendingEntry);
     jobIds.length = 0;
     const at = repoClock(repo)().toISOString();

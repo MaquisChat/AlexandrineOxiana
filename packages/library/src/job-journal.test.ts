@@ -785,6 +785,36 @@ describe("list kinds", () => {
     expect(ids).toContain("entry-done");
   });
 
+  it("updateJobRecords compacts a mostly superseded journal in its own turn (R672)", async () => {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const p = project.id;
+    const at0 = Date.now();
+    const expected = new Map<string, JobRecord>();
+    const statuses: Array<JobRecord["status"]> = ["queued", "running", "done", "failed"];
+    let largest = 0;
+    for (let k = 0; k < 3000; k++) {
+      const index = k % 500;
+      const t = new Date(at0 + k).toISOString();
+      const status = statuses[Math.floor(k / 500) % statuses.length]!;
+      const item: JobRecord = {
+        v: 1, id: `live/${index}`, projectId: p, kind: "capture.item", status, createdAt: new Date(at0).toISOString(), updatedAt: t,
+        item: { runId: "live", index, postId: `post-${index}`, url: `https://www.youtube.com/watch?v=${index}` },
+        ...(status === "failed" ? { error: "PRIVATE" } : {}),
+      };
+      const run: JobRecord = { v: 1, id: "live", projectId: p, kind: "capture.run", status: "running", createdAt: new Date(at0).toISOString(), updatedAt: t, run: { ...runData("downloading"), total: 500 } };
+      const after = await updateJobRecords(lib.root, project.folder, p, null, () => [item, run]);
+      expected.set(item.id, item);
+      expected.set(run.id, run);
+      expect(after.get(item.id)).toEqual(item);
+      if (k % 25 === 24) largest = Math.max(largest, (await readJobJournal(lib.root, project.folder, p, null)).lines);
+    }
+    const back = await readJobJournal(lib.root, project.folder, p, null);
+    expect(back.lines).toBeLessThan(2000);
+    expect(largest).toBeLessThanOrEqual(2000);
+    expect(back.records.size).toBe(501);
+    for (const [id, r] of expected) expect(back.records.get(id)).toEqual(r);
+  }, 120_000);
+
   it("updateJobRecords appends in the file's turn", async () => {
     const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
     const key = projectDataKey(repo, project.id);

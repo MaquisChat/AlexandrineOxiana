@@ -166,6 +166,18 @@ export interface TranscriptionEntryData {
 /** The error of a run the researcher discarded. */
 export const DISCARDED_CODE = "DISCARDED";
 
+/**
+ * R672 (I4): an older build that opens this journal takes every queued or running list record for a worker job it
+ * cannot resume and claims it as failed with this error, keeping the data. This build reads such a record as it
+ * was before (run-journal.ts, transcription-list.ts) and compaction keeps it.
+ */
+export const OLDER_BUILD_CLAIM_CODE = "UNRECOVERABLE";
+
+/** A list record an older build claimed (see OLDER_BUILD_CLAIM_CODE). */
+export function claimedByOlderBuild(r: JobRecord): boolean {
+  return isListKind(r.kind) && r.status === "failed" && r.error === OLDER_BUILD_CLAIM_CODE;
+}
+
 /** What a job is for (see JobRecord.about): ids and a model name only, nothing identifying. */
 export interface JobAbout {
   sourceId: string;
@@ -425,16 +437,27 @@ export async function updateJobRecords(
   fn: (records: ReadonlyMap<string, JobRecord>) => JobRecord[],
 ): Promise<ReadonlyMap<string, JobRecord>> {
   return serialize(journalPath(root, projectRel), async () => {
-    const records = (await readJobJournal(root, projectRel, projectId, key)).records;
+    const parsed = await readJobJournal(root, projectRel, projectId, key);
+    const records = parsed.records;
     const next = fn(records);
     await appendNow(root, projectRel, key, next);
     for (const r of next) {
       records.delete(r.id);
       records.set(r.id, r);
     }
+    // R672: a whole channel must not make every write read tens of thousands of dead lines.
+    const lines = parsed.lines + next.length;
+    const superseded = lines - records.size - parsed.unreadable.length;
+    if (lines > UPDATE_COMPACT_LINES && superseded * 2 > lines) {
+      const dropped = await compactNow(root, projectRel, projectId, key, UPDATE_COMPACT_LINES, Date.now());
+      for (const id of dropped ?? []) records.delete(id);
+    }
     return records;
   });
 }
+
+/** `updateJobRecords` compacts in its own turn a journal of more than this many lines, more than half superseded (R672). */
+export const UPDATE_COMPACT_LINES = 2000;
 
 /** Lines beyond which a journal is compacted. */
 const COMPACT_MIN_LINES = 64;
@@ -452,6 +475,8 @@ export function isPending(r: JobRecord): boolean {
 }
 
 const cancelledEntry = (r: JobRecord) => r.kind === "transcription.entry" && r.status === "cancelled";
+const liveRun = (r: JobRecord) =>
+  r.kind === "capture.run" && !!r.run && r.run.state !== "finished" && !(r.status === "cancelled" && r.error === DISCARDED_CODE);
 
 /**
  * The ids compaction drops (R142): see the constants above. Pending records are never dropped. The lists'
@@ -459,12 +484,15 @@ const cancelledEntry = (r: JobRecord) => r.kind === "transcription.entry" && r.s
  * count rules never apply to items, so a live run keeps every video); the `transcription.list` record is never
  * dropped; runs and transcription entries follow the rules of finished jobs, except that a cancelled
  * `transcription.entry` is always dropped and never counts toward MAX_FAILED_KEPT (R672: one Stop of a long list
- * must not push out the worker's failed jobs).
+ * must not push out the worker's failed jobs). Never dropped, whatever the caps (R672, I4): a `capture.run` that is
+ * neither finished nor discarded, and a `transcription.entry` an older build claimed (it is still pending).
  */
 function prunable(records: Map<string, JobRecord>, now: number): Set<string> {
   const drop = new Set<string>();
   const newestFirst = (a: JobRecord, b: JobRecord) => (a.updatedAt === b.updatedAt ? 0 : a.updatedAt < b.updatedAt ? 1 : -1);
-  const all = [...records.values()].filter((r) => r.kind !== "capture.item" && r.kind !== "transcription.list" && !cancelledEntry(r));
+  const all = [...records.values()].filter(
+    (r) => r.kind !== "capture.item" && r.kind !== "transcription.list" && !cancelledEntry(r) && !liveRun(r) && !(r.kind === "transcription.entry" && claimedByOlderBuild(r)),
+  );
   for (const r of records.values()) {
     if (cancelledEntry(r)) drop.add(r.id);
     if (r.kind !== "capture.item") continue;
@@ -500,24 +528,27 @@ export async function compactJobJournal(
   minLines = COMPACT_MIN_LINES,
   now = Date.now(),
 ): Promise<boolean> {
+  return serialize(journalPath(root, projectRel), async () => (await compactNow(root, projectRel, projectId, key, minLines, now)) !== undefined);
+}
+
+/** The compaction itself; callers hold the file's turn in `serialize`. Returns the ids dropped, or undefined when not rewritten. */
+async function compactNow(root: string, projectRel: string, projectId: string, key: ProjectKey, minLines: number, now: number): Promise<Set<string> | undefined> {
   const path = journalPath(root, projectRel);
-  return serialize(path, async () => {
-    await sweepCompactionTemps(root, projectRel);
-    const raw = await readMaybe(path);
-    if (!raw) return false;
-    const parsed = parseJobJournal(raw.toString("utf8"), projectId, key ? key.key : null);
-    const drop = prunable(parsed.records, now);
-    const kept = parsed.latestLines.size - drop.size + parsed.unreadable.length;
-    // R400 (e): a journal that still holds a line with an absolute path is compacted whatever its size.
-    if (!parsed.absolutePaths && (parsed.lines <= minLines || (drop.size === 0 && kept * 2 > parsed.lines))) return false;
-    await prepare(root, projectRel);
-    const lines = [
-      ...parsed.unreadable,
-      ...[...parsed.latestLines].filter(([id]) => !drop.has(id)).map(([id, l]) => relativeLine(root, parsed.records.get(id)!, key) ?? l),
-    ];
-    await writeFileAtomic(path, lines.map((l) => `${l}\n`).join(""), { mode: FILE_MODE });
-    return true;
-  });
+  await sweepCompactionTemps(root, projectRel);
+  const raw = await readMaybe(path);
+  if (!raw) return undefined;
+  const parsed = parseJobJournal(raw.toString("utf8"), projectId, key ? key.key : null);
+  const drop = prunable(parsed.records, now);
+  const kept = parsed.latestLines.size - drop.size + parsed.unreadable.length;
+  // R400 (e): a journal that still holds a line with an absolute path is compacted whatever its size.
+  if (!parsed.absolutePaths && (parsed.lines <= minLines || (drop.size === 0 && kept * 2 > parsed.lines))) return undefined;
+  await prepare(root, projectRel);
+  const lines = [
+    ...parsed.unreadable,
+    ...[...parsed.latestLines].filter(([id]) => !drop.has(id)).map(([id, l]) => relativeLine(root, parsed.records.get(id)!, key) ?? l),
+  ];
+  await writeFileAtomic(path, lines.map((l) => `${l}\n`).join(""), { mode: FILE_MODE });
+  return drop;
 }
 
 /**

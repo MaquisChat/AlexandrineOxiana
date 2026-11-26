@@ -2,14 +2,15 @@
  * Whole-channel capture (R668, R669): a download run and its videos are written to the project's job journal
  * (R31) as `capture.run` and `capture.item` records, sealed in an encrypted project, read back after a restart.
  */
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import { FAST, OPEN_GOV, makeKit, makeProject, type Kit } from "../export/test-kit.js";
-import { compactJobJournal, journalPath, readJobJournal } from "../job-journal.js";
+import { appendJobRecords, compactJobJournal, journalPath, readJobJournal, type JobRecord, type ProjectKey } from "../job-journal.js";
 import { openLibrary } from "../library.js";
-import { ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { NotFoundError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
 import { projectDataKey } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
 import {
@@ -23,6 +24,21 @@ const base = {
 };
 const items = (n: number, from = 0) =>
   Array.from({ length: n }, (_, i) => ({ postId: `v${from + i}`, url: `https://www.youtube.com/watch?v=${MARKER}${from + i}`, title: `Video ${from + i}`, durationSec: 60 * (from + i + 1) }));
+
+/**
+ * What an older build does to this journal when it opens it (R672, I4): it takes every queued or running record
+ * with no worker job for a worker job it cannot resume, and claims it as failed UNRECOVERABLE, keeping the data.
+ */
+async function olderBuildOpens(root: string, folder: string, projectId: string, key: ProjectKey): Promise<void> {
+  const records = (await readJobJournal(root, folder, projectId, key)).records;
+  const claimed: JobRecord[] = [...records.values()]
+    .filter((r) => (r.status === "queued" || r.status === "running") && !r.job)
+    .map((r) => {
+      const { job: _job, error: _error, ...b } = r;
+      return { ...b, status: "failed", updatedAt: new Date().toISOString(), error: "UNRECOVERABLE", attempt: randomUUID() };
+    });
+  await appendJobRecords(root, folder, key, claimed);
+}
 
 let kit: Kit;
 beforeEach(async () => {
@@ -184,6 +200,79 @@ describe("download runs in the job journal", () => {
     await expect(createRun(kit.repo, p.id, "r2", base)).rejects.toBeInstanceOf(ProjectLockedError);
     await expect(setRunState(kit.repo, p.id, "r", "paused")).rejects.toBeInstanceOf(ProjectLockedError);
     await expect(discardRun(kit.repo, p.id, "r")).rejects.toBeInstanceOf(ProjectLockedError);
+  });
+
+  it("an item not found names the run, never the post id (R672)", async () => {
+    const p = await makeProject(kit);
+    await createRun(kit.repo, p.id, "run-x", base);
+    await setRunItems(kit.repo, p.id, "run-x", items(1));
+    const err = await recordRunItem(kit.repo, p.id, "run-x", "secret-post-42", { status: "done" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(NotFoundError);
+    expect((err as Error).message).toContain("run-x");
+    expect((err as Error).message).not.toContain("secret-post-42");
+  });
+
+  it("setRunState recounts the run's counters from its items (R672)", async () => {
+    const p = await makeProject(kit);
+    await createRun(kit.repo, p.id, "r", base);
+    await setRunItems(kit.repo, p.id, "r", items(3));
+    const folder = kit.repo.getProject(p.id).folder;
+    const recs = (await readJobJournal(kit.lib.root, folder, p.id, null)).records;
+    const at = kit.clock.now.toISOString();
+    // A torn final append left the items written and the run's record stale.
+    const one = recs.get("r/0")!;
+    const two = recs.get("r/1")!;
+    await appendJobRecords(kit.lib.root, folder, null, [
+      { ...one, status: "done", updatedAt: at },
+      { ...two, status: "failed", error: "PRIVATE", updatedAt: at, item: { ...two.item!, errorCode: "PRIVATE" } },
+      { ...one, id: "r/3", item: { ...one.item!, index: 3, postId: "v3" } },
+    ]);
+    expect((await readRun(kit.repo, p.id, "r"))!.record.run).toMatchObject({ total: 3, done: 0, failed: 0 });
+    const v = await setRunState(kit.repo, p.id, "r", "paused");
+    expect(v.record.run).toMatchObject({ state: "paused", total: 4, done: 1, failed: 1 });
+    expect((await readRun(kit.repo, p.id, "r"))!.record.run).toMatchObject({ total: 4, done: 1, failed: 1 });
+  });
+
+  it("a journal an older build opened: the run and its items are not completed and compaction keeps them (R672)", async () => {
+    const p = await makeProject(kit, OPEN_GOV, true);
+    const key = projectDataKey(kit.repo, p.id);
+    const folder = kit.repo.getProject(p.id).folder;
+    await createRun(kit.repo, p.id, "r", base);
+    await setRunItems(kit.repo, p.id, "r", items(4));
+    await recordRunItem(kit.repo, p.id, "r", "v0", { status: "done", sourceId: "s0" });
+    await recordRunItem(kit.repo, p.id, "r", "v1", { status: "failed", errorCode: "PRIVATE" });
+    await recordRunItem(kit.repo, p.id, "r", "v2", { status: "running" });
+    await setRunState(kit.repo, p.id, "r", "paused-disk");
+    await olderBuildOpens(kit.lib.root, folder, p.id, key);
+    const raw = (await readJobJournal(kit.lib.root, folder, p.id, key)).records;
+    expect(["r", "r/2", "r/3"].map((id) => [raw.get(id)!.status, raw.get(id)!.error])).toEqual([
+      ["failed", "UNRECOVERABLE"], ["failed", "UNRECOVERABLE"], ["failed", "UNRECOVERABLE"],
+    ]);
+    // 600 newer failed worker jobs: the run would be beyond the cap of kept failed records.
+    const at = Date.now();
+    const worker: JobRecord[] = Array.from({ length: 600 }, (_, i) => {
+      const t = new Date(at + (i + 1) * 1000).toISOString();
+      return { v: 1, id: `ocr-${i}`, projectId: p.id, kind: "pdf.ocr", status: "failed", error: "WORKER_FAILED", createdAt: t, updatedAt: t };
+    });
+    await appendJobRecords(kit.lib.root, folder, key, worker);
+    expect(await compactJobJournal(kit.lib.root, folder, p.id, key, 0)).toBe(true);
+
+    const repo = await kit.reopen();
+    const run = (await readRun(repo, p.id, "r"))!;
+    expect(run.record).toMatchObject({ status: "queued", run: { state: "paused-disk", total: 4, done: 1, failed: 1 } });
+    expect(run.record.error).toBeUndefined();
+    expect((await readRuns(repo, p.id)).map((r) => r.runId)).toEqual(["r"]);
+    expect((await readRunItems(repo, p.id, "r")).map((i) => [i.id, i.status, i.item.errorCode])).toEqual([
+      ["r/0", "done", undefined],
+      ["r/1", "failed", "PRIVATE"],
+      ["r/2", "queued", undefined],
+      ["r/3", "queued", undefined],
+    ]);
+    // "Resume downloads" puts the failed ones back and takes every item not completed.
+    const back = await requeueFailedItems(repo, p.id, "r");
+    expect(back.record.run).toMatchObject({ total: 4, done: 1, failed: 0 });
+    expect((await readRunItems(repo, p.id, "r")).filter((i) => i.status !== "done").map((i) => i.item.postId)).toEqual(["v1", "v2", "v3"]);
+    expect((await setRunState(repo, p.id, "r", "downloading")).record.status).toBe("running");
   });
 
   it("assertNoSecrets refuses options naming a cookie value", async () => {
