@@ -55,7 +55,7 @@ import {
 import { isValidId } from "../api/import";
 import { errorText } from "../api/library";
 import { CaptureQueue } from "../components/CaptureQueue";
-import { WorkLines } from "../components/WorkLines";
+import { useEventFeed, WorkLines } from "../components/WorkLines";
 import { PageReads, usePageHost, usePageRead } from "../components/PageReads";
 import { modelOptionLabel, SpeechModelNotice, ToolsLink, useSpeechModels } from "../components/MissingToolNotice";
 import { DEFAULT_SPEECH_MODEL, toolsApi } from "../api/tools";
@@ -376,8 +376,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   const [formError, setFormError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [queues, setQueues] = useState<CaptureQueueState[]>([]);
-  /** The work lines are mounted afresh (and read again) after a profile capture is started here. */
-  const [linesKey, setLinesKey] = useState(0);
+  /** The work lines follow this screen's own event stream (R679 A2). */
+  const feed = useEventFeed();
   const queuesNow = useRef(queues);
   queuesNow.current = queues;
   /** Queues in the list (started here, or read from the service). */
@@ -617,6 +617,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         const again = attempts++ > 0;
         try {
           const onOpen = () => {
+            feed.opened();
             connected.current = true;
             conn.current++;
             tries = 0; // a working connection starts the count again (review M4)
@@ -628,6 +629,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
           // FR-756 (R597): a stream not opened within `streamOpenMs` is closed and tried afresh below.
           for await (const ev of client.events({ signal: ctl.signal, onOpen, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
             if (stop) return;
+            feed.event(ev);
             const e = captureProgress(ev, projectId);
             if (e) onProgress(e);
           }
@@ -653,7 +655,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       conn.current++;
       ctl.abort();
     };
-  }, [client, projectId, onProgress, readQueues, attempt, streamOpenMs, readAgain, streamQuietMs]);
+  }, [client, projectId, onProgress, readQueues, attempt, streamOpenMs, readAgain, streamQuietMs, feed]);
 
   /** A queue the service has started: its early events are applied now. */
   const addQueue = (q: CaptureQueueState) => {
@@ -782,8 +784,6 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         const { queueId } = await api.captureProfile(projectId, url, options);
         if (!live.current) return;
         addQueue(profileQueue(queueId, url));
-        // The work lines read the project's runs again: the one just started is among them.
-        setLinesKey((k) => k + 1);
         setProfileUrl("");
       } catch (err) {
         if (live.current) refused(err, "The profile capture could not be started.");
@@ -1150,7 +1150,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       <p className="ao-capture__hint">
         Captures started earlier or from the browser extension are shown here too, for as long as the library service runs; a finished capture stays listed for up to an hour.
       </p>
-      {!locked && <WorkLines key={linesKey} client={client} projectId={projectId} streamOpenMs={streamOpenMs} streamQuietMs={streamQuietMs} />}
+      {!locked && <WorkLines client={client} projectId={projectId} events={feed.events} />}
       <CaptureQueue queues={queues} />
 
       <CaptureTools api={api} />

@@ -3,14 +3,15 @@
  * list, with their buttons, "Show them" and its copied list, and the event stream that keeps them current (R597, R641
  * D2, R658, R659). The sentences come from @ao/shared; the expected strings here are the plan's own.
  */
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { LIST_STOPPED_TEXT, problemLine, WORK_LINES_TEXT, type DownloadProblem } from "@ao/shared";
+import { BACKGROUND_EVENT, LIST_STOPPED_TEXT, problemLine, WORK_LINES_TEXT, type BackgroundProgressEvent, type DownloadProblem } from "@ao/shared";
+import type { ServiceEvent } from "../api/client";
 import { exampleRun, idleList, mockBackground, type BackgroundSetup } from "../test/backgroundService";
 import { hang, server, testClient, url, useMockService } from "../test/service";
-import { WorkLines } from "./WorkLines";
+import { WorkLines, type WorkLinesEvents } from "./WorkLines";
 
 useMockService();
 
@@ -29,12 +30,38 @@ const heading = () => screen.getByRole("heading", { level: 2, name: WORK_LINES_T
 const buttonNames = () => within(screen.getByRole("region", { name: WORK_LINES_TEXT.heading })).queryAllByRole("button").map((b) => b.textContent);
 const LOST = WORK_LINES_TEXT.lost;
 
-function start(o: BackgroundSetup = {}, props: { streamOpenMs?: number; streamQuietMs?: number; projectId?: string } = {}) {
+function start(o: BackgroundSetup = {}, props: { streamOpenMs?: number; streamQuietMs?: number; projectId?: string; events?: WorkLinesEvents } = {}) {
   const m = mockBackground(o);
   server.use(...m.handlers);
   const client = testClient();
-  const view = render(<WorkLines client={client} projectId={props.projectId ?? "p1"} {...(props.streamOpenMs !== undefined ? { streamOpenMs: props.streamOpenMs } : {})} {...(props.streamQuietMs !== undefined ? { streamQuietMs: props.streamQuietMs } : {})} />);
+  const view = render(
+    <WorkLines
+      client={client}
+      projectId={props.projectId ?? "p1"}
+      {...(props.streamOpenMs !== undefined ? { streamOpenMs: props.streamOpenMs } : {})}
+      {...(props.streamQuietMs !== undefined ? { streamQuietMs: props.streamQuietMs } : {})}
+      {...(props.events ? { events: props.events } : {})}
+    />,
+  );
   return { m, client, view };
+}
+
+/** A screen's own event stream, as handed to the lines (A1): `emit` delivers an event, `open` a (re)opening. */
+function screenStream() {
+  const subs = new Set<{ onEvent: (e: ServiceEvent) => void; onOpen: () => void }>();
+  const events: WorkLinesEvents = {
+    subscribe(onEvent, onOpen) {
+      const s = { onEvent, onOpen };
+      subs.add(s);
+      return () => void subs.delete(s);
+    },
+  };
+  return {
+    events,
+    subscribers: () => subs.size,
+    emit: (data: BackgroundProgressEvent, type: string = BACKGROUND_EVENT) => act(async () => [...subs].forEach((s) => s.onEvent({ type, data }))),
+    open: () => act(async () => [...subs].forEach((s) => s.onOpen())),
+  };
 }
 
 const later = (n: number) => new Date(Date.parse("2026-11-26T11:00:00.000Z") + n * 1000).toISOString();
@@ -249,13 +276,18 @@ describe("WorkLines: the transcription line", () => {
     expect(m.count("POST /projects/p1/transcription-list/stop")).toBe(1);
   });
 
-  it("nothing to show renders nothing: no run and an idle list with nothing on it (and no stream is opened)", async () => {
+  it("nothing to show renders nothing: no run and an idle list with nothing on it (the stream is followed all the same)", async () => {
     const { m } = start();
-    await waitFor(() => expect(m.count("GET /projects/p1/transcription-list")).toBe(1));
-    await waitFor(() => expect(m.count("GET /projects/p1/downloads")).toBe(1));
-    expect(m.count("GET /events")).toBe(0);
+    // Without a screen's stream, the lines' own stream runs from the mount (R679 A1): read at the mount and at its opening.
+    await waitFor(() => expect(m.streams()).toBe(1));
+    await waitFor(() => expect(m.count("GET /projects/p1/transcription-list")).toBe(2));
+    await waitFor(() => expect(m.count("GET /projects/p1/downloads")).toBe(2));
+    expect(m.count("GET /events")).toBe(1);
     expect(screen.queryByRole("heading", { name: WORK_LINES_TEXT.heading })).toBeNull();
     expect(screen.queryByRole("region")).toBeNull();
+    // A run that starts later shows its line.
+    await act(async () => m.emit({ projectId: "p1", downloads: exampleRun({ state: "queued", total: 0, done: 0 }) }));
+    await shown('"Example Channel" is waiting its turn. It starts by itself when the downloads before it have finished, paused or stopped.');
   });
 
   it("a service that does not know the two routes (404) shows nothing and says no error", async () => {
@@ -266,9 +298,10 @@ describe("WorkLines: the transcription line", () => {
       runs: [exampleRun()],
       extra: [http.get(url("/projects/p1/downloads"), unknown("/projects/p1/downloads")), http.get(url("/projects/p1/transcription-list"), unknown("/projects/p1/transcription-list"))],
     });
-    await waitFor(() => expect(asks).toBe(2));
-    // Nothing to show: no stream is followed, no error said.
-    expect(m.count("GET /events")).toBe(0);
+    await waitFor(() => expect(m.streams()).toBe(1));
+    // At the mount and at the stream's opening.
+    await waitFor(() => expect(asks).toBe(4));
+    // Nothing to show: no error said.
     expect(screen.queryByRole("region")).toBeNull();
     expect(screen.queryAllByRole("alert")).toEqual([]);
   });
@@ -371,10 +404,13 @@ describe("WorkLines: the event stream (R597, R641 D2, R658, R659)", () => {
     // The read of p1's runs is held.
     const reads = holding("/projects/p1/downloads", () => true);
     const { m, client, view } = start({ runs: [exampleRun()], extra: [reads.handler] });
-    await waitFor(() => expect(reads.count()).toBe(1));
+    // At the mount and at the opening of the stream (R679 A1).
+    await waitFor(() => expect(reads.count()).toBe(2));
     view.rerender(<WorkLines client={client} projectId="p2" />);
-    await waitFor(() => expect(m.count("GET /projects/p2/downloads")).toBe(1));
+    // At the mount and at the opening of the stream, which runs from the mount (R679 A1).
+    await waitFor(() => expect(m.count("GET /projects/p2/downloads")).toBe(2));
     expect(reads.requests[0]!.signal.aborted).toBe(true);
+    expect(reads.requests[1]!.signal.aborted).toBe(true);
     reads.release();
     await waitFor(() => expect(m.count("GET /projects/p2/transcription-list")).toBeGreaterThanOrEqual(1));
     notShown('Downloading "Example Channel": 120 of 412');
@@ -383,9 +419,142 @@ describe("WorkLines: the event stream (R597, R641 D2, R658, R659)", () => {
     const later2 = holding("/projects/p2/transcription-list", () => true);
     server.use(later2.handler);
     view.rerender(<WorkLines client={client} projectId="p2" key="again" />);
-    await waitFor(() => expect(later2.count()).toBe(1));
+    await waitFor(() => expect(later2.count()).toBe(2));
     view.unmount();
     await waitFor(() => expect(later2.requests[0]!.signal.aborted).toBe(true));
+    await waitFor(() => expect(later2.requests[1]!.signal.aborted).toBe(true));
     later2.release();
+  });
+});
+
+describe("WorkLines: the screen's own stream (R679 A)", () => {
+  const RUNNING_LIST = idleList("p1", { state: "running", total: 5, done: 1 });
+
+  it("a screen that showed nothing gets a run and a running list by event: both lines appear, and the lines open no stream of their own", async () => {
+    const feed = screenStream();
+    const { m } = start({}, { events: feed.events });
+    await waitFor(() => expect(m.count("GET /projects/p1/downloads")).toBe(1));
+    await waitFor(() => expect(m.count("GET /projects/p1/transcription-list")).toBe(1));
+    expect(feed.subscribers()).toBe(1);
+    expect(screen.queryByRole("region")).toBeNull();
+    await feed.emit({ projectId: "p1", downloads: exampleRun() });
+    await feed.emit({ projectId: "p1", transcriptions: RUNNING_LIST });
+    await shown('Downloading "Example Channel": 120 of 412');
+    await shown("Transcribing: 1 of 5");
+    expect(m.count("GET /events")).toBe(0);
+  });
+
+  it("a run discarded by event, then a new run's event: the new line appears", async () => {
+    const feed = screenStream();
+    const { m } = start({ runs: [exampleRun({ state: "interrupted" })] }, { events: feed.events });
+    await shown("The capture of 'Example Channel' was interrupted: 120 of 412 done.");
+    await feed.emit({ projectId: "p1", discarded: "run-1" });
+    await waitFor(() => expect(screen.queryByRole("region")).toBeNull());
+    await feed.emit({ projectId: "p1", downloads: exampleRun({ runId: "run-2", title: "Second Channel", startedAt: later(5), updatedAt: later(5) }) });
+    await shown('Downloading "Second Channel": 120 of 412');
+    expect(feed.subscribers()).toBe(1);
+    expect(m.count("GET /events")).toBe(0);
+  });
+
+  it("both lists are read again at every opening of the screen's stream", async () => {
+    const feed = screenStream();
+    const { m } = start({}, { events: feed.events });
+    await waitFor(() => expect(m.count("GET /projects/p1/downloads")).toBe(1));
+    m.setRuns([exampleRun({ state: "paused" })]);
+    await feed.open();
+    await shown('"Example Channel" is paused: 120 of 412 downloaded.');
+    await waitFor(() => expect(m.count("GET /projects/p1/transcription-list")).toBe(2));
+    expect(m.count("GET /projects/p1/downloads")).toBe(2);
+    expect(m.count("GET /events")).toBe(0);
+  });
+
+  it("a read that fails (500) shows the notice; Reconnect reads again, and a read that succeeds takes the notice away", async () => {
+    const feed = screenStream();
+    let failing = true;
+    let asks = 0;
+    const fail = () => (asks++, failing ? HttpResponse.json({ error: { code: "INTERNAL", message: "Something went wrong." } }, { status: 500 }) : undefined);
+    const { m } = start({ runs: [exampleRun()], extra: [http.get(url("/projects/p1/downloads"), fail), http.get(url("/projects/p1/transcription-list"), fail)] }, { events: feed.events });
+    await shown(LOST);
+    notShown('Downloading "Example Channel": 120 of 412');
+    // Reconnect reads again: still failing, the notice stays.
+    await userEvent.setup().click(screen.getByRole("button", { name: "Reconnect" }));
+    await waitFor(() => expect(asks).toBe(4));
+    await shown(LOST);
+    failing = false;
+    await userEvent.setup().click(screen.getByRole("button", { name: "Reconnect" }));
+    await shown('Downloading "Example Channel": 120 of 412');
+    await waitFor(() => notShown(LOST));
+    // Failing again; the next opening of the screen's stream reads, and its success takes the notice away.
+    failing = true;
+    await feed.open();
+    await shown(LOST);
+    failing = false;
+    await feed.open();
+    await waitFor(() => notShown(LOST));
+    expect(m.count("GET /events")).toBe(0);
+  });
+
+  it("a 404 says nothing and keeps the runs learned from events", async () => {
+    const feed = screenStream();
+    let asks = 0;
+    const unknown = () => (asks++, HttpResponse.json({ message: "Route not found", error: "Not Found", statusCode: 404 }, { status: 404 }));
+    start({ extra: [http.get(url("/projects/p1/downloads"), unknown), http.get(url("/projects/p1/transcription-list"), unknown)] }, { events: feed.events });
+    await feed.emit({ projectId: "p1", downloads: exampleRun() });
+    await shown('Downloading "Example Channel": 120 of 412');
+    await feed.open();
+    await waitFor(() => expect(asks).toBe(4));
+    await act(async () => {});
+    expect(getShown('Downloading "Example Channel": 120 of 412')).toBeTruthy();
+    notShown(LOST);
+    expect(screen.queryAllByRole("alert")).toEqual([]);
+  });
+
+  it("a read that answers after a newer event does not overwrite it (the runs and the list)", async () => {
+    const feed = screenStream();
+    const runsRead = holding("/projects/p1/downloads", () => true);
+    const listRead = holding("/projects/p1/transcription-list", () => true);
+    const { m } = start({ runs: [exampleRun({ done: 100 })], lists: { p1: idleList("p1", { state: "running", total: 5, done: 1 }) }, extra: [runsRead.handler, listRead.handler] }, { events: feed.events });
+    await waitFor(() => expect(runsRead.count()).toBe(1));
+    await waitFor(() => expect(listRead.count()).toBe(1));
+    // While the reads are out: the run moved on, a second run started, and the list moved on. The same updatedAt as the
+    // read's own, so only the order of arrival tells which is newer.
+    await feed.emit({ projectId: "p1", downloads: exampleRun({ done: 130 }) });
+    await feed.emit({ projectId: "p1", downloads: exampleRun({ runId: "run-2", title: "Second Channel", startedAt: later(5), updatedAt: later(5) }) });
+    await feed.emit({ projectId: "p1", transcriptions: idleList("p1", { state: "running", total: 5, done: 3 }) });
+    await shown('Downloading "Example Channel": 130 of 412');
+    await shown("Transcribing: 3 of 5");
+    runsRead.release();
+    listRead.release();
+    await waitFor(() => expect(m.count("GET /projects/p1/transcription-list")).toBe(1));
+    await waitFor(() => expect(m.count("GET /projects/p1/downloads")).toBe(1));
+    // The read's answers came (as they stood when it was sent) and changed nothing.
+    await act(async () => {});
+    expect(getShown('Downloading "Example Channel": 130 of 412')).toBeTruthy();
+    expect(getShown('Downloading "Second Channel": 120 of 412')).toBeTruthy();
+    expect(getShown("Transcribing: 3 of 5")).toBeTruthy();
+    notShown('Downloading "Example Channel": 100 of 412');
+    notShown("Transcribing: 1 of 5");
+  });
+
+  it("after a Discard here, once focus leaves the heading, nothing is left on screen (M6)", async () => {
+    const feed = screenStream();
+    const { m } = start({ runs: [exampleRun({ state: "interrupted" })] }, { events: feed.events });
+    await shown("The capture of 'Example Channel' was interrupted: 120 of 412 done.");
+    await userEvent.setup().click(screen.getByRole("button", { name: /^Discard/ }));
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+    expect(m.count("POST /projects/p1/downloads/run-1/discard")).toBe(1);
+    act(() => heading().blur());
+    await waitFor(() => expect(screen.queryByRole("region")).toBeNull());
+    // Still subscribed: a new run shows its line.
+    await feed.emit({ projectId: "p1", downloads: exampleRun({ runId: "run-2", title: "Second Channel" }) });
+    await shown('Downloading "Second Channel": 120 of 412');
+  });
+
+  it("the lines unsubscribe at unmount", async () => {
+    const feed = screenStream();
+    const { view } = start({}, { events: feed.events });
+    expect(feed.subscribers()).toBe(1);
+    view.unmount();
+    expect(feed.subscribers()).toBe(0);
   });
 });

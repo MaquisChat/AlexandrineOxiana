@@ -795,18 +795,20 @@ describe("Capture screen — profile", () => {
     expect(bg.count(`GET /projects/${P2}/downloads`)).toBe(0);
   });
 
-  it("a profile capture started here shows its run in the work lines", async () => {
+  it("a profile capture started here shows its run in the work lines, from an event on the screen's own stream", async () => {
     const bg = mockBackground({ noEvents: true }, BASE);
-    const { user } = await setup({ extra: bg.handlers });
-    await waitFor(() => expect(bg.count(`GET /projects/${P1}/downloads`)).toBe(1));
+    const { m, user } = await setup({ extra: bg.handlers });
+    await waitFor(() => expect(bg.count(`GET /projects/${P1}/downloads`)).toBeGreaterThanOrEqual(1));
     expect(screen.queryByRole("region", { name: "Downloads and transcriptions" })).toBeNull();
-    bg.setRuns([exampleRun({ projectId: P1, runId: "qp1", title: "someone", url: PROFILE, platform: "instagram", state: "downloading", total: 0, done: 0 })]);
     await user.type(screen.getByRole("textbox", { name: "Profile, channel or playlist link" }), PROFILE);
     await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    // The service publishes the new run on the one stream the screen has (R679 A2).
+    m.emit("background.progress", { projectId: P1, downloads: exampleRun({ projectId: P1, runId: "qp1", title: "someone", url: PROFILE, platform: "instagram", state: "downloading", total: 0, done: 0 }) });
     const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
     expect(await within(lines).findByText((_c, el) => el?.textContent === 'Downloading "someone": reading the list of posts…' && el.tagName === "P")).toBeTruthy();
-    // Read at the opening, again once the capture started, and at the opening of the stream it now follows.
-    await waitFor(() => expect(bg.count(`GET /projects/${P1}/downloads`)).toBe(3));
+    // Still one stream: the lines follow the screen's.
+    expect(m.streams()).toBe(1);
+    expect(m.calls.filter((c) => c.path === "/events")).toHaveLength(1);
   });
 
   it("a profile run's posts and summary appear as its events arrive", async () => {

@@ -4,12 +4,13 @@
  * @ao/shared (`runLines`, `transcriptionLines` and the fixed texts); titles, addresses and the service's and platform's
  * words go through UserText.
  *
- * Both lists are read at the opening and at every opening of the event stream; `background.progress` events of this
- * project keep them current. The stream is followed only while there is something to show (no run and an idle list
- * show nothing and open no stream); a screen that starts work mounts the lines afresh (a new `key`). The stream follows R597, R641 D2, R658 and R659 as the import's run step does: an opening
- * limit and a silence limit, two reconnects 300 ms apart, and the count of tries starts again only when a connection
- * proved itself (an event of this project arrived on it, or it stayed open and silent to the silence limit). A service
- * that does not know the two routes (404) has nothing to show: the section stays quiet.
+ * Both lists are read at the mount and at every opening of the event stream; `background.progress` events of this
+ * project keep them current, from the mount to the unmount, whatever is shown (R679 A1). A screen hands its own event
+ * stream to the lines (`events`, see `useEventFeed`), so a screen has one stream; without it the lines follow a stream
+ * of their own, as the import's run step does (R597, R641 D2, R658, R659): an opening limit and a silence limit, two
+ * reconnects 300 ms apart, and the count of tries starts again only when a connection proved itself (an event of this
+ * project arrived on it, or it stayed open and silent to the silence limit). A service that does not know the two
+ * routes (404) has nothing to show; any other failed read says the notice, with "Reconnect" (R679 A3).
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import {
@@ -27,11 +28,17 @@ import {
   type TranscriptionListSummary,
 } from "@ao/shared";
 import { backgroundApi, backgroundProgress } from "../api/background";
-import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient, type ServiceEvent } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isNoAnswerInTime, readWithin } from "../api/firstRead";
 import { errorText } from "../api/library";
 import { UserText } from "./UserText";
 import "./WorkLines.css";
+
+/** A screen's own event stream, handed to the lines (R679 A1): every event it receives and every (re)opening. */
+export interface WorkLinesEvents {
+  /** Returns the function that ends the subscription. */
+  subscribe(onEvent: (e: ServiceEvent) => void, onOpen: () => void): () => void;
+}
 
 export interface WorkLinesProps {
   client: ApiClient;
@@ -40,6 +47,30 @@ export interface WorkLinesProps {
   streamOpenMs?: number;
   /** R641 D2: how long an open event stream may deliver nothing before it is closed and tried afresh (smaller in tests). */
   streamQuietMs?: number;
+  /** The screen's own event stream (R679 A1): with it, the lines open no stream of their own. */
+  events?: WorkLinesEvents;
+}
+
+/**
+ * For a screen (R679 A2): a small set of subscribers beside its own event stream. The screen calls `event` for every
+ * event its stream receives and `opened` at every opening; `events` goes to the lines.
+ */
+export function useEventFeed(): { events: WorkLinesEvents; event(e: ServiceEvent): void; opened(): void } {
+  const [feed] = useState(() => {
+    const subs = new Set<{ onEvent: (e: ServiceEvent) => void; onOpen: () => void }>();
+    return {
+      events: {
+        subscribe(onEvent: (e: ServiceEvent) => void, onOpen: () => void) {
+          const s = { onEvent, onOpen };
+          subs.add(s);
+          return () => void subs.delete(s);
+        },
+      },
+      event: (e: ServiceEvent) => [...subs].forEach((s) => s.onEvent(e)),
+      opened: () => [...subs].forEach((s) => s.onOpen()),
+    };
+  });
+  return feed;
 }
 
 /** Reconnects after the event stream ends (then the notice and "Reconnect"). */
@@ -55,13 +86,23 @@ const unknownRoute = (err: unknown) => err instanceof ApiClientError && err.stat
 
 const newestFirst = (runs: DownloadRunSummary[]) => [...runs].sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0));
 
-/** A run's state as read, unless the one already held is newer (an event that came while the read was out). */
-function merge(held: DownloadRunSummary[], read: DownloadRunSummary[]): DownloadRunSummary[] {
+/**
+ * The runs as read, against those held (R679 A4): a run that an event (or an answer) changed after the read was sent
+ * keeps what that said, also a run the read does not know yet, or one an event removed; otherwise the read's, unless
+ * the one held is newer by its `updatedAt`.
+ */
+function merge(held: DownloadRunSummary[], read: DownloadRunSummary[], seen: ReadonlyMap<string, number>, sent: number): DownloadRunSummary[] {
   const byId = new Map(held.map((r) => [r.runId, r]));
-  return newestFirst(read.map((r) => {
+  const after = (id: string) => (seen.get(id) ?? -1) > sent;
+  const out: DownloadRunSummary[] = [];
+  for (const r of read) {
     const h = byId.get(r.runId);
-    return h && h.updatedAt > r.updatedAt ? h : r;
-  }));
+    if (after(r.runId)) {
+      if (h) out.push(h);
+    } else out.push(h && h.updatedAt > r.updatedAt ? h : r);
+  }
+  for (const h of held) if (after(h.runId) && !read.some((r) => r.runId === h.runId)) out.push(h);
+  return newestFirst(out);
 }
 
 function upsert(held: DownloadRunSummary[], run: DownloadRunSummary): DownloadRunSummary[] {
@@ -122,22 +163,34 @@ interface ProblemsView {
   copied?: string;
 }
 
-export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: WorkLinesProps) {
+export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS, events }: WorkLinesProps) {
   const api = useMemo(() => backgroundApi(client), [client]);
   const headingId = useId();
   const heading = useRef<HTMLHeadingElement>(null);
   const [runs, setRuns] = useState<DownloadRunSummary[]>([]);
   const [list, setList] = useState<TranscriptionListSummary | null>(null);
   const [stopped, setStopped] = useState(false);
-  /** After a Discard or a Stop here, the section stays while focus is on its heading (even with nothing left in it). */
-  const [keep, setKeep] = useState(false);
+  /** After a Discard here, the section stays while focus is on its heading (even with nothing left in it); it goes when focus leaves. */
+  const [holdFocus, setHoldFocus] = useState(false);
+  /** The lines' own stream gave up (R659). */
   const [lost, setLost] = useState(false);
+  /** A read of the runs or of the list failed with anything but 404 (R679 A3). */
+  const [failed, setFailed] = useState<{ runs: boolean; list: boolean }>({ runs: false, list: false });
   const [attempt, setAttempt] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
   const busyNow = useRef(new Set<string>());
   const [problems, setProblems] = useState<Record<string, ProblemsView>>({});
   const focusHeading = useRef(false);
+  /**
+   * R679 A4: a count of what arrived (events and answers), and for each run, and for the list, the count when it last
+   * changed. A read's answer about something that changed after the read was sent is dropped.
+   */
+  const seq = useRef(0);
+  const runSeen = useRef(new Map<string, number>());
+  const listSeen = useRef(-1);
+  /** The reads of the project shown now are cancelled through this when it changes or the lines go. */
+  const reads = useRef(new AbortController());
   /** The project shown now: an answer for another one (or after unmount) changes nothing. */
   const current = useRef<string | null>(projectId);
   current.current = projectId;
@@ -153,12 +206,15 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
     setRuns([]);
     setList(null);
     setStopped(false);
-    setKeep(false);
+    setHoldFocus(false);
     setLost(false);
+    setFailed({ runs: false, list: false });
     setError(null);
     setProblems({});
     busyNow.current = new Set();
     setBusy(new Set());
+    runSeen.current = new Map();
+    listSeen.current = -1;
   }, [projectId]);
 
   useEffect(() => {
@@ -168,45 +224,94 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
     }
   });
 
+  const runChanged = useCallback((runId: string) => runSeen.current.set(runId, ++seq.current), []);
+  const listChanged = useCallback(() => (listSeen.current = ++seq.current), []);
+
   /** Both lists, read for `pid`; dropped when the project changed or the read was cancelled. */
   const read = useCallback(
     (pid: string, signal: AbortSignal) => {
       const mine = () => !signal.aborted && current.current === pid;
+      const sent = seq.current;
       void readWithin((s) => api.downloads(pid, { signal: s }), FIRST_READ_TIMEOUT_MS, signal).then(
-        (read) => mine() && setRuns((held) => merge(held, read.filter((r) => r.projectId === pid))),
-        (err: unknown) => mine() && unknownRoute(err) && setRuns([]),
+        (read) => {
+          if (!mine()) return;
+          setFailed((f) => (f.runs ? { ...f, runs: false } : f));
+          setRuns((held) => merge(held, read.filter((r) => r.projectId === pid), runSeen.current, sent));
+        },
+        (err: unknown) => {
+          if (!mine()) return;
+          // A 404: this service has no such route, nothing to show (and what events said stays).
+          const lostRead = !unknownRoute(err);
+          setFailed((f) => (f.runs === lostRead ? f : { ...f, runs: lostRead }));
+        },
       );
       void readWithin((s) => api.transcriptionList(pid, { signal: s }), FIRST_READ_TIMEOUT_MS, signal).then(
         (l) => {
           if (!mine()) return;
+          setFailed((f) => (f.list ? { ...f, list: false } : f));
+          if (listSeen.current > sent) return;
           setList(l);
           if (l.total > 0) setStopped(false);
         },
-        (err: unknown) => mine() && unknownRoute(err) && setList(null),
+        (err: unknown) => {
+          if (!mine()) return;
+          const lostRead = !unknownRoute(err);
+          setFailed((f) => (f.list === lostRead ? f : { ...f, list: lostRead }));
+        },
       );
     },
     [api],
   );
 
-  const mine = runs.filter((r) => r.projectId === projectId);
-  const listOfProject = list && list.projectId === projectId ? list : null;
-  const listLines = listOfProject ? transcriptionLines(listOfProject) : {};
-  const anything = mine.length > 0 || listLines.title !== undefined;
-  /**
-   * The event stream is followed while the section shows something. With nothing to show, the lists are read once (a
-   * screen that starts work here mounts the lines afresh, with a new `key`, so that they are read again).
-   */
-  const following = anything || stopped || keep;
+  /** A `background.progress` event of `pid` applied; any other event is not. True when it was one. */
+  const apply = useCallback(
+    (ev: ServiceEvent, pid: string): boolean => {
+      const e = backgroundProgress(ev, pid);
+      if (!e) return false;
+      if (e.downloads) {
+        const run = e.downloads;
+        runChanged(run.runId);
+        setRuns((held) => upsert(held, run));
+      }
+      if (e.discarded !== undefined) {
+        const gone = e.discarded;
+        runChanged(gone);
+        setRuns((held) => held.filter((r) => r.runId !== gone));
+      }
+      if (e.transcriptions) {
+        const l = e.transcriptions;
+        listChanged();
+        setList(l);
+        if (l.total > 0) setStopped(false);
+      }
+      return true;
+    },
+    [runChanged, listChanged],
+  );
 
-  // The lists as they stand at the opening.
+  // The lists as they stand at the mount; with the screen's stream, its events and a new read at each of its openings.
   useEffect(() => {
     const ctl = new AbortController();
-    read(projectId, ctl.signal);
-    return () => ctl.abort();
-  }, [projectId, read]);
+    reads.current = ctl;
+    const pid = projectId;
+    const unsubscribe = events?.subscribe(
+      (ev) => {
+        if (!ctl.signal.aborted) apply(ev, pid);
+      },
+      () => {
+        if (!ctl.signal.aborted) read(pid, ctl.signal);
+      },
+    );
+    read(pid, ctl.signal);
+    return () => {
+      ctl.abort();
+      unsubscribe?.();
+    };
+  }, [projectId, read, apply, events]);
 
+  // Without the screen's stream: the lines' own, from the mount.
   useEffect(() => {
-    if (!following) return;
+    if (events) return;
     const ctl = new AbortController();
     let stop = false;
     const pid = projectId;
@@ -227,22 +332,7 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
           };
           for await (const ev of client.events({ signal: ctl.signal, onOpen, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
             if (stop) return;
-            const e = backgroundProgress(ev, pid);
-            if (!e) continue;
-            proved = true;
-            if (e.downloads) {
-              const run = e.downloads;
-              setRuns((held) => upsert(held, run));
-            }
-            if (e.discarded !== undefined) {
-              const gone = e.discarded;
-              setRuns((held) => held.filter((r) => r.runId !== gone));
-            }
-            if (e.transcriptions) {
-              const l = e.transcriptions;
-              setList(l);
-              if (l.total > 0) setStopped(false);
-            }
+            if (apply(ev, pid)) proved = true;
           }
         } catch (err) {
           // Once open, the client's "did not answer in time" is only its quiet limit: the stream was open and silent to it.
@@ -261,7 +351,7 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
       stop = true;
       ctl.abort();
     };
-  }, [client, projectId, read, attempt, streamOpenMs, streamQuietMs, following]);
+  }, [client, projectId, read, apply, attempt, streamOpenMs, streamQuietMs, events]);
 
   /** One request at a time per line (a double press sends one), its answer dropped if the project changed. */
   const act = async <T,>(key: string, call: () => Promise<T>, then: (answer: T) => void) => {
@@ -284,21 +374,25 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
   };
 
   const runAction = (run: DownloadRunSummary, what: "pause" | "stop" | "resume") =>
-    void act(`run:${run.runId}`, () => api.runAction(projectId, run.runId, what), (r) => setRuns((held) => upsert(held, r)));
+    void act(`run:${run.runId}`, () => api.runAction(projectId, run.runId, what), (r) => {
+      runChanged(r.runId);
+      setRuns((held) => upsert(held, r));
+    });
 
   const discard = (run: DownloadRunSummary) =>
     void act(`run:${run.runId}`, () => api.discard(projectId, run.runId), () => {
+      runChanged(run.runId);
       setRuns((held) => held.filter((r) => r.runId !== run.runId));
-      setKeep(true);
+      setHoldFocus(true);
       focusHeading.current = true;
     });
 
   const listAction = (what: "pause" | "continue" | "stop") =>
     void act("list", () => api.listAction(projectId, what), (l) => {
+      listChanged();
       setList(l);
       if (what === "stop") {
         setStopped(true);
-        setKeep(true);
         focusHeading.current = true;
       }
     });
@@ -328,11 +422,17 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
     setProblems((p) => (p[run.runId] ? { ...p, [run.runId]: { ...p[run.runId], copied: said } } : p));
   };
 
-  if (!following) return null;
+  const mine = runs.filter((r) => r.projectId === projectId);
+  const listOfProject = list && list.projectId === projectId ? list : null;
+  const listLines = listOfProject ? transcriptionLines(listOfProject) : {};
+  const notice = lost || failed.runs || failed.list;
+  /** R679 A5: nothing visible with no run, an idle empty list, no notice and no status sentence. */
+  const visible = mine.length > 0 || listLines.title !== undefined || notice || stopped || error !== null || holdFocus;
+  if (!visible) return null;
 
   return (
     <section className="ao-worklines" aria-labelledby={headingId}>
-      <h2 id={headingId} ref={heading} tabIndex={-1}>
+      <h2 id={headingId} ref={heading} tabIndex={-1} onBlur={() => setHoldFocus(false)}>
         {WORK_LINES_TEXT.heading}
       </h2>
       {stopped && <p role="status">{LIST_STOPPED_TEXT}</p>}
@@ -341,14 +441,17 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
           <UserText as="p">{error}</UserText>
         </div>
       )}
-      {lost && anything && (
+      {notice && (
         <div className="ao-worklines__note" role="alert">
           <p>{WORK_LINES_TEXT.lost}</p>
           <button
             type="button"
             onClick={() => {
-              setLost(false);
-              setAttempt((n) => n + 1);
+              if (lost) {
+                setLost(false);
+                setAttempt((n) => n + 1);
+              }
+              if (failed.runs || failed.list) read(projectId, reads.current.signal);
             }}
           >
             {WORK_LINES_TEXT.reconnect}

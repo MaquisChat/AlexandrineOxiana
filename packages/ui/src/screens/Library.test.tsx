@@ -34,6 +34,20 @@ describe("Library screen", () => {
     expect(m.count("GET /projects/p2/downloads")).toBe(0);
   });
 
+  it("an event on the screen's own stream shows its line in the work lines (R679 A2)", async () => {
+    // The screen's one /events stream is the background fake's, so a test can publish on it.
+    const m = mockBackground({});
+    server.use(...m.handlers, ...libraryHandlers());
+    renderLibrary();
+    await waitFor(() => expect(m.count("GET /projects/p1/downloads")).toBeGreaterThan(0));
+    await waitFor(() => expect(m.streams()).toBe(1));
+    expect(screen.queryByRole("region", { name: "Downloads and transcriptions" })).toBeNull();
+    act(() => m.emit({ projectId: "p1", downloads: exampleRun({ projectId: "p1", state: "queued", total: 0, done: 0 }) }));
+    const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
+    expect(await within(lines).findByText((_c, el) => el?.textContent === '"Example Channel" is waiting its turn. It starts by itself when the downloads before it have finished, paused or stopped.' && el.tagName === "P")).toBeTruthy();
+    expect(m.count("GET /events")).toBe(1);
+  });
+
   it("lists projects with their compliance profile badges, and marks locked ones", async () => {
     server.use(...libraryHandlers());
     renderLibrary();

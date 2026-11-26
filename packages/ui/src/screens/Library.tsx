@@ -20,7 +20,7 @@ import { JobsIndicator, type Job } from "../components/JobsIndicator";
 import { PageReads, usePageHost } from "../components/PageReads";
 import { ProjectNav } from "../components/ProjectNav";
 import { RecheckProjectButton, useProjectRecheck } from "../components/RecheckProject";
-import { WorkLines } from "../components/WorkLines";
+import { useEventFeed, WorkLines } from "../components/WorkLines";
 import { SearchBox } from "../components/SearchBox";
 import { SourceTable } from "../components/SourceTable";
 import { PendingWritesDialog } from "../components/PendingWritesDialog";
@@ -352,6 +352,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /** How many times the event stream below has connected again after dropping (R515 N2: the recheck asks again). */
   const [reconnects, setReconnects] = useState(0);
 
+  /** The work lines follow this screen's own event stream (R679 A2). */
+  const feed = useEventFeed();
+
   // ---- service events: library state, index progress, background jobs ----
   useEffect(() => {
     const ac = new AbortController();
@@ -363,10 +366,12 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       // FR-756 B: at an opening after the stream was lost, without waiting for an event on it, what has not been read is
       // read again (as FR-750's screens do). The first opening, with the first reads still out, reads nothing more.
       const onOpen = () => {
+        feed.opened();
         if (again) readAgainRef.current();
       };
       try {
         for await (const e of api.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
+          feed.event(e);
           // A stream after a drop is open once its first event (the fresh state) arrives: what was missed is asked for.
           if (first) {
             first = false;
@@ -422,7 +427,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       ac.abort();
       clearTimeout(retry);
     };
-  }, [api, noteUnknownCreates, streamOpenMs, streamQuietMs]);
+  }, [api, noteUnknownCreates, streamOpenMs, streamQuietMs, feed]);
 
   // ---- projects and their profile badges ----
   const showProjects = useCallback((list: ProjectSummary[]) => {
@@ -1097,7 +1102,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         )}
         {project && !locked && (
           <>
-            <WorkLines client={api.client} projectId={project.id} streamOpenMs={streamOpenMs} streamQuietMs={streamQuietMs} />
+            <WorkLines client={api.client} projectId={project.id} events={feed.events} />
             <SearchBox label="Search sources" onSearch={(text) => setFilter((f) => (f.text === text ? f : { ...f, text }))} />
             <DropZone onPaths={(paths) => void attach(paths)} disabled={readOnly || attaching} disabledReason={attaching ? "Attaching…" : readOnlyReason} target={project.name} />
             {outcomes && (
