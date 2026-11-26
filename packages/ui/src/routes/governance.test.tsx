@@ -60,7 +60,7 @@ describe("governance routes (R113, R118)", () => {
     expect(m.count("GET /projects/p2/automation")).toBe(1);
   });
 
-  it("on a locked project the Governance screen of the app does not read the automatic transcription switch, and the switch says nothing of its own (R684)", async () => {
+  it("on a locked project the Governance screen of the app does not show or read the automatic transcription switch (R686)", async () => {
     const m = mockBackground({ noEvents: true, locked: ["p1"] }, BASE);
     server.use(
       ...m.handlers,
@@ -73,11 +73,10 @@ describe("governance routes (R113, R118)", () => {
     window.history.replaceState(null, "", "/governance?project=p1");
     render(<Host />);
     expect(await screen.findByText("This project is locked, so its rules cannot be changed until it is unlocked.")).toBeTruthy();
-    const section = await screen.findByRole("region", { name: "Automatic transcription" });
     await screen.findByText("Nothing is due for destruction.");
+    expect(screen.queryByRole("heading", { name: "Automatic transcription" })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "Transcribe captured audio and video automatically" })).toBeNull();
     expect(m.count("GET /projects/p1/automation")).toBe(0);
-    expect(within(section).queryByRole("alert")).toBeNull();
-    expect((within(section).getByRole("checkbox", { name: "Transcribe captured audio and video automatically" }) as HTMLInputElement).disabled).toBe(true);
   });
 
   it("an unknown project in the address selects none and says so, instead of showing another project's screen (41b2 M1)", async () => {

@@ -23,8 +23,7 @@ import { UserText } from "./UserText";
 export interface SavedSwitchProps {
   label: string;
   hint: string;
-  /** Left out: nothing is read (a locked project, R684); the box stays off, described by `whyId`. */
-  read: ((signal: AbortSignal) => Promise<boolean>) | undefined;
+  read: (signal: AbortSignal) => Promise<boolean>;
   save: (on: boolean) => Promise<boolean>;
   whyId?: string | undefined;
   /** Where focus goes after "Try again" is pressed (the section's heading, `tabIndex={-1}`). */
@@ -63,7 +62,6 @@ export function SavedSwitch({ label, hint, read, save, whyId, focusTo, firstRead
     setWanted(undefined);
     setError(null);
     setReadFailed(false);
-    if (!read) return;
     readWithin(read, firstReadMs, ac.signal).then(
       (v) => {
         if (generation.current === my) setSaved(v);

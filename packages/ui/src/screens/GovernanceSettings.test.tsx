@@ -1379,24 +1379,28 @@ describe("Automatic transcription, on the Governance screen (whole channels, Tas
     expect(box.checked).toBe(true);
   });
 
-  it("on a locked project the switch is not read and says nothing of its own; the screen's reason describes it (R684)", async () => {
+  it("on a locked project the section is not shown and nothing is read for it; unlocked, it appears with the read value (R686)", async () => {
     serve();
     // The service refuses a locked project's switch (423), as it refuses the project's other routes.
     server.use(...lockedAutomation());
-    const m = mockBackground({ noEvents: true, locked: [PID] }, BASE);
+    const m = mockBackground({ noEvents: true, automation: { [PID]: { transcribeNewMedia: true } }, locked: [PID] }, BASE);
     server.use(...m.handlers);
     const why = "This project is locked, so its rules cannot be changed until it is unlocked.";
-    render(<GovernanceSettings api={makeApi()} projectId={PID} background={background()} readOnlyReason={why} projectLocked />);
-    const section = await screen.findByRole("region", { name: "Automatic transcription" });
-    const box = within(section).getByRole("checkbox", { name: LABEL }) as HTMLInputElement;
+    const api = makeApi();
+    const bg = background();
+    const view = render(<GovernanceSettings api={api} projectId={PID} background={bg} readOnlyReason={why} projectLocked />);
     // The screen's other sections have been read and shown: the switch has had every chance to read.
     await screen.findByText("Nothing is due for destruction.");
+    expect(screen.queryByRole("heading", { name: "Automatic transcription" })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: LABEL })).toBeNull();
     expect(m.count(`GET /projects/${PID}/automation`)).toBe(0);
-    expect(within(section).queryByRole("alert")).toBeNull();
-    expect(box.disabled).toBe(true);
-    const described = (box.getAttribute("aria-describedby") ?? "").split(" ").map((id) => document.getElementById(id)?.textContent ?? "");
-    expect(described).toContain(why);
-    await userEvent.click(box);
-    expect(m.count(`PUT /projects/${PID}/automation`)).toBe(0);
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    // Unlocked: the section appears and reads the project's value.
+    server.use(...mockBackground({ noEvents: true, automation: { [PID]: { transcribeNewMedia: true } } }, BASE).handlers);
+    view.rerender(<GovernanceSettings api={api} projectId={PID} background={bg} />);
+    const section = await screen.findByRole("region", { name: "Automatic transcription" });
+    const box = within(section).getByRole("checkbox", { name: LABEL }) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(true);
   });
 });
