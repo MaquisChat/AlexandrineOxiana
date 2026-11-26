@@ -588,3 +588,4 @@ R662 (2026-11-26 UTC): N17 green in every step (11,946 tests; 230/230; the unit 
 R663 (2026-11-26 UTC): MAC BUILD 16 exists — Desktop (macOS) run 25 (id 45736712881, reader 04ec3bd) green at 01:49 UTC; dmg sha256 827058e4…37e2e3; 56 constraints, Python 3.13.17, scenario Q 2 of 2, all checks passed; main still build 15
 R664 (2026-11-26 UTC): CI run 294 green on build request 16 (reader 04ec3bd, 02:35 UTC); the owner's page has part 16; the owner asked for main (no word yet; main stays build 15)
 R665 (2026-11-26 UTC): the owner's word for build 16 — "Merge": the reader branch at 04ec3bd exactly plus the working branch's documents; not an answer to the three open questions
+R666 (2026-11-26 UTC): build request 16 MERGED to main on the owner's word — merge commit 23f16ec, code identical to 04ec3bd; the documents merged after it; main's own check and Mac run to be read

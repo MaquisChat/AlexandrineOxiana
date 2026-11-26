@@ -1,5 +1,7 @@
 # The final review — what I need from you
 
+*Updated 26 November 2026, just after midnight Central: BUILD 16 IS IN `main`, on your word "Merge". Mac build 16 (part 16) is now the build of `main` and the build to use.*
+
 *Updated 25 November 2026, 8:44 pm Central: part 16, at the end, is new — build request 16 (silent connections are opened again, the check for missing files shows its progress, "Back up now", backups said in sentences) passed all its tests and GitHub's check, and MAC BUILD 16 EXISTS. It is NOT in `main` yet: that waits for your word.*
 
 *Updated 24 November 2026, 7 pm Central: MAC BUILD 12 EXISTS — GitHub gave the build a Mac this time and every check passed, the test of Quit among them. Part 12 says where to download it. It replaces build 10.*
@@ -944,7 +946,7 @@ A short part. Build request 15 holds two safety mends that the review of the sto
 - **Pushed as build request 15** at 10:21 am Central on 25 November.
 - **GitHub's own check is green** on exactly this code: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45652933197 (green at 11:34 am Central).
 - **It is in `main`.** At 10:17 am Central you wrote "merge build 15 to main when the check is green"; I merged exactly build request 15 at 11:37 am Central. `main`'s own check passed too, at 12:49 pm: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45666793004
-- **Mac build 15 exists, and it is the build to use now** (it replaces build 13 and contains all of build 14). Run 24 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45666793010 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon` (you must be signed in to GitHub). The disk image's SHA-256 is `4d39b818f6ab75e94894d88a153de11afe7837e19de12a1bce233b856e198157`. GitHub gave no Mac during the US working day (four tries were dropped); asked again at 6:31 pm Central on 25 November, it gave one at once. The Mac built the app at 6:36 pm and ran every check on it: the app starts from the disk image, its helpers start and stop cleanly, Quit by a system request goes the orderly way (2 of 2 runs), and nothing is left running. It was built from `main` as it stands, which is exactly build request 15.
+- **Mac build 15 exists, and it is the build to use now** (it replaces build 13 and contains all of build 14). Run 24 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45666793010 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon` (you must be signed in to GitHub). The disk image's SHA-256 is `4d39b818f6ab75e94894d88a153de11afe7837e19de12a1bce233b856e198157`. GitHub gave no Mac during the US working day (four tries were dropped); asked again at 6:31 pm Central on 25 November, it gave one at once. The Mac built the app at 6:36 pm and ran every check on it: the app starts from the disk image, its helpers start and stop cleanly, Quit by a system request goes the orderly way (2 of 2 runs), and nothing is left running. It was built from `main` as it stands, which is exactly build request 15. *(Superseded just after midnight on 26 November: build 16 is in `main` and Mac build 16 is the build to use — part 16.)*
 
 ### What it mends
 
@@ -988,8 +990,8 @@ Build request 16 holds four pieces. Each was built by one agent and gone through
 - **Tested together on my side:** every step passed — 11,946 tests, 230 of 230 browser scenarios, the Python tests, the desktop tests and scenarios, the app started and quit. One test failed at the first run for a reason of my test machine, not of the app: a test that restores a backup of over 4 GB found the machine's disk nearly full. I read that from the test's own output, freed the disk, and ran the whole step again: no failure.
 - **Pushed as build request 16** at 7:34 pm Central on 25 November.
 - **GitHub's own check is green** on exactly this code: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45736712839 (green at 8:35 pm Central).
-- **Not in `main` yet.** `main` holds build 15. Build 16 goes in when you say so.
-- **Mac build 16 exists.** Run 25 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45736712881 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon` (you must be signed in to GitHub). The disk image's SHA-256 is `827058e453509383b0a752aae436a1786fc011271372444a29ed211a0d37e2e3`. GitHub's Mac built it at 7:40 pm Central on 25 November and ran every check on it (the app starts from the disk image, its helpers start and stop cleanly, Quit by a system request goes the orderly way in 2 of 2 runs, nothing is left running). It contains everything up to build 16. Mac build 15 (part 15) is the build of `main` as it stands.
+- **It is in `main`.** At 11:58 pm Central on 25 November you wrote "Merge"; I merged exactly build request 16 a few minutes after midnight on the 26th. `main`, the reader branch and Mac build 16 now hold the same code.
+- **Mac build 16 exists.** Run 25 of "Desktop (macOS)" on GitHub: https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45736712881 — at the bottom of that page, under "Artifacts", download `alexandrine-oxiana-macos-apple-silicon` (you must be signed in to GitHub). The disk image's SHA-256 is `827058e453509383b0a752aae436a1786fc011271372444a29ed211a0d37e2e3`. GitHub's Mac built it at 7:40 pm Central on 25 November and ran every check on it (the app starts from the disk image, its helpers start and stop cleanly, Quit by a system request goes the orderly way in 2 of 2 runs, nothing is left running). It contains everything up to build 16. Since the merge it is the build of `main`, and the build to use.
 
 ### What you can see
 
@@ -1045,4 +1047,4 @@ Listed, not built:
 - **Held-file cards disappear for the moment a list is read again**, and their notes are announced a second time. Keeping them in place would change an order of focus that was ruled earlier; left as untidy.
 - **FR-760, a remainder:** after an upgrade from an older build, two move destinations whose folders have the same name can still be confused at the first check; the later checks refuse. Accepted.
 
-Waiting for you: the design for whole channels with automatic transcription (its one question), the two decisions of part 15, and your word about `main` for build 16.
+Waiting for you: the design for whole channels with automatic transcription (its one question), and the two decisions of part 15.
