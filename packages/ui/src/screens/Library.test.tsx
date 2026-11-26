@@ -311,6 +311,19 @@ describe("Library screen", () => {
     expect(screen.queryByRole("link", { name: "Find and acquire" })).toBeNull();
   });
 
+  it("a read-only library offers Transcribe everything without a transcript switched off, as its other edit buttons, with the banner saying why (R684)", async () => {
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "locked-by-other-device" };
+    const m = mockBackground({ untranscribed: { p1: { count: 12, soundSeconds: 3.5 * 3600, unknownLengths: 0 } } });
+    server.use(...m.handlers, ...libraryHandlers({ current: ro }));
+    renderLibrary(ro);
+    const button = (await screen.findByRole("button", { name: "Transcribe everything without a transcript" })) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "New collection" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((await screen.findByText(/Read-only \(locked by another device\)/)).closest("[role=status]")).toBeTruthy();
+    await userEvent.click(button);
+    expect(m.count("GET /projects/p1/untranscribed")).toBe(0);
+  });
+
   it("a read-only library offers no new project", async () => {
     server.use(...libraryHandlers({ current: { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" } }));
     renderLibrary({ libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" });

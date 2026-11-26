@@ -70,6 +70,14 @@ export function switchDefaults(base: string = BG_BASE): RequestHandler[] {
   ];
 }
 
+/** The service's answer for a locked project (423 PROJECT_LOCKED), as the project routes give it. */
+export const projectLocked = (): Response => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "This project is locked." } }, { status: 423 });
+
+/** GET and PUT …/automation answered 423 for every project (a locked project), for the screens' own fakes (msw-governance.ts). */
+export function automationLocked(base: string = BG_BASE): RequestHandler[] {
+  return [http.get(`${base}/projects/:id/automation`, projectLocked), http.put(`${base}/projects/:id/automation`, projectLocked)];
+}
+
 export interface BackgroundRecorded {
   method: string;
   path: string;
@@ -103,6 +111,10 @@ export interface BackgroundSetup {
   transcribeAllAnswer?: (body: unknown) => Response | undefined;
   /** Hold the PUTs of the switches and POST …/transcription-list too until `release()` (or the test's end). */
   holdSwitches?: boolean;
+  /** Hold the GETs of the switches and of …/untranscribed until `release()` (or the test's end). */
+  holdReads?: boolean;
+  /** Projects that are locked: GET and PUT …/automation answer 423, as the service answers a locked project. */
+  locked?: string[];
   /** Leave out the /events handler (the test gives its own). */
   noEvents?: boolean;
   /** Handlers tried first. */
@@ -146,6 +158,8 @@ export function mockBackground(o: BackgroundSetup = {}, base: string = BG_BASE):
   let settings: BackgroundSettings = o.settings ?? { keepAwake: true };
   const untranscribed: Record<string, UntranscribedResponse> = { ...(o.untranscribed ?? {}) };
   const holdSwitch = () => (o.holdSwitches ? released : Promise.resolve());
+  const holdRead = () => (o.holdReads ? released : Promise.resolve());
+  const isLocked = (pid: string) => (o.locked ?? []).includes(pid);
   const nothing: UntranscribedResponse = { count: 0, soundSeconds: 0, unknownLengths: 0 };
   const readBody = async (request: Request): Promise<unknown> => {
     const text = await request.text();
@@ -188,8 +202,10 @@ export function mockBackground(o: BackgroundSetup = {}, base: string = BG_BASE):
       runs = runs.map((x) => (x.runId === runId ? next : x));
       return HttpResponse.json({ run: next });
     }),
-    http.get(`${base}/projects/:id/automation`, ({ request, params }) => {
+    http.get(`${base}/projects/:id/automation`, async ({ request, params }) => {
       rec(request, `/projects/${String(params.id)}/automation`);
+      await holdRead();
+      if (isLocked(String(params.id))) return projectLocked();
       return HttpResponse.json(automation[String(params.id)] ?? { transcribeNewMedia: false });
     }),
     http.put(`${base}/projects/:id/automation`, async ({ request, params }) => {
@@ -197,13 +213,15 @@ export function mockBackground(o: BackgroundSetup = {}, base: string = BG_BASE):
       const body = await readBody(request);
       calls.push({ method: "PUT", path: `/projects/${pid}/automation`, body });
       await holdSwitch();
+      if (isLocked(pid)) return projectLocked();
       const answer = o.automationAnswer?.(body);
       if (answer) return answer;
       automation[pid] = body as ProjectAutomation;
       return HttpResponse.json(automation[pid]);
     }),
-    http.get(`${base}/settings/background`, ({ request }) => {
+    http.get(`${base}/settings/background`, async ({ request }) => {
       rec(request, "/settings/background");
+      await holdRead();
       return HttpResponse.json(settings);
     }),
     http.put(`${base}/settings/background`, async ({ request }) => {
@@ -215,8 +233,9 @@ export function mockBackground(o: BackgroundSetup = {}, base: string = BG_BASE):
       settings = body as BackgroundSettings;
       return HttpResponse.json(settings);
     }),
-    http.get(`${base}/projects/:id/untranscribed`, ({ request, params }) => {
+    http.get(`${base}/projects/:id/untranscribed`, async ({ request, params }) => {
       rec(request, `/projects/${String(params.id)}/untranscribed`);
+      await holdRead();
       return HttpResponse.json(untranscribed[String(params.id)] ?? nothing);
     }),
     http.post(`${base}/projects/:id/transcription-list`, async ({ request, params }) => {

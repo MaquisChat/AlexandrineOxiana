@@ -1147,7 +1147,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                 ))}
               </ul>
             )}
-            <TranscribeAll client={api.client} projectId={project.id} />
+            <TranscribeAll client={api.client} projectId={project.id} readOnly={readOnly} />
             {sourcesError && (
               <p role="alert" className="ao-error">
                 {sourcesError}

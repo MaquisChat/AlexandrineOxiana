@@ -8,9 +8,13 @@
  * many were put on it as a status and returns focus to the button. The work line of the list comes by itself: the service
  * publishes the change on the screen's own event stream (R679), so nothing here touches the work lines.
  *
- * A refusal shows the service's sentence; a missing speech model is named as SpeechModelNotice names it, with the link
- * to the Optional tools screen (a read-only library's refusal included: the button is not taken away for it). One request per press (a synchronous guard, then the button is disabled). Answers that
- * arrive after the project changed or after unmount are dropped.
+ * A refusal shows the service's sentence; a missing speech model is said once, as SpeechModelNotice says it, with the
+ * link to the Optional tools screen (another missing tool as MissingToolNotice says it). One request per press (a
+ * synchronous guard, then the button is disabled). Answers that arrive after the project changed or after unmount are
+ * dropped.
+ *
+ * `readOnly`: the library is read-only. The button is then off, as the Library screen's other edit buttons are; the
+ * screen's read-only banner says why (R684).
  */
 import { transcribeAllText, type UntranscribedResponse } from "@ao/shared";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
@@ -24,6 +28,8 @@ import { UserText } from "./UserText";
 export interface TranscribeAllProps {
   client: ApiClient;
   projectId: string;
+  /** The library is read-only: the button is off and nothing is asked. */
+  readOnly?: boolean;
 }
 
 /** The app's usual words when the service gives none. */
@@ -31,7 +37,7 @@ const FAILED = "That could not be done. Try again.";
 
 type Step = { kind: "idle" } | { kind: "asking" } | { kind: "confirm"; r: UntranscribedResponse } | { kind: "sending"; r: UntranscribedResponse };
 
-export function TranscribeAll({ client, projectId }: TranscribeAllProps) {
+export function TranscribeAll({ client, projectId, readOnly = false }: TranscribeAllProps) {
   const api = useMemo(() => backgroundApi(client), [client]);
   const id = useId();
   const [step, setStep] = useState<Step>({ kind: "idle" });
@@ -65,7 +71,7 @@ export function TranscribeAll({ client, projectId }: TranscribeAllProps) {
   });
 
   const ask = async () => {
-    if (busy.current) return;
+    if (busy.current || readOnly) return;
     busy.current = true;
     const my = generation.current;
     setStep({ kind: "asking" });
@@ -121,7 +127,7 @@ export function TranscribeAll({ client, projectId }: TranscribeAllProps) {
       <button
         ref={button}
         type="button"
-        disabled={step.kind === "asking" || step.kind === "sending"}
+        disabled={readOnly || step.kind === "asking" || step.kind === "sending"}
         onClick={() => void ask()}
       >
         {transcribeAllText.button}
@@ -153,17 +159,15 @@ export function TranscribeAll({ client, projectId }: TranscribeAllProps) {
   );
 }
 
-/** The service's sentence; a missing speech model named as SpeechModelNotice names it; another missing tool as MissingToolNotice does. */
+/**
+ * The service's sentence; a missing tool is said once (R684): a speech model as SpeechModelNotice says it, another tool
+ * as MissingToolNotice does, each with its link, and not the service's general sentence as well.
+ */
 function Refusal({ err }: { err: unknown }) {
   const missing = missingToolOf(err);
   const model = missing?.tool ? speechSize(missing.tool) : undefined;
   if (missing && err instanceof ApiClientError) {
-    return (
-      <>
-        {err.message ? <UserText as="p">{err.message}</UserText> : null}
-        {model ? <SpeechModelNotice model={model} installed={{ [model]: false }} /> : <MissingToolNotice from={err} as="p" />}
-      </>
-    );
+    return model ? <SpeechModelNotice model={model} installed={{ [model]: false }} /> : <MissingToolNotice from={err} as="p" />;
   }
   return <UserText as="p">{errorText(err, FAILED)}</UserText>;
 }
