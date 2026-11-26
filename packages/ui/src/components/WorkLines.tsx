@@ -55,6 +55,15 @@ export interface WorkLinesProps {
  * For a screen (R679 A2): a small set of subscribers beside its own event stream. The screen calls `event` for every
  * event its stream receives and `opened` at every opening; `events` goes to the lines.
  */
+/** R681 S1: one subscriber's fault is its own; it neither breaks the screen's stream loop nor the subscribers after it. */
+function each(call: () => void): void {
+  try {
+    call();
+  } catch {
+    // dropped: the file has no way of reporting such an error
+  }
+}
+
 export function useEventFeed(): { events: WorkLinesEvents; event(e: ServiceEvent): void; opened(): void } {
   const [feed] = useState(() => {
     const subs = new Set<{ onEvent: (e: ServiceEvent) => void; onOpen: () => void }>();
@@ -66,8 +75,8 @@ export function useEventFeed(): { events: WorkLinesEvents; event(e: ServiceEvent
           return () => void subs.delete(s);
         },
       },
-      event: (e: ServiceEvent) => [...subs].forEach((s) => s.onEvent(e)),
-      opened: () => [...subs].forEach((s) => s.onOpen()),
+      event: (e: ServiceEvent) => [...subs].forEach((s) => each(() => s.onEvent(e))),
+      opened: () => [...subs].forEach((s) => each(() => s.onOpen())),
     };
   });
   return feed;
@@ -485,7 +494,10 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
 
   return (
     <section className="ao-worklines" aria-labelledby={headingId}>
-      <h2 id={headingId} ref={heading} tabIndex={-1} onBlur={() => setHoldFocus(false)}>
+      <h2 id={headingId} ref={heading} tabIndex={-1} onBlur={() => {
+          // R681 S2: only when focus moved within the page; when the window lost it, the heading stays for its return.
+          if (document.hasFocus()) setHoldFocus(false);
+        }}>
         {WORK_LINES_TEXT.heading}
       </h2>
       {/* R679 B2: the status is there before its sentence, so that a screen reader says it when it arrives. */}

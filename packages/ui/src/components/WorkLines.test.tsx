@@ -3,15 +3,15 @@
  * list, with their buttons, "Show them" and its copied list, and the event stream that keeps them current (R597, R641
  * D2, R658, R659). The sentences come from @ao/shared; the expected strings here are the plan's own.
  */
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { BACKGROUND_EVENT, LIST_STOPPED_TEXT, problemLine, WORK_LINES_TEXT, type BackgroundProgressEvent, type DownloadProblem } from "@ao/shared";
 import type { ServiceEvent } from "../api/client";
 import { exampleRun, idleList, mockBackground, type BackgroundSetup } from "../test/backgroundService";
 import { hang, server, testClient, url, useMockService } from "../test/service";
-import { WorkLines, type WorkLinesEvents } from "./WorkLines";
+import { useEventFeed, WorkLines, type WorkLinesEvents } from "./WorkLines";
 
 useMockService();
 
@@ -590,6 +590,9 @@ describe("WorkLines: the screen's own stream (R679 A)", () => {
     await userEvent.setup().click(buttonOf("The capture of 'Example Channel' was interrupted: 120 of 412 done.", "Discard"));
     await waitFor(() => expect(document.activeElement).toBe(heading()));
     expect(m.count("POST /projects/p1/downloads/run-1/discard")).toBe(1);
+    // Focus moves elsewhere within the page (the page has the focus: R681 S2).
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    onTestFinished(() => hasFocus.mockRestore());
     act(() => heading().blur());
     await waitFor(() => expect(screen.queryByRole("region")).toBeNull());
     // Still subscribed: a new run shows its line.
@@ -808,6 +811,52 @@ describe("WorkLines: smaller points (R679 D)", () => {
       expect(problems.requests[0]!.signal.aborted).toBe(true);
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+describe("WorkLines: last fixes (R681)", () => {
+  it("a subscriber that throws does not stop the ones after it, and the screen's loop sees no throw (S1)", () => {
+    const { result } = renderHook(() => useEventFeed());
+    const feed = result.current;
+    const second = { events: 0, opens: 0 };
+    feed.events.subscribe(
+      () => {
+        throw new Error("first subscriber's event");
+      },
+      () => {
+        throw new Error("first subscriber's open");
+      },
+    );
+    feed.events.subscribe(
+      () => void second.events++,
+      () => void second.opens++,
+    );
+    expect(() => feed.event({ type: BACKGROUND_EVENT, data: { projectId: "p1" } })).not.toThrow();
+    expect(() => feed.opened()).not.toThrow();
+    expect(second).toEqual({ events: 1, opens: 1 });
+  });
+
+  it("after a Remove of the last line, the window losing focus keeps the heading; focus moving within the page removes the section (S2)", async () => {
+    const TITLE = '"Example Channel": all 412 downloaded.';
+    start({ runs: [exampleRun({ state: "finished", done: 412 })] });
+    await shown(TITLE);
+    await userEvent.setup().click(buttonOf(TITLE, "Remove from this list"));
+    await waitFor(() => expect(document.activeElement).toBe(heading()));
+    const hasFocus = vi.spyOn(document, "hasFocus");
+    try {
+      // Another application took the focus: the window lost it, the heading stays for when it comes back.
+      hasFocus.mockReturnValue(false);
+      act(() => heading().blur());
+      expect(heading()).toBeTruthy();
+      expect(screen.getByRole("region", { name: WORK_LINES_TEXT.heading })).toBeTruthy();
+      // Back, and focus moves elsewhere within the page: the empty section goes.
+      act(() => heading().focus());
+      hasFocus.mockReturnValue(true);
+      act(() => heading().blur());
+      await waitFor(() => expect(screen.queryByRole("region")).toBeNull());
+    } finally {
+      hasFocus.mockRestore();
     }
   });
 });
