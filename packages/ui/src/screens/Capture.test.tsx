@@ -913,7 +913,12 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
     await user.click(screen.getByRole("button", { name: "Capture profile" }));
     await user.click(await screen.findByRole("radio", { name: "Audio only" }));
     await user.click(screen.getByRole("checkbox", { name: /Transcribe each video on this Mac/ }));
-    await user.dblClick(screen.getByRole("button", { name: "Start" }));
+    // Two presses in the same tick, before any re-render can disable the button: only the synchronous guard holds (R683 E1).
+    const startButton = screen.getByRole("button", { name: "Start" });
+    act(() => {
+      fireEvent.click(startButton);
+      fireEvent.click(startButton);
+    });
     await screen.findByRole("region", { name: "Capture queue" });
     expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toEqual([{ url: YT_CHANNEL, options: { transcribe: true, transcribeModel: "medium", quality: "audio" } }]);
     // The queue is added as today, the region closes and focus returns to the profile field, emptied.
@@ -1211,10 +1216,10 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
     await user.click(screen.getByRole("button", { name: "Capture profile" }));
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-estimate`)).toHaveLength(1));
     view.rerender(<Capture client={m.client} projectId={P2} />);
-    await act(async () => {
-      gate.release();
-      await new Promise((r) => setTimeout(r, 50));
-    });
+    await act(async () => gate.release());
+    // The held answer has reached the screen (R683 E2).
+    await waitFor(() => expect(m.settled(`POST /projects/${P1}/capture-estimate`)).toBe(1));
+    await act(async () => {});
     expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
     expect(screen.queryByText("Asking YouTube for the list of videos…")).toBeNull();
     expect(m.bodies(`POST /projects/${P2}/capture-profile`)).toHaveLength(0);
