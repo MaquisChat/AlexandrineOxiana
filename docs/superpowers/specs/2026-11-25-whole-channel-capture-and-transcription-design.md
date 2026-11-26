@@ -164,6 +164,10 @@ A standing rule of the project (ruling R41, point I3) said a download cut by a q
 - After a project was locked and unlocked, its downloads wait for "Resume downloads" too (the page first said they would carry on by themselves; your answer made one click the rule).
 - Several channels can be started one after another; they are downloaded in the order you started them.
 - A single pasted link is captured at once even while a channel is downloading or waiting.
+- A single pasted link is saved at up to 720p when Video tools are installed (until now it was a small, low-quality file), and as before without them. It is not put through the estimate.
+- At "Up to 720p" and "Up to 1080p" (and for "Best available" wherever the platform offers it at the best size) the app asks for the kind of file that plays inside the app on every Mac (H.264 picture, AAC sound, MP4). "Best available" above 1080p is usually a newer kind of file that older Macs (before the M3 chips) may not play inside the app; it is still stored and transcribed.
+- A video whose pieces could not all be fetched fails with an error and is tried again by "Resume downloads"; it is never stored cut short.
+- When a platform's servers answer with a server error, the run waits and tries the same video again, as for "slow down".
 - The wait between two videos is 10 seconds, on top of the downloader's own short pauses.
 - The switch "Transcribe captured audio and video automatically" is on the project's Governance screen (the app has no other per-project settings screen); the switch for keeping the Mac awake is on the Optional tools screen.
 - When YouTube says "slow down", the run keeps trying by itself at growing intervals for 12 hours before it pauses for good.
