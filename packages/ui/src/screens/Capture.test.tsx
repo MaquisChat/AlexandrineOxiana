@@ -1,10 +1,10 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 import { COOKIES_ACKNOWLEDGEMENT } from "../api/capture";
 import type { CaptureQueueDetail } from "@ao/shared";
 import { http } from "msw";
-import { ANON_RULES, BASE, errorResponse, mockCapture, P1, P2, server, STRICT_RULES, type CaptureSetup } from "../test/captureService";
+import { ANON_RULES, BASE, errorResponse, exampleEstimate, mockCapture, P1, P2, server, STRICT_RULES, type CaptureSetup } from "../test/captureService";
 import { exampleRun, idleList, mockBackground } from "../test/backgroundService";
 import { Capture, CaptureRoute } from "./Capture";
 
@@ -52,6 +52,14 @@ const links = () => screen.getByRole("textbox", { name: "Links, one per line" })
 async function paste(user: ReturnType<typeof userEvent.setup>, lines: string[]) {
   await user.click(links());
   await user.paste(lines.join("\n"));
+}
+
+const profileBox = () => screen.getByRole("textbox", { name: "Profile, channel or playlist link" });
+
+/** "Capture profile", then "Start" in the estimate that it shows (whole channels, Task 8). */
+async function captureAndStart(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("button", { name: "Capture profile" }));
+  await user.click(await screen.findByRole("button", { name: "Start" }));
 }
 
 describe("Capture screen — links", () => {
@@ -725,11 +733,16 @@ describe("Capture screen — profile", () => {
     fireEvent.change(screen.getByLabelText("Posts until"), { target: { value: "2026-06-30" } });
     await user.click(screen.getByRole("checkbox", { name: "Reels" }));
     await user.click(screen.getByRole("checkbox", { name: "Metadata only" }));
-    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    await captureAndStart(user);
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+    // The estimate is asked with the form's options; Start sends them with an explicit transcription choice (the
+    // project's switch, off here) and, for metadata only, no quality (whole channels, Task 8).
+    expect(m.bodies(`POST /projects/${P1}/capture-estimate`)).toEqual([
+      { url: PROFILE, options: { transcribeModel: "medium", since: "2026-01-01", until: "2026-06-30", maxItems: 25, contentTypes: ["reels"], metadataOnly: true } },
+    ]);
     expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({
       url: PROFILE,
-      options: { transcribeModel: "medium", since: "2026-01-01", until: "2026-06-30", maxItems: 25, contentTypes: ["reels"], metadataOnly: true },
+      options: { transcribe: false, since: "2026-01-01", until: "2026-06-30", maxItems: 25, contentTypes: ["reels"], metadataOnly: true },
     });
     const queue = await screen.findByRole("region", { name: "Capture queue" });
     expect(within(queue).getByText(PROFILE)).toBeTruthy();
@@ -740,12 +753,11 @@ describe("Capture screen — profile", () => {
     const box = screen.getByRole("textbox", { name: "Profile, channel or playlist link" });
     await user.type(box, YT);
     expect(screen.getByText(/looks like a single post.*the app will check it/)).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    await captureAndStart(user);
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
-    await user.clear(box);
     await user.type(box, "https://www.youtube.com/something-new/abc");
     expect(screen.getByText(/Not recognised here.*the app will check it/)).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    await captureAndStart(user);
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(2));
     // The service's refusal shows in the queue.
     await act(async () =>
@@ -776,11 +788,12 @@ describe("Capture screen — profile", () => {
     const field = screen.getByRole("textbox", { name: "Legal basis" });
     await user.click(screen.getByRole("button", { name: "Capture profile" }));
     expect(await screen.findByText(/Enter the legal basis for this capture/)).toBeTruthy();
+    expect(m.bodies(`POST /projects/${P1}/capture-estimate`)).toHaveLength(0);
     expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(0);
     await user.type(field, "Legitimate interests");
-    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    await captureAndStart(user);
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
-    expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({ url: PROFILE, options: { transcribeModel: "medium", includeComments: true, legalBasis: "Legitimate interests" } });
+    expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({ url: PROFILE, options: { transcribe: false, quality: "720p", includeComments: true, legalBasis: "Legitimate interests" } });
   });
 
   it("the work lines are shown for the open project", async () => {
@@ -801,7 +814,7 @@ describe("Capture screen — profile", () => {
     await waitFor(() => expect(bg.count(`GET /projects/${P1}/downloads`)).toBeGreaterThanOrEqual(1));
     expect(screen.queryByRole("region", { name: "Downloads and transcriptions" })).toBeNull();
     await user.type(screen.getByRole("textbox", { name: "Profile, channel or playlist link" }), PROFILE);
-    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    await captureAndStart(user);
     // The service publishes the new run on the one stream the screen has (R679 A2).
     m.emit("background.progress", { projectId: P1, downloads: exampleRun({ projectId: P1, runId: "qp1", title: "someone", url: PROFILE, platform: "instagram", state: "downloading", total: 0, done: 0 }) });
     const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
@@ -814,7 +827,7 @@ describe("Capture screen — profile", () => {
   it("a profile run's posts and summary appear as its events arrive", async () => {
     const { m, user } = await setup();
     await user.type(screen.getByRole("textbox", { name: "Profile, channel or playlist link" }), PROFILE);
-    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    await captureAndStart(user);
     await screen.findByRole("region", { name: "Capture queue" });
     await act(async () => {
       m.emit("capture.progress", { queueId: "qp1", projectId: P1, done: 1, total: 1, finished: false, outcome: { url: IG, status: "created" } });
@@ -826,6 +839,146 @@ describe("Capture screen — profile", () => {
       });
     });
     expect(await screen.findByText(/1 new post saved.*2 posts no longer on the platform/)).toBeTruthy();
+  });
+});
+
+describe("Capture screen — the estimate before a profile is captured (whole channels, Task 8)", () => {
+  const HEADING = 'Capture channel: "Example Channel"';
+  const YT_CHANNEL = "https://www.youtube.com/@examplechannel";
+
+  /** A promise the test releases (and releases by itself when the test ends). */
+  function held() {
+    let release!: () => void;
+    const p = new Promise<void>((r) => (release = r));
+    onTestFinished(() => release());
+    return { p, release };
+  }
+
+  it("asks for the list first, then shows the estimate in place of the form's buttons", async () => {
+    const gate = held();
+    const { m, user } = await setup({ estimateHold: gate.p });
+    await user.type(profileBox(), YT_CHANNEL);
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    expect(await screen.findByText("Asking YouTube for the list of videos…")).toBeTruthy();
+    expect(screen.getByText("Asking YouTube for the list of videos…").closest("[role=status]")).not.toBeNull();
+    await act(async () => gate.release());
+    const region = await screen.findByRole("region", { name: HEADING });
+    expect(within(region).getByText("412 videos, about 310 hours.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Capture profile" })).toBeNull();
+    expect(screen.queryByText("Asking YouTube for the list of videos…")).toBeNull();
+    // Nothing is started before Start.
+    expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(0);
+    expect(m.bodies(`POST /projects/${P1}/capture-estimate`)).toEqual([{ url: YT_CHANNEL, options: { transcribeModel: "medium" } }]);
+  });
+
+  it("the heading takes focus when the estimate appears", async () => {
+    const { user } = await setup();
+    await user.type(profileBox(), YT_CHANNEL);
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    const heading = await screen.findByRole("heading", { level: 3, name: HEADING });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+  });
+
+  it("the Transcribe box starts from the project's switch and names the speech model", async () => {
+    const { m, user } = await setup({ automation: { [P1]: true }, estimateAnswer: () => exampleEstimate({ speechModel: "small" }) });
+    await user.selectOptions(screen.getByRole("combobox", { name: "Transcription model" }), "small");
+    await user.type(profileBox(), YT_CHANNEL);
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    const box = (await screen.findByRole("checkbox", { name: "Transcribe each video on this Mac (speech model: small)" })) as HTMLInputElement;
+    // "Use the project's setting", and the project's switch is on.
+    expect(box.checked).toBe(true);
+    expect(m.calls.filter((c) => c.path === `/projects/${P1}/automation`)).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    // "Do not transcribe" above starts it unticked, without asking the project.
+    await user.click(screen.getByRole("radio", { name: "Do not transcribe" }));
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    expect(((await screen.findByRole("checkbox", { name: /Transcribe each video on this Mac/ })) as HTMLInputElement).checked).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    // "Transcribe" starts it ticked.
+    await user.click(screen.getByRole("radio", { name: "Transcribe" }));
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    expect(((await screen.findByRole("checkbox", { name: /Transcribe each video on this Mac/ })) as HTMLInputElement).checked).toBe(true);
+    expect(m.calls.filter((c) => c.path === `/projects/${P1}/automation`)).toHaveLength(1);
+    // The hint says what "Use the project's setting" follows.
+    expect(screen.getByText("“Use the project's setting” follows the project's switch “Transcribe captured audio and video automatically”, on the Governance screen.")).toBeTruthy();
+    expect(screen.queryByText(/A profile capture transcribes only when/)).toBeNull();
+  });
+
+  it("Start sends the quality and the transcription choice once, however often it is pressed", async () => {
+    const { m, user } = await setup({ profileDelayMs: 80 });
+    await user.type(profileBox(), YT_CHANNEL);
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    await user.click(await screen.findByRole("radio", { name: "Audio only" }));
+    await user.click(screen.getByRole("checkbox", { name: /Transcribe each video on this Mac/ }));
+    await user.dblClick(screen.getByRole("button", { name: "Start" }));
+    await screen.findByRole("region", { name: "Capture queue" });
+    expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toEqual([{ url: YT_CHANNEL, options: { transcribe: true, transcribeModel: "medium", quality: "audio" } }]);
+    // The queue is added as today, the region closes and focus returns to the profile field, emptied.
+    expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
+    expect(document.activeElement).toBe(profileBox());
+    expect((profileBox() as HTMLInputElement).value).toBe("");
+    expect(screen.getByRole("button", { name: "Capture profile" })).toBeTruthy();
+  });
+
+  it("without Video tools, Start sends the ready-made file", async () => {
+    const { m, user } = await setup({ estimateAnswer: () => exampleEstimate({ videoToolsInstalled: false }) });
+    await user.type(profileBox(), YT_CHANNEL);
+    await captureAndStart(user);
+    await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+    expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({ url: YT_CHANNEL, options: { transcribe: false, quality: "ready" } });
+  });
+
+  it("Cancel goes back with focus on the profile field", async () => {
+    const { m, user } = await setup();
+    await user.type(profileBox(), YT_CHANNEL);
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    await user.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
+    expect(document.activeElement).toBe(profileBox());
+    expect((profileBox() as HTMLInputElement).value).toBe(YT_CHANNEL);
+    expect(screen.getByRole("button", { name: "Capture profile" })).toBeTruthy();
+    expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(0);
+  });
+
+  it("a refusal shows the service's sentence", async () => {
+    const { m, user } = await setup({
+      estimateAnswer: () => errorResponse(403, "POLICY_DENIED", "This project's rules do not allow that.", "The downloader is not among this project's capture methods."),
+    });
+    await user.type(profileBox(), YT_CHANNEL);
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/The downloader is not among this project's capture methods\./);
+    expect(alert.textContent).not.toMatch(/POLICY_DENIED/);
+    expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
+    expect(screen.getByRole("button", { name: "Capture profile" })).toBeTruthy();
+    expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(0);
+  });
+
+  it("a refusal of Start shows the service's sentence and keeps the estimate", async () => {
+    const SAID = "Video tools are not installed, so this quality cannot be downloaded. Install them from the Optional tools screen, or choose “Ready-made file (lower quality)”.";
+    const { user } = await setup({ profileAnswer: () => errorResponse(409, "TOOL_NOT_INSTALLED", SAID, "ffmpeg") });
+    await user.type(profileBox(), YT_CHANNEL);
+    await captureAndStart(user);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(SAID);
+    expect(screen.getByRole("region", { name: HEADING })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Capture queue" })).toBeNull();
+  });
+
+  it("an answer after the project changed is dropped", async () => {
+    const gate = held();
+    const { m, user, view } = await setup({ estimateHold: gate.p });
+    await user.type(profileBox(), YT_CHANNEL);
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-estimate`)).toHaveLength(1));
+    view.rerender(<Capture client={m.client} projectId={P2} />);
+    await act(async () => {
+      gate.release();
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
+    expect(screen.queryByText("Asking YouTube for the list of videos…")).toBeNull();
+    expect(m.bodies(`POST /projects/${P2}/capture-profile`)).toHaveLength(0);
   });
 });
 

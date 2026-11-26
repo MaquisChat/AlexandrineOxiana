@@ -68,6 +68,11 @@ describe("MissingToolNotice", () => {
     expect(screen.getByText(/ffmpeg/)).toBeTruthy();
     expect(screen.getByText(/proxy pending/)).toBeTruthy();
   });
+
+  it("says that without ffmpeg videos can be downloaded only as ready-made, lower-quality files (R671)", () => {
+    render(<MissingToolNotice from={missing("ffmpeg")} />);
+    expect(screen.getByText(/videos can be downloaded only as ready-made, lower-quality files and get no viewing copies/)).toBeTruthy();
+  });
 });
 
 describe("SourceToolNotice (the source's viewing-copy and OCR state)", () => {

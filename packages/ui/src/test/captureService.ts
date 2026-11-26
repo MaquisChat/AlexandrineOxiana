@@ -5,7 +5,7 @@
  */
 import { http, HttpResponse, type RequestHandler } from "msw";
 import { setupServer } from "msw/node";
-import type { CaptureQueueDetail } from "@ao/shared";
+import type { CaptureEstimate, CaptureQueueDetail } from "@ao/shared";
 import { createClient, type ApiClient } from "../api/client";
 import { backgroundDefaults } from "./backgroundService";
 
@@ -23,6 +23,29 @@ export const STRICT_RULES = "captureMethods: [downloader]\n";
 /** Rules whose data is not identifiable: no legal basis needed. */
 export const ANON_RULES = "captureMethods: [downloader]\nidentifiability:\n  containsIdentifiable: false\n";
 
+/**
+ * The estimate of POST /projects/:id/capture-estimate (whole channels, Task 5's route): the spec's channel of 412
+ * videos and 310 hours, 380 GB free on "Macintosh HD", Video tools installed.
+ */
+export function exampleEstimate(over: Partial<CaptureEstimate> = {}): CaptureEstimate {
+  return {
+    kind: "channel",
+    platform: "youtube",
+    title: "Example Channel",
+    count: 412,
+    alreadyInProject: 0,
+    soundSeconds: 310 * 3600,
+    unknownLengths: 0,
+    listComplete: true,
+    freeBytes: 380_000_000_000,
+    diskName: "Macintosh HD",
+    videoToolsInstalled: true,
+    speechModel: "medium",
+    metadataOnly: false,
+    ...over,
+  };
+}
+
 export interface Recorded {
   method: string;
   path: string;
@@ -37,6 +60,17 @@ export interface CaptureSetup {
   captureAnswer?: (n: number) => Response | undefined;
   captureDelayMs?: number;
   profileAnswer?: (n: number) => Response | undefined;
+  /** Delay before POST /projects/:id/capture-profile answers. */
+  profileDelayMs?: number;
+  /**
+   * Answer of POST /projects/:id/capture-estimate (default: `exampleEstimate`, with `metadataOnly` as asked); a
+   * CaptureEstimate is sent as JSON.
+   */
+  estimateAnswer?: (n: number, body: unknown) => Response | CaptureEstimate | undefined;
+  /** Held until this settles before the estimate is answered. */
+  estimateHold?: Promise<unknown>;
+  /** Per project: `automation.transcribeNewMedia` (GET /projects/:id/automation, Task 7's route); default false. */
+  automation?: Record<string, boolean>;
   /** Delay before GET /projects/:id/governance answers. */
   governanceDelayMs?: number;
   /** Projects whose rules the service says it cannot read (`readable: false`, R379 FR-A18). */
@@ -90,6 +124,7 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
   const wait = (ms: number | undefined) => (ms ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
   let captures = 0;
   let profiles = 0;
+  let estimates = 0;
   let queues = o.queues ?? [];
   let queueReads = 0;
   const cut = { ...(o.cutByLock ?? {}) };
@@ -139,7 +174,23 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
     http.post(url("/projects/:id/capture-profile"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/capture-profile`);
       profiles++;
-      return o.profileAnswer?.(profiles) ?? HttpResponse.json({ queueId: `qp${profiles}` });
+      const n = profiles;
+      await wait(o.profileDelayMs);
+      return o.profileAnswer?.(n) ?? HttpResponse.json({ queueId: `qp${n}` });
+    }),
+    http.post(url("/projects/:id/capture-estimate"), async ({ request, params }) => {
+      const body = await rec(request, `/projects/${params.id as string}/capture-estimate`);
+      estimates++;
+      const n = estimates;
+      await o.estimateHold;
+      const answer = o.estimateAnswer?.(n, body);
+      if (answer instanceof Response) return answer;
+      const asked = (body as { options?: { metadataOnly?: boolean } } | undefined)?.options;
+      return HttpResponse.json(answer ?? exampleEstimate({ metadataOnly: asked?.metadataOnly === true }));
+    }),
+    http.get(url("/projects/:id/automation"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/automation`);
+      return HttpResponse.json({ transcribeNewMedia: o.automation?.[params.id as string] ?? false });
     }),
     http.get(url("/projects/:id/captures"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/captures`);

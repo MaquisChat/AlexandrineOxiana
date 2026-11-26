@@ -92,6 +92,35 @@ describe("CaptureQueue", () => {
     expect(screen.getByText(/Removed posts were not looked for/)).toBeTruthy();
   });
 
+  it("a completed run with a limited list keeps the sentence about the limited list (R677)", () => {
+    let q = profileQueue("q7", "https://www.instagram.com/someone/");
+    q = applyProgress(q, {
+      queueId: "q7",
+      projectId: P,
+      finished: true,
+      report: { status: "completed", listComplete: false, created: 1, duplicates: 0, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, items: [] },
+    });
+    render(<CaptureQueue queues={[q]} />);
+    expect(screen.getByText("Removed posts were not looked for in this run: the list was limited (by dates or a maximum number of items) or did not come back whole.")).toBeTruthy();
+    expect(screen.queryByText(/because it did not finish/)).toBeNull();
+  });
+
+  it("a run that did not finish says removed posts were not looked for because it did not finish (R677)", () => {
+    for (const status of ["paused-rate-limited", "failed", "stopped"]) {
+      let q = profileQueue(`q-${status}`, "https://www.instagram.com/someone/");
+      q = applyProgress(q, {
+        queueId: `q-${status}`,
+        projectId: P,
+        finished: true,
+        report: { status, listComplete: false, created: 2, duplicates: 0, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, items: [] },
+      });
+      const view = render(<CaptureQueue queues={[q]} />);
+      expect(screen.getByText("Removed posts were not looked for in this run, because it did not finish.")).toBeTruthy();
+      expect(screen.queryByText(/the list was limited/)).toBeNull();
+      view.unmount();
+    }
+  });
+
   it("FR-106: posts that look edited but could not be checked are counted in the summary", () => {
     let q = profileQueue("q8", "https://www.instagram.com/someone/");
     q = applyProgress(q, {

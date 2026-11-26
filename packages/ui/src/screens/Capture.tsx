@@ -12,6 +12,11 @@
  * earlier or from the browser extension are shown, and outcomes missed while the connection was
  * down are replaced by the truth.
  *
+ * A profile, channel or playlist is not captured at once (whole channels, Task 8): "Capture profile" asks the
+ * service for an estimate (the platform is asked only for the list) and shows it in place of the form's buttons
+ * (CaptureEstimate), with the quality and the Transcribe box; "Start" captures it. The box starts from the
+ * Transcription choice, where "Use the project's setting" is the project's automation switch.
+ *
  * Stale answers are dropped: the screen is keyed by its project, every answer and event is checked
  * against `live` (unmount), a read is used only if the connection it was asked on is still the
  * current one (and only the latest read), and events of other projects are never applied. A capture
@@ -20,7 +25,16 @@
  */
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { CAPTURE_RULES_UNREADABLE_TEXT, CAPTURE_RUNNING, CAPTURE_STOPPING } from "@ao/shared";
+import {
+  AUTOMATION_TEXT,
+  CAPTURE_RULES_UNREADABLE_TEXT,
+  CAPTURE_RUNNING,
+  CAPTURE_STOPPING,
+  estimateText,
+  type CaptureEstimate as Estimate,
+  type CapturePlatform,
+  type DownloadQuality,
+} from "@ao/shared";
 import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, oneNoAnswerSentence, readWithin } from "../api/firstRead";
 import {
@@ -54,6 +68,7 @@ import {
 } from "../api/capture";
 import { isValidId } from "../api/import";
 import { errorText } from "../api/library";
+import { CaptureEstimate, initialQuality } from "../components/CaptureEstimate";
 import { CaptureQueue } from "../components/CaptureQueue";
 import { useEventFeed, WorkLines } from "../components/WorkLines";
 import { PageReads, usePageHost, usePageRead } from "../components/PageReads";
@@ -115,6 +130,16 @@ function profileHint(url: string): string {
 }
 
 type Transcribe = "project" | "yes" | "no";
+
+/** The platforms whose list the estimate can name ("Asking YouTube for the list of videos…"). */
+const LISTED: readonly string[] = ["youtube", "instagram", "tiktok"] satisfies CapturePlatform[];
+
+/** An estimate on show: what it was asked for (sent again at Start), and the researcher's choices in it. */
+interface ShownEstimate {
+  estimate: Estimate;
+  url: string;
+  options: ProfileCaptureOptions;
+}
 
 const LEGAL_MISSING = "Enter the legal basis for this capture. This project's rules need one for social-media data that can identify people, and they give no default.";
 const COMMENTS_LEGAL_MISSING = "Enter the legal basis for this capture. Comments are other people's personal data, so saving them always needs one.";
@@ -370,6 +395,15 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   const [metadataOnly, setMetadataOnly] = useState(false);
   const [comments, setComments] = useState(false);
   const [profileError, setProfileError] = useState<string | null>(null);
+  const profileRef = useRef<HTMLInputElement>(null);
+  // The estimate before a profile is captured (whole channels, Task 8).
+  const [listing, setListing] = useState<string | null>(null);
+  const [shown, setShown] = useState<ShownEstimate | null>(null);
+  const [quality, setQuality] = useState<DownloadQuality>("720p");
+  const [estTranscribe, setEstTranscribe] = useState(false);
+  /** The project this screen is for now: an estimate asked for another one is dropped. */
+  const projectNow = useRef(projectId);
+  projectNow.current = projectId;
   // Starting, queues and the acknowledgement.
   const [submitting, setSubmitting] = useState(false);
   const busy = useRef(false);
@@ -424,6 +458,12 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       live.current = false;
     };
   }, []);
+
+  // Another project: an estimate shown or asked for this one goes.
+  useEffect(() => {
+    setShown(null);
+    setListing(null);
+  }, [projectId]);
 
   // The project; given up after `firstReadMs` as a read that got no answer (FR-756).
   useEffect(() => {
@@ -761,6 +801,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
 
   const maxNumber = maxItems.trim() === "" ? undefined : Number(maxItems);
 
+  /** "Capture profile": the form checked as before, then the estimate is asked for and shown (nothing is captured yet). */
   const captureProfile = () =>
     start(async () => {
       const url = profileUrl.trim();
@@ -780,15 +821,63 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       if (types.length) options.contentTypes = CONTENT_TYPES.map((t) => t.value).filter((t) => types.includes(t));
       if (metadataOnly) options.metadataOnly = true;
       if (comments) options.includeComments = true;
+      const asked = projectId;
+      const stillHere = () => live.current && projectNow.current === asked;
+      const platform = previewLink(url).platform;
+      setListing(LISTED.includes(platform) ? estimateText.listing(platform as CapturePlatform) : null);
       try {
-        const { queueId } = await api.captureProfile(projectId, url, options);
-        if (!live.current) return;
-        addQueue(profileQueue(queueId, url));
-        setProfileUrl("");
+        // The Transcribe box starts from the Transcription choice; "Use the project's setting" is the project's switch.
+        const [estimate, transcribeNow] = await Promise.all([
+          api.estimate(projectId, url, options),
+          transcribe === "project"
+            ? api.automation(projectId).then(
+                (a) => a.transcribeNewMedia === true,
+                // Not readable: the box starts unticked, and the researcher sees it before Start.
+                () => false,
+              )
+            : Promise.resolve(transcribe === "yes"),
+        ]);
+        if (!stillHere()) return;
+        setQuality(initialQuality(estimate));
+        setEstTranscribe(transcribeNow);
+        setShown({ estimate, url, options });
       } catch (err) {
-        if (live.current) refused(err, "The profile capture could not be started.");
+        if (stillHere()) refused(err, "The profile capture could not be started.");
+      } finally {
+        if (stillHere()) setListing(null);
       }
     });
+
+  /** "Start": the estimated profile with the chosen quality and an explicit transcription choice. */
+  const startProfile = () =>
+    start(async () => {
+      if (!shown) return;
+      const asked = projectId;
+      const { url, estimate } = shown;
+      // By assignment to the shared request type, as baseOptions (R184).
+      const options: ProfileCaptureOptions = { ...shown.options, transcribe: estTranscribe };
+      // The model the estimate was asked with (the one its Transcribe box names).
+      if (estTranscribe) options.transcribeModel = shown.options.transcribeModel ?? model;
+      else delete options.transcribeModel;
+      if (!estimate.metadataOnly) options.quality = quality;
+      try {
+        const { queueId } = await api.captureProfile(projectId, url, options);
+        if (!live.current || projectNow.current !== asked) return;
+        addQueue(profileQueue(queueId, url));
+        setProfileUrl("");
+        setShown(null);
+        profileRef.current?.focus();
+      } catch (err) {
+        if (live.current && projectNow.current === asked) refused(err, "The profile capture could not be started.");
+      }
+    });
+
+  /** "Cancel": the estimate goes and the profile field takes focus. */
+  const cancelEstimate = () => {
+    if (busy.current) return;
+    setShown(null);
+    profileRef.current?.focus();
+  };
 
   // ---- the acknowledgement ----
   const onSessionChange = (checked: boolean) => {
@@ -1015,7 +1104,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
             ))}
           </select>
           {transcribe !== "no" && <SpeechModelNotice model={model} installed={installedModels} />}
-          <Hint id={`${id}-transcribe-hint`}>A profile capture transcribes only when “Transcribe” is chosen.</Hint>
+          <Hint id={`${id}-transcribe-hint`}>{`“Use the project's setting” follows the project's switch “${AUTOMATION_TEXT.label}”, on the Governance screen.`}</Hint>
         </fieldset>
         <label>
           <input type="checkbox" checked={refresh} aria-describedby={ids.refresh} onChange={(e) => setRefresh(e.target.checked)} /> Refresh existing
@@ -1064,7 +1153,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         noValidate
         onSubmit={(e) => {
           e.preventDefault();
-          void captureProfile();
+          if (!shown) void captureProfile();
         }}
       >
         <h2 id={`${id}-profile-h`}>Capture profile</h2>
@@ -1074,6 +1163,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         </label>
         <input
           id={ids.profile}
+          ref={profileRef}
           type="text"
           inputMode="url"
           spellCheck={false}
@@ -1084,6 +1174,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
           onChange={(e) => {
             setProfileUrl(e.target.value);
             setProfileError(null);
+            // An estimate shown is of the address it was asked for, not of a new one.
+            if (!busy.current) setShown(null);
           }}
         />
         <Hint id={ids.profileHint}>{profileUrl.trim() ? profileHint(profileUrl.trim()) : "For example https://www.instagram.com/name/ or a YouTube channel."}</Hint>
@@ -1132,11 +1224,25 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
           Off unless you need them. Comments are other people&apos;s personal data: saving them always needs a legal basis, and they are kept as a separate file of each post.
         </Hint>
         <FieldError id={ids.profileError} error={profileError} />
-        <div className="ao-capture__actions">
-          <button type="submit" className="ao-capture__primary" disabled={submitting || !ready}>
-            Capture profile
-          </button>
-        </div>
+        {shown ? (
+          <CaptureEstimate
+            estimate={shown.estimate}
+            quality={quality}
+            onQuality={setQuality}
+            transcribe={estTranscribe}
+            onTranscribe={setEstTranscribe}
+            onStart={() => void startProfile()}
+            onCancel={cancelEstimate}
+            busy={submitting}
+          />
+        ) : (
+          <div className="ao-capture__actions">
+            <button type="submit" className="ao-capture__primary" disabled={submitting || !ready}>
+              Capture profile
+            </button>
+            {listing && <span role="status">{listing}</span>}
+          </div>
+        )}
       </form>
 
       {formError && (

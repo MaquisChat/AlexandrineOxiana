@@ -525,11 +525,14 @@ async function captureProfileTwice(page: Page, app: AppHarness): Promise<{ missi
     await openCapture(page, library);
   });
 
-  /** Captures the profile from the screen; the request's options. */
+  /** Captures the profile from the screen ("Capture profile", then "Start" in the estimate it shows); the request's options. */
   const captureIt = async (): Promise<Record<string, unknown>> => {
     await page.getByRole("textbox", { name: "Profile, channel or playlist link" }).fill(PROFILE_LINK);
-    const answer = page.waitForResponse((r) => r.request().method() === "POST" && new URL(r.url()).pathname === `/projects/${projectId}/capture-profile`);
     await page.getByRole("button", { name: "Capture profile" }).click();
+    // Whole channels (Task 8): the estimate comes first; nothing is captured before Start. Where the disk has little
+    // free space, the button says "Start anyway — it will pause when the disk is nearly full".
+    const answer = page.waitForResponse((r) => r.request().method() === "POST" && new URL(r.url()).pathname === `/projects/${projectId}/capture-profile`);
+    await page.getByRole("button", { name: /^Start( anyway — it will pause when the disk is nearly full)?$/ }).click();
     const sent = await answer;
     expect(sent.status()).toBe(200);
     return (sent.request().postDataJSON() as { options: Record<string, unknown> }).options;
