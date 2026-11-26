@@ -249,9 +249,11 @@ TOOLS: dict[str, Tool] = {
              components=("gallery-dl",),
              notice="gallery-dl is free software under the GNU GPL version 2; it runs as its own program."),
         Tool(id="ffmpeg", group="media", name="Video tools (ffmpeg)",
-             purpose="Makes viewing copies of videos, and copies that leave out or coarsen a recorded location.",
-             without="Videos get no viewing copies. Media that carries a location stays \"proxy pending\" and is "
-                     "left out of exports until ffmpeg is installed.",
+             purpose="Joins the best picture and sound when videos are downloaded, makes viewing copies of videos, "
+                     "and makes copies that leave out or coarsen a recorded location.",
+             without="Videos can be downloaded only as ready-made, lower-quality files, and get no viewing copies. "
+                     "Media that carries a location stays \"proxy pending\" and is left out of exports until "
+                     "ffmpeg is installed.",
              components=("ffmpeg",),
              notice="This ffmpeg is free software under the GNU GPL; its source is published by its builder."),
         Tool(id="ocr", group="documents", name="Text recognition (OCR)",

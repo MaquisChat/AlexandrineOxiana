@@ -1114,3 +1114,11 @@ def test_the_ytdlp_download_enforces_the_catalogues_hosts():
     from ao_worker import download
 
     assert download.YTDLP_HOSTS == toolpins.COMPONENTS["yt-dlp"].hosts
+
+
+def test_ffmpeg_catalogue_sentences_are_exactly_the_plans():
+    t = toolpins.TOOLS["ffmpeg"]
+    assert t.purpose == ("Joins the best picture and sound when videos are downloaded, makes viewing copies of videos, "
+                         "and makes copies that leave out or coarsen a recorded location.")
+    assert t.without == ("Videos can be downloaded only as ready-made, lower-quality files, and get no viewing copies. "
+                         "Media that carries a location stays \"proxy pending\" and is left out of exports until ffmpeg is installed.")
