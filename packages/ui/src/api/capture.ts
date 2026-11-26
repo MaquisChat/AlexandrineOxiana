@@ -609,12 +609,12 @@ export function captureApi(client: ApiClient) {
      * What capturing a profile, channel or playlist would take (whole channels): the platform is asked only for the
      * list. Nothing is captured; the options are the ones `captureProfile` would send.
      */
-    estimate: (projectId: string, url: string, options: ProfileCaptureOptions): Promise<CaptureEstimate> => {
+    estimate: (projectId: string, url: string, options: ProfileCaptureOptions, o: { signal?: AbortSignal } = {}): Promise<CaptureEstimate> => {
       const body: CaptureEstimateRequest = { url, options };
-      return r<CaptureEstimate>("POST", `/projects/${pid(projectId)}/capture-estimate`, { body });
+      return r<CaptureEstimate>("POST", `/projects/${pid(projectId)}/capture-estimate`, { body, ...o });
     },
     /** The project's automation switch ("Transcribe captured audio and video automatically"), for the estimate's Transcribe box. */
-    automation: (projectId: string) => r<ProjectAutomation>("GET", `/projects/${pid(projectId)}/automation`),
+    automation: (projectId: string, o: { signal?: AbortSignal } = {}) => r<ProjectAutomation>("GET", `/projects/${pid(projectId)}/automation`, o),
     /** Records the one-time browser-session acknowledgement (audited by the service). */
     acknowledge: async (projectId: string) => {
       const body: AcknowledgeRequest = { kind: "cookies" };

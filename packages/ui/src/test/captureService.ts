@@ -71,6 +71,10 @@ export interface CaptureSetup {
   estimateHold?: Promise<unknown>;
   /** Per project: `automation.transcribeNewMedia` (GET /projects/:id/automation, Task 7's route); default false. */
   automation?: Record<string, boolean>;
+  /** Answer of GET /projects/:id/automation instead of the switch (e.g. a 500). */
+  automationAnswer?: (projectId: string) => Response | undefined;
+  /** Held until this settles before the project's switch is answered. */
+  automationHold?: Promise<unknown>;
   /** Delay before GET /projects/:id/governance answers. */
   governanceDelayMs?: number;
   /** Projects whose rules the service says it cannot read (`readable: false`, R379 FR-A18). */
@@ -106,6 +110,10 @@ export interface CaptureMock {
   setQueues(queues: CaptureQueueDetail[]): void;
   /** GET /projects/:id/captures answers sent so far. */
   queueReads(): number;
+  /** The POST /projects/:id/capture-estimate requests as received (their `signal` says whether the screen cancelled them). */
+  estimateRequests(): Request[];
+  /** The screen's requests by "METHOD path" whose answer (or failure) has reached the screen. */
+  settled(key: string): number;
   client: ApiClient;
 }
 
@@ -118,6 +126,8 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
   const calls: Recorded[] = [];
   const open = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const held: Request[] = [];
+  const estimateRequests: Request[] = [];
+  const settled = new Map<string, number>();
   const enc = new TextEncoder();
   const acks = new Set(o.acknowledged ?? []);
   const url = (p: string) => `${BASE}${p}`;
@@ -179,6 +189,7 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
       return o.profileAnswer?.(n) ?? HttpResponse.json({ queueId: `qp${n}` });
     }),
     http.post(url("/projects/:id/capture-estimate"), async ({ request, params }) => {
+      estimateRequests.push(request);
       const body = await rec(request, `/projects/${params.id as string}/capture-estimate`);
       estimates++;
       const n = estimates;
@@ -190,6 +201,9 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
     }),
     http.get(url("/projects/:id/automation"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/automation`);
+      await o.automationHold;
+      const answer = o.automationAnswer?.(params.id as string);
+      if (answer) return answer;
       return HttpResponse.json({ transcribeNewMedia: o.automation?.[params.id as string] ?? false });
     }),
     http.get(url("/projects/:id/captures"), async ({ request, params }) => {
@@ -249,6 +263,7 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
     ...backgroundDefaults(BASE),
   );
 
+  const client = createClient(BASE, TOKEN);
   return {
     calls,
     bodies: (key) => calls.filter((c) => `${c.method} ${c.path}` === key).map((c) => c.body),
@@ -266,6 +281,8 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
       queues = q;
     },
     queueReads: () => queueReads,
+    estimateRequests: () => [...estimateRequests],
+    settled: (key) => settled.get(key) ?? 0,
     closeStreams() {
       for (const c of [...open]) {
         open.delete(c);
@@ -276,6 +293,15 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
         }
       }
     },
-    client: createClient(BASE, TOKEN),
+    client: {
+      ...client,
+      request<T>(...args: Parameters<ApiClient["request"]>): Promise<T> {
+        const answer = client.request<T>(...args);
+        const key = `${args[0]} ${args[1]}`;
+        const note = () => settled.set(key, (settled.get(key) ?? 0) + 1);
+        answer.then(note, note);
+        return answer;
+      },
+    },
   };
 }

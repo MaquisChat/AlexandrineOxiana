@@ -139,6 +139,8 @@ interface ShownEstimate {
   estimate: Estimate;
   url: string;
   options: ProfileCaptureOptions;
+  /** The profile form it was asked for (R683 B). */
+  form: string;
 }
 
 const LEGAL_MISSING = "Enter the legal basis for this capture. This project's rules need one for social-media data that can identify people, and they give no default.";
@@ -397,8 +399,14 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   const [profileError, setProfileError] = useState<string | null>(null);
   const profileRef = useRef<HTMLInputElement>(null);
   // The estimate before a profile is captured (whole channels, Task 8).
-  const [listing, setListing] = useState<string | null>(null);
+  /** The profile form's status: the listing, or why an estimate was closed. The region is always there (R683 M5). */
+  const [estStatus, setEstStatus] = useState("");
   const [shown, setShown] = useState<ShownEstimate | null>(null);
+  /**
+   * The estimate open or still being read, and the profile form as it was when "Capture profile" was pressed (R683 B):
+   * the address and every option. Whenever the form differs from it, the estimate is closed (one comparison, below).
+   */
+  const estimateOf = useRef<{ form: string; ac: AbortController } | null>(null);
   const [quality, setQuality] = useState<DownloadQuality>("720p");
   const [estTranscribe, setEstTranscribe] = useState(false);
   /** The project this screen is for now: an estimate asked for another one is dropped. */
@@ -461,8 +469,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
 
   // Another project: an estimate shown or asked for this one goes.
   useEffect(() => {
-    setShown(null);
-    setListing(null);
+    dropEstimate();
+    setEstStatus("");
   }, [projectId]);
 
   // The project; given up after `firstReadMs` as a read that got no answer (FR-756).
@@ -801,6 +809,25 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
 
   const maxNumber = maxItems.trim() === "" ? undefined : Number(maxItems);
 
+  /** The profile form as it is now: the address and every option that goes into the request (R683 B1). */
+  const profileForm = JSON.stringify([profileUrl.trim(), since, until, maxItems, types, metadataOnly, comments, legalBasis.trim(), useSession, browser, transcribe, model, refresh]);
+  const profileUrlNow = useRef(profileUrl);
+  profileUrlNow.current = profileUrl;
+
+  /** The estimate goes: a request still out is cancelled (its answer dropped), an open one is closed. */
+  function dropEstimate() {
+    estimateOf.current?.ac.abort();
+    estimateOf.current = null;
+    setShown(null);
+  }
+
+  // One place (R683 B1): the form no longer as it was when "Capture profile" was pressed closes the estimate, said once.
+  useEffect(() => {
+    if (!estimateOf.current || estimateOf.current.form === profileForm) return;
+    dropEstimate();
+    setEstStatus(estimateText.settingsChanged);
+  }, [profileForm]);
+
   /** "Capture profile": the form checked as before, then the estimate is asked for and shown (nothing is captured yet). */
   const captureProfile = () =>
     start(async () => {
@@ -822,13 +849,17 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       if (metadataOnly) options.metadataOnly = true;
       if (comments) options.includeComments = true;
       const asked = projectId;
-      const stillHere = () => live.current && projectNow.current === asked;
+      const mine = { form: profileForm, ac: new AbortController() };
+      estimateOf.current?.ac.abort();
+      estimateOf.current = mine;
+      // Only the estimate of the form as it still is, for this project, is shown.
+      const stillHere = () => live.current && projectNow.current === asked && estimateOf.current === mine;
       const platform = previewLink(url).platform;
-      setListing(LISTED.includes(platform) ? estimateText.listing(platform as CapturePlatform) : null);
+      setEstStatus(LISTED.includes(platform) ? estimateText.listing(platform as CapturePlatform) : "");
       try {
         // The Transcribe box starts from the Transcription choice; "Use the project's setting" is the project's switch.
         const [estimate, transcribeNow] = await Promise.all([
-          api.estimate(projectId, url, options),
+          api.estimate(projectId, url, options, { signal: mine.ac.signal }),
           transcribe === "project"
             ? api.automation(projectId).then(
                 (a) => a.transcribeNewMedia === true,
@@ -838,13 +869,15 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
             : Promise.resolve(transcribe === "yes"),
         ]);
         if (!stillHere()) return;
+        setEstStatus("");
         setQuality(initialQuality(estimate));
         setEstTranscribe(transcribeNow);
-        setShown({ estimate, url, options });
+        setShown({ estimate, url, options, form: mine.form });
       } catch (err) {
-        if (stillHere()) refused(err, "The profile capture could not be started.");
-      } finally {
-        if (stillHere()) setListing(null);
+        if (!stillHere()) return;
+        estimateOf.current = null;
+        setEstStatus("");
+        refused(err, "The profile capture could not be started.");
       }
     });
 
@@ -864,8 +897,12 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         const { queueId } = await api.captureProfile(projectId, url, options);
         if (!live.current || projectNow.current !== asked) return;
         addQueue(profileQueue(queueId, url));
-        setProfileUrl("");
-        setShown(null);
+        // An address typed since Start was pressed is not wiped.
+        if (profileUrlNow.current.trim() === url) setProfileUrl("");
+        if (estimateOf.current?.form === shown.form) {
+          estimateOf.current = null;
+          setShown(null);
+        }
         profileRef.current?.focus();
       } catch (err) {
         if (live.current && projectNow.current === asked) refused(err, "The profile capture could not be started.");
@@ -875,7 +912,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   /** "Cancel": the estimate goes and the profile field takes focus. */
   const cancelEstimate = () => {
     if (busy.current) return;
-    setShown(null);
+    dropEstimate();
+    setEstStatus("");
     profileRef.current?.focus();
   };
 
@@ -1174,8 +1212,6 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
           onChange={(e) => {
             setProfileUrl(e.target.value);
             setProfileError(null);
-            // An estimate shown is of the address it was asked for, not of a new one.
-            if (!busy.current) setShown(null);
           }}
         />
         <Hint id={ids.profileHint}>{profileUrl.trim() ? profileHint(profileUrl.trim()) : "For example https://www.instagram.com/name/ or a YouTube channel."}</Hint>
@@ -1224,7 +1260,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
           Off unless you need them. Comments are other people&apos;s personal data: saving them always needs a legal basis, and they are kept as a separate file of each post.
         </Hint>
         <FieldError id={ids.profileError} error={profileError} />
-        {shown ? (
+        {shown && (
           <CaptureEstimate
             estimate={shown.estimate}
             quality={quality}
@@ -1235,14 +1271,15 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
             onCancel={cancelEstimate}
             busy={submitting}
           />
-        ) : (
-          <div className="ao-capture__actions">
+        )}
+        <div className="ao-capture__actions">
+          {!shown && (
             <button type="submit" className="ao-capture__primary" disabled={submitting || !ready}>
               Capture profile
             </button>
-            {listing && <span role="status">{listing}</span>}
-          </div>
-        )}
+          )}
+          <span role="status">{estStatus}</span>
+        </div>
       </form>
 
       {formError && (

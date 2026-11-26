@@ -965,6 +965,65 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
     expect(screen.queryByRole("region", { name: "Capture queue" })).toBeNull();
   });
 
+  describe("an estimate is only ever started for what the screen shows (R683 B)", () => {
+    const CHANGED = "The settings changed, so the estimate was closed. Press “Capture profile” to see it again.";
+    const OLD = "https://www.youtube.com/@old";
+    const NEW = "https://www.youtube.com/@new";
+
+    it("an address changed while the list is asked for: the old one's estimate is never shown, nothing is sent, the new address stays", async () => {
+      const gate = held();
+      const { m, user } = await setup({ estimateHold: gate.p });
+      await user.type(profileBox(), OLD);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await waitFor(() => expect(m.estimateRequests()).toHaveLength(1));
+      await user.clear(profileBox());
+      await user.type(profileBox(), NEW);
+      // The request still out is cancelled.
+      expect(m.estimateRequests()[0]!.signal.aborted).toBe(true);
+      await act(async () => gate.release());
+      await waitFor(() => expect(m.settled(`POST /projects/${P1}/capture-estimate`)).toBe(1));
+      await act(async () => {});
+      expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
+      expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(0);
+      expect((profileBox() as HTMLInputElement).value).toBe(NEW);
+      expect(screen.getAllByText(CHANGED)).toHaveLength(1);
+      expect(screen.getByText(CHANGED).closest("[role=status]")).not.toBeNull();
+      expect(screen.getByRole("button", { name: "Capture profile" })).toBeTruthy();
+    });
+
+    it("an option changed under an open estimate closes it, said once; a new estimate then sends what the form shows", async () => {
+      const { m, user } = await setup();
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByRole("region", { name: HEADING });
+      const status = screen.getByRole("button", { name: "Start" }).closest("form")!.querySelector("[role=status]");
+      // The status region is there before its sentence.
+      expect(status).not.toBeNull();
+      expect(status!.textContent).toBe("");
+      await user.click(screen.getByRole("checkbox", { name: "Metadata only" }));
+      expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
+      expect(screen.getAllByText(CHANGED)).toHaveLength(1);
+      expect(status!.textContent).toBe(CHANGED);
+      await captureAndStart(user);
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      const sent = m.bodies(`POST /projects/${P1}/capture-profile`)[0] as { url: string; options: Record<string, unknown> };
+      expect(sent.url).toBe(YT_CHANNEL);
+      expect(sent.options.metadataOnly).toBe(true);
+      expect("quality" in sent.options).toBe(false);
+    });
+
+    it("the Transcription choice changed under an open estimate closes it", async () => {
+      const { m, user } = await setup();
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByRole("region", { name: HEADING });
+      await user.click(screen.getByRole("radio", { name: "Do not transcribe" }));
+      expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
+      expect(screen.getAllByText(CHANGED)).toHaveLength(1);
+      expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(0);
+    });
+  });
+
   it("an answer after the project changed is dropped", async () => {
     const gate = held();
     const { m, user, view } = await setup({ estimateHold: gate.p });
