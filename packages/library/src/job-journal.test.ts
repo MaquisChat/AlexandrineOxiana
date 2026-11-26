@@ -10,8 +10,8 @@ import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
 import { INDEX_FILE, IndexHandle, createIndexSink, getMeta, rebuildIndex, setMeta } from "./index/index.js";
 import {
-  JOBS_FILE, MAX_FAILED_KEPT, MAX_SUCCEEDED_KEPT, SUCCEEDED_MAX_AGE_DAYS, appendJobRecords, assertNoSecrets, claimJobRecord, compactJobJournal,
-  journalPath, readJobJournal, refreshJobRows, upgradeLegacyJobs, upsertJobRow, type JobRecord,
+  JOBS_FILE, LIST_KINDS, MAX_FAILED_KEPT, MAX_SUCCEEDED_KEPT, SUCCEEDED_MAX_AGE_DAYS, appendJobRecords, assertNoSecrets, claimJobRecord, compactJobJournal,
+  isListKind, isPending, journalPath, readJobJournal, refreshJobRows, syncJobRows, updateJobRecords, upgradeLegacyJobs, upsertJobRow, type JobRecord,
 } from "./job-journal.js";
 import { createLibrary, openLibrary, type Library } from "./library.js";
 import type { Repo } from "./repo/index.js";
@@ -696,5 +696,137 @@ describe("R142 fix round 2: smaller points", () => {
       ["fresh", "queued"],
       ["old", "failed"],
     ]);
+  });
+});
+
+describe("list kinds", () => {
+  const DAY = 86_400_000;
+  const iso = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
+  const runData = (state: "downloading" | "paused" | "finished", failed = 0) => ({
+    url: "https://www.youtube.com/@example", title: "Example", platform: "youtube" as const, options: {}, state, total: 2, done: 2 - failed, failed, startedBy: "desktop" as const,
+  });
+  const runRec = (projectId: string, id: string, status: JobRecord["status"], extra: Partial<JobRecord> = {}): JobRecord => ({
+    v: 1, id, projectId, kind: "capture.run", status, createdAt: iso(100 * DAY), updatedAt: iso(100 * DAY), run: runData("finished"), ...extra,
+  });
+  const itemRec = (projectId: string, runId: string, index: number, status: JobRecord["status"] = "done"): JobRecord => ({
+    v: 1, id: `${runId}/${index}`, projectId, kind: "capture.item", status, createdAt: iso(100 * DAY), updatedAt: iso(100 * DAY),
+    item: { runId, index, postId: `post-${index}`, url: `https://www.youtube.com/watch?v=${index}` },
+  });
+
+  it("list records are never pending, never resubmitted and never cached as job rows", async () => {
+    expect(LIST_KINDS).toEqual(["capture.run", "capture.item", "transcription.list", "transcription.entry"]);
+    expect(LIST_KINDS.every(isListKind)).toBe(true);
+    expect(isListKind("capture.download")).toBe(false);
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const at = new Date().toISOString();
+    const run: JobRecord = { v: 1, id: "run-1", projectId: project.id, kind: "capture.run", status: "running", createdAt: at, updatedAt: at, run: runData("downloading") };
+    const entry: JobRecord = {
+      v: 1, id: "entry-1", projectId: project.id, kind: "transcription.entry", status: "queued", createdAt: at, updatedAt: at, entry: { sourceId: "s1", model: "medium" },
+    };
+    await appendJobRecords(lib.root, project.folder, null, [run, entry]);
+    expect(isPending(run)).toBe(false);
+    expect(isPending(entry)).toBe(false);
+    syncJobRows(handle.db, project.id, [run, entry]);
+    upsertJobRow(handle.db, run);
+    await refreshJobRows(() => handle.db, lib.root, project.folder, project.id, null);
+    expect(jobRows()).toEqual([]);
+    const w = await okWorker();
+    expect(await client(w).resumePending()).toEqual([]);
+    expect(w.jobs.size).toBe(0);
+    // A rebuild of the index caches none of them either.
+    await dropIndex();
+    await rebuildIndex(handle, ring, lib);
+    expect(jobRows()).toEqual([]);
+  });
+
+  it("compaction keeps a live run's items and drops a finished or discarded run's items", async () => {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const p = project.id;
+    const recs: JobRecord[] = [
+      runRec(p, "live", "queued", { run: runData("paused") }),
+      itemRec(p, "live", 0), itemRec(p, "live", 1, "queued"),
+      runRec(p, "with-failures", "queued", { run: runData("finished", 1) }),
+      itemRec(p, "with-failures", 0), itemRec(p, "with-failures", 1, "failed"),
+      runRec(p, "finished", "done", { updatedAt: iso(DAY), createdAt: iso(DAY) }),
+      itemRec(p, "finished", 0), itemRec(p, "finished", 1),
+      runRec(p, "discarded", "cancelled", { error: "DISCARDED", updatedAt: iso(DAY) }),
+      itemRec(p, "discarded", 0, "failed"),
+      itemRec(p, "gone", 0, "queued"), // its run's record is absent
+      { v: 1, id: "transcription-list", projectId: p, kind: "transcription.list", status: "queued", createdAt: iso(400 * DAY), updatedAt: iso(400 * DAY), list: { state: "running", total: 0, done: 0, failed: 0 } },
+      { v: 1, id: "old-entry", projectId: p, kind: "transcription.entry", status: "done", createdAt: iso(40 * DAY), updatedAt: iso(40 * DAY), entry: { sourceId: "s", model: "medium" } },
+    ];
+    await appendJobRecords(lib.root, project.folder, null, recs);
+    expect(await compactJobJournal(lib.root, project.folder, p, null, 0)).toBe(true);
+    const ids = [...(await readJobJournal(lib.root, project.folder, p, null)).records.keys()];
+    expect(ids.sort()).toEqual(
+      ["discarded", "finished", "live", "live/0", "live/1", "transcription-list", "with-failures", "with-failures/0", "with-failures/1"].sort(),
+    );
+  });
+
+  it("cancelled transcription entries are dropped at compaction and never push out the worker's failed jobs (R672)", async () => {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const p = project.id;
+    const recs: JobRecord[] = [];
+    for (let i = 0; i < 120; i++) {
+      recs.push({ v: 1, id: `ocr-${i}`, projectId: p, kind: "pdf.ocr", status: "failed", error: "WORKER_FAILED", createdAt: iso(2 * DAY + i * 1000), updatedAt: iso(2 * DAY + i * 1000) });
+    }
+    for (let i = 0; i < 400; i++) {
+      recs.push({
+        v: 1, id: `entry-${i}`, projectId: p, kind: "transcription.entry", status: "cancelled", error: "STOPPED", createdAt: iso(DAY), updatedAt: iso(DAY - i * 1000),
+        entry: { sourceId: `s${i}`, model: "medium" },
+      });
+    }
+    recs.push({ v: 1, id: "entry-done", projectId: p, kind: "transcription.entry", status: "done", createdAt: iso(DAY), updatedAt: iso(DAY), entry: { sourceId: "sd", model: "medium" } });
+    await appendJobRecords(lib.root, project.folder, null, recs);
+    expect(await compactJobJournal(lib.root, project.folder, p, null, 0)).toBe(true);
+    const ids = [...(await readJobJournal(lib.root, project.folder, p, null)).records.keys()];
+    expect(ids.filter((i) => i.startsWith("ocr-"))).toHaveLength(120);
+    expect(ids.filter((i) => i.startsWith("entry-") && i !== "entry-done")).toEqual([]);
+    expect(ids).toContain("entry-done");
+  });
+
+  it("updateJobRecords compacts a mostly superseded journal in its own turn (R672)", async () => {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const p = project.id;
+    const at0 = Date.now();
+    const expected = new Map<string, JobRecord>();
+    const statuses: Array<JobRecord["status"]> = ["queued", "running", "done", "failed"];
+    let largest = 0;
+    for (let k = 0; k < 3000; k++) {
+      const index = k % 500;
+      const t = new Date(at0 + k).toISOString();
+      const status = statuses[Math.floor(k / 500) % statuses.length]!;
+      const item: JobRecord = {
+        v: 1, id: `live/${index}`, projectId: p, kind: "capture.item", status, createdAt: new Date(at0).toISOString(), updatedAt: t,
+        item: { runId: "live", index, postId: `post-${index}`, url: `https://www.youtube.com/watch?v=${index}` },
+        ...(status === "failed" ? { error: "PRIVATE" } : {}),
+      };
+      const run: JobRecord = { v: 1, id: "live", projectId: p, kind: "capture.run", status: "running", createdAt: new Date(at0).toISOString(), updatedAt: t, run: { ...runData("downloading"), total: 500 } };
+      const after = await updateJobRecords(lib.root, project.folder, p, null, () => [item, run]);
+      expected.set(item.id, item);
+      expected.set(run.id, run);
+      expect(after.get(item.id)).toEqual(item);
+      if (k % 25 === 24) largest = Math.max(largest, (await readJobJournal(lib.root, project.folder, p, null)).lines);
+    }
+    const back = await readJobJournal(lib.root, project.folder, p, null);
+    expect(back.lines).toBeLessThan(2000);
+    expect(largest).toBeLessThanOrEqual(2000);
+    expect(back.records.size).toBe(501);
+    for (const [id, r] of expected) expect(back.records.get(id)).toEqual(r);
+  }, 120_000);
+
+  it("updateJobRecords appends in the file's turn", async () => {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const key = projectDataKey(repo, project.id);
+    const bump = () =>
+      updateJobRecords(lib.root, project.folder, project.id, key, (records) => {
+        const at = new Date().toISOString();
+        const cur = records.get("counter");
+        const n = cur?.list?.total ?? 0;
+        return [{ v: 1, id: "counter", projectId: project.id, kind: "transcription.list", status: "queued", createdAt: cur?.createdAt ?? at, updatedAt: at, list: { state: "running", total: n + 1, done: 0, failed: 0 } }];
+      });
+    const [a, b] = await Promise.all([bump(), bump()]);
+    expect([a.get("counter")!.list!.total, b.get("counter")!.list!.total].sort()).toEqual([1, 2]);
+    expect((await readJobJournal(lib.root, project.folder, project.id, key)).records.get("counter")!.list!.total).toBe(2);
   });
 });
