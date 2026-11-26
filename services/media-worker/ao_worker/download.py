@@ -428,6 +428,10 @@ def build_ytdlp_args(url: str, out: str, params: dict, js_runtime: str | None = 
         if quality in QUALITY_SORT:
             args += ["-S", QUALITY_SORT[quality]]
         args += QUALITY_EXTRA_ARGS.get(quality, [])
+        if quality in QUALITY_SORT:
+            # Above 1080p the sort gives a VP9 picture with AAC sound, which would be joined into .mkv,
+            # a file the app cannot play; mp4 always.
+            args += ["--merge-output-format", "mp4"]
     if not enumeration:
         # A video whose pieces could not all be fetched fails; it is never stored cut short.
         args.append("--abort-on-unavailable-fragments")

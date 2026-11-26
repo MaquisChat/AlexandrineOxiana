@@ -328,6 +328,18 @@ def test_metadata_only_and_flat_list_get_no_format_and_are_never_refused_for_ffm
     assert "-f" not in json.loads(argv_file.read_text())
 
 
+def test_merged_videos_are_always_mp4():
+    def merges(params, ffmpeg="/fake/ffmpeg"):
+        args = build_ytdlp_args("https://x.test/p", "/out", params, ffmpeg=ffmpeg)
+        return "--merge-output-format" in args and args[args.index("--merge-output-format") + 1] == "mp4"
+    for q in ("best", "1080p", "720p"):
+        assert merges({"quality": q}), q
+    assert merges({})  # no quality, ffmpeg found: the 720p default
+    assert not merges({"quality": "audio"}) and not merges({"quality": "ready"})
+    assert not merges({}, ffmpeg=None)
+    assert not merges({"flatList": True}) and not merges({"metadataOnly": True, "quality": "720p"})
+
+
 def test_downloads_abort_on_unavailable_fragments():
     assert "--abort-on-unavailable-fragments" in build_ytdlp_args("https://x.test/p", "/out", {})
     assert "--abort-on-unavailable-fragments" in build_ytdlp_args("https://x.test/p", "/out", {"quality": "ready"})
