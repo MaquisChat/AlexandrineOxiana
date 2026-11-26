@@ -64,6 +64,7 @@ const REASONS: Record<string, string> = {
   DISK_NEARLY_FULL: "The capture was paused because the disk is nearly full.",
   NETWORK_LOST: "The connection was lost three times.",
   DISK_FULL: "The disk became full during the download, so nothing of it was kept.",
+  NETWORK_LOST_GAVE_UP: "The connection stayed lost for 12 hours, so the capture was paused.",
 };
 
 /** What each optional tool (Task 48a catalogue id) is called in a sentence. */

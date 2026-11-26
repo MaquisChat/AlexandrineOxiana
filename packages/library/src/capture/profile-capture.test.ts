@@ -1260,6 +1260,66 @@ describe("run hooks (whole channels, Task 3)", { timeout: 120_000 }, () => {
     expect(await run).toMatchObject({ status: "stopped", created: 3 });
   });
 
+  it("the 12 hours start again after a successful video (R674 D2)", async () => {
+    const prof = synthetic();
+    prof.items[1]!.error = "HTTP Error 429: Too Many Requests";
+    prof.items[3]!.error = "HTTP Error 429: Too Many Requests";
+    await setProfile(prof);
+    const p = await project();
+    const asked: number[] = [];
+    const hooks: RunHooks = {
+      wait: async (ms) => {
+        asked.push(ms / 1000);
+        // the first slow-down lifts just before the 12 hours run out, the second after four waits
+        if (asked.length === 11) delete prof.items[1]!.error;
+        if (asked.length === 15) delete prof.items[3]!.error;
+        await setProfile(prof);
+        return "go";
+      },
+    };
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks });
+    expect(asked).toEqual([60, 120, 240, 900, 1_800, 3_600, 7_200, 7_200, 7_200, 7_200, 7_200, 60, 120, 240, 900]);
+    expect(r).toMatchObject({ status: "completed", created: 12, failed: 0 });
+  });
+
+  it("a run without hooks treats lost connections and a full disk as ordinary failures (R674 D3)", async () => {
+    const prof = synthetic();
+    prof.items[1]!.error = "network";
+    prof.items[2]!.error = "network";
+    prof.items[3]!.error = "disk";
+    await setProfile(prof);
+    const p = await project();
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(r).toMatchObject({ status: "completed", created: 9, failed: 3 });
+    expect(waits).toEqual([]);
+    expect(r.items.filter((o) => o.status === "failed").map((o) => [idOfUrl(o.url), o.errorCode])).toEqual([
+      [prof.items[1]!.id, "NETWORK_LOST"],
+      [prof.items[2]!.id, "NETWORK_LOST"],
+      [prof.items[3]!.id, "DISK_FULL"],
+    ]);
+  });
+
+  it("12 hours of lost connections end the run failed, the video in hand put back (R674 D1)", async () => {
+    const prof = synthetic();
+    prof.items[1]!.error = "network";
+    prof.items[2]!.error = "network";
+    await setProfile(prof);
+    const p = await project();
+    const told: string[] = [];
+    const asked: string[] = [];
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, {
+      hooks: { afterItem: async (e) => void told.push(e.id), wait: async (_ms, why) => (asked.push(why), "go") },
+    });
+    expect(asked).toEqual(Array.from({ length: 12 }, () => "connection"));
+    expect(r).toMatchObject({ status: "failed", errorCode: "NETWORK_LOST", reason: "The connection stayed lost for 12 hours, so the capture was paused.", created: 1, failed: 1 });
+    expect(plainReason("NETWORK_LOST_GAVE_UP")).toBe("The connection stayed lost for 12 hours, so the capture was paused.");
+    expect(told).toEqual([prof.items[0]!.id, prof.items[1]!.id]);
+    expect((await batchOf(p.folder)).state).toBe("failed");
+    const reports = await reportsOf(p.folder);
+    const text = await readFile(join(lib.root, p.folder, "profiles", "tiktok-fake.dancer", reports[0]!), "utf8");
+    expect(text).toContain("- Result: The connection stayed lost for 12 hours, so the capture was paused.\n");
+  });
+
   describe("the listing with hooks (R674 C1)", () => {
     it("a slowed-down listing waits on the growing schedule, then lists (guard)", async () => {
       process.env.FAKE_TOOL_MODE = "enumratelimit";
@@ -1306,6 +1366,15 @@ describe("run hooks (whole channels, Task 3)", { timeout: 120_000 }, () => {
         expect(await walk(join(lib.root, p.folder, "imports"))).toEqual([]);
         expect(await walk(join(lib.root, p.folder, "profiles"))).toEqual([]);
       }
+    });
+
+    it("12 hours of lost connections at the listing end the run failed (D1)", async () => {
+      process.env.FAKE_TOOL_MODE = "enumnetwork";
+      const p = await project();
+      const asked: string[] = [];
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks: { wait: async (_ms, why) => (asked.push(why), "go") } });
+      expect(asked).toHaveLength(12);
+      expect(r).toMatchObject({ status: "failed", errorCode: "NETWORK_LOST", reason: plainReason("NETWORK_LOST_GAVE_UP"), created: 0 });
     });
 
     it("a missing tool at the listing pauses the run and names the tool; a full disk pauses on the disk", async () => {

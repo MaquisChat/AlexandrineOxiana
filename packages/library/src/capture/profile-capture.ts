@@ -484,8 +484,12 @@ export function createProfileCapture(core: CaptureCore) {
     /** The run's own Pause or Stop (asked before a video, or answered to a wait). */
     const endAs = (a: "pause" | "stop") =>
       Object.assign(report, a === "pause" ? { status: "paused" as const, reason: plainReason("RUN_PAUSED") } : { status: "stopped" as const, reason: plainReason("RUN_STOPPED") });
-    /** The waits are used up: a slow-down pauses as before; 12 hours of lost connections pause the run (plan's decision). */
-    const gaveUp = (why: RunWaitWhy) => (why === "rate-limited" ? pause() : Object.assign(report, { status: "paused" as const, errorCode: "NETWORK_LOST", reason: plainReason("RUN_PAUSED") }));
+    /**
+     * The waits are used up: a slow-down pauses as before; 12 hours of lost connections end the run
+     * failed with NETWORK_LOST, so the screen says why and still offers Resume downloads (R674 D1).
+     */
+    const gaveUp = (why: RunWaitWhy) =>
+      why === "rate-limited" ? pause() : Object.assign(report, { status: "failed" as const, errorCode: "NETWORK_LOST", reason: plainReason("NETWORK_LOST_GAVE_UP") });
 
     /** The run's end for a post whose failure every later post would share; false for an ordinary failure. */
     const putBack = (out: CaptureOutcome): boolean => {
@@ -1204,6 +1208,7 @@ const PLATFORM_NAMES: Record<Platform, string> = { youtube: "YouTube", instagram
 /** The plain-language capture report (no links, no paths). */
 function reportText(platform: Platform, label: string, r: ProfileCaptureReport, startedAt: string, finishedAt: string, wholeList: boolean): string {
   const gaveUp = plainReason("RATE_LIMITED_GAVE_UP");
+  const lostGaveUp = plainReason("NETWORK_LOST_GAVE_UP");
   const status =
     r.status === "completed"
       ? "Finished."
@@ -1219,7 +1224,9 @@ function reportText(platform: Platform, label: string, r: ProfileCaptureReport, 
               ? (r.reason ?? plainReason("DISK_NEARLY_FULL"))
               : r.status === "paused-tool"
                 ? (r.reason ?? toolMissingReason(r.tool))
-                : `Stopped. ${r.reason ?? ""}`.trim();
+                : r.reason === lostGaveUp
+                  ? lostGaveUp
+                  : `Stopped. ${r.reason ?? ""}`.trim();
   const lines = [
     `# Profile capture report`,
     "",
