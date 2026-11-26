@@ -104,6 +104,8 @@ export class Transcriptions {
   private readonly bySource = new Map<string, string | symbol>();
   /** Told when a job this run holds has ended (whenEnded). */
   private readonly waiters = new Map<string, Set<(job: TranscriptionJob) => void>>();
+  /** Per source key: told when a reservation becomes a job (its id) or is given up (undefined) (whenStarted). */
+  private readonly starts = new Map<string, Set<(jobId: string | undefined) => void>>();
 
   constructor(private readonly state: ServiceState) {}
 
@@ -140,7 +142,9 @@ export class Transcriptions {
     return {
       token,
       release: () => {
-        if (this.bySource.get(key) === token) this.bySource.delete(key);
+        if (this.bySource.get(key) !== token) return;
+        this.bySource.delete(key);
+        this.told(key, undefined);
       },
     };
   }
@@ -151,7 +155,13 @@ export class Transcriptions {
     let entry: Live | undefined;
     const job = await transcriptionJob(s.repo, projectId, sourceId, params, { id, onStored: (st) => entry && this.stored(entry, st) });
     const key = this.key(projectId, sourceId);
-    if (this.bySource.get(key) !== token) throw busyError(); // released meanwhile (a close)
+    if (this.bySource.get(key) !== token) throw busyError(); // released meanwhile (a close, a lock)
+    // Locked meanwhile (R692 M4): nothing of the project is tracked or kept here.
+    if (!s.repo.isUnlocked(projectId)) {
+      this.bySource.delete(key);
+      this.told(key, undefined);
+      throw new ProjectLockedError(projectId);
+    }
     entry = this.track(s, id, projectId, sourceId, typeof job.about?.model === "string" ? job.about.model : undefined);
     const live = entry;
     void this.state.startWork("transcription", async (ctl) => {
@@ -263,6 +273,52 @@ export class Transcriptions {
     });
   }
 
+  /**
+   * For a source taken by a start at this moment (`reserve` refused): resolves with the job's id once that start has
+   * made it, or with undefined when the start gave up (or nothing holds the source any more). A job already queued or
+   * running for the source is answered at once. `signal` gives up the wait (R692 M3).
+   */
+  whenStarted(projectId: string, sourceId: string, signal?: AbortSignal): Promise<string | undefined> {
+    const key = this.key(projectId, sourceId);
+    return new Promise<string | undefined>((resolve, reject) => {
+      const held = this.bySource.get(key);
+      if (typeof held === "string" && this.active(this.live.get(held))) return resolve(held);
+      if (typeof held !== "symbol") return resolve(undefined);
+      if (signal?.aborted) return reject(signal.reason instanceof Error ? signal.reason : new Error("the wait was given up"));
+      const set = this.starts.get(key) ?? new Set();
+      this.starts.set(key, set);
+      const cleanup = () => {
+        set.delete(done);
+        if (set.size === 0 && this.starts.get(key) === set) this.starts.delete(key);
+        signal?.removeEventListener("abort", aborted);
+      };
+      const done = (jobId: string | undefined) => {
+        cleanup();
+        resolve(jobId);
+      };
+      const aborted = () => {
+        cleanup();
+        reject(signal?.reason instanceof Error ? signal.reason : new Error("the wait was given up"));
+      };
+      signal?.addEventListener("abort", aborted, { once: true });
+      set.add(done);
+    });
+  }
+
+  private told(key: string, jobId: string | undefined): void {
+    const set = this.starts.get(key);
+    if (set) for (const fn of [...set]) fn(jobId);
+  }
+
+  /** What this run holds, for tests and diagnostics: the live jobs' and held sources' project ids; the waited job ids, and the projects of waited starts. */
+  memory(): { live: string[]; waiters: string[]; sources: string[] } {
+    return {
+      live: [...this.live.values()].map((l) => l.job.projectId),
+      waiters: [...this.waiters.keys(), ...[...this.starts.keys()].map((k) => k.split("\u0000")[0]!)],
+      sources: [...this.bySource.keys()].map((k) => k.split("\u0000")[0]!),
+    };
+  }
+
   /** Forgets everything held for a library that was closed (its jobs stay in its journal). */
   forget(lib: object): void {
     this.drop((l) => l.lib === lib);
@@ -289,7 +345,11 @@ export class Transcriptions {
       l.forgotten = true;
       this.live.delete(id);
     }
-    for (const [key, v] of this.bySource) if (typeof v === "symbol" || !this.live.has(v)) this.bySource.delete(key);
+    for (const [key, v] of this.bySource) {
+      if (typeof v !== "symbol" && this.live.has(v)) continue;
+      this.bySource.delete(key);
+      if (typeof v === "symbol") this.told(key, undefined);
+    }
   }
 
   // ---- internals ----
@@ -304,6 +364,7 @@ export class Transcriptions {
     };
     this.live.set(id, entry);
     this.bySource.set(this.key(projectId, sourceId), id);
+    this.told(this.key(projectId, sourceId), id);
     this.prune();
     this.publish(entry);
     return entry;

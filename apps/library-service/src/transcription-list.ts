@@ -112,9 +112,17 @@ export class TranscriptionListRunner {
     return [...this.loops.keys()].map((projectId) => ({ projectId }));
   }
 
+  /** Projects kicked while a move of the library ran: kicked again when it has ended (R692 M9). */
+  private readonly afterMoveKicks = new Set<string>();
+
   /** Starts the project's loop (it ends by itself when the list is paused or has nothing pending). */
   kick(s: Session, projectId: string): void {
     const { state } = this;
+    if (state.session === s && state.moving && !state.shuttingDown) {
+      // No loop writes while the library is being moved (R692 M9): it is started when the move has ended.
+      this.afterMoveKicks.add(projectId);
+      return;
+    }
     if (state.session !== s || s.lib.mode !== "read-write" || state.startsHeld || state.shuttingDown) return;
     try {
       if (!s.repo.isUnlocked(projectId)) return;
@@ -220,8 +228,26 @@ export class TranscriptionListRunner {
         const started = await this.start(s, l, head);
         if (started === "next") return true;
         if (started === "end") return false;
-        jobId = started;
-        startedAt = state.opts.now().getTime();
+        if (started === "busy") {
+          // Being started by hand at this very moment (R692 M3): that job is followed once it is made.
+          let hand: string | undefined;
+          try {
+            hand = await state.transcriptions.whenStarted(pid, sid, AbortSignal.any([l.cut.signal, l.wake.signal]));
+          } catch (err) {
+            if (l.cut.signal.aborted) return false;
+            if (l.wake.signal.aborted) {
+              l.wake = new AbortController();
+              return true;
+            }
+            throw err;
+          }
+          if (l.cut.signal.aborted) return false;
+          if (hand === undefined) return true; // the hand start gave up: read the list again
+          jobId = hand;
+        } else {
+          jobId = started;
+          startedAt = state.opts.now().getTime();
+        }
       }
       const marked = await markTranscriptionEntry(s.repo, pid, head.entryId, { status: "running", jobId });
       if (l.cut.signal.aborted) return false;
@@ -265,8 +291,11 @@ export class TranscriptionListRunner {
     return !l.cut.signal.aborted;
   }
 
-  /** Starts the entry's transcription: its job id, "next" (the entry ended; go on) or "end" (the loop ends). */
-  private async start(s: Session, l: Loop, head: TranscriptionEntryView): Promise<string | "next" | "end"> {
+  /**
+   * Starts the entry's transcription: its job id, "next" (the entry ended; go on), "end" (the loop ends) or "busy" (a
+   * start by hand holds the source at this very moment).
+   */
+  private async start(s: Session, l: Loop, head: TranscriptionEntryView): Promise<string | "next" | "end" | "busy"> {
     const { state } = this;
     const pid = l.projectId;
     const sid = head.entry.sourceId;
@@ -286,9 +315,7 @@ export class TranscriptionListRunner {
     try {
       reserved = state.transcriptions.reserve(pid, sid);
     } catch {
-      // Being started by hand at this very moment: the list waits and is asked again by the next change.
-      state.opts.log.info({}, "transcription-list waits for a transcription started by hand");
-      return "end";
+      return "busy"; // being started by hand at this very moment: followed (R692 M3)
     }
     try {
       const job = await state.transcriptions.start(s, client, pid, sid, { model: head.entry.model }, reserved.token);
@@ -404,8 +431,17 @@ export class TranscriptionListRunner {
     this.loops.delete(projectId);
   }
 
+  /** A move of the library has ended (moved, refused or failed): what was kicked meanwhile is kicked now (R692 M9). */
+  afterMove(): void {
+    const s = this.state.session;
+    const kicked = [...this.afterMoveKicks];
+    this.afterMoveKicks.clear();
+    if (s) for (const pid of kicked) this.kick(s, pid);
+  }
+
   /** At a close: every loop ends. */
   stopAll(): void {
+    this.afterMoveKicks.clear();
     for (const pid of new Set([...this.loops.keys(), ...this.retries.keys(), ...this.failedOnce])) this.stopProject(pid);
   }
 }

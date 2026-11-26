@@ -474,6 +474,8 @@ describe("the transcription list", () => {
     expect(svc!.state.transcriptionList.active()).toBe(false);
     first.released = true; // its store step finds the key gone: cancelled as locked, to run again at the unlock (R142)
     await svc!.state.idle();
+    // Nor in the transcriptions: no live job, no waiter, no held source (R692 M4).
+    expect(svc!.state.transcriptions.memory()).toEqual({ live: [], waiters: [], sources: [] });
     expect(worker.runs).toHaveLength(1);
     expect((await call({ url: `/projects/${pid}/transcription-list` })).status).toBe(423);
     expect(JSON.stringify(events)).not.toMatch(/Secret interview/);
@@ -589,6 +591,79 @@ describe("the transcription list", () => {
     expect((await list(pid)).stalled).toBeUndefined();
   });
 
+  it("a transcription started by hand at the very moment the list reaches its source is followed, then the list goes on (R692)", async () => {
+    worker = await stubWorker();
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const one = await audioSource(pid, "One", 60);
+    const two = await audioSource(pid, "Two", 60);
+    const t = svc!.state.transcriptions;
+    const s = svc!.state.session!;
+    // The hand start has taken the source and not yet made its job.
+    const byHand = t.reserve(pid, one);
+    let clashed!: () => void;
+    const clash = new Promise<void>((r) => (clashed = r));
+    const realReserve = t.reserve.bind(t);
+    vi.spyOn(t, "reserve").mockImplementation((...args) => {
+      try {
+        return realReserve(...args);
+      } catch (err) {
+        clashed();
+        throw err;
+      }
+    });
+    await transcribeAll(pid);
+    await clash;
+    const client = await svc!.state.workerClient();
+    const hand = await t.start(s, client, pid, one, { model: "medium" }, byHand.token);
+    byHand.release();
+    const run = await worker.posted(1);
+    worker.instant = true;
+    run.released = true;
+    await svc!.state.idle();
+    // The list followed the hand-started job (no second transcription of One), then did Two.
+    expect(worker.runs).toHaveLength(2);
+    expect(await list(pid)).toMatchObject({ state: "idle", total: 2, done: 2, failed: 0 });
+    expect((await call({ url: `/projects/${pid}/sources/${one}/transcription` })).json.job).toMatchObject({ jobId: hand.jobId, status: "done" });
+    for (const sid of [one, two]) expect(await transcripts(pid, sid)).toBe(2);
+  });
+
+  it("a lock that lands while the list starts a transcription leaves nothing of the project in memory (R692)", async () => {
+    worker = await stubWorker();
+    await start();
+    await openLibrary();
+    const pid = await project({ encrypted: true });
+    const one = await audioSource(pid, "Secret one", 60);
+    expect((await listAct(pid, "pause")).status).toBe(200);
+    await transcribeAll(pid);
+    await svc!.state.idle();
+    const repo = svc!.state.session!.repo;
+    const realGet = repo.getSource.bind(repo);
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    onTestFinished(() => open());
+    let reached!: () => void;
+    const atGate = new Promise<void>((r) => (reached = r));
+    // The transcription's own read of its source (inside Transcriptions.start): the lock lands right after it.
+    vi.spyOn(repo, "getSource").mockImplementation(async (...args) => {
+      const sf = await realGet(...args);
+      if (args[1] === one) {
+        reached();
+        await gate;
+      }
+      return sf;
+    });
+    expect((await listAct(pid, "continue")).status).toBe(200);
+    await atGate;
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    open();
+    await svc!.state.idle();
+    expect(worker.runs).toHaveLength(0);
+    expect(svc!.state.transcriptionList.memory()).toEqual([]);
+    expect(svc!.state.transcriptions.memory()).toEqual({ live: [], waiters: [], sources: [] });
+  });
+
   it("the speed is measured from what this Mac did and the time left follows; before the first, none is given", async () => {
     worker = await stubWorker();
     await start();
@@ -622,6 +697,38 @@ describe("the transcription list", () => {
     vi.mocked(svc!.state.downloads.estimate).mockResolvedValue({ ...(e.json as CaptureEstimate), measuredSpeed: undefined, speechModel: "small" } as CaptureEstimate);
     const unmeasured = await call({ method: "POST", url: `/projects/${pid}/capture-estimate`, body: { url: "https://www.tiktok.com/@fake.dancer" } });
     expect(unmeasured.json.measuredSpeed).toBeUndefined();
+  });
+});
+
+describe("the list and a move", () => {
+  it("no loop starts while a move of the library is in progress; it is started when the move has ended (R692)", async () => {
+    worker = await stubWorker();
+    worker.instant = true;
+    let during: { active: boolean; runs: number } | undefined;
+    let pid = "";
+    await start({
+      beforeMovePlan: async () => {
+        // As a download run storing a video, or an unlock, in the move's window.
+        const s = svc!.state.session!;
+        const { addToTranscriptionList } = await import("@ao/library");
+        await addToTranscriptionList(s.repo, pid, [{ sourceId: s.repo.listSourceIds(pid)[0]! }]);
+        svc!.state.transcriptionList.kick(s, pid);
+        during = { active: svc!.state.transcriptionList.active(), runs: worker!.runs.length };
+      },
+    });
+    await openLibrary();
+    pid = await project();
+    const one = await audioSource(pid, "One", 60);
+    const dest = join(tmp, "Taken");
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, "something.txt"), "not empty");
+    const done = listEvent(pid, (l) => l.state === "idle" && l.done === 1);
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    expect(moved.body).toMatch(/error/); // refused at its plan: the folder is not empty
+    expect(during).toEqual({ active: false, runs: 0 });
+    expect(await done).toMatchObject({ total: 1, done: 1 });
+    await svc!.state.idle();
+    expect(await transcripts(pid, one)).toBe(2);
   });
 });
 
