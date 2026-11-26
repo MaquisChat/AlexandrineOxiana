@@ -124,3 +124,19 @@ Tests `MissingFiles.test.tsx:223–260`: "R658: “Check again” after a stop, 
 **Verify (once, no load):** `ImportWizard.test.tsx` Tests 56 passed (56); `reader.firstReads.test.tsx` 7 passed; `reader.test.tsx` 13 passed (13); `Reader.test.tsx` 59 passed (59); `MissingFiles.test.tsx` 14 passed; `@ao/ui typecheck` 0 errors; `lint:css`, `lint:colours` clean; `git status --short` empty.
 
 Uncertain: the import's "proved by silence" relies on the client's only post-open did-not-answer-in-time being the quiet limit (true at this head, `client.ts:466–484`); a future change there would need this read again.
+
+### Correction (R659)
+
+Commit 01af081, on top of 64d525a; it is now the head. The real service sends `library.state` as soon as a stream opens, so the R658 rule "any event proves the connection" let a stream that opens and closes at once be retried for ever.
+- `packages/ui/src/screens/import/StepRun.tsx:87–105`: `proved = true` now comes after the `isProgressFor(batchId, e)` check. The comment above `let tries` is updated. Proof (ii), opened and then did-not-answer-in-time, is unchanged.
+- `packages/ui/src/api/client.ts:484`: a one-line comment (no code change) saying StepRun reads "opened, then this error" as "open and silent to the quiet limit".
+- Tests, all in `ImportWizard.firstReads.test.tsx`. A `dropping()` helper answers `/events` as the real service does: the opening `library.state` event, then the test's own event, then the stream ends.
+  - New: "R659: a stream that sends only the service's opening state and ends, every time, ends after the step's tries in the notice with “Check again”; the step then rests". The notice appears and the connection count is 3. It failed at 64d525a: no notice, endless reconnects.
+  - New: "R659: a stream that delivered the opening state and another batch's event and then dropped, every time, ends after the step's tries in the notice". It failed at 64d525a the same way.
+  - Changed: "R658, R659: a stream that delivered a progress event of this batch and then dropped, more times than the step's tries, does not end in the notice …". Each stream sends the opening state, then this batch's progress. It passes at 64d525a too. This is expected, since it is the positive case; it failed first in R658, against the original loop.
+- Runs:
+  - `ImportWizard.firstReads.test.tsx`: Tests 18 passed (18).
+  - `ImportWizard.test.tsx`: Tests 56 passed (56).
+  - `@ao/ui typecheck`: 0 errors.
+  - `ImportWizard.firstReads.test.tsx` 30 times under load (4 busy loops, killed): 30/30, last line Tests 18 passed (18).
+  - `git status` is empty.
