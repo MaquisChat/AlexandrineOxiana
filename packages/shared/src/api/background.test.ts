@@ -154,6 +154,15 @@ describe("the estimate's words", () => {
     expect(estimateText.cancel).toBe("Cancel");
     expect(estimateText.legends).toEqual({ quality: "Quality", transcribe: "Transcribe", disk: "Disk", time: "Time" });
   });
+
+  it("the settings changed, the switch not read, and a slow listing (R683)", () => {
+    expect(estimateText.settingsChanged).toBe("The settings changed, so the estimate was closed. Press “Capture profile” to see it again.");
+    expect(estimateText.switchNotRead).toBe(
+      "The project's switch for automatic transcription could not be read. This capture follows the switch as it stands, unless you tick the box.",
+    );
+    expect(estimateText.listingSlow("youtube")).toBe("Still asking YouTube for the list. A long list can take a few minutes.");
+    expect(estimateText.listingSlow("instagram")).toBe("Still asking Instagram for the list. A long list can take a few minutes.");
+  });
 });
 
 describe("refusals", () => {
