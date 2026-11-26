@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, IndexStatus, ProjectSummary, SourcePage, Tag } from "../api/library";
 import { errorText, isProjectLocked, knownProfiles } from "../api/library";
-import { ApiClientError, SERVICE_NO_ANSWER, STREAM_OPEN_TIMEOUT_MS } from "../api/client";
+import { ApiClientError, SERVICE_NO_ANSWER, STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, readWithin } from "../api/firstRead";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
@@ -82,6 +82,11 @@ export interface LibraryProps {
    * screen's usual pause (STREAM_OPEN_TIMEOUT_MS; smaller in tests). A stream that has opened is never ended by it.
    */
   streamOpenMs?: number;
+  /**
+   * R641 D2: how long an open event stream may deliver nothing (not even the service's keep-alive) before it is taken
+   * as lost, closed and, after the same pause, opened afresh (STREAM_QUIET_TIMEOUT_MS; smaller in tests).
+   */
+  streamQuietMs?: number;
 }
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
@@ -110,7 +115,7 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
 
 const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing", transcription: "Transcribing recordings" };
 
-export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected, firstUse, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: LibraryProps) {
+export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected, firstUse, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: LibraryProps) {
   const [state, setState] = useState<LibraryState>({
     mode: current.mode,
     ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}),
@@ -241,16 +246,17 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /**
    * FR-756's remainder: the source's detail, opened beside the list, is part of this page. While the screen says its
    * one sentence, the panel says none of its own, the sentence covers the panel's read too (R602 M1), and the one
-   * "Try again" reads it again as well (R605 I2).
+   * "Try again" reads it again as well (R605 I2). The panel is a side panel: once the screen's own read is unanswered the
+   * screen says the page's sentence in its own place, even where the panel said it first (R641 C2 i).
    */
-  const { page, sentence: pageSentence, retryAll } = usePageHost({
+  const { page, sentence: pageSentence, retryAll, tryAgainRef } = usePageHost({
     sentence: unansweredText,
     out: () => out.current.size > 0 || !projectsRef.current,
     retry: () => {
       triedAgain.current = true;
       readAgain();
     },
-  });
+  }, { panelsOnly: true });
   useEffect(() => {
     if (showTryAgain || !triedAgain.current) return;
     triedAgain.current = false;
@@ -359,7 +365,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         if (again) readAgainRef.current();
       };
       try {
-        for await (const e of api.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs })) {
+        for await (const e of api.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
           // A stream after a drop is open once its first event (the fresh state) arrives: what was missed is asked for.
           if (first) {
             first = false;
@@ -406,7 +412,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           }
         }
       } catch {
-        // the stream dropped, or did not open in time (FR-756 C): listen again shortly (a fresh state arrives first)
+        // the stream dropped, did not open in time (FR-756 C) or fell silent (R641 D2): listen again shortly (a fresh state arrives first)
       }
       if (!ac.signal.aborted) retry = setTimeout(() => void listen(), 2000);
     };
@@ -415,7 +421,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       ac.abort();
       clearTimeout(retry);
     };
-  }, [api, noteUnknownCreates, streamOpenMs]);
+  }, [api, noteUnknownCreates, streamOpenMs, streamQuietMs]);
 
   // ---- projects and their profile badges ----
   const showProjects = useCallback((list: ProjectSummary[]) => {
@@ -445,12 +451,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     };
   }, [api, showProjects, firstReadMs, tries.projects, answered, noAnswer]);
   const mounted = useRef(true);
-  useEffect(
-    () => () => {
+  // Set again at mount: under strict mode (mount, clean-up, mount) the screen otherwise reads nothing after (FR-762).
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
       mounted.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
   /** Reads the project list again (after the new-project dialog closes, whatever the reason). */
   const reloadProjects = useCallback(async (keep?: ProjectSummary) => {
     const { projects: read } = await api.projects.list();
@@ -1066,7 +1073,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         )}
         {pageSentence !== undefined && (
           <p>
-            <button type="button" onClick={retryAll}>
+            <button type="button" ref={tryAgainRef} onClick={retryAll}>
               Try again
             </button>
           </p>

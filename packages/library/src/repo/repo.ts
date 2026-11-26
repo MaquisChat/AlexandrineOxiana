@@ -60,6 +60,7 @@ import {
   issueRecoveryCode,
   lockAsksOf,
   lockProject,
+  lockStopOf,
   readFullData,
   recoveryCodeUnshown,
   unlockProject,
@@ -243,6 +244,10 @@ export class Repo {
   }
   isUnlocked(projectId: string): boolean {
     return isUnlocked(this.core, projectId);
+  }
+  /** FR-769: the stop a project's running imports and attaches carry in their lookups; aborted at its lock. */
+  lockStopOf(projectId: string): AbortSignal {
+    return lockStopOf(this.core, projectId);
   }
   /** The project's count of locks asked so far (read-only): noted by an unlock when its request arrives (R443 a). */
   lockAsksOf(projectId: string): number {

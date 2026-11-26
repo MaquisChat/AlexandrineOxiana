@@ -937,7 +937,7 @@ residency:
     });
   }
 
-  it("I6: rerunning executeMove after a crash in a split switch finishes it without duplicate audit events", async () => {
+  it("I6: a crash in a split switch is finished at its new place without duplicate audit events; the remaining library's own move there is refused (FR-760 (1))", async () => {
     const { lib, a, b } = await fixture(HIPAA_GOV, true);
     const dest = join(tmp, "Dest");
     moveSeams.crashAfter = "audit-split";
@@ -950,7 +950,11 @@ residency:
     j.switch.done = j.switch.done.filter((s: string) => s !== "audit-split");
     await writeFile(jp, JSON.stringify(j));
     const rest = await openLibrary(lib.root, mkDeps());
-    const res = await executeMove(rest, dest, { deps: mkDeps(), env, excludeProjectIds: [b.id] });
+    // FR-760 (1), R641 B1: the remaining library is not the library this split moved; its move there is refused.
+    await expect(executeMove(rest, dest, { deps: mkDeps(), env, excludeProjectIds: [b.id] })).rejects.toMatchObject({ code: "destination-not-empty" });
+    await rest.close();
+    await lib.close();
+    const res = await completeMove(dest, mkDeps(), env);
     expect(res.verified).toBe(true);
     await assertFinished(lib, dest, [a.folder]);
     expect((await auditOf(lib.root, b.folder)).filter((e) => e.action === "library.split")).toHaveLength(1);
@@ -2061,6 +2065,76 @@ describe("FR-068 (R607 a): a move into a folder holding a stopped move's switch 
       expect(await readdir(dest)).not.toContain(".move-journal.json");
     });
   }
+});
+
+describe("FR-760 (1), R641 B1: the library that stayed behind after a split, moved into that split's new place, is refused like any folder that holds something", () => {
+  const NOT_EMPTY = { name: "MoveNotAllowedError", code: "destination-not-empty", message: "The destination folder is not empty; choose an empty folder" };
+
+  for (const [what, crashAfter] of [
+    ["the split stopped after its marks were recorded", "register"],
+    ["the split stopped after its own audit", "audit-split"],
+  ] as const) {
+    it(`${what}: the plan (the dialog's check), the early plan and the move each refuse it in the ordinary words; nothing is written; the split is still finished by opening its new place`, async () => {
+      const f = await fixture(HIPAA_GOV, true);
+      const dest = join(tmp, "Dest");
+      moveSeams.crashAfter = crashAfter;
+      await expect(executeMove(f.lib, dest, { deps: mkDeps(), env, excludeProjectIds: [f.b.id] })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+      await f.lib.close();
+      const rest = await openLibrary(f.lib.root, mkDeps());
+      open.push(rest);
+      expect(rest.id).not.toBe(f.lib.id); // the remaining library, its id the split's
+      const before = [await hashes(join(tmp, "config")), await hashes(f.lib.root), await hashes(dest)];
+      await expect(planMove(rest, dest, env)).rejects.toMatchObject(NOT_EMPTY);
+      await expect(acceptMovePlan(rest, dest, { deps: mkDeps(), env })).rejects.toMatchObject(NOT_EMPTY);
+      await expect(executeMove(rest, dest, { deps: mkDeps(), env })).rejects.toMatchObject(NOT_EMPTY);
+      expect([await hashes(join(tmp, "config")), await hashes(f.lib.root), await hashes(dest)]).toEqual(before);
+      expect(JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8")).phase).toBe("switching");
+      await rest.close();
+      expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+      expect(await readdir(dest)).not.toContain(".move-journal.json");
+      expect((await auditOf(f.lib.root, f.b.folder)).filter((e) => e.action === "library.split")).toHaveLength(1);
+    });
+  }
+});
+
+describe("FR-760 (2), R641 B2: at the finishing's first step a mark without a move's id counts only where the folder's own record of the move agrees", () => {
+  /** A move of `lib` into `dest` that fails before its old copy is marked (a folder stands where the mark goes, then removed). */
+  async function failedBeforeMark(lib: Library, dest: string) {
+    await mkdir(join(lib.root, "MOVED.json"));
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toThrow();
+    await rm(join(lib.root, "MOVED.json"), { recursive: true });
+    expect(JSON.parse(await readFile(join(dest, ".move-journal.json"), "utf8")).switch.done).toEqual([]);
+  }
+  /** The top mark at `root` as an older build wrote it: without the move's id. */
+  async function asOlderBuild(root: string) {
+    const { moveId: _drop, ...older } = JSON.parse(await readFile(join(root, "MOVED.json"), "utf8")) as Record<string, unknown>;
+    await writeFile(join(root, "MOVED.json"), JSON.stringify(older, null, 2));
+  }
+
+  it("across an upgrade: A→B failed before the mark, A→C finished with a mark without an id; opening B finishes nothing and writes nothing, at its first step", async () => {
+    const { lib } = await fixture();
+    const b = join(tmp, "B");
+    const c = join(tmp, "C");
+    await failedBeforeMark(lib, b);
+    expect((await executeMove(lib, c, { deps: mkDeps(), env })).verified).toBe(true);
+    await asOlderBuild(lib.root);
+    const at = async () => [await hashes(lib.root), await hashes(b), await hashes(c), await hashes(join(tmp, "config"))];
+    const before = await at();
+    // Not refused by the later checks (the checksums, the audit logs): the step itself does not count that mark.
+    expect(await finishMoveAt(b, mkDeps())).toBeUndefined();
+    expect(await at()).toEqual(before);
+    expect((await listLibraries(mkDeps())).find((e) => e.libraryId === lib.id)!.lastKnownPaths[0]).toBe(c);
+  });
+
+  it("unchanged: the move's own mark without an id (an older build's), its record agreeing, is still counted and the move finished", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.fail = { at: "journal", after: "mark-old" };
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toMatchObject({ code: "ENOSPC" });
+    await asOlderBuild(lib.root);
+    await lib.close();
+    expect((await finishMoveAt(dest, mkDeps()))?.verified).toBe(true);
+  });
 });
 
 describe("FR-068 (R607 b): a resumed copy never writes through a link", () => {

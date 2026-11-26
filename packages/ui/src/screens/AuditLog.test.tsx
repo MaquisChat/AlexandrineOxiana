@@ -1,6 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
+import { StrictMode } from "react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { makeApi, server, url, useMsw } from "../test/msw-governance";
 import { AuditLog } from "./AuditLog";
@@ -398,5 +399,38 @@ describe("N3, N8: set-asides in the project's log; stale answers and double clic
     await new Promise((r) => setTimeout(r, 150));
     expect(screen.queryByText(/library\.relink/)).toBeNull();
     expect(screen.getByText(/Nothing needs attention/)).toBeTruthy();
+  });
+});
+
+describe("FR-762: under strict mode (mounted, cleaned up, mounted again) the screen still shows what it reads", () => {
+  it("Needs attention shows its list", async () => {
+    serveAudit(0);
+    render(
+      <StrictMode>
+        <AuditLog api={makeApi()} projectId={PID} />
+      </StrictMode>,
+    );
+    const region = await screen.findByRole("region", { name: "Needs attention" });
+    expect(await within(region).findByText(/Nothing needs attention/)).toBeTruthy();
+  });
+
+  it("the library's audit log and its check are shown", async () => {
+    serveAudit(0);
+    server.use(
+      http.get(url("/libraries/audit"), () =>
+        HttpResponse.json({ events: [{ seq: 1, at: "2026-11-09T10:00:00.000Z", actor: "ana", device: "dev-A", action: "store", decision: { result: "deny", reason: "Governance requires encryption at rest" }, details: { op: "project.create", name: "Field diary", encrypted: false } }], total: 1 }),
+      ),
+      http.get(url("/libraries/audit/verify"), () => HttpResponse.json({ ok: true, events: 1, anchored: true, alteredAt: [] })),
+    );
+    const user = userEvent.setup();
+    render(
+      <StrictMode>
+        <AuditLog api={makeApi()} projectId={PID} />
+      </StrictMode>,
+    );
+    await user.click(await screen.findByRole("button", { name: "Show the library's audit log" }));
+    expect(await screen.findByRole("table", { name: "Library audit events" })).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Verify the library's audit log" }));
+    expect(await screen.findByText(/1 events? — hash chain intact/)).toBeTruthy();
   });
 });

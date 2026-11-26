@@ -195,10 +195,10 @@ describe("library routes", () => {
 
     it("R602 M4: the tools question's read beside the library is given up silently at the limit and cancelled", async () => {
       const gate = hang();
-      let signal: AbortSignal | undefined;
+      let req: Request | undefined;
       server.use(
         http.get(url("/tools"), async ({ request }) => {
-          signal = request.signal;
+          req = request;
           await gate;
           return HttpResponse.json({ platform: null, tools: [] });
         }),
@@ -206,7 +206,7 @@ describe("library routes", () => {
       );
       render(<LibraryRoutes client={testClient()} firstReadMs={300} />);
       expect(await screen.findByRole("navigation", { name: "Projects" })).toBeTruthy();
-      await waitFor(() => expect(signal?.aborted).toBe(true), { timeout: 3000 });
+      await waitFor(() => expect(req?.signal.aborted).toBe(true), { timeout: 3000 });
       expect(screen.queryAllByRole("alert")).toHaveLength(0);
       expect(tryAgain()).toBeNull();
     });

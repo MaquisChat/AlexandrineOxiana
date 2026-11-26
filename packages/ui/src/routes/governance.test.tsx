@@ -1,7 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createClient } from "../api/client";
 import { useLocation } from "../navigation";
 import { BASE, TOKEN, server, url, useMsw } from "../test/msw-governance";
@@ -294,6 +294,161 @@ describe("R463 M4: Fieldwork in a read-only library does not offer to detach a s
     } else {
       expect(await within(records).findByText(why)).toBeTruthy();
       expect(within(records).queryByRole("button", { name: /Detach/ })).toBeNull();
+    }
+  });
+});
+
+describe("R641 D1: the Governance form's event stream reconnects by itself, with an opening limit", () => {
+  const readOnly = "This library is open read-only here, so its rules cannot be changed.";
+  /** GET /events whose attempts answer in turn: "hang" (never opens until the request is cancelled) or a stream that sends one state and stays open (`drop()` ends it). */
+  function attempts(answer: (n: number) => "hang" | Record<string, unknown>) {
+    let n = 0;
+    let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const requests: Request[] = [];
+    return {
+      handler: http.get(url("/events"), async ({ request }) => {
+        requests.push(request);
+        const a = answer(++n);
+        if (a === "hang") {
+          await new Promise<void>((r) => request.signal.addEventListener("abort", () => r(), { once: true }));
+          return HttpResponse.error();
+        }
+        const body = new ReadableStream<Uint8Array>({
+          start: (c) => {
+            ctl = c;
+            c.enqueue(new TextEncoder().encode(`event: library.state\ndata: ${JSON.stringify(a)}\n\n`));
+          },
+        });
+        return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
+      }),
+      attempts: () => n,
+      signals: () => requests.map((r) => r.signal),
+      drop: () => {
+        ctl?.close();
+        ctl = undefined;
+      },
+    };
+  }
+  function serve(events: { handler: Parameters<typeof server.use>[0] }) {
+    const count = { projects: 0 };
+    server.use(
+      events.handler,
+      http.get(url("/projects"), () => {
+        count.projects++;
+        return HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted: false, unlocked: true }] });
+      }),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
+      http.get(url("/projects/p1/governance"), () => HttpResponse.json({ yaml: "captureMethods: [manual_upload, browser_capture]\n", sha256: "a".repeat(64), violations: [] })),
+      http.get(url("/projects/p1/protocol/documents"), () => HttpResponse.json({ documents: [] })),
+      http.get(url("/projects/p1/retention"), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+    );
+    return count;
+  }
+  const browserBox = async () => {
+    const capture = await screen.findByRole("region", { name: "Capture methods" });
+    return () => within(capture).getByRole("checkbox", { name: /Browser capture/ }) as HTMLInputElement;
+  };
+
+  it("a stream that drops is opened again after a pause; the state it opens with counts as a change (what was missed is read again)", async () => {
+    const ev = attempts((n) => (n === 1 ? { open: true, mode: "read-write" } : { open: true, mode: "read-only" }));
+    const count = serve(ev);
+    window.history.replaceState(null, "", "/governance?project=p1");
+    render(<GovernanceRoutes client={createClient(BASE, TOKEN)} loc={window.location} streamOpenMs={5_000} />);
+    const browser = await browserBox();
+    await waitFor(() => expect(browser().disabled).toBe(false));
+    await waitFor(() => expect(ev.attempts()).toBe(1));
+    expect(count.projects).toBe(1);
+    // The library turned read-only while the stream was down: the reopened stream's first state says so.
+    ev.drop();
+    expect(await screen.findByText(readOnly, undefined, { timeout: 10_000 })).toBeTruthy();
+    expect(ev.attempts()).toBe(2);
+    expect(browser().disabled).toBe(true);
+    await waitFor(() => expect(count.projects).toBe(2));
+  });
+
+  it("a stream that never opens is given up at the limit (its request cancelled) and opened afresh", async () => {
+    const ev = attempts((n) => (n === 1 ? "hang" : { open: true, mode: "read-only" }));
+    serve(ev);
+    window.history.replaceState(null, "", "/governance?project=p1");
+    render(<GovernanceRoutes client={createClient(BASE, TOKEN)} loc={window.location} streamOpenMs={300} />);
+    expect(await screen.findByText(readOnly, undefined, { timeout: 10_000 })).toBeTruthy();
+    expect(ev.attempts()).toBe(2);
+    expect(ev.signals()[0]!.aborted).toBe(true);
+    expect(ev.signals()[1]!.aborted).toBe(false);
+  });
+  it("a stream that opens and then delivers nothing for `streamQuietMs` is given up (its request cancelled) and opened afresh (R641 D2)", async () => {
+    let n = 0;
+    const requests: Request[] = [];
+    serve({
+      handler: http.get(url("/events"), ({ request }) => {
+        requests.push(request);
+        // The first opens and sends nothing at all, not even a keep-alive; the second sends the state as it now is.
+        const first = ++n === 1;
+        const body = new ReadableStream<Uint8Array>({
+          start: (c) => {
+            if (!first) c.enqueue(new TextEncoder().encode(`event: library.state\ndata: ${JSON.stringify({ open: true, mode: "read-only" })}\n\n`));
+          },
+        });
+        return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
+      }),
+    });
+    // On a fake clock: the silence limit, the pause and the second stream's own silence act only as the test moves time.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      window.history.replaceState(null, "", "/governance?project=p1");
+      render(<GovernanceRoutes client={createClient(BASE, TOKEN)} loc={window.location} streamQuietMs={300} />);
+      await vi.waitFor(() => expect(n).toBe(1));
+      // The clock moves on in steps of 100 ms until the silence limit has given the first stream up …
+      await vi.waitFor(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+        expect(requests[0]!.signal.aborted).toBe(true);
+      });
+      // … then by the pause (2 s), after which it is opened afresh and its first state is shown.
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(screen.getByText(readOnly)).toBeTruthy());
+      expect(n).toBe(2);
+      expect(requests[1]!.signal.aborted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("each pause before the stream is opened again leaves no abort listener behind once it is over (review M4)", async () => {
+    serve({ handler: http.get(url("/events"), () => HttpResponse.error()) });
+    // The screen's own signal, as it is handed to the stream; its live "abort" listeners are counted.
+    const client = createClient(BASE, TOKEN);
+    let live = 0;
+    let watched: AbortSignal | undefined;
+    const opened = vi.fn((o: Parameters<typeof client.events>[0]) => {
+      const signal = o?.signal;
+      if (signal && !watched) {
+        watched = signal;
+        const add = signal.addEventListener.bind(signal);
+        const remove = signal.removeEventListener.bind(signal);
+        signal.addEventListener = ((type: string, fn: EventListenerOrEventListenerObject, opts?: AddEventListenerOptions | boolean) => {
+          if (type === "abort") live++;
+          add(type, fn, opts);
+        }) as AbortSignal["addEventListener"];
+        signal.removeEventListener = ((type: string, fn: EventListenerOrEventListenerObject, opts?: EventListenerOptions | boolean) => {
+          if (type === "abort") live--;
+          remove(type, fn, opts);
+        }) as AbortSignal["removeEventListener"];
+      }
+      return client.events(o);
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      window.history.replaceState(null, "", "/governance?project=p1");
+      render(<GovernanceRoutes client={{ ...client, events: opened }} loc={window.location} />);
+      // Each try fails at once; after it the screen pauses (2 s), then tries again. Five pauses go by.
+      for (let n = 1; n <= 6; n++) {
+        await vi.waitFor(() => expect(opened).toHaveBeenCalledTimes(n));
+        if (n < 6) await vi.advanceTimersByTimeAsync(2_000);
+      }
+      // At rest in the sixth pause: its own listener, and none left from the five pauses before.
+      await vi.waitFor(() => expect(live).toBe(1));
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

@@ -475,7 +475,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     return { ...r, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) };
   });
 
-  app.get("/libraries/integrity", async (req) => {
+  app.get("/libraries/integrity", async (req, reply) => {
     const s = state.requireSession();
     const q = queryOf(req).sample;
     let sample: IntegritySample = 0.05;
@@ -485,23 +485,46 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       if (!(n > 0 && n <= 1)) throw badRequest('"sample" must be a fraction above 0 and at most 1, or "full".');
       sample = n;
     }
-    // A finding is read again in the write queue's turn: a change in progress is not reported (FR-420).
-    let report: Awaited<ReturnType<typeof checkIntegrity>>;
-    try {
-      report = await checkIntegrity(s.lib, sample, { keyRing: s.ring, confirm: state.writeQueueTurn(s) });
-    } catch (err) {
-      // Ended by a close or a move (its session is gone or replaced): said as such; a library that really is open
-      // read-only keeps its own answer (R491 C b).
-      // FR-749: a closed library's write queue refuses the turn with LibraryClosedError (R546 1).
-      if ((err instanceof ReadOnlyLibraryError || err instanceof LibraryClosedError) && state.session !== s) throw checkStoppedByClose();
-      throw err;
-    }
-    const projectWarnings = await state.projectWarnings(s);
-    return {
-      report: { ...report, errors: report.errors.map((e) => ({ path: e.path, message: scrubPaths(e.message, state.roots) })) },
-      integrityWarnings: state.integrityWarnings(s),
-      projectWarnings,
+    const check = async (more: { signal?: AbortSignal; onProgress?: (checked: number, total: number) => void } = {}) => {
+      // A finding is read again in the write queue's turn: a change in progress is not reported (FR-420).
+      let report: Awaited<ReturnType<typeof checkIntegrity>>;
+      try {
+        report = await checkIntegrity(s.lib, sample, { keyRing: s.ring, confirm: state.writeQueueTurn(s), ...more });
+      } catch (err) {
+        // Ended by a close or a move (its session is gone or replaced): said as such; a library that really is open
+        // read-only keeps its own answer (R491 C b).
+        // FR-749: a closed library's write queue refuses the turn with LibraryClosedError (R546 1).
+        if ((err instanceof ReadOnlyLibraryError || err instanceof LibraryClosedError) && state.session !== s) throw checkStoppedByClose();
+        throw err;
+      }
+      const projectWarnings = await state.projectWarnings(s);
+      return {
+        report: { ...report, errors: report.errors.map((e) => ({ path: e.path, message: scrubPaths(e.message, state.roots) })) },
+        integrityWarnings: state.integrityWarnings(s),
+        projectWarnings,
+      };
     };
+    // R641 D3: asked for NDJSON (the missing-files screen), the check says how far it is — `{progress:{checked,total}}`
+    // at the start, at most every 250 ms and at the end — then `{result}` (the plain answer) or `{error}`. A client
+    // that goes away aborts it (it only reads, so nothing is left behind). No time limit (R601). Every other caller
+    // gets the plain answer, unchanged.
+    if (!String(req.headers.accept ?? "").includes("application/x-ndjson")) return check();
+    const ac = new AbortController();
+    const write = ndjson(reply);
+    reply.raw.on("close", () => ac.abort());
+    let last = 0;
+    const onProgress = (checked: number, total: number) => {
+      const now = Date.now();
+      if (checked !== 0 && checked !== total && now - last < 250) return;
+      last = now;
+      void write({ progress: { checked, total } }).catch(() => {});
+    };
+    try {
+      await write({ result: await check({ signal: ac.signal, onProgress }) });
+    } catch (err) {
+      if (!ac.signal.aborted) await write(ndjsonError(ctx, err)).catch(() => {});
+    }
+    reply.raw.end();
   });
 
   // ---- interrupted changes recovery could not settle (R27): listed, and resolved by the researcher's choice ----

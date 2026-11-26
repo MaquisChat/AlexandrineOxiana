@@ -5,7 +5,7 @@
  * library screen says its one sentence, the panel says none of its own and the page's one "Try again" reads it again too
  * (R602 M1, R605 I2: one sentence and one "Try again" per page).
  */
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
@@ -86,11 +86,11 @@ describe("the source's detail alone: its read has the limit (FR-756 remainder)",
   for (const reRead of ["given up", "failed with no answer"] as const)
     it(`a refused read, then a re-read (the badges refreshed) ${reRead}: the refusal stands while the re-read is out, then one alert, the re-read's (R623 Minor 1)`, async () => {
       styles();
-      const signals: AbortSignal[] = [];
+      const requests: Request[] = [];
       server.use(
         http.get(url("/projects/:id/sources/:sid"), async ({ request }) => {
-          signals.push(request.signal);
-          if (signals.length === 1) return HttpResponse.json({ error: { code: "INTERNAL", message: REFUSED_READ } }, { status: 500 });
+          requests.push(request);
+          if (requests.length === 1) return HttpResponse.json({ error: { code: "INTERNAL", message: REFUSED_READ } }, { status: 500 });
           if (reRead === "failed with no answer") return HttpResponse.error();
           await hang();
           return undefined;
@@ -100,7 +100,7 @@ describe("the source's detail alone: its read has the limit (FR-756 remainder)",
       const { rerender } = render(<SourceDetail {...props} refreshKey={0} />);
       await waitFor(() => expect(alerts().join(" ")).toContain(REFUSED_READ));
       rerender(<SourceDetail {...props} refreshKey={1} />);
-      await waitFor(() => expect(signals).toHaveLength(2));
+      await waitFor(() => expect(requests).toHaveLength(2));
       if (reRead === "given up") {
         expect(alerts()).toHaveLength(1);
         expect(alerts().join(" ")).toContain(REFUSED_READ);
@@ -163,6 +163,59 @@ describe("the source's detail inside the library screen: one sentence and one �
     expect(tryAgains()).toHaveLength(0);
     expect(detailAsks).toBe(2);
     expect(searchAsks).toBeGreaterThan(searchBefore);
+  });
+
+  it("R641 C2 (i): the library's own read given up AFTER the panel's: the page's one sentence and one “Try again” are the library's, not the panel's; closing the panel does not say it again", async () => {
+    styles();
+    let answer = false;
+    let searchHangs = false;
+    const gate = hang();
+    let detailAsks = 0;
+    let searchAsks = 0;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), async () => {
+        detailAsks++;
+        if (!answer) await gate;
+        return HttpResponse.json(SOURCE_FILE);
+      }),
+      http.get(url("/projects/:id/sources"), async () => {
+        searchAsks++;
+        if (searchHangs && !answer) await gate;
+        return HttpResponse.json(SOURCES);
+      }),
+      ...libraryHandlers(),
+    );
+    render(<Library api={testApi()} current={CURRENT_RW as never} firstReadMs={LIMIT} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Ethnography at Work" }));
+    // The panel's read is given up first: its own alert, alone on the page. Focus is on its "Try again".
+    const panelAgain = await within(panel()).findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    panelAgain.focus();
+    // Then the library's own read of the sources (a search) is given up too.
+    searchHangs = true;
+    // Typed without taking the focus away from the panel's "Try again".
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search sources" }), { target: { value: "x" } });
+    expect(document.activeElement).toBe(panelAgain);
+    await waitFor(() => expect(within(panel()).queryByRole("alert")).toBeNull(), { timeout: 5000 });
+    expect(alerts()).toEqual([NO_ANSWER]);
+    expect(tryAgains()).toHaveLength(1);
+    expect(within(panel()).queryByRole("button", { name: "Try again" })).toBeNull();
+    // R641 second round: the focus that was on the panel's "Try again" is on the page's "Try again", never dropped.
+    expect(document.activeElement).toBe(tryAgains()[0]);
+    const said = screen.getByRole("alert");
+    expect(said.closest("main")).not.toBeNull();
+    // Closing the panel leaves the same alert where it is: the sentence is not said again.
+    await user.click(within(panel()).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("region", { name: "Source details" })).toBeNull();
+    expect(screen.getAllByRole("alert")).toEqual([said]);
+    expect(tryAgains()).toHaveLength(1);
+    const searchBefore = searchAsks;
+    answer = true;
+    await user.click(tryAgains()[0]!);
+    await waitFor(() => expect(alerts()).toEqual([]));
+    expect(searchAsks).toBeGreaterThan(searchBefore);
+    expect(detailAsks).toBe(1);
   });
 
   it("the panel's read given up while the library says nothing: the panel's own alert and “Try again”, alone on the page", async () => {

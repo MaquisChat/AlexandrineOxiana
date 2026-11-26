@@ -191,8 +191,11 @@ export function LibraryChooser({ api, onOpened, onNotFound, firstReadMs = FIRST_
   // FR-756 I3 (R602): the list has the time limit. A read that got no answer (none at all, or none in time) says its own
   // sentence with "Try again" (`listTry` moves it on); one refused with an answer says so as before.
   const [listNoAnswer, setListNoAnswer] = useState<string | undefined>();
-  /** FR-756's remainder (R609 N2): the list's last read was refused with an answer (it says so; the list is not known). */
-  const [listRefused, setListRefused] = useState(false);
+  /**
+   * FR-756's remainder (R609 N2): the list's last read was refused with an answer: its sentence (the list is not known).
+   * R641 C2 (ii): kept apart from the acts' words, so an act (which clears those) never takes it away.
+   */
+  const [listRefused, setListRefused] = useState<string | undefined>();
   const [listTry, setListTry] = useState(0);
   const triedList = useRef(false);
   useEffect(() => {
@@ -201,7 +204,7 @@ export function LibraryChooser({ api, onOpened, onNotFound, firstReadMs = FIRST_
       .then((r) => {
         if (ac.signal.aborted) return;
         setListNoAnswer(undefined);
-        setListRefused(false);
+        setListRefused(undefined);
         setLibraries(r.libraries);
         setNotices(r.notices ?? []);
       })
@@ -214,8 +217,7 @@ export function LibraryChooser({ api, onOpened, onNotFound, firstReadMs = FIRST_
           return;
         }
         setListNoAnswer(undefined);
-        setListRefused(true);
-        setError(message(err, "The list of libraries could not be read."));
+        setListRefused(message(err, "The list of libraries could not be read."));
       });
     return () => ac.abort();
   }, [api, firstReadMs, listTry]);
@@ -306,7 +308,13 @@ export function LibraryChooser({ api, onOpened, onNotFound, firstReadMs = FIRST_
           </p>
         </>
       )}
-      {error && (
+      {listRefused && (
+        <p role="alert" className="ao-error">
+          {listRefused}
+        </p>
+      )}
+      {/* R641 C2 (ii): an act's words that are the refused list's own are not said a second time. */}
+      {error && error !== listRefused && (
         <p role="alert" className="ao-error">
           {error}
         </p>

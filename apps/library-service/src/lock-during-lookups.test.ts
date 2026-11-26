@@ -17,7 +17,7 @@ import { Writable } from "node:stream";
 import { Dispatcher, getGlobalDispatcher, setGlobalDispatcher } from "../../../packages/library/node_modules/undici/index.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished } from "vitest";
 import { deviceDeps, type Deps } from "@ao/library";
-import { buildPdf } from "../../../tests/fixtures/generate.mjs";
+import { buildDoiPdf, buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { useMemorySecrets } from "../../../packages/library/src/secrets-testing.js";
 import { setSecret } from "../../../packages/library/src/secrets.js";
 import { FakeZotero, guardNetwork } from "../../../packages/library/tests/zotero/fake-zotero.js";
@@ -46,6 +46,8 @@ class Held extends Dispatcher {
   release!: () => void;
   private arrived!: () => void;
   atGate!: Promise<void>;
+  /** FR-769: the origin of every request handed to this dispatcher (held or not), in order. */
+  readonly sent: string[] = [];
   constructor(private readonly inner: Dispatcher) {
     super();
   }
@@ -55,6 +57,7 @@ class Held extends Dispatcher {
     this.atGate = new Promise<void>((r) => (this.arrived = r));
   }
   override dispatch(opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
+    this.sent.push(String(opts.origin));
     if (!this.origin || !String(opts.origin).startsWith(this.origin)) return this.inner.dispatch(opts, handler);
     this.arrived();
     void this.gate.then(() => this.inner.dispatch(opts, handler));
@@ -276,5 +279,91 @@ describe("FR-767: a lock while a lookup of background work is in the air", () =>
     await svc!.state.zoteroSync.idle();
     await svc!.state.idle();
     expect(sensitiveInMemory()).toBe(0);
+  });
+});
+
+/** The requests to the metadata services among `sent` (Zotero's own requests are not lookups). */
+const lookupsIn = (sent: string[]) => sent.filter((o) => o.startsWith(CROSSREF) || o.startsWith(OPENALEX));
+
+/** The batch's last word: its first `import.progress` event that is not "running". */
+const batchEnd = (batchId: () => string | undefined) => nextEvent((e) => e.type === "import.progress" && e.data.batchId === batchId() && e.data.state !== "running");
+
+describe("FR-769: at a project's lock, its running imports and attaches ask nothing more for it", () => {
+  it("the Zotero Web import: after the lock no further lookup is sent; the batch ends as at a lock, no item failed", async () => {
+    const { pid } = await sealedProject();
+    await addWithDoi("10.5555/sealed.1");
+    await addWithDoi("10.5555/sealed.2");
+    held.arm(CROSSREF);
+    onTestFinished(() => held.release());
+    let batchId: string | undefined;
+    const ended = batchEnd(() => batchId);
+    const r = await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: ZOTERO } });
+    expect(r.status, r.body).toBe(200);
+    batchId = r.json.batchId as string;
+    await held.atGate;
+    const before = held.sent.length;
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    held.release();
+    const end = await ended;
+    await svc!.state.idle();
+    // Before FR-769 the run asked OpenAlex for the same item after Crossref's late answer.
+    expect(lookupsIn(held.sent.slice(before))).toEqual([]);
+    expect(end.data.state).toBe("failed");
+    expect(end.data.counts?.failed ?? 0).toBe(0);
+    expect(sensitiveInMemory()).toBe(0);
+    // It stays resumable, and asks again after the unlock (a fresh stop: the old one ended with the lock).
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    const afterUnlock = held.sent.length;
+    const resumedEnd = batchEnd(() => batchId);
+    const resumed = await call({ method: "POST", url: `/imports/${batchId}/resume` });
+    expect(resumed.status, resumed.body).toBe(200);
+    expect((await resumedEnd).data.state).toBe("finished");
+    expect(lookupsIn(held.sent.slice(afterUnlock))).toContain(CROSSREF);
+  });
+
+  it("an attach: after the lock no further lookup is sent for its file, which ends as locked", async () => {
+    const { pid } = await sealedProject();
+    const dir = join(tmp, "Desktop");
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, "article.pdf");
+    await writeFile(file, await buildDoiPdf());
+    held.arm(CROSSREF);
+    onTestFinished(() => held.release());
+    const attached = call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [file] } });
+    await held.atGate;
+    const before = held.sent.length;
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    held.release();
+    const r = await attached;
+    expect(r.status, r.body).toBe(200);
+    expect(lookupsIn(held.sent.slice(before))).toEqual([]);
+    expect(r.json.items).toHaveLength(1);
+    expect(r.json.items[0].outcome).toBe("failed");
+    expect(r.json.items[0].reason).toMatch(/locked/i);
+    expect(sensitiveInMemory()).toBe(0);
+  });
+
+  it("another project's attach on the same lookup client goes on untouched by the lock", async () => {
+    const { pid } = await sealedProject();
+    const other = await call({ method: "POST", url: "/projects", body: { name: "Open", governanceYaml: LOOKUP_GOV, encryption: { enabled: true, passphrase: PASS } } });
+    expect(other.status, other.body).toBe(200);
+    const oid = other.json.project.id as string;
+    const dir = join(tmp, "Desktop");
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, "article.pdf");
+    await writeFile(file, await buildDoiPdf());
+    held.arm(CROSSREF);
+    onTestFinished(() => held.release());
+    const attached = call({ method: "POST", url: `/projects/${oid}/attach`, body: { paths: [file] } });
+    await held.atGate;
+    const before = held.sent.length;
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    held.release();
+    const r = await attached;
+    expect(r.status, r.body).toBe(200);
+    // Crossref knew nothing: OpenAlex is asked next, for the project that was not locked.
+    expect(lookupsIn(held.sent.slice(before)).some((o) => o.startsWith(OPENALEX))).toBe(true);
+    expect(r.json.items).toHaveLength(1);
+    expect(r.json.items[0].outcome).not.toBe("failed");
   });
 });

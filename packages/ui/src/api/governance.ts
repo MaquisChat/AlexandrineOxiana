@@ -7,7 +7,7 @@
  * returned; R99): the service answers 409 CONFLICT when the file changed elsewhere meanwhile.
  */
 import type { AttentionMarksResponse, AuditReasonView, GovernanceReadability, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";
-import { ApiClientError, type ApiClient } from "./client";
+import { ApiClientError, type ApiClient, type ServiceError } from "./client";
 
 /**
  * The client's error for a stream that ended unexpectedly: cut off in the middle of a line, or the
@@ -248,6 +248,9 @@ export function governanceApi(client: ApiClient) {
     addProtocolDocuments: (projectId: string, paths: string[]) =>
       r<{ results: ProtocolDocumentResult[]; documents: ProtocolDocument[] }>("POST", `${p(projectId)}/protocol/documents`, { body: { paths } }),
 
+    /** FR-754 (R641 C3): a backup of the project now (governed and audited by the service; R125, R551). `warnings`: the backup's own sentences (review I1). */
+    backUpNow: (projectId: string) => r<{ backup: { file: string; sha256: string; bytes: number; warnings?: string[] } }>("POST", `${p(projectId)}/backups`),
+
     retention: (projectId: string) => r<RetentionDue>("GET", `${p(projectId)}/retention`),
     /** Sets (an IANA zone name) or clears (null: UTC) the time zone the project's dates are read in (R93). */
     setTimeZone: (projectId: string, timeZone: string | null) => r<{ timeZone: string | null }>("PUT", `${p(projectId)}/time-zone`, { body: { timeZone } }),
@@ -303,6 +306,21 @@ export function governanceApi(client: ApiClient) {
     deleteOldCopy: (token: string) => r<{ warnings: string[]; [k: string]: unknown }>("POST", "/libraries/move/delete-old", { body: { token } }),
 
     integrity: () => r<IntegrityAnswer>("GET", "/libraries/integrity"),
+    /**
+     * R641 D3: the same check, saying how far it is: `onProgress(checked, total)` for each progress line, then the
+     * answer. An abort of `signal` stops it (the service aborts the check) and the promise rejects as an abort. An error
+     * line is thrown in the service's words.
+     */
+    integrityProgress: async (o: { signal: AbortSignal; onProgress: (checked: number, total: number) => void }): Promise<IntegrityAnswer> => {
+      type Line = { progress?: { checked: number; total: number }; result?: IntegrityAnswer; error?: ServiceError };
+      for await (const line of client.ndjson<Line>("GET", "/libraries/integrity", { signal: o.signal })) {
+        if (line.error) throw new ApiClientError(200, line.error);
+        if (line.progress) o.onProgress(line.progress.checked, line.progress.total);
+        if (line.result) return line.result;
+      }
+      if (o.signal.aborted) throw new DOMException("The check was stopped.", "AbortError");
+      throw new ApiClientError(0, { code: "INTERNAL", message: "The library could not be checked." });
+    },
     relink: (searchDir: string) => r<RelinkResult>("POST", "/libraries/relink", { body: { searchDir } }),
     /** "Rebuild library from folder" (spec 4.3, D8). */
     rebuildIndex: () => r<{ indexed: number; lockedProjects: number; errors: number }>("POST", "/libraries/rebuild-index"),

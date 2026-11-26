@@ -14,7 +14,7 @@
  * step lists the project's recent imports, each linking to its report.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { STREAM_OPEN_TIMEOUT_MS, type ApiClient, type ApiClientError } from "../../api/client";
+import { STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient, type ApiClientError } from "../../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, oneNoAnswerSentence, readWithin } from "../../api/firstRead";
 import { IMPORT_RULES_UNREADABLE_TEXT } from "@ao/shared";
 import { importApi, isValidId, type BatchState, type BatchSummary, type ImportPolicy, type ProjectInfo, type ScanSummary } from "../../api/import";
@@ -68,6 +68,8 @@ export interface ImportWizardProps {
   firstReadMs?: number;
   /** FR-756 (R597): how long the run step's event stream is waited for to open before it is closed and tried afresh. */
   streamOpenMs?: number;
+  /** R641 D2: how long an open event stream may deliver nothing (not even the service's keep-alive) before it is closed and tried afresh. */
+  streamQuietMs?: number;
 }
 
 /** FR-756: a read that got no answer (none in time, or the service could not be reached) says only its own sentence. */
@@ -86,7 +88,7 @@ interface Scanned {
   summary: ScanSummary;
 }
 
-export function ImportWizard({ client, projectId: initialProject, batchId: initialBatch, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: ImportWizardProps) {
+export function ImportWizard({ client, projectId: initialProject, batchId: initialBatch, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: ImportWizardProps) {
   const api = useMemo(() => importApi(client), [client]);
   /** The import named by the address, when both ids are valid: it is read before anything is shown. */
   const [opening, setOpening] = useState(() => isValidId(initialProject) && isValidId(initialBatch));
@@ -393,7 +395,7 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
           </div>
         </>
       )}
-      {step === "run" && batchId && runProject && <StepRun client={client} api={api} projectId={runProject} batchId={batchId} onEnded={ended} focusOnArrival={arrived} firstReadMs={firstReadMs} streamOpenMs={streamOpenMs} />}
+      {step === "run" && batchId && runProject && <StepRun client={client} api={api} projectId={runProject} batchId={batchId} onEnded={ended} focusOnArrival={arrived} firstReadMs={firstReadMs} streamOpenMs={streamOpenMs} streamQuietMs={streamQuietMs} />}
       {step === "report" && batchId && runProject && <StepReport api={api} projectId={runProject} batchId={batchId} focusOnArrival={reportFocus ?? arrived} {...(runError ? { error: runError } : {})} />}
     </main>
   );

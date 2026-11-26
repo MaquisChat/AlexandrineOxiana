@@ -167,9 +167,9 @@ describe("Library: first reads that never settle or fail (FR-756 B)", () => {
 describe("Library: the reads beside the screen are given up silently at the limit (FR-756 M4, R602)", () => {
   it("a held review count, recheck state and Zotero read are each cancelled at the limit, and nothing new is shown", async () => {
     const gate = hang();
-    const seen = new Map<string, AbortSignal>();
+    const seen = new Map<string, Request>();
     const held = (name: string, body: unknown) => async ({ request }: { request: Request }) => {
-      seen.set(name, request.signal);
+      seen.set(name, request);
       await gate;
       return HttpResponse.json(body as never);
     };
@@ -182,7 +182,7 @@ describe("Library: the reads beside the screen are given up silently at the limi
     show(300);
     await screen.findByText("Ethnography at Work");
     await waitFor(() => expect([...seen.keys()].sort()).toEqual(["recheck", "review", "zotero"]));
-    await waitFor(() => expect([...seen.values()].every((s) => s.aborted)).toBe(true), { timeout: 3000 });
+    await waitFor(() => expect([...seen.values()].every((r) => r.signal.aborted)).toBe(true), { timeout: 3000 });
     expect(alerts()).toEqual([]);
     expect(tryAgain()).toBeNull();
     expect(screen.queryByRole("link", { name: /Review queue/ })).toBeNull();
@@ -193,9 +193,9 @@ describe("Library: the reads beside the screen are given up silently at the limi
 describe("Library: leaving the screen cancels the reads beside it (FR-756 remainder, R609 N3)", () => {
   it("the held review count, recheck state and Zotero read are cancelled when the screen is left, long before the limit", async () => {
     const gate = hang();
-    const seen = new Map<string, AbortSignal>();
+    const seen = new Map<string, Request>();
     const held = (name: string, body: unknown) => async ({ request }: { request: Request }) => {
-      seen.set(name, request.signal);
+      seen.set(name, request);
       await gate;
       return HttpResponse.json(body as never);
     };
@@ -208,9 +208,9 @@ describe("Library: leaving the screen cancels the reads beside it (FR-756 remain
     const { unmount } = show(60_000);
     await screen.findByText("Ethnography at Work");
     await waitFor(() => expect([...seen.keys()].sort()).toEqual(["recheck", "review", "zotero"]));
-    expect([...seen.values()].some((s) => s.aborted)).toBe(false);
+    expect([...seen.values()].some((r) => r.signal.aborted)).toBe(false);
     unmount();
-    await waitFor(() => expect(Object.fromEntries([...seen].map(([k, s]) => [k, s.aborted]))).toEqual({ recheck: true, review: true, zotero: true }), { timeout: 1000 });
+    await waitFor(() => expect(Object.fromEntries([...seen].map(([k, r]) => [k, r.signal.aborted]))).toEqual({ recheck: true, review: true, zotero: true }), { timeout: 1000 });
   });
 });
 
@@ -406,5 +406,17 @@ describe("Library: an event stream that does not open within the limit is tried 
     expect(ev.attempts()).toBe(1);
     // R602 M2: the page has not cancelled it (a drop after the answer began would not end a mocked body).
     expect(ev.signals()[0]!.aborted).toBe(false);
+  });
+});
+
+describe("Library: an event stream that opens and then delivers nothing is given up after a silence and opened afresh (R641 D2)", () => {
+  it("a stream silent for `streamQuietMs` (not even the service's keep-alive) is cancelled and, after the pause, opened again; nothing is said", async () => {
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler, ...libraryHandlers());
+    render(<Library api={testApi()} current={CURRENT_RW as never} streamQuietMs={300} />);
+    await screen.findByText("Ethnography at Work");
+    await waitFor(() => expect(ev.attempts()).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(ev.signals()[0]!.aborted).toBe(true);
+    expect(alerts()).toEqual([]);
   });
 });

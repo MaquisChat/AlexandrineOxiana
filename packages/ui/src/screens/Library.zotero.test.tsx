@@ -126,12 +126,12 @@ describe("Library: the Zotero lines", () => {
   it("under strict mode (mounted, cleaned up, mounted again) the lines are read once and shown (R623 Minor 5)", async () => {
     const a = run({ ref: "user:42" });
     const ev = liveEvents();
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     server.use(
       ev.handler,
       ...libraryHandlers(),
       http.get(url("/zotero/sync"), ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         return HttpResponse.json(stateOf([{ ref: "user:42", projectId: "p1", lastRun: a }]));
       }),
     );
@@ -144,7 +144,7 @@ describe("Library: the Zotero lines", () => {
     const box = await screen.findByTestId("zotero-lines");
     expect([...box.querySelectorAll("p")].map((p) => p.textContent)).toEqual([`Zotero library user:42: ${zoteroSyncStatusLine(a, new Date())}`]);
     // The read of the first mount is cancelled by its clean-up; the second mount's is the one answered.
-    expect(signals.filter((s) => !s.aborted)).toHaveLength(1);
+    expect(requests.filter((r) => !r.signal.aborted)).toHaveLength(1);
   });
 
   it("the other project's links show when it is chosen, and the ones of the project left are gone", async () => {

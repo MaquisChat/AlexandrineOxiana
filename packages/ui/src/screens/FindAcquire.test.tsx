@@ -98,16 +98,41 @@ const refusal = (status: number, code: string, message: string, reason?: string)
 function eventStream() {
   const enc = new TextEncoder();
   let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let beatAgain = () => {};
   return {
     handler: http.get(url("/events"), () => {
       const body = new ReadableStream<Uint8Array>({
         start(c) {
           ctl = c;
+          // As the real service does (routes/libraries.ts), a keep-alive every 25 seconds, so a screen's silence limit
+          // (R641 D2) never takes this stream for lost, under the test's own clock too. It stops when the stream ends.
+          let beat: ReturnType<typeof setTimeout> | undefined;
+          const next = () => {
+            beat = setTimeout(() => {
+              try {
+                c.enqueue(enc.encode(": keep-alive\n\n"));
+                next();
+              } catch {
+                // the stream has ended
+              }
+            }, 25_000);
+          };
+          next();
+          beatAgain = () => {
+            clearTimeout(beat);
+            next();
+          };
+          onTestFinished(() => clearTimeout(beat));
+        },
+        cancel() {
+          // nothing more is sent (the timer's next enqueue fails and stops it)
         },
       });
       return new HttpResponse(body, { headers: { "content-type": "text/event-stream" } });
     }),
     open: () => ctl !== undefined,
+    /** Starts the keep-alives again on the clock now in force (after a test switched to its own clock). */
+    keepAlive: () => beatAgain(),
     /** Several events in ONE chunk. */
     push(...evs: Array<{ type: string; data: unknown }>) {
       ctl!.enqueue(enc.encode(evs.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e.data)}\n\n`).join("")));
@@ -4263,6 +4288,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       const control = () => row("hung read").querySelector<HTMLElement>('button[data-act="library"]');
       hang = true;
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      // The service's keep-alives on the test's clock (R641 D2: the screen's silence limit is a minute, as long as these waits).
+      events.keepAlive();
       try {
         // A read asked for by an event never answers…
         progress(current[0]!, "no-open-copy");
@@ -4293,11 +4320,14 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       let hang = false;
       let open = 0;
       let most = 0;
+      // Each held request is kept, so its signal's abort reaches the listener (a request no longer held can miss it).
+      const held: Request[] = [];
       server.use(
         http.get(url(`/projects/${PID}/find`), ({ request }) => {
           if (!hang) return HttpResponse.json(queue(current));
           open++;
           most = Math.max(most, open);
+          held.push(request);
           request.signal.addEventListener("abort", () => open--, { once: true });
           return new Promise<Response>(() => {});
         }),
@@ -4308,6 +4338,8 @@ describe("FindAcquire: Get through my library (F18b; R340)", () => {
       const before = reads();
       hang = true;
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      // The service's keep-alives on the test's clock (R641 D2: the screen's silence limit is a minute, as long as these waits).
+      events.keepAlive();
       try {
         for (let k = 1; k <= 8; k++) {
           // A read asked for by an event never answers, and is given up after QUEUE_READ_WAIT_MS.
@@ -5552,6 +5584,17 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     expect(ev.signals()[0]!.aborted).toBe(false);
   });
 
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh", async () => {
+    useService();
+    const ev = sseAttempts(() => []);
+    server.use(ev.handler);
+    render(<FindAcquire client={testClient()} loc={{ pathname: "/find", search: "" }} streamQuietMs={300} />);
+    await screen.findByRole("textbox", { name: "References" });
+    await waitFor(() => expect(ev.attempts()).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(ev.signals()[0]!.aborted).toBe(true);
+    expect(tryAgain()).toBeNull();
+  });
+
   it("a service that stays unreachable is asked again once per opening of the stream, never in a loop", async () => {
     useService();
     const ev = sseAttempts((n) => (n === 1 ? "fail" : []));
@@ -5727,6 +5770,86 @@ describe("FindAcquire: first reads that never settle (FR-750, R579)", () => {
     await screen.findByText(FIND_SCREEN_EMPTY);
     expect(tryAgain()).toBeNull();
     expect(reads()).toBe(2);
+  });
+
+  it("R641 C2 (iv): the settings given up, then a source's panel given up too: the page says one sentence with one “Try again” (the screen's), which reads both again", async () => {
+    const e = entry({ typed: "done", state: "record-complete", sourceId: SID, candidates: [cand({ id: "c1" })], chosen: "c1" });
+    useService({ queues: { [PID]: queue([e]) } });
+    let answer = false;
+    const gate = hang();
+    server.use(
+      http.get(url("/find/screen"), async () => {
+        if (!answer) await gate;
+        return HttpResponse.json(screenSettings);
+      }),
+      http.get(url("/projects/:id/sources/:sid"), async () => {
+        if (!answer) await gate;
+        return HttpResponse.json(SOURCE_FILE);
+      }),
+      http.get(url("/projects/:id/sources/:sid/watch-origin"), () => HttpResponse.json({ origins: [] })),
+    );
+    showWithin(300, `?project=${PID}`);
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await screen.findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+    const user = userEvent.setup();
+    await user.click(within(row("done")).getByRole("button", { name: "Open: “done”" }));
+    const region = await screen.findByRole("region", { name: "Record" });
+    // Past the panel's limit: still one sentence and one button, and neither is inside the panel.
+    await new Promise((r) => setTimeout(r, 900));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+    expect(within(region).queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(within(region).queryByRole("alert")).toBeNull();
+    const detailBefore = count(`/projects/${PID}/sources/${SID}`);
+    answer = true;
+    await user.click(tryAgain()!);
+    await waitFor(() => expect(count("/find/screen")).toBe(2));
+    await waitFor(() => expect(count(`/projects/${PID}/sources/${SID}`)).toBe(detailBefore + 1));
+    await within(region).findByRole("heading", { level: 2 });
+    expect(tryAgain()).toBeNull();
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+  });
+
+  // Review M2: the other order — the panel's read given up first, then the screen's own read (the projects, read again
+  // with the time limit on a `library.state` event) given up too: the page takes the sentence over, one alert and one
+  // "Try again" outside the panel, and focus moves from the panel's "Try again" to the page's.
+  it("R641 C2 (iv), the panel first: a source's panel given up, then the projects' re-read given up: one sentence and one “Try again”, outside the panel, focus moved to it", async () => {
+    const e = entry({ typed: "done", state: "record-complete", sourceId: SID, candidates: [cand({ id: "c1" })], chosen: "c1" });
+    useService({ queues: { [PID]: queue([e]) } });
+    const gate = hang();
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), async () => {
+        await gate;
+        return HttpResponse.json(SOURCE_FILE);
+      }),
+      http.get(url("/projects/:id/sources/:sid/watch-origin"), () => HttpResponse.json({ origins: [] })),
+    );
+    showWithin(300, `?project=${PID}`);
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    await waitFor(() => expect(events.open()).toBe(true));
+    // The library is known to the screen (its first state), so a later state of the same library reads the projects again.
+    events.push({ type: "library.state", data: { open: true, libraryId: "lib-1", name: "L", mode: "read-write" } });
+    const user = userEvent.setup();
+    await user.click(within(row("done")).getByRole("button", { name: "Open: “done”" }));
+    const region = await screen.findByRole("region", { name: "Record" });
+    const panelTryAgain = await within(region).findByRole("button", { name: "Try again" }, { timeout: 5000 });
+    panelTryAgain.focus();
+    expect(document.activeElement).toBe(panelTryAgain);
+    const projectReads = count("/projects");
+    server.use(
+      http.get(url("/projects"), async () => {
+        await gate;
+        return HttpResponse.json(PROJECTS);
+      }),
+    );
+    events.push({ type: "library.state", data: { open: true, libraryId: "lib-1", name: "L", mode: "read-write" } });
+    await waitFor(() => expect(count("/projects")).toBe(projectReads + 1));
+    await waitFor(() => expect(within(region).queryByRole("button", { name: "Try again" })).toBeNull(), { timeout: 5000 });
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([NO_ANSWER]);
+    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
+    expect(within(region).queryByRole("alert")).toBeNull();
+    expect(document.activeElement).toBe(tryAgain());
   });
 });
 const FIND_SCREEN_EMPTY = "Nothing is in the queue yet.";

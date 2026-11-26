@@ -875,14 +875,14 @@ describe("ReaderRoute: the reader ends at once when its project is locked or its
     });
 
     it("a question that never answers is given up at 5 s and asked again", async () => {
-      const signals: AbortSignal[] = [];
+      const requests: Request[] = [];
       let calls = 0;
       const svc = serveRoute({
         unlocked: () => true,
         projects: async (request) => {
           calls++;
           if (calls === 1) {
-            signals.push(request.signal);
+            requests.push(request);
             await new Promise<void>((r) => request.signal.addEventListener("abort", () => r()));
             return HttpResponse.error() as unknown as Response;
           }
@@ -896,12 +896,12 @@ describe("ReaderRoute: the reader ends at once when its project is locked or its
       await act(async () => {
         await vi.advanceTimersByTimeAsync(QUESTION_TIMEOUT_MS - 100);
       });
-      expect(signals[0]!.aborted).toBe(false);
+      expect(requests[0]!.signal.aborted).toBe(false);
       expect(calls).toBe(1);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(200);
       });
-      expect(signals[0]!.aborted).toBe(true);
+      expect(requests[0]!.signal.aborted).toBe(true);
       expect(f.destroy).not.toHaveBeenCalled();
       await act(async () => {
         await vi.advanceTimersByTimeAsync(QUESTION_RETRY_MS);
@@ -912,12 +912,12 @@ describe("ReaderRoute: the reader ends at once when its project is locked or its
 
     it("no timer or request is left after the reader goes", async () => {
       let calls = 0;
-      const signals: AbortSignal[] = [];
+      const requests: Request[] = [];
       const svc = serveRoute({
         unlocked: () => true,
         projects: async (request) => {
           calls++;
-          signals.push(request.signal);
+          requests.push(request);
           if (calls === 1) return serviceError(500, "INTERNAL", "x") as unknown as Response;
           await new Promise<void>((r) => request.signal.addEventListener("abort", () => r()));
           return HttpResponse.error() as unknown as Response;
@@ -936,12 +936,12 @@ describe("ReaderRoute: the reader ends at once when its project is locked or its
 
       // A request in flight: leaving aborts it, and nothing follows.
       calls = 0;
-      signals.length = 0;
+      requests.length = 0;
       const svc2 = serveRoute({
         unlocked: () => true,
         projects: async (request) => {
           calls++;
-          signals.push(request.signal);
+          requests.push(request);
           await new Promise<void>((res) => request.signal.addEventListener("abort", () => res()));
           return HttpResponse.error() as unknown as Response;
         },
@@ -950,7 +950,7 @@ describe("ReaderRoute: the reader ends at once when its project is locked or its
       svc2.events.send("library.state", STATE);
       await waitFor(() => expect(calls).toBe(1));
       r2.unmount();
-      await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+      await waitFor(() => expect(requests[0]!.signal.aborted).toBe(true));
       await act(async () => {
         await vi.advanceTimersByTimeAsync(QUESTION_RETRY_MS + QUESTION_TIMEOUT_MS * 3);
       });
@@ -1265,11 +1265,11 @@ describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
 
   it("the list request is aborted when the document ends (A11, M5)", async () => {
     serveDocument();
-    let signal: AbortSignal | undefined;
+    let req: Request | undefined;
     serveAnnotations([], () => new Promise<Response>(() => {}));
     server.use(
       http.get(url("/projects/:id/sources/:sid/annotations"), ({ request }) => {
-        signal = request.signal;
+        req = request;
         return new Promise<Response>(() => {});
       }),
     );
@@ -1277,11 +1277,11 @@ describe("ReaderScreen: highlights drawn in place (Task R8)", () => {
     openPdf.mockResolvedValueOnce(f.handle);
     screenFor();
     await screen.findByRole("region", { name: "Page 1 of 2" });
-    await waitFor(() => expect(signal).toBeDefined());
-    expect(signal!.aborted).toBe(false);
+    await waitFor(() => expect(req).toBeDefined());
+    expect(req!.signal.aborted).toBe(false);
     act(() => f.fail(new PdfOpenError("other", "The file changed while it was being read.")));
     await screen.findByRole("heading", { level: 2, name: "PDF not shown" });
-    await waitFor(() => expect(signal!.aborted).toBe(true));
+    await waitFor(() => expect(req!.signal.aborted).toBe(true));
   });
 
   it("no verdict for a quote under four letters or for an annotation that also lies on another file (A11, M1, M6)", async () => {

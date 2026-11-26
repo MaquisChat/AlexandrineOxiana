@@ -304,7 +304,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     };
   }, [projectId, sourceId, refreshKey, reloads, failed, firstReadMs, tries]);
   // R605 I2: inside a page that says one sentence (the library screen), the panel yields its own.
-  const { yields, retryAll } = usePageRead("source", {
+  const { yields, retryAll, handFocus } = usePageRead("source", {
     sentence: unanswered,
     out: () => recordOut.current,
     retry: () => {
@@ -312,6 +312,10 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
       setTries((n) => n + 1);
     },
   });
+
+  /** R641 C2: the panel's "Try again" gave way to the page's (the panel yields now), not to a closed panel or an answer. */
+  const yieldsRef = useRef(yields);
+  yieldsRef.current = yields;
 
   const src = file?.source;
   const variants = src?.title?.variants ?? [];
@@ -547,7 +551,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
           <p role="alert" className="ao-error">
             {unanswered}
           </p>
-          <TryAgain focusTo={closeRef} onPress={retryAll} />
+          <TryAgain focusTo={closeRef} onPress={retryAll} onGoneWithFocus={() => yieldsRef.current && handFocus?.()} />
         </>
       )}
       {!src && !error && !unanswered && <p aria-live="polite">Loading…</p>}

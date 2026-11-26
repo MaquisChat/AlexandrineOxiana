@@ -1023,7 +1023,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
    * holds (the cards have moved, as the researcher asked).
    */
   const layOutAgain = () => {
-    const list = itemsRef.current ?? [];
+    // Review 2 (I1): while the queue's re-read got no answer, the queue as last read (the cards shown from it).
+    const list = itemsRef.current ?? lastRead.current ?? [];
     putLayout({ items: list.filter(isFound) as HeldItem[], ended: {} });
     holdQuiet(Date.now());
     setStatus(FOUND_FILES_TEXT.laidOut);
@@ -1203,8 +1204,18 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   const item = currentItem;
   /** The entries listed beside the panel, and the waiting files, shown in their own section (R303 b). */
   const listed = useMemo(() => (projectWide ? (items ?? []).filter((i) => !isFound(i)) : (items ?? [])), [items, projectWide]);
+  /**
+   * R641 C2 (iii): the queue as last read. While a re-read got no answer, the found files' cards stay in place with their
+   * own messages, as that read left them, beside the page's one alert ("one sentence per page" is about the service's
+   * silence, not a card's own message). Review I2: meanwhile their deciding controls are off (`heldStale`).
+   */
+  const lastRead = useRef<ReviewItem[] | null>(null);
+  if (items !== null) lastRead.current = items;
+  else if (locked) lastRead.current = null;
+  const heldShown = items ?? (unanswered ? lastRead.current : null);
+  const heldStale = items === null && heldShown !== null;
   /** R319: the waiting files the service lists now (by id); those not laid out have arrived during the visit. */
-  const waitingIds = useMemo(() => new Set((items ?? []).filter(isFound).map((i) => i.id)), [items]);
+  const waitingIds = useMemo(() => new Set((heldShown ?? []).filter(isFound).map((i) => i.id)), [heldShown]);
   /**
    * R487 a (ii): the file looked at no longer waits — decided here, found decided, or no longer listed by the queue as
    * last read (while the queue is being read again, it is not known yet).
@@ -1400,7 +1411,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           )}
         </div>
       )}
-      {!locked && items !== null && projectWide && laid && (laid.items.length > 0 || arrivedCount > 0) && (
+      {!locked && heldShown !== null && projectWide && laid && (laid.items.length > 0 || arrivedCount > 0) && (
         <FoundFiles
           items={laid.items}
           waiting={waitingIds}
@@ -1408,6 +1419,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
           arrived={arrivedCount}
           store={store}
           busy={heldBusy}
+          stale={heldStale}
           errors={heldErrors}
           sectionRef={foundHead}
           headRef={headRefFor}
@@ -1616,6 +1628,8 @@ interface FoundFilesProps {
   arrived: number;
   store: RecordStore;
   busy: Readonly<Record<string, HeldFileDecision>>;
+  /** Review I2: the cards are drawn from the last read (the queue's re-read got no answer). */
+  stale: boolean;
   errors: Readonly<Record<string, string>>;
   headRef(id: string, el: HTMLHeadingElement | null): void;
   cardRef(id: string, el: HTMLElement | null): void;
@@ -1659,7 +1673,7 @@ function describeRecord(item: HeldItem, record: SourceFile | undefined): string 
  * and stays). Files that arrive are only counted, on a line in a place kept for it above the groups (laid out whether
  * or not it says anything, so its appearing moves nothing); "Show them" lays the section out afresh.
  */
-function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, sectionRef, failed, notices, pointing, onPointedAt, headRef, cardRef, onDecide, onShowArrived, onLook }: FoundFilesProps) {
+function FoundFiles({ items, waiting, ended, arrived, store, busy, stale, errors, sectionRef, failed, notices, pointing, onPointedAt, headRef, cardRef, onDecide, onShowArrived, onLook }: FoundFilesProps) {
   // Re-rendered when a record is read: the names depend on every waiting file's record.
   useSyncExternalStore(store.subscribe, store.version);
   const right = items.filter(looksRight);
@@ -1699,6 +1713,7 @@ function FoundFiles({ items, waiting, ended, arrived, store, busy, errors, secti
               onPointedAt={onPointedAt}
               epoch={waiting}
               busy={busy[i.id]}
+              stale={stale}
               error={errors[i.id]}
               headRef={headRef}
               cardRef={cardRef}
@@ -1749,6 +1764,11 @@ interface FileCardProps {
   named: string;
   /** The decision under way on this file. */
   busy: HeldFileDecision | undefined;
+  /**
+   * Review I2: drawn from the last read: its two deciding controls are off as when busy (aria-disabled, the same words);
+   * a press decides nothing (the screen takes none until the queue is read).
+   */
+  stale: boolean;
   /** The service's sentence when the last decision on this file was refused, or HELD_NO_ANSWER_TEXT. */
   error: string | undefined;
   /** R319: what became of this file — decided here, found already decided, or no longer listed; undefined while it waits. */
@@ -1780,7 +1800,7 @@ export const RECORD_ROW_TEXT = { reading: "…", none: "—", unread: "This sour
  * "Removing this file…" and looks busy, the other looks unavailable; R318 b: the press renews the quiet); R313 b — a key held down never decides: a repeated keydown
  * (Enter or Space) is cancelled, and so is the click a browser makes of it.
  */
-const FileCard = memo(function FileCard({ item, store, named, end, unread, notice, pointing, onPointedAt, epoch, busy, error, headRef, cardRef, onDecide, onLook }: FileCardProps) {
+const FileCard = memo(function FileCard({ item, store, named, end, unread, notice, pointing, onPointedAt, epoch, busy, stale, error, headRef, cardRef, onDecide, onLook }: FileCardProps) {
   const h = item.heldFile;
   const record = useRecord(store, item.sourceId);
   const s = record?.source;
@@ -1889,7 +1909,7 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
               type="button"
               className="ao-import__primary"
               aria-label={`${words("attach")} for ${named}`}
-              aria-disabled={busy ? true : undefined}
+              aria-disabled={busy || stale ? true : undefined}
               aria-busy={busy === "attach" || undefined}
               aria-describedby={describedBy}
               {...guard.bind("attach")}
@@ -1900,7 +1920,7 @@ const FileCard = memo(function FileCard({ item, store, named, end, unread, notic
             <button
               type="button"
               aria-label={`${words("discard")} for ${named}`}
-              aria-disabled={busy ? true : undefined}
+              aria-disabled={busy || stale ? true : undefined}
               aria-busy={busy === "discard" || undefined}
               aria-describedby={describedBy}
               {...guard.bind("discard")}

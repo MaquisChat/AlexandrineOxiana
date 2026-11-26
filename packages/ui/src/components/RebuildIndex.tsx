@@ -19,12 +19,13 @@ export function RebuildIndex({ api }: { api: RebuildIndexApi }) {
   const [error, setError] = useState<string | null>(null);
   const running = useRef(false);
   const live = useRef(true);
-  useEffect(
-    () => () => {
+  // Set again at mount: under strict mode (mount, clean-up, mount) the result would never be shown (FR-762).
+  useEffect(() => {
+    live.current = true;
+    return () => {
       live.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
 
   const rebuild = async () => {
     if (running.current) return; // a double click sends one request

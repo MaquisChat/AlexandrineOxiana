@@ -21,7 +21,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { CAPTURE_RULES_UNREADABLE_TEXT, CAPTURE_RUNNING, CAPTURE_STOPPING } from "@ao/shared";
-import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, type ApiClient } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS, type ApiClient } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, oneNoAnswerSentence, readWithin } from "../api/firstRead";
 import {
   applyProgress,
@@ -316,12 +316,14 @@ export interface CaptureProps {
   firstReadMs?: number;
   /** FR-756 (R597): how long the event stream is waited for to open before it is closed and tried afresh. */
   streamOpenMs?: number;
+  /** R641 D2: how long an open event stream may deliver nothing (not even the service's keep-alive) before it is closed and tried afresh. */
+  streamQuietMs?: number;
 }
 
 /** FR-756: the first reads that "Try again" (and a new opening of the event stream) can make again. */
 type FirstRead = "project" | "policy";
 
-export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: CaptureProps) {
+export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: CaptureProps) {
   const api = useMemo(() => captureApi(client), [client]);
   const installedModels = useSpeechModels(useMemo(() => toolsApi(client), [client]));
   const id = useId();
@@ -621,7 +623,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
             if (again && live.current) readAgain(true);
           };
           // FR-756 (R597): a stream not opened within `streamOpenMs` is closed and tried afresh below.
-          for await (const ev of client.events({ signal: ctl.signal, onOpen, openWithinMs: streamOpenMs })) {
+          for await (const ev of client.events({ signal: ctl.signal, onOpen, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
             if (stop) return;
             const e = captureProgress(ev, projectId);
             if (e) onProgress(e);
@@ -648,7 +650,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       conn.current++;
       ctl.abort();
     };
-  }, [client, projectId, onProgress, readQueues, attempt, streamOpenMs, readAgain]);
+  }, [client, projectId, onProgress, readQueues, attempt, streamOpenMs, readAgain, streamQuietMs]);
 
   /** A queue the service has started: its early events are applied now. */
   const addQueue = (q: CaptureQueueState) => {

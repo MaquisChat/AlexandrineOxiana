@@ -347,6 +347,41 @@ describe("Governance settings", () => {
     expect(cert.textContent).toMatch(/destruction-2026-11-11 0930\.json/);
   });
 
+  // FR-751 (R641 B4, second round): the backups line is a sentence for each status, never the raw code.
+  for (const [status, sentence] of [
+    ["none", "Backups holding them: no listed backup held these files."],
+    ["pending", "Backups holding them: at least one listed backup is still to be removed; the app will try again."],
+    ["unknown-pending", "Backups holding them: at least one listed backup that may still hold them is still there."],
+    ["deleted", "Backups holding them: none is left that holds them; the app removed each one that did."],
+    ["no-longer-present", "Backups holding them: none is left. At least one listed backup is no longer there, and the app has no record of removing it."],
+    ["something-new", "Backups holding them: the app cannot tell how they stand."],
+  ] as const) {
+    it(`the certificate's backups line for "${status}" is a sentence, not the code`, async () => {
+      serve();
+      server.use(
+        http.get(url(`/projects/${PID}/retention`), () => HttpResponse.json({ destroyAfter: "2026-01-01", due: [{ sourceId: "s1", title: "Interview", assetIds: ["a1"] }] })),
+        http.post(url(`/projects/${PID}/retention/destroy`), () =>
+          HttpResponse.json({
+            certificateFile: "Projects/Field/retention/destruction-2026-11-11 0930.json",
+            certificate: { kind: "destruction-certificate", at: "2026-11-11T09:30:00.000Z", actor: "ana", assets: [{ assetId: "a1" }], backups: { status, containing: [], deleted: [] }, notice: "Done." },
+          }),
+        ),
+      );
+      render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+      await loaded();
+      const ret = card("Retention and destruction");
+      await within(ret).findByText("Interview");
+      const user = userEvent.setup();
+      await user.click(within(ret).getByRole("button", { name: "Destroy raw data" }));
+      const dialog = screen.getByRole("dialog", { name: "Destroy raw data" });
+      await user.type(within(dialog).getByRole("textbox", { name: /Type destroy to confirm/ }), "destroy");
+      await user.click(within(dialog).getByRole("button", { name: "Destroy permanently" }));
+      const cert = await screen.findByRole("region", { name: "Destruction certificate" });
+      expect(within(cert).getByText(sentence)).toBeTruthy();
+      expect(cert.textContent).not.toContain(`Backups holding them: ${status}.`);
+    });
+  }
+
   it("the project's time zone (R93, R160): defaults explained, set once per click, refused in plain words tied to the field, cleared", async () => {
     serve();
     const sent: any[] = [];

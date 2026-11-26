@@ -132,7 +132,7 @@ const WARNINGS: Record<string, (p: string, n: number) => string> = {
   "trimmed-incomplete-audit-line": (p) => `The last entry of an audit log in ${p} was cut off by a crash and has been removed. The removal is recorded.`,
   "incomplete-audit-line-pending": (p) => `The last entry of an audit log in ${p} was cut off by a crash. It is tidied up when the library is next opened with write access.`,
   "audit-append-failed-at-open": (p) => `A check made while opening ${p} could not be recorded in the audit log, so changes to ${p} are off until the library is opened again.`,
-  "backup-failed": (p) => `The last automatic backup of ${p} failed. Your sources are unchanged; the backup is tried again tomorrow, or make one now from the project's settings.`,
+  "backup-failed": (p) => `The last automatic backup of ${p} failed. Your sources are unchanged; the backup is tried again tomorrow, or make one now with “Back up now” on the project's Governance screen.`,
   "deleted-records-unreadable": (p) =>
     `The record of deleted items in ${p} could not be read. It was set aside; deleting still works, but re-importing from Zotero is paused until the record is reset.`,
   "annotations-unreadable": (p) => `Some annotations in ${p} could not be read. The sources still open; the annotations that could not be read are not shown.`,
@@ -214,9 +214,11 @@ const PLACE_WARNINGS: Record<string, (n: number, place: string) => string> = {
     `The move of this library to this folder has not finished, and the app did not finish it: ${files(n)} what was checked when the library was copied. The old copy at ${place} still holds every file as it was checked. Both copies are kept as they are, and this library is open read-only.`,
   "move-not-finished-files-differ-old-unconfirmed": (n, place) =>
     `The move of this library to this folder has not finished, and the app did not finish it: ${files(n)} what was checked when the library was copied, and the old copy at ${place} could not be confirmed to hold every file either. Both copies are kept as they are, and this library is open read-only. Ask for help before changing or deleting either copy.`,
-  // R583 M4: the old copy's marks must be looked at and its drive is not connected.
+  // R583 M4: the old copy's marks must be looked at and its drive is not connected. FR-766 (R641 B3): the journal does not
+  // record the mark, so the move may have stopped before the switch (with the drive back, the folder is a leftover) or
+  // marked its old copy unrecorded (then it finishes): the app cannot tell which, and promises no finishing.
   "move-not-finished-old-copy-unreachable": (_n, place) =>
-    `The move of this library to this folder has not finished, and it could not be finished now because its old copy at ${place} cannot be reached. Connect the drive it is on and open the library again; both copies are kept.`,
+    `The app cannot tell whether the move into this folder finished, because ${place} cannot be reached. Connect that drive, then open this folder again.`,
 };
 
 /**

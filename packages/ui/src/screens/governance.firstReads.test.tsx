@@ -477,18 +477,18 @@ describe("FR-756, R605 I2: one sentence and one “Try again” for the page —
 });
 
 describe("FR-756, R605 M3: leaving a governance screen cancels its held read", () => {
-  /** A GET that never settles; each ask's request signal is kept. */
-  function heldSignals(path: string) {
-    const signals: AbortSignal[] = [];
+  /** A GET that never settles; each ask's request is kept (its signal is read when asserted). */
+  function heldRequests(path: string) {
+    const requests: Request[] = [];
     const gate = hang();
     server.use(
       http.get(path, async ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         await gate;
         return HttpResponse.json({});
       }),
     );
-    return signals;
+    return requests;
   }
   it.each([
     ["the project's rules", "/governance", () => <GovernanceSettings api={makeApi()} projectId={PID} />],
@@ -502,12 +502,12 @@ describe("FR-756, R605 M3: leaving a governance screen cancels its held read", (
       http.get(P("/sessions"), () => HttpResponse.json({ sessions: [], complete: true })),
       http.get(P("/consents"), () => HttpResponse.json({ consents: [], complete: true })),
     );
-    const signals = heldSignals(P(path));
+    const requests = heldRequests(P(path));
     const { unmount } = render(el());
-    await waitFor(() => expect(signals).toHaveLength(1));
-    expect(signals[0]!.aborted).toBe(false);
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]!.signal.aborted).toBe(false);
     unmount();
-    await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+    await waitFor(() => expect(requests[0]!.signal.aborted).toBe(true));
   });
 });
 
@@ -577,10 +577,10 @@ describe("FR-756, R605 M5: a re-read after an act, given up, never replaces the 
 
 describe("FR-756, R605 M6: fieldwork's three requests are one read: the failure of one cancels the others at once", () => {
   it("a records request that fails cancels the two still out, long before the limit", async () => {
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     const gate = hang();
     const held = async ({ request }: { request: Request }) => {
-      signals.push(request.signal);
+      requests.push(request);
       await gate;
       return HttpResponse.json({});
     };
@@ -588,8 +588,8 @@ describe("FR-756, R605 M6: fieldwork's three requests are one read: the failure 
     render(<Fieldwork api={makeApi()} projectId={PID} />);
     await screen.findByRole("button", { name: "Try again" });
     expect(alerts()).toEqual([UNREACHABLE]);
-    expect(signals).toHaveLength(2);
-    await waitFor(() => expect(signals.every((s) => s.aborted)).toBe(true), { timeout: 1000 });
+    expect(requests).toHaveLength(2);
+    await waitFor(() => expect(requests.every((r) => r.signal.aborted)).toBe(true), { timeout: 1000 });
   });
 });
 

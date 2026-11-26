@@ -1481,20 +1481,20 @@ describe("Your library: a first read that never settles (FR-756, R584, R586)", (
 
 describe("Your library: leaving the screen cancels its held read (FR-756, R605 M3)", () => {
   it("the request's signal is aborted when the screen is left", async () => {
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     const gate = hang();
     server.use(
       http.get(url("/settings/your-library"), async ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         await gate;
         return HttpResponse.json({});
       }),
     );
     const { unmount } = render(<YourLibrary client={testClient()} />);
-    await waitFor(() => expect(signals).toHaveLength(1));
-    expect(signals[0]!.aborted).toBe(false);
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]!.signal.aborted).toBe(false);
     unmount();
-    await waitFor(() => expect(signals[0]!.aborted).toBe(true));
+    await waitFor(() => expect(requests[0]!.signal.aborted).toBe(true));
   });
 });
 

@@ -76,3 +76,20 @@ export function oldCopiesPendingText(s: Pick<DestructionOldCopiesState, "oldCopi
   if (known.length) out.push(known.every((c) => c.canDelete) ? OLD_COPIES_DELETE_IN_APP_TEXT : OLD_COPIES_DELETE_BY_HAND_TEXT);
   return out.length ? out.join(" ") : OLD_COPIES_DELETE_BY_HAND_TEXT;
 }
+
+/**
+ * FR-751 (R641 B4): the sentence for a destruction's backups step, by its status, from each status's definition in the
+ * library (`BackupsStepStatus`, retention.ts): what the app can prove, never the raw code. A status this build does not
+ * know is said as such.
+ */
+const BACKUPS_STATUS_TEXT: Readonly<Record<string, string>> = {
+  none: "Backups holding them: no listed backup held these files.",
+  pending: "Backups holding them: at least one listed backup is still to be removed; the app will try again.",
+  "unknown-pending": "Backups holding them: at least one listed backup that may still hold them is still there.",
+  deleted: "Backups holding them: none is left that holds them; the app removed each one that did.",
+  "no-longer-present": "Backups holding them: none is left. At least one listed backup is no longer there, and the app has no record of removing it.",
+};
+
+export function backupsStatusText(status: string): string {
+  return Object.hasOwn(BACKUPS_STATUS_TEXT, status) ? BACKUPS_STATUS_TEXT[status]! : "Backups holding them: the app cannot tell how they stand.";
+}

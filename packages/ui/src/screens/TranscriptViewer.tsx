@@ -27,7 +27,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { TranscriptionJob, TranscriptResponse, TranscriptSaveRequest, TranscriptVersionSummary } from "@ao/shared";
 import { TRANSCRIPTION_RUNNING } from "@ao/shared";
-import { ApiClientError, STREAM_OPEN_TIMEOUT_MS } from "../api/client";
+import { ApiClientError, STREAM_OPEN_TIMEOUT_MS, STREAM_QUIET_TIMEOUT_MS } from "../api/client";
 import { FIRST_READ_TIMEOUT_MS, isUnreachable, oneNoAnswerSentence, readWithin } from "../api/firstRead";
 import { errorText, isProjectLocked, type SourceFile } from "../api/library";
 import { TRANSCRIPTION_MODELS, transcriptionJobOf, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
@@ -53,6 +53,8 @@ export interface TranscriptViewerProps {
   firstReadMs?: number;
   /** FR-756 (R597): how long the event stream is waited for to open before it is closed and tried afresh. */
   streamOpenMs?: number;
+  /** R641 D2: how long an open event stream may deliver nothing (not even the service's keep-alive) before it is closed and tried afresh. */
+  streamQuietMs?: number;
 }
 
 /** FR-756: the first reads that "Try again" (and a new opening of the event stream) can make again. */
@@ -163,7 +165,7 @@ export function TranscriptViewer(props: TranscriptViewerProps) {
   return <Viewer key={`${props.projectId}\u0000${props.sourceId}`} {...props} />;
 }
 
-function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS }: TranscriptViewerProps) {
+function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST_READ_TIMEOUT_MS, streamOpenMs = STREAM_OPEN_TIMEOUT_MS, streamQuietMs = STREAM_QUIET_TIMEOUT_MS }: TranscriptViewerProps) {
   const installedModels = useSpeechModels(tools);
   const id = useId();
   const key = `${projectId}\u0000${sourceId}`;
@@ -571,7 +573,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
         if (again) readAgain(true);
       };
       try {
-        for await (const e of apiRef.current.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs })) {
+        for await (const e of apiRef.current.events({ signal: ac.signal, onOpen, openWithinMs: streamOpenMs, quietWithinMs: streamQuietMs })) {
           if (e.type !== "job.progress") continue;
           const j = transcriptionJobOf(e.data);
           if (j && j.projectId === projectId && j.sourceId === sourceId) accept(j);
@@ -589,7 +591,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools, firstReadMs = FIRST
       clearTimeout(retry);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, attempt, streamOpenMs]);
+  }, [key, attempt, streamOpenMs, streamQuietMs]);
 
   const transcribeButton = useRef<HTMLButtonElement | null>(null);
   const stopButton = useRef<HTMLButtonElement | null>(null);

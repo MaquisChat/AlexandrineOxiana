@@ -207,6 +207,11 @@ export class RepoCore {
   readonly pendingUnlocks = new Map<string, Promise<void>>();
   /** Locks asked so far, per project: an unlock that sees this change while it runs was overtaken by a lock (R435 a). */
   readonly lockAsks = new Map<string, number>();
+  /**
+   * FR-769 (R641 A1): per project, the stop its running imports and attaches carry in their lookup context
+   * (`lockStopOf`): aborted at the project's lock, then dropped, so the next one given after an unlock is fresh.
+   */
+  readonly lockStops = new Map<string, AbortController>();
 
   constructor(
     readonly library: Library,

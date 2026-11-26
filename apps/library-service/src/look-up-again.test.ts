@@ -859,7 +859,8 @@ describe("fix round (R600)", () => {
     expect((await call({ method: "POST", url: `/projects/${lib.pid}/lock` })).status).toBe(200);
     held.release();
     await svc!.state.idle();
-    expect(sent).toEqual([`api.openalex.org ${titleOf(1)} Souza`]);
+    // FR-769 (R641 A1): the request held before it left is not sent after the lock (before, it went out).
+    expect(sent).toEqual([]);
     const memory = (svc!.state.session!.http as unknown as { memory: Map<string, { sensitive: boolean }> }).memory;
     expect([...memory.values()].filter((e) => e.sensitive)).toHaveLength(0);
   });

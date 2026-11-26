@@ -60,7 +60,7 @@ function holding(path: string, held: number, answer: () => Response | Promise<Re
   };
 }
 
-const show = (p: { firstReadMs?: number; streamOpenMs?: number } = {}) => render(<TranscriptViewer api={transcriptApi(testClient())} projectId="p1" sourceId="s1" {...p} />);
+const show = (p: { firstReadMs?: number; streamOpenMs?: number; streamQuietMs?: number } = {}) => render(<TranscriptViewer api={transcriptApi(testClient())} projectId="p1" sourceId="s1" {...p} />);
 
 describe("TranscriptViewer: first reads that never settle or fail (FR-756)", () => {
   it("a source read that hangs is given up at the limit: the alert and “Try again”; pressing it reads again, the title shows, focus is not lost", async () => {
@@ -218,20 +218,34 @@ describe("TranscriptViewer: an event stream that does not open within the limit 
   });
 
   it("a stream that has opened is never dropped by the limit, however long it stays quiet", async () => {
-    const signals: AbortSignal[] = [];
+    const requests: Request[] = [];
     serve(
       http.get(url("/events"), ({ request }) => {
-        signals.push(request.signal);
+        requests.push(request);
         return sse([]);
       }),
     );
     show({ streamOpenMs: 200 });
     await screen.findByText("Hello and welcome.");
-    await waitFor(() => expect(signals).toHaveLength(1));
+    await waitFor(() => expect(requests).toHaveLength(1));
     // Fifteen times the limit, and more than the screen's pause before a new try (two seconds): still the first stream,
     // and its request not cancelled (R602: the body of a mocked stream goes on after an abort, so the signal is what tells).
     await new Promise((r) => setTimeout(r, 3_000));
-    expect(signals).toHaveLength(1);
-    expect(signals[0]!.aborted).toBe(false);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.signal.aborted).toBe(false);
+  });
+
+  it("R641 D2: a stream that opens and then delivers nothing for `streamQuietMs` (not even a keep-alive) is cancelled and opened afresh", async () => {
+    const requests: Request[] = [];
+    serve(
+      http.get(url("/events"), ({ request }) => {
+        requests.push(request);
+        return sse([]);
+      }),
+    );
+    show({ streamQuietMs: 300 });
+    await screen.findByText("Hello and welcome.");
+    await waitFor(() => expect(requests.length).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
+    expect(requests[0]!.signal.aborted).toBe(true);
   });
 });

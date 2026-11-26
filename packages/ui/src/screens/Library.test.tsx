@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
+import { StrictMode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { LOOKUP_WAITING_TEXT, attachClosedSentence } from "@ao/shared";
 import { CURRENT_RW, libraryHandlers, PROJECTS, server, SOURCES, TAGS, serviceError, testApi, url, useMockService } from "../test/service";
@@ -845,4 +846,24 @@ describe("R362 h: the library screen tells its collection and tag fields when th
       expect(screen.queryAllByText(NAME_NOTE)).toHaveLength(encrypted ? 2 : 0);
     });
   }
+});
+
+describe("FR-762: under strict mode (mounted, cleaned up, mounted again) the screen still reads", () => {
+  it("the list read again as the new-project dialog closes is shown", async () => {
+    server.use(...libraryHandlers());
+    render(
+      <StrictMode>
+        <Library api={testApi()} current={CURRENT_RW as never} />
+      </StrictMode>,
+    );
+    const user = userEvent.setup();
+    const nav = await screen.findByRole("navigation", { name: "Projects" });
+    await within(nav).findByRole("button", { name: /Dissertation/ });
+    const third = { id: "p3", name: "Field diary", folder: "Field diary", encrypted: false, unlocked: true, profiles: [] };
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [...PROJECTS.projects, third] })));
+    await user.click(screen.getByRole("button", { name: "New project" }));
+    const dialog = await screen.findByRole("dialog", { name: "New project" });
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(await within(nav).findByRole("button", { name: /Field diary/ })).toBeTruthy();
+  });
 });
