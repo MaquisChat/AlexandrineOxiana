@@ -154,12 +154,13 @@ def map_error(stderr: str) -> str:
 
 _PLATFORM_REASON_RE = re.compile(r"ERROR: \[[^\]]+\] [^:]+: (.+)")
 # Control characters, and the invisible direction and zero-width characters.
-_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff\u061c\u2060\u00ad]")
 PLATFORM_REASON_MAX = 200
 # The platform's words end where yt-dlp starts speaking for itself.
-_REASON_CUTS = (" Use --", "; please report", " (caused by", " See ")
+_REASON_CUTS = ("; please report", " (caused by", " See ")
+_OPTION_CUT_RE = re.compile(r" (?:[A-Za-z]+ )?--[A-Za-z]")  # " Use --cookies", " use --list-formats": the program speaking, with its introducing word
 _REASON_REFUSED = ("Errno", "urlopen", "ConnectionPool", "HTTP Error", "Traceback",
-                   "/Users/", "/home/", "/var/", "/tmp/")
+                   "/Users/", "/home/", "/var/", "/tmp/", "~/")
 _DRIVE_RE = re.compile(r"\b[A-Za-z]:[\\/]")
 # Only for these failures is the platform's sentence about the video; for the rest it is yt-dlp's or Python's.
 PLATFORM_REASON_CODES = ("PRIVATE", "GEO_BLOCKED", "NOT_FOUND_OR_REMOVED", "LOGIN_REQUIRED")
@@ -181,6 +182,9 @@ def platform_reason(stderr: str) -> str | None:
         return None
     reason = _CONTROL_RE.sub("", redact(reason))
     cuts = [reason.find(c) for c in _REASON_CUTS if c in reason]
+    option = _OPTION_CUT_RE.search(reason)
+    if option:
+        cuts.append(option.start())
     if cuts:
         reason = reason[: min(cuts)]
     reason = re.sub(r" {2,}", " ", _URL_RE.sub("", reason)).strip()
@@ -188,6 +192,9 @@ def platform_reason(stderr: str) -> str | None:
         return None
     slash = reason.find("/")
     if slash != -1 and "?" in reason[slash:]:
+        return None
+    q = reason.find("?")
+    if q != -1 and "=" in reason[q:]:  # a query string, with or without the path before it
         return None
     if len(reason) > PLATFORM_REASON_MAX:
         head = reason[: PLATFORM_REASON_MAX - 1]

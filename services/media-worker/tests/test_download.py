@@ -223,10 +223,27 @@ def test_platform_reason_is_only_the_platforms_own_sentence(stderr, want):
 
 def test_platform_reason_hides_the_home_folder(monkeypatch):
     from ao_worker.download import platform_reason
-    monkeypatch.setenv("HOME", "/Users/zed")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/Users/zed")))
-    reason = platform_reason("ERROR: [youtube] abc: Cannot read cookies of zed from /Users/zed")
-    assert reason is None or "/Users/zed" not in reason
+    # a path inside the home folder becomes ~/..., and any such path gives nothing at all
+    assert platform_reason("ERROR: [youtube] abc: Cannot read /Users/zed/Library/Cookies/x") is None
+
+
+def test_platform_reason_refuses_a_query_without_a_slash():
+    from ao_worker.download import platform_reason
+    assert platform_reason("ERROR: [youtube] abc: Video unavailable token=s3cr3t&sig=AAA watch?v=1") is None
+    assert platform_reason("ERROR: [youtube] abc: Video unavailable?x=1") is None
+    assert platform_reason("ERROR: [youtube] abc: Is it private?") == "Is it private?"
+
+
+def test_platform_reason_removes_more_invisible_characters():
+    from ao_worker.download import platform_reason
+    assert platform_reason("ERROR: [youtube] abc: Vid\u061ceo\u2060 un\u00adavailable") == "Video unavailable"
+
+
+def test_platform_reason_cuts_at_any_program_option_in_any_case():
+    from ao_worker.download import platform_reason
+    assert platform_reason("ERROR: [youtube] abc: Sign in to confirm. use --cookies-from-browser or --cookies") == "Sign in to confirm."
+    assert platform_reason("ERROR: [youtube] abc: Video gone -- really") == "Video gone -- really"
 
 
 def test_a_long_platform_reason_is_cut_at_a_word_with_an_ellipsis():
@@ -377,6 +394,12 @@ def test_a_missing_ffmpeg_during_the_job_is_a_missing_tool_not_a_removed_video(w
 
 
 FIRST = "abc123.info.json,abc123.en.vtt,abc123.webp,abc123.mp4.part"
+
+
+def test_a_gallery_dl_failure_is_not_named_after_a_retry_warning_before_it():
+    text = GDL_WARN + "\n[instagram][error] NotFoundError: Requested user could not be found"
+    assert map_error(text) != "NETWORK_LOST"
+    assert map_error(text) == "EXTRACTOR_ERROR"
 
 
 @pytest.mark.parametrize("stderr,written,code", [
