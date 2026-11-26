@@ -158,7 +158,7 @@ _CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u
 PLATFORM_REASON_MAX = 200
 # The platform's words end where yt-dlp starts speaking for itself.
 _REASON_CUTS = ("; please report", " (caused by", " See ")
-_OPTION_CUT_RE = re.compile(r" (?:[A-Za-z]+ )?--[A-Za-z]")  # " Use --cookies", " use --list-formats": the program speaking, with its introducing word
+_OPTION_CUT_RE = re.compile(r"\s+(?:use\s+)?--[A-Za-z]", re.I)  # " Use --cookies": the program speaking; only "use" goes with it
 _REASON_REFUSED = ("Errno", "urlopen", "ConnectionPool", "HTTP Error", "Traceback",
                    "/Users/", "/home/", "/var/", "/tmp/", "~/")
 _DRIVE_RE = re.compile(r"\b[A-Za-z]:[\\/]")
@@ -543,12 +543,14 @@ def _list_outputs(out: Path, tool: str, archive: str | None) -> tuple[list[str],
 DOWNLOAD_FAILS_ALWAYS = ("NETWORK_LOST", "DISK_FULL", "TOOL_NOT_INSTALLED")
 _MEDIA_SUFFIXES = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".flv", ".3gp", ".ts", ".mpg", ".mpeg",
                    ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".oga", ".wav", ".flac", ".weba"}
-_UNJOINED_RE = re.compile(r"\.f\d+(-\d+)?\.[^.]+$")  # abc.f137.mp4, abc.f251.webm: one stream, not yet joined
+_UNJOINED_RE = re.compile(r"\.f[^.]+\.[^.]+$")  # abc.f137.mp4, abc.fhls-720p.mp4: one stream, not yet joined
 
 
 def _is_finished_media(path: str) -> bool:
     """A video or audio file that is not an unjoined stream (`.part` and `.ytdl` files are never listed)."""
     name = Path(path).name
+    if ".temp." in name or ".part" in name or name.endswith(".ytdl"):  # a join or download still in progress
+        return False
     return Path(name).suffix.lower() in _MEDIA_SUFFIXES and not _UNJOINED_RE.search(name)
 
 

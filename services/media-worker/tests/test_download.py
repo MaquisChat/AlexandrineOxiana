@@ -244,6 +244,10 @@ def test_platform_reason_cuts_at_any_program_option_in_any_case():
     from ao_worker.download import platform_reason
     assert platform_reason("ERROR: [youtube] abc: Sign in to confirm. use --cookies-from-browser or --cookies") == "Sign in to confirm."
     assert platform_reason("ERROR: [youtube] abc: Video gone -- really") == "Video gone -- really"
+    sign_in = "ERROR: [youtube] abc: Sign in to confirm you’re not a bot. %s --cookies-from-browser or --cookies"
+    assert platform_reason(sign_in % "Use") == "Sign in to confirm you’re not a bot."
+    assert platform_reason(sign_in % "use") == "Sign in to confirm you’re not a bot."
+    assert platform_reason("ERROR: [youtube] abc: This video is private --ask the owner") == "This video is private"
 
 
 def test_a_long_platform_reason_is_cut_at_a_word_with_an_ellipsis():
@@ -422,6 +426,22 @@ def test_a_failure_in_the_middle_of_a_download_is_a_failure(worker, tmp_path, mo
         assert job["error"]["tool"] == "ffmpeg"
 
 
+@pytest.mark.parametrize("leftover", ["abc.temp.mp4", "abc.fhls-720p.mp4", "abc.f251-drc.webm", "abc.mp4.part", "abc.mp4.ytdl"])
+def test_a_failed_join_leaves_no_finished_recording(worker, tmp_path, monkeypatch, leftover):
+    monkeypatch.setenv("FAKE_YTDLP_STDERR", "ERROR: Postprocessing: Conversion failed!")
+    monkeypatch.setenv("FAKE_YTDLP_WRITE", f"abc123.info.json,abc123.webp,{leftover}")
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "failed", job
+    assert job["error"]["code"] == "EXTRACTOR_ERROR"
+
+
+def test_a_finished_mp4_then_a_429_is_still_partial(worker, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_YTDLP_STDERR", "ERROR: [youtube] abc123: HTTP Error 429: Too Many Requests")
+    monkeypatch.setenv("FAKE_YTDLP_WRITE", "abc123.info.json,abc.mp4")
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "done" and job["result"]["meta"]["partial"] is True
+
+
 def test_a_finished_media_file_keeps_a_failed_download_partial(worker, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_YTDLP_STDERR", "ERROR: [youtube] abc123: HTTP Error 429: Too Many Requests")
     monkeypatch.setenv("FAKE_YTDLP_WRITE", "abc123.info.json,abc123.mp4,abc123.f140.m4a")
@@ -435,8 +455,10 @@ def test_a_finished_media_file_keeps_a_failed_download_partial(worker, tmp_path,
 
 def test_only_format_stream_names_are_unjoined():
     from ao_worker.download import _is_finished_media
-    assert _is_finished_media("/o/my.final.mp4") and _is_finished_media("/o/abc.m4a")
+    assert _is_finished_media("/o/my-video.mp4") and _is_finished_media("/o/abc.m4a")
     assert not _is_finished_media("/o/abc.f137.mp4") and not _is_finished_media("/o/abc.f251-1.webm")
+    assert not _is_finished_media("/o/abc.temp.mp4") and not _is_finished_media("/o/abc.fhls-720p.mp4")
+    assert not _is_finished_media("/o/abc.f251-drc.webm") and not _is_finished_media("/o/abc.mp4.ytdl")
     assert not _is_finished_media("/o/abc.webp") and not _is_finished_media("/o/abc.en.vtt")
 
 
