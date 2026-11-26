@@ -1216,6 +1216,149 @@ describe("the test-only free space (R687 D, R47)", () => {
   });
 });
 
+describe("a slow-down wait across a move (R690)", () => {
+  /** The download runs' sleep, under the test's hand: each sleep ends when woken (by its signal, or by the test). */
+  function controlledSleep(): {
+    sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+    sleeps: Array<{ ms: number; wake: () => void; done: boolean }>;
+    next: () => Promise<{ ms: number; wake: () => void }>;
+    /** From now on every sleep ends at once (the gaps between the downloads that follow). */
+    free: () => void;
+  } {
+    let freed = false;
+    const sleeps: Array<{ ms: number; wake: () => void; done: boolean }> = [];
+    let waiting: ((x: { ms: number; wake: () => void }) => void) | undefined;
+    releases.push(() => {
+      for (const x of sleeps) x.wake();
+    });
+    return {
+      sleeps,
+      next: () => new Promise((r) => (waiting = r)),
+      free: () => (freed = true),
+      sleep: (ms, signal) =>
+        new Promise<void>((resolve) => {
+          const x = { ms, done: false, wake: () => ((x.done = true), resolve()) };
+          if (freed || signal?.aborted) return x.wake();
+          signal?.addEventListener("abort", x.wake, { once: true });
+          sleeps.push(x);
+          const w = waiting;
+          waiting = undefined;
+          w?.(x);
+        }),
+    };
+  }
+  const listings = () => runLog.filter((u) => !u.includes("/video/")).length;
+
+  it("after a successful move a run that was waiting on a slow-down sleeps the rest of the wait before it asks the platform again; then it goes on", async () => {
+    const clock = controlledSleep();
+    await start({ downloadSleep: clock.sleep });
+    await openLibrary();
+    const pid = await project();
+    process.env.FAKE_TOOL_MODE = "enumratelimit";
+    const waited = clock.next();
+    const a = await captureProfile(pid, A);
+    const runId = a.json.queueId as string;
+    const first = await waited;
+    expect(await runOf(pid, runId)).toMatchObject({ state: "waiting", wait: { why: "rate-limited" } });
+    const ms = (await runOf(pid, runId))!.wait!.ms;
+    expect(listings()).toBe(1);
+    const rest = clock.next();
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    expect(first).toMatchObject({ ms });
+    const restOf = await rest;
+    // The rest of the wait, nothing asked of the platform meanwhile; the run still waiting, and held.
+    expect(restOf.ms).toBeGreaterThan(0);
+    expect(restOf.ms).toBeLessThanOrEqual(ms);
+    expect(restOf.ms).toBeGreaterThan(ms - 30_000);
+    expect(listings()).toBe(1);
+    expect(await runOf(pid, runId)).toMatchObject({ state: "waiting" });
+    expect(svc.state.downloads.held(runId)).toBe(true);
+    delete process.env.FAKE_TOOL_MODE;
+    clock.free();
+    restOf.wake();
+    await svc.state.idle();
+    expect(await runOf(pid, runId)).toMatchObject({ state: "finished", done: 3 });
+    expect(listings()).toBe(2);
+  });
+
+  it("after a refused move a run that was waiting on a slow-down sleeps the rest of the wait before it asks the platform again", async () => {
+    const clock = controlledSleep();
+    await start({ downloadSleep: clock.sleep });
+    await openLibrary();
+    const pid = await project();
+    process.env.FAKE_TOOL_MODE = "enumratelimit";
+    const waited = clock.next();
+    const a = await captureProfile(pid, A);
+    const runId = a.json.queueId as string;
+    await waited;
+    const ms = (await runOf(pid, runId))!.wait!.ms;
+    const asked = runLog.length;
+    // The move's drain ends the run, then the move is refused (as when other work did not stop in time).
+    const drain = svc.state.drainWork.bind(svc.state);
+    vi.spyOn(svc.state, "drainWork").mockImplementation(async (t, which) => {
+      await drain(t, which);
+      return false;
+    });
+    const rest = clock.next();
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } })).status).toBe(409);
+    expect(svc.state.session!.lib.root).toBe(join(tmp, "Lib"));
+    const restOf = await rest;
+    expect(restOf.ms).toBeGreaterThan(0);
+    expect(restOf.ms).toBeLessThanOrEqual(ms);
+    expect(runLog).toHaveLength(asked);
+    expect(await runOf(pid, runId)).toMatchObject({ state: "waiting" });
+    expect(svc.state.downloads.held(runId)).toBe(true);
+    delete process.env.FAKE_TOOL_MODE;
+    clock.free();
+    restOf.wake();
+    await svc.state.idle();
+    expect(await runOf(pid, runId)).toMatchObject({ state: "finished", done: 3 });
+    expect(svc.state.stoppedWorkCount()).toBe(0);
+  });
+
+  it("a Stop during the rest of the wait ends the run stopped, with nothing asked of the platform", async () => {
+    const clock = controlledSleep();
+    await start({ downloadSleep: clock.sleep });
+    await openLibrary();
+    const pid = await project();
+    process.env.FAKE_TOOL_MODE = "enumratelimit";
+    const waited = clock.next();
+    const a = await captureProfile(pid, A);
+    const runId = a.json.queueId as string;
+    await waited;
+    const asked = runLog.length;
+    const rest = clock.next();
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } })).body).toContain('"done":true');
+    const restOf = await rest;
+    expect(runLog).toHaveLength(asked);
+    delete process.env.FAKE_TOOL_MODE;
+    expect((await act(pid, runId, "stop")).status).toBe(200);
+    await svc.state.idle();
+    expect(clock.sleeps.find((y) => y === (restOf as unknown))?.done).toBe(true);
+    expect(await runOf(pid, runId)).toMatchObject({ state: "stopped" });
+    expect(runLog).toHaveLength(asked);
+    expect(svc.state.downloads.held(runId)).toBe(false);
+  });
+
+  it("a Pause asked while a run finishes its video after a refused move ends it paused, and it is not continued", async () => {
+    await start({ suspendTimeoutMs: 300 });
+    await openLibrary();
+    const pid = await project();
+    const held = hold(itemOf(idA(2)));
+    const a = await captureProfile(pid, A);
+    const runId = a.json.queueId as string;
+    await held.reached;
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } })).status).toBe(409);
+    expect((await act(pid, runId, "pause")).status).toBe(200);
+    held.release();
+    await svc.state.idle();
+    expect(await runOf(pid, runId)).toMatchObject({ state: "paused", done: 2, notCompleted: 1 });
+    expect(itemDownloads()).toEqual([idA(3), idA(2)]);
+    expect(svc.state.downloads.held(runId)).toBe(false);
+  });
+});
+
 describe("the routes' guards", () => {
   it("every new route refuses a locked project with 423 and the extension token with 403", async () => {
     await start();

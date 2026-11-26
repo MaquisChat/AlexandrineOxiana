@@ -23,7 +23,9 @@
  *   downloading continues on the moved library by itself (`capture.profile.continue`, R106), only if its
  *   journal still says queued, downloading or waiting and nobody paused, stopped or resumed it meanwhile;
  *   an encrypted project's run, or one only waiting its turn, does not (R534 b, R668) and is shown
- *   interrupted. A continuation that does not go on is dropped, never kept for a later move.
+ *   interrupted. A continuation that does not go on is dropped, never kept for a later move. A run woken
+ *   out of a slow-down wait sleeps the rest of it before it asks the platform again; a Pause or Stop asked
+ *   while a run was halted is written as such (R690).
  */
 import { randomUUID } from "node:crypto";
 import { classifyUrl } from "@ao/core";
@@ -33,6 +35,7 @@ import {
   WorkerUnavailableError,
   checkCaptureAllowed,
   plainReason,
+  setRunState,
   createDownloadRuns,
   type CaptureOutcome,
   type DownloadRuns,
@@ -101,6 +104,20 @@ const runFinished = () => new ApiError(409, "CONFLICT", plainReason("RUN_FINISHE
 const NO_WORKER = {
   submit: () => Promise.reject(new WorkerUnavailableError("the media helper is not ready")),
 } as unknown as WorkerClient;
+
+/** A real timer, woken early by the signal (the sleep seam's stand-in outside tests). */
+function realSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
 
 /** An address in the form two spellings of it share. */
 export function addressKey(url: string): string {
@@ -385,18 +402,49 @@ export class DownloadRunner {
       async (ctl) => {
         const now = await this.reader(next).get(pid, old.runId, () => true);
         if (!now || !LIVE.has(now.state)) throw new NotContinued();
+        // Woken out of a slow-down (or lost-connection) wait by the move (R680): the rest of the wait the platform
+        // asked for is slept first, the run still waiting and held; nothing is asked of the platform before it ends
+        // (R690). A Stop or Pause ends it with that end, a lock or close cuts it, another move halts it again.
+        if (now.state === "waiting" && now.wait) {
+          const rest = Date.parse(now.updatedAt) + now.wait.ms - this.state.opts.now().getTime();
+          if (rest > 0) {
+            h.begun = true;
+            h.state = "waiting";
+            await (this.seams().sleep ?? realSleep)(rest, AbortSignal.any([h.req.signal, h.cut.signal, h.stop.signal]));
+            if (h.cancelled || h.halted) throw new CaptureCancelledError();
+            if (h.asked) {
+              const run = await this.writeAsked(next, h);
+              if (!run) throw new NotContinued();
+              ctl.onChange(run);
+              return run;
+            }
+          }
+        }
         return this.library(next, await this.state.workerClient()).resume(pid, old.runId, "continue", ctl);
       },
       () => true,
     ).catch(() => {});
   }
 
-  /** Publishes the run as it now reads (a Stop asked of it while it ended is written first). Never throws. */
+  /**
+   * The researcher's Pause or Stop of a run that ended (or slept) without the library honouring it, after a move
+   * (R690): written to the journal as `paused` or `stopped`. A run no longer going on stays as it is.
+   */
+  private async writeAsked(s: Session, h: Held): Promise<DownloadRunSummary | undefined> {
+    const reader = this.reader(s);
+    if (h.asked === "stop") return reader.stopNotRunning(h.projectId, h.runId);
+    const now = await reader.get(h.projectId, h.runId, () => true);
+    if (!now || !LIVE.has(now.state)) return now;
+    await setRunState(s.repo, h.projectId, h.runId, "paused", { reason: plainReason("RUN_PAUSED") });
+    return reader.get(h.projectId, h.runId, () => true);
+  }
+
+  /** Publishes the run as it now reads (a Pause or Stop asked of it while it ended is written first). Never throws. */
   private async publishRun(s: Session, h: Held): Promise<void> {
     if (h.cancelled) return;
     try {
       const reader = this.reader(s);
-      if (h.asked === "stop" && !this.runs.has(h.runId)) await reader.stopNotRunning(h.projectId, h.runId);
+      if (h.asked && !this.runs.has(h.runId)) await this.writeAsked(s, h);
       const run = await reader.get(h.projectId, h.runId, this.isHeld);
       if (run) this.state.publishBackground(h.projectId, { downloads: run });
     } catch {
