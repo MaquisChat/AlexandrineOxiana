@@ -81,3 +81,7 @@
   clip-path: inset(50%);
   white-space: nowrap;
 }
+
+.ao-worklines__status:empty {
+  margin: 0;
+}

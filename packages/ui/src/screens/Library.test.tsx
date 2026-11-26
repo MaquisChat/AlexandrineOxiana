@@ -28,7 +28,7 @@ describe("Library screen", () => {
     const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
     expect(await within(lines).findByText((_c, el) => el?.textContent === "The capture of 'Example Channel' was interrupted: 120 of 412 done." && el.tagName === "P")).toBeTruthy();
     expect(within(lines).getByText("Transcriptions paused: 14 of 412 done.", { ignore: ".ao-visually-hidden" })).toBeTruthy();
-    expect(within(lines).getByRole("button", { name: "Resume downloads (292 did not complete)" })).toBeTruthy();
+    expect(within(lines).getByRole("button", { name: "Resume downloads (292 did not complete) The capture of 'Example Channel' was interrupted: 120 of 412 done." })).toBeTruthy();
     expect(within(lines).queryByText(/Locked Channel/)).toBeNull();
     expect(m.count("GET /projects/p1/downloads")).toBeGreaterThan(0);
     expect(m.count("GET /projects/p2/downloads")).toBe(0);
@@ -44,7 +44,7 @@ describe("Library screen", () => {
     expect(screen.queryByRole("region", { name: "Downloads and transcriptions" })).toBeNull();
     act(() => m.emit({ projectId: "p1", downloads: exampleRun({ projectId: "p1", state: "queued", total: 0, done: 0 }) }));
     const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
-    expect(await within(lines).findByText((_c, el) => el?.textContent === '"Example Channel" is waiting its turn. It starts by itself when the downloads before it have finished, paused or stopped.' && el.tagName === "P")).toBeTruthy();
+    expect(await within(lines).findByText((_c, el) => el?.textContent === '"Example Channel" is waiting its turn. It starts by itself when the downloads before it have finished, paused or stopped.' && el.tagName === "P", { ignore: ".ao-visually-hidden" })).toBeTruthy();
     expect(m.count("GET /events")).toBe(1);
   });
 

@@ -790,7 +790,7 @@ describe("Capture screen — profile", () => {
     const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
     expect(await within(lines).findByText((_c, el) => el?.textContent === "The capture of 'Example Channel' was interrupted: 120 of 412 done." && el.tagName === "P")).toBeTruthy();
     expect(within(lines).getByText("Transcriptions paused: 14 of 412 done.", { ignore: ".ao-visually-hidden" })).toBeTruthy();
-    expect(within(lines).getByRole("button", { name: "Resume downloads (292 did not complete)" })).toBeTruthy();
+    expect(within(lines).getByRole("button", { name: "Resume downloads (292 did not complete) The capture of 'Example Channel' was interrupted: 120 of 412 done." })).toBeTruthy();
     expect(within(lines).queryByText(/Other Channel/)).toBeNull();
     expect(bg.count(`GET /projects/${P2}/downloads`)).toBe(0);
   });
@@ -805,7 +805,7 @@ describe("Capture screen — profile", () => {
     // The service publishes the new run on the one stream the screen has (R679 A2).
     m.emit("background.progress", { projectId: P1, downloads: exampleRun({ projectId: P1, runId: "qp1", title: "someone", url: PROFILE, platform: "instagram", state: "downloading", total: 0, done: 0 }) });
     const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
-    expect(await within(lines).findByText((_c, el) => el?.textContent === 'Downloading "someone": reading the list of posts…' && el.tagName === "P")).toBeTruthy();
+    expect(await within(lines).findByText((_c, el) => el?.textContent === 'Downloading "someone": reading the list of posts…' && el.tagName === "P", { ignore: ".ao-visually-hidden" })).toBeTruthy();
     // Still one stream: the lines follow the screen's.
     expect(m.streams()).toBe(1);
     expect(m.calls.filter((c) => c.path === "/events")).toHaveLength(1);

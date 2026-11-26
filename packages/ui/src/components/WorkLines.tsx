@@ -126,12 +126,13 @@ function Sentence({ text, part }: { text: string; part: string | undefined }): R
 
 /**
  * R658 M3: the line as told to a screen reader, at most every SAY_EVERY_MS, the last state always said in the end. The
- * line as first read is shown, not told: only its changes are.
+ * line as first read is shown, not told: only its changes are (a run that first appears through an event is told).
  */
-function useSaid(text: string | undefined): string {
+function useSaid(text: string | undefined, tellFirst = false): string {
   const [said, setSaid] = useState("");
   const saidAt = useRef(Number.NEGATIVE_INFINITY);
-  const opening = useRef<string | undefined | null>(text);
+  /** R679 B3: a line that first appeared through an event is told as it first is too. */
+  const opening = useRef<string | undefined | null>(tellFirst ? null : text);
   useEffect(() => {
     if (text === undefined) return;
     if (opening.current !== null && text === opening.current) return;
@@ -148,8 +149,8 @@ function useSaid(text: string | undefined): string {
   return said;
 }
 
-function Said({ text }: { text: string | undefined }) {
-  const said = useSaid(text);
+function Said({ text, tellFirst }: { text: string | undefined; tellFirst?: boolean }) {
+  const said = useSaid(text, tellFirst);
   return (
     <p className="ao-visually-hidden ao-worklines__said" role="status">
       {said}
@@ -177,7 +178,8 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
   /** A read of the runs or of the list failed with anything but 404 (R679 A3). */
   const [failed, setFailed] = useState<{ runs: boolean; list: boolean }>({ runs: false, list: false });
   const [attempt, setAttempt] = useState(0);
-  const [error, setError] = useState<string | null>(null);
+  /** An action's refusal, per line (`run:<id>` or `list`), shown inside that line's block (R679 B4). */
+  const [errors, setErrors] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
   const busyNow = useRef(new Set<string>());
   const [problems, setProblems] = useState<Record<string, ProblemsView>>({});
@@ -189,6 +191,8 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
   const seq = useRef(0);
   const runSeen = useRef(new Map<string, number>());
   const listSeen = useRef(-1);
+  /** The runs that first appeared through an event (R679 B3: told to a screen reader as they first are). */
+  const firstByEvent = useRef(new Set<string>());
   /** The reads of the project shown now are cancelled through this when it changes or the lines go. */
   const reads = useRef(new AbortController());
   /** The project shown now: an answer for another one (or after unmount) changes nothing. */
@@ -209,12 +213,13 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
     setHoldFocus(false);
     setLost(false);
     setFailed({ runs: false, list: false });
-    setError(null);
+    setErrors({});
     setProblems({});
     busyNow.current = new Set();
     setBusy(new Set());
     runSeen.current = new Map();
     listSeen.current = -1;
+    firstByEvent.current = new Set();
   }, [projectId]);
 
   useEffect(() => {
@@ -271,7 +276,10 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
       if (e.downloads) {
         const run = e.downloads;
         runChanged(run.runId);
-        setRuns((held) => upsert(held, run));
+        setRuns((held) => {
+          if (!held.some((r) => r.runId === run.runId)) firstByEvent.current.add(run.runId);
+          return upsert(held, run);
+        });
       }
       if (e.discarded !== undefined) {
         const gone = e.discarded;
@@ -358,13 +366,13 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
     if (busyNow.current.has(key)) return;
     busyNow.current.add(key);
     setBusy(new Set(busyNow.current));
-    setError(null);
+    setErrors(({ [key]: _gone, ...rest }) => rest);
     const pid = projectId;
     try {
       const answer = await call();
       if (current.current === pid) then(answer);
     } catch (err) {
-      if (current.current === pid) setError(errorText(err, "That could not be done. Try again."));
+      if (current.current === pid) setErrors((e) => ({ ...e, [key]: errorText(err, "That could not be done. Try again.") }));
     } finally {
       if (current.current === pid) {
         busyNow.current.delete(key);
@@ -427,7 +435,7 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
   const listLines = listOfProject ? transcriptionLines(listOfProject) : {};
   const notice = lost || failed.runs || failed.list;
   /** R679 A5: nothing visible with no run, an idle empty list, no notice and no status sentence. */
-  const visible = mine.length > 0 || listLines.title !== undefined || notice || stopped || error !== null || holdFocus;
+  const visible = mine.length > 0 || listLines.title !== undefined || notice || stopped || holdFocus;
   if (!visible) return null;
 
   return (
@@ -435,12 +443,10 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
       <h2 id={headingId} ref={heading} tabIndex={-1} onBlur={() => setHoldFocus(false)}>
         {WORK_LINES_TEXT.heading}
       </h2>
-      {stopped && <p role="status">{LIST_STOPPED_TEXT}</p>}
-      {error && (
-        <div className="ao-worklines__error" role="alert">
-          <UserText as="p">{error}</UserText>
-        </div>
-      )}
+      {/* R679 B2: the status is there before its sentence, so that a screen reader says it when it arrives. */}
+      <p role="status" className="ao-worklines__status">
+        {stopped ? LIST_STOPPED_TEXT : ""}
+      </p>
       {notice && (
         <div className="ao-worklines__note" role="alert">
           <p>{WORK_LINES_TEXT.lost}</p>
@@ -465,6 +471,8 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
               key={run.runId}
               run={run}
               busy={busy.has(`run:${run.runId}`)}
+              error={errors[`run:${run.runId}`]}
+              tellFirst={firstByEvent.current.has(run.runId)}
               problems={problems[run.runId]}
               onAction={(what) => runAction(run, what)}
               onDiscard={() => discard(run)}
@@ -475,15 +483,30 @@ export function WorkLines({ client, projectId, streamOpenMs = STREAM_OPEN_TIMEOU
         </ul>
       )}
       {listOfProject && listLines.title !== undefined && (
-        <ListLine list={listOfProject} title={listLines.title} time={listLines.time} busy={busy.has("list")} onAction={listAction} />
+        <ListLine list={listOfProject} title={listLines.title} time={listLines.time} busy={busy.has("list")} error={errors.list} onAction={listAction} />
       )}
     </section>
+  );
+}
+
+/** R679 B1: a button named by itself and its line's title. */
+const named = (lineId: string, key: string) => ({ id: `${lineId}-${key}`, "aria-labelledby": `${lineId}-${key} ${lineId}-title` });
+
+/** An action's refusal, inside the block of its line (R679 B4). */
+function LineError({ text }: { text: string | undefined }) {
+  if (!text) return null;
+  return (
+    <div className="ao-worklines__error" role="alert">
+      <UserText as="p">{text}</UserText>
+    </div>
   );
 }
 
 function RunLine({
   run,
   busy,
+  error,
+  tellFirst,
   problems,
   onAction,
   onDiscard,
@@ -492,6 +515,8 @@ function RunLine({
 }: {
   run: DownloadRunSummary;
   busy: boolean;
+  error: string | undefined;
+  tellFirst: boolean;
   problems: ProblemsView | undefined;
   onAction(what: "pause" | "stop" | "resume"): void;
   onDiscard(): void;
@@ -510,13 +535,12 @@ function RunLine({
     if (open && !wasOpen.current) problemsHeading.current?.focus();
     wasOpen.current = open;
   }, [open]);
-  const describe = { "aria-describedby": `${id}-title` };
   return (
     <li className="ao-worklines__run">
       <p id={`${id}-title`} className="ao-worklines__title">
         <Sentence text={lines.title} part={run.title} />
       </p>
-      <Said text={lines.title} />
+      <Said text={lines.title} tellFirst={tellFirst} />
       {lines.wait && <p className="ao-worklines__detail">{lines.wait}</p>}
       {lines.failures && <p className="ao-worklines__detail">{lines.failures}</p>}
       {lines.why && (
@@ -527,32 +551,33 @@ function RunLine({
       {!allDone && (
         <div className="ao-worklines__actions">
           {(run.state === "downloading" || run.state === "waiting") && (
-            <button type="button" disabled={busy} {...describe} onClick={() => onAction("pause")}>
+            <button type="button" disabled={busy} {...named(id, "pause")} onClick={() => onAction("pause")}>
               {RUN_BUTTONS.pause}
             </button>
           )}
           {running && (
-            <button type="button" disabled={busy} {...describe} onClick={() => onAction("stop")}>
+            <button type="button" disabled={busy} {...named(id, "stop")} onClick={() => onAction("stop")}>
               {RUN_BUTTONS.stop}
             </button>
           )}
           {run.failed > 0 && (
-            <button type="button" aria-expanded={open} {...describe} onClick={onShowProblems}>
+            <button type="button" aria-expanded={open} {...named(id, "show")} onClick={onShowProblems}>
               {RUN_BUTTONS.showThem}
             </button>
           )}
           {lines.resume && (
-            <button type="button" disabled={busy} {...describe} onClick={() => onAction("resume")}>
+            <button type="button" disabled={busy} {...named(id, "resume")} onClick={() => onAction("resume")}>
               {lines.resume}
             </button>
           )}
           {!running && (
-            <button type="button" disabled={busy} {...describe} onClick={onDiscard}>
+            <button type="button" disabled={busy} {...named(id, "discard")} onClick={onDiscard}>
               {RUN_BUTTONS.discard}
             </button>
           )}
         </div>
       )}
+      <LineError text={error} />
       {open && (
         <div className="ao-worklines__problems">
           <h3 ref={problemsHeading} tabIndex={-1}>
@@ -575,7 +600,7 @@ function RunLine({
                   </li>
                 ))}
               </ul>
-              <button type="button" onClick={() => onCopy(problems.data!)}>
+              <button type="button" {...named(id, "copy")} onClick={() => onCopy(problems.data!)}>
                 {PROBLEMS_TEXT.copy}
               </button>
               <p role="status">{problems.copied ?? ""}</p>
@@ -587,9 +612,8 @@ function RunLine({
   );
 }
 
-function ListLine({ list, title, time, busy, onAction }: { list: TranscriptionListSummary; title: string; time: string | undefined; busy: boolean; onAction(what: "pause" | "continue" | "stop"): void }) {
+function ListLine({ list, title, time, busy, error, onAction }: { list: TranscriptionListSummary; title: string; time: string | undefined; busy: boolean; error: string | undefined; onAction(what: "pause" | "continue" | "stop"): void }) {
   const id = useId();
-  const describe = { "aria-describedby": `${id}-title` };
   return (
     <div className="ao-worklines__list">
       <p id={`${id}-title`} className="ao-worklines__title">
@@ -600,19 +624,20 @@ function ListLine({ list, title, time, busy, onAction }: { list: TranscriptionLi
       {list.state !== "idle" && (
         <div className="ao-worklines__actions">
           {list.state === "running" ? (
-            <button type="button" disabled={busy} {...describe} onClick={() => onAction("pause")}>
+            <button type="button" disabled={busy} {...named(id, "pause")} onClick={() => onAction("pause")}>
               {LIST_BUTTONS.pause}
             </button>
           ) : (
-            <button type="button" disabled={busy} {...describe} onClick={() => onAction("continue")}>
+            <button type="button" disabled={busy} {...named(id, "continue")} onClick={() => onAction("continue")}>
               {LIST_BUTTONS.continue}
             </button>
           )}
-          <button type="button" disabled={busy} {...describe} onClick={() => onAction("stop")}>
+          <button type="button" disabled={busy} {...named(id, "stop")} onClick={() => onAction("stop")}>
             {LIST_BUTTONS.stop}
           </button>
         </div>
       )}
+      <LineError text={error} />
     </div>
   );
 }

@@ -29,6 +29,10 @@ const getShown = (text: string) => screen.getByText(whole(text), SHOWN);
 const heading = () => screen.getByRole("heading", { level: 2, name: WORK_LINES_TEXT.heading });
 const buttonNames = () => within(screen.getByRole("region", { name: WORK_LINES_TEXT.heading })).queryAllByRole("button").map((b) => b.textContent);
 const LOST = WORK_LINES_TEXT.lost;
+/** The block of the line whose title is `title` (a run, or the transcription list). */
+const lineOf = (title: string) => getShown(title).closest("li.ao-worklines__run, .ao-worklines__list") as HTMLElement;
+/** A button found within its line, named by itself and its line's title (R679 B1). */
+const buttonOf = (title: string, name: string) => within(lineOf(title)).getByRole("button", { name: `${name} ${title}` });
 
 function start(o: BackgroundSetup = {}, props: { streamOpenMs?: number; streamQuietMs?: number; projectId?: string; events?: WorkLinesEvents } = {}) {
   const m = mockBackground(o);
@@ -89,7 +93,7 @@ describe("WorkLines: the download runs", () => {
     const { m } = start({ runs: [exampleRun({ failed: 3 })], problems: { "run-1": { platform: "youtube", problems: PROBLEMS } } });
     await shown("3 could not be downloaded");
     expect(buttonNames()).toEqual(["Pause", "Stop", "Show them"]);
-    await userEvent.setup().click(screen.getByRole("button", { name: "Show them" }));
+    await userEvent.setup().click(buttonOf('Downloading "Example Channel": 120 of 412', "Show them"));
     const h = await screen.findByRole("heading", { name: "Could not be downloaded" });
     await waitFor(() => expect(document.activeElement).toBe(h));
     const title = await shown("Interview with the mayor");
@@ -144,7 +148,7 @@ describe("WorkLines: the download runs", () => {
     const { m } = start({ runs: [exampleRun({ state: "interrupted" })], holdActions: true });
     const user = userEvent.setup();
     await shown("The capture of 'Example Channel' was interrupted: 120 of 412 done.");
-    const resume = screen.getByRole("button", { name: "Resume downloads (292 did not complete)" });
+    const resume = buttonOf("The capture of 'Example Channel' was interrupted: 120 of 412 done.", "Resume downloads (292 did not complete)");
     await user.dblClick(resume);
     await waitFor(() => expect(m.count("POST /projects/p1/downloads/run-1/resume")).toBe(1));
     expect((resume as HTMLButtonElement).disabled).toBe(true);
@@ -159,9 +163,11 @@ describe("WorkLines: the download runs", () => {
     const user = userEvent.setup(); // installs its own clipboard: stubbed after it
     const writeText = vi.fn(async (_text: string) => {});
     Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
-    await user.click(await screen.findByRole("button", { name: "Show them" }));
+    const FINISHED = '"Example Channel": 409 of 412 downloaded. 3 could not be downloaded.';
+    await shown(FINISHED);
+    await user.click(buttonOf(FINISHED, "Show them"));
     await shown("Interview with the mayor");
-    await user.click(screen.getByRole("button", { name: "Copy the list" }));
+    await user.click(buttonOf(FINISHED, "Copy the list"));
     await shown("The list was copied.");
     expect(writeText).toHaveBeenCalledTimes(1);
     expect(writeText.mock.calls[0]![0]).toBe(PROBLEMS.map((p) => problemLine(p, "youtube")).join("\n"));
@@ -172,7 +178,7 @@ describe("WorkLines: the download runs", () => {
     ]);
     // A refusal says so, in plain words.
     writeText.mockRejectedValueOnce(new Error("denied"));
-    await user.click(screen.getByRole("button", { name: "Copy the list" }));
+    await user.click(buttonOf(FINISHED, "Copy the list"));
     await shown("The list could not be copied. Select it and copy it by hand.");
     notShown("The list was copied.");
   });
@@ -180,7 +186,7 @@ describe("WorkLines: the download runs", () => {
   it("Discard removes the run and focus goes to the heading", async () => {
     const { m } = start({ runs: [exampleRun({ state: "interrupted" })] });
     await shown("The capture of 'Example Channel' was interrupted: 120 of 412 done.");
-    await userEvent.setup().click(screen.getByRole("button", { name: "Discard" }));
+    await userEvent.setup().click(buttonOf("The capture of 'Example Channel' was interrupted: 120 of 412 done.", "Discard"));
     await waitFor(() => notShown("The capture of 'Example Channel' was interrupted: 120 of 412 done."));
     expect(m.count("POST /projects/p1/downloads/run-1/discard")).toBe(1);
     await waitFor(() => expect(document.activeElement).toBe(heading()));
@@ -258,7 +264,7 @@ describe("WorkLines: the transcription line", () => {
     const { m } = start({ lists: { p1: { ...running, state: "paused" } } });
     await shown("Transcriptions paused: 14 of 412 done.");
     expect(buttonNames()).toEqual(["Continue", "Stop"]);
-    await userEvent.setup().click(screen.getByRole("button", { name: "Continue" }));
+    await userEvent.setup().click(buttonOf("Transcriptions paused: 14 of 412 done.", "Continue"));
     await shown('Transcribing: 14 of 412 — "Title of the video"');
     expect(m.count("POST /projects/p1/transcription-list/continue")).toBe(1);
   });
@@ -266,7 +272,7 @@ describe("WorkLines: the transcription line", () => {
   it("Stop of the transcriptions removes the line, says the stopped sentence once and moves focus to the heading", async () => {
     const { m } = start({ lists: { p1: running } });
     await shown('Transcribing: 14 of 412 — "Title of the video"');
-    await userEvent.setup().click(screen.getByRole("button", { name: "Stop" }));
+    await userEvent.setup().click(buttonOf('Transcribing: 14 of 412 — "Title of the video"', "Stop"));
     await shown(LIST_STOPPED_TEXT);
     expect(screen.getAllByText(LIST_STOPPED_TEXT)).toHaveLength(1);
     expect(screen.getByText(LIST_STOPPED_TEXT).getAttribute("role")).toBe("status");
@@ -540,7 +546,7 @@ describe("WorkLines: the screen's own stream (R679 A)", () => {
     const feed = screenStream();
     const { m } = start({ runs: [exampleRun({ state: "interrupted" })] }, { events: feed.events });
     await shown("The capture of 'Example Channel' was interrupted: 120 of 412 done.");
-    await userEvent.setup().click(screen.getByRole("button", { name: /^Discard/ }));
+    await userEvent.setup().click(buttonOf("The capture of 'Example Channel' was interrupted: 120 of 412 done.", "Discard"));
     await waitFor(() => expect(document.activeElement).toBe(heading()));
     expect(m.count("POST /projects/p1/downloads/run-1/discard")).toBe(1);
     act(() => heading().blur());
@@ -556,5 +562,79 @@ describe("WorkLines: the screen's own stream (R679 A)", () => {
     expect(feed.subscribers()).toBe(1);
     view.unmount();
     expect(feed.subscribers()).toBe(0);
+  });
+});
+
+describe("WorkLines: names and what a screen reader is told (R679 B)", () => {
+  it("each button is named by itself and its line: three Stop buttons have three names", async () => {
+    start({
+      runs: [exampleRun(), exampleRun({ runId: "run-2", title: "Second Channel", state: "queued", total: 0, done: 0, startedAt: later(5) })],
+      lists: { p1: idleList("p1", { state: "running", total: 5, done: 1 }) },
+    });
+    await shown('Downloading "Example Channel": 120 of 412');
+    const region = screen.getByRole("region", { name: WORK_LINES_TEXT.heading });
+    expect(within(region).getByRole("button", { name: 'Stop Downloading "Example Channel": 120 of 412' })).toBeTruthy();
+    expect(within(region).getByRole("button", { name: 'Pause Downloading "Example Channel": 120 of 412' })).toBeTruthy();
+    expect(within(region).getByRole("button", { name: 'Stop "Second Channel" is waiting its turn. It starts by itself when the downloads before it have finished, paused or stopped.' })).toBeTruthy();
+    expect(within(region).getByRole("button", { name: "Stop Transcribing: 1 of 5" })).toBeTruthy();
+    expect(within(region).queryAllByRole("button", { name: "Stop" })).toEqual([]);
+  });
+
+  it("the status that says the list was stopped is there, empty, before its sentence arrives (M2)", async () => {
+    const TITLE = "Transcribing: 1 of 5";
+    start({ lists: { p1: idleList("p1", { state: "running", total: 5, done: 1 }) } });
+    await shown(TITLE);
+    const region = screen.getByRole("region", { name: WORK_LINES_TEXT.heading });
+    const statuses = () => within(region).getAllByRole("status").filter((e) => !e.classList.contains("ao-visually-hidden"));
+    expect(statuses()).toHaveLength(1);
+    const status = statuses()[0]!;
+    expect(status.textContent).toBe("");
+    await userEvent.setup().click(buttonOf(TITLE, "Stop"));
+    await waitFor(() => expect(status.textContent).toBe(LIST_STOPPED_TEXT));
+    expect(statuses()).toEqual([status]);
+  });
+
+  it("a run that first appears through an event is told to a screen reader once (M5)", async () => {
+    const feed = screenStream();
+    const told = () => screen.queryAllByRole("status").filter((e) => e.classList.contains("ao-visually-hidden")).map((e) => e.textContent);
+    const { m } = start({ runs: [exampleRun()] }, { events: feed.events });
+    await shown('Downloading "Example Channel": 120 of 412');
+    await waitFor(() => expect(m.count("GET /projects/p1/transcription-list")).toBe(1));
+    const QUEUED = '"Second Channel" is waiting its turn. It starts by itself when the downloads before it have finished, paused or stopped.';
+    const second = exampleRun({ runId: "run-2", title: "Second Channel", state: "queued", total: 0, done: 0, startedAt: later(5) });
+    await feed.emit({ projectId: "p1", downloads: second });
+    await shown(QUEUED);
+    await waitFor(() => expect(told()).toContain(QUEUED));
+    m.setRuns([exampleRun(), second]);
+    // A read again changes nothing told: the new line is told once, the line read at the mount not at all.
+    await feed.open();
+    await waitFor(() => expect(m.count("GET /projects/p1/transcription-list")).toBe(2));
+    await act(async () => {});
+    expect(told().filter((t) => t === QUEUED)).toHaveLength(1);
+    expect(told().some((t) => t?.includes("120 of 412"))).toBe(false);
+  });
+
+  it("an action's refusal is shown inside the block of its run, and of the list (M9)", async () => {
+    const FIRST = 'Downloading "Example Channel": 120 of 412';
+    const SECOND = 'Downloading "Second Channel": 120 of 412';
+    const LIST = "Transcriptions paused: 1 of 5 done.";
+    const conflict = (message: string) => HttpResponse.json({ error: { code: "CONFLICT", message } }, { status: 409 });
+    start({
+      runs: [exampleRun(), exampleRun({ runId: "run-2", title: "Second Channel", startedAt: later(5) })],
+      lists: { p1: idleList("p1", { state: "paused", total: 5, done: 1 }) },
+      runAnswer: (_what, runId) => (runId === "run-2" ? conflict("These downloads are already running.") : undefined),
+      listAnswer: () => conflict("The list changed."),
+    });
+    await shown(SECOND);
+    const user = userEvent.setup();
+    await user.click(buttonOf(SECOND, "Pause"));
+    const alert = await within(lineOf(SECOND)).findByRole("alert");
+    expect(alert.textContent).toContain("These downloads are already running.");
+    expect(within(lineOf(FIRST)).queryByRole("alert")).toBeNull();
+    expect(screen.getAllByRole("alert")).toEqual([alert]);
+    await user.click(buttonOf(LIST, "Continue"));
+    const listAlert = await within(lineOf(LIST)).findByRole("alert");
+    expect(listAlert.textContent).toContain("The list changed.");
+    expect(within(lineOf(SECOND)).getByRole("alert")).toBe(alert);
   });
 });
