@@ -60,6 +60,26 @@ describe("governance routes (R113, R118)", () => {
     expect(m.count("GET /projects/p2/automation")).toBe(1);
   });
 
+  it("on a locked project the Governance screen of the app does not read the automatic transcription switch, and the switch says nothing of its own (R684)", async () => {
+    const m = mockBackground({ noEvents: true, locked: ["p1"] }, BASE);
+    server.use(
+      ...m.handlers,
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: false }] })),
+      http.get(url("/projects/p1/governance"), () => HttpResponse.json({ yaml: "", sha256: "a".repeat(64), violations: [] })),
+      http.get(url("/projects/p1/protocol/documents"), () => HttpResponse.json({ documents: [] })),
+      http.get(url("/projects/p1/retention"), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
+    );
+    window.history.replaceState(null, "", "/governance?project=p1");
+    render(<Host />);
+    expect(await screen.findByText("This project is locked, so its rules cannot be changed until it is unlocked.")).toBeTruthy();
+    const section = await screen.findByRole("region", { name: "Automatic transcription" });
+    await screen.findByText("Nothing is due for destruction.");
+    expect(m.count("GET /projects/p1/automation")).toBe(0);
+    expect(within(section).queryByRole("alert")).toBeNull();
+    expect((within(section).getByRole("checkbox", { name: "Transcribe captured audio and video automatically" }) as HTMLInputElement).disabled).toBe(true);
+  });
+
   it("an unknown project in the address selects none and says so, instead of showing another project's screen (41b2 M1)", async () => {
     server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Coastal kinship" }] })));
     window.history.replaceState(null, "", "/fieldwork?project=nope");

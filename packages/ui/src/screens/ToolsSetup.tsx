@@ -92,14 +92,17 @@ export function ToolsSetupRoute({ client, loc, memory }: { client: ApiClient; lo
 }
 
 /** Whole channels (Task 9): keeping the Mac awake while either list runs (Task 7's setting), saved at once. */
-function KeepAwake({ background }: { background: Pick<BackgroundApi, "settings" | "setSettings"> }) {
+function KeepAwake({ background, firstReadMs }: { background: Pick<BackgroundApi, "settings" | "setSettings">; firstReadMs: number }) {
   const id = useId();
+  const heading = useRef<HTMLHeadingElement>(null);
   const read = useCallback(async (signal: AbortSignal) => (await background.settings({ signal })).keepAwake !== false, [background]);
   const save = useCallback(async (on: boolean) => (await background.setSettings({ keepAwake: on })).keepAwake !== false, [background]);
   return (
     <section className="ao-tools__group" aria-labelledby={id}>
-      <h2 id={id}>{KEEP_AWAKE_TEXT.heading}</h2>
-      <SavedSwitch label={KEEP_AWAKE_TEXT.label} hint={KEEP_AWAKE_TEXT.hint} read={read} save={save} />
+      <h2 id={id} ref={heading} tabIndex={-1}>
+        {KEEP_AWAKE_TEXT.heading}
+      </h2>
+      <SavedSwitch label={KEEP_AWAKE_TEXT.label} hint={KEEP_AWAKE_TEXT.hint} read={read} save={save} focusTo={heading} firstReadMs={firstReadMs} />
     </section>
   );
 }
@@ -590,7 +593,7 @@ export function ToolsSetup({
             {g.tools.map(card)}
           </section>
         ))}
-      {background ? <KeepAwake background={background} /> : null}
+      {background ? <KeepAwake background={background} firstReadMs={firstReadMs} /> : null}
     </main>
   );
 }

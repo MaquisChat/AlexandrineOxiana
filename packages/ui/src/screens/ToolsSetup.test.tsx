@@ -1,6 +1,6 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS } from "@ao/shared";
 import { http, HttpResponse } from "msw";
 import { backgroundApi } from "../api/background";
@@ -504,6 +504,104 @@ describe("keeping the Mac awake, on the optional tools screen (whole channels, T
     expect(box.checked).toBe(true);
     expect(box.disabled).toBe(false);
     expect(m.count("PUT /settings/background")).toBe(1);
+  });
+
+  const SECTION = "While downloads or transcriptions run";
+  const dropFocus = (el: HTMLInputElement) => {
+    el.disabled = false;
+    el.blur();
+    el.disabled = true;
+  };
+
+  it("a failed first read of keeping awake says so, with Try again; pressed, it reads again and the switch is shown (R684)", async () => {
+    const m = mockBackground(
+      { noEvents: true, extra: [http.get(`${BASE}/settings/background`, () => HttpResponse.json({ error: { code: "INTERNAL", message: "Something went wrong." } }, { status: 500 }), { once: true })] },
+      BASE,
+    );
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()) });
+    const section = screen.getByRole("region", { name: SECTION });
+    const alert = await within(section).findByRole("alert");
+    expect(alert.textContent).toBe("This setting could not be read.Try again");
+    const box = within(section).getByRole("checkbox", { name: LABEL }) as HTMLInputElement;
+    expect(box.disabled).toBe(true);
+    await userEvent.click(within(alert).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(true);
+    expect(within(section).queryByRole("alert")).toBeNull();
+    expect(m.count("GET /settings/background")).toBe(1);
+    // Focus, which was on "Try again", went to the section's heading, not to the page.
+    expect(document.activeElement).toBe(within(section).getByRole("heading", { level: 2, name: SECTION }));
+  });
+
+  it("a first read of keeping awake that never answers is given up at the screen's first-read limit, with Try again (R684)", async () => {
+    const m = mockBackground({ noEvents: true, holdReads: true }, BASE);
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()), firstReadMs: 300 });
+    const section = screen.getByRole("region", { name: SECTION });
+    const alert = await within(section).findByRole("alert", {}, { timeout: 5000 });
+    expect(alert.textContent).toBe("This setting could not be read.Try again");
+    expect(m.count("GET /settings/background")).toBe(1);
+    m.release();
+    await userEvent.click(within(alert).getByRole("button", { name: "Try again" }));
+    const box = within(section).getByRole("checkbox", { name: LABEL }) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(true);
+    expect(m.count("GET /settings/background")).toBe(2);
+  });
+
+  it("two changes of keeping awake in the same moment send one request (R684)", async () => {
+    const m = mockBackground({ noEvents: true }, BASE);
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()) });
+    const box = (await screen.findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    // Both changes land before the box re-renders (it is not yet disabled): the synchronous guard holds.
+    act(() => {
+      fireEvent.click(box);
+      fireEvent.click(box);
+    });
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(m.bodies("PUT /settings/background")).toEqual([{ keepAwake: false }]);
+    expect(box.checked).toBe(false);
+  });
+
+  it("focus stays on the switch after a save, and after a failed one (R684)", async () => {
+    // Each save is held until the test lets it answer: the first is saved, the second refused.
+    const gates: Array<() => void> = [];
+    onTestFinished(() => gates.forEach((g) => g()));
+    let puts = 0;
+    const m = mockBackground(
+      {
+        noEvents: true,
+        extra: [
+          http.put(`${BASE}/settings/background`, async ({ request }) => {
+            const n = ++puts;
+            const body = (await request.json()) as { keepAwake: boolean };
+            await new Promise<void>((r) => gates.push(r));
+            return n === 1 ? HttpResponse.json(body) : HttpResponse.json({ error: { code: "INTERNAL", message: "The setting could not be saved." } }, { status: 500 });
+          }),
+        ],
+      },
+      BASE,
+    );
+    server.use(...m.handlers);
+    await shown(toolsService(), { background: backgroundApi(makeClient()) });
+    const box = (await screen.findByRole("checkbox", { name: LABEL })) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    for (const outcome of ["saved", "refused"]) {
+      await userEvent.click(box);
+      await waitFor(() => expect(gates.length).toBe(outcome === "saved" ? 1 : 2));
+      expect(box.disabled).toBe(true);
+      dropFocus(box);
+      expect(document.activeElement).toBe(document.body);
+      gates[gates.length - 1]!();
+      await waitFor(() => expect(box.disabled).toBe(false));
+      // Saved: off now; refused: put back to the saved value (off), with the alert.
+      expect(box.checked).toBe(false);
+      if (outcome === "refused") expect(screen.getByRole("alert").textContent).toContain("The setting could not be saved.");
+      expect(document.activeElement).toBe(box);
+    }
   });
 
   it("the Video tools group says they also join the best picture and sound when videos are downloaded (R671)", async () => {

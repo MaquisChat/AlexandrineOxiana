@@ -15,7 +15,8 @@
  *
  * Whole channels (Task 9): the section "Automatic transcription" holds the project's switch "Transcribe captured audio
  * and video automatically" (GET/PUT /projects/:id/automation, saved at once and apart from governance.yaml), off with
- * the screen's reason on a locked project or a read-only library.
+ * the screen's reason on a locked project or a read-only library. On a locked project it is not read (the service would
+ * refuse it, 423) and says nothing of its own: the screen's reason says why (R684).
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { isMap, isScalar, isSeq, parseDocument, type Document } from "yaml";
@@ -96,6 +97,8 @@ export interface GovernanceSettingsProps {
   firstReadMs?: number;
   /** Whole channels (Task 9): the project's automatic transcription switch is read and saved through it; left out, the section is not shown. */
   background?: Pick<BackgroundApi, "automation" | "setAutomation"> | undefined;
+  /** The project is locked (encrypted and not unlocked): the automatic transcription switch is not read (R684). */
+  projectLocked?: boolean | undefined;
 }
 
 /**
@@ -111,7 +114,7 @@ const localToday = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
-export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, firstReadMs = FIRST_READ_TIMEOUT_MS, background }: GovernanceSettingsProps) {
+export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, firstReadMs = FIRST_READ_TIMEOUT_MS, background, projectLocked = false }: GovernanceSettingsProps) {
   const [saved, setSaved] = useState<{ yaml: string; sha256: string } | null>(null);
   const [text, setTextNow] = useState("");
   // What the cards show is parsed from `parseText`: at once for form edits, 300 ms after the last
@@ -500,7 +503,9 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
         </ControlCard>
       </div>
 
-      {background ? <AutomaticTranscription background={background} projectId={projectId} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} /> : null}
+      {background ? (
+        <AutomaticTranscription background={background} projectId={projectId} firstReadMs={firstReadMs} locked={projectLocked} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} />
+      ) : null}
 
       <BackUpNow api={api} projectId={projectId} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} />
 
@@ -545,15 +550,33 @@ export function GovernanceSettings({ api, projectId, readOnlyReason, encrypted, 
   );
 }
 
-/** Whole channels (Task 9): the project's switch, saved at once (Task 7's route; governed and audited by the library). */
-function AutomaticTranscription({ background, projectId, whyId }: { background: Pick<BackgroundApi, "automation" | "setAutomation">; projectId: string; whyId?: string }) {
+/**
+ * Whole channels (Task 9): the project's switch, saved at once (Task 7's route; governed and audited by the library).
+ * Its first read has the screen's first-read limit; `locked`: not read at all (R684).
+ */
+function AutomaticTranscription({
+  background,
+  projectId,
+  whyId,
+  firstReadMs,
+  locked,
+}: {
+  background: Pick<BackgroundApi, "automation" | "setAutomation">;
+  projectId: string;
+  whyId?: string;
+  firstReadMs: number;
+  locked: boolean;
+}) {
   const id = useId();
+  const heading = useRef<HTMLHeadingElement>(null);
   const read = useCallback(async (signal: AbortSignal) => (await background.automation(projectId, { signal })).transcribeNewMedia === true, [background, projectId]);
   const save = useCallback(async (on: boolean) => (await background.setAutomation(projectId, { transcribeNewMedia: on })).transcribeNewMedia === true, [background, projectId]);
   return (
     <section className="ao-card" aria-labelledby={id}>
-      <h2 id={id}>{AUTOMATION_TEXT.heading}</h2>
-      <SavedSwitch label={AUTOMATION_TEXT.label} hint={AUTOMATION_TEXT.hint} read={read} save={save} whyId={whyId} />
+      <h2 id={id} ref={heading} tabIndex={-1}>
+        {AUTOMATION_TEXT.heading}
+      </h2>
+      <SavedSwitch label={AUTOMATION_TEXT.label} hint={AUTOMATION_TEXT.hint} read={locked ? undefined : read} save={save} whyId={whyId} focusTo={heading} firstReadMs={firstReadMs} />
     </section>
   );
 }

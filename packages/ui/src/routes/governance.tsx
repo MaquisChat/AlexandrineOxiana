@@ -27,12 +27,12 @@ export interface GovernanceRoute {
   render(
     api: GovernanceApi,
     projectId: string,
-    ctx: { readOnlyReason?: string | undefined; encrypted?: boolean | undefined; readOnlyLibrary?: boolean; firstReadMs?: number; background?: BackgroundApi },
+    ctx: { readOnlyReason?: string | undefined; encrypted?: boolean | undefined; readOnlyLibrary?: boolean; firstReadMs?: number; background?: BackgroundApi; projectLocked?: boolean },
   ): ReactNode;
 }
 
 export const governanceRoutes: GovernanceRoute[] = [
-  { path: PATHS.governance, label: "Governance", needsProject: true, render: (api, pid, ctx) => <GovernanceSettings key={pid} api={api} projectId={pid} readOnlyReason={ctx.readOnlyReason} encrypted={ctx.encrypted} background={ctx.background} {...(ctx.firstReadMs !== undefined ? { firstReadMs: ctx.firstReadMs } : {})} /> },
+  { path: PATHS.governance, label: "Governance", needsProject: true, render: (api, pid, ctx) => <GovernanceSettings key={pid} api={api} projectId={pid} readOnlyReason={ctx.readOnlyReason} encrypted={ctx.encrypted} background={ctx.background} projectLocked={ctx.projectLocked} {...(ctx.firstReadMs !== undefined ? { firstReadMs: ctx.firstReadMs } : {})} /> },
   { path: PATHS.audit, label: "Audit log", needsProject: true, render: (api, pid, ctx) => <AuditLog key={pid} api={api} projectId={pid} {...(ctx.firstReadMs !== undefined ? { firstReadMs: ctx.firstReadMs } : {})} /> },
   { path: PATHS.fieldwork, label: "Fieldwork", needsProject: true, render: (api, pid, ctx) => <Fieldwork key={pid} api={api} projectId={pid} encrypted={ctx.encrypted} readOnly={ctx.readOnlyLibrary === true} {...(ctx.firstReadMs !== undefined ? { firstReadMs: ctx.firstReadMs } : {})} /> },
   { path: PATHS.moveLibrary, label: "Move library", needsProject: false, render: (api) => <MoveLibrary api={api} /> },
@@ -234,7 +234,7 @@ export function GovernanceRoutes({ client, loc, firstReadMs = FIRST_READ_TIMEOUT
         </p>
       )}
       <PageReads value={page}>
-        {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId, { readOnlyReason, encrypted: project?.encrypted === true, readOnlyLibrary: libraryMode === "read-only", firstReadMs, background }) : null}
+        {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId, { readOnlyReason, encrypted: project?.encrypted === true, readOnlyLibrary: libraryMode === "read-only", firstReadMs, background, projectLocked: isLocked(project) }) : null}
       </PageReads>
     </div>
   );
