@@ -63,3 +63,33 @@ All files were restored. `git status --short` is empty.
 - How long the listing really takes against YouTube.
 - Screen-reader announcements on a real Mac (VoiceOver with the status and the disabled radios).
 - The quality the e2e harness's catalogue leads to.
+
+---
+
+# Second look (R683)
+
+Range 573aebb..942ca42 (a1236d0, e98f272, 687c04e, 7a4ac08, d697397, 942ca42), checked against the fix brief and R685.
+
+## Verdict: APPROVED WITH MINORS
+
+I1–I6 and M1, M2, M4 and M5 are mended. I found no Critical or Important issue.
+
+## Checked
+- **A.** The `background.ts` diff only adds `settingsChanged`, `switchNotRead`, `listingSlow(p)`, `listingAny` and `listingSlowAny`, character for character as the briefs give them (curly quotes, ellipsis). Each is tested in `background.test.ts` (28/28).
+- **B.** There is one comparison: `profileForm` (`Capture.tsx` ≈:846) with an effect on it. It covers the address, since, until, the maximum, content types, metadata only, comments, legal basis, the browser session (`useSession`, `browser`), the Transcription choice, the model and Refresh existing. No control of the profile request is missing. I found no setter of these values outside a researcher's own action (no default filled in from a read), so neither a re-render nor a late read can close the estimate. A request still out is aborted. Mutation: without the signal, 2 tests fail, because they read `request.signal.aborted` at the assertion. `settingsChanged` is said once, in a status region that is always mounted. The address typed meanwhile is kept, also on a Start success (`profileUrlNow`).
+- **C.** What Start sends: "Use the project's setting" with the box untouched → no `transcribe` key; "Transcribe" or "Do not transcribe" above → explicit; the box changed → explicit; metadata only → no box and never `true`; the model sent is `estimate.speechModel`. The switch is read through `readWithin(firstReadMs)` beside the estimate, never in the way of it (tested). A failed read shows `switchNotRead`, tied to the box with `aria-describedby`.
+- **D.** Cancel during the listing aborts the request, moves focus to the field and drops the late answer (tested). `listingSlow` and `listingSlowAny` are tested with a fake clock. The links form has its own busy flag: a link capture works while an estimate is out and while one is open, and the estimate stays. A 409 `TOOL_NOT_INSTALLED` on the estimate and on Start goes through `MissingToolNotice` with the link (ffmpeg and video-downloader are each tested), and the estimate stays open after a refused Start.
+- **E.** Without the synchronous guard (now in `startProfileWork`, which Start uses), the double-press test fails. The project-change test waits on `m.settled(…)` and no longer on a timer. `start()`'s guard now covers only the links form, whose tests are unchanged.
+- **Unchanged areas.** The changed existing profile tests drop `transcribe` (untouched project setting) and keep `transcribeModel: "medium"` where the setting is not metadata only; that is the R683 C1 change, and nothing is loosened. `Capture.firstReads.test.tsx`, `WorkLines.tsx`, the `WorkLines` mount and `useEventFeed` are untouched.
+
+## Minor
+- **N1.** Probe: switch ON, read held; the researcher ticks then unticks the box; the read arrives. The box shows unticked with no note, but Start sends no `transcribe`, so the service applies the switch (ON) and transcribes. The cause is `explicit = … || estTranscribe !== estInitial.current` (`Capture.tsx` ≈:944). The rule (C1) is "changed the box". Fix: `|| estTouched.current`. The case is narrow: two clicks before a local read answers.
+- **N2.** No test covers "a read that arrives after the box was touched does not overwrite it". The mutation removing `estTouched.current` from the read's handler passed all 92 tests. The code is right by reading. Add a test, ideally together with N1.
+- **N3.** A form change while a Start is in flight closes the estimate and says `settingsChanged` ("…Press “Capture profile” to see it again."), while the capture still starts and appears in the queue. The sentence misleads for that moment. Fix: skip the effect while `profileBusy` holds a Start, or hold the form's fields during a Start.
+- **N4.** Only three of the thirteen compared values have a test (the address, metadata only, the Transcription choice), as the brief allowed. Dropping, say, `types` from `profileForm` would go unnoticed.
+
+## Runs
+`Capture.test.tsx` 92/92, `CaptureEstimate.test.tsx` 14/14, `Capture.firstReads.test.tsx` 15/15, `CaptureQueue.test.tsx` 24/24, `MissingToolNotice.test.tsx` 11/11, shared `background.test.ts` 28/28. `typecheck`, `lint:css` and `lint:colours` for `@ao/ui` are clean. I restored every file after the mutations (guard: test failed; `estTouched`: survived; signal: 2 failed) and removed the probe. `git status --short` is empty.
+
+## Not checked
+The e2e scenario (no routes in this worktree) and VoiceOver on a real Mac.

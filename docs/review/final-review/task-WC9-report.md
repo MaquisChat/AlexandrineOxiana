@@ -112,3 +112,78 @@ None.
 - `pnpm --filter @ao/ui typecheck`: clean
 - `lint:css`: clean
 - `lint:colours`: "ok: no hard-coded colours in src/**/*.ts(x)"
+
+## Fix round (R684)
+
+Three commits on `wc-9-switches`, on top of 6d2627c: **535a675** (A), **f9712a6** (B), **04bb184** (C). Nothing pushed, the e2e step was not run, and `git status --short` is empty. No file on the do-not-touch list was edited.
+
+### A. "Transcribe everything" (535a675)
+- **A1 (I1).** `TranscribeAll` has a new `readOnly` prop (`components/TranscribeAll.tsx`), and `Library.tsx:1150` passes the screen's `readOnly`.
+  - On a read-only library the button is off and nothing is asked.
+  - This follows the Library screen's own rule. Its other edit buttons (New project, New collection, New tag, rename and delete) are only disabled, and the read-only banner (`role=status`) says why. No new sentence and no `aria-describedby`.
+  - Tests:
+    - `on a read-only library the button is off, as the screen's other edit buttons are, and asks nothing` (TranscribeAll).
+    - `a read-only library offers Transcribe everything … switched off … (R684)` (Library).
+  - Both failed before the mend.
+- **A2 (I2).**
+  - `an answer after the project changed is dropped` is rewritten. Existing test changed: it used to press for p2, which hid the late answer.
+  - New: `an answer of the count after the project changed is dropped`.
+  - Both use a watched client. Its `settled()` resolves after the component's own continuation, with no timer. Each test asserts that the status is empty and there is no alert (POST test), or that there is no confirmation (count test).
+  - Mutation check: deleting each generation check (`:97`, `:76`) fails its test.
+- **A3.** New test: `two presses of Transcribe them in the same moment send one request`, using two `fireEvent.click` calls in one `act`. It fails with the `busy` guard removed.
+- **A4 (M2).** A missing tool is said once: `SpeechModelNotice` alone for a speech model, `MissingToolNotice` alone for another tool. `err.message` is dropped.
+  - Existing test changed: `a refusal for a missing speech model names it` now asserts the alert's exact text, without the general sentence.
+  - New test: `a refusal for another missing tool says it once …`.
+  - Both failed before the mend.
+- **Fake.** `backgroundService.ts` gains:
+  - `holdReads`, which holds the switch GETs and the untranscribed GET;
+  - `locked: string[]`, which makes the automation routes answer 423;
+  - `projectLocked()` and `automationLocked(base)`.
+
+### B. The switches (f9712a6)
+- **B1 (I3).** `SavedSwitch` reads through `readWithin(read, firstReadMs)`. The screens pass their own `firstReadMs`.
+  - A read that fails or runs out shows an alert: "This setting could not be read." followed by the screens' `TryAgain`. Pressing it reads again, and focus goes to the section's h2 (now `tabIndex=-1`, passed as the new `focusTo` prop).
+  - New tests, all failing before the mend:
+    - on ToolsSetup: a failed first read, then Try again, then the switch is shown; and a read given up at a limit of 300 ms, then Try again;
+    - the same two on GovernanceSettings.
+- **B2.** Two changes in one tick send one request, tested on each switch. Both tests pass on the existing code and fail with the `sending` guard removed.
+- **B3 (M3, M5).** While locked, the Governance screen's other sections still read (retention, documents), so the brief's two directions do not agree. I followed the explicit one: on a locked project the switch is not read and shows no alert.
+  - `GovernanceSettings` gains `projectLocked`. The route passes `isLocked(project)` through `ctx.projectLocked`, and `SavedSwitch`'s `read` may be left out.
+  - `msw-governance.ts` gains `lockedAutomation()` (423).
+  - Tests, failing before the mend:
+    - GovernanceSettings: `on a locked project the switch is not read …`;
+    - routes/governance: `on a locked project the Governance screen of the app does not read … (R684)`.
+- **B4 (M4).** New test: `focus stays on the switch after a save, and after a failed one`. jsdom keeps focus on a disabled box, so the test drops it as WebKit would. It fails with the `refocus` effect removed.
+
+### C. (04bb184)
+- The review's existing defect is fixed: the Optional tools screen's group sections are now named by their headings. The id carries the group's index, not its title with spaces.
+- New test: `each group of tools is a region named by its heading`. It failed first.
+
+### Researcher-visible sentences
+- None new.
+- On a failed or given-up switch read, the alert now says "This setting could not be read." in every case. The service's own sentence is no longer shown there, as the brief directs.
+- A missing tool's refusal no longer repeats the service's general sentence.
+
+### NEEDS A RULING
+1. **The switch on a locked project.** It is shown unchecked and disabled, without having been read, so the unchecked box may not be the project's real value. Options: (a) keep this; (b) do not show the section while locked. I recommend (b) if the owner prefers no box that could mislead.
+2. **The locked rule.** The brief's "as the screen's other sections do while locked" does not match the code: Retention and Approval documents still read on a locked project. I built "not read, no alert", as the brief says.
+
+### Runs (single files, `nice -n 10`)
+TranscribeAll 11 passed; GovernanceSettings 78; GovernanceSettings.backup 6; ToolsSetup 42; Library 53; Library.firstReads 18; screens/governance.firstReads 37; routes/governance 26; routes/tools 10; FirstUseTools 24; App 16. Typecheck `@ao/ui` clean; `lint:css` clean; `lint:colours` ok.
+
+## Last fix (R686)
+
+One commit on top of 04bb184. Nothing pushed; `git status --short` is empty.
+
+**What changed**
+- While the project is locked, the Governance screen does not show the "Automatic transcription" section at all (`background && !projectLocked`), and nothing is read for it.
+- Once the project is unlocked, the section appears and reads as usual.
+- `SavedSwitch`'s `read` prop is required again: the "leave out the read" path is gone.
+
+**Tests changed** (both replace the R684 locked tests, and both failed at 04bb184)
+- GovernanceSettings, `on a locked project the section is not shown and nothing is read for it; unlocked, it appears with the read value (R686)`:
+  - while locked: no heading, no checkbox, no automation GET and no alert;
+  - after a rerender as unlocked: the section shows the value it read.
+- routes/governance, `on a locked project the Governance screen of the app does not show or read the automatic transcription switch (R686)`.
+
+**Runs** (single files, `nice -n 10`): GovernanceSettings 78 passed; screens/governance.firstReads 37 passed; routes/governance 26 passed; typecheck `@ao/ui` clean.

@@ -64,3 +64,72 @@ None.
 - `pnpm --filter @ao/ui typecheck`: no errors. `lint:css`: clean. `lint:colours`: "ok: no hard-coded colours in src/**/*.ts(x)".
 - Not run, on the dispatch's word: the UI build and `e2e/capture.spec.ts` (scenario 10 needs Task 5's routes).
 - `git status --short`: empty.
+
+## Fix round (R683)
+
+Fresh implementer. Branch `wc-8-estimate`, five commits on 573aebb, head **d697397**: A a1236d0, B e98f272, C 687c04e, D 7a4ac08, E d697397.
+
+### A. Three sentences (`packages/shared/src/api/background.ts`, in `estimateText`)
+`settingsChanged`, `switchNotRead` and `listingSlow(p)`, word for word as the brief gives them. Test: `background.test.ts` "the settings changed, the switch not read, and a slow listing (R683)". It failed first because the keys were undefined.
+
+### B. An estimate only of what the screen shows (I1, I2), in `Capture.tsx`
+- `profileForm` is a JSON of the trimmed address, since, until, maxItems, types, metadataOnly, comments, the trimmed legal basis, useSession, browser, the Transcription choice, model and refresh. `estimateOf` (a ref) holds `{form, ac}` from the moment "Capture profile" is pressed until the estimate is closed. One effect on `profileForm` handles every change: `dropEstimate()` aborts the request, drops the answer, closes the estimate and puts the buttons back, and then the status says `settingsChanged`.
+- The status `<span role="status">` is always mounted in the profile form's actions (M5).
+- The field's old `if (!busy.current) setShown(null)` is removed.
+- After a successful Start, the field is emptied only if it still holds the address that was sent.
+- Tests: "an address changed while the list is asked for…", "an option changed under an open estimate…", "the Transcription choice changed…". All three failed first (no abort, no status region, the estimate stayed open).
+- `captureService.ts`:
+  - `estimateRequests()` keeps the Request objects, so a test can read `signal.aborted`.
+  - `settled(key)` comes from a wrapped `client.request` and counts answers that have reached the screen.
+  - New options `automationAnswer` and `automationHold`.
+- `api/capture.ts`: `estimate` and `automation` take `{signal}`.
+
+### C. The project's switch is never overridden (I3, M1, M2)
+- Start sends `transcribe` explicitly in two cases: the Transcription choice above is "Transcribe" or "Do not transcribe", or the box now differs from how it started. Otherwise `transcribe` is left out. In that case `transcribeModel` (if it was asked) becomes `estimate.speechModel`.
+- When transcription is sent as true, the model sent is `estimate.speechModel`.
+- Metadata only: there is no box and no transcribing time (`CaptureEstimate.tsx`). `transcribeModel` is dropped, and an explicit choice is sent as `false`.
+- The switch is read with `readWithin(firstReadMs)`, aborted together with the estimate, and never awaited with it. If the read fails, `switchNotRead` is shown beside the box through the new prop `transcribeNote`, with `aria-describedby`. If the switch answers before the box is touched, the box follows it.
+- Tests:
+  - Six new tests in Capture.test, under the describe "(R683 C)". "“Do not transcribe” above…" and "the box changed from the switch…" passed before the change: they pin behaviour that was already right. The other four failed first.
+  - Two new tests in CaptureEstimate.test (metadata only shows no box; the note describes the box). Both failed first.
+
+### D. The listing (I4, I5, M5)
+- The profile form has its own guard and busy (`profileBusy`, `profileSubmitting`, `startProfileWork`), so "Capture links" is never held.
+- While the list is being asked for, a `Cancel` (`estimateText.cancel`) sits beside the status. It aborts the request, drops the answer and focuses the profile field.
+- There is no hard limit. After `firstReadMs` the status changes to `listingSlow(platform)`.
+- For an estimate refusal, `refused(…, namesTool)` keeps the original `ApiClientError`, reason included. The alert renders `MissingToolNotice` around the usual text.
+- Tests (all four failed first): Cancel during the listing (keeps the `request` and reads `signal.aborted`, checks focus, a late answer shows nothing); the slow sentence (fake clock with `shouldAdvanceTime`, `firstReadMs` 10 000); "Capture links" while the estimate is being asked for and while it is open; a 409 for `video-downloader` names the tool and links to `/settings/tools?tool=video-downloader`.
+
+### E. Tests
+- E1: the double press is now two `fireEvent.click` calls inside one `act`. I removed the guard locally and the test failed with 2 requests; the guard is restored.
+- E2: the test now waits for `settled(capture-estimate) === 1`. Mutation check: with both the project effect's drop and the `projectNow` guard removed, it fails.
+
+### Existing tests changed
+- "sends the profile form…": no `transcribe` key ("Use the project's setting", untouched; metadata only).
+- "comments need a legal basis…" and "without Video tools…": `transcribe:false` becomes left out, with `transcribeModel:"medium"`.
+- "the Transcribe box starts from the project's switch…": the ticked check is now a `waitFor`, because the switch arrives beside the estimate.
+- The double-press test and the project-change test, as E says.
+
+### NEEDS A RULING
+- D1 says "a platform the form accepts always gets a status". The form accepts any web address. For an address the preview cannot place (platform "other"), no fixed sentence exists, because `listing` and `listingSlow` take only YouTube, Instagram or TikTok. Such an address now gets an empty status but still gets Cancel. Options: (a) leave it like this; (b) add a platform-free sentence to `estimateText`. I recommend (b).
+- The refusal of Start for TOOL_NOT_INSTALLED still shows the service's sentence, not `MissingToolNotice`: D3 names only the estimate. Should Start be treated the same way?
+
+### Runs (each alone, `nice -n 10`)
+CaptureEstimate 14/14 · Capture 90/90 · Capture.firstReads 15/15 · CaptureQueue 24/24 · MissingToolNotice 11/11 (also .capture 4/4, .hookups 8/8) · shared background 28/28 · typecheck @ao/shared and @ao/ui clean · lint:css clean · lint:colours ok · `git status --short` empty. The e2e step was not run.
+
+## Last fix (R685)
+
+Commit **942ca42**.
+1. Added `estimateText.listingAny` ("Asking the platform for the list…") and `listingSlowAny` ("Still asking the platform for the list. A long list can take a few minutes."), word for word, to `packages/shared/src/api/background.ts` and tested them in `background.test.ts`. The screen now uses them whenever the preview has no platform, and the slow timer runs for every address. Test: "an address the preview cannot place still gets words and Cancel, and the slow words after the limit (R685)", run with a fake clock.
+2. A `Start` refused with 409 `TOOL_NOT_INSTALLED` now goes through `refused(…, true)`, so `MissingToolNotice` names the tool and gives its link, and the estimate stays open. The existing test "a refusal of Start shows the service's sentence and keeps the estimate" is changed: it now expects the ffmpeg notice (the R671 sentence) and the link `/settings/tools?tool=ffmpeg`. A new test covers `video-downloader`.
+All three tests, and the shared test, failed before the change.
+Runs, each file alone: Capture 92/92 · CaptureEstimate 14/14 · shared background 28/28 · typecheck of @ao/shared and @ao/ui clean · `git status --short` empty.
+
+## Last fix (R688)
+
+Commit **7f57d56**.
+- **N1:** once the researcher has touched the box, Start always sends `transcribe` as the box shows it (`explicit = chosen above || estTouched`). The `estInitial` ref is gone. Test: "the box ticked then unticked before a slow switch arrives… (R688 N1)" (switch ON, read held, tick, untick, release, Start). It failed first: the request had no `transcribe` key.
+- **N2:** test "a switch read that arrives after the box was touched never changes it (R688 N2)". It passed before the fix, because the code was already right. To prove it, I removed `|| estTouched.current` from the read's handler: the N2 and N1 tests then fail. The check is restored.
+- **N3:** a new state, `startOut`, holds the comparison effect while a Start is out. A refused Start then closes an estimate the form no longer matches and says the sentence once. A successful Start had already cleared the snapshot. Tests: "a form changed while Start is on its way… (R688 N3)" (no sentence, one capture) and "…refused Start… closes the estimate once the refusal is in (R688 N3)". Both failed first. The fake gained `profileHold`.
+- **N4:** one `it.each` over all thirteen values: the address, posts from, posts until, the maximum, content types, metadata only, comments, legal basis, the browser session, the browser (the session is ticked before the press, because the picker is disabled without it), the Transcription choice, the model, and Refresh existing. Every control could be driven. These cases passed before, because the code was right. To prove they guard it, I dropped `types` from `profileForm`: the "content types" case then fails. Restored.
+- **Runs, each file alone:** Capture 109/109 · CaptureEstimate 14/14 · typecheck @ao/ui clean · `git status --short` empty.

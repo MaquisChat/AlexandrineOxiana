@@ -121,3 +121,99 @@ Worktree `.claude/worktrees/kg-4`, branch `wc-9-switches`, range a210250..6d2627
   - whether focus on a box that is disabled while it saves falls to `body`, which the `refocus` effect depends on;
   - VoiceOver's reading of the empty status and of the confirmation group.
 - Whether `caffeinate` actually keeps a real Mac awake; that is Task 7's.
+
+---
+
+# Second look (R684)
+
+Range 6d2627c..aa65328 (535a675 A, f9712a6 B, 04bb184 C, aa65328 R686). `git status --short` is empty at the end; every probe was removed and every mutation restored.
+
+## Verdict: APPROVED WITH MINORS
+
+One timing-sensitive test should be made exact before merging (S1). The fix is a single line.
+
+## Findings
+
+**S1 (should be fixed before merge: the test is uncertain).** The test is `ToolsSetup.test.tsx`, "focus stays on the switch after a save, and after a failed one (R684)".
+- What I saw: it failed once in 9 runs of the whole file (`Tests 1 failed | 41 passed`). It passed 3 of 3 times run alone and 5 of 5 more times in the whole file.
+- Why, by reading the code: the test waits for `box.disabled === false` and then asserts `document.activeElement === box` straight away.
+  - The focus is given back in a passive `useEffect` keyed on `saving` (`SavedSwitch.tsx`, the `refocus` effect).
+  - The save's answer arrives outside `act`, so React commits the enabled box first and runs that effect in a later scheduler task.
+  - `waitFor`'s MutationObserver can see the commit inside that gap.
+- Smallest fix: `await waitFor(() => expect(document.activeElement).toBe(box))`, or give the focus back in a `useLayoutEffect` in `SavedSwitch`.
+- The check itself holds: removing the refocus line makes the test fail every time.
+
+**S2 (Minor).** If the library becomes read-only while the confirmation is open, `Transcribe them` and `Cancel` stay enabled, because `send` does not check `readOnly`. Since Task 7 now pins `requireWritable`, the service refuses and the screen shows the service's sentence. Fix: close the confirmation when `readOnly` turns true, or turn its buttons off.
+
+**S3 (Minor).** If the project is locked while the Governance screen is open and focus is on the switch, the section is removed (R686) and focus falls to `<body>`. My probe: a rerender with the section gone left `document.activeElement` as BODY. A screen reader hears only the screen's existing "This project is locked…" reason. The screen's other controls lose focus the same way when they become disabled, so this is not a regression. It could later be sent to the heading.
+
+## Checks, point by point
+
+**1. A: "Transcribe everything".**
+- **Read-only library:** the button is `disabled` and a press asks nothing. That matches the Library screen's other edit buttons: `New collection` and `New project` are plain `disabled`, and the banner "Read-only (…)" says why. No new sentence was added.
+- **Stale-answer and guard mutations:** all three are now caught (table below).
+- **Missing speech model:** said once (only `SpeechModelNotice` plus its link). Another missing tool is said once through `MissingToolNotice`.
+- **Changed test assertions:** the missing-model test's expected text changed from "contains the service sentence" to "only the model sentence". That is the change A4 asked for, not a loosening.
+
+**2. B: the switches.**
+- **Time limit:** the first read goes through `readWithin(read, firstReadMs)`, with the screen's own `firstReadMs` passed by both screens.
+- **A failed or slow read:** it shows "This setting could not be read." and "Try again", using the screens' `TryAgain`. Focus goes to the section heading (`tabIndex=-1`).
+- **My probe:**
+  - "Try again" failing again brings the alert and the button back, with focus on the heading;
+  - two presses of "Try again" in one tick cause one read (3 reads in total for fail, fail, success);
+  - the switch is then shown enabled with the value read.
+- **Guard:** pinned on both screens.
+- **Focus after a save:** asserted after a successful and after a failed save (but see S1).
+
+**3. R686: a locked project.**
+- No heading, no switch, and 0 `GET …/automation`, shown both in the screen test and in the routes test through the real `GovernanceRoutes` (`projectLocked: isLocked(project)`).
+- After the unlock the section appears with the value read.
+- `governance.firstReads.test.tsx` and `routes/governance.test.tsx` pass, so the rest of the screen is unchanged.
+- The fakes can now answer 423: `locked` and `automationLocked`/`lockedAutomation`.
+
+**4. C: tool group names.** Each group is labelled by `${ids}-g-${i}`, an id without spaces. A new test checks that every h2's section is a region named by that h2. Nothing else references the old ids, and no behaviour changed: 42/42 tests pass, and `routes/tools` 10/10.
+
+**5. Nothing loosened.** No test was removed or skipped, and no `.only` is left. None of the files the brief forbids is in `git diff --stat 6d2627c..aa65328`.
+
+## Mutations
+
+Each was checked against the shipped tests.
+
+| Mutation | Result | Test that failed |
+|---|---|---|
+| Stale-answer check deleted after `transcribeAll` | caught | "an answer after the project changed is dropped" |
+| Stale-answer check deleted after `untranscribed` | caught | "an answer of the count after the project changed is dropped" |
+| `busy` guard deleted in `send` | caught | "two presses of Transcribe them in the same moment send one request" |
+| Read-only handling deleted | caught | "on a read-only library the button is off…" |
+| `sending` guard deleted in `SavedSwitch` | caught | "two changes … in the same moment" on both screens |
+| `readWithin` replaced by a plain `read` | caught | "never answers" on both screens |
+| Refocus line deleted | caught | "focus stays on the switch…" |
+| `!projectLocked` gate deleted | caught | the screen test and the routes test |
+
+## Runs
+
+Single files, at `nice -n 10`:
+
+| File | Result |
+|---|---|
+| TranscribeAll | 11 passed |
+| GovernanceSettings | 78 passed |
+| GovernanceSettings.backup | 6 passed |
+| ToolsSetup | 42 passed (8 of 9 runs; S1) |
+| Library | 53 passed |
+| Library.firstReads | 18 passed |
+| screens/governance.firstReads | 37 passed |
+| routes/governance | 26 passed |
+| routes/tools | 10 passed |
+
+There is no `SavedSwitch.test.tsx`: its behaviour is tested through the two screens.
+
+Typecheck `@ao/ui`, `lint:css` and `lint:colours` are clean.
+
+## Not checked
+
+- The e2e step, as directed.
+- The real Task 7 routes.
+- WebKit:
+  - where focus goes when a focused box is disabled while saving, or removed at a lock;
+  - VoiceOver's reading of the "Try again" alert.
