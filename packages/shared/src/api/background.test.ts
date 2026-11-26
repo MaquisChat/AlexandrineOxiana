@@ -262,8 +262,9 @@ describe("problems", () => {
       heading: "Could not be downloaded", copy: "Copy the list", copied: "The list was copied.",
       copyFailed: "The list could not be copied. Select it and copy it by hand.", noTitle: "(no title)",
     });
-    expect(RUN_BUTTONS).toEqual({ pause: "Pause", stop: "Stop", showThem: "Show them", discard: "Discard" });
-    expect(LIST_BUTTONS).toEqual({ pause: "Pause", continue: "Continue", stop: "Stop" });
+    // R679 C1: "Remove from this list" takes a finished line off the screen.
+    expect(RUN_BUTTONS).toEqual({ pause: "Pause", stop: "Stop", showThem: "Show them", discard: "Discard", remove: "Remove from this list" });
+    expect(LIST_BUTTONS).toEqual({ pause: "Pause", continue: "Continue", stop: "Stop", remove: "Remove from this list" });
   });
 });
 

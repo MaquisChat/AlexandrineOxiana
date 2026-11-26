@@ -7,6 +7,7 @@ import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, onTestFinished } from "vitest";
 import { createClient } from "../api/client";
 import { libraryApi, type LibraryApi } from "../api/library";
+import { backgroundDefaults } from "./backgroundService";
 
 export const BASE = "http://127.0.0.1:4100";
 export const TOKEN = "t".repeat(40);
@@ -246,5 +247,7 @@ export function libraryHandlers(opts: { current?: Record<string, unknown>; state
     http.get(url("/projects/:id/recheck"), j({ running: null })),
     http.get(url("/styles"), j(STYLES)),
     http.get(url("/events"), () => sse([{ type: "library.state", data: state }, ...(opts.events ?? [])])),
+    // The work lines (whole channels): no download run, and an idle transcription list.
+    ...backgroundDefaults(BASE),
   ];
 }
