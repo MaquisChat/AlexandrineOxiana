@@ -62,6 +62,8 @@ export interface CaptureSetup {
   profileAnswer?: (n: number) => Response | undefined;
   /** Delay before POST /projects/:id/capture-profile answers. */
   profileDelayMs?: number;
+  /** Held until this settles before POST /projects/:id/capture-profile answers. */
+  profileHold?: Promise<unknown>;
   /**
    * Answer of POST /projects/:id/capture-estimate (default: `exampleEstimate`, with `metadataOnly` as asked); a
    * CaptureEstimate is sent as JSON.
@@ -186,6 +188,7 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
       profiles++;
       const n = profiles;
       await wait(o.profileDelayMs);
+      await o.profileHold;
       return o.profileAnswer?.(n) ?? HttpResponse.json({ queueId: `qp${n}` });
     }),
     http.post(url("/projects/:id/capture-estimate"), async ({ request, params }) => {

@@ -411,8 +411,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   const estimateOf = useRef<{ form: string; ac: AbortController } | null>(null);
   const [quality, setQuality] = useState<DownloadQuality>("720p");
   const [estTranscribe, setEstTranscribe] = useState(false);
-  /** The box's starting state, and whether the researcher has changed it (R683 C1). */
-  const estInitial = useRef(false);
+  /** Whether the researcher has touched the box: then it is sent as it shows, and a late read never changes it (R688 N1). */
   const estTouched = useRef(false);
   /** Beside the box when the project's switch could not be read (R683 C2). */
   const [switchNote, setSwitchNote] = useState<string | undefined>();
@@ -430,6 +429,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   const [profileSubmitting, setProfileSubmitting] = useState(false);
   /** The list is being asked for: its status and Cancel are shown (R683 D1). */
   const [listing, setListing] = useState(false);
+  /** A Start is on its way: it was sent with the form as it was, so a change now closes nothing yet (R688 N3). */
+  const [startOut, setStartOut] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [queues, setQueues] = useState<CaptureQueueState[]>([]);
   /** The work lines follow this screen's own event stream (R679 A2). */
@@ -856,11 +857,12 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   }
 
   // One place (R683 B1): the form no longer as it was when "Capture profile" was pressed closes the estimate, said once.
+  // While a Start is out it waits: a refused Start then closes an estimate the form no longer matches (R688 N3).
   useEffect(() => {
-    if (!estimateOf.current || estimateOf.current.form === profileForm) return;
+    if (startOut || !estimateOf.current || estimateOf.current.form === profileForm) return;
     dropEstimate();
     setEstStatus(estimateText.settingsChanged);
-  }, [profileForm]);
+  }, [profileForm, startOut]);
 
   /** "Capture profile": the form checked as before, then the estimate is asked for and shown (nothing is captured yet). */
   const captureProfile = () =>
@@ -897,15 +899,13 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       // The Transcribe box starts from the Transcription choice; "Use the project's setting" is the project's switch,
       // read beside the estimate with the first-read limit, never holding it back (R683 C2).
       estTouched.current = false;
-      estInitial.current = transcribe === "yes";
-      setEstTranscribe(estInitial.current);
+      setEstTranscribe(transcribe === "yes");
       setSwitchNote(undefined);
       if (transcribe === "project") {
         readWithin((signal) => api.automation(projectId, { signal }), firstReadMs, mine.ac.signal).then(
           (a) => {
             if (!stillHere() || estTouched.current) return;
-            estInitial.current = a.transcribeNewMedia === true;
-            setEstTranscribe(estInitial.current);
+            setEstTranscribe(a.transcribeNewMedia === true);
           },
           () => {
             // Not read: the box stays unticked, said beside it; untouched, the service applies the switch.
@@ -939,7 +939,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       const options: ProfileCaptureOptions = { ...shown.options };
       // Explicit only when chosen above ("Transcribe", "Do not transcribe") or changed in the box (R683 C1); else left
       // out, and the service applies the project's switch as it stands then.
-      const explicit = shown.options.transcribe !== undefined || estTranscribe !== estInitial.current;
+      // Once touched, the box is always sent as it shows (R688 N1).
+      const explicit = shown.options.transcribe !== undefined || estTouched.current;
       if (estimate.metadataOnly) {
         // Nothing to transcribe: never sent as true (R683 C3).
         delete options.transcribeModel;
@@ -954,6 +955,7 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
         if (options.transcribeModel !== undefined) options.transcribeModel = estimate.speechModel;
       }
       if (!estimate.metadataOnly) options.quality = quality;
+      setStartOut(true);
       try {
         const { queueId } = await api.captureProfile(projectId, url, options);
         if (!live.current || projectNow.current !== asked) return;
@@ -968,6 +970,8 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       } catch (err) {
         // A missing tool is named as for a refused estimate; the estimate stays, so another quality can be chosen (R685).
         if (live.current && projectNow.current === asked) refused(err, "The profile capture could not be started.", true);
+      } finally {
+        if (live.current) setStartOut(false);
       }
     });
 

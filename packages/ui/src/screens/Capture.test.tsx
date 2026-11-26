@@ -1033,6 +1033,67 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
       expect("quality" in sent.options).toBe(false);
     });
 
+    // R688 N4: every value the snapshot compares, each alone.
+    type Driver = (user: ReturnType<typeof userEvent.setup>) => Promise<void>;
+    const each: Array<[string, Driver | undefined, Driver]> = [
+      ["the address", undefined, (u) => u.type(profileBox(), "x")],
+      ["posts from", undefined, async () => void fireEvent.change(screen.getByLabelText("Posts from"), { target: { value: "2026-01-01" } })],
+      ["posts until", undefined, async () => void fireEvent.change(screen.getByLabelText("Posts until"), { target: { value: "2026-06-30" } })],
+      ["the maximum", undefined, (u) => u.type(screen.getByRole("spinbutton", { name: "Maximum number of items" }), "5")],
+      ["the content types", undefined, (u) => u.click(screen.getByRole("checkbox", { name: "Reels" }))],
+      ["metadata only", undefined, (u) => u.click(screen.getByRole("checkbox", { name: "Metadata only" }))],
+      ["comments", undefined, (u) => u.click(screen.getByRole("checkbox", { name: "Include comments" }))],
+      ["the legal basis", undefined, (u) => u.type(screen.getByRole("textbox", { name: "Legal basis" }), "Public task")],
+      ["the browser session", undefined, (u) => u.click(screen.getByRole("checkbox", { name: "Use my browser session" }))],
+      ["the browser", (u) => u.click(screen.getByRole("checkbox", { name: "Use my browser session" })), (u) => u.selectOptions(screen.getByRole("combobox", { name: "Browser" }), "firefox")],
+      ["the Transcription choice", undefined, (u) => u.click(screen.getByRole("radio", { name: "Transcribe" }))],
+      ["the model", undefined, (u) => u.selectOptions(screen.getByRole("combobox", { name: "Transcription model" }), "small")],
+      ["refresh existing", undefined, (u) => u.click(screen.getByRole("checkbox", { name: "Refresh existing" }))],
+    ];
+    it.each(each)("changing %s alone closes an open estimate with the sentence", async (_name, before, change) => {
+      const { m, user } = await setup({ acknowledged: [P1] });
+      await screen.findByRole("checkbox", { name: "Use my browser session" });
+      await waitFor(() => expect(m.calls.some((c) => c.path === "/projects")).toBe(true));
+      if (before) await before(user);
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByRole("region", { name: HEADING });
+      await change(user);
+      expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
+      expect(screen.getAllByText(CHANGED)).toHaveLength(1);
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    it("a form changed while Start is on its way: nothing is said or cancelled, and the capture starts once (R688 N3)", async () => {
+      const gate = held();
+      const { m, user } = await setup({ profileHold: gate.p });
+      await user.type(profileBox(), YT_CHANNEL);
+      await captureAndStart(user);
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      await user.click(screen.getByRole("checkbox", { name: "Metadata only" }));
+      expect(screen.queryByText(CHANGED)).toBeNull();
+      await act(async () => gate.release());
+      await screen.findByRole("region", { name: "Capture queue" });
+      expect(screen.queryByText(CHANGED)).toBeNull();
+      expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1);
+      expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
+    });
+
+    it("a form changed while a refused Start was on its way closes the estimate once the refusal is in (R688 N3)", async () => {
+      const gate = held();
+      const { m, user } = await setup({ profileHold: gate.p, profileAnswer: () => errorResponse(409, "CONFLICT", "These downloads are already running.") });
+      await user.type(profileBox(), YT_CHANNEL);
+      await captureAndStart(user);
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      await user.click(screen.getByRole("checkbox", { name: "Metadata only" }));
+      expect(screen.queryByText(CHANGED)).toBeNull();
+      await act(async () => gate.release());
+      await screen.findByRole("alert");
+      // The estimate no longer matches the form: it does not stay open to be started with the old settings.
+      await waitFor(() => expect(screen.queryByRole("region", { name: HEADING })).toBeNull());
+      expect(screen.getAllByText(CHANGED)).toHaveLength(1);
+    });
+
     it("the Transcription choice changed under an open estimate closes it", async () => {
       const { m, user } = await setup();
       await user.type(profileBox(), YT_CHANNEL);
@@ -1111,6 +1172,39 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
       await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
       expect(sent(m).options.transcribe).toBe(false);
       expect("transcribeModel" in sent(m).options).toBe(false);
+    });
+
+    it("the box ticked then unticked before a slow switch arrives: Start sends transcribe: false and the box stays unticked (R688 N1)", async () => {
+      const gate = held();
+      const { m, user } = await setup({ automation: { [P1]: true }, automationHold: gate.p });
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByRole("region", { name: HEADING });
+      await user.click(box());
+      await user.click(box());
+      await act(async () => gate.release());
+      await waitFor(() => expect(m.settled(`GET /projects/${P1}/automation`)).toBe(1));
+      await act(async () => {});
+      expect(box().checked).toBe(false);
+      await user.click(screen.getByRole("button", { name: "Start" }));
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      expect(sent(m).options.transcribe).toBe(false);
+    });
+
+    it("a switch read that arrives after the box was touched never changes it (R688 N2)", async () => {
+      const gate = held();
+      const { m, user } = await setup({ automation: { [P1]: false }, automationHold: gate.p });
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByRole("region", { name: HEADING });
+      await user.click(box());
+      await act(async () => gate.release());
+      await waitFor(() => expect(m.settled(`GET /projects/${P1}/automation`)).toBe(1));
+      await act(async () => {});
+      expect(box().checked).toBe(true);
+      await user.click(screen.getByRole("button", { name: "Start" }));
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      expect(sent(m).options.transcribe).toBe(true);
     });
 
     it("the model sent is the one the estimate names", async () => {
