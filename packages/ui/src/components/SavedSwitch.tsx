@@ -14,7 +14,7 @@
  * - `whyId`: the element saying why nothing may be changed now (a locked project, a read-only library): the box is then
  *   off and described by it.
  */
-import { useEffect, useId, useRef, useState, type RefObject } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { FIRST_READ_TIMEOUT_MS, readWithin } from "../api/firstRead";
 import { errorText } from "../api/library";
 import { TryAgain } from "./TryAgain";
@@ -101,7 +101,9 @@ export function SavedSwitch({ label, hint, read, save, whyId, focusTo, firstRead
 
   const saving = wanted !== undefined;
   // The box was disabled while it was saved: focus that was on it comes back to it once it is enabled again.
-  useEffect(() => {
+  // A layout effect (R689): it runs in the same commit that enables the box, before paint and before any other effect,
+  // so there is no moment in which the box is enabled and focus is elsewhere.
+  useLayoutEffect(() => {
     if (saving || !refocus.current) return;
     refocus.current = false;
     if (document.activeElement === document.body || document.activeElement === null) box.current?.focus();

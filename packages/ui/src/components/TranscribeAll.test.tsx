@@ -51,8 +51,8 @@ describe("Transcribe everything without a transcript", () => {
     await userEvent.click(screen.getByRole("button", { name: BUTTON }));
     const said = await screen.findByText(transcribeAllText.confirm(TWELVE));
     expect(said.textContent).toBe("12 sources have audio or video and no transcript: about 3.5 hours of sound. They are transcribed one at a time on this Mac, after anything already on the list.");
-    // The confirmation takes focus.
-    expect(document.activeElement).toBe(said);
+    // The confirmation takes focus (waited for itself, R689).
+    await waitFor(() => expect(document.activeElement).toBe(said));
     expect(screen.getByRole("button", { name: "Transcribe them" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
     expect(m.count("GET /projects/p1/untranscribed")).toBe(1);
@@ -63,7 +63,7 @@ describe("Transcribe everything without a transcript", () => {
     const { m } = start({ untranscribed: { p1: { count: 0, soundSeconds: 0, unknownLengths: 0 } } });
     await userEvent.click(screen.getByRole("button", { name: BUTTON }));
     const said = await screen.findByText("Every source with audio or video already has a transcript, or is already on the transcription list.");
-    expect(document.activeElement).toBe(said);
+    await waitFor(() => expect(document.activeElement).toBe(said));
     expect(screen.queryByRole("button", { name: "Transcribe them" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
     expect(m.count("POST /projects/p1/transcription-list")).toBe(0);
@@ -83,8 +83,8 @@ describe("Transcribe everything without a transcript", () => {
     await waitFor(() => expect(status.textContent).toBe("12 sources were put on the transcription list."));
     expect(m.count("POST /projects/p1/transcription-list")).toBe(1);
     expect(screen.queryByRole("button", { name: "Transcribe them" })).toBeNull();
-    // Focus returns to the button.
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: BUTTON }));
+    // Focus returns to the button (waited for itself, R689).
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: BUTTON })));
   });
 
   it("Cancel sends nothing and focus returns to the button", async () => {

@@ -596,11 +596,12 @@ describe("keeping the Mac awake, on the optional tools screen (whole channels, T
       dropFocus(box);
       expect(document.activeElement).toBe(document.body);
       gates[gates.length - 1]!();
-      await waitFor(() => expect(box.disabled).toBe(false));
+      // The focus itself is waited for (R689), not "enabled" and then focus.
+      await waitFor(() => expect(document.activeElement).toBe(box));
+      expect(box.disabled).toBe(false);
       // Saved: off now; refused: put back to the saved value (off), with the alert.
       expect(box.checked).toBe(false);
       if (outcome === "refused") expect(screen.getByRole("alert").textContent).toContain("The setting could not be saved.");
-      expect(document.activeElement).toBe(box);
     }
   });
 

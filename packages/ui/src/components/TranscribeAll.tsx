@@ -17,7 +17,7 @@
  * screen's read-only banner says why (R684).
  */
 import { transcribeAllText, type UntranscribedResponse } from "@ao/shared";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { backgroundApi } from "../api/background";
 import { ApiClientError, type ApiClient } from "../api/client";
 import { errorText } from "../api/library";
@@ -63,7 +63,8 @@ export function TranscribeAll({ client, projectId, readOnly = false }: Transcrib
     };
   }, [projectId]);
 
-  useEffect(() => {
+  // A layout effect (R689): focus moves in the same commit that shows the sentence or enables the button again.
+  useLayoutEffect(() => {
     const to = focusTo.current;
     if (!to) return;
     focusTo.current = null;
