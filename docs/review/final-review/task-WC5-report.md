@@ -75,3 +75,62 @@ Exactly the plan's table and Task 1's shared sentences: `RUN_ALREADY_RUNNING_TEX
 - `pnpm --filter @ao/library-service typecheck`: exit 0.
 - `@ao/ui build`: built.
 - `e2e/capture.spec.ts` (chromium): 3 passed, 1 failed (scenario 10, disk floor: ruling 3). With the floor bypassed temporarily: scenario 10 passed.
+
+## Fix round (R687)
+
+Fresh implementer. Branch `wc-5-service`, five commits after a0a1226. Each test below failed before its fix unless it is marked as a guard. `packages/library` is untouched.
+
+### A. Runs after a move (C1, Critical): commit 6a4dfce
+- `downloads.ts`:
+  - **Places in the order.** A run's turn is read from the project's order by `seq` each time it is checked (`launch`, `ahead`/`turn`). A continuation is registered again under its old `seq`, so it takes back its place.
+  - **The move's end.** When a halted run ends while `work.stopping` is still true, it returns a continuation (`afterMove`). When it ends after the drain was rolled back, `afterMove` runs at once on the same session.
+  - **`afterMove`**:
+    - On the same root (refused or rolled back), every halted run goes on, including those waiting their turn and those of encrypted projects.
+    - On a new root, only a begun run of a plain project goes on.
+    - A run never goes on when: a Pause or Stop was asked of it, it is held again, its project is locked, or the session has changed.
+    - The continuation's body reads the journal first. If the state is not queued, downloading or waiting, it throws `NotContinued`: the continuation is dropped and the run is published as it now reads.
+- `state.ts`: `stoppedWorkCount()` (for diagnostics and tests).
+- Tests:
+  - "a move refused for time leaves the runs as they were…" (the reviewer's probe);
+  - "after a refused move, a run paused meanwhile stays paused through a later successful move…";
+  - "a run stopped after the move halted it is not continued…": it failed with the journal check removed;
+  - the existing plain-move test now also asserts `stoppedWorkCount() === 0`.
+
+### B. Around a Resume (I1, I2, I3, Minor 9): commit 70e9c48
+- **I3.** `resume` registers the run in `runs` and in the order synchronously at entry.
+  - The run gets its address key once `get` returns, and the same-address check (`addressHeld`) runs then.
+  - `stillHeld()` is checked after every await, and `requireUnlocked` right before `launch`.
+  - A `finally` forgets the run and settles it on every early exit.
+  - Pause on a run being resumed answers 409 (not running). Stop marks the run, waits for it to settle, then writes `stopNotRunning` if nothing holds it.
+  - `discard` and `start` see the run as held.
+- **I1.** A failure after the route answered is logged with `log.warn` as `download-run failed` and published through `publishRun`. A run cut by a lock or a close is excluded.
+- **Minor 9.** `InvalidInputError` RUN_FINISHED becomes 409 CONFLICT with the RUN_FINISHED sentence.
+- Tests: six, under "around a Resume (R687)".
+
+### C. Routes (Minors 2, 5, 6): commit 3df82ef
+- **Estimate.** After the listing, and also after a failed listing, the lock is checked again: 423.
+  - `WorkerToolError` goes through unchanged (409 with the tool id).
+  - TOOL_NOT_INSTALLED without a tool id answers 409 with `TOOL_NOT_INSTALLED_TEXT` (now exported from `errors.ts`, the same sentence as before).
+  - Any other listing failure answers 502 INTERNAL with the library's own plain sentence (`err.message`, which is `plainReason(code)`) and `reason` = the code.
+- **capture-profile** classifies the link right after the lock check. A link the runs refuse answers 400 with `plainReason("UNSUPPORTED_URL")` before any queue or run exists.
+- **No quality.** The service already passed none on, so the new test passed at once: it is a **guard**.
+- The estimate tests for the tool-id row and for 400 on an unknown quality also passed at once: they are guards. The other estimate tests failed first. The lock test gates `videoToolsInstalled`, because a gate on the listing passed by accident (the library's repo read met the lock).
+
+### D. Test-only free space (Minors 3, 7): commit 1181aa2
+- `downloadFreeBytesFromEnv` in `downloads.ts` reads `AO_TEST_FREE_BYTES`, only when `NODE_ENV === "test"`. In test mode, a value that is not 1–16 digits refuses the start and names the variable.
+- `main.ts` reads it beside the other test-only switches and passes it as `downloadFreeBytes`. `e2e/fixtures.ts` sets it to `500000000000`.
+- The `downloadSeams` gate is now `NODE_ENV === "test"` only.
+- Unit tests:
+  - the switch is ignored under any other NODE_ENV;
+  - the seams are ignored under NODE_ENV=development (this failed first, because VITEST let them through).
+- "a paused or stopped first run lets the next one begin" now asserts from `runLog`. With the turn removed, it fails.
+
+### New researcher-visible sentences
+- None. The routes reuse existing sentences: `plainReason(...)` and the existing missing-tool sentence.
+
+### NEEDS A RULING
+- None.
+
+### Runs
+- See the final message.
+- downloads-routes 42 passed; capture-queues 31; capture-routes 10; server 160 passed | 1 skipped; ui-only-routes 128; transcription-jobs 40; streams 3; move-finish 48; library-place-routes 8; lock-during-change 3; typecheck @ao/library-service exit 0; e2e tsc exit 0; `@ao/ui build` built; `e2e/capture.spec.ts` (chromium) 4 passed, scenario 10 included; `git status --short` empty.

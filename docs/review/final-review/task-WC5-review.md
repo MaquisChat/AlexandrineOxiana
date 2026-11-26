@@ -150,3 +150,119 @@ The tests use gates that are released after each test and `state.idle()`, with n
 - The real macOS `diskutil` and `/Volumes` naming.
 - Real yt-dlp and ffmpeg behaviour on a long download during a move. C1 was reproduced with a short drain limit, not a real 60 s download.
 - Whether the closures of the library's `captureProfile` keep an address after the lock until the cut job returns (needs a heap snapshot).
+
+---
+
+# Second look (R687)
+
+Range a0a1226..1181aa2 (A 6a4dfce, B 70e9c48, C 3df82ef, D 1181aa2). All probes were removed and every file restored; `git status --short` is empty.
+
+## Verdict: CHANGES NEEDED
+
+One Important finding (I4), which may need a ruling. Everything else the fix brief asked for holds.
+
+## Important
+
+**I4. A move ends a slow-down wait at once, and the run then asks the platform straight away.** This holds whether the move goes ahead or is refused. `downloads.ts:299-302, 366-392` (`afterMove`, then the library's `resume("continue")`).
+- What happens:
+  - `haltSignal` wakes the wait, as R680 requires, and the run ends with `CaptureCancelledError`. The journal still says `waiting {ms, why: "rate-limited"}`.
+  - The continuation then calls `resume(…, "continue")`. That starts a fresh try: the run is listed again at once.
+  - Whatever was left of the platform's slow-down is dropped, and the growing schedule and the 12-hour clock start again from zero.
+  - A refused move does the same, because the run goes on at once.
+- How I know (probe, since removed):
+  - Set-up: listing slowed down (`FAKE_TOOL_MODE=enumratelimit`); a sleep seam that wakes only on abort.
+  - The run was `waiting` (60 000 ms, rate-limited), with 1 listing in the run log. After a successful move, the run log had 2 lines (a new listing), the run was `downloading`, and no new wait had been started.
+  - This answers your question: the run continues "from a fresh try", not "in the same wait".
+- Smallest fix: when the journal says `waiting` with a `wait`, the continuation's body first sleeps for the rest of that wait before it calls `resume`.
+  - The rest is measured from the run's `updatedAt` plus `wait.ms`.
+  - The sleep goes through the seam, and a Stop or a cut ends it early.
+  - The run stays `waiting` while it sleeps.
+- If the growing schedule must carry on as well (rather than only the current wait), that needs `packages/library`: NEEDS A RULING.
+
+## Minor
+
+1. **A Pause asked of a run still finishing its video after a refused move ends "interrupted", not "paused"** (probe). It never goes on by itself, and Resume works. But `afterMove` drops the run without writing the pause; without a move, the same press gives "paused".
+2. **The continuations after a refused move are audited as `capture.profile.continue`** (probe: `["capture.profile", "capture.profile.continue", "capture.profile.continue"]`).
+   - That records a continuation for a move that did not happen.
+   - For a run that was waiting its turn, it is also the run's FIRST decision: its start is audited as a continuation.
+3. **An estimate whose listing fails for another reason answers 502 with code `INTERNAL`.**
+   - The message is now the library's plain sentence, with the error code as `reason`, which is fine.
+   - The status and code still describe an internal failure, for conditions such as a sign-in being needed or the channel being gone.
+4. **`resume` computes `before` at the press.** If every run ahead ends during the Resume's awaits, the answer is `queued` and a `downloading` event follows at once. This is only cosmetic.
+
+## The fix brief's points, checked
+
+**A (the Critical): closed.**
+
+These tests are in place and pass:
+- the refused-move test (the run and the run behind it go on in their order, `stoppedWorkCount() === 0`);
+- Resume, Pause, then a successful move: the run stays paused and the run log has no new line;
+- a run stopped after the halt is not continued.
+
+Beyond the brief, by probe and by reading:
+
+| Case | How checked | Result |
+|---|---|---|
+| A refused move while one run downloads and two wait | Probe | All three stay held. A Stop of the third while it waits works. The order is kept (A, then B; nothing of C asked). Nothing is left in `stoppedWork`. |
+| A run stopped, finished or discarded between the halt and its continuation | Reading | The journal check (`LIVE`) drops it, and the run is published as it now reads. |
+| A run stopped while its continuation is pending | Reading | The old `Held` has no `asked`, but the journal check catches it. |
+| A run resumed between the halt and its continuation | Reading | `runs.has` prevents a second hold. Resume, Pause, Stop, a lock and a close all answer 503 during a move (server.ts `preHandler`), so the window is only the refused path. |
+| Two moves in a row, the first refused | Test | Covered by the test above. |
+| An encrypted project's run at a successful move | Reading | Not continued; shown interrupted. It is published only if its project is unlocked: `publishRun` swallows `ProjectLockedError`. |
+| A close or a lock during a move | Reading | Refused with 503. |
+| A two-hour wait at a move | Probe | **I4.** |
+
+**B: closed.**
+- I3: the run is registered synchronously at entry. Every early exit lies inside the `try`, whose `finally` forgets the run and settles it when it was not launched:
+  - the run not found;
+  - `RUN_FINISHED`;
+  - an address conflict;
+  - a policy refusal;
+  - the media helper missing;
+  - a lock found by `stillHeld`;
+  - the final `requireUnlocked`.
+
+  A Discard, a Pause, a start of the address and a second Resume all meet the mark; each is tested. A Stop during the Resume ends `stopped` with nothing asked of the platform. A lock during the awaits gives 423, with `memory()` empty and the library's resume never called.
+- I2: a Resume is refused while another held run of the project has the same address. Tested: 409, one run held, no second listing.
+- I1: a failure after the answer is logged as `download-run failed` and the run is published as interrupted. Runs cut by a lock or a close are excluded (`late && !h.cancelled`). Tested.
+- Minor 9: 409 with the `RUN_FINISHED` sentence. Tested.
+
+**C: closed, except Minor 3 above.**
+- No quality in the request means none is passed on (a guard test).
+- The estimate checks the lock again after its listing and on every failure path (423, no title).
+- A missing tool with no id answers 409 with the general sentence.
+- A link the runs refuse answers 400 before any queue or run exists.
+
+**D: closed.**
+- `downloadFreeBytesFromEnv` returns undefined unless `NODE_ENV === "test"`. A unit test covers undefined, `production`, `development`, `Test` and `"test "`.
+- It is read in `main.ts` beside the other test-only switches and gated a second time in `downloadSeams` (`NODE_ENV === "test"` only; the `VITEST` clause is gone).
+- `e2e/fixtures.ts` sets `AO_TEST_FREE_BYTES` to 500 GB.
+
+**Nothing loosened.**
+- `capture-queues.test.ts` was not touched in this range, so :578 is unchanged.
+- The three lines removed from `downloads-routes.test.ts` were replaced by stricter assertions in Minor 7's test.
+
+## Mutations (each restored)
+
+1. **The immediate `afterMove` after a rollback removed**: the refused-move test FAILED.
+2. **The `LIVE` journal check removed**: "a run stopped after the move halted it…" FAILED. The paused-run test still passed: there the `asked` check covers it.
+3. **The turn removed**: "a paused or stopped first run lets the next one begin" now FAILS, as Minor 7 asked.
+
+## Runs (single files, nice -n 10)
+
+- `downloads-routes.test.ts`: 42 passed.
+- `capture-queues.test.ts`: 31 passed.
+- `capture-routes.test.ts`: 10 passed.
+- `server.test.ts`: 160 passed, 1 skipped.
+- `ui-only-routes.test.ts`: 128 passed.
+- `transcription-jobs.test.ts`: 40 passed.
+- `streams.test.ts`: 3 passed.
+- `move-finish.test.ts`: 48 passed.
+- `pnpm --filter @ao/library-service typecheck`: exit 0.
+- The e2e was not run, as instructed.
+
+## What I could not check
+
+- The e2e.
+- A real 60 s drain on a Mac.
+- Whether a real platform punishes a listing sent early during its slow-down (I4).
