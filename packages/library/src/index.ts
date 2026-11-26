@@ -153,7 +153,7 @@ export { ResourceMissingError } from "./resources.js";
 export { DISCARDED_CODE, LIST_KINDS, isListKind } from "./job-journal.js";
 export type { CaptureItemData, CaptureRunData, JobStatus, TranscriptionEntryData, TranscriptionListData } from "./job-journal.js";
 export {
-  createRun, discardRun, readRun, readRunItems, readRuns, recordRunItem, requeueFailedItems, setRunItems, setRunState,
+  createRun, discardRun, readRun, readRunItems, readRuns, recordRunItem, requeueFailedItems, setRunItems, setRunState, setRunTitle,
 } from "./lists/run-journal.js";
 export type { RunItemView, RunView } from "./lists/run-journal.js";
 export {
@@ -171,6 +171,11 @@ export type { BrowserName, CaptureControl, CaptureOptions, CaptureOutcome, Captu
 export type { ProfileCaptureOptions, ProfileCaptureReport, ProfileContentType, ProfileRecord, ProfileRunStatus } from "./capture/profile-capture.js";
 export { CaptureQueueRegistry } from "./capture/queues.js";
 export type { CaptureQueueRegistryOptions } from "./capture/queues.js";
+// Whole channels: download runs, the disk and the estimate (Task 4).
+export { DOWNLOAD_GAP_MS, createDownloadRuns } from "./capture/download-run.js";
+export type { DownloadRuns, DownloadRunsDeps, RunControl, RunOptions } from "./capture/download-run.js";
+export { diskName, freeBytes } from "./capture/disk.js";
+export { estimateCapture } from "./capture/estimate.js";
 
 export * from "./extract/index.js";
 export { AUTO_ACCEPT_THRESHOLD, MAX_CANDIDATES, resolveItem } from "./import/resolve.js";

@@ -65,6 +65,10 @@ const REASONS: Record<string, string> = {
   NETWORK_LOST: "The connection was lost three times.",
   DISK_FULL: "The disk became full during the download, so nothing of it was kept.",
   NETWORK_LOST_GAVE_UP: "The connection stayed lost for 12 hours, so the capture was paused.",
+  // A Resume whose listing did not come back whole: the videos past the cut are still to do (R678).
+  LIST_INCOMPLETE: "The platform's list came back incomplete, so some videos could not be looked for.",
+  // Resume downloads asked of a run that has nothing left to do (R680).
+  RUN_FINISHED: "These downloads have finished, so there is nothing to resume.",
 };
 
 /** What each optional tool (Task 48a catalogue id) is called in a sentence. */
