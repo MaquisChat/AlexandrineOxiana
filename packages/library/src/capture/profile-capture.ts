@@ -41,7 +41,9 @@
  * itself (`wait`, on the growing schedule of waits.ts). With hooks, a video that could not finish
  * for a reason every later video would share (a full disk, a missing tool, the media helper gone,
  * the rules) is put back, not reported, and the run ends; a second lost connection in a row waits
- * on the same schedule. Without hooks (the command line, a profile queue) all of this is as before.
+ * on the same schedule, and 12 hours of them end the run failed (NETWORK_LOST). The listing is
+ * treated the same way (a lost connection there waits from the first). Without hooks (the command
+ * line, a profile queue) all of this is as before.
  * The platform's lane (R116) is taken per listing and per video, never for a whole run (R669 item
  * 2), so a single link goes ahead while a run waits.
  */
