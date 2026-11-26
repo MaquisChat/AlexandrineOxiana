@@ -187,3 +187,35 @@ One commit on top of 04bb184. Nothing pushed; `git status --short` is empty.
 - routes/governance, `on a locked project the Governance screen of the app does not show or read the automatic transcription switch (R686)`.
 
 **Runs** (single files, `nice -n 10`): GovernanceSettings 78 passed; screens/governance.firstReads 37 passed; routes/governance 26 passed; typecheck `@ao/ui` clean.
+
+## Last fix (R689)
+
+One commit on top of aa65328: **9d8fb7d**. Nothing pushed; `git status --short` is empty.
+
+### Code
+- `SavedSwitch` puts focus back on the box in a `useLayoutEffect`. It runs in the same commit that enables the box again, so there is no moment when the box is enabled and focus is elsewhere.
+- `TranscribeAll` moves focus to the sentence or the button the same way.
+
+### Tests
+The tests that assert focus after a request now wait for the focus itself, with `waitFor(() => expect(document.activeElement).toBe(...))`, instead of waiting for "enabled" and then checking focus.
+- **ToolsSetup:** "focus stays on the switch…", after both the successful and the failed save.
+- **TranscribeAll:** three tests:
+  - the confirmation takes focus;
+  - the "nothing to do" sentence takes focus;
+  - focus returns to the button after "Transcribe them".
+- **GovernanceSettings:** no test of this kind.
+
+### Load runs
+Each run: `NODE_OPTIONS="--use-openssl-ca" nice -n 10 pnpm --filter @ao/ui exec vitest run <path> --testTimeout 120000`, with four busy loops running.
+
+| File | Result |
+|---|---|
+| ToolsSetup | 30/30 passed |
+| GovernanceSettings | 30/30 passed (22 + 8) |
+| TranscribeAll | 30/30 passed |
+
+- **Why GovernanceSettings is 22 + 8:** each of its runs takes about 5 minutes under load. The first background batch reached the 2-hour limit after 22 runs, all passed, and was stopped. A second batch ran the last 8 runs.
+- **A first attempt was thrown away:** its pass check was wrong, because it matched the word "failed" inside test names. No result is taken from it.
+- **Nothing is left running:** the busy loops were killed by the script's exit trap.
+
+Typecheck `@ao/ui` is clean.
