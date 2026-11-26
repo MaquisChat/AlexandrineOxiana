@@ -73,8 +73,8 @@ interface Item {
   timestamp: number;
   /** Seconds, carried on the listing's entry (whole channels, Task 3). */
   duration?: number;
-  /** The fake downloader fails this item with the matching error line. */
-  error?: "private" | "removed" | "network" | "disk";
+  /** The fake downloader fails this item with the matching error line (any other text: `ERROR: [x] id: <text>`). */
+  error?: "private" | "removed" | "network" | "disk" | (string & {});
 }
 interface Profile {
   platform: "tiktok" | "instagram" | "youtube";
@@ -1258,6 +1258,105 @@ describe("run hooks (whole channels, Task 3)", { timeout: 120_000 }, () => {
     expect(single).toMatchObject({ status: "created" });
     release("stop");
     expect(await run).toMatchObject({ status: "stopped", created: 3 });
+  });
+
+  describe("the listing with hooks (R674 C1)", () => {
+    it("a slowed-down listing waits on the growing schedule, then lists (guard)", async () => {
+      process.env.FAKE_TOOL_MODE = "enumratelimit";
+      const p = await project();
+      const asked: Array<[number, string]> = [];
+      const hooks: RunHooks = {
+        wait: async (ms, why) => {
+          asked.push([ms, why]);
+          if (asked.length === 2) delete process.env.FAKE_TOOL_MODE;
+          return "go";
+        },
+      };
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks });
+      expect(asked).toEqual([
+        [60_000, "rate-limited"],
+        [120_000, "rate-limited"],
+      ]);
+      expect(r).toMatchObject({ status: "completed", created: 12 });
+      expect(waits).toEqual([]);
+    });
+
+    it("a listing that lost its connection waits from the first, then lists", async () => {
+      process.env.FAKE_TOOL_MODE = "enumnetwork";
+      const p = await project();
+      const asked: Array<[number, string]> = [];
+      const hooks: RunHooks = {
+        wait: async (ms, why) => {
+          asked.push([ms, why]);
+          delete process.env.FAKE_TOOL_MODE;
+          return "go";
+        },
+      };
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks });
+      expect(asked).toEqual([[60_000, "connection"]]);
+      expect(r).toMatchObject({ status: "completed", created: 12 });
+    });
+
+    it("a wait at the listing answered pause or stop ends the run so, with no batch and no report file (C3)", async () => {
+      process.env.FAKE_TOOL_MODE = "enumnetwork";
+      for (const [answer, status] of [["pause", "paused"], ["stop", "stopped"]] as const) {
+        const p = await project();
+        const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks: { wait: async () => answer } });
+        expect([r.status, r.created, r.listComplete]).toEqual([status, 0, false]);
+        expect(await walk(join(lib.root, p.folder, "imports"))).toEqual([]);
+        expect(await walk(join(lib.root, p.folder, "profiles"))).toEqual([]);
+      }
+    });
+
+    it("a missing tool at the listing pauses the run and names the tool; a full disk pauses on the disk", async () => {
+      const submit = client.submit.bind(client);
+      let fail: Error = new WorkerToolError("TOOL_NOT_INSTALLED", "the video downloader is not installed", "video-downloader");
+      vi.spyOn(client, "submit").mockImplementation(async (...args) => {
+        if (args[1].params?.flatList) throw fail;
+        return submit(...args);
+      });
+      const p = await project();
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks: { afterItem: async () => {} } });
+      expect(r).toMatchObject({ status: "paused-tool", errorCode: "TOOL_NOT_INSTALLED", tool: "video-downloader", reason: toolMissingReason("video-downloader"), created: 0 });
+      const { WorkerJobError } = await import("../worker-client.js");
+      fail = new WorkerJobError("DISK_FULL", "no space");
+      const d = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks: { afterItem: async () => {} } });
+      expect(d).toMatchObject({ status: "paused-disk", errorCode: "DISK_FULL", reason: plainReason("DISK_FULL"), created: 0 });
+    });
+
+    it("without hooks a listing that fails fails the run as before (guard)", async () => {
+      process.env.FAKE_TOOL_MODE = "enumnetwork";
+      const p = await project();
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+      expect(r).toMatchObject({ status: "failed", errorCode: "NETWORK_LOST", reason: plainReason("NETWORK_LOST"), created: 0, listComplete: false });
+      expect(waits).toEqual([]);
+    });
+  });
+
+  it("only a completed run claims that missing posts were checked (R674 C2)", async () => {
+    const CHECKED = "The whole profile was listed, so posts missing from it were checked.";
+    const NOT_FINISHED = "The whole profile was listed, but the capture did not finish, so posts missing from it were not checked.";
+    for (const [answer, status] of [["pause", "paused"], ["stop", "stopped"]] as const) {
+      const p = await project();
+      const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { hooks: { beforeItem: async () => answer } });
+      expect([r.status, r.listComplete]).toEqual([status, false]);
+      const text = await readFile(join(lib.root, p.folder, "profiles", "tiktok-fake.dancer", (await reportsOf(p.folder))[0]!), "utf8");
+      expect(text).not.toContain(CHECKED);
+      expect(text).toContain(NOT_FINISHED);
+      const audit = (await auditEvents(p.folder)).filter((e) => e.action === "capture.profile");
+      expect(audit.at(-1)?.details).toMatchObject({ status, listComplete: false });
+    }
+    // a completed run still says so; a limited one says neither
+    const q = await project();
+    expect(await capture.captureProfile(q.id, TT_PROFILE, { transcribe: false }, undefined, { hooks: {} })).toMatchObject({ status: "completed", listComplete: true });
+    const done = await readFile(join(lib.root, q.folder, "profiles", "tiktok-fake.dancer", (await reportsOf(q.folder))[0]!), "utf8");
+    expect(done).toContain(CHECKED);
+    expect((await auditEvents(q.folder)).filter((e) => e.action === "capture.profile").at(-1)?.details).toMatchObject({ status: "completed", listComplete: true });
+    const l = await project();
+    await capture.captureProfile(l.id, TT_PROFILE, { transcribe: false, maxItems: 2 }, undefined, { hooks: { beforeItem: async () => "pause" } });
+    const limited = await readFile(join(lib.root, l.folder, "profiles", "tiktok-fake.dancer", (await reportsOf(l.folder))[0]!), "utf8");
+    expect(limited).not.toContain(CHECKED);
+    expect(limited).not.toContain(NOT_FINISHED);
   });
 
   it("listProfile lists once, with the lengths and what the project already has, and stores nothing", async () => {

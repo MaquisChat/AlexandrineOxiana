@@ -34,7 +34,7 @@ if (mode === "notfound") {
 // Modes: ratelimit (items from position `rateLimitAfter`, default 3, fail with 429), enumpartial
 // (only the first `cutAfter` entries, default 7, then 429), enumbroken (the same, then an extractor
 // error), enumshort (the same, but no error: a list silently shorter than the profile), enumratelimit
-// (the enumeration fails with 429). Items may have `listing` (YouTube: videos | shorts) and `noMedia`,
+// (the enumeration fails with 429), enumnetwork (the enumeration fails with a lost connection). Items may have `listing` (YouTube: videos | shorts) and `noMedia`,
 // `duration` (seconds, carried on the flat entry) and `error` (private | removed | network | disk:
 // the item's download prints the matching ERROR line and exits 1). With `-x` (audio only) an item
 // writes `<id>.m4a` instead of `<id>.mp4`.
@@ -91,6 +91,10 @@ function profileRun(prof) {
   }
   if (mode === "enumratelimit") {
     console.error(`ERROR: [${yt ? "youtube:tab" : "tiktok:user"}] ${prof.handle}: HTTP Error 429: Too Many Requests`);
+    process.exit(1);
+  }
+  if (mode === "enumnetwork") {
+    console.error(`ERROR: [${yt ? "youtube:tab" : "tiktok:user"}] ${prof.handle}: Unable to download webpage: <urlopen error timed out>`);
     process.exit(1);
   }
   const base = url.replace(/\/(videos|shorts)\/?$/, "");

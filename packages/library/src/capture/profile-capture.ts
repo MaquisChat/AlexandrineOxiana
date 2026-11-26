@@ -163,7 +163,7 @@ export interface ProfileCaptureReport {
   profileSourceId?: string;
   /** The run's import batch (every source the run created carries it). */
   batchId?: string;
-  /** The enumeration listed the whole profile (removed-post detection ran). */
+  /** The enumeration listed the whole profile and the run completed (removed-post detection ran). */
   listComplete: boolean;
   created: number;
   duplicates: number;
@@ -504,16 +504,24 @@ export function createProfileCapture(core: CaptureCore) {
     for (;;) {
       const r = await core.inLane(platform, () => enumerate(projectId, c, opts, tool, signal));
       // Rate limited, even part-way through a list: wait and list again, or pause (not once ended, N7).
-      if (r.error === "RATE_LIMITED" || r.results.some((x) => x.partialCode === "RATE_LIMITED")) {
+      // With hooks, a listing that lost its connection waits on the same schedule, from the first
+      // failure (there is no video of its own to fail first, R674 C1).
+      const why: RunWaitWhy | undefined =
+        r.error === "RATE_LIMITED" || r.results.some((x) => x.partialCode === "RATE_LIMITED") ? "rate-limited" : hooked && r.error === "NETWORK_LOST" ? "connection" : undefined;
+      if (why) {
         check();
-        const a = await backOff("rate-limited");
+        const a = await backOff(why);
         if (a === "go") {
           check();
           continue;
         }
         check();
-        if (a === "give-up") pause();
+        if (a === "give-up") gaveUp(why);
         else endAs(a);
+        return audited(projectId, platform, report);
+      }
+      // With hooks, a full disk or a missing tool at the listing ends the run as it would at a video.
+      if (r.error && hooked && putBack({ url: c.canonicalUrl, status: "failed", errorCode: r.error, ...(r.tool ? { tool: r.tool } : {}) })) {
         return audited(projectId, platform, report);
       }
       if (r.error) {
@@ -522,6 +530,8 @@ export function createProfileCapture(core: CaptureCore) {
         return audited(projectId, platform, missing ? { ...failedReport(r.error), ...missing, reason: toolMissingReason(missing.tool) } : failedReport(r.error));
       }
       ({ results, toolVersion } = r);
+      // Listed: the 12 hours start again for the videos, as after a successful video.
+      if (hooked) resetWaits();
       break;
     }
     const { profile, listedIds, incompleteListings, listed } = readListings(results, c, tool);
@@ -794,7 +804,8 @@ export function createProfileCapture(core: CaptureCore) {
     // Sanity guard: a list that shares less than half of the known posts is more likely the wrong
     // list (or a login wall) than half the profile deleted.
     const plausible = checked.length === 0 || overlap * 2 >= checked.length;
-    report.listComplete = !filtered && incompleteListings.size === 0 && plausible && !(entries.length === 0 && checked.length > 0);
+    /** The whole profile was listed; the check for missing posts runs only when the run also completes. */
+    const wholeList = !filtered && incompleteListings.size === 0 && plausible && !(entries.length === 0 && checked.length > 0);
     if (!stopped && (await core.stillAllowed(projectId, platform))) {
       for (const e of entries) {
         check();
@@ -839,6 +850,8 @@ export function createProfileCapture(core: CaptureCore) {
 
     // 7. Report, batch record, audit (written after a stop too: they record what happened).
     check();
+    // Only a completed run checked the posts missing from the list (R674 C2).
+    report.listComplete = wholeList && report.status === "completed";
     const finishedAt = new Date().toISOString();
     rec.lastCapturedAt = finishedAt;
     const reportName = datedFileName("capture", new Date(finishedAt), "md", repoTz(repo));
@@ -847,7 +860,7 @@ export function createProfileCapture(core: CaptureCore) {
     await save([
       ...recordFiles(),
       batchFile(state, finishedAt),
-      { rel: `${dirRel}/reports/${reportName}`, data: reportText(platform, collectionLabel, report, at, finishedAt), dated: true },
+      { rel: `${dirRel}/reports/${reportName}`, data: reportText(platform, collectionLabel, report, at, finishedAt, wholeList), dated: true },
     ]);
     return audited(projectId, platform, report);
   }
@@ -1189,7 +1202,7 @@ function groundingSnapshot(prov: unknown, edited: string | undefined): Record<st
 const PLATFORM_NAMES: Record<Platform, string> = { youtube: "YouTube", instagram: "Instagram", tiktok: "TikTok", other: "Other" };
 
 /** The plain-language capture report (no links, no paths). */
-function reportText(platform: Platform, label: string, r: ProfileCaptureReport, startedAt: string, finishedAt: string): string {
+function reportText(platform: Platform, label: string, r: ProfileCaptureReport, startedAt: string, finishedAt: string, wholeList: boolean): string {
   const gaveUp = plainReason("RATE_LIMITED_GAVE_UP");
   const status =
     r.status === "completed"
@@ -1229,7 +1242,9 @@ function reportText(platform: Platform, label: string, r: ProfileCaptureReport, 
     "",
     r.listComplete
       ? "The whole profile was listed, so posts missing from it were checked."
-      : "The profile was not listed completely (cut short, or limited by date, type or number), so no post was marked as no longer available.",
+      : wholeList
+        ? "The whole profile was listed, but the capture did not finish, so posts missing from it were not checked."
+        : "The profile was not listed completely (cut short, or limited by date, type or number), so no post was marked as no longer available.",
   ];
   const problems = r.items.filter((o) => o.status === "failed" || o.status === "incomplete");
   if (problems.length) {
