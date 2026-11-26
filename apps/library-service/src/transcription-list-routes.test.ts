@@ -14,11 +14,11 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { Writable } from "node:stream";
-import { WorkerClient, deviceDeps, type Deps, type WorkerToolsClient } from "@ao/library";
+import { PolicyDeniedError, WorkerClient, deviceDeps, markTranscriptionEntry, readTranscriptionList, type Deps, type WorkerToolsClient } from "@ao/library";
 import { BACKGROUND_EVENT, transcriptionLines, type BackgroundProgressEvent, type CaptureEstimate, type TranscriptionListSummary } from "@ao/shared";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { FAKE_TOOLS_DIR, startToolWorker, type SubmittedJob, type ToolWorker } from "../../../packages/library/src/capture/testing.js";
-import { appendJobRecords, type JobRecord } from "../../../packages/library/src/job-journal.js";
+import { appendJobRecords, readJobJournal, type JobRecord } from "../../../packages/library/src/job-journal.js";
 import { projectDataKey } from "../../../packages/library/src/repo/repo.js";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
@@ -351,6 +351,9 @@ describe("the transcription list", () => {
     expect(p.status, p.body).toBe(200);
     expect(p.json.list).toMatchObject({ state: "paused", total: 2, done: 0 });
     const ended = listEvent(pid, (l) => l.done === 1);
+    // Anything started after the pause would end at once: a loop that ignored the pause fails below, not by the time
+    // limit (R692 F).
+    worker.instant = true;
     first.released = true;
     expect(await ended).toMatchObject({ state: "paused", done: 1, total: 2 });
     await svc!.state.idle();
@@ -418,16 +421,29 @@ describe("the transcription list", () => {
     const pid = await project();
     const sid = await audioSource(pid, "One", 60);
     const t = svc!.state.transcriptions;
+    const st = svc!.state;
     const real = t.start.bind(t);
+    const cancel = vi.spyOn(t, "cancel");
     let stopped: Promise<unknown> | undefined;
+    let loopEnded!: () => void;
+    const ended = new Promise<void>((r) => (loopEnded = r));
     vi.spyOn(t, "start").mockImplementation(async (...args) => {
       const job = await real(...args);
       await worker!.posted(1);
       stopped = listAct(pid, "stop"); // answered before the loop marks the entry running
       await stopped;
+      // The loop's end is told (its `finally` updates keeping awake once it has left the runner): the wait is bounded
+      // by it, so a loop that forgets to cancel fails by the assertion below, not by the time limit (R692 F).
+      const realUpdate = st.updateKeepAwake.bind(st);
+      vi.spyOn(st, "updateKeepAwake").mockImplementation(() => {
+        realUpdate();
+        if (st.transcriptionList.memory().length === 0) loopEnded();
+      });
       return job;
     });
     await transcribeAll(pid);
+    await ended;
+    expect(cancel).toHaveBeenCalledTimes(1); // the loop cancelled the job it had just started
     await svc!.state.idle();
     expect(((await stopped) as { status: number }).status).toBe(200);
     expect(worker.runs).toHaveLength(1);
@@ -449,11 +465,10 @@ describe("the transcription list", () => {
     await transcribeAll(pid);
     const first = await worker.posted(1);
     await svc!.state.session!.repo.deleteSource(pid, two);
-    const done = listEvent(pid, (l) => l.state === "idle" && l.total > 0);
     worker.instant = true;
     first.released = true;
-    expect(await done).toMatchObject({ total: 2, done: 2, failed: 0 });
-    await svc!.state.idle();
+    await svc!.state.idle(); // the loop is registered work: a loop that stops at the gone source fails below (R692 F)
+    expect(await list(pid)).toMatchObject({ state: "idle", total: 2, done: 2, failed: 0 });
     expect(transcriptionLines(await list(pid)).title).toBe("Transcriptions finished: all 2 done.");
     expect(worker.runs).toHaveLength(2);
     expect(await transcripts(pid, one)).toBe(2);
@@ -700,6 +715,93 @@ describe("the transcription list", () => {
     vi.mocked(svc!.state.downloads.estimate).mockResolvedValue({ ...(e.json as CaptureEstimate), measuredSpeed: undefined, speechModel: "small" } as CaptureEstimate);
     const unmeasured = await call({ method: "POST", url: `/projects/${pid}/capture-estimate`, body: { url: "https://www.tiktok.com/@fake.dancer" } });
     expect(unmeasured.json.measuredSpeed).toBeUndefined();
+  });
+});
+
+/** The entry records of the project's list, by source id (how each ended, with its error code). */
+async function entries(pid: string): Promise<Map<string, { status: string; error?: string }>> {
+  const s = svc!.state.session!;
+  const recs = (await readJobJournal(s.lib.root, s.repo.getProject(pid).folder, pid, projectDataKey(s.repo, pid))).records;
+  const out = new Map<string, { status: string; error?: string }>();
+  for (const r of recs.values()) if (r.kind === "transcription.entry" && r.entry) out.set(r.entry.sourceId, { status: r.status, ...(r.error ? { error: r.error } : {}) });
+  return out;
+}
+
+describe("how an entry ends (R692 F)", () => {
+  it("the project's rules refusing transcription in the middle of the list fail that entry and pause the list", async () => {
+    worker = await stubWorker();
+    worker.instant = true;
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const ids = [await audioSource(pid, "One", 60), await audioSource(pid, "Two", 60), await audioSource(pid, "Three", 60)];
+    const t = svc!.state.transcriptions;
+    const real = t.start.bind(t);
+    let n = 0;
+    vi.spyOn(t, "start").mockImplementation(async (...args) => {
+      if (++n === 2) throw new PolicyDeniedError("transcription is not allowed by this project's rules", { action: "process", process: { op: "transcription", provider: "local" } } as never);
+      return real(...args);
+    });
+    await transcribeAll(pid);
+    await svc!.state.idle();
+    expect(await list(pid)).toMatchObject({ state: "paused", total: 3, done: 1, failed: 1 });
+    const e = await entries(pid);
+    expect([ids.map((id) => e.get(id))]).toEqual([[{ status: "done" }, { status: "failed", error: "POLICY_DENIED" }, { status: "queued" }]]);
+    expect(worker.runs).toHaveLength(1);
+    expect(svc!.state.transcriptionList.active()).toBe(false);
+  });
+
+  it("a failed job fails its entry with its code, and a job ended UNRECOVERABLE gives TRANSCRIPTION_UNRECOVERABLE", async () => {
+    worker = await stubWorker();
+    await start();
+    await openLibrary();
+    const pid = await project();
+    const one = await audioSource(pid, "One", 60);
+    const two = await audioSource(pid, "Two", 60);
+    const three = await audioSource(pid, "Three", 60);
+    const s = svc!.state.session!;
+    // Three is on the list already, its job recorded before (an older run) as ended UNRECOVERABLE.
+    expect((await import("@ao/library").then((m) => m.addToTranscriptionList(s.repo, pid, [{ sourceId: three }]))).added).toBe(1);
+    const [head] = (await readTranscriptionList(s.repo, pid)).pending;
+    const at = clock.toISOString();
+    await appendJobRecords(s.lib.root, s.repo.getProject(pid).folder, projectDataKey(s.repo, pid), [
+      { v: 1, id: "old-job", projectId: pid, kind: "audio.transcribe", status: "failed", error: "UNRECOVERABLE", createdAt: at, updatedAt: at, about: { sourceId: three, model: "medium" } },
+    ]);
+    await markTranscriptionEntry(s.repo, pid, head!.entryId, { status: "running", jobId: "old-job" });
+    worker.failWith = { code: "AUDIO_UNREADABLE", message: "the recording could not be read" };
+    await transcribeAll(pid);
+    await svc!.state.idle();
+    expect(await list(pid)).toMatchObject({ state: "idle", total: 3, done: 0, failed: 3 });
+    const e = await entries(pid);
+    expect([three, one, two].map((id) => e.get(id))).toEqual([
+      { status: "failed", error: "TRANSCRIPTION_UNRECOVERABLE" },
+      { status: "failed", error: "AUDIO_UNREADABLE" },
+      { status: "failed", error: "AUDIO_UNREADABLE" },
+    ]);
+    expect(worker.runs).toHaveLength(2);
+  });
+
+  it("a read-only library refuses each of the four routes that change the list (R684)", async () => {
+    await start();
+    await openLibrary();
+    const pid = await project();
+    await audioSource(pid, "One", 60);
+    await svc!.close();
+    const metaPath = join(tmp, "Lib", "library.json");
+    await writeFile(metaPath, JSON.stringify({ ...JSON.parse(await readFile(metaPath, "utf8")), formatVersion: 99 }));
+    svc = await createService(serviceOpts as ServiceOptions);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } })).json).toMatchObject({ mode: "read-only" });
+    expect((await call({ url: `/projects/${pid}/transcription-list` })).status).toBe(200); // reading still works
+    for (const r of [
+      { method: "POST" as const, url: `/projects/${pid}/transcription-list/pause` },
+      { method: "POST" as const, url: `/projects/${pid}/transcription-list/continue` },
+      { method: "POST" as const, url: `/projects/${pid}/transcription-list/stop` },
+      { method: "POST" as const, url: `/projects/${pid}/transcription-list`, body: {} },
+    ]) {
+      const res = await call(r);
+      expect(res.status, r.url).toBe(409);
+      expect(res.json.error).toMatchObject({ code: "READ_ONLY", message: "This library is open read-only, so nothing can be changed." });
+    }
   });
 });
 
