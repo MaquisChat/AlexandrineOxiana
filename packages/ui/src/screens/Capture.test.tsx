@@ -742,7 +742,7 @@ describe("Capture screen — profile", () => {
     ]);
     expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({
       url: PROFILE,
-      options: { transcribe: false, since: "2026-01-01", until: "2026-06-30", maxItems: 25, contentTypes: ["reels"], metadataOnly: true },
+      options: { since: "2026-01-01", until: "2026-06-30", maxItems: 25, contentTypes: ["reels"], metadataOnly: true },
     });
     const queue = await screen.findByRole("region", { name: "Capture queue" });
     expect(within(queue).getByText(PROFILE)).toBeTruthy();
@@ -793,7 +793,10 @@ describe("Capture screen — profile", () => {
     await user.type(field, "Legitimate interests");
     await captureAndStart(user);
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
-    expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({ url: PROFILE, options: { transcribe: false, quality: "720p", includeComments: true, legalBasis: "Legitimate interests" } });
+    expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({
+      url: PROFILE,
+      options: { transcribeModel: "medium", quality: "720p", includeComments: true, legalBasis: "Legitimate interests" },
+    });
   });
 
   it("the work lines are shown for the open project", async () => {
@@ -885,8 +888,8 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
     await user.type(profileBox(), YT_CHANNEL);
     await user.click(screen.getByRole("button", { name: "Capture profile" }));
     const box = (await screen.findByRole("checkbox", { name: "Transcribe each video on this Mac (speech model: small)" })) as HTMLInputElement;
-    // "Use the project's setting", and the project's switch is on.
-    expect(box.checked).toBe(true);
+    // "Use the project's setting", and the project's switch is on (read beside the estimate, R683 C2).
+    await waitFor(() => expect(box.checked).toBe(true));
     expect(m.calls.filter((c) => c.path === `/projects/${P1}/automation`)).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: "Cancel" }));
     // "Do not transcribe" above starts it unticked, without asking the project.
@@ -925,7 +928,7 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
     await user.type(profileBox(), YT_CHANNEL);
     await captureAndStart(user);
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
-    expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({ url: YT_CHANNEL, options: { transcribe: false, quality: "ready" } });
+    expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({ url: YT_CHANNEL, options: { transcribeModel: "medium", quality: "ready" } });
   });
 
   it("Cancel goes back with focus on the profile field", async () => {
@@ -1021,6 +1024,102 @@ describe("Capture screen — the estimate before a profile is captured (whole ch
       expect(screen.queryByRole("region", { name: HEADING })).toBeNull();
       expect(screen.getAllByText(CHANGED)).toHaveLength(1);
       expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(0);
+    });
+  });
+
+  describe("the project's switch is never overridden by a failed read (R683 C)", () => {
+    const NOT_READ = "The project's switch for automatic transcription could not be read. This capture follows the switch as it stands, unless you tick the box.";
+    const box = () => screen.getByRole("checkbox", { name: /Transcribe each video on this Mac/ }) as HTMLInputElement;
+    const sent = (m: ReturnType<typeof mockCapture>) => m.bodies(`POST /projects/${P1}/capture-profile`)[0] as { url: string; options: Record<string, unknown> };
+
+    it("the switch cannot be read: the box starts unticked and says so; untouched, Start leaves transcription to the service", async () => {
+      const { m, user } = await setup({ automation: { [P1]: true }, automationAnswer: () => errorResponse(500, "INTERNAL", "Something went wrong.") });
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByRole("region", { name: HEADING });
+      expect(await screen.findByText(NOT_READ)).toBeTruthy();
+      expect(box().checked).toBe(false);
+      expect(document.getElementById(box().getAttribute("aria-describedby")!)!.textContent).toBe(NOT_READ);
+      await user.click(screen.getByRole("button", { name: "Start" }));
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      expect("transcribe" in sent(m).options).toBe(false);
+    });
+
+    it("the switch cannot be read and the box is ticked: transcribe: true", async () => {
+      const { m, user } = await setup({ automationAnswer: () => errorResponse(500, "INTERNAL", "Something went wrong.") });
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByText(NOT_READ);
+      await user.click(box());
+      await user.click(screen.getByRole("button", { name: "Start" }));
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      expect(sent(m).options).toEqual({ transcribe: true, transcribeModel: "medium", quality: "720p" });
+    });
+
+    it("a switch slower than the estimate never holds it back; the box follows it when it comes", async () => {
+      const gate = held();
+      const { m, user } = await setup({ automation: { [P1]: true }, automationHold: gate.p });
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByRole("region", { name: HEADING });
+      expect(m.settled(`GET /projects/${P1}/automation`)).toBe(0);
+      expect(box().checked).toBe(false);
+      await act(async () => gate.release());
+      await waitFor(() => expect(box().checked).toBe(true));
+      expect(screen.queryByText(NOT_READ)).toBeNull();
+      // Untouched: the service applies the switch as it stands.
+      await user.click(screen.getByRole("button", { name: "Start" }));
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      expect("transcribe" in sent(m).options).toBe(false);
+    });
+
+    it("“Do not transcribe” above is sent as transcribe: false", async () => {
+      const { m, user } = await setup({ automation: { [P1]: true } });
+      await user.click(screen.getByRole("radio", { name: "Do not transcribe" }));
+      await user.type(profileBox(), YT_CHANNEL);
+      await captureAndStart(user);
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      expect(sent(m).options).toEqual({ transcribe: false, quality: "720p" });
+    });
+
+    it("the box changed from the switch is sent explicitly", async () => {
+      const { m, user } = await setup({ automation: { [P1]: true } });
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByRole("region", { name: HEADING });
+      await waitFor(() => expect(box().checked).toBe(true));
+      await user.click(box());
+      await user.click(screen.getByRole("button", { name: "Start" }));
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      expect(sent(m).options.transcribe).toBe(false);
+      expect("transcribeModel" in sent(m).options).toBe(false);
+    });
+
+    it("the model sent is the one the estimate names", async () => {
+      const { m, user } = await setup();
+      await user.selectOptions(screen.getByRole("combobox", { name: "Transcription model" }), "small");
+      await user.click(screen.getByRole("radio", { name: "Do not transcribe" }));
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      // Asked without a model, the estimate names the service's (medium).
+      await user.click(await screen.findByRole("checkbox", { name: "Transcribe each video on this Mac (speech model: medium)" }));
+      await user.click(screen.getByRole("button", { name: "Start" }));
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      expect(sent(m).options).toEqual({ transcribe: true, transcribeModel: "medium", quality: "720p" });
+    });
+
+    it("metadata only: no box, and transcription is never sent as true", async () => {
+      const { m, user } = await setup();
+      await user.click(screen.getByRole("radio", { name: "Transcribe" }));
+      await user.click(screen.getByRole("checkbox", { name: "Metadata only" }));
+      await user.type(profileBox(), YT_CHANNEL);
+      await user.click(screen.getByRole("button", { name: "Capture profile" }));
+      await screen.findByRole("region", { name: HEADING });
+      expect(screen.queryByRole("checkbox", { name: /Transcribe each video on this Mac/ })).toBeNull();
+      await user.click(screen.getByRole("button", { name: "Start" }));
+      await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+      expect(sent(m).options.transcribe).not.toBe(true);
+      expect("transcribeModel" in sent(m).options).toBe(false);
     });
   });
 

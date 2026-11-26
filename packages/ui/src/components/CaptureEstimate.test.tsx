@@ -25,10 +25,34 @@ const channel = (over: Partial<Estimate> = {}): Estimate => ({
 });
 
 /** The component with its quality and transcription held as the screen holds them. */
-function Holder({ estimate, transcribe: t0 = false, onStart = () => {}, onCancel = () => {} }: { estimate: Estimate; transcribe?: boolean; onStart?: () => void; onCancel?: () => void }) {
+function Holder({
+  estimate,
+  transcribe: t0 = false,
+  transcribeNote,
+  onStart = () => {},
+  onCancel = () => {},
+}: {
+  estimate: Estimate;
+  transcribe?: boolean;
+  transcribeNote?: string;
+  onStart?: () => void;
+  onCancel?: () => void;
+}) {
   const [quality, setQuality] = useState<DownloadQuality>(initialQuality(estimate));
   const [transcribe, setTranscribe] = useState(t0);
-  return <CaptureEstimate estimate={estimate} quality={quality} onQuality={setQuality} transcribe={transcribe} onTranscribe={setTranscribe} onStart={onStart} onCancel={onCancel} busy={false} />;
+  return (
+    <CaptureEstimate
+      estimate={estimate}
+      quality={quality}
+      onQuality={setQuality}
+      transcribe={transcribe}
+      onTranscribe={setTranscribe}
+      {...(transcribeNote !== undefined ? { transcribeNote } : {})}
+      onStart={onStart}
+      onCancel={onCancel}
+      busy={false}
+    />
+  );
 }
 
 const region = () => screen.getByRole("region", { name: 'Capture channel: "Example Channel"' });
@@ -108,6 +132,23 @@ describe("CaptureEstimate", () => {
     render(<Holder estimate={channel({ metadataOnly: true })} />);
     expect(screen.queryByRole("group", { name: "Quality" })).toBeNull();
     expect(screen.getByText("Metadata only: almost no disk space is needed.")).toBeTruthy();
+  });
+
+  it("metadata only offers no Transcribe box and no transcribing time (R683 C3)", () => {
+    render(<Holder estimate={channel({ metadataOnly: true })} transcribe />);
+    expect(screen.queryByRole("group", { name: "Transcribe" })).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByText(/^Transcribing:/)).toBeNull();
+  });
+
+  it("a note on the Transcribe box is shown beside it and describes it (R683 C2)", () => {
+    const NOTE = "The project's switch for automatic transcription could not be read. This capture follows the switch as it stands, unless you tick the box.";
+    render(<Holder estimate={channel()} transcribeNote={NOTE} />);
+    const box = screen.getByRole("checkbox", { name: /Transcribe each video on this Mac/ });
+    const ids = box.getAttribute("aria-describedby");
+    expect(ids).toBeTruthy();
+    expect(document.getElementById(ids!)!.textContent).toBe(NOTE);
+    expect(within(screen.getByRole("group", { name: "Transcribe" })).getByText(NOTE)).toBeTruthy();
   });
 
   it("the Transcribe box names the speech model and follows its value", async () => {

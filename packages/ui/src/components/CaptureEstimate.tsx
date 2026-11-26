@@ -6,7 +6,8 @@
  *
  * Without Video tools (`videoToolsInstalled === false`) the four better choices are disabled, said so with a link to
  * install them, and the ready-made file is offered; with them, it is not offered. Metadata only has no quality.
- * The heading takes focus when the estimate appears.
+ * The heading takes focus when the estimate appears. Metadata only has no Transcribe box either (R683 C3); a note on
+ * the box (`transcribeNote`, e.g. the project's switch could not be read) is shown beside it and describes it.
  */
 import { useEffect, useId, useRef } from "react";
 import {
@@ -26,6 +27,8 @@ export interface CaptureEstimateProps {
   estimate: Estimate;
   transcribe: boolean;
   onTranscribe(v: boolean): void;
+  /** Said beside the Transcribe box, and tied to it (R683 C2). */
+  transcribeNote?: string;
   quality: DownloadQuality;
   onQuality(q: DownloadQuality): void;
   onStart(): void;
@@ -38,7 +41,7 @@ export const initialQuality = (e: Estimate): DownloadQuality => (e.videoToolsIns
 
 const needsTools = (q: DownloadQuality) => QUALITIES_NEEDING_VIDEO_TOOLS.includes(q);
 
-export function CaptureEstimate({ estimate: e, transcribe, onTranscribe, quality, onQuality, onStart, onCancel, busy }: CaptureEstimateProps) {
+export function CaptureEstimate({ estimate: e, transcribe, onTranscribe, transcribeNote, quality, onQuality, onStart, onCancel, busy }: CaptureEstimateProps) {
   const id = useId();
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => heading.current?.focus(), []);
@@ -84,12 +87,25 @@ export function CaptureEstimate({ estimate: e, transcribe, onTranscribe, quality
           )}
         </fieldset>
       )}
-      <fieldset className="ao-capture__group ao-capture-estimate__choices">
-        <legend>{L.transcribe}</legend>
-        <label>
-          <input type="checkbox" checked={transcribe} onChange={(ev) => onTranscribe(ev.target.checked)} /> {estimateText.transcribeLabel(e.speechModel)}
-        </label>
-      </fieldset>
+      {!e.metadataOnly && (
+        <fieldset className="ao-capture__group ao-capture-estimate__choices">
+          <legend>{L.transcribe}</legend>
+          <label>
+            <input
+              type="checkbox"
+              checked={transcribe}
+              aria-describedby={transcribeNote ? `${id}-tnote` : undefined}
+              onChange={(ev) => onTranscribe(ev.target.checked)}
+            />{" "}
+            {estimateText.transcribeLabel(e.speechModel)}
+          </label>
+          {transcribeNote && (
+            <p className="ao-capture__hint" id={`${id}-tnote`}>
+              {transcribeNote}
+            </p>
+          )}
+        </fieldset>
+      )}
       <dl className="ao-capture-estimate__facts">
         <dt>{L.disk}</dt>
         <dd>
@@ -100,7 +116,7 @@ export function CaptureEstimate({ estimate: e, transcribe, onTranscribe, quality
         <dt>{L.time}</dt>
         <dd>
           <p>{estimateText.downloadTime(e)}</p>
-          {transcribe && <p>{estimateText.transcribeTime(e)}</p>}
+          {transcribe && !e.metadataOnly && <p>{estimateText.transcribeTime(e)}</p>}
         </dd>
       </dl>
       <div className="ao-capture__actions">

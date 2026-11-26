@@ -15,7 +15,9 @@
  * A profile, channel or playlist is not captured at once (whole channels, Task 8): "Capture profile" asks the
  * service for an estimate (the platform is asked only for the list) and shows it in place of the form's buttons
  * (CaptureEstimate), with the quality and the Transcribe box; "Start" captures it. The box starts from the
- * Transcription choice, where "Use the project's setting" is the project's automation switch.
+ * Transcription choice, where "Use the project's setting" is the project's automation switch (read beside the estimate;
+ * untouched, Start leaves transcription out and the service applies the switch, R683 C). The estimate belongs to the
+ * form as it was when "Capture profile" was pressed: any change closes it (R683 B).
  *
  * Stale answers are dropped: the screen is keyed by its project, every answer and event is checked
  * against `live` (unmount), a read is used only if the connection it was asked on is still the
@@ -409,6 +411,11 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
   const estimateOf = useRef<{ form: string; ac: AbortController } | null>(null);
   const [quality, setQuality] = useState<DownloadQuality>("720p");
   const [estTranscribe, setEstTranscribe] = useState(false);
+  /** The box's starting state, and whether the researcher has changed it (R683 C1). */
+  const estInitial = useRef(false);
+  const estTouched = useRef(false);
+  /** Beside the box when the project's switch could not be read (R683 C2). */
+  const [switchNote, setSwitchNote] = useState<string | undefined>();
   /** The project this screen is for now: an estimate asked for another one is dropped. */
   const projectNow = useRef(projectId);
   projectNow.current = projectId;
@@ -856,22 +863,30 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       const stillHere = () => live.current && projectNow.current === asked && estimateOf.current === mine;
       const platform = previewLink(url).platform;
       setEstStatus(LISTED.includes(platform) ? estimateText.listing(platform as CapturePlatform) : "");
+      // The Transcribe box starts from the Transcription choice; "Use the project's setting" is the project's switch,
+      // read beside the estimate with the first-read limit, never holding it back (R683 C2).
+      estTouched.current = false;
+      estInitial.current = transcribe === "yes";
+      setEstTranscribe(estInitial.current);
+      setSwitchNote(undefined);
+      if (transcribe === "project") {
+        readWithin((signal) => api.automation(projectId, { signal }), firstReadMs, mine.ac.signal).then(
+          (a) => {
+            if (!stillHere() || estTouched.current) return;
+            estInitial.current = a.transcribeNewMedia === true;
+            setEstTranscribe(estInitial.current);
+          },
+          () => {
+            // Not read: the box stays unticked, said beside it; untouched, the service applies the switch.
+            if (stillHere()) setSwitchNote(estimateText.switchNotRead);
+          },
+        );
+      }
       try {
-        // The Transcribe box starts from the Transcription choice; "Use the project's setting" is the project's switch.
-        const [estimate, transcribeNow] = await Promise.all([
-          api.estimate(projectId, url, options, { signal: mine.ac.signal }),
-          transcribe === "project"
-            ? api.automation(projectId).then(
-                (a) => a.transcribeNewMedia === true,
-                // Not readable: the box starts unticked, and the researcher sees it before Start.
-                () => false,
-              )
-            : Promise.resolve(transcribe === "yes"),
-        ]);
+        const estimate = await api.estimate(projectId, url, options, { signal: mine.ac.signal });
         if (!stillHere()) return;
         setEstStatus("");
         setQuality(initialQuality(estimate));
-        setEstTranscribe(transcribeNow);
         setShown({ estimate, url, options, form: mine.form });
       } catch (err) {
         if (!stillHere()) return;
@@ -888,10 +903,23 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
       const asked = projectId;
       const { url, estimate } = shown;
       // By assignment to the shared request type, as baseOptions (R184).
-      const options: ProfileCaptureOptions = { ...shown.options, transcribe: estTranscribe };
-      // The model the estimate was asked with (the one its Transcribe box names).
-      if (estTranscribe) options.transcribeModel = shown.options.transcribeModel ?? model;
-      else delete options.transcribeModel;
+      const options: ProfileCaptureOptions = { ...shown.options };
+      // Explicit only when chosen above ("Transcribe", "Do not transcribe") or changed in the box (R683 C1); else left
+      // out, and the service applies the project's switch as it stands then.
+      const explicit = shown.options.transcribe !== undefined || estTranscribe !== estInitial.current;
+      if (estimate.metadataOnly) {
+        // Nothing to transcribe: never sent as true (R683 C3).
+        delete options.transcribeModel;
+        if (options.transcribe !== undefined) options.transcribe = false;
+      } else if (explicit) {
+        options.transcribe = estTranscribe;
+        // The model the box names (R683 C3).
+        if (estTranscribe) options.transcribeModel = estimate.speechModel;
+        else delete options.transcribeModel;
+      } else {
+        delete options.transcribe;
+        if (options.transcribeModel !== undefined) options.transcribeModel = estimate.speechModel;
+      }
       if (!estimate.metadataOnly) options.quality = quality;
       try {
         const { queueId } = await api.captureProfile(projectId, url, options);
@@ -1266,7 +1294,11 @@ export function Capture({ client, projectId, firstReadMs = FIRST_READ_TIMEOUT_MS
             quality={quality}
             onQuality={setQuality}
             transcribe={estTranscribe}
-            onTranscribe={setEstTranscribe}
+            onTranscribe={(v) => {
+              estTouched.current = true;
+              setEstTranscribe(v);
+            }}
+            {...(switchNote ? { transcribeNote: switchNote } : {})}
             onStart={() => void startProfile()}
             onCancel={cancelEstimate}
             busy={submitting}
