@@ -104,7 +104,7 @@ describe("the transcription list", () => {
     expect(await addToTranscriptionList(kit.repo, p.id, [{ sourceId: paper.source.id }])).toEqual({ added: 0 });
   });
 
-  it("adding to an empty list resets total, done and failed", async () => {
+  it("adding to an emptied list keeps total, done and failed: only a Stop sets them to 0 (R692)", async () => {
     const p = await makeProject(kit);
     const a = await audioSource(p, "Alpha");
     const b = await audioSource(p, "Beta");
@@ -115,11 +115,36 @@ describe("the transcription list", () => {
     await markTranscriptionEntry(kit.repo, p.id, eb!.entryId, { status: "failed", error: "WORKER_FAILED" });
     expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ total: 2, done: 1, failed: 1, pending: [] });
     await addToTranscriptionList(kit.repo, p.id, [{ sourceId: c.source.id }]);
-    expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ total: 1, done: 0, failed: 0 });
+    expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ total: 3, done: 1, failed: 1 });
     // Not empty: added on top.
     await addToTranscriptionList(kit.repo, p.id, [{ sourceId: a.source.id }]);
-    expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ total: 2, done: 0, failed: 0 });
+    expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ total: 4, done: 1, failed: 1 });
     expect(await pendingIds(p)).toEqual([c.source.id, a.source.id]);
+    // A Stop (or "Remove from this list") is what sets them to 0.
+    await stopTranscriptionList(kit.repo, p.id);
+    expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ total: 0, done: 0, failed: 0, pending: [] });
+    await addToTranscriptionList(kit.repo, p.id, [{ sourceId: b.source.id }]);
+    expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ total: 1, done: 0, failed: 0 });
+  });
+
+  it("an entry that has ended never moves again: a Stop that lands as its job ends leaves the counters at 0 (R692)", async () => {
+    const p = await makeProject(kit);
+    const a = await audioSource(p, "Alpha");
+    await addToTranscriptionList(kit.repo, p.id, [{ sourceId: a.source.id }]);
+    const [ea] = (await readTranscriptionList(kit.repo, p.id)).pending;
+    await markTranscriptionEntry(kit.repo, p.id, ea!.entryId, { status: "running", jobId: "job-a" });
+    await stopTranscriptionList(kit.repo, p.id);
+    // The job ended just before the Stop's write: the loop's mark comes after it.
+    expect(await markTranscriptionEntry(kit.repo, p.id, ea!.entryId, { status: "done" })).toBe(false);
+    expect(await markTranscriptionEntry(kit.repo, p.id, ea!.entryId, { status: "failed", error: "WORKER_FAILED" })).toBe(false);
+    expect(await readTranscriptionList(kit.repo, p.id)).toEqual({ state: "running", total: 0, done: 0, failed: 0, pending: [] });
+    // done -> failed is refused too.
+    const b = await audioSource(p, "Beta");
+    await addToTranscriptionList(kit.repo, p.id, [{ sourceId: b.source.id }]);
+    const [eb] = (await readTranscriptionList(kit.repo, p.id)).pending;
+    await markTranscriptionEntry(kit.repo, p.id, eb!.entryId, { status: "done" });
+    expect(await markTranscriptionEntry(kit.repo, p.id, eb!.entryId, { status: "failed", error: "WORKER_FAILED" })).toBe(false);
+    expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ total: 1, done: 1, failed: 0 });
   });
 
   it("markTranscriptionEntry done and failed move the counters", async () => {

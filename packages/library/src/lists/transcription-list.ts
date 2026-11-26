@@ -5,9 +5,9 @@
  *
  * - An entry is queued, then running (with the id of its transcription job), then done, failed or cancelled.
  *   The pending entries (queued and running) are transcribed one at a time, in the order they were added.
- * - `total` counts what was put on the list since it was last empty, less what was cancelled (a source gone
- *   before its turn, or the list stopped): so `total` = done + failed + pending. Adding to an empty list starts
- *   the counters again.
+ * - `total` counts what was put on the list since it was last stopped, less what was cancelled (a source gone
+ *   before its turn): so `total` = done + failed + pending. An add only adds: the counters go back to 0 only
+ *   through `stopTranscriptionList` (a Stop, or "Remove from this list" of an idle list) (R692).
  * - Putting sources on the list is decided once by the project's rules (process: transcription, local); a deny
  *   is audited and thrown, an allow is not audited here: each transcription audits its own decision when it runs
  *   (as `transcriptionJob` does). The records themselves are not governed changes, as the worker's are not.
@@ -166,8 +166,7 @@ export async function addToTranscriptionList(repo: Repo, projectId: string, item
       return { v: 1, id: randomUUID(), projectId, kind: ENTRY_KIND, status: "queued", createdAt: created, updatedAt: created, entry };
     });
     const { data } = listOf(records);
-    const base = pending.length === 0 ? { ...data, total: 0, done: 0, failed: 0 } : data;
-    return [...recs, listRecord(projectId, records, { ...base, total: base.total + fresh.length }, at)];
+    return [...recs, listRecord(projectId, records, { ...data, total: data.total + fresh.length }, at)];
   });
   return { added };
 }
@@ -194,10 +193,11 @@ function moved(data: TranscriptionListData, from: JobStatus, to: JobStatus): Tra
 const ENDED: ReadonlySet<JobStatus> = new Set(["done", "failed", "cancelled"]);
 
 /**
- * Records what became of one entry; the list's counters follow (an entry marked twice is counted once). An entry
- * that has ended (done, failed, cancelled) is never moved back to running or queued: such a call writes nothing
- * and returns false (R672: a Stop that came between the start of an entry's job and this mark; the caller then
- * cancels the job it started). An entry no longer in the journal (dropped by compaction after a Stop) is treated
+ * Records what became of one entry; the list's counters follow. An entry that has ended (done, failed,
+ * cancelled) never moves again: any call that would move it out of its ended state writes nothing and returns
+ * false (R672: a Stop that came between the start of an entry's job and this mark, the caller then cancels the
+ * job it started; R692: a Stop that landed just as the job ended, so the list stays empty with its counters at
+ * 0). Marking an ended entry with the status it already has writes nothing and returns true. An entry no longer in the journal (dropped by compaction after a Stop) is treated
  * the same: nothing is written and false is returned (R676). Every other move returns true.
  */
 export async function markTranscriptionEntry(
@@ -216,8 +216,10 @@ export async function markTranscriptionEntry(
       moves = false;
       return [];
     }
-    moves = !(ENDED.has(old.status) && (next.status === "running" || (next.status as JobStatus) === "queued"));
-    if (!moves) return [];
+    if (ENDED.has(old.status)) {
+      moves = next.status === old.status;
+      return [];
+    }
     const at = repoClock(repo)().toISOString();
     const { error: _error, ...base } = old;
     const entry: TranscriptionEntryData = next.status === "running" ? { ...old.entry, jobId: next.jobId } : old.entry;

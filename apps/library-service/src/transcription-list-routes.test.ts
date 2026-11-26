@@ -557,6 +557,13 @@ describe("a run with transcribe", () => {
     await start({ worker: provider({ endpoint: { baseUrl: tw.baseUrl, token: tw.token } }), downloadSleep: async () => {}, downloadFreeBytes: async () => null });
     await openLibrary();
     const pid = await project();
+    // Every line the list publishes across the run (R692): its counters only grow, never back to "1 of 1".
+    const lines: TranscriptionListSummary[] = [];
+    const off = svc!.state.events.subscribe((e) => {
+      const d = e.data as unknown as BackgroundProgressEvent;
+      if (e.type === BACKGROUND_EVENT && d.projectId === pid && d.transcriptions) lines.push(d.transcriptions);
+    });
+    onTestFinished(() => off?.());
     const r = await call({ method: "POST", url: `/projects/${pid}/capture-profile`, body: { url: "https://www.tiktok.com/@fake.dancer", options: { transcribe: true } } });
     expect(r.status, r.body).toBe(200);
     await reached;
@@ -577,13 +584,23 @@ describe("a run with transcribe", () => {
       await next;
     }
     expect(tw.submitted.filter((j) => j.type === "audio.transcribe")).toHaveLength(2);
+    // The second of the two stored so far is done: "2 of 2", not "1 of 1" (its mark may follow its transcript).
+    const settled = listEvent(pid, (l) => l.state === "idle");
+    const now = await list(pid);
+    expect(now.state === "idle" ? now : await settled).toMatchObject({ state: "idle", total: 2, done: 2, failed: 0 });
     release();
     await svc!.state.idle();
     const all = await videos();
     expect(all).toHaveLength(3);
     for (const sid of all) expect(await transcripts(pid, sid)).toBe(2);
-    expect(await list(pid)).toMatchObject({ state: "idle", failed: 0 });
+    expect(await list(pid)).toMatchObject({ state: "idle", total: 3, done: 3, failed: 0 });
+    expect(transcriptionLines(await list(pid)).title).toBe("Transcriptions finished: all 3 done.");
     expect(tw.submitted.filter((j) => j.type === "audio.transcribe")).toHaveLength(3);
+    expect(lines.length).toBeGreaterThan(0);
+    for (let i = 1; i < lines.length; i++) {
+      expect(lines[i]!.total, `line ${i}`).toBeGreaterThanOrEqual(lines[i - 1]!.total);
+      expect(lines[i]!.done, `line ${i}`).toBeGreaterThanOrEqual(lines[i - 1]!.done);
+    }
   });
 });
 
