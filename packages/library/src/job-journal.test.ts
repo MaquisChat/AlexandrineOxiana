@@ -763,6 +763,28 @@ describe("list kinds", () => {
     );
   });
 
+  it("cancelled transcription entries are dropped at compaction and never push out the worker's failed jobs (R672)", async () => {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const p = project.id;
+    const recs: JobRecord[] = [];
+    for (let i = 0; i < 120; i++) {
+      recs.push({ v: 1, id: `ocr-${i}`, projectId: p, kind: "pdf.ocr", status: "failed", error: "WORKER_FAILED", createdAt: iso(2 * DAY + i * 1000), updatedAt: iso(2 * DAY + i * 1000) });
+    }
+    for (let i = 0; i < 400; i++) {
+      recs.push({
+        v: 1, id: `entry-${i}`, projectId: p, kind: "transcription.entry", status: "cancelled", error: "STOPPED", createdAt: iso(DAY), updatedAt: iso(DAY - i * 1000),
+        entry: { sourceId: `s${i}`, model: "medium" },
+      });
+    }
+    recs.push({ v: 1, id: "entry-done", projectId: p, kind: "transcription.entry", status: "done", createdAt: iso(DAY), updatedAt: iso(DAY), entry: { sourceId: "sd", model: "medium" } });
+    await appendJobRecords(lib.root, project.folder, null, recs);
+    expect(await compactJobJournal(lib.root, project.folder, p, null, 0)).toBe(true);
+    const ids = [...(await readJobJournal(lib.root, project.folder, p, null)).records.keys()];
+    expect(ids.filter((i) => i.startsWith("ocr-"))).toHaveLength(120);
+    expect(ids.filter((i) => i.startsWith("entry-") && i !== "entry-done")).toEqual([]);
+    expect(ids).toContain("entry-done");
+  });
+
   it("updateJobRecords appends in the file's turn", async () => {
     const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
     const key = projectDataKey(repo, project.id);

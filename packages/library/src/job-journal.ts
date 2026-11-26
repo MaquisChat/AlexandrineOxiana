@@ -451,17 +451,22 @@ export function isPending(r: JobRecord): boolean {
   return UNFINISHED.has(r.status) || (r.status === "cancelled" && r.error === LOCKED_CODE && r.job !== undefined);
 }
 
+const cancelledEntry = (r: JobRecord) => r.kind === "transcription.entry" && r.status === "cancelled";
+
 /**
  * The ids compaction drops (R142): see the constants above. Pending records are never dropped. The lists'
  * records: a `capture.item` is dropped exactly when its run's record is absent, done, or discarded (the age and
  * count rules never apply to items, so a live run keeps every video); the `transcription.list` record is never
- * dropped; runs and transcription entries follow the rules of finished jobs.
+ * dropped; runs and transcription entries follow the rules of finished jobs, except that a cancelled
+ * `transcription.entry` is always dropped and never counts toward MAX_FAILED_KEPT (R672: one Stop of a long list
+ * must not push out the worker's failed jobs).
  */
 function prunable(records: Map<string, JobRecord>, now: number): Set<string> {
   const drop = new Set<string>();
   const newestFirst = (a: JobRecord, b: JobRecord) => (a.updatedAt === b.updatedAt ? 0 : a.updatedAt < b.updatedAt ? 1 : -1);
-  const all = [...records.values()].filter((r) => r.kind !== "capture.item" && r.kind !== "transcription.list");
+  const all = [...records.values()].filter((r) => r.kind !== "capture.item" && r.kind !== "transcription.list" && !cancelledEntry(r));
   for (const r of records.values()) {
+    if (cancelledEntry(r)) drop.add(r.id);
     if (r.kind !== "capture.item") continue;
     const run = r.item ? records.get(r.item.runId) : undefined;
     if (!run || run.kind !== "capture.run" || run.status === "done" || (run.status === "cancelled" && run.error === DISCARDED_CODE)) drop.add(r.id);

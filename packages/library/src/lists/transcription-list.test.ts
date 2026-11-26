@@ -3,13 +3,21 @@
  * journal (R31) as one `transcription.list` record and a `transcription.entry` record per source.
  */
 import type { Project, SourceDraft, SourceFile } from "@ao/core";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OPEN_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "../export/test-kit.js";
 import { PolicyDeniedError } from "../repo/errors.js";
+import { authorizeProcessing } from "../repo/repo.js";
 import {
   TRANSCRIPTION_LIST_ID, addToTranscriptionList, markTranscriptionEntry, readTranscriptionList, setTranscriptionListState, soundSecondsOf,
   stopTranscriptionList,
 } from "./transcription-list.js";
+
+// The seam that counts how often the project's rules are asked (R672): the real function, observed.
+vi.mock("../repo/repo.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../repo/repo.js")>();
+  return { ...actual, authorizeProcessing: vi.fn(actual.authorizeProcessing) };
+});
+const asked = () => vi.mocked(authorizeProcessing).mock.calls.filter(([, , req]) => req.action === "process" && req.process?.op === "transcription").length;
 
 let kit: Kit;
 beforeEach(async () => {
@@ -42,10 +50,12 @@ describe("the transcription list", () => {
     const d1 = await audioSource(denied, "One");
     const d2 = await audioSource(denied, "Two");
     const before = (await auditEvents(kit, denied)).length;
+    vi.mocked(authorizeProcessing).mockClear();
     await expect(addToTranscriptionList(kit.repo, denied.id, [{ sourceId: d1.source.id }, { sourceId: d2.source.id }])).rejects.toBeInstanceOf(PolicyDeniedError);
     const events = (await auditEvents(kit, denied)).slice(before);
     expect(events.filter((e) => e.decision?.result === "deny")).toHaveLength(1);
     expect(events).toHaveLength(1);
+    expect(asked()).toBe(1);
     expect(await readTranscriptionList(kit.repo, denied.id)).toEqual({ state: "running", total: 0, done: 0, failed: 0, pending: [] });
 
     const p = await makeProject(kit);
@@ -53,10 +63,12 @@ describe("the transcription list", () => {
     const b = await audioSource(p, "Beta");
     const paper = await addSource(kit, p, { title: "Paper" });
     const n = (await auditEvents(kit, p)).length;
+    vi.mocked(authorizeProcessing).mockClear();
     const r = await addToTranscriptionList(kit.repo, p.id, [
       { sourceId: a.source.id, model: "small" }, { sourceId: a.source.id }, { sourceId: paper.source.id }, { sourceId: b.source.id },
     ]);
     expect(r).toEqual({ added: 2 });
+    expect(asked()).toBe(1); // once for the four items, not once per item
     expect((await auditEvents(kit, p)).length).toBe(n); // an allow is not audited here
     const list = await readTranscriptionList(kit.repo, p.id);
     expect(list).toMatchObject({ state: "running", total: 2, done: 0, failed: 0 });
@@ -123,9 +135,42 @@ describe("the transcription list", () => {
     await markTranscriptionEntry(kit.repo, p.id, e1!.entryId, { status: "running", jobId: "job-1" });
     await setTranscriptionListState(kit.repo, p.id, "paused");
     expect(await stopTranscriptionList(kit.repo, p.id)).toEqual({ jobIds: ["job-1"] });
-    const list = await readTranscriptionList(kit.repo, p.id);
-    expect(list).toMatchObject({ pending: [], done: 1, failed: 0, total: 1 });
+    // R672: Stop also empties the counters and leaves the list running.
+    expect(await readTranscriptionList(kit.repo, p.id)).toEqual({ state: "running", total: 0, done: 0, failed: 0, pending: [] });
     expect(await stopTranscriptionList(kit.repo, p.id)).toEqual({ jobIds: [] });
+  });
+
+  it("an entry that has ended is never moved back to running or queued (R672)", async () => {
+    const p = await makeProject(kit);
+    const s = [await audioSource(p, "Alpha"), await audioSource(p, "Beta")];
+    await addToTranscriptionList(kit.repo, p.id, s.map((x) => ({ sourceId: x.source.id })));
+    const [e0, e1] = (await readTranscriptionList(kit.repo, p.id)).pending;
+    expect(await stopTranscriptionList(kit.repo, p.id)).toEqual({ jobIds: [] });
+    // The loop started the head's job just before the Stop: its late mark is refused.
+    expect(await markTranscriptionEntry(kit.repo, p.id, e0!.entryId, { status: "running", jobId: "late-job" })).toBe(false);
+    expect(await markTranscriptionEntry(kit.repo, p.id, e1!.entryId, { status: "queued" } as never)).toBe(false);
+    expect(await readTranscriptionList(kit.repo, p.id)).toEqual({ state: "running", total: 0, done: 0, failed: 0, pending: [] });
+    // Every other move is made.
+    const c = await audioSource(p, "Gamma");
+    await addToTranscriptionList(kit.repo, p.id, [{ sourceId: c.source.id }]);
+    const [ec] = (await readTranscriptionList(kit.repo, p.id)).pending;
+    expect(await markTranscriptionEntry(kit.repo, p.id, ec!.entryId, { status: "running", jobId: "job-c" })).toBe(true);
+    expect(await markTranscriptionEntry(kit.repo, p.id, ec!.entryId, { status: "done" })).toBe(true);
+    expect(await markTranscriptionEntry(kit.repo, p.id, ec!.entryId, { status: "running", jobId: "job-again" })).toBe(false);
+    expect(await readTranscriptionList(kit.repo, p.id)).toEqual({ state: "running", total: 1, done: 1, failed: 0, pending: [] });
+  });
+
+  it("stop after 3 of 10 done empties the counters and the list stays running (R672)", async () => {
+    const p = await makeProject(kit);
+    const s: SourceFile[] = [];
+    for (let i = 0; i < 10; i++) s.push(await audioSource(p, `Source ${i}`));
+    await addToTranscriptionList(kit.repo, p.id, s.map((x) => ({ sourceId: x.source.id })));
+    const pending = (await readTranscriptionList(kit.repo, p.id)).pending;
+    for (const e of pending.slice(0, 3)) await markTranscriptionEntry(kit.repo, p.id, e.entryId, { status: "done" });
+    await setTranscriptionListState(kit.repo, p.id, "paused");
+    expect(await readTranscriptionList(kit.repo, p.id)).toMatchObject({ state: "paused", total: 10, done: 3, failed: 0 });
+    await stopTranscriptionList(kit.repo, p.id);
+    expect(await readTranscriptionList(kit.repo, p.id)).toEqual({ state: "running", total: 0, done: 0, failed: 0, pending: [] });
   });
 
   it("the list state survives a re-read", async () => {

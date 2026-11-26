@@ -175,17 +175,27 @@ function moved(data: TranscriptionListData, from: JobStatus, to: JobStatus): Tra
   };
 }
 
-/** Records what became of one entry; the list's counters follow (an entry marked twice is counted once). */
+const ENDED: ReadonlySet<JobStatus> = new Set(["done", "failed", "cancelled"]);
+
+/**
+ * Records what became of one entry; the list's counters follow (an entry marked twice is counted once). An entry
+ * that has ended (done, failed, cancelled) is never moved back to running or queued: such a call writes nothing
+ * and returns false (R672: a Stop that came between the start of an entry's job and this mark; the caller then
+ * cancels the job it started). Every other move returns true.
+ */
 export async function markTranscriptionEntry(
   repo: Repo,
   projectId: string,
   entryId: string,
   next: { status: "running"; jobId: string } | { status: "done" } | { status: "failed"; error: string } | { status: "cancelled"; error?: string },
-): Promise<void> {
+): Promise<boolean> {
   const p = writable(repo, projectId);
+  let moves = true;
   await updateJobRecords(p.root, p.folder, projectId, p.key, (records) => {
     const old = records.get(entryId);
     if (!old || old.kind !== ENTRY_KIND || !old.entry) throw new NotFoundError("Transcription list entry", entryId);
+    moves = !(ENDED.has(old.status) && (next.status === "running" || (next.status as JobStatus) === "queued"));
+    if (!moves) return [];
     const at = repoClock(repo)().toISOString();
     const { error: _error, ...base } = old;
     const entry: TranscriptionEntryData = next.status === "running" ? { ...old.entry, jobId: next.jobId } : old.entry;
@@ -194,6 +204,7 @@ export async function markTranscriptionEntry(
     const { data } = listOf(records);
     return [rec, listRecord(projectId, records, moved(data, old.status, next.status), at)];
   });
+  return moves;
 }
 
 /** Pauses the list (the transcription in hand finishes) or lets it run. */
@@ -206,8 +217,8 @@ export async function setTranscriptionListState(repo: Repo, projectId: string, s
 }
 
 /**
- * Empties the list: every pending entry is cancelled (error STOPPED), and the list runs again for whatever is put
- * on it next. Returns the job ids of the entries that were running, for the caller to cancel those jobs.
+ * Empties the list: every pending entry is cancelled (error STOPPED), `total`, `done` and `failed` go back to 0
+ * (so the idle list shows no line, R672), and the list runs again for whatever is put on it next. Returns the job ids of the entries that were running, for the caller to cancel those jobs.
  */
 export async function stopTranscriptionList(repo: Repo, projectId: string): Promise<{ jobIds: string[] }> {
   const p = writable(repo, projectId);
@@ -216,15 +227,15 @@ export async function stopTranscriptionList(repo: Repo, projectId: string): Prom
     const pending = entriesOf(records).filter(isPendingEntry);
     jobIds.length = 0;
     const at = repoClock(repo)().toISOString();
-    let { data } = listOf(records);
+    const { data } = listOf(records);
     const recs: JobRecord[] = pending.map((e) => {
       if (e.status === "running" && e.entry.jobId) jobIds.push(e.entry.jobId);
-      data = moved(data, e.status, "cancelled");
       const { error: _error, ...base } = e;
       return { ...base, status: "cancelled", updatedAt: at, error: "STOPPED" };
     });
-    if (recs.length === 0 && data.state === "running") return [];
-    return [...recs, listRecord(projectId, records, { ...data, state: "running" }, at)];
+    const emptied: TranscriptionListData = { ...data, state: "running", total: 0, done: 0, failed: 0 };
+    if (recs.length === 0 && data.state === "running" && data.total === 0 && data.done === 0 && data.failed === 0) return [];
+    return [...recs, listRecord(projectId, records, emptied, at)];
   });
   return { jobIds };
 }
