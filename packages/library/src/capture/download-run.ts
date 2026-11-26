@@ -49,8 +49,9 @@ import {
   type RunView,
 } from "../lists/run-journal.js";
 import { addToTranscriptionList } from "../lists/transcription-list.js";
-import { InvalidInputError, NotFoundError, PolicyDeniedError } from "../repo/errors.js";
+import { InvalidInputError, NotFoundError, PolicyDeniedError, ReadOnlyLibraryError } from "../repo/errors.js";
 import { repoLibrary, type Repo } from "../repo/repo.js";
+import { transcriptVersions } from "../source-actions.js";
 import type { WorkerClient } from "../worker-client.js";
 import { diskName, freeBytes } from "./disk.js";
 import { CaptureCancelledError, plainReason } from "./errors.js";
@@ -340,16 +341,23 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
         // A video this run stored goes on the transcription list BEFORE its own outcome is written, so a
         // cut between the two never leaves it off the list (the add skips a source already pending). A
         // duplicate is this run's own only when it was the video in hand when the last segment was cut.
-        const stored = out.status !== "duplicate" || wasRunning.has(e.id);
+        const sourceId = out.sourceId;
+        let offer = opts.transcribe && sourceId !== undefined && !transcribeRefused && (out.status !== "duplicate" || wasRunning.has(e.id));
+        // The video in hand at the last cut may have reached the list then, and been transcribed since
+        // (R682 S1): a source that already has a transcript is not offered again (a pending one the add skips).
+        if (offer && out.status === "duplicate") offer = transcriptVersions(await repo.getSource(projectId, sourceId!)).length === 0;
         let queued: string | undefined;
-        if (opts.transcribe && out.sourceId && stored && !transcribeRefused) {
+        if (offer) {
           guard();
           try {
-            const { added } = await addToTranscriptionList(repo, projectId, [{ sourceId: out.sourceId, ...(opts.transcribeModel ? { model: opts.transcribeModel } : {}) }]);
-            if (added > 0) queued = out.sourceId;
-          } catch {
-            // Refused by the rules (audited) or not writable: the downloads go on without it, and the
-            // following videos are not offered to the list either.
+            const { added } = await addToTranscriptionList(repo, projectId, [{ sourceId: sourceId!, ...(opts.transcribeModel ? { model: opts.transcribeModel } : {}) }]);
+            if (added > 0) queued = sourceId;
+          } catch (err) {
+            // Only a refusal is a refusal (R682 S2): the rules (audited) or a read-only library. The
+            // downloads go on without it, and the following videos are not offered to the list either.
+            // Any other error ends the segment before the done write: the video stays running, and the
+            // next Resume, seeing it as a duplicate that was running, offers it again.
+            if (!(err instanceof PolicyDeniedError || err instanceof ReadOnlyLibraryError)) throw err;
             transcribeRefused = true;
           }
         }
@@ -387,8 +395,12 @@ export function createDownloadRuns(deps: DownloadRunsDeps): DownloadRuns {
       // Refused by the project's rules (Minor 3): the run ends failed with the rule's own reason, so
       // its line says why and still offers Resume downloads; the refusal itself goes on to the caller.
       if (err instanceof PolicyDeniedError && !ctl.cancelled()) {
-        await putBackInHand();
-        await write(() => setRunState(repo, projectId, runId, "failed", { errorCode: "POLICY_DENIED", reason: err.reason }));
+        try {
+          await putBackInHand();
+          await write(() => setRunState(repo, projectId, runId, "failed", { errorCode: "POLICY_DENIED", reason: err.reason }));
+        } catch {
+          // The caller still gets the refusal itself (R682 S4), not the error of writing it down.
+        }
       }
       throw err;
     }

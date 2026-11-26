@@ -4,7 +4,9 @@
  * Pause, Stop, Resume and the turn (R669). The fake tools (tests/fixtures/fake-tools) play the
  * platform; every wait goes through the injected sleep, and no test waits on a real timer.
  */
-import { readFile, readdir, rm, mkdtemp, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { mkdir, readFile, readdir, rm, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import type { AuditEvent, SourceFile } from "@ao/core";
@@ -17,7 +19,9 @@ import { createIndexSink } from "../index/sink.js";
 import { journalPath } from "../job-journal.js";
 import { createLibrary, type Library } from "../library.js";
 import { readRun, readRunItems } from "../lists/run-journal.js";
-import { readTranscriptionList } from "../lists/transcription-list.js";
+import { markTranscriptionEntry, readTranscriptionList } from "../lists/transcription-list.js";
+import { storeTranscript } from "../transcript-store.js";
+import { recordingOf } from "../transcription-jobs.js";
 import { InvalidInputError, PolicyDeniedError, type Repo } from "../repo/index.js";
 import { openTestRepo } from "../repo/testing.js";
 import { WorkerClient } from "../worker-client.js";
@@ -570,6 +574,68 @@ describe("download runs", { timeout: 120_000 }, () => {
     expect((await auditEvents(p.folder)).filter((e) => e.decision?.result === "deny")).toHaveLength(1);
   });
 
+  it("a video already transcribed is not put on the transcription list again at a Resume", async () => {
+    const p = await project();
+    const id = newRunId();
+    const TR: RunOptions = { transcribe: true, quality: "720p" };
+    // the cut comes once the first video is on the list, before its own outcome is written
+    const journal = journalPath(lib.root, p.folder);
+    let cut = false;
+    const listed = () => {
+      try {
+        return readFileSync(journal, "utf8").includes('"kind":"transcription.entry"');
+      } catch {
+        return false;
+      }
+    };
+    const c = control({ cancelled: () => (cut ||= listed()) });
+    await expect(runs.start(p.id, id, TT_PROFILE, TR, c.ctl)).rejects.toBeInstanceOf(CaptureCancelledError);
+    expect((await readRunItems(repo, p.id, id)).map((i) => i.status)).toEqual(["running", "queued", "queued"]);
+    const [entry] = (await readTranscriptionList(repo, p.id)).pending;
+    expect(entry).toBeDefined();
+    const sid = entry!.entry.sourceId;
+    // the list transcribes it meanwhile
+    const sf = await repo.getSource(p.id, sid);
+    const out = join(tmp, "transcript-out");
+    await mkdir(out, { recursive: true });
+    await writeFile(join(out, "transcript.vtt"), "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nWelcome.\n");
+    await writeFile(join(out, "segments.json"), JSON.stringify([{ start: 0, end: 2, text: "Welcome.", lang: "en", flags: [] }]));
+    await storeTranscript(repo, p.id, sid, recordingOf(sf)!, { id: randomUUID(), type: "audio.transcribe", output: out, files: [join(out, "transcript.vtt"), join(out, "segments.json")], meta: { model: "small", detectedLanguages: ["en"], flaggedCount: 0 }, encrypted: false }, { model: "small" }, "tester");
+    expect(await markTranscriptionEntry(repo, p.id, entry!.entryId, { status: "done" })).toBe(true);
+
+    const told: string[] = [];
+    expect(await runs.resume(p.id, id, "researcher", control({ onQueuedForTranscription: (x) => void told.push(x) }).ctl)).toMatchObject({ state: "finished", done: 3 });
+    const pending = (await readTranscriptionList(repo, p.id)).pending.map((e) => e.entry.sourceId);
+    expect(pending).not.toContain(sid);
+    expect(pending).toHaveLength(2);
+    expect(told).not.toContain(sid);
+  });
+
+  it("an add to the transcription list that fails for another reason ends the segment and the Resume adds the video", async () => {
+    const p = await project();
+    const id = newRunId();
+    const TR: RunOptions = { transcribe: true, quality: "720p" };
+    const getSource = repo.getSource.bind(repo);
+    let failOnce = true;
+    vi.spyOn(repo, "getSource").mockImplementation(async (...args) => {
+      if (failOnce && /addToTranscriptionList/.test(new Error().stack ?? "")) {
+        failOnce = false;
+        throw new Error("the source file could not be read");
+      }
+      return getSource(...args);
+    });
+    await expect(runs.start(p.id, id, TT_PROFILE, TR, control().ctl)).rejects.toThrow("the source file could not be read");
+    expect(failOnce).toBe(false);
+    vi.restoreAllMocks();
+    expect((await readRunItems(repo, p.id, id)).map((i) => i.status)).toEqual(["running", "queued", "queued"]);
+    expect((await readTranscriptionList(repo, p.id)).pending).toHaveLength(0);
+
+    expect(await runs.resume(p.id, id, "researcher", control().ctl)).toMatchObject({ state: "finished", done: 3 });
+    const stored = (await posts(p.id)).map((sf) => sf.source.id).sort();
+    expect(stored).toHaveLength(3);
+    expect((await readTranscriptionList(repo, p.id)).pending.map((e) => e.entry.sourceId).sort()).toEqual(stored);
+  });
+
   it("a run cut by a cancel writes nothing more and shows as interrupted when not held", async () => {
     const prof = synthetic(3);
     const p = await project();
@@ -650,6 +716,27 @@ describe("download runs", { timeout: 120_000 }, () => {
     expect(c.states()).toEqual(["queued", "downloading", "failed"]);
     expect((await readRun(repo, p.id, id))?.record.run.errorCode).toBe("POLICY_DENIED");
     expect(runLines(shown!).resume).toBe("Resume downloads");
+  });
+
+  it("a refusal whose own state write fails still reaches the caller as the refusal", async () => {
+    const p = await project(GOV.replace("[downloader]", "[manual_upload]"));
+    // once the run is downloading, the run's state can no longer be written (the library reads as
+    // read-only to that writer alone, so the capture still reaches the rules)
+    let armed = false;
+    vi.spyOn(lib, "mode", "get").mockImplementation(() => (armed && /setRunState/.test(new Error().stack ?? "") ? "read-only" : "read-write"));
+    const c = control({
+      onChange: (r) => {
+        c.changes.push(r);
+        if (r.state === "downloading") armed = true;
+      },
+    });
+    const id = newRunId();
+    const err = await runs.start(p.id, id, TT_PROFILE, OPTS, c.ctl).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PolicyDeniedError);
+    expect(c.states()).toEqual(["queued", "downloading"]);
+    expect((await auditEvents(p.folder)).filter((e) => e.decision?.result === "deny")).toHaveLength(1);
+    vi.restoreAllMocks();
+    expect((await readRun(repo, p.id, id))?.record.run.state).toBe("downloading");
   });
 
   it("a Resume whose listing fails keeps the failures the run knew", async () => {
