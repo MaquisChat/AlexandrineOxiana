@@ -62,3 +62,47 @@ Branch `wc-3-executor`, worktree `.claude/worktrees/kg-3a`, head **5810efe** (on
 - `@ao/core` `src/model`: Tests 27 passed (27)
 - typecheck `@ao/shared`, `@ao/library`, `@ao/library-service`, `@ao/ui`, `@ao/core`: all exit 0
 - `git status --short`: empty after the commit.
+
+## Fix round (R674)
+
+Branch `wc-3-executor`, head on 5810efe: A bf63dc1, B f4c8890, C 3a6fa79, D 2039786, E d08b2ec.
+
+**A. A Resume reports every id (I1)** — `profile-capture.ts` (onlyIds block in `run`, the `told` helper and the loop after the listed posts). The `onlyIds` pool is built from `dated` without `isKnown`. A known post takes the duplicate path and is reported after `beforeItem`. An id the listing no longer has is told to `afterItem` as failed `NOT_FOUND_OR_REMOVED`, with the existing reason sentence. Those ids come after the listed ones, in `onlyIds` order, with no `beforeItem`, no wait and no worker job. The entry handed over is `{ id, url: postUrl(...) ?? "", raw: {}, listing }`. Each one also gets a batch journal line and counts in `report.failed`, and progress counts them in its total. Removed detection is untouched. `onListed` now gets the posts the run will take; with `onlyIds` that includes listed known ones, but never the unlisted ones (no listing data). Its doc comment says so.
+Tests, both failed first: `a Resume reports every id it was given: …` (the reviewer's probe 1) and `a Resume after a failed journal write tells the stored post again, as a duplicate` (probe 2).
+
+**B. The stand-in mirrors the worker (I2)** — `capture/testing.ts` mirrors worker commit **c4b43b8** (kg-2 has one uncommitted edit in `map_error`, apparently a reviewer's mutation, so I mirrored the commit, not the working tree). It copies:
+- the error patterns in their order, the HTTP-answer guard and the `][error]` line pick-up;
+- `build_ytdlp_args` (the 720p default with ffmpeg; `-S`; `--merge-output-format mp4`; `--abort-on-unavailable-fragments`; no format arguments for listings) and `build_gallerydl_args`;
+- the ffmpeg refusal, through a new option `startToolWorker({ ffmpeg })`, default found;
+- `DOWNLOAD_FAILS_ALWAYS` with the finished-media rule, and the skipped `.part` and similar files;
+- `platformReason` by the visible rule, without the redaction.
+
+New file `capture/testing.test.ts` (6 tests, all failed first; the table test also failed against the old mapping when I briefly exported it). It includes `the stand-in names failures as the worker does`, which runs `test_map_error`, the gallery-dl/HTTP table and the two single cases.
+Existing test changed: `link-capture.test.ts` › "a login wall fails with the plain-language reason and saves nothing" now also expects `platformReason: "Sign in to confirm you're not a bot."`, because the stand-in now gives the platform's reason as the worker does.
+
+**C. The listing with hooks; the report's claim (Minors 4, 3)**
+- With hooks: `RATE_LIMITED` waits as before. `NETWORK_LOST` waits from the first failure with why `connection`. `TOOL_NOT_INSTALLED` ends the run `paused-tool` with `tool`, and `DISK_FULL` ends it `paused-disk`; both go through `putBack`. A pause or stop answer ends the run with that status, with no batch and no report file (C3).
+- After a successful listing with hooks, the waits are reset (my choice: "as after a successful video").
+- C2: `report.listComplete` (and with it the audit's field) is now `wholeList && status === "completed"`. `reportText` gets `wholeList`.
+- The fake yt-dlp gained the mode `enumnetwork`.
+- Tests:
+  - Failed first: "a listing that lost its connection waits from the first, then lists"; "a wait at the listing answered pause or stop … (C3)"; "a missing tool at the listing pauses the run and names the tool; a full disk pauses on the disk"; "only a completed run claims that missing posts were checked".
+  - Guards (passed before): "a slowed-down listing waits …, then lists"; "without hooks a listing that fails fails the run as before".
+
+**D. Lost connections for 12 hours (ruling); the pins**
+- D1: `gaveUp("connection")` now ends the run `failed`, with `NETWORK_LOST` and `NETWORK_LOST_GAVE_UP`, at a video or at the listing. The video in hand is not reported. The batch is `failed`. The "Result:" line is the reason itself.
+- D1 tests, both failed first: "12 hours of lost connections end the run failed, the video in hand put back" and "… at the listing end the run failed".
+- D2 "the 12 hours start again after a successful video" and D3 "a run without hooks treats lost connections and a full disk as ordinary failures" are pins: they passed on the code as it was. Against mutations: M1 fails D2; M3 and M4 fail D3. Each mutation was applied and then restored.
+
+**E.** Only the header comment of `profile-capture.ts` changed. I found nothing wrong in Minors 5–8.
+
+**Sentences, new or changed:**
+- `NETWORK_LOST_GAVE_UP` "The connection stayed lost for 12 hours, so the capture was paused." (the brief's wording).
+- Report file, for a run that listed the whole profile but did not complete: "The whole profile was listed, but the capture did not finish, so posts missing from it were not checked." (my wording).
+
+**NEEDS A RULING**
+1. `CaptureQueue.tsx:129` shows "Removed posts were not looked for in this run: the list was limited (by dates or a maximum number of items) or did not come back whole." whenever `listComplete` is false. After C2 this note now also appears for a paused or stopped run that listed everything, so the stated cause is wrong for those runs. Options: (a) leave it; (b) make the note depend on the status, with a sentence for unfinished runs. I recommend (b), in Task 6 or a screen task.
+2. An `onlyIds` id that is listed but falls outside the run's dates is still neither taken nor reported. This happens only if the platform's date for that post changed. Options: take it, or report it as failed. I recommend taking it (build the pool from `listed`).
+
+**Runs** (nice -n 10, one file at a time): see the final message.
+- waits 1/1; profile-capture 62/62; link-capture 66/66; queues 13/13; worker-client 32/32; testing 6/6; service capture-queues 31/31; capture-routes 9/9; typecheck @ao/library, @ao/shared, @ao/library-service, @ao/ui, @ao/core all exit 0; `git status --short` empty.
