@@ -95,3 +95,38 @@ Clicks and layout: no fixed sleeps; every wait is for an exact sentence. The wor
 ## Could not check here
 - A real Mac or a real platform: real yt-dlp against YouTube, real speech, caffeinate, sleep and wake, the disk's name.
 - Which quality branch the catalogue chose on this machine.
+
+## Second look (R697)
+
+Range 8371e56..7b08c80 (d4e598b, 53509ac, 7b08c80). `git diff --stat 540cee3..7b08c80` lists only `e2e/fixtures.ts`, `e2e/whole-channel.spec.ts`, the fake yt-dlp and the fake faster-whisper. No product file changed. No fixed sleep was added, and every new wait is for an exact sentence or state. The new run-log and audit checks are read only after a resting state that proves the new service's worker has served something: in scenario 2 the held transcription finishing, in scenario 3 an estimate the worker listed.
+
+### Verdict: APPROVED WITH MINORS
+
+### Mutation M1 applied again
+M1: the service resumes every interrupted or paused run by itself after a restart. Both scenarios now fail at the run-log assertion, with messages that name the fault. Both failures together took 44 s, test set-up included.
+
+| Scenario | Line | Message | Diff |
+|---|---|---|---|
+| 2 | `:334` | "no run of the fake yt-dlp since the restart (the downloads must wait for Resume downloads)" | +4 runs |
+| 3 | `:378` | "no video of the paused run asked for since the restart (a paused run waits for Resume downloads)" | +3 runs |
+
+The product was restored afterwards.
+
+### I2: transcriptions carry on after a restart
+- Scenario 2 holds video 1's transcription in the fake speech recognition and restarts the app. It then waits until the new worker takes that transcription up again by itself (`heldSpeech() === 1` after the restart), releases it, and reaches "Transcriptions finished: all 1 done." with nobody pressing anything.
+- Break: the transcription lists no longer started at library open (`state.ts:1927` turned off). Scenario 2 FAILED at `:332`: expected "Transcriptions finished: all 1 done.", received "Transcribing: 0 of 1 — "Fake Channel video 1: …"". That came after the 180 s wait, but the message names the fault. Restored.
+- The fake faster-whisper is shared only by the end-to-end tests: `capture.spec.ts` and `whole-channel.spec.ts` through `AO_WORKER_BIN`. No worker Python test imports it (grep). The hold is OFF unless a scenario calls `holdSpeech()`: the environment variable is set for every `fakeControl` test, but the fake waits only while the `hold-speech` file exists.
+
+### B1–B4 and C, as built
+- **B1:** each of the 3 downloaded videos has a machine transcript (json and vtt) through `/sources/:id/transcripts`, and the private video has no source.
+- **B2:** the quality sent (`options.quality`) is checked, and so is video 1's `-f` / `-S` in the run log, with both branches written out.
+- **B3:** after the Stop, the estimate counts 2 videos and says "2 more are already in this project…". Videos 1 and 2 are not asked for again, video 3 is retried, and video 4 is downloaded.
+- **B4:** after "Remove from this list", the files are on disk, the audit has no deletion, and the line stays gone after two reloads.
+- **C:** `held()` counts only markers of live processes. Scenario 2 asserts that the stale marker is on disk and is not counted.
+
+### Minors (no change needed before verification)
+- The fake's `_job_cancelled` finds the worker's `ctx` by walking the call stack. If the worker renames that local, the hold silently stops honouring a cancel. No current scenario depends on that: a restart kills the worker anyway.
+- The I2 break, like M4, fails only after its 180 s wait for the sentence, though the message names the fault.
+
+### Run
+`whole-channel.spec.ts`, Chromium, `--repeat-each 2`: 10 passed (5.4 min). `git status --short` is empty.

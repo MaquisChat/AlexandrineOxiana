@@ -37,3 +37,39 @@ None. (The fixture and fake-tool changes keep their old behaviour.)
 - `capture.spec.ts --project=chromium`: 4 passed (53.6s).
 - `@ao/library vitest src/capture/profile-capture.test.ts`: 64 passed.
 - `e2e tsc --noEmit`: clean. `git status --short`: empty.
+
+## Fix round (R697)
+
+Commits on `wc-10-e2e`: d4e598b (A), 53509ac (B), 7b08c80 (C). Only test files and test fixtures changed; product code was changed only for the mutations and restored with `git checkout --`.
+
+### A. Restarts (I1, I2)
+- **A1.** The fake faster-whisper the e2e worker uses (`packages/library/tests/fixtures/fake-speech/faster_whisper/__init__.py`, a test fixture) now has a hold. While the file `hold-speech` exists in the folder named by `AO_FAKE_SPEECH_CONTROL`, `WhisperModel.transcribe` waits and writes a marker `held-speech-<worker pid>-<thread>`. The worker passes `AO_*` variables on to its own process. A held transcription stops waiting once its job is cancelled; it finds the job's `JobContext` up the stack. Without that, the service did not stop within 30 s of SIGTERM, because it waits for the transcription job to end on a quit. The real model stops between segments. `e2e/fixtures.ts`: `fakeControlFor` sets the variable, and FakeControl gains `holdSpeech()`, `releaseSpeech()` and `heldSpeech()`, which counts only markers of live workers. No `services/media-worker` change was needed.
+- **A2.** Scenario 2 holds speech, then holds yt-dlp at video 2, and starts. It waits until both holds are taken: `held("yt-dlp") == 1` and `heldSpeech() == 1`. Then it restarts and reopens the project. With no click, it waits for `heldSpeech() == 1` in the new worker, releases the hold, and waits for `Transcriptions finished: all 1 done.`. Only then does it check two things: no fake yt-dlp run since the restart (`asked(app).slice(before)` equals `[]`), and no audited resume. After that it checks the interrupted sentence and the Resume button. The click and what follows are unchanged.
+- **A3.** Scenario 3, after the restart: it opens Capture and estimates the same channel. The estimate is listed by the new worker; the scenario waits for `2 videos, about 6 minutes.`. Then it checks that no video of the channel was asked for since the restart (the listing itself is allowed) and that there was no audited resume. It checks that the line still reads paused with its Resume button, then presses Cancel.
+- **A4. M1.** The mutation: in `DownloadRunner.list` of a fresh service, every interrupted or paused run is resumed. Both scenarios failed in about 20 s, at the run-log assertion, with these messages:
+  - Scenario 2: `Error: no run of the fake yt-dlp since the restart (the downloads must wait for Resume downloads)`. Received `["https://www.youtube.com/@fakechannel/videos", "https://www.youtube.com/watch?v=fakeChan002"]` at `whole-channel.spec.ts:333`.
+  - Scenario 3: `Error: no video of the paused run asked for since the restart (a paused run waits for Resume downloads)`. Received `["https://www.youtube.com/watch?v=fakeChan003"]` at `:377`.
+
+  The product was restored; `git status --short` was clean.
+
+### B. Titles asserted
+- **B1 (I3).** Scenario 1, after `all 3 done.`: the stored videos are exactly fakeChan001, 002 and 004, and the private video has no source. For each of them, `GET /projects/:id/sources/:sid/transcripts` lists machine versions `["json","vtt"]`.
+- **B2 (M-a).** `options.quality` from the `capture-profile` request equals the branch the catalogue reports (`GET /tools` ffmpeg installed: `720p`, else `ready`). The fake yt-dlp's run for video 1 is checked per branch. For 720p it has `-f bv*+ba/b` and `-S res:720,fps,vcodec:h264,acodec:m4a`. For ready it has `-f b` and no `-S`. The branch is recorded as a test annotation ("quality"). On this machine ffmpeg is installed, so the 720p branch runs.
+- **B3 (M-b).** Scenario 3, after the Stop: the same channel is estimated again and shows `2 videos, about 6 minutes.` and `2 more are already in this project and are not downloaded again.`. After Start the new line reads `"Fake Channel": 1 of 2 downloaded. 1 could not be downloaded.`. Videos 1 and 2 were still asked for only once, video 3 was tried again (twice in all), video 4 was downloaded once, and the stored videos are 1, 2 and 4.
+- **B4 (M-d).** Scenario 5, after "Remove from this list": each video has files, and every file is on disk. No delete, remove or trash entry is in the audit. After another reload the sources are still listed and the line is still gone.
+
+### C. Stale hold markers (M-c)
+- `held()` and `heldSpeech()` count only markers whose process is alive (`liveMarkers`, using `running(pid)`). Scenario 2 checks this after the restart: the stopped run's `held-yt-dlp-*` marker is still on disk, and `held("yt-dlp")` is 0. With the old `held()` put back temporarily, scenario 2 failed with `Error: a marker of a stopped run is not counted as held`, `Expected: 0 Received: 1`.
+
+### NEEDS A RULING
+None.
+
+### Runs (fix round)
+- `pnpm --filter @ao/ui build`: built (the dist was older than the head).
+- `whole-channel.spec.ts --project=chromium --repeat-each 5`: **25 passed (13.8m)**.
+- `whole-channel.spec.ts --project=webkit`: **5 passed (2.8m)**.
+- `capture.spec.ts --project=chromium`: the first run had 3 passed and 1 failed, scenario 9, and took 2.8 min. I kept only the tail of its output, so I do not know the failure message.
+  - Scenario 9 alone then passed (9.0 s), and two full runs then passed (4 passed, 53.6 s and 53.8 s).
+  - The speech hold acts only while `hold-speech` exists, and capture.spec never writes that file, so the change should have no effect there.
+- The shared fake downloader was not changed, so the library and service tests that use it were not run.
+- `e2e tsc --noEmit` is clean, and `git status --short` is empty.
