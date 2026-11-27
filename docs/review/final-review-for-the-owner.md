@@ -1,5 +1,7 @@
 # The final review — what I need from you
 
+*Updated 26 November 2026, 6:15 pm Central: part 17, at the end, is new — WHOLE CHANNELS, DOWNLOADED AND TRANSCRIBED WITHOUT WATCHING OVER THEM, is built, passed all its tests and GitHub's check, and IS IN `main` on your word. MAC BUILD 17 EXISTS and is the build to use; part 17 says where to download it. Development is paused, as you asked.*
+
 *Updated 26 November 2026, just after midnight Central: BUILD 16 IS IN `main`, on your word "Merge". Mac build 16 (part 16) is now the build of `main` and the build to use.*
 
 *Updated 25 November 2026, 8:44 pm Central: part 16, at the end, is new — build request 16 (silent connections are opened again, the check for missing files shows its progress, "Back up now", backups said in sentences) passed all its tests and GitHub's check, and MAC BUILD 16 EXISTS. It is NOT in `main` yet: that waits for your word.*
@@ -1047,4 +1049,150 @@ Listed, not built:
 - **Held-file cards disappear for the moment a list is read again**, and their notes are announced a second time. Keeping them in place would change an order of focus that was ruled earlier; left as untidy.
 - **FR-760, a remainder:** after an upgrade from an older build, two move destinations whose folders have the same name can still be confused at the first check; the later checks refuse. Accepted.
 
-Waiting for you: the design for whole channels with automatic transcription (its one question), and the two decisions of part 15.
+Waiting for you: the two decisions of part 15. (You answered the design for whole channels on 26 November; it is built: part 17.)
+
+## 17. Added on 26 November: whole channels, downloaded and transcribed without watching over them
+
+On 25 November you asked how long until you could download YouTube channels in full and have them transcribed automatically. You approved the design on the morning of the 26th with two directions: a video that does not download gets an error and the run goes on, and one button resumes whatever did not complete. This part is that piece, built.
+
+It was built as ten tasks. Each was built by one agent and then gone through by another who had not built it and whose job was to break it. Every one of those reviews found something real, and several of the faults were in my plan, not in the building. I ruled each finding; the worst are named under "What the reviews caught".
+
+- **Tested together on my side:** every step green: 12,318 unit tests, 240 browser scenarios, 318 Python tests, the desktop tests and scenarios, and the launch check. The first run of the unit tests had three failures from two causes, and I read both before running anything again:
+  - **One real fault, mended.** Three of the ten tasks added nine new reason codes to the library, and the interface's own table of sentences did not have them. You would not have seen a difference: for a code it does not know, the interface shows the library's sentence, which has the same words.
+  - **One timing accident.** A watched-folders test ran out of time while the machine was busy. Whole channels did not touch that code, and the test passes when run alone. It has now done this twice, so I listed it to be looked into properly (FR-776).
+- **Pushed as build request 17** at 4:55 pm Central on 26 November.
+- **GitHub's own check:** green at 6:03 pm Central ([CI run 296](https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45907837097)).
+- **In `main`** since the evening of 26 November, on your word: "merge build 17 to main when the check is green." `main` runs its own check after every merge; its result is in the note at the top of this page once it has ended.
+- **Mac build 17 exists** and is the build to use. Every check passed, including the release app started from the mounted disk image.
+  - Where: [Desktop (macOS) run 27](https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45907837109), under "Artifacts", `alexandrine-oxiana-macos-apple-silicon`.
+  - The file: `Alexandrine-Oxiana-0.0.0-apple-silicon.dmg`, SHA-256 `cc5090d4818fdf35a414c96316a38194568d978ca558250dd93e66dbea3fc5d6`.
+  - That run also shows a small file called `mac-crash-reports`. It is not the app: Apple's own `xcodebuild` tool stopped while my build script asked it for its version, four minutes before the app was built (FR-777).
+- **Development is paused**, as you asked, until you say to go on.
+
+### What you can do now
+
+**A. See before you start.** Paste the address of a channel, a playlist or a profile on the Capture screen and press "Capture profile". The app first asks the platform only for the list, then shows:
+
+```
+Capture channel: "Example Channel"
+412 videos, about 310 hours.
+
+Quality     ( ) Best available   (•) Up to 720p   ( ) Up to 1080p   ( ) Audio only
+Transcribe  [x] Transcribe each video on this Mac (speech model: medium)
+
+Disk        Roughly 150–250 GB at this quality. 380 GB are free on "Macintosh HD".
+Time        Downloading: some hours; it depends on YouTube.
+            Transcribing: days rather than hours. The app will say more exactly
+            once it has transcribed the first video on this Mac.
+
+            [ Start ]   [ Cancel ]
+```
+
+- Videos already in the project are not counted and not downloaded again.
+- If the estimate is larger than the free space, the button reads "Start anyway — it will pause when the disk is nearly full".
+- Without Video tools installed, the four choices are greyed with "These need Video tools." and a link to install them; "Ready-made file (lower quality)" is offered in their place.
+- Asking for a long list can take minutes. There is a "Cancel", and single links stay usable meanwhile.
+- If you change the address or any setting while the estimate is open, it closes and says so, so that "Start" can only ever start what you see.
+
+**B. Walk away.** Videos are downloaded one at a time, with a ten-second pause between two. A line shows where it is, on the Capture screen and on the library screen:
+
+```
+Downloading "Example Channel": 120 of 412           [ Pause ]  [ Stop ]
+  waiting 2 minutes — YouTube asked to slow down
+  3 could not be downloaded                          [ Show them ]
+Transcribing: 14 of 120 — "Title of the video"      [ Pause ]  [ Stop ]
+  about 6 days left at this Mac's speed (4 minutes of sound per minute)
+```
+
+**C. Several channels.** Start a second channel while one is downloading: it says it "is waiting its turn" and starts by itself when the ones before it have finished, paused or stopped. A single pasted link is still captured at once, in between.
+
+**D. A video that cannot be downloaded** (private, removed, not available in your country, needing a sign-in, or a connection that kept failing) gets its error and the run goes on. "Show them" lists each one with its title, address and reason, and the list can be copied. At the end:
+
+```
+"Example Channel": 398 of 412 downloaded. 14 could not be downloaded.
+                    [ Show them ]  [ Resume downloads (14 did not complete) ]  [ Discard ]
+```
+
+**E. "Resume downloads"** is the one button for everything that did not complete: videos that ended in an error, and videos the run never reached because of a quit, a Stop, a pause, a full disk or a lock. Nothing starts downloading by itself after you quit the app or unlock a project; your press is recorded as your decision, and the project's rules are asked again. "Discard" takes a run off the list; what was downloaded stays in the library. A run that completed everything has one button, "Remove from this list".
+
+**F. When something is in the way,** the run says what and waits or pauses:
+
+- YouTube says "slow down": it waits 1, 2 and 4 minutes, then 15 and 30 minutes, an hour, then every two hours, and tries again by itself each time. After 12 hours it pauses: "Paused: YouTube kept asking the app to slow down for 12 hours. Press Resume downloads to try again."
+- The connection is lost (the Mac woke before the network): it waits in the same way; it does not mark every remaining video as failed.
+- The disk: before each download the app checks that 10 GB would stay free. If not: "Paused: the disk is nearly full. Free some space, then press Resume downloads."
+- A tool is missing: "Paused: Video tools are not installed. Install them from the Optional tools screen, then press Resume downloads."
+
+**G. Automatic transcription.**
+
+- A switch on the project's Governance screen: "Transcribe captured audio and video automatically". The estimate's "Transcribe" box starts from it and can be changed for one capture.
+- Above the sources list: "Transcribe everything without a transcript". It first says how many sources and how many hours, then puts them on the list.
+- Recordings are transcribed one at a time. The time left is measured on your Mac; until the first one is done the line says "measuring…".
+- Transcription carries on by itself after a quit, a restart or an unlock (nothing leaves the Mac). Downloads do not.
+- If the speech model is missing, the list pauses and names it: "Paused: the speech model “medium” is not installed. Install it from the Optional tools screen, then press Continue."
+
+**H. Keeping the Mac awake.** While downloads or transcriptions run, the app asks the Mac not to sleep by itself (the screen may still switch off; closing the lid still sleeps it). The switch is on the Optional tools screen: "Keep this Mac awake while downloads or transcriptions run".
+
+### Two things that change for what you already had
+
+1. **A single pasted link is now saved at up to 720p** when Video tools are installed. Until now it saved a small, low-quality file. The files are larger than before. Without Video tools it is as before.
+2. **A download that fails part-way now says so.** Until now, if the connection dropped or the disk filled in the middle of a video, the app counted the download as done and stored a source with no video in it, and a later try found "a duplicate". This is as old as the capture itself and may be part of what you saw when downloads "were not working".
+
+### What the reviews caught
+
+The ones that would have reached you:
+
+- **A paused channel could have started again by itself.** After a library move that was refused, a leftover instruction restarted the run at the next move, even a paused one. Closed: nothing goes out that you did not just ask for.
+- **Videos in a format the app could not play.** The first settings would mostly have saved newer formats that do not play inside the app on Macs older than the M3 chips. Now the app asks for the size you chose and, at that size, for the kind of file every Mac plays. Only "Best available" above 1080p can still be a newer format.
+- **"Resume downloads" that could never finish**, when the app quit at one exact moment or a video vanished from the platform in between.
+- **Videos marked "removed" when the platform's list came back incomplete.** Now only a complete list can show that a video is gone.
+- **Starting the wrong capture.** An address changed while the estimate loaded, or "Metadata only" ticked after it appeared, was ignored by "Start".
+- **A recording transcribed twice**, a transcription that could not be stopped, and a count that kept starting over at "1 of 1".
+- **A video cut short** by a network drop being stored as complete.
+- **Asking a platform again too early** after a library move interrupted a "slow down" wait.
+
+### Sentences that are new
+
+Tell me any you would word differently:
+
+- "…is waiting its turn. It starts by itself when the downloads before it have finished, paused or stopped."
+- "The capture of 'Example Channel' was interrupted: 120 of 412 done."
+- "Remove from this list" (for a line that has finished; it removes the line only)
+- "The settings changed, so the estimate was closed. Press “Capture profile” to see it again."
+- "The project's switch for automatic transcription could not be read. This capture follows the switch as it stands, unless you tick the box."
+- "Still asking YouTube for the list. A long list can take a few minutes."
+- "The transcriptions were stopped. The sources stay; “Transcribe everything without a transcript” puts them on the list again."
+- "The connection stayed lost for 12 hours, so the capture was paused."
+- "The platform's list came back incomplete, so some videos could not be looked for."
+- "Paused: something went wrong while transcribing. Press Continue to try again."
+
+### Things only you can check (with the Mac build of build 17)
+
+My tests use a stand-in for YouTube. Nothing here has touched a real platform or a real Mac.
+
+- [ ] A small real channel, end to end: the estimate, Start, the line moving, the videos in the library.
+- [ ] **Each quality once, and that the video plays inside the app:** Up to 720p, Up to 1080p, Best available, Audio only (sound only).
+- [ ] Quit in the middle and open again: "…was interrupted…", nothing downloading; press "Resume downloads".
+- [ ] A list that contains one address that does not exist: its error, the run going on, "Show them".
+- [ ] Two channels one after the other: the second waits its turn.
+- [ ] Transcription: the box ticked; "measuring…" and then a time left that looks sensible; quit and reopen, and it carries on.
+- [ ] "Transcribe everything without a transcript" on a project that already has videos.
+- [ ] Leave it running with the screen off for an hour: it kept going. Close the lid, open it: it carries on.
+- [ ] A single pasted link: the file is larger and sharper than before.
+- [ ] With VoiceOver, if you use it: the lines and their buttons are read with the channel's name.
+
+### Still open
+
+Listed, not built:
+
+- **FR-770:** a destruction certificate still gives the state of the backups as a code.
+- **FR-771:** whether a Zotero import's own requests to Zotero stop when its project is locked; to be checked.
+- **FR-772:** on the Capture screen, a connection that opens and closes at once is retried every second without the screen saying it is lost.
+- **FR-773:** a test aid: one shared table of "this error text means this failure", so two copies cannot drift.
+- **FR-774:** no screen yet offers to reset the keep-awake setting when its file cannot be read.
+- **FR-775:** on the transcript screen the recording area changes height while the player retries, so the lines below jump; a press at that moment can miss.
+- **FR-776:** a watched-folders test has twice run out of time on a busy machine; to find out whether it is only the test, or whether stopping a watched folder can hang.
+- **FR-777:** the Mac build's script can make Apple's Xcode tool leave a crash report that reads as if the app had crashed; to tidy.
+
+Not in this piece, by the design: checking a channel again every week, translation, speaker names, using YouTube's own captions in place of a transcript, anything running while the app is closed, and continuing downloads by themselves after a quit.
+
+Waiting for you: your checks on a Mac (the list above); the two decisions of part 15; what Phase 2 is mainly for; and your word to go on building.

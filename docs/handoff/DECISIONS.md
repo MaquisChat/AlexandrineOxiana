@@ -201,3 +201,12 @@ The coordinator's rulings after the whole-branch review and the owner's first tr
 | A reviewer who had not built the task for every one of the ten tasks, a second look after each fix round, and a mutation of the code for the three most important behaviours (R669–R694) | One whole-branch review at the end | Every first review found real faults; five of them were faults of the plan that the builders had followed faithfully. Cost: the piece took a day of review beyond its building |
 | A failed check is read before it is run again, by someone who proves the cause (R695, R696) | Re-running the browser scenario until it passed | It was a test's timing accident, proven by forcing it; a blind re-run would have "passed" and left the accident in place for the next full run |
 | Tasks 8 and 9 (screens) started beside Task 5, against pinned routes with fakes, their browser scenarios run by the coordinator at the join (R682) | Waiting for Task 5 and Task 7 | They share no file with the service tasks. It took two tasks off the critical path; both merged cleanly three merges later |
+
+## Build 17 in `main`, and the pause (26 November 2026, Central)
+
+| Decision | Who | Why |
+|---|---|---|
+| Build 17 (whole channels with automatic transcription) goes to `main` as soon as GitHub's check is green | The owner ("merge build 17 to main when the check is green") | `main` changes only on the owner's word (R702) |
+| Further development is paused after that merge | The owner ("please pause further development, as we are nearing this week's usage limit") | The week's usage limit; nothing new is started until the owner says to go on |
+| The interface gets its own sentence for each of the nine new reason codes, in the library's words | Coordinator (R699) | A test compares the two tables; the full verification found them apart after the join |
+| The watched-folders test that timed out under load does not hold build 17; it is listed for a debugger (FR-776) | Coordinator (R699) | Code untouched by this piece and the same as in `main`; passes alone; but twice is a pattern and is to be explained, not waved through |
