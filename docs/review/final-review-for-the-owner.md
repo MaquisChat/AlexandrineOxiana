@@ -1,6 +1,6 @@
 # The final review — what I need from you
 
-*Updated 26 November 2026, 6:15 pm Central: part 17, at the end, is new — WHOLE CHANNELS, DOWNLOADED AND TRANSCRIBED WITHOUT WATCHING OVER THEM, is built, passed all its tests and GitHub's check, and IS IN `main` on your word. MAC BUILD 17 EXISTS and is the build to use; part 17 says where to download it. Development is paused, as you asked.*
+*Updated 26 November 2026, 6:10 pm Central: part 17, at the end, is new — WHOLE CHANNELS, DOWNLOADED AND TRANSCRIBED WITHOUT WATCHING OVER THEM, is built, passed all its tests and GitHub's check, and IS IN `main` on your word. MAC BUILD 17 EXISTS and is the build to use; part 17 says where to download it. Development is paused, as you asked.*
 
 *Updated 26 November 2026, just after midnight Central: BUILD 16 IS IN `main`, on your word "Merge". Mac build 16 (part 16) is now the build of `main` and the build to use.*
 
