@@ -158,6 +158,8 @@ export class WorkerJobError extends Error {
     readonly code: string,
     message: string,
     readonly detail?: string,
+    /** The platform's own words for why it refused (the worker's `platformReason`: no link, at most 200 characters). */
+    readonly platformReason?: string,
   ) {
     super(message);
   }
@@ -180,14 +182,21 @@ export class WorkerToolError extends WorkerJobError {
     message: string,
     readonly tool: string,
     detail?: string,
+    platformReason?: string,
   ) {
-    super(code, message, detail);
+    super(code, message, detail, platformReason);
   }
 }
 
-/** The error for a worker `{ code, message, detail?, tool? }`. */
-function workerError(e: { code: string; message: string; detail?: string | undefined; tool?: string | undefined }): WorkerJobError {
-  return typeof e.tool === "string" && e.tool ? new WorkerToolError(e.code, e.message, e.tool, e.detail) : new WorkerJobError(e.code, e.message, e.detail);
+/** The worker's `platformReason`, kept only when it is a non-empty string (and never longer than the worker sends it). */
+function platformReasonOf(v: unknown): string | undefined {
+  return typeof v === "string" && v.trim() ? v.trim().slice(0, 200) : undefined;
+}
+
+/** The error for a worker `{ code, message, detail?, tool?, platformReason? }`. */
+function workerError(e: { code: string; message: string; detail?: string | undefined; tool?: string | undefined; platformReason?: unknown }): WorkerJobError {
+  const reason = platformReasonOf(e.platformReason);
+  return typeof e.tool === "string" && e.tool ? new WorkerToolError(e.code, e.message, e.tool, e.detail, reason) : new WorkerJobError(e.code, e.message, e.detail, reason);
 }
 
 export interface WorkerEndpoint {
@@ -212,7 +221,7 @@ interface WorkerJobState {
   status: "queued" | "running" | "done" | "failed" | "cancelled";
   progress?: number;
   result?: { output: string; meta?: Record<string, unknown> };
-  error?: { code: string; message: string; detail?: string; tool?: string };
+  error?: { code: string; message: string; detail?: string; tool?: string; platformReason?: string };
 }
 
 const TERMINAL = new Set(["done", "failed", "cancelled"]);

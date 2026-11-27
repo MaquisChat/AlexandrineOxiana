@@ -365,6 +365,8 @@ const proj = (id: string) => `/projects/${seg(id)}`;
 export function libraryApi(client: ApiClient) {
   const r = client.request;
   return {
+    /** The client itself, for the parts of the library screen that take one (the work lines, components/WorkLines.tsx). */
+    client,
     events: (opts: EventsOptions = {}): AsyncGenerator<ServiceEvent, void, undefined> => client.events(opts),
     /** Interrupted changes recovery could not settle, resolved by the researcher's choice (R27). */
     pendingWrites: {

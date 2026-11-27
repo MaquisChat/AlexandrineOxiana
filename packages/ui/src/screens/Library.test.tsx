@@ -5,6 +5,7 @@ import { StrictMode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { LOOKUP_WAITING_TEXT, attachClosedSentence } from "@ao/shared";
 import { CURRENT_RW, libraryHandlers, PROJECTS, server, SOURCES, TAGS, serviceError, testApi, url, useMockService } from "../test/service";
+import { exampleRun, idleList, mockBackground } from "../test/backgroundService";
 import { Library } from "./Library";
 
 useMockService();
@@ -19,6 +20,53 @@ function drop(zone: HTMLElement, paths: string[]) {
 }
 
 describe("Library screen", () => {
+  it("the work lines are shown for the open project", async () => {
+    const run = exampleRun({ projectId: "p1", state: "interrupted" });
+    const m = mockBackground({ runs: [run, exampleRun({ projectId: "p2", runId: "run-9", title: "Locked Channel" })], lists: { p1: idleList("p1", { state: "paused", total: 412, done: 14 }) }, noEvents: true });
+    server.use(...m.handlers, ...libraryHandlers());
+    renderLibrary();
+    const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
+    expect(await within(lines).findByText((_c, el) => el?.textContent === "The capture of 'Example Channel' was interrupted: 120 of 412 done." && el.tagName === "P")).toBeTruthy();
+    expect(within(lines).getByText("Transcriptions paused: 14 of 412 done.", { ignore: ".ao-visually-hidden" })).toBeTruthy();
+    expect(within(lines).getByRole("button", { name: "Resume downloads (292 did not complete) The capture of 'Example Channel' was interrupted: 120 of 412 done." })).toBeTruthy();
+    expect(within(lines).queryByText(/Locked Channel/)).toBeNull();
+    expect(m.count("GET /projects/p1/downloads")).toBeGreaterThan(0);
+    expect(m.count("GET /projects/p2/downloads")).toBe(0);
+  });
+
+  it("an event on the screen's own stream shows its line in the work lines (R679 A2)", async () => {
+    // The screen's one /events stream is the background fake's, so a test can publish on it.
+    const m = mockBackground({});
+    server.use(...m.handlers, ...libraryHandlers());
+    renderLibrary();
+    await waitFor(() => expect(m.count("GET /projects/p1/downloads")).toBeGreaterThan(0));
+    await waitFor(() => expect(m.streams()).toBe(1));
+    expect(screen.queryByRole("region", { name: "Downloads and transcriptions" })).toBeNull();
+    act(() => m.emit({ projectId: "p1", downloads: exampleRun({ projectId: "p1", state: "queued", total: 0, done: 0 }) }));
+    const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
+    expect(await within(lines).findByText((_c, el) => el?.textContent === '"Example Channel" is waiting its turn. It starts by itself when the downloads before it have finished, paused or stopped.' && el.tagName === "P", { ignore: ".ao-visually-hidden" })).toBeTruthy();
+    expect(m.count("GET /events")).toBe(1);
+  });
+
+  it("Transcribe everything without a transcript is offered above the sources list, and its list reaches the work lines (Task 9)", async () => {
+    const m = mockBackground({ untranscribed: { p1: { count: 12, soundSeconds: 3.5 * 3600, unknownLengths: 0 } } });
+    server.use(...m.handlers, ...libraryHandlers());
+    renderLibrary();
+    const button = await screen.findByRole("button", { name: "Transcribe everything without a transcript" });
+    const table = await screen.findByRole("table", { name: "Sources" });
+    // Above the sources list, in reading order.
+    expect(button.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await waitFor(() => expect(m.streams()).toBe(1));
+    await userEvent.click(button);
+    await userEvent.click(await screen.findByRole("button", { name: "Transcribe them" }));
+    expect(await screen.findByText("12 sources were put on the transcription list.")).toBeTruthy();
+    // The service publishes the list's change; the screen's own stream brings the line (R679): nothing is read again for it.
+    const lines = await screen.findByRole("region", { name: "Downloads and transcriptions" });
+    expect(await within(lines).findByText("Transcribing: 0 of 12", { ignore: ".ao-visually-hidden" })).toBeTruthy();
+    expect(m.count("POST /projects/p1/transcription-list")).toBe(1);
+    expect(m.count("GET /events")).toBe(1);
+  });
+
   it("lists projects with their compliance profile badges, and marks locked ones", async () => {
     server.use(...libraryHandlers());
     renderLibrary();
@@ -261,6 +309,19 @@ describe("Library screen", () => {
     renderLibrary(ro);
     await screen.findByRole("link", { name: "Governance and records" });
     expect(screen.queryByRole("link", { name: "Find and acquire" })).toBeNull();
+  });
+
+  it("a read-only library offers Transcribe everything without a transcript switched off, as its other edit buttons, with the banner saying why (R684)", async () => {
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "locked-by-other-device" };
+    const m = mockBackground({ untranscribed: { p1: { count: 12, soundSeconds: 3.5 * 3600, unknownLengths: 0 } } });
+    server.use(...m.handlers, ...libraryHandlers({ current: ro }));
+    renderLibrary(ro);
+    const button = (await screen.findByRole("button", { name: "Transcribe everything without a transcript" })) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "New collection" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((await screen.findByText(/Read-only \(locked by another device\)/)).closest("[role=status]")).toBeTruthy();
+    await userEvent.click(button);
+    expect(m.count("GET /projects/p1/untranscribed")).toBe(0);
   });
 
   it("a read-only library offers no new project", async () => {

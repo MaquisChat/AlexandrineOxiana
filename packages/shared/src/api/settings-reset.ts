@@ -7,7 +7,7 @@
  */
 
 /** The settings files that can be reset this way, as the error's `reason` names them. */
-export const RESETTABLE_SETTINGS = ["extension-pairings", "fonts", "appearance"] as const;
+export const RESETTABLE_SETTINGS = ["extension-pairings", "fonts", "appearance", "background"] as const;
 export type ResettableSetting = (typeof RESETTABLE_SETTINGS)[number];
 
 export function isResettableSetting(v: unknown): v is ResettableSetting {

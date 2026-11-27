@@ -277,7 +277,8 @@ describe("captureUrl", () => {
     const p = await project();
     process.env.FAKE_TOOL_MODE = "login";
     const out = await capture.captureUrl(p.id, YT, { transcribe: false });
-    expect(out).toEqual({ url: YT, status: "failed", errorCode: "LOGIN_REQUIRED", reason: LOGIN_SENTENCE });
+    // The stand-in gives the platform's own words as the worker does (R674 B), cut where yt-dlp speaks.
+    expect(out).toEqual({ url: YT, status: "failed", errorCode: "LOGIN_REQUIRED", reason: LOGIN_SENTENCE, platformReason: "Sign in to confirm you're not a bot." });
     expect(repo.listSourceIds(p.id)).toEqual([]);
   });
 
@@ -478,6 +479,10 @@ describe("with the real Python media worker", () => {
       await chmod(join(bin, "yt-dlp"), 0o755);
     };
     await wrap("ok");
+    // The better qualities need the video tools: a fake ffmpeg first on PATH, so the worker finds one
+    // on any machine (the fake yt-dlp never calls it).
+    await writeFile(join(bin, "ffmpeg"), "#!/bin/sh\nexit 0\n");
+    await chmod(join(bin, "ffmpeg"), 0o755);
     const w = await startWorker({ env: { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, AO_MODELS_DIR: join(tmp, "models"), AO_TOOLS_DIR: join(tmp, "tools") } });
     closers.push(() => w.stop());
     const real = createLinkCapture({ repo, worker: new WorkerClient({ repo, worker: w, index: { db: handle.db }, pollMs: 20 }), index: handle });
@@ -904,5 +909,34 @@ describe("the speech model names in sentences (R158)", () => {
     const { readFile } = await import("node:fs/promises");
     const src = await readFile(new URL("./errors.ts", import.meta.url), "utf8");
     expect(src).not.toMatch(/large-v3|\btiny\b/);
+  });
+});
+
+describe("the requested quality and the platform's reason (whole channels, Task 3)", () => {
+  it("the requested quality is passed to the worker and recorded on the stored recording", async () => {
+    const p = await project();
+    const out = await capture.captureUrl(p.id, YT, { transcribe: false, quality: "audio" });
+    expect(out).toMatchObject({ status: "created" });
+    const job = worker.submitted.find((j) => j.type === "capture.download");
+    expect(job?.params.quality).toBe("audio");
+    const sf = await repo.getSource(p.id, out.sourceId!);
+    const media = sf.assets.filter((a) => a.role === "original" && (a.kind === "audio" || a.kind === "video"));
+    expect(media.map((a) => [a.kind, a.path.endsWith(".m4a")])).toEqual([["audio", true]]);
+    expect(media[0]!.metadata).toMatchObject({ requestedQuality: "audio" });
+    // Only the recording carries it: the thumbnail and the platform's data do not.
+    for (const a of sf.assets.filter((x) => x.kind !== "audio")) expect(a.metadata?.requestedQuality).toBeUndefined();
+
+    // Without a requested quality nothing is recorded.
+    const plain = await capture.captureUrl(p.id, YT_CONFLICT, { transcribe: false });
+    const sf2 = await repo.getSource(p.id, plain.sourceId!);
+    for (const a of sf2.assets) expect(a.metadata?.requestedQuality).toBeUndefined();
+  });
+
+  it("a worker failure's platform reason is carried on the outcome", async () => {
+    const p = await project();
+    const { WorkerJobError } = await import("../worker-client.js");
+    vi.spyOn(client, "submit").mockRejectedValue(new WorkerJobError("NOT_FOUND_OR_REMOVED", "the post was not found", undefined, "Video unavailable."));
+    const out = await capture.captureUrl(p.id, YT, { transcribe: false });
+    expect(out).toEqual({ url: YT, status: "failed", errorCode: "NOT_FOUND_OR_REMOVED", reason: plainReason("NOT_FOUND_OR_REMOVED"), platformReason: "Video unavailable." });
   });
 });

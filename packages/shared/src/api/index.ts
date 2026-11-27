@@ -28,3 +28,4 @@ export * from "./destruction.js";
 export * from "./library-place.js";
 export * from "./interrupted-changes.js";
 export * from "./library-move.js";
+export * from "./background.js";

@@ -4,7 +4,9 @@
  * and answer shapes are declared once, in @ao/shared (api/capture.ts, Task 47):
  *
  *   POST /projects/:id/capture           { urls, options? } → { queueId }  (capture.ts)
- *   POST /projects/:id/capture-profile   { url, options? }  → { queueId }  (capture.ts)
+ *   POST /projects/:id/capture-profile   { url, options? }  → { queueId }  (capture.ts; `options.quality`, whole channels)
+ *   POST /projects/:id/capture-estimate  { url, options? }  → CaptureEstimate (downloads.ts; whole channels, Task 5)
+ *   GET  /projects/:id/automation        → ProjectAutomation (whole channels, Task 7)
  *   POST /projects/:id/acknowledge       { kind: "cookies" } → { acknowledgements } (projects.ts)
  *   GET  /projects/:id/captures          → CaptureQueueListResponse (@ao/shared; Task 63)
  *   GET  /projects/:id/captures/:queueId → CaptureQueueDetail
@@ -44,6 +46,8 @@ import {
   type AcknowledgeResponse,
   type CaptureBrowser,
   type CaptureContentType,
+  type CaptureEstimate,
+  type CaptureEstimateRequest,
   type CaptureItemOutcome,
   type CaptureItemStatus,
   type CaptureLinksRequest,
@@ -61,6 +65,7 @@ import {
   type CaptureToolVersionsResponse,
   type GovernanceReadability,
   type ProfileCaptureRequestOptions,
+  type ProjectAutomation,
   type SpeechModel,
 } from "@ao/shared";
 import type { ApiClient, ServiceEvent } from "./client";
@@ -230,6 +235,16 @@ const OUTCOME_TEXT: Record<string, string> = {
   POLICY_CHANGED_RUN: "This project's rules changed during the capture. Posts saved before the change are kept; nothing else was saved.",
   RATE_LIMITED_PAUSED: "The platform is limiting requests, so the profile capture was paused. Run it again later; it continues where it stopped.",
   INVALID_OPTIONS: "Some profile capture options are not valid. Check the dates (YYYY-MM-DD) and the maximum number of items.",
+  // Whole channels (download runs): the library's own sentences, word for word.
+  RATE_LIMITED_GAVE_UP: "The platform kept limiting requests for 12 hours, so the capture was paused.",
+  RUN_PAUSED: "The capture was paused.",
+  RUN_STOPPED: "The capture was stopped. What was downloaded stays in the library.",
+  DISK_NEARLY_FULL: "The capture was paused because the disk is nearly full.",
+  NETWORK_LOST: "The connection was lost three times.",
+  DISK_FULL: "The disk became full during the download, so nothing of it was kept.",
+  NETWORK_LOST_GAVE_UP: "The connection stayed lost for 12 hours, so the capture was paused.",
+  LIST_INCOMPLETE: "The platform's list came back incomplete, so some videos could not be looked for.",
+  RUN_FINISHED: "These downloads have finished, so there is nothing to resume.",
   POLICY_DENIED: "This project's rules do not allow this capture.",
   PROJECT_LOCKED: "The project is locked. Unlock it, then try again.",
   CAPTURE_FAILED: "Something went wrong while saving this link. Nothing was saved.",
@@ -600,6 +615,16 @@ export function captureApi(client: ApiClient) {
       const body: CaptureProfileRequest = { url, options };
       return r<CaptureStartedResponse>("POST", `/projects/${pid(projectId)}/capture-profile`, { body });
     },
+    /**
+     * What capturing a profile, channel or playlist would take (whole channels): the platform is asked only for the
+     * list. Nothing is captured; the options are the ones `captureProfile` would send.
+     */
+    estimate: (projectId: string, url: string, options: ProfileCaptureOptions, o: { signal?: AbortSignal } = {}): Promise<CaptureEstimate> => {
+      const body: CaptureEstimateRequest = { url, options };
+      return r<CaptureEstimate>("POST", `/projects/${pid(projectId)}/capture-estimate`, { body, ...o });
+    },
+    /** The project's automation switch ("Transcribe captured audio and video automatically"), for the estimate's Transcribe box. */
+    automation: (projectId: string, o: { signal?: AbortSignal } = {}) => r<ProjectAutomation>("GET", `/projects/${pid(projectId)}/automation`, o),
     /** Records the one-time browser-session acknowledgement (audited by the service). */
     acknowledge: async (projectId: string) => {
       const body: AcknowledgeRequest = { kind: "cookies" };

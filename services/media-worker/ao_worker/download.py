@@ -45,11 +45,30 @@ log = logging.getLogger("ao_worker.download")
 TOOLS = ("yt-dlp", "gallery-dl")
 BROWSERS = ("chrome", "firefox", "safari", "edge", "brave")
 # yt-dlp format selection per quality choice (best video+audio, falling back to the best single file).
+_H264_AAC = "vcodec:h264,acodec:m4a"
 QUALITY_FORMATS = {
     "best": "bv*+ba/b",
-    "1080p": "bv*[height<=1080]+ba/b[height<=1080]/b",
-    "720p": "bv*[height<=720]+ba/b[height<=720]/b",
+    "1080p": "bv*+ba/b",
+    "720p": "bv*+ba/b",
+    "audio": "ba[ext=m4a]/ba/b",
+    "ready": "b",
 }
+# Format sorting per quality choice. `res:N` takes the best picture whose SMALLER side is at most N (an
+# upright video is not thrown out by a height filter) and never fails for lack of a match; the H.264/AAC
+# preference comes after the size, so the codec never lowers the size, and yt-dlp joins that pair into an
+# MP4 that plays in the app on every Mac.
+QUALITY_SORT = {
+    "best": f"res,fps,{_H264_AAC}",
+    "1080p": f"res:1080,fps,{_H264_AAC}",
+    "720p": f"res:720,fps,{_H264_AAC}",
+}
+# Extra yt-dlp arguments per quality choice ("Audio only" is saved as an m4a file).
+QUALITY_EXTRA_ARGS = {"audio": ["-x", "--audio-format", "m4a"]}
+# Only "ready" (a file already joined by the platform) can be saved without ffmpeg: the others join
+# picture and sound, or extract the sound, and refuse to run rather than save a lower quality silently.
+QUALITY_WITHOUT_FFMPEG = ("ready",)
+# Asked for nothing and ffmpeg is there: the default quality of the app.
+DEFAULT_QUALITY = "720p"
 DATE_RE = re.compile(r"^\d{8}$")
 YTDLP_RELEASES = "https://github.com/yt-dlp/yt-dlp/releases/"
 # Hosts the release files may come from (GitHub redirects downloads to its file host): the
@@ -60,16 +79,25 @@ YTDLP_MAX_BYTES = 200 * 1024 * 1024
 SUMS_MAX_BYTES = 1024 * 1024
 _TAG_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}(\.\d+)?$")
 
-ERROR_CODES = ("LOGIN_REQUIRED", "RATE_LIMITED", "NOT_FOUND_OR_REMOVED", "GEO_BLOCKED", "PRIVATE", "EXTRACTOR_ERROR")
+ERROR_CODES = ("LOGIN_REQUIRED", "RATE_LIMITED", "NOT_FOUND_OR_REMOVED", "GEO_BLOCKED", "PRIVATE", "EXTRACTOR_ERROR", "DISK_FULL", "NETWORK_LOST", "TOOL_NOT_INSTALLED")
 
 # First match wins; the order matters ("Private video. Sign in if ..." is PRIVATE, not LOGIN_REQUIRED).
 _ERROR_PATTERNS = [
+    ("TOOL_NOT_INSTALLED", re.compile(r"ffmpeg not found", re.I)),
     ("PRIVATE", re.compile(r"private video|this (account|profile|user) is private|is private\b|private (account|profile|post)", re.I)),
     ("GEO_BLOCKED", re.compile(r"not (made this video )?available in your (country|region|location)|geo[- ]?(restrict|block)", re.I)),
-    ("RATE_LIMITED", re.compile(r"\b429\b|too many requests|rate[- ]?limit", re.I)),
+    # 5xx: the server asks to be tried later. Placed before NOT_FOUND_OR_REMOVED ("Service Unavailable").
+    ("RATE_LIMITED", re.compile(
+        r"\b429\b|too many requests|rate[- ]?limit|HTTP ?Error:? '?5\d\d|content isn'?t available, try again later", re.I)),
     ("LOGIN_REQUIRED", re.compile(
         r"sign in to confirm|log ?in required|login required|requires? (a )?log ?in|--cookies|authentication|"
         r"age[- ]?restricted|you need to log in|log in to", re.I)),
+    ("DISK_FULL", re.compile(r"No space left on device|ENOSPC|disk (is )?full", re.I)),
+    ("NETWORK_LOST", re.compile(
+        r"urlopen error|timed out|Connection (reset|refused|aborted)|Network is unreachable|No route to host|"
+        r"Temporary failure in name resolution|Name or service not known|nodename nor servname|"
+        r"getaddrinfo failed|Remote end closed connection|IncompleteRead|"
+        r"Did not get any data blocks|fragment \d+ not found", re.I)),
     ("NOT_FOUND_OR_REMOVED", re.compile(
         r"video unavailable|has been removed|\b404\b|not found|does not exist|no longer available|"
         r"has been deleted|account (has been )?(terminated|suspended)|unavailable", re.I)),
@@ -111,12 +139,68 @@ def redact(text: str) -> str:
 
 
 def map_error(stderr: str) -> str:
-    lines = [l for l in stderr.splitlines() if "ERROR" in l]
+    # yt-dlp writes `ERROR: ...`, gallery-dl `[instagram][error] ...`; warnings are not the failure.
+    lines = [l for l in stderr.splitlines() if "ERROR" in l or re.search(r"\]\[error\]", l, re.I)]
     text = "\n".join(lines) if lines else stderr
+    # An HTTP answer means the connection worked: such a text is never a lost connection.
+    http_answer = re.search(r"HTTP ?Error", text, re.I) is not None
     for code, pat in _ERROR_PATTERNS:
+        if code == "NETWORK_LOST" and http_answer:
+            continue
         if pat.search(text):
             return code
     return "EXTRACTOR_ERROR"
+
+
+_PLATFORM_REASON_RE = re.compile(r"ERROR: \[[^\]]+\] [^:]+: (.+)")
+# Control characters, and the invisible direction and zero-width characters.
+_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff\u061c\u2060\u00ad]")
+PLATFORM_REASON_MAX = 200
+# The platform's words end where yt-dlp starts speaking for itself.
+_REASON_CUTS = ("; please report", " (caused by", " See ")
+_OPTION_CUT_RE = re.compile(r"\s+(?:use\s+)?--[A-Za-z]", re.I)  # " Use --cookies": the program speaking; only "use" goes with it
+_REASON_REFUSED = ("Errno", "urlopen", "ConnectionPool", "HTTP Error", "Traceback",
+                   "/Users/", "/home/", "/var/", "/tmp/", "~/")
+_DRIVE_RE = re.compile(r"\b[A-Za-z]:[\\/]")
+# Only for these failures is the platform's sentence about the video; for the rest it is yt-dlp's or Python's.
+PLATFORM_REASON_CODES = ("PRIVATE", "GEO_BLOCKED", "NOT_FOUND_OR_REMOVED", "LOGIN_REQUIRED")
+
+
+def platform_reason(stderr: str) -> str | None:
+    """The platform's own sentence from the last `ERROR: [platform] id: <reason>` line, or None.
+
+    Redacted, links and invisible characters removed, cut where yt-dlp starts speaking itself, and
+    None when what is left is empty or carries a Python or network detail or a path. At most 200
+    characters, cut at a word and ended with an ellipsis. Callers give it only for the codes in
+    PLATFORM_REASON_CODES."""
+    reason = None
+    for line in stderr.splitlines():
+        m = _PLATFORM_REASON_RE.search(line)
+        if m:
+            reason = m.group(1)
+    if reason is None:
+        return None
+    reason = _CONTROL_RE.sub("", redact(reason))
+    cuts = [reason.find(c) for c in _REASON_CUTS if c in reason]
+    option = _OPTION_CUT_RE.search(reason)
+    if option:
+        cuts.append(option.start())
+    if cuts:
+        reason = reason[: min(cuts)]
+    reason = re.sub(r" {2,}", " ", _URL_RE.sub("", reason)).strip()
+    if not reason or any(bad in reason for bad in _REASON_REFUSED) or _DRIVE_RE.search(reason):
+        return None
+    slash = reason.find("/")
+    if slash != -1 and "?" in reason[slash:]:
+        return None
+    q = reason.find("?")
+    if q != -1 and "=" in reason[q:]:  # a query string, with or without the path before it
+        return None
+    if len(reason) > PLATFORM_REASON_MAX:
+        head = reason[: PLATFORM_REASON_MAX - 1]
+        space = head.rfind(" ")
+        reason = (head[:space] if space > 0 else head).rstrip() + "…"
+    return reason
 
 
 # ---------- yt-dlp binary management ----------
@@ -319,7 +403,7 @@ def update_tools() -> dict:
 # ---------- arguments ----------
 
 
-def build_ytdlp_args(url: str, out: str, params: dict, js_runtime: str | None = None) -> list[str]:
+def build_ytdlp_args(url: str, out: str, params: dict, js_runtime: str | None = None, ffmpeg: str | None = None) -> list[str]:
     args = [
         "--ignore-config", "--newline", "--no-color",
         "-o", os.path.join(out, "%(id)s.%(ext)s"),
@@ -344,8 +428,22 @@ def build_ytdlp_args(url: str, out: str, params: dict, js_runtime: str | None = 
         args.append("--write-comments")
     if params.get("cookiesFromBrowser"):
         args += ["--cookies-from-browser", params["cookiesFromBrowser"]]
-    if params.get("quality"):
-        args += ["-f", QUALITY_FORMATS[params["quality"]]]
+    enumeration = bool(params.get("flatList") or params.get("metadataOnly"))
+    quality = params.get("quality") or (DEFAULT_QUALITY if ffmpeg else None)
+    if quality and not enumeration:
+        args += ["-f", QUALITY_FORMATS[quality]]
+        if quality in QUALITY_SORT:
+            args += ["-S", QUALITY_SORT[quality]]
+        args += QUALITY_EXTRA_ARGS.get(quality, [])
+        if quality in QUALITY_SORT:
+            # Above 1080p the sort gives a VP9 picture with AAC sound, which would be joined into .mkv,
+            # a file the app cannot play; mp4 always.
+            args += ["--merge-output-format", "mp4"]
+    if not enumeration:
+        # A video whose pieces could not all be fetched fails; it is never stored cut short.
+        args.append("--abort-on-unavailable-fragments")
+    if ffmpeg:
+        args += ["--ffmpeg-location", ffmpeg]
     if js_runtime:
         # Named explicitly (ADR 0014, R133): yt-dlp needs a JavaScript runtime for YouTube.
         args += ["--js-runtimes", f"deno:{js_runtime}"]
@@ -398,7 +496,7 @@ def validate_params(url: str, params: dict) -> str | None:
             return f"params.{k} must be a boolean"
     q = params.get("quality")
     if q is not None and (q not in QUALITY_FORMATS or params.get("tool", "yt-dlp") != "yt-dlp"):
-        return "params.quality must be best, 1080p or 720p (yt-dlp only)"
+        return "params.quality must be best, 1080p, 720p, audio or ready (yt-dlp only)"
     m = params.get("maxItems")
     if m is not None and (isinstance(m, bool) or not isinstance(m, int) or m < 1):
         return "params.maxItems must be a positive integer"
@@ -441,6 +539,21 @@ def _list_outputs(out: Path, tool: str, archive: str | None) -> tuple[list[str],
     return files, infos, comments
 
 
+# After these a download never counts as partial, whatever was written.
+DOWNLOAD_FAILS_ALWAYS = ("NETWORK_LOST", "DISK_FULL", "TOOL_NOT_INSTALLED")
+_MEDIA_SUFFIXES = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".flv", ".3gp", ".ts", ".mpg", ".mpeg",
+                   ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".oga", ".wav", ".flac", ".weba"}
+_UNJOINED_RE = re.compile(r"\.f[^.]+\.[^.]+$")  # abc.f137.mp4, abc.fhls-720p.mp4: one stream, not yet joined
+
+
+def _is_finished_media(path: str) -> bool:
+    """A video or audio file that is not an unjoined stream (`.part` and `.ytdl` files are never listed)."""
+    name = Path(path).name
+    if ".temp." in name or ".part" in name or name.endswith(".ytdl"):  # a join or download still in progress
+        return False
+    return Path(name).suffix.lower() in _MEDIA_SUFFIXES and not _UNJOINED_RE.search(name)
+
+
 def _split_comments(out: Path) -> None:
     """Moves yt-dlp's `comments` out of each info JSON into `<id>.comments.json` next to it."""
     for p in sorted(out.rglob("*.info.json")):
@@ -462,6 +575,7 @@ def run(job: Job, ctx: JobContext) -> dict:
     out = Path(job.output)
     out.mkdir(parents=True, exist_ok=True)
     log.info("capture job %s tool=%s url=%s", job.id, tool, strip_url(job.input))
+    from . import tools
     from .tools import deno_path, not_installed
 
     extra_env: dict[str, str] = {}
@@ -469,9 +583,13 @@ def run(job: Job, ctx: JobContext) -> dict:
         resolved = resolve_ytdlp(download=False)
         if resolved is None:
             raise not_installed("video-downloader")
+        ffmpeg = tools.which("ffmpeg")
+        downloads = not (params.get("flatList") or params.get("metadataOnly"))
+        if ffmpeg is None and downloads and params.get("quality") not in (None, *QUALITY_WITHOUT_FFMPEG):
+            raise not_installed("ffmpeg")
         cmd = [resolved[0]]
         version = tool_version(cmd)
-        argv = [*cmd, *build_ytdlp_args(job.input, str(out), params, js_runtime=deno_path())]
+        argv = [*cmd, *build_ytdlp_args(job.input, str(out), params, js_runtime=deno_path(), ffmpeg=ffmpeg)]
     else:
         g = gallerydl_cmd()
         if g is None:
@@ -508,10 +626,19 @@ def run(job: Job, ctx: JobContext) -> dict:
     if rc != 0:
         code = map_error(stderr)
         detail = redact("\n".join(stderr.strip().splitlines()[-20:]))
-        if files or (enumeration and infos):
+        if tool == "yt-dlp" and not enumeration:
+            # Info JSON, captions and the thumbnail are written before the picture and sound, so they
+            # prove nothing. A lost connection, a full disk or a vanished ffmpeg always fails; any other
+            # failure is partial only when a finished video or audio file was written.
+            keep = code not in DOWNLOAD_FAILS_ALWAYS and any(_is_finished_media(f) for f in files)
+        else:
+            keep = bool(files or (enumeration and infos))
+        if keep:
             log.warning("capture job %s partial code=%s", job.id, code)
             meta.update(partial=True, errorCode=code, errorDetail=detail)
         else:
-            raise JobError(code, f"{tool} failed ({code})", detail)
+            if code == "TOOL_NOT_INSTALLED":  # ffmpeg went away while the job ran
+                raise not_installed("ffmpeg")
+            raise JobError(code, f"{tool} failed ({code})", detail, platform_reason=platform_reason(stderr) if code in PLATFORM_REASON_CODES else None)
     log.info("capture job %s finished files=%d", job.id, len(files))
     return {"output": str(out), "meta": meta}

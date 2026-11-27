@@ -7,7 +7,8 @@
  *  - starts the service as its `start` script does (`node --max-old-space-size=512 --import tsx
  *    src/main.ts`), with a fresh random token written on its standard input as one line (R98: never
  *    in its environment or command line; standard input is left open), port 0, NODE_ENV=test,
- *    AO_CONFIG_DIR in the temporary folder, the recorded lookup answers (AO_LOOKUP_FIXTURES, honoured only in test mode) and the
+ *    AO_CONFIG_DIR in the temporary folder, the recorded lookup answers (AO_LOOKUP_FIXTURES, honoured only in test mode), 500 GB
+ *    of free space for the download runs (AO_TEST_FREE_BYTES, honoured only in test mode) and the
  *    fake yt-dlp / gallery-dl named in AO_YTDLP_BIN / AO_GALLERYDL_BIN (the worker would otherwise
  *    run the real gallery-dl from its venv) and first on PATH; it waits for
  *    `AO_SERVICE_READY port=<n>`. The service starts the real media worker itself when a library
@@ -107,13 +108,28 @@ export type FakeTool = "yt-dlp" | "gallery-dl";
  * PYTHONPATH (through AO_WORKER_BIN, as the packaged app names its worker).
  */
 export interface FakeControl {
-  /** The synthetic profile the fake downloaders list and download (their FAKE_PROFILE_FILE); read at every run, so it can change between captures. */
+  /** The synthetic profile the fake downloaders list and download (their FAKE_PROFILE_FILE), or a list of them for fake yt-dlp (two channels at once); read at every run, so it can change between captures. */
   setProfile(profile: unknown): Promise<void>;
-  /** From now on every run of `tool` (but `--version`) waits before it starts, until `release(tool)`: a capture that is still running for as long as the test needs. */
-  hold(tool: FakeTool): Promise<void>;
+  /**
+   * From now on every run of `tool` (but `--version`) waits before it starts, until `release(tool)`: a capture that is
+   * still running for as long as the test needs. With `match`, only a run one of whose arguments contains it waits (one
+   * video of a channel, say), and every other run goes on.
+   */
+  hold(tool: FakeTool, match?: string): Promise<void>;
   release(tool: FakeTool): Promise<void>;
-  /** Runs of `tool` waiting at the hold now. */
+  /**
+   * Runs of `tool` waiting at the hold now: only those whose process is alive. A run waiting at the hold when
+   * `app.restart()` stopped the service leaves its marker behind; it is not counted (R697 M-c).
+   */
   held(tool: FakeTool): number;
+  /**
+   * From now on the fake speech recognition waits before it answers (each transcription stays running), until
+   * `releaseSpeech()`; it holds the transcriptions of a service started after a restart too, for as long as the hold is on.
+   */
+  holdSpeech(): Promise<void>;
+  releaseSpeech(): Promise<void>;
+  /** Transcriptions waiting at the speech hold now, in a worker that is alive. */
+  heldSpeech(): number;
   /** The arguments of every run of `tool` so far, oldest first. */
   runs(tool: FakeTool): string[][];
   /**
@@ -279,7 +295,7 @@ function fakeWrapper(tool: FakeTool, control: string): string {
   return [
     "#!/usr/bin/env node",
     '"use strict";',
-    'const { appendFileSync, existsSync, rmSync, writeFileSync } = require("node:fs");',
+    'const { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } = require("node:fs");',
     'const { spawnSync } = require("node:child_process");',
     `const CONTROL = ${JSON.stringify(control)};`,
     `const TOOL = ${JSON.stringify(join(FAKE_TOOLS, tool))};`,
@@ -293,11 +309,21 @@ function fakeWrapper(tool: FakeTool, control: string): string {
     "  process.exit(r.status ?? 1);",
     "};",
     'const hold = CONTROL + "/hold-" + NAME;',
-    'if (!args.includes("--version") && existsSync(hold)) {',
+    "// The hold file holds what an argument must contain for this run to wait; empty, every run waits.",
+    "const holding = () => {",
+    "  let match;",
+    "  try {",
+    '    match = readFileSync(hold, "utf8");',
+    "  } catch {",
+    "    return false;",
+    "  }",
+    '  return match === "" || args.some((a) => a.includes(match));',
+    "};",
+    'if (!args.includes("--version") && holding()) {',
     '  const marker = CONTROL + "/held-" + NAME + "-" + process.pid;',
     "  writeFileSync(marker, JSON.stringify(args));",
     "  const timer = setInterval(() => {",
-    "    if (existsSync(hold)) return;",
+    "    if (holding()) return;",
     "    clearInterval(timer);",
     "    rmSync(marker, { force: true });",
     "    run();",
@@ -307,12 +333,25 @@ function fakeWrapper(tool: FakeTool, control: string): string {
   ].join("\n");
 }
 
+/**
+ * The hold markers in `dir` named `<prefix><pid>[-…]` whose process is still running. A marker of a process that is gone
+ * (a held run the restart killed) is not counted, so nothing that polls `held` after a restart passes on a stale marker.
+ */
+export function liveMarkers(dir: string, prefix: string): number {
+  return readdirSync(dir).filter((n) => {
+    if (!n.startsWith(prefix)) return false;
+    const pid = Number(n.slice(prefix.length).split("-")[0]);
+    return Number.isInteger(pid) && pid > 0 && running(pid);
+  }).length;
+}
+
 /** A `fakeControl` test's wrappers and its FakeControl (see FakeControl). */
 async function fakeControlFor(root: string): Promise<{ env: Record<string, string>; control: FakeControl }> {
   const dir = join(root, "fake-control");
   const bin = join(dir, "bin");
   await mkdir(bin, { recursive: true });
-  const env: Record<string, string> = { AO_WORKER_BIN: join(FAKE_SPEECH, "ao-worker") };
+  // AO_FAKE_SPEECH_CONTROL: where the fake speech recognition looks for its hold (the worker is given the AO_ variables).
+  const env: Record<string, string> = { AO_WORKER_BIN: join(FAKE_SPEECH, "ao-worker"), AO_FAKE_SPEECH_CONTROL: dir };
   for (const tool of ["yt-dlp", "gallery-dl"] as const) {
     const file = join(bin, tool);
     await writeFile(file, fakeWrapper(tool, dir), { mode: 0o755 });
@@ -320,9 +359,12 @@ async function fakeControlFor(root: string): Promise<{ env: Record<string, strin
   }
   const control: FakeControl = {
     setProfile: (profile) => writeFile(join(dir, "profile.json"), JSON.stringify(profile)),
-    hold: (tool) => writeFile(join(dir, `hold-${tool}`), ""),
+    hold: (tool, match) => writeFile(join(dir, `hold-${tool}`), match ?? ""),
     release: (tool) => rm(join(dir, `hold-${tool}`), { force: true }),
-    held: (tool) => readdirSync(dir).filter((n) => n.startsWith(`held-${tool}-`)).length,
+    held: (tool) => liveMarkers(dir, `held-${tool}-`),
+    holdSpeech: () => writeFile(join(dir, "hold-speech"), ""),
+    releaseSpeech: () => rm(join(dir, "hold-speech"), { force: true }),
+    heldSpeech: () => liveMarkers(dir, "held-speech-"),
     runs: (tool) => {
       const file = join(dir, `runs-${tool}.jsonl`);
       return existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as string[]) : [];
@@ -381,6 +423,8 @@ export async function startService(root: string, opts: StartOptions = {}): Promi
   const token = randomBytes(32).toString("hex");
   const env = serviceEnv({
     NODE_ENV: "test",
+    // Test-only (honoured only under NODE_ENV=test): the download runs see 500 GB free, so no scenario depends on this machine's disk (R687 D).
+    AO_TEST_FREE_BYTES: "500000000000",
     AO_SERVICE_PORT: "0",
     AO_CONFIG_DIR: join(root, "config"),
     AO_TOOLS_DIR: join(root, "tools"),

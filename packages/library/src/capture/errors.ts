@@ -57,6 +57,18 @@ const REASONS: Record<string, string> = {
   RATE_LIMITED_PAUSED: "The platform is limiting requests, so the profile capture was paused. Run it again later; it continues where it stopped.",
   INVALID_OPTIONS: "Some profile capture options are not valid. Check the dates (YYYY-MM-DD) and the maximum number of items.",
   TOOL_NOT_INSTALLED: "A tool this needs is not installed on this computer, so nothing was saved. Install it from the Optional tools screen, then try again.",
+  // Whole channels (download runs).
+  RATE_LIMITED_GAVE_UP: "The platform kept limiting requests for 12 hours, so the capture was paused.",
+  RUN_PAUSED: "The capture was paused.",
+  RUN_STOPPED: "The capture was stopped. What was downloaded stays in the library.",
+  DISK_NEARLY_FULL: "The capture was paused because the disk is nearly full.",
+  NETWORK_LOST: "The connection was lost three times.",
+  DISK_FULL: "The disk became full during the download, so nothing of it was kept.",
+  NETWORK_LOST_GAVE_UP: "The connection stayed lost for 12 hours, so the capture was paused.",
+  // A Resume whose listing did not come back whole: the videos past the cut are still to do (R678).
+  LIST_INCOMPLETE: "The platform's list came back incomplete, so some videos could not be looked for.",
+  // Resume downloads asked of a run that has nothing left to do (R680).
+  RUN_FINISHED: "These downloads have finished, so there is nothing to resume.",
 };
 
 /** What each optional tool (Task 48a catalogue id) is called in a sentence. */

@@ -34,6 +34,18 @@
  *
  * Immediately before each store the `capture` decision is evaluated again (no allow audited): if
  * the rules changed during the run, it stops with `POLICY_CHANGED` and one audited deny.
+ *
+ * Whole channels (R668, R669): a download run drives this capture through `RunHooks` — it is told
+ * the fresh list before any download (`onListed`), asked before each video (`beforeItem`: go,
+ * pause, stop, or pause for the disk), told each final outcome (`afterItem`), and does each wait
+ * itself (`wait`, on the growing schedule of waits.ts). With hooks, a video that could not finish
+ * for a reason every later video would share (a full disk, a missing tool, the media helper gone,
+ * the rules) is put back, not reported, and the run ends; a second lost connection in a row waits
+ * on the same schedule, and 12 hours of them end the run failed (NETWORK_LOST). The listing is
+ * treated the same way (a lost connection there waits from the first). Without hooks (the command
+ * line, a profile queue) all of this is as before.
+ * The platform's lane (R116) is taken per listing and per video, never for a whole run (R669 item
+ * 2), so a single link goes ahead while a run waits.
  */
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
@@ -73,9 +85,10 @@ import {
 import { creatorKey } from "../repo/pseudonyms.js";
 import { WorkerJobError, WorkerToolError, WorkerUnavailableError } from "../worker-client.js";
 import { AcknowledgementRequiredError, CaptureCancelledError, plainReason, toolMissingReason } from "./errors.js";
+import { nextWaitMs } from "./waits.js";
 import type { CaptureCore, CaptureOptions, CaptureOutcome, ItemContext } from "./link-capture.js";
 import { classifyUrl, type ClassifiedUrl, type Platform } from "./platforms.js";
-import { captionOf, profileSnapshot, readEnumeration, type ProfileEntry, type ProfileMeta } from "./profile-snapshot.js";
+import { captionOf, postUrl, profileSnapshot, readEnumeration, type ProfileEntry, type ProfileMeta } from "./profile-snapshot.js";
 import { firstLine, stripSnapshot, type CaptureTool } from "./snapshot.js";
 
 export type ProfileContentType = "posts" | "reels" | "videos" | "shorts" | "highlights";
@@ -92,9 +105,59 @@ export interface ProfileCaptureOptions extends CaptureOptions {
   metadataOnly?: boolean;
   /** Also save each new post's comments (third-party personal data; default false). */
   includeComments?: boolean;
+  /**
+   * Only these posts (by the platform's id), in this order, among those listed, whatever the dates
+   * and the maximum (a download run's Resume). Every id is reported: one already stored as a duplicate, one no longer listed as failed
+   * (`NOT_FOUND_OR_REMOVED`, after the listed ones). Not a filter for removed detection.
+   */
+  onlyIds?: string[];
+  /**
+   * The run continues an earlier one: only the audited decision changes — `capture.profile.resume`
+   * (the researcher's press of Resume downloads) or `capture.profile.continue` (it continued by itself).
+   */
+  resume?: "researcher" | "continue";
 }
 
-export type ProfileRunStatus = "completed" | "paused-rate-limited" | "failed";
+export type { ProfileEntry };
+
+export type ProfileRunStatus = "completed" | "paused-rate-limited" | "failed" | "paused" | "stopped" | "paused-disk" | "paused-tool";
+
+/** Why a run waits: the platform asked to slow down, or the connection was lost twice in a row. */
+export type RunWaitWhy = "rate-limited" | "connection";
+
+/**
+ * How a download run (download-run.ts) follows and steers a profile capture. Each hook runs outside
+ * the platform's lane. Without hooks the capture behaves as it always has.
+ */
+export interface RunHooks {
+  /**
+   * The posts the run will take, with their lengths, before any download: those not yet in the
+   * project, or with `onlyIds` those of its ids that are listed (known ones too).
+   */
+  onListed?(fresh: Array<ProfileEntry & { listing: string }>, meta: { title: string }): Promise<void>;
+  /** Asked before each fresh post (a duplicate too); may throw CaptureCancelledError. */
+  beforeItem?(e: ProfileEntry): Promise<"go" | "pause" | "stop" | "pause-disk">;
+  /** Told each final outcome, never a post put back. */
+  afterItem?(e: ProfileEntry, out: CaptureOutcome): Promise<void>;
+  /** Does one wait of the growing schedule; "pause" or "stop" ends the run, the post in hand not reported. */
+  wait?(ms: number, why: RunWaitWhy): Promise<"go" | "pause" | "stop">;
+}
+
+/** One listing of a profile, channel or playlist: what a capture would take (`listProfile`). */
+export interface ProfileListing {
+  status: "listed" | "rate-limited" | "failed";
+  platform: Platform;
+  kind: "channel" | "playlist" | "profile";
+  /** The display name, else the handle, else the link's own key. */
+  title: string;
+  /** In the platform's order, after the date and number limits; `known`: already in the project. */
+  entries: Array<ProfileEntry & { listing: string; known: boolean }>;
+  /** The whole profile was listed (not cut short, not limited by date or number). */
+  listComplete: boolean;
+  errorCode?: string;
+  /** The optional tool that was missing, with TOOL_NOT_INSTALLED. */
+  tool?: string;
+}
 
 export interface ProfileCaptureReport {
   status: ProfileRunStatus;
@@ -102,7 +165,7 @@ export interface ProfileCaptureReport {
   profileSourceId?: string;
   /** The run's import batch (every source the run created carries it). */
   batchId?: string;
-  /** The enumeration listed the whole profile (removed-post detection ran). */
+  /** The enumeration listed the whole profile and the run completed (removed-post detection ran). */
   listComplete: boolean;
   created: number;
   duplicates: number;
@@ -178,7 +241,42 @@ function invalidOptions(o: ProfileCaptureOptions): boolean {
   if (!validDay(o.since) || !validDay(o.until) || (o.since && o.until && o.since > o.until)) return true;
   if (o.maxItems !== undefined && (!Number.isInteger(o.maxItems) || o.maxItems < 1)) return true;
   if (o.contentTypes !== undefined && (!Array.isArray(o.contentTypes) || o.contentTypes.some((t) => !CONTENT_TYPES.has(t)))) return true;
+  if (o.onlyIds !== undefined && (!Array.isArray(o.onlyIds) || o.onlyIds.some((id) => typeof id !== "string" || !id))) return true;
+  if (o.resume !== undefined && o.resume !== "researcher" && o.resume !== "continue") return true;
   return false;
+}
+
+/** The profile and its posts from every listing (tab), each post once, and the listings that did not come back whole. */
+function readListings(results: ListingResult[], c: ClassifiedUrl, tool: CaptureTool) {
+  let profile: ProfileMeta | undefined;
+  const listed: ListedEntry[] = [];
+  const listedIds = new Set<string>();
+  /** Listings that did not come back whole: cut short, nested, or shorter than the platform's own count. */
+  const incompleteListings = new Set<string>();
+  for (const res of results) {
+    const en = readEnumeration(res.docs, c, tool);
+    if (!profile || (!profile.handle && en.profile.handle)) profile = en.profile;
+    const unique = en.entries.filter((e) => !listedIds.has(e.id));
+    if (res.partialCode || en.nested || (res.listing.main && en.reportedCount !== undefined && en.reportedCount > en.entries.length)) {
+      incompleteListings.add(res.listing.listing);
+    }
+    for (const e of unique) {
+      listedIds.add(e.id);
+      listed.push({ ...e, listing: res.listing.listing });
+    }
+  }
+  return { profile: profile ?? { links: [] }, listed, listedIds, incompleteListings };
+}
+
+/** The listed posts within the date limits (`dated`), and also within the maximum (`entries`). */
+function limitEntries(listed: ListedEntry[], opts: ProfileCaptureOptions) {
+  const sinceTs = opts.since ? Date.parse(`${opts.since}T00:00:00Z`) / 1000 : undefined;
+  const untilTs = opts.until ? Date.parse(`${opts.until}T00:00:00Z`) / 1000 + 86400 : undefined;
+  const dated = listed.filter((e) => e.timestamp === undefined || ((sinceTs === undefined || e.timestamp >= sinceTs) && (untilTs === undefined || e.timestamp < untilTs)));
+  const entries = opts.maxItems !== undefined ? dated.slice(0, opts.maxItems) : dated;
+  // Any date or number limit (gallery-dl's range counts files, not posts): never a whole list.
+  const filtered = !!(opts.since || opts.until || opts.maxItems !== undefined);
+  return { dated, entries, filtered };
 }
 
 /** The part of a profile link that names it when no handle is in the link (channel id, playlist id). */
@@ -256,13 +354,44 @@ export function createProfileCapture(core: CaptureCore) {
     profileUrl: string,
     opts: ProfileCaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
-    control?: { cancelled?: () => boolean; signal?: AbortSignal },
+    control?: { cancelled?: () => boolean; signal?: AbortSignal; hooks?: RunHooks },
   ): Promise<ProfileCaptureReport> {
     if (opts.cookiesFromBrowser && !core.acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
     const c = classifyUrl(profileUrl);
     if ((c.kind !== "profile" && c.kind !== "playlist") || c.platform === "other") return failedReport("UNSUPPORTED_URL");
     if (invalidOptions(opts)) return failedReport("INVALID_OPTIONS");
-    return core.inLane(c.platform, () => run(projectId, c, opts, onProgress, control?.cancelled, control?.signal));
+    // R669 item 2: the platform's lane is taken per listing and per video inside the run, not for the run.
+    return run(projectId, c, opts, onProgress, control?.cancelled, control?.signal, control?.hooks);
+  }
+
+  /** One enumeration of a profile link (no waits, nothing stored): what a capture would take. */
+  async function listProfile(projectId: string, url: string, opts: ProfileCaptureOptions, signal?: AbortSignal): Promise<ProfileListing> {
+    if (opts.cookiesFromBrowser && !core.acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
+    const c = classifyUrl(url);
+    const kind: ProfileListing["kind"] = c.kind === "playlist" ? "playlist" : c.platform === "youtube" ? "channel" : "profile";
+    const none = { platform: c.platform, kind, entries: [], listComplete: false };
+    if ((c.kind !== "profile" && c.kind !== "playlist") || c.platform === "other") return { status: "failed", ...none, title: c.handle ?? "", errorCode: "UNSUPPORTED_URL" };
+    if (invalidOptions(opts)) return { status: "failed", ...none, title: linkKey(c), errorCode: "INVALID_OPTIONS" };
+    const platform = c.platform;
+    // The project's rules are asked before the platform is (no allow audited: the capture audits its
+    // own decision when it starts; a deny is audited and thrown as PolicyDeniedError).
+    await authorizeProcessing(repo, projectId, { action: "capture", capture: { method: "downloader", platform } }, { op: "capture.profile.list" });
+    const tool: CaptureTool = platform === "instagram" ? "gallery-dl" : "yt-dlp";
+    const r = await core.inLane(platform, () => enumerate(projectId, c, opts, tool, signal));
+    if (r.error === "RATE_LIMITED" || r.results.some((x) => x.partialCode === "RATE_LIMITED")) return { status: "rate-limited", ...none, title: linkKey(c), errorCode: "RATE_LIMITED" };
+    if (r.error) return { status: "failed", ...none, title: linkKey(c), errorCode: r.error, ...(r.error === "TOOL_NOT_INSTALLED" && r.tool ? { tool: r.tool } : {}) };
+    const { profile, listed, incompleteListings } = readListings(r.results, c, tool);
+    const { entries, filtered } = limitEntries(listed, opts);
+    const out: ProfileListing["entries"] = [];
+    for (const e of entries) out.push({ ...e, known: (await core.findExisting(projectId, platform, e.id)) !== undefined });
+    return {
+      status: "listed",
+      platform,
+      kind,
+      title: profile.displayName ?? c.handle ?? profile.handle ?? linkKey(c),
+      entries: out,
+      listComplete: !filtered && incompleteListings.size === 0,
+    };
   }
 
   async function run(
@@ -272,6 +401,7 @@ export function createProfileCapture(core: CaptureCore) {
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
     isCancelled: () => boolean = () => false,
     signal?: AbortSignal,
+    hooks?: RunHooks,
   ): Promise<ProfileCaptureReport> {
     /** Ended from outside (Task 63 I3): nothing more is stored, the run ends here (its batch stays as an interrupted one). */
     const check = () => {
@@ -283,12 +413,15 @@ export function createProfileCapture(core: CaptureCore) {
     const tool: CaptureTool = platform === "instagram" ? "gallery-dl" : "yt-dlp";
     const root = repoLibrary(repo).root;
 
-    // 1. Policy, before anything is downloaded: one audited capture decision for the whole run.
+    // 1. Policy, before anything is downloaded: one audited capture decision for the whole run (a
+    //    Resume, or a continuation by itself, is its own decision with the rules asked again, R668).
+    const decisionOp = opts.resume === "researcher" ? "capture.profile.resume" : opts.resume === "continue" ? "capture.profile.continue" : "capture.profile";
+    const resumed = opts.resume === "researcher" ? { resume: true } : opts.resume === "continue" ? { continued: true } : {};
     await authorizeProcessing(
       repo,
       projectId,
       { action: "capture", capture: { method: "downloader", platform } },
-      { op: "capture.profile", auditAllow: { details: { platform, cookies, comments: includeComments } } },
+      { op: decisionOp, auditAllow: { details: { platform, cookies, comments: includeComments, ...resumed } } },
     );
     const policy = await projectPolicy(repo, projectId);
     const identifiable = policy?.identifiability.containsIdentifiable ?? true;
@@ -324,29 +457,77 @@ export function createProfileCapture(core: CaptureCore) {
       editsNotChecked: 0,
       items: [],
     };
-    let waits = 0;
-    /** Waits before the next attempt; false when the waits are used up (the run pauses). */
-    const backOff = async (): Promise<boolean> => {
-      if (waits >= BACKOFF_MS.length) return false;
-      await core.sleep(BACKOFF_MS[waits++]!);
+    /** Hooks given: a download run (the waits, the stops and the errors that put a video back are its). */
+    const hooked = hooks !== undefined;
+    let attempt = 0;
+    let waitedMs = 0;
+    /**
+     * One wait before the next attempt: without `hooks.wait` the old 60/120/240 s (core.sleep), with
+     * it the growing schedule through the hook. "give-up" when the waits are used up (the run pauses).
+     */
+    const backOff = async (why: RunWaitWhy): Promise<"go" | "pause" | "stop" | "give-up"> => {
+      if (!hooks?.wait) {
+        if (attempt >= BACKOFF_MS.length) return "give-up";
+        await core.sleep(BACKOFF_MS[attempt++]!);
+        return "go";
+      }
+      const ms = nextWaitMs(attempt, waitedMs);
+      if (ms === undefined) return "give-up";
+      attempt++;
+      waitedMs += ms;
+      return hooks.wait(ms, why);
+    };
+    const resetWaits = () => {
+      attempt = 0;
+      waitedMs = 0;
+    };
+    const pause = () => Object.assign(report, { status: "paused-rate-limited" as const, reason: plainReason(hooks?.wait ? "RATE_LIMITED_GAVE_UP" : "RATE_LIMITED_PAUSED") });
+    const policyChanged = () => Object.assign(report, { status: "failed" as const, errorCode: "POLICY_CHANGED", reason: plainReason("POLICY_CHANGED_RUN") });
+    /** The run's own Pause or Stop (asked before a video, or answered to a wait). */
+    const endAs = (a: "pause" | "stop") =>
+      Object.assign(report, a === "pause" ? { status: "paused" as const, reason: plainReason("RUN_PAUSED") } : { status: "stopped" as const, reason: plainReason("RUN_STOPPED") });
+    /**
+     * The waits are used up: a slow-down pauses as before; 12 hours of lost connections end the run
+     * failed with NETWORK_LOST, so the screen says why and still offers Resume downloads (R674 D1).
+     */
+    const gaveUp = (why: RunWaitWhy) =>
+      why === "rate-limited" ? pause() : Object.assign(report, { status: "failed" as const, errorCode: "NETWORK_LOST", reason: plainReason("NETWORK_LOST_GAVE_UP") });
+
+    /** The run's end for a post whose failure every later post would share; false for an ordinary failure. */
+    const putBack = (out: CaptureOutcome): boolean => {
+      const code = out.errorCode;
+      if (code === "DISK_FULL") Object.assign(report, { status: "paused-disk" as const, errorCode: code, reason: plainReason("DISK_FULL") });
+      else if (code === "TOOL_NOT_INSTALLED") Object.assign(report, { status: "paused-tool" as const, errorCode: code, reason: out.reason ?? toolMissingReason(out.tool), ...(out.tool ? { tool: out.tool } : {}) });
+      else if (code === "WORKER_UNAVAILABLE") Object.assign(report, { status: "failed" as const, errorCode: code, reason: plainReason(code) });
+      else if (code === "POLICY_DENIED") Object.assign(report, { status: "failed" as const, errorCode: code, reason: out.reason ?? plainReason(code) });
+      else return false;
       return true;
     };
-    const pause = () => Object.assign(report, { status: "paused-rate-limited" as const, reason: plainReason("RATE_LIMITED_PAUSED") });
-    const policyChanged = () => Object.assign(report, { status: "failed" as const, errorCode: "POLICY_CHANGED", reason: plainReason("POLICY_CHANGED_RUN") });
 
     // 2. Enumerate each listing (tab).
     let results: ListingResult[] = [];
     let toolVersion = "unknown";
     for (;;) {
-      const r = await enumerate(projectId, c, opts, tool, signal);
+      const r = await core.inLane(platform, () => enumerate(projectId, c, opts, tool, signal));
       // Rate limited, even part-way through a list: wait and list again, or pause (not once ended, N7).
-      if (r.error === "RATE_LIMITED" || r.results.some((x) => x.partialCode === "RATE_LIMITED")) {
+      // With hooks, a listing that lost its connection waits on the same schedule, from the first
+      // failure (there is no video of its own to fail first, R674 C1).
+      const why: RunWaitWhy | undefined =
+        r.error === "RATE_LIMITED" || r.results.some((x) => x.partialCode === "RATE_LIMITED") ? "rate-limited" : hooked && r.error === "NETWORK_LOST" ? "connection" : undefined;
+      if (why) {
         check();
-        if (await backOff()) {
+        const a = await backOff(why);
+        if (a === "go") {
           check();
           continue;
         }
-        pause();
+        check();
+        if (a === "give-up") gaveUp(why);
+        else endAs(a);
+        return audited(projectId, platform, report);
+      }
+      // With hooks, a full disk or a missing tool at the listing ends the run as it would at a video.
+      if (r.error && hooked && putBack({ url: c.canonicalUrl, status: "failed", errorCode: r.error, ...(r.tool ? { tool: r.tool } : {}) })) {
         return audited(projectId, platform, report);
       }
       if (r.error) {
@@ -355,32 +536,12 @@ export function createProfileCapture(core: CaptureCore) {
         return audited(projectId, platform, missing ? { ...failedReport(r.error), ...missing, reason: toolMissingReason(missing.tool) } : failedReport(r.error));
       }
       ({ results, toolVersion } = r);
+      // Listed: the 12 hours start again for the videos, as after a successful video.
+      if (hooked) resetWaits();
       break;
     }
-    let profile: ProfileMeta | undefined;
-    const listed: ListedEntry[] = [];
-    const listedIds = new Set<string>();
-    /** Listings that did not come back whole: cut short, nested, or shorter than the platform's own count. */
-    const incompleteListings = new Set<string>();
-    for (const res of results) {
-      const en = readEnumeration(res.docs, c, tool);
-      if (!profile || (!profile.handle && en.profile.handle)) profile = en.profile;
-      const unique = en.entries.filter((e) => !listedIds.has(e.id));
-      if (res.partialCode || en.nested || (res.listing.main && en.reportedCount !== undefined && en.reportedCount > en.entries.length)) {
-        incompleteListings.add(res.listing.listing);
-      }
-      for (const e of unique) {
-        listedIds.add(e.id);
-        listed.push({ ...e, listing: res.listing.listing });
-      }
-    }
-    profile ??= { links: [] };
-    const sinceTs = opts.since ? Date.parse(`${opts.since}T00:00:00Z`) / 1000 : undefined;
-    const untilTs = opts.until ? Date.parse(`${opts.until}T00:00:00Z`) / 1000 + 86400 : undefined;
-    let entries = listed.filter((e) => e.timestamp === undefined || ((sinceTs === undefined || e.timestamp >= sinceTs) && (untilTs === undefined || e.timestamp < untilTs)));
-    if (opts.maxItems !== undefined) entries = entries.slice(0, opts.maxItems);
-    // Any date or number limit (gallery-dl's range counts files, not posts): never a whole list.
-    const filtered = !!(opts.since || opts.until || opts.maxItems !== undefined);
+    const { profile, listedIds, incompleteListings, listed } = readListings(results, c, tool);
+    const { dated, entries, filtered } = limitEntries(listed, opts);
 
     // 3. Batch record first, then the profile: record, source, collection, snapshot.
     check();
@@ -545,12 +706,61 @@ export function createProfileCapture(core: CaptureCore) {
       cancelled: isCancelled,
       ...(signal ? { signal } : {}),
     };
-    const fresh = entries.filter((e) => !isKnown(e.id));
+    // Whether this listing can be trusted to show what is gone (also used for removed detection below).
+    const wholeListings = new Set(results.map((r) => r.listing.listing).filter((l) => !incompleteListings.has(l)));
+    const checked = Object.entries(knownBefore).filter(([, k]) => wholeListings.has(k.listing)).map(([id]) => id);
+    const overlap = checked.filter((id) => listedIds.has(id)).length;
+    // Sanity guard: a list that shares less than half of the known posts is more likely the wrong
+    // list (or a login wall) than half the profile deleted.
+    const plausible = checked.length === 0 || overlap * 2 >= checked.length;
+    let fresh = entries.filter((e) => !isKnown(e.id));
+    /** `onlyIds` a whole listing no longer has: each is told as failed (removed), after the listed ones (R674 A, R678). */
+    let unlisted: ListedEntry[] = [];
+    if (opts.onlyIds) {
+      // Only these, in the order given, among everything the listing has: not cut by the run's dates
+      // or maximum (the ids were chosen by an earlier listing under the same options; a post whose
+      // date the platform changed is still taken, R677). A post already stored is not left out: it
+      // takes the duplicate path below and is reported as a duplicate, so a Resume reports every id
+      // it was given (R674 A).
+      const pool = new Map(listed.map((e) => [e.id, e] as const));
+      const ids = [...new Set(opts.onlyIds)];
+      fresh = ids.flatMap((id) => (pool.has(id) ? [pool.get(id)!] : []));
+      // Only a whole and plausible listing proves an id gone (R678): the same test as the whole list
+      // below, without the run's dates and maximum, which no longer cut a Resume's listing (R677).
+      // Otherwise an id not listed is told nothing: it stays to do, and the next Resume takes it.
+      const provesGone = incompleteListings.size === 0 && plausible && !(listed.length === 0 && checked.length > 0);
+      if (provesGone) unlisted = ids.filter((id) => !listedIds.has(id)).map((id) => ({ id, url: postUrl(platform, id, handle) ?? "", raw: {}, listing: fallbackListing }));
+    }
     const freshIds = new Set(fresh.map((e) => e.id));
+    check();
+    await hooks?.onListed?.(fresh, { title: profile.displayName ?? handle ?? label });
     let done = 0;
     let stopped = false;
+    /** The last post ended with a lost connection (a second one in a row waits instead, with hooks). */
+    let lastLost = false;
+    const total = fresh.length + unlisted.length;
+    const told = async (e: ListedEntry, out: CaptureOutcome) => {
+      report.items.push(out);
+      await hooks?.afterItem?.(e, out);
+      done++;
+      try {
+        onProgress?.(done, total, out);
+      } catch {
+        // a progress callback must not stop the run
+      }
+    };
     for (const e of fresh) {
       check();
+      if (hooks?.beforeItem) {
+        const a = await hooks.beforeItem(e);
+        check();
+        if (a !== "go") {
+          if (a === "pause-disk") Object.assign(report, { status: "paused-disk" as const, reason: plainReason("DISK_NEARLY_FULL") });
+          else endAs(a);
+          stopped = true;
+          break;
+        }
+      }
       const existing = await core.findExisting(projectId, platform, e.id);
       let out: CaptureOutcome;
       if (existing) {
@@ -560,14 +770,22 @@ export function createProfileCapture(core: CaptureCore) {
         report.duplicates++;
         await save(recordFiles(), { key: e.id, outcome: "duplicate", sourceId: existing });
       } else {
-        out = await captureWithBackoff(projectId, e, opts, item, backOff);
-        if (out.status === "failed" && out.errorCode === "RATE_LIMITED") {
-          pause();
+        const got = await captureWithBackoff(projectId, platform, e, opts, item, backOff, () => hooked && lastLost);
+        if ("ended" in got) {
+          // The post in hand is put back: not reported, tried again by the next run.
+          if (got.ended === "give-up") gaveUp(got.why);
+          else endAs(got.ended);
           stopped = true;
           break;
         }
+        out = got;
         if (out.status === "failed" && out.errorCode === "POLICY_CHANGED") {
           policyChanged();
+          stopped = true;
+          break;
+        }
+        // With hooks, a failure every later post would share puts this one back and ends the run.
+        if (hooked && out.status === "failed" && putBack(out)) {
           stopped = true;
           break;
         }
@@ -583,25 +801,24 @@ export function createProfileCapture(core: CaptureCore) {
           if (out.status !== "duplicate") createdSourceIds.push(out.sourceId);
         }
         await save(out.sourceId ? recordFiles() : [], { key: e.id, outcome: out.status, ...(out.sourceId ? { sourceId: out.sourceId } : {}), ...(out.errorCode ? { errorCode: out.errorCode } : {}) });
-        waits = 0;
+        resetWaits();
       }
-      report.items.push(out);
-      done++;
-      try {
-        onProgress?.(done, fresh.length, out);
-      } catch {
-        // a progress callback must not stop the run
-      }
+      lastLost = out.status === "failed" && out.errorCode === "NETWORK_LOST";
+      await told(e, out);
+    }
+    // A Resume's ids the platform no longer lists: a final failure each, nothing asked of the
+    // platform, no beforeItem and no wait (R674 A).
+    for (const e of stopped ? [] : unlisted) {
+      check();
+      const out: CaptureOutcome = { url: e.url, status: "failed", errorCode: "NOT_FOUND_OR_REMOVED", reason: plainReason("NOT_FOUND_OR_REMOVED") };
+      report.failed++;
+      await save([], { key: e.id, outcome: out.status, errorCode: out.errorCode });
+      await told(e, out);
     }
 
     // 5–6. Known posts: edits, reappearance; removed detection only for whole lists.
-    const wholeListings = new Set(results.map((r) => r.listing.listing).filter((l) => !incompleteListings.has(l)));
-    const checked = Object.entries(knownBefore).filter(([, k]) => wholeListings.has(k.listing)).map(([id]) => id);
-    const overlap = checked.filter((id) => listedIds.has(id)).length;
-    // Sanity guard: a list that shares less than half of the known posts is more likely the wrong
-    // list (or a login wall) than half the profile deleted.
-    const plausible = checked.length === 0 || overlap * 2 >= checked.length;
-    report.listComplete = !filtered && incompleteListings.size === 0 && plausible && !(entries.length === 0 && checked.length > 0);
+    /** The whole profile was listed; the check for missing posts runs only when the run also completes. */
+    const wholeList = !filtered && incompleteListings.size === 0 && plausible && !(entries.length === 0 && checked.length > 0);
     if (!stopped && (await core.stillAllowed(projectId, platform))) {
       for (const e of entries) {
         check();
@@ -646,14 +863,17 @@ export function createProfileCapture(core: CaptureCore) {
 
     // 7. Report, batch record, audit (written after a stop too: they record what happened).
     check();
+    // Only a completed run checked the posts missing from the list (R674 C2).
+    report.listComplete = wholeList && report.status === "completed";
     const finishedAt = new Date().toISOString();
     rec.lastCapturedAt = finishedAt;
     const reportName = datedFileName("capture", new Date(finishedAt), "md", repoTz(repo));
-    const state = report.status === "completed" ? "finished" : report.status === "paused-rate-limited" ? "paused" : "failed";
+    // Every end but a failure is a pause of the batch: a later run continues it.
+    const state = report.status === "completed" ? "finished" : report.status === "failed" ? "failed" : "paused";
     await save([
       ...recordFiles(),
       batchFile(state, finishedAt),
-      { rel: `${dirRel}/reports/${reportName}`, data: reportText(platform, collectionLabel, report, at, finishedAt), dated: true },
+      { rel: `${dirRel}/reports/${reportName}`, data: reportText(platform, collectionLabel, report, at, finishedAt, wholeList), dated: true },
     ]);
     return audited(projectId, platform, report);
   }
@@ -693,14 +913,20 @@ export function createProfileCapture(core: CaptureCore) {
     return r;
   }
 
-  /** One post through the per-item path; a rate-limited attempt waits and retries while waits remain. */
+  /**
+   * One post through the per-item path (in the platform's lane); a rate-limited attempt — or, when
+   * `afterLost()`, a lost connection — waits and retries while waits remain. `ended` when a wait was
+   * answered pause or stop, or the waits ran out: the post is then put back (not reported).
+   */
   async function captureWithBackoff(
     projectId: string,
+    platform: Platform,
     e: ProfileEntry,
     opts: ProfileCaptureOptions,
     item: ItemContext,
-    backOff: () => Promise<boolean>,
-  ): Promise<CaptureOutcome> {
+    backOff: (why: RunWaitWhy) => Promise<"go" | "pause" | "stop" | "give-up">,
+    afterLost: () => boolean,
+  ): Promise<CaptureOutcome | { ended: "pause" | "stop" | "give-up"; why: RunWaitWhy }> {
     const perItem: CaptureOptions = {
       transcribe: opts.transcribe,
       ...(opts.transcribeModel ? { transcribeModel: opts.transcribeModel } : {}),
@@ -710,7 +936,7 @@ export function createProfileCapture(core: CaptureCore) {
     for (;;) {
       let out: CaptureOutcome;
       try {
-        out = await core.captureItem(projectId, e.url, classifyUrl(e.url), perItem, item);
+        out = await core.inLane(platform, () => core.captureItem(projectId, e.url, classifyUrl(e.url), perItem, item));
       } catch (err) {
         if (err instanceof PolicyDeniedError) out = { url: e.url, status: "failed", errorCode: "POLICY_DENIED", reason: err.reason };
         else if (err instanceof ProjectLockedError) throw err;
@@ -718,13 +944,15 @@ export function createProfileCapture(core: CaptureCore) {
       }
       // Ended while the post downloaded: nothing of it was stored, and nothing more is.
       if (out.status === "failed" && out.errorCode === "CANCELLED") throw new CaptureCancelledError();
-      if (out.status === "failed" && out.errorCode === "RATE_LIMITED") {
+      const why: RunWaitWhy | undefined =
+        out.status !== "failed" ? undefined : out.errorCode === "RATE_LIMITED" ? "rate-limited" : out.errorCode === "NETWORK_LOST" && afterLost() ? "connection" : undefined;
+      if (why) {
         // Ended before or during the wait: no further attempt is started (N7).
         if (item.cancelled?.()) throw new CaptureCancelledError();
-        if (await backOff()) {
-          if (item.cancelled?.()) throw new CaptureCancelledError();
-          continue;
-        }
+        const a = await backOff(why);
+        if (item.cancelled?.()) throw new CaptureCancelledError();
+        if (a === "go") continue;
+        return { ended: a, why };
       }
       return out;
     }
@@ -753,9 +981,11 @@ export function createProfileCapture(core: CaptureCore) {
               tool,
               ...(tool === "yt-dlp" ? { flatList: true } : {}),
               metadataOnly: true,
-              ...(opts.maxItems ? { maxItems: opts.maxItems } : {}),
-              ...(opts.since ? { dateAfter: ymd(opts.since) } : {}),
-              ...(opts.until ? { dateBefore: ymd(opts.until) } : {}),
+              // A Resume's `onlyIds` are looked for in the whole listing, so the platform is not
+              // asked to cut it by date or number (R677); the run's own limits still apply below.
+              ...(opts.maxItems && !opts.onlyIds ? { maxItems: opts.maxItems } : {}),
+              ...(opts.since && !opts.onlyIds ? { dateAfter: ymd(opts.since) } : {}),
+              ...(opts.until && !opts.onlyIds ? { dateBefore: ymd(opts.until) } : {}),
               ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
             },
           });
@@ -892,14 +1122,16 @@ export function createProfileCapture(core: CaptureCore) {
     const flat = stripSnapshot(e.raw, { localPrefixes: [root] });
     const suspect = platform === "youtube" ? differs(stored.title, flat.title) : differs(captionOf(stored), captionOf(flat));
     if (!suspect) return "unchanged";
-    const now = await core.fetchMetadata(
-      projectId,
-      classifyUrl(e.url),
-      {
-        transcribe: false,
-        ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
-      },
-      signal,
+    const now = await core.inLane(platform, () =>
+      core.fetchMetadata(
+        projectId,
+        classifyUrl(e.url),
+        {
+          transcribe: false,
+          ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
+        },
+        signal,
+      ),
     );
     check(); // ended while it fetched: nothing is stored
     // The post's own data could not be fetched: the edit is counted as not checked, not passed over silently (FR-106).
@@ -965,10 +1197,12 @@ export function createProfileCapture(core: CaptureCore) {
     }
     const summary = `${r.created} new post(s) saved, ${r.failed + r.incomplete} not saved completely.`;
     if (r.status === "paused-rate-limited") return { url, status: "incomplete", sourceId: r.profileSourceId, errorCode: "RATE_LIMITED", reason: `${r.reason} ${summary}` };
+    // A run that a download run's hooks paused or stopped (never one started by a link alone).
+    if (r.status !== "completed") return { url, status: "incomplete", sourceId: r.profileSourceId, ...(r.errorCode ? { errorCode: r.errorCode } : {}), ...(r.tool ? { tool: r.tool } : {}), reason: `${r.reason ?? plainReason("RUN_PAUSED")} ${summary}` };
     return { url, status: "created", sourceId: r.profileSourceId, reason: summary };
   }
 
-  return { captureProfile, outcomeOf };
+  return { captureProfile, listProfile, outcomeOf };
 }
 
 /** The provenance snapshot plus an edited text under a free text key, for grounding both versions. */
@@ -983,13 +1217,27 @@ function groundingSnapshot(prov: unknown, edited: string | undefined): Record<st
 const PLATFORM_NAMES: Record<Platform, string> = { youtube: "YouTube", instagram: "Instagram", tiktok: "TikTok", other: "Other" };
 
 /** The plain-language capture report (no links, no paths). */
-function reportText(platform: Platform, label: string, r: ProfileCaptureReport, startedAt: string, finishedAt: string): string {
+function reportText(platform: Platform, label: string, r: ProfileCaptureReport, startedAt: string, finishedAt: string, wholeList: boolean): string {
+  const gaveUp = plainReason("RATE_LIMITED_GAVE_UP");
+  const lostGaveUp = plainReason("NETWORK_LOST_GAVE_UP");
   const status =
     r.status === "completed"
       ? "Finished."
       : r.status === "paused-rate-limited"
-        ? "Paused because the platform is limiting requests. Run the capture again later; it continues where it stopped."
-        : `Stopped. ${r.reason ?? ""}`.trim();
+        ? r.reason === gaveUp
+          ? gaveUp
+          : "Paused because the platform is limiting requests. Run the capture again later; it continues where it stopped."
+        : r.status === "paused"
+          ? plainReason("RUN_PAUSED")
+          : r.status === "stopped"
+            ? plainReason("RUN_STOPPED")
+            : r.status === "paused-disk"
+              ? (r.reason ?? plainReason("DISK_NEARLY_FULL"))
+              : r.status === "paused-tool"
+                ? (r.reason ?? toolMissingReason(r.tool))
+                : r.reason === lostGaveUp
+                  ? lostGaveUp
+                  : `Stopped. ${r.reason ?? ""}`.trim();
   const lines = [
     `# Profile capture report`,
     "",
@@ -1012,7 +1260,9 @@ function reportText(platform: Platform, label: string, r: ProfileCaptureReport, 
     "",
     r.listComplete
       ? "The whole profile was listed, so posts missing from it were checked."
-      : "The profile was not listed completely (cut short, or limited by date, type or number), so no post was marked as no longer available.",
+      : wholeList
+        ? "The whole profile was listed, but the capture did not finish, so posts missing from it were not checked."
+        : "The profile was not listed completely (cut short, or limited by date, type or number), so no post was marked as no longer available.",
   ];
   const problems = r.items.filter((o) => o.status === "failed" || o.status === "incomplete");
   if (problems.length) {

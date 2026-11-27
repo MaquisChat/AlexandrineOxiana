@@ -50,7 +50,7 @@ import {
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
 import { AUDIT_REASONS_FILE, LIBRARY_AUDIT_REASONS_FILE, auditedReason, auditedReasonIn, hasSealedReason, openLibraryReason, readLibraryReasonLines, readProjectReasons, reasonKey, reasonMatches, reasonView } from "./audit-reasons.js";
-import { type AuditReasonView } from "@ao/shared";
+import { type AuditReasonView, type ProjectAutomation } from "@ao/shared";
 import { authorizeOnly, decide, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import {
   RECOVERY_CODE_UNSHOWN_WARNING,
@@ -110,6 +110,7 @@ import {
 import { amendDestruction, destroyAssets, type AmendInput, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
 import { setTimeZone as setTimeZoneIn } from "./time-zone.js";
+import { setProjectAutomation as setProjectAutomationIn } from "./automation.js";
 import { readGovernance, readGovernanceFile, setGovernance as setGovernanceIn, type GovernanceEditResult, type GovernanceFileState } from "./governance-edit.js";
 import {
   AUDIT_WAITING_WARNING,
@@ -1679,6 +1680,14 @@ const endsAt = (last: { seq: number; hash: string } | null, head: { seq: number;
 /** Sets a project's backup settings (daily automatic backup, how many to keep); governed and audited. */
 export function setProjectBackupSettings(repo: Repo, projectId: string, settings: BackupSettings): Promise<Project> {
   return setBackupSettingsIn(cores.get(repo)!, projectId, settings);
+}
+
+/**
+ * Sets the project's automation (whole channels, Task 7): `transcribeNewMedia`, the switch "Transcribe captured audio
+ * and video automatically"; governed and audited (op `project.automation`).
+ */
+export function setProjectAutomation(repo: Repo, projectId: string, a: ProjectAutomation): Promise<Project> {
+  return setProjectAutomationIn(cores.get(repo)!, projectId, a);
 }
 
 /**

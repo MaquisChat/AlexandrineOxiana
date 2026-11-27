@@ -149,6 +149,20 @@ export type {
 } from "./worker-client.js";
 export { ResourceMissingError } from "./resources.js";
 
+// Whole-channel capture and transcription (R668, R669): the lists' records in the job journal.
+export { DISCARDED_CODE, LIST_KINDS, isListKind } from "./job-journal.js";
+export type { CaptureItemData, CaptureRunData, JobStatus, TranscriptionEntryData, TranscriptionListData } from "./job-journal.js";
+export {
+  createRun, discardRun, readRun, readRunItems, readRuns, recordRunItem, requeueFailedItems, setRunItems, setRunState, setRunTitle,
+} from "./lists/run-journal.js";
+export type { RunItemView, RunView } from "./lists/run-journal.js";
+export {
+  TRANSCRIPTION_LIST_ID, addToTranscriptionList, markTranscriptionEntry, readTranscriptionList, setTranscriptionListState, soundSecondsOf,
+  stopTranscriptionList,
+} from "./lists/transcription-list.js";
+export type { TranscriptionEntryView, TranscriptionListView } from "./lists/transcription-list.js";
+export { untranscribedSources } from "./untranscribed.js";
+
 export { classifyUrl, isCollectionLink, isPostLink } from "./capture/platforms.js";
 export type { ClassifiedUrl, LinkKind, Platform } from "./capture/platforms.js";
 export { AcknowledgementRequiredError, CaptureCancelledError, COOKIES_ACKNOWLEDGEMENT, incompleteReason, plainReason } from "./capture/errors.js";
@@ -158,6 +172,11 @@ export type { BrowserName, CaptureControl, CaptureOptions, CaptureOutcome, Captu
 export type { ProfileCaptureOptions, ProfileCaptureReport, ProfileContentType, ProfileRecord, ProfileRunStatus } from "./capture/profile-capture.js";
 export { CaptureQueueRegistry } from "./capture/queues.js";
 export type { CaptureQueueRegistryOptions } from "./capture/queues.js";
+// Whole channels: download runs, the disk and the estimate (Task 4).
+export { DOWNLOAD_GAP_MS, createDownloadRuns } from "./capture/download-run.js";
+export type { DownloadRuns, DownloadRunsDeps, RunControl, RunOptions } from "./capture/download-run.js";
+export { diskName, freeBytes } from "./capture/disk.js";
+export { estimateCapture } from "./capture/estimate.js";
 
 export * from "./extract/index.js";
 export { AUTO_ACCEPT_THRESHOLD, MAX_CANDIDATES, resolveItem } from "./import/resolve.js";

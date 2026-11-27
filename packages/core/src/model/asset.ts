@@ -73,6 +73,8 @@ export const Asset = z
       pairedAssetId: Id.optional(),
       /** Transcripts: how many segments the hallucination checks flagged for review (spec 5.8). */
       flaggedSegments: z.number().int().min(0).optional(),
+      /** Captured recordings: the quality asked of the video downloader (whole channels, R668). */
+      requestedQuality: z.enum(["best", "1080p", "720p", "audio", "ready"]).optional(),
     })
     .optional(),
   })

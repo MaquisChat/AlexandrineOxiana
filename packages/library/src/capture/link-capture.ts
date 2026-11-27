@@ -47,10 +47,17 @@ import { WorkerJobError, WorkerToolError, WorkerUnavailableError, type JobResult
 import { AcknowledgementRequiredError, CaptureCancelledError, incompleteReason, plainReason, toolMissingReason, transcriptToolMissingNote } from "./errors.js";
 import { storeTranscript } from "../transcript-store.js";
 import { classifyUrl, isCollectionLink, type ClassifiedUrl, type Platform } from "./platforms.js";
-import { createProfileCapture, type ProfileCaptureOptions, type ProfileCaptureReport } from "./profile-capture.js";
+import { createProfileCapture, type ProfileCaptureOptions, type ProfileCaptureReport, type ProfileListing, type RunHooks } from "./profile-capture.js";
 import { buildDraft, stripSnapshot, verificationSnapshot, type CaptureTool } from "./snapshot.js";
 
 export type BrowserName = "chrome" | "firefox" | "safari" | "edge" | "brave";
+
+/**
+ * The quality asked of the video downloader: the best, up to 1080p, up to 720p (these three need
+ * the video tools to join picture and sound), the sound alone ("audio", also through the video
+ * tools), or the platform's ready-made single file ("ready", lower quality, no video tools needed).
+ */
+export type DownloadQuality = "best" | "1080p" | "720p" | "audio" | "ready";
 
 export interface CaptureOptions {
   /** Use the researcher's signed-in browser session (needs the project's acknowledgement). */
@@ -59,7 +66,8 @@ export interface CaptureOptions {
   transcribe: boolean | "project-default";
   /** faster-whisper model (the worker's default when omitted). */
   transcribeModel?: string;
-  quality?: "best" | "1080p" | "720p";
+  /** Recorded on the stored recording as asset metadata `requestedQuality`. */
+  quality?: DownloadQuality;
   /** For a post already in the project: add a new dated platform-metadata snapshot. */
   refreshIfExists?: boolean;
   /** Legal basis for this capture; default: the project's `consent.defaultLegalBasis['social-media']`. */
@@ -76,6 +84,8 @@ export interface CaptureOutcome {
   errorCode?: string;
   /** The optional tool that was missing (Task 48a catalogue id), with `TOOL_NOT_INSTALLED` or a transcript note. */
   tool?: string;
+  /** The platform's own words for why it refused (from the worker, no link): shown beside `reason`. */
+  platformReason?: string;
 }
 
 export interface LinkCaptureDeps {
@@ -163,9 +173,14 @@ export interface LinkCapture {
     profileUrl: string,
     opts: ProfileCaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
-    /** Ended from outside: CaptureCancelledError at the next check, nothing more stored. */
-    control?: Pick<CaptureControl, "cancelled" | "signal">,
+    /**
+     * Ended from outside: CaptureCancelledError at the next check, nothing more stored. `hooks` let a
+     * download run journal each video, pause, stop and wait (profile-capture.ts `RunHooks`).
+     */
+    control?: Pick<CaptureControl, "cancelled" | "signal"> & { hooks?: RunHooks },
   ): Promise<ProfileCaptureReport>;
+  /** One listing of a profile, channel or playlist (metadata only, no waits): what a capture would take. */
+  listProfile(projectId: string, url: string, opts: ProfileCaptureOptions, signal?: AbortSignal): Promise<ProfileListing>;
   /** One link at a time, in order; `onProgress(done, total, outcome)` after each. */
   captureUrls(
     projectId: string,
@@ -211,10 +226,11 @@ function failed(url: string, code: string, reason = plainReason(code)): CaptureO
   return { url, status: "failed", errorCode: code, reason };
 }
 
-/** A worker failure as an outcome; a missing tool is named, with how to get it (R126). */
+/** A worker failure as an outcome; a missing tool is named, with how to get it (R126); the platform's own reason is kept. */
 function workerFailed(url: string, err: WorkerJobError): CaptureOutcome {
-  if (err instanceof WorkerToolError && err.code === "TOOL_NOT_INSTALLED") return { ...failed(url, err.code, toolMissingReason(err.tool)), tool: err.tool };
-  return failed(url, err.code);
+  const why = err.platformReason ? { platformReason: err.platformReason } : {};
+  if (err instanceof WorkerToolError && err.code === "TOOL_NOT_INSTALLED") return { ...failed(url, err.code, toolMissingReason(err.tool)), tool: err.tool, ...why };
+  return { ...failed(url, err.code), ...why };
 }
 
 /** One set of per-platform lanes per open library (repo), whichever queue or capture uses it (R116). */
@@ -529,8 +545,11 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
         else if (IMAGE_EXT.has(ext)) (tool === "yt-dlp" && hasAV ? thumbs : media).push(f);
       }
       const enc = result.encrypted ? { encrypted: true } : {};
+      // The quality asked for is recorded with the recording itself (only when it was asked of the downloader).
+      const asked = opts.quality && toolFor(c) === "yt-dlp" ? opts.quality : undefined;
+      const qualityOf = (path: string) => (asked && (VIDEO_EXT.has(extOf(path)) || AUDIO_EXT.has(extOf(path))) ? { metadata: { requestedQuality: asked } } : {});
       const inputs: SourceInputFile[] = [
-        ...media.map((path) => ({ path, role: "original" as const, handling: "copy" as const, ...enc })),
+        ...media.map((path) => ({ path, role: "original" as const, handling: "copy" as const, ...qualityOf(path), ...enc })),
         ...thumbs.map((path) => ({ path, role: "original" as const, handling: "copy" as const, kind: "thumbnail", ...enc })),
       ];
       if (raw) {
@@ -716,5 +735,11 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     return out;
   }
 
-  return { captureUrl: (projectId, url, opts) => captureUrl(projectId, url, opts), captureUrls, captureProfile: profiles.captureProfile, transcribeSource };
+  return {
+    captureUrl: (projectId, url, opts) => captureUrl(projectId, url, opts),
+    captureUrls,
+    captureProfile: profiles.captureProfile,
+    listProfile: profiles.listProfile,
+    transcribeSource,
+  };
 }
