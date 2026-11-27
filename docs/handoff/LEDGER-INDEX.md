@@ -625,3 +625,4 @@ R699 (2026-11-26 UTC): N18 green but for the unit step (3 of 12,325; two causes 
 R700 (2026-11-26 UTC): N18b green (12,318 unit tests on the mended join); BUILD REQUEST 17 pushed, reader 765e02b; CI run 296, Mac run 27.
 R701 (2026-11-26 UTC): Mac build 17 green (run 27, id 45907837109, reader 765e02b); dmg SHA-256 cc5090d4…ea3fc5d6; artifact id 15158776840; its crash report is Apple's xcodebuild in the pins step (FR-777), not the app.
 R702 (2026-11-27 UTC): CI run 296 green on 765e02b; BUILD 17 MERGED TO main on the owner's word (merge commit 958880d; code identical to 765e02b); part 17 of the owner's page; DEVELOPMENT PAUSED BY THE OWNER.
+R703 (2026-11-27 UTC): main 4f6b641 — its own check green (CI run 297) and its Mac run green (run 28); the merge of build 17 is closed; development paused by the owner.

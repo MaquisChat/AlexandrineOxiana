@@ -1,5 +1,7 @@
 # The final review — what I need from you
 
+*Updated 26 November 2026, 7:22 pm Central: `main`'s own check on build 17 is green (7:15 pm). Nothing is running; development is paused until you say to go on.*
+
 *Updated 26 November 2026, 6:10 pm Central: part 17, at the end, is new — WHOLE CHANNELS, DOWNLOADED AND TRANSCRIBED WITHOUT WATCHING OVER THEM, is built, passed all its tests and GitHub's check, and IS IN `main` on your word. MAC BUILD 17 EXISTS and is the build to use; part 17 says where to download it. Development is paused, as you asked.*
 
 *Updated 26 November 2026, just after midnight Central: BUILD 16 IS IN `main`, on your word "Merge". Mac build 16 (part 16) is now the build of `main` and the build to use.*
@@ -1062,7 +1064,7 @@ It was built as ten tasks. Each was built by one agent and then gone through by 
   - **One timing accident.** A watched-folders test ran out of time while the machine was busy. Whole channels did not touch that code, and the test passes when run alone. It has now done this twice, so I listed it to be looked into properly (FR-776).
 - **Pushed as build request 17** at 4:55 pm Central on 26 November.
 - **GitHub's own check:** green at 6:03 pm Central ([CI run 296](https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45907837097)).
-- **In `main`** since the evening of 26 November, on your word: "merge build 17 to main when the check is green." `main` runs its own check after every merge; its result is in the note at the top of this page once it has ended.
+- **In `main`** since the evening of 26 November, on your word: "merge build 17 to main when the check is green." `main`'s own check after the merge is green too (7:15 pm Central).
 - **Mac build 17 exists** and is the build to use. Every check passed, including the release app started from the mounted disk image.
   - Where: [Desktop (macOS) run 27](https://github.com/MaquisChat/AlexandrineOxiana/actions/runs/45907837109), under "Artifacts", `alexandrine-oxiana-macos-apple-silicon`.
   - The file: `Alexandrine-Oxiana-0.0.0-apple-silicon.dmg`, SHA-256 `cc5090d4818fdf35a414c96316a38194568d978ca558250dd93e66dbea3fc5d6`.
