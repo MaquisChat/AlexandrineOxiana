@@ -1,0 +1,41 @@
+# Task 1 (shared contract and the lists' journal) — fix round after the review (Ruling R672)
+
+You are a FRESH implementer (the first one is at its size limit). Read the common brief first, in full: `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/wc-common.md` (it names the plan, the design and the house rules; your task is Task 1). Then read the review in full: `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task-WC1-review.md` — the finding numbers below are its numbers — and the first implementer's report `task-WC1-report.md`.
+
+Worktree `/home/user/AlexandrineOxiana/.claude/worktrees/kg-1`, branch `wc-1-contract`, head 0b7e336. Tests first for every point: each new or changed test must fail before its mend (say so per point). One commit per group A–D. Where this brief pins a string or a rule it REPLACES or ADDS TO the plan's Task 1 (the plan's text has been updated to match; if the two differ, this brief wins and you say so). Other tasks are built against these names and sentences: character for character, curly quotes and all.
+
+## A. Sentences (`packages/shared/src/api/background.ts`) — I2, I3, Minors 1–5
+
+A1. **A run that never read its list (total 0) never says "0 of 0"** (I2). `{noun}` as elsewhere ("videos"; Instagram "posts"):
+- stopped, total 0: title `"Example Channel" was stopped before it began.`
+- paused, total 0: title `"Example Channel" is paused. The list of videos has not been read yet.`
+- paused-disk, paused-rate-limited, paused-tool, failed with total 0: title `"Example Channel": the list of videos has not been read yet.`; `why` exactly as for total > 0.
+- (unchanged, already pinned: queued; downloading with total 0; interrupted with total 0; finished with total 0; the three-way `resume` label.)
+A2. **A new constant** `export const LIST_STOPPED_TEXT: string` = `The transcriptions were stopped. The sources stay; “Transcribe everything without a transcript” puts them on the list again.` (the screens say it once after a Stop of the transcription list).
+A3. `transcribeAllText.confirm` for exactly 1 source ends `It is transcribed on this Mac, after anything already on the list.` (for more than 1: `They are transcribed one at a time on this Mac, after anything already on the list.`, as now). With 1 source of unknown length: `1 source has audio or video and no transcript; its length is not known. It is transcribed on this Mac, after anything already on the list.`
+A4. `estimateText.disk` when `count` is 0: `Nothing new will be downloaded, so no disk space is needed.` (no size, no free-space part); `tooBig` is undefined when `count` is 0.
+A5. `formatSizeRange(low, high)`: when `low` < 1 000 000 ≤ `high` → `up to 1.2 MB` (the high end alone); when both are below 1 000 000 → `less than 1 MB`. The `disk` sentence then reads `Roughly up to 1.2 MB at this quality.` / `Roughly less than 1 MB at this quality.`
+A6. `estimateText.transcribeTime` with a measured speed: when `soundSeconds` is 0 and `unknownLengths` > 0 → `Transcribing: the lengths are not known, so the app cannot say how long.`; when some lengths are unknown and some known → the measured sentence followed by ` The 12 videos of unknown length are not counted.` (`The 1 video of unknown length is not counted.`; Instagram "posts"/"post").
+A7. Rounding never produces "60 minutes", "120 minutes" or "48 hours": `formatSoundLength` — when the rounded minutes reach 60 it says `about 1 hour`; `formatTimeLeft` — when the rounded minutes reach 120 it says `about 2 hours`, when the rounded hours reach 48 it says `about 2 days`. Everything else of the two as pinned.
+A8. `problemLine` with an empty title uses `(no title)` (an empty string counts as no title).
+Tests: one assertion per sentence above, exact strings.
+
+## B. The transcription list (`packages/library/src/lists/transcription-list.ts`) — I1, I3, Minors 9, 10
+
+B1. (I1) `markTranscriptionEntry` returns `Promise<boolean>`. An entry that has ended (done, failed, cancelled) is never moved to `running` or `queued`: such a call writes nothing and returns `false`. Every other move returns `true`. Test: the reviewer's probe (add two, stop the list, mark the first running with a late job id → `false`, the list still empty, total unchanged).
+B2. (I3) `stopTranscriptionList` also sets `total`, `done` and `failed` to 0 and leaves the list state `running` (so the next "Transcribe everything" starts at once). After it `readTranscriptionList` gives `{ state: "running", total: 0, done: 0, failed: 0, pending: [] }`. Test: stop after 3 of 10 done → exactly that.
+B3. (Minor 9) A `transcription.entry` whose status is `cancelled` is dropped at the next compaction whatever the caps say, and never counts toward the cap of kept failed/cancelled records that it shares with the worker's jobs. Test: 400 cancelled entries and a handful of failed worker jobs → after compaction the worker jobs' records are all still there and no cancelled entry is.
+B4. (Minor 10) The test "evaluates process transcription once…" must fail if the policy were evaluated once per item: count the evaluations through whatever seam exists (a spy on the policy engine's evaluate, or a policy whose evaluation is observable). If there is no seam without changing product code, say so and leave the test.
+
+## C. The run journal and the journal file — Minors 6, 7, 8 and I4
+
+C1. (Minor 6) No post id in an error message: `NotFoundError` names the run and the item's index.
+C2. (Minor 8) `setRunState` recounts the run's `total` / `done` / `failed` from its items, as the item writes do. Test: a run record whose counters are stale (write an item record directly, then `setRunState`) reads back with the recounted numbers.
+C3. (Minor 7) `updateJobRecords` compacts the journal in its own turn when the file has more than 2 000 lines and more than half of them are superseded (use the existing compaction; the thresholds as named constants). A whole channel must not make every write read tens of thousands of dead lines. Test: after 3 000 writes to 500 items of one run the file has fewer than 2 000 lines and every record reads back unchanged; a compaction never drops a live run's items (the existing rule).
+C4. (I4, ruled: repair) An OLDER build that opens this journal claims every queued or running list record as `failed` with error `UNRECOVERABLE` (it takes them for worker jobs it cannot resume); the data fields survive. This build repairs that when it reads: in `run-journal.ts` and `transcription-list.ts`, a list record (`isListKind`) whose status is `failed` with error `UNRECOVERABLE` is read as `queued` (for a run: its `run.state` decides what is shown, as always; for an item: `queued`, i.e. not completed; for an entry: `queued`, i.e. pending; for the list record: as if untouched) — but an item or entry that carries its own failure (an item with `item.errorCode`, an entry marked failed by this build with another error) stays failed. And `prunable` never drops a `capture.run` whose `run.state` is not `finished` and that is not discarded, whatever its record status and whatever the caps. Tests: build a journal as this build writes it, rewrite the pending list records the way the older build would (status `failed`, `error: "UNRECOVERABLE"`, everything else kept), then: the run and its items read back as not completed (and `requeueFailedItems` + a resume would take them), the transcription list still has its pending entries and its counters, and compaction keeps the run and its items.
+
+## D. Anything else in the review you can settle without a choice
+Read the review's remaining remarks; mend what is plainly a slip and say what you did. Anything that needs a choice about what the researcher sees: do NOT guess — "NEEDS A RULING" in your report.
+
+## Runs and report
+The single files of the common brief's "Verify" for `@ao/shared` and `@ao/library` (the test files you touched, plus `src/job-journal-paths.test.ts` and `src/worker-client.test.ts`), typecheck `@ao/shared`, `@ao/library`, `@ao/library-service`, `@ao/ui`; `git status --short` empty. Same trailers as the dispatch gives you. Append "Fix round (R672)" to `/home/user/AlexandrineOxiana/.superpowers/sdd/PLAN/task-WC1-report.md` (per point: file:line, its tests and that they failed first, anything not done as written and why). Final message at most 150 words.
